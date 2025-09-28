@@ -1,0 +1,106 @@
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: websocket-handler-hpa
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/name: websocket-handler
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: websocket-handler
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  # CPU utilization
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  # Memory utilization
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  # Custom metrics based on WebSocket connections
+  - type: Pods
+    pods:
+      metric:
+        name: websocket_connections_per_pod
+      target:
+        type: AverageValue
+        averageValue: "8000"  # Scale when connections > 8k per pod
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 300  # 5 minutes
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 600  # 10 minutes
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 300
+      - type: Pods
+        value: 1
+        periodSeconds: 300
+      selectPolicy: Min
+
+---
+# Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: websocket-handler-pdb
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/name: websocket-handler
+    app.kubernetes.io/component: disruption-budget
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: websocket-handler
+      app.kubernetes.io/component: server
+
+---
+# Vertical Pod Autoscaler (optional - requires VPA controller)
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: websocket-handler-vpa
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/name: websocket-handler
+    app.kubernetes.io/component: vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: websocket-handler
+  updatePolicy:
+    updateMode: "Off"  # Recommendation only, don't auto-update
+  resourcePolicy:
+    containerPolicies:
+    - containerName: websocket-handler
+      minAllowed:
+        cpu: 100m
+        memory: 500Mi
+      maxAllowed:
+        cpu: 4
+        memory: 8Gi
+      controlledResources: ["cpu", "memory"]
+      controlledValues: RequestsAndLimits
