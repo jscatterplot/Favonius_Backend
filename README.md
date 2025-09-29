@@ -83,7 +83,15 @@ docker-compose logs -f websocket-handler
 
 ### Kubernetes (Production)
 
-1. **Deploy to Kubernetes**:
+1. **Deploy Redis Cluster first**:
+```bash
+# Deploy Redis cluster with high availability
+./deploy-redis.sh --type kubernetes --env production \
+  --password "secure-redis-password" \
+  --storage-class "fast-ssd"
+```
+
+2. **Deploy WebSocket Handler**:
 ```bash
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/configmap.yaml
@@ -94,9 +102,10 @@ kubectl apply -f k8s/ingress.yaml
 kubectl apply -f k8s/autoscaling.yaml
 ```
 
-2. **Verify deployment**:
+3. **Verify deployment**:
 ```bash
 kubectl get pods -n ev-charging
+kubectl get pods -n redis-cluster
 kubectl logs -f deployment/websocket-handler -n ev-charging
 ```
 
@@ -246,10 +255,15 @@ flake8 src/ tests/
 - Monitor memory usage per connection
 
 ### Redis Optimizations
-- Use pipelining for batch operations
-- Configure appropriate memory policies
-- Use Redis Streams for event handling
-- Monitor connection pool utilization
+- **Enhanced Redis Client** with cluster support and atomic operations
+- **Time-series telemetry storage** with automatic retention
+- **Fleet management bitmaps** for O(1) availability queries
+- **Market data caching** with price forecasting
+- **Lua scripts** for atomic state management
+- **Redis Streams** for grid signals and event handling
+- **Connection pooling** and compression for optimal performance
+
+For detailed Redis implementation, see [REDIS_IMPLEMENTATION.md](REDIS_IMPLEMENTATION.md)
 
 ## Deployment Considerations
 

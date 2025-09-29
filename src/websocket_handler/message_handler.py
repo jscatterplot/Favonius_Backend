@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from .config import Config
-from .redis_client import RedisClient
+from .redis_enhanced import EnhancedRedisClient, ChargerState, TelemetryData
+from .redis_integration import RedisIntegrationService
 from .kafka_producer import KafkaProducer
 from .monitoring import get_logger
 
@@ -18,13 +19,14 @@ class MessageHandler:
     
     def __init__(
         self, 
-        redis_client: RedisClient,
+        redis_client: EnhancedRedisClient,
         kafka_producer: KafkaProducer,
         connection_manager: 'ConnectionManager',
         config: Config
     ):
         """Initialize message handler."""
         self.redis_client = redis_client
+        self.redis_integration = RedisIntegrationService(redis_client)
         self.kafka_producer = kafka_producer
         self.connection_manager = connection_manager
         self.config = config
@@ -81,27 +83,15 @@ class MessageHandler:
         self, station_id: str, payload: Dict[str, Any], unique_id: str
     ) -> Dict[str, Any]:
         """Handle BootNotification message."""
-        charging_station = payload.get("chargingStation", {})
-        
-        # Extract station information
-        station_info = {
-            "model": charging_station.get("model"),
-            "vendor_name": charging_station.get("vendorName"),
-            "firmware_version": charging_station.get("firmwareVersion"),
-            "serial_number": charging_station.get("serialNumber"),
-            "ocpp_version": "2.1",
-            "boot_time": datetime.now(timezone.utc).isoformat(),
-        }
-        
-        # Update station info in Redis
-        await self.redis_client.update_station_info(station_id, station_info)
+        # Use enhanced Redis integration for boot handling
+        await self.redis_integration.handle_charger_boot(station_id, payload)
         
         # Publish boot event to Kafka
         event = {
             "event_type": "station_boot",
             "station_id": station_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": station_info
+            "data": payload.get("chargingStation", {})
         }
         await self.kafka_producer.send_event("charger.events", event)
         
@@ -197,11 +187,10 @@ class MessageHandler:
         self, station_id: str, payload: Dict[str, Any], unique_id: str
     ) -> Dict[str, Any]:
         """Handle MeterValues message."""
-        evse_id = payload.get("evseId", 1)
         meter_values = payload.get("meterValue", [])
         
-        for meter_value in meter_values:
-            await self._process_meter_values(station_id, evse_id, meter_value)
+        # Use enhanced Redis integration for telemetry processing
+        await self.redis_integration.handle_telemetry_update(station_id, meter_values)
         
         return {}  # Empty response for MeterValues
     

@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
 from .config import Config
-from .redis_client import RedisClient
+from .redis_enhanced import EnhancedRedisClient
 from .kafka_producer import KafkaProducer
 from .monitoring import get_logger
 
@@ -76,7 +76,7 @@ class V2XController:
     
     def __init__(
         self, 
-        redis_client: RedisClient,
+        redis_client: EnhancedRedisClient,
         kafka_producer: KafkaProducer,
         config: V2XControllerConfig,
         app_config: Config

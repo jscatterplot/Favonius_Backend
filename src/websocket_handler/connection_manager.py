@@ -7,14 +7,14 @@ from typing import Dict, Optional, Set
 from websockets.server import WebSocketServerProtocol
 
 from .config import Config
-from .redis_client import RedisClient
+from .redis_enhanced import EnhancedRedisClient
 from .monitoring import get_logger
 
 
 class ConnectionManager:
     """Manages WebSocket connections and message routing."""
     
-    def __init__(self, redis_client: RedisClient, config: Config):
+    def __init__(self, redis_client: EnhancedRedisClient, config: Config):
         """Initialize connection manager."""
         self.redis_client = redis_client
         self.config = config

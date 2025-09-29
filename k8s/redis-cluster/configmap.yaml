@@ -1,0 +1,168 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-cluster-config
+  namespace: redis-cluster
+  labels:
+    app.kubernetes.io/name: redis-cluster
+    app.kubernetes.io/component: config
+data:
+  redis.conf: |
+    # Redis Cluster Configuration for Kubernetes
+    bind 0.0.0.0
+    port 6379
+    protected-mode no
+    daemonize no
+    
+    # Cluster configuration
+    cluster-enabled yes
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout 15000
+    cluster-announce-bus-port 16379
+    
+    # Memory management
+    maxmemory 2gb
+    maxmemory-policy allkeys-lru
+    maxmemory-samples 10
+    
+    # Performance tuning
+    hz 10
+    dynamic-hz yes
+    tcp-keepalive 300
+    tcp-backlog 511
+    timeout 0
+    tcp-nodelay yes
+    
+    # Persistence
+    save 900 1
+    save 300 10
+    save 60 10000
+    
+    # AOF
+    appendonly yes
+    appendfilename "appendonly.aof"
+    appendfsync everysec
+    no-appendfsync-on-rewrite no
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+    
+    # Client management
+    maxclients 10000
+    
+    # Logging
+    loglevel notice
+    logfile ""
+    
+    # Slow log
+    slowlog-log-slower-than 10000
+    slowlog-max-len 128
+    
+    # Memory usage optimization
+    hash-max-ziplist-entries 512
+    hash-max-ziplist-value 64
+    list-max-ziplist-size -2
+    set-max-intset-entries 512
+    zset-max-ziplist-entries 128
+    zset-max-ziplist-value 64
+    
+    # Stream configuration
+    stream-node-max-bytes 4096
+    stream-node-max-entries 100
+    
+    # Event notification for pub/sub
+    notify-keyspace-events "Ex"
+    
+    # Advanced settings
+    activerehashing yes
+    client-output-buffer-limit normal 0 0 0
+    client-output-buffer-limit replica 256mb 64mb 60
+    client-output-buffer-limit pubsub 32mb 8mb 60
+    
+    # Latency monitoring
+    latency-monitor-threshold 100
+
+  cluster-init.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Waiting for Redis pods to be ready..."
+    
+    # Wait for all pods to be ready
+    for i in {0..5}; do
+        echo "Checking redis-cluster-$i..."
+        while ! redis-cli -h redis-cluster-$i.redis-cluster-headless -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+            echo "Waiting for redis-cluster-$i to be ready..."
+            sleep 5
+        done
+        echo "redis-cluster-$i is ready"
+    done
+    
+    echo "Creating Redis cluster..."
+    
+    # Create cluster
+    redis-cli -a "$REDIS_PASSWORD" --cluster create \
+        redis-cluster-0.redis-cluster-headless:6379 \
+        redis-cluster-1.redis-cluster-headless:6379 \
+        redis-cluster-2.redis-cluster-headless:6379 \
+        redis-cluster-3.redis-cluster-headless:6379 \
+        redis-cluster-4.redis-cluster-headless:6379 \
+        redis-cluster-5.redis-cluster-headless:6379 \
+        --cluster-replicas 1 \
+        --cluster-yes
+    
+    echo "Cluster created successfully!"
+    
+    # Verify cluster
+    redis-cli -h redis-cluster-0.redis-cluster-headless -p 6379 -a "$REDIS_PASSWORD" cluster info
+    redis-cli -h redis-cluster-0.redis-cluster-headless -p 6379 -a "$REDIS_PASSWORD" cluster nodes
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-cluster-scripts
+  namespace: redis-cluster
+  labels:
+    app.kubernetes.io/name: redis-cluster
+    app.kubernetes.io/component: scripts
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Starting Redis Cluster Node..."
+    
+    # Get pod info
+    POD_IP=$(hostname -i)
+    POD_NAME=$(hostname)
+    
+    echo "Pod Name: $POD_NAME"
+    echo "Pod IP: $POD_IP"
+    
+    # Copy config file
+    cp /config/redis.conf /data/redis.conf
+    
+    # Set password if provided
+    if [ ! -z "$REDIS_PASSWORD" ]; then
+        echo "requirepass $REDIS_PASSWORD" >> /data/redis.conf
+        echo "masterauth $REDIS_PASSWORD" >> /data/redis.conf
+    fi
+    
+    # Set cluster announce IP to pod IP
+    echo "cluster-announce-ip $POD_IP" >> /data/redis.conf
+    
+    # Set ownership
+    chown redis:redis /data -R
+    
+    echo "Starting Redis server..."
+    exec redis-server /data/redis.conf
+  
+  health-check.sh: |
+    #!/bin/bash
+    
+    # Health check script
+    if [ ! -z "$REDIS_PASSWORD" ]; then
+        redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG
+    else
+        redis-cli ping | grep -q PONG
+    fi

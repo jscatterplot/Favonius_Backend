@@ -16,7 +16,7 @@ from prometheus_client import Counter, Histogram, Gauge
 from .config import Config
 from .connection_manager import ConnectionManager
 from .message_handler import MessageHandler
-from .redis_client import RedisClient
+from .redis_enhanced import EnhancedRedisClient
 from .kafka_producer import KafkaProducer
 from .monitoring import setup_monitoring, get_logger
 
@@ -40,7 +40,7 @@ class OCPPWebSocketServer:
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
         self.message_handler: Optional[MessageHandler] = None
-        self.redis_client: Optional[RedisClient] = None
+        self.redis_client: Optional[EnhancedRedisClient] = None
         self.kafka_producer: Optional[KafkaProducer] = None
         
         # Server state
@@ -126,8 +126,8 @@ class OCPPWebSocketServer:
     
     async def _initialize_components(self) -> None:
         """Initialize Redis, Kafka, and other components."""
-        # Initialize Redis client
-        self.redis_client = RedisClient(self.config.redis)
+        # Initialize enhanced Redis client
+        self.redis_client = EnhancedRedisClient(self.config.redis)
         await self.redis_client.connect()
         
         # Initialize Kafka producer
