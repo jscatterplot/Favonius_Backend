@@ -1,0 +1,205 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-cluster
+  namespace: redis-cluster
+  labels:
+    app.kubernetes.io/name: redis-cluster
+    app.kubernetes.io/component: database
+    app.kubernetes.io/version: v7.2.0
+spec:
+  serviceName: redis-cluster-headless
+  replicas: 6
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-cluster
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis-cluster
+        app.kubernetes.io/component: database
+        app.kubernetes.io/version: v7.2.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "6379"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: redis-cluster
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        fsGroup: 999
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["redis-cluster"]
+              - key: app.kubernetes.io/component
+                operator: In
+                values: ["database"]
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: redis
+          containerPort: 6379
+          protocol: TCP
+        - name: cluster-bus
+          containerPort: 16379
+          protocol: TCP
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-cluster-auth
+              key: REDIS_PASSWORD
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        command:
+        - /scripts/entrypoint.sh
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "250m"
+          limits:
+            memory: "4Gi" 
+            cpu: "1"
+        livenessProbe:
+          exec:
+            command:
+            - /scripts/health-check.sh
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        readinessProbe:
+          exec:
+            command:
+            - /scripts/health-check.sh
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: scripts
+          mountPath: /scripts
+          defaultMode: 0755
+          readOnly: true
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - SETGID
+            - SETUID
+      volumes:
+      - name: config
+        configMap:
+          name: redis-cluster-config
+          items:
+          - key: redis.conf
+            path: redis.conf
+      - name: scripts
+        configMap:
+          name: redis-cluster-scripts
+          defaultMode: 0755
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app.kubernetes.io/name: redis-cluster
+        app.kubernetes.io/component: database
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "fast-ssd"  # Adjust to your storage class
+      resources:
+        requests:
+          storage: 20Gi  # Adjust based on your data requirements
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-cluster
+  namespace: redis-cluster
+  labels:
+    app.kubernetes.io/name: redis-cluster
+    app.kubernetes.io/component: serviceaccount
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: redis-cluster
+  name: redis-cluster
+  labels:
+    app.kubernetes.io/name: redis-cluster
+    app.kubernetes.io/component: rbac
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: redis-cluster
+  namespace: redis-cluster
+  labels:
+    app.kubernetes.io/name: redis-cluster
+    app.kubernetes.io/component: rbac
+subjects:
+- kind: ServiceAccount
+  name: redis-cluster
+  namespace: redis-cluster
+roleRef:
+  kind: Role
+  name: redis-cluster
+  apiGroup: rbac.authorization.k8s.io

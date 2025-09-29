@@ -1,0 +1,254 @@
+version: '3.8'
+
+services:
+  # Main WebSocket handler service
+  websocket-handler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ev-websocket-handler
+    ports:
+      - "9000:9000"   # WebSocket server
+      - "8080:8080"   # Metrics
+      - "8081:8081"   # Health checks
+    environment:
+      # Redis configuration
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_MAX_CONNECTIONS: 100
+      
+      # Kafka configuration
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CHARGER_EVENTS_TOPIC: charger.events
+      KAFKA_OPTIMIZATION_COMMANDS_TOPIC: optimization.commands
+      KAFKA_CONSUMER_GROUP: websocket-handler
+      
+      # WebSocket configuration
+      WEBSOCKET_HOST: 0.0.0.0
+      WEBSOCKET_PORT: 9000
+      MAX_CONNECTIONS: 1000
+      HEARTBEAT_INTERVAL: 30
+      MESSAGE_TIMEOUT: 60
+      RATE_LIMIT_PER_MINUTE: 100
+      
+      # Monitoring configuration
+      METRICS_PORT: 8080
+      HEALTH_CHECK_PORT: 8081
+      LOG_LEVEL: INFO
+      ENABLE_TELEMETRY: true
+      
+      # Application configuration
+      ENVIRONMENT: development
+      DEBUG: false
+      
+      # TLS configuration (optional)
+      # TLS_CERT_PATH: /app/certs/server.crt
+      # TLS_KEY_PATH: /app/certs/server.key
+      # TLS_VERIFY_CLIENT: false
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      # Uncomment for TLS certificates
+      # - ./certs:/app/certs:ro
+    depends_on:
+      - redis
+      - kafka
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/liveness"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+
+  # Redis for state management
+  redis:
+    image: redis:7.2-alpine
+    container_name: ev-redis
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-}
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Zookeeper for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: ev-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    restart: unless-stopped
+    
+  # Kafka for event streaming
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: ev-kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_EXTERNAL://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_EXTERNAL://localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
+      KAFKA_LOG_RETENTION_BYTES: 1073741824  # 1GB
+      KAFKA_COMPRESSION_TYPE: snappy
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # TimescaleDB for time series data (optional for local dev)
+  timescaledb:
+    image: timescale/timescaledb:2.13.1-pg15
+    container_name: ev-timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ev_charging
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      TIMESCALEDB_TELEMETRY: off
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ev_charging"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus for metrics collection (optional)
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: ev-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    depends_on:
+      - websocket-handler
+
+  # Grafana for monitoring dashboards (optional)
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: ev-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # OCPP Simulator for testing (optional)
+  ocpp-simulator:
+    image: ghcr.io/thoughtworks/steve:latest
+    container_name: ev-ocpp-simulator
+    ports:
+      - "8180:8180"
+    environment:
+      STEVE_DB_URL: jdbc:mysql://mysql:3306/stevedb
+      STEVE_DB_USER: steve
+      STEVE_DB_PASSWORD: changeme
+      STEVE_OCPP_SERVER_URL: ws://websocket-handler:9000/
+    depends_on:
+      - websocket-handler
+      - mysql
+    restart: unless-stopped
+    profiles: ["testing"]
+
+  # MySQL for OCPP simulator (optional)
+  mysql:
+    image: mysql:8.0
+    container_name: ev-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: stevedb
+      MYSQL_USER: steve
+      MYSQL_PASSWORD: changeme
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: unless-stopped
+    profiles: ["testing"]
+
+volumes:
+  redis_data:
+    driver: local
+  kafka_data:
+    driver: local
+  zookeeper_data:
+    driver: local
+  zookeeper_logs:
+    driver: local
+  timescaledb_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  mysql_data:
+    driver: local
+
+networks:
+  default:
+    name: ev-charging-network
+    driver: bridge
