@@ -42,6 +42,21 @@ class WebSocketConfig(BaseModel):
     rate_limit_per_minute: int = Field(default=100, description="Rate limit per connection per minute")
 
 
+class SupabaseConfig(BaseModel):
+    """Supabase configuration."""
+    url: str = Field(description="Supabase project URL")
+    anon_key: str = Field(description="Supabase anonymous key")
+    service_key: str = Field(description="Supabase service role key")
+    db_host: str = Field(description="Database host")
+    db_port: int = Field(default=5432, description="Database port")
+    db_name: str = Field(default="postgres", description="Database name")
+    db_user: str = Field(description="Database user")
+    db_password: str = Field(description="Database password")
+    max_connections: int = Field(default=20, description="Maximum database connections")
+    connection_timeout: int = Field(default=30, description="Connection timeout in seconds")
+    enable_realtime: bool = Field(default=True, description="Enable real-time subscriptions")
+
+
 class MonitoringConfig(BaseModel):
     """Monitoring and observability configuration."""
     metrics_port: int = Field(default=8080, description="Prometheus metrics port")
@@ -56,6 +71,7 @@ class Config(BaseModel):
     kafka: KafkaConfig = Field(default_factory=KafkaConfig)
     tls: TLSConfig = Field(default_factory=TLSConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
+    supabase: SupabaseConfig = Field(default_factory=SupabaseConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     
     # Environment-specific settings
@@ -92,6 +108,19 @@ class Config(BaseModel):
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "65536")),
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
+            ),
+            supabase=SupabaseConfig(
+                url=os.getenv("SUPABASE_URL", ""),
+                anon_key=os.getenv("SUPABASE_ANON_KEY", ""),
+                service_key=os.getenv("SUPABASE_SERVICE_KEY", ""),
+                db_host=os.getenv("SUPABASE_DB_HOST", "aws-1-us-east-2.pooler.supabase.com"),
+                db_port=int(os.getenv("SUPABASE_DB_PORT", "6543")),
+                db_name=os.getenv("SUPABASE_DB_NAME", "postgres"),
+                db_user=os.getenv("SUPABASE_DB_USER", "postgres.evdehwjbbgdgiwdvjqfk"),
+                db_password=os.getenv("SUPABASE_DB_PASSWORD", "1NDLK5slwkI8Ka7b"),
+                max_connections=int(os.getenv("SUPABASE_MAX_CONNECTIONS", "20")),
+                connection_timeout=int(os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")),
+                enable_realtime=os.getenv("SUPABASE_ENABLE_REALTIME", "true").lower() == "true",
             ),
             monitoring=MonitoringConfig(
                 metrics_port=int(os.getenv("METRICS_PORT", "8080")),

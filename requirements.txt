@@ -43,3 +43,8 @@ mypy>=1.8.0
 # Performance monitoring
 psutil>=5.9.6
 py-spy>=0.3.14
+
+# Supabase integration
+supabase>=2.3.0
+postgrest>=0.13.0
+asyncpg>=0.29.0
