@@ -42,6 +42,24 @@ class WebSocketConfig(BaseModel):
     rate_limit_per_minute: int = Field(default=100, description="Rate limit per connection per minute")
 
 
+class TimescaleConfig(BaseModel):
+    """TimescaleDB configuration."""
+    service_url: str = Field(description="TimescaleDB service URL")
+    host: str = Field(description="Database host")
+    port: int = Field(default=5432, description="Database port")
+    database: str = Field(default="tsdb", description="Database name")
+    user: str = Field(description="Database user")
+    password: str = Field(description="Database password")
+    sslmode: str = Field(default="require", description="SSL mode")
+    max_connections: int = Field(default=100, description="Maximum database connections")
+    pool_size: int = Field(default=20, description="Connection pool size")
+    statement_timeout: int = Field(default=30, description="Statement timeout in seconds")
+    idle_timeout: int = Field(default=600, description="Idle timeout in seconds")
+    chunk_time_interval: str = Field(default="1 day", description="Hypertable chunk interval")
+    compression_after: str = Field(default="7 days", description="Compression policy interval")
+    retention_period: str = Field(default="2 years", description="Data retention period")
+
+
 class SupabaseConfig(BaseModel):
     """Supabase configuration."""
     url: str = Field(description="Supabase project URL")
@@ -71,6 +89,7 @@ class Config(BaseModel):
     kafka: KafkaConfig = Field(default_factory=KafkaConfig)
     tls: TLSConfig = Field(default_factory=TLSConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
+    timescale: TimescaleConfig = Field(default_factory=TimescaleConfig)
     supabase: SupabaseConfig = Field(default_factory=SupabaseConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     
@@ -108,6 +127,22 @@ class Config(BaseModel):
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "65536")),
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
+            ),
+            timescale=TimescaleConfig(
+                service_url=os.getenv("TIMESCALE_SERVICE_URL", "postgres://tsdbadmin:lyqgv8a0j1bt1zaa@avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com:32634/tsdb?sslmode=require"),
+                host=os.getenv("PGHOST", "avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com"),
+                port=int(os.getenv("PGPORT", "32634")),
+                database=os.getenv("PGDATABASE", "tsdb"),
+                user=os.getenv("PGUSER", "tsdbadmin"),
+                password=os.getenv("PGPASSWORD", "lyqgv8a0j1bt1zaa"),
+                sslmode=os.getenv("PGSSLMODE", "require"),
+                max_connections=int(os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")),
+                pool_size=int(os.getenv("TIMESCALE_POOL_SIZE", "20")),
+                statement_timeout=int(os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")),
+                idle_timeout=int(os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")),
+                chunk_time_interval=os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
+                compression_after=os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
+                retention_period=os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
             ),
             supabase=SupabaseConfig(
                 url=os.getenv("SUPABASE_URL", ""),

@@ -16,6 +16,10 @@ from .auth_manager import AuthManager
 from .data_sync import DataSyncService
 from .api_server import APIServer
 from .database_schema import create_schema_from_config
+from .timescale_client import TimescaleClient
+from .timescale_schema import create_timescale_schema_from_config
+from .telemetry_ingestion import TelemetryIngestionService
+from .analytics_service import AnalyticsService
 
 
 class Application:
@@ -36,6 +40,11 @@ class Application:
         self.data_sync_service: Optional[DataSyncService] = None
         self.api_server: Optional[APIServer] = None
         
+        # TimescaleDB components
+        self.timescale_client: Optional[TimescaleClient] = None
+        self.telemetry_ingestion_service: Optional[TelemetryIngestionService] = None
+        self.analytics_service: Optional[AnalyticsService] = None
+        
         # State
         self.running = False
         self.start_time = time.time()
@@ -50,6 +59,9 @@ class Application:
             
             # Initialize Supabase components
             await self._initialize_supabase_components()
+            
+            # Initialize TimescaleDB components
+            await self._initialize_timescale_components()
             
             # Create WebSocket server
             self.websocket_server = OCPPWebSocketServer(self.config)
@@ -79,6 +91,9 @@ class Application:
             # Start data sync service
             await self.data_sync_service.start()
             
+            # Start telemetry ingestion service
+            await self.telemetry_ingestion_service.start()
+            
             # Start WebSocket server
             self.running = True
             
@@ -102,6 +117,9 @@ class Application:
         # Stop components in reverse order
         stop_tasks = []
         
+        if self.telemetry_ingestion_service:
+            stop_tasks.append(self.telemetry_ingestion_service.stop())
+        
         if self.data_sync_service:
             stop_tasks.append(self.data_sync_service.stop())
         
@@ -113,6 +131,9 @@ class Application:
         
         if self.health_server:
             stop_tasks.append(self.health_server.stop())
+        
+        if self.timescale_client:
+            stop_tasks.append(self.timescale_client.disconnect())
         
         if self.supabase_client:
             stop_tasks.append(self.supabase_client.disconnect())
@@ -148,6 +169,37 @@ class Application:
             
         except Exception as e:
             self.logger.error(f"Failed to initialize Supabase components: {e}")
+            raise
+    
+    async def _initialize_timescale_components(self) -> None:
+        """Initialize TimescaleDB components."""
+        try:
+            # Create TimescaleDB client
+            self.timescale_client = TimescaleClient(self.config.timescale)
+            await self.timescale_client.connect()
+            
+            # Create telemetry ingestion service
+            self.telemetry_ingestion_service = TelemetryIngestionService(
+                self.config.timescale,
+                self.config.kafka
+            )
+            
+            # Create analytics service
+            self.analytics_service = AnalyticsService(self.config.timescale)
+            await self.analytics_service.initialize()
+            
+            # Initialize TimescaleDB schema if needed
+            if self.config.environment == "development":
+                try:
+                    await create_timescale_schema_from_config(self.config.timescale)
+                    self.logger.info("TimescaleDB schema initialized")
+                except Exception as e:
+                    self.logger.warning(f"TimescaleDB schema initialization failed (may already exist): {e}")
+            
+            self.logger.info("TimescaleDB components initialized successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize TimescaleDB components: {e}")
             raise
     
     def setup_signal_handlers(self) -> None:
