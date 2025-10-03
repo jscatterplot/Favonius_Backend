@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
 from .config import Config
-from .redis_enhanced import EnhancedRedisClient
+# Redis removed for simplification
 from .kafka_producer import KafkaProducer
 from .monitoring import get_logger
 
@@ -76,13 +76,12 @@ class V2XController:
     
     def __init__(
         self, 
-        redis_client: EnhancedRedisClient,
         kafka_producer: KafkaProducer,
         config: V2XControllerConfig,
         app_config: Config
     ):
         """Initialize V2X controller."""
-        self.redis_client = redis_client
+        # Redis client removed for simplification
         self.kafka_producer = kafka_producer
         self.v2x_config = config
         self.app_config = app_config
@@ -159,8 +158,7 @@ class V2XController:
             success = await self._send_setpoint_to_charger(setpoint)
             
             if success:
-                # Store in Redis
-                await self._store_setpoint_in_redis(setpoint)
+                # Redis storage removed for simplification
                 
                 # Publish event
                 await self.kafka_producer.send_event("v2x.setpoints", {
@@ -206,8 +204,7 @@ class V2XController:
                     # Remove from active setpoints
                     del self.active_setpoints[station_id]
                     
-                    # Clear from Redis
-                    await self.redis_client.client.delete(f"v2x:setpoint:{station_id}")
+                    # Redis clearing removed for simplification
                 
                 return success
             
@@ -283,42 +280,9 @@ class V2XController:
             self.logger.error(f"Failed to send setpoint to charger {setpoint.station_id}: {e}")
             return False
     
-    async def _store_setpoint_in_redis(self, setpoint: V2XSetpoint) -> None:
-        """Store setpoint in Redis."""
-        setpoint_data = {
-            "station_id": setpoint.station_id,
-            "evse_id": setpoint.evse_id,
-            "power_kw": setpoint.power_kw,
-            "mode": setpoint.mode.value,
-            "timestamp": setpoint.timestamp,
-            "duration_seconds": setpoint.duration_seconds,
-            "ramp_rate_kw_per_s": setpoint.ramp_rate_kw_per_s,
-            "constraints": json.dumps(setpoint.constraints) if setpoint.constraints else None
-        }
-        
-        await self.redis_client.client.hmset(
-            f"v2x:setpoint:{setpoint.station_id}", 
-            setpoint_data
-        )
-        await self.redis_client.client.expire(
-            f"v2x:setpoint:{setpoint.station_id}", 
-            7200  # 2 hours
-        )
+    # Redis setpoint storage removed for simplification
     
-    async def _store_pending_profile(self, station_id: str, evse_id: int, profile: Dict) -> None:
-        """Store pending charging profile to be sent."""
-        await self.redis_client.client.hmset(
-            f"v2x:pending_profile:{station_id}:{evse_id}",
-            {
-                "profile": json.dumps(profile),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "status": "pending"
-            }
-        )
-        await self.redis_client.client.expire(
-            f"v2x:pending_profile:{station_id}:{evse_id}",
-            300  # 5 minutes
-        )
+    # Redis pending profile storage removed for simplification
     
     async def _monitor_setpoints(self) -> None:
         """Monitor active setpoints and handle timeouts."""

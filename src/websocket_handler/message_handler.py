@@ -8,8 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from .config import Config
-from .redis_enhanced import EnhancedRedisClient, ChargerState, TelemetryData
-from .redis_integration import RedisIntegrationService
+# Redis removed for simplification - can be added back later
 from .kafka_producer import KafkaProducer
 from .monitoring import get_logger
 
@@ -19,14 +18,12 @@ class MessageHandler:
     
     def __init__(
         self, 
-        redis_client: EnhancedRedisClient,
         kafka_producer: KafkaProducer,
         connection_manager: 'ConnectionManager',
         config: Config
     ):
         """Initialize message handler."""
-        self.redis_client = redis_client
-        self.redis_integration = RedisIntegrationService(redis_client)
+        # Redis removed for simplification
         self.kafka_producer = kafka_producer
         self.connection_manager = connection_manager
         self.config = config
@@ -83,8 +80,7 @@ class MessageHandler:
         self, station_id: str, payload: Dict[str, Any], unique_id: str
     ) -> Dict[str, Any]:
         """Handle BootNotification message."""
-        # Use enhanced Redis integration for boot handling
-        await self.redis_integration.handle_charger_boot(station_id, payload)
+        # Redis integration removed for simplification
         
         # Publish boot event to Kafka
         event = {
@@ -115,7 +111,7 @@ class MessageHandler:
         evse_id = payload.get("evseId", 1)
         connector_id = payload.get("connectorId", 1)
         
-        # Update status in Redis
+        # Redis status update removed for simplification
         status_data = {
             "status": connector_status,
             "evse_id": evse_id,
@@ -123,8 +119,6 @@ class MessageHandler:
             "timestamp": timestamp,
             "error_code": payload.get("errorCode", "NoError"),
         }
-        
-        await self.redis_client.update_charger_status(station_id, status_data)
         
         # Publish status change event
         event = {
@@ -152,7 +146,7 @@ class MessageHandler:
         
         transaction_id = transaction_info.get("transactionId")
         
-        # Update transaction state in Redis
+        # Redis transaction update removed for simplification
         transaction_data = {
             "transaction_id": transaction_id,
             "event_type": event_type,
@@ -162,8 +156,6 @@ class MessageHandler:
             "stopped_reason": transaction_info.get("stoppedReason"),
             "remote_start_id": transaction_info.get("remoteStartId"),
         }
-        
-        await self.redis_client.update_transaction(station_id, transaction_id, transaction_data)
         
         # Handle meter values if present
         meter_values = payload.get("meterValue", [])
@@ -189,8 +181,10 @@ class MessageHandler:
         """Handle MeterValues message."""
         meter_values = payload.get("meterValue", [])
         
-        # Use enhanced Redis integration for telemetry processing
-        await self.redis_integration.handle_telemetry_update(station_id, meter_values)
+        # Redis integration removed for simplification
+        # Process meter values directly to Kafka
+        for meter_value in meter_values:
+            await self._process_meter_values(station_id, 1, meter_value)
         
         return {}  # Empty response for MeterValues
     
@@ -241,8 +235,7 @@ class MessageHandler:
             elif measurand == "Power.Factor":
                 telemetry_data["power_factor"] = float(value)
         
-        # Update real-time telemetry in Redis
-        await self.redis_client.update_telemetry(station_id, telemetry_data)
+        # Redis telemetry update removed for simplification
         
         # Send telemetry to TimescaleDB via Kafka
         telemetry_event = {
@@ -269,8 +262,7 @@ class MessageHandler:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
-        # Store EV needs in Redis for optimization engine
-        await self.redis_client.update_ev_needs(station_id, evse_id, ev_needs)
+        # Redis EV needs storage removed for simplification
         
         # Publish to optimization system
         event = {
@@ -302,7 +294,7 @@ class MessageHandler:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
-        await self.redis_client.update_ev_schedule(station_id, evse_id, schedule_data)
+        # Redis EV schedule storage removed for simplification
         
         return {"status": "Accepted"}
     
@@ -312,8 +304,7 @@ class MessageHandler:
         """Handle Heartbeat message."""
         current_time = datetime.now(timezone.utc).isoformat()
         
-        # Update last heartbeat in Redis
-        await self.redis_client.update_heartbeat(station_id, current_time)
+        # Redis heartbeat update removed for simplification
         
         return {"currentTime": current_time}
     
@@ -361,7 +352,7 @@ class MessageHandler:
                 "data": data,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            await self.redis_client.store_data_transfer(station_id, transfer_data)
+            # Redis data transfer storage removed for simplification
         
         return {
             "status": "Accepted",
@@ -395,8 +386,7 @@ class MessageHandler:
             raw_message = json.dumps(message, separators=(',', ':'))
             await connection.send(raw_message)
             
-            # Store sent profile in Redis
-            await self.redis_client.store_sent_profile(station_id, evse_id, charging_profile)
+            # Redis profile storage removed for simplification
             
             self.logger.info(f"Sent charging profile to {station_id}, EVSE {evse_id}")
             return True

@@ -7,16 +7,16 @@ from typing import Dict, Optional, Set
 from websockets.server import WebSocketServerProtocol
 
 from .config import Config
-from .redis_enhanced import EnhancedRedisClient
+# Redis removed for simplification
 from .monitoring import get_logger
 
 
 class ConnectionManager:
     """Manages WebSocket connections and message routing."""
     
-    def __init__(self, redis_client: EnhancedRedisClient, config: Config):
+    def __init__(self, config: Config):
         """Initialize connection manager."""
-        self.redis_client = redis_client
+        # Redis client removed for simplification
         self.config = config
         self.logger = get_logger(__name__)
         
@@ -61,8 +61,7 @@ class ConnectionManager:
                 "last_activity": time.time(),
             }
             
-            # Register in Redis for distributed tracking
-            await self.redis_client.register_connection(station_id, connection_id, client_ip)
+            # Redis registration removed for simplification
             
             self.logger.info(f"Registered connection {connection_id} for station {station_id} from {client_ip}")
             
@@ -87,8 +86,7 @@ class ConnectionManager:
             self.last_heartbeats.pop(station_id, None)
             stats = self.connection_stats.pop(connection_id, None)
             
-            # Unregister from Redis
-            await self.redis_client.unregister_connection(station_id)
+            # Redis unregistration removed for simplification
             
             # Log connection statistics
             if stats:
@@ -176,8 +174,7 @@ class ConnectionManager:
         success = await self.send_message_to_station(station_id, message)
         
         if success:
-            # Store sent profile for tracking
-            await self.redis_client.store_sent_profile(station_id, evse_id, charging_profile)
+            # Profile tracking removed for simplification
             self.logger.info(f"Sent charging profile to {station_id}, EVSE {evse_id}")
         
         return success
@@ -201,7 +198,7 @@ class ConnectionManager:
     async def update_heartbeat(self, station_id: str) -> None:
         """Update last heartbeat timestamp for a station."""
         self.last_heartbeats[station_id] = time.time()
-        await self.redis_client.update_heartbeat(station_id, time.time())
+        # Redis heartbeat update removed for simplification
     
     async def record_message_received(self, station_id: str, message_size: int) -> None:
         """Record statistics for received message."""
@@ -241,10 +238,7 @@ class ConnectionManager:
                     self.logger.warning(f"Connection for station {station_id} appears stale")
                     await self._mark_connection_for_cleanup(station_id)
                 
-                # Update Redis with current connection status
-                if self.station_connections:
-                    active_stations = list(self.station_connections.keys())
-                    await self.redis_client.client.sadd("connections:active", *active_stations)
+                # Redis connection status update removed for simplification
                 
                 await asyncio.sleep(30)  # Monitor every 30 seconds
                 

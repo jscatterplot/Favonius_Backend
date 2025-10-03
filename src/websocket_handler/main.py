@@ -77,9 +77,9 @@ class Application:
             )
             
             # Setup health checks after components are created
-            if hasattr(self.websocket_server, 'redis_client') and hasattr(self.websocket_server, 'kafka_producer'):
+            if hasattr(self.websocket_server, 'kafka_producer'):
                 setup_health_checks(
-                    self.websocket_server.redis_client,
+                    None,  # Redis removed
                     self.websocket_server.kafka_producer,
                     self.websocket_server.connection_manager
                 )
@@ -264,7 +264,7 @@ def main() -> None:
         # Validate configuration
         logger.info("Loading configuration...")
         logger.info(f"WebSocket server will bind to {config.websocket.host}:{config.websocket.port}")
-        logger.info(f"Redis URL: {config.redis.url}")
+        # Redis removed for simplification
         logger.info(f"Kafka brokers: {', '.join(config.kafka.brokers)}")
         logger.info(f"Environment: {config.environment}")
         

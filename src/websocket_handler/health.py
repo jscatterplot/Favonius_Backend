@@ -81,7 +81,7 @@ class HealthCheckServer:
             # Check if critical components are ready
             results = await health_checker.run_checks()
             
-            critical_checks = ["redis", "connections"]
+            critical_checks = ["connections"]  # Redis removed
             ready = all(
                 results["checks"].get(check, {}).get("status") == "healthy"
                 for check in critical_checks

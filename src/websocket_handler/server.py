@@ -16,7 +16,7 @@ from prometheus_client import Counter, Histogram, Gauge
 from .config import Config
 from .connection_manager import ConnectionManager
 from .message_handler import MessageHandler
-from .redis_enhanced import EnhancedRedisClient
+# Redis removed for simplification - can be added back later
 from .kafka_producer import KafkaProducer
 from .monitoring import setup_monitoring, get_logger
 
@@ -40,7 +40,7 @@ class OCPPWebSocketServer:
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
         self.message_handler: Optional[MessageHandler] = None
-        self.redis_client: Optional[EnhancedRedisClient] = None
+        # Redis client removed for simplification
         self.kafka_producer: Optional[KafkaProducer] = None
         
         # Server state
@@ -119,16 +119,13 @@ class OCPPWebSocketServer:
         # Cleanup components
         if self.kafka_producer:
             await self.kafka_producer.stop()
-        if self.redis_client:
-            await self.redis_client.close()
+        # Redis cleanup removed
         
         self.logger.info("WebSocket server stopped")
     
     async def _initialize_components(self) -> None:
-        """Initialize Redis, Kafka, and other components."""
-        # Initialize enhanced Redis client
-        self.redis_client = EnhancedRedisClient(self.config.redis)
-        await self.redis_client.connect()
+        """Initialize Kafka and other components."""
+        # Redis removed for simplification
         
         # Initialize Kafka producer
         self.kafka_producer = KafkaProducer(self.config.kafka)
@@ -136,13 +133,11 @@ class OCPPWebSocketServer:
         
         # Initialize connection manager
         self.connection_manager = ConnectionManager(
-            redis_client=self.redis_client,
             config=self.config
         )
         
         # Initialize message handler
         self.message_handler = MessageHandler(
-            redis_client=self.redis_client,
             kafka_producer=self.kafka_producer,
             connection_manager=self.connection_manager,
             config=self.config

@@ -33,7 +33,7 @@ Commercial and industrial facilities face increasing demand charges that can rep
 - **FR1.1**: Establish persistent WebSocket connections with OCPP 2.1 compliant chargers
 - **FR1.2**: Process BootNotification, StatusNotification, and TransactionEvent messages
 - **FR1.3**: Handle MeterValues with 30-second sampling frequency
-- **FR1.4**: Support 10,000 concurrent charger connections per server instance
+- **FR1.4**: Support 100 concurrent charger connections per server instance (simplified for initial implementation)
 - **FR1.5**: Implement exponential backoff reconnection (2s, 4s, 8s, 16s, max 60s)
 
 #### FR2: Market Data Integration
@@ -41,7 +41,7 @@ Commercial and industrial facilities face increasing demand charges that can rep
 - **FR2.2**: Subscribe to day-ahead market prices for 24-hour forecasting
 - **FR2.3**: Process fifteen-minute market (FMM) prices for near-term optimization
 - **FR2.4**: Map facility locations to nearest CAISO pricing nodes
-- **FR2.5**: Cache price data in Redis with 10-minute TTL
+- **FR2.5**: Cache price data in memory with 10-minute TTL (Redis removed for simplification)
 
 #### FR3: Telemetry Processing
 - **FR3.1**: Ingest power flow measurements (kW) with positive/negative differentiation
@@ -57,7 +57,7 @@ Commercial and industrial facilities face increasing demand charges that can rep
 - **FR4.2**: Minimize total cost function: energy costs - V2G revenue + demand charges
 - **FR4.3**: Respect vehicle departure time constraints with required SoC
 - **FR4.4**: Enforce mutual exclusion between charging and discharging states
-- **FR4.5**: Complete optimization within 800ms for 100-vehicle fleet
+- **FR4.5**: Complete optimization within 800ms for 100-vehicle fleet (simplified target)
 
 #### FR5: Constraint Management
 - **FR5.1**: Enforce minimum SoC threshold of 20% for battery health
@@ -91,12 +91,12 @@ Commercial and industrial facilities face increasing demand charges that can rep
 
 ### State Management
 
-#### FR9: Redis Real-time Cache
-- **FR9.1**: Maintain charger connection registry with server assignments
-- **FR9.2**: Store current vehicle states in hash structures
-- **FR9.3**: Implement fleet availability bitmaps for rapid queries
+#### FR9: In-Memory State Management (Redis Removed for Simplification)
+- **FR9.1**: Maintain charger connection registry in application memory
+- **FR9.2**: Store current vehicle states in local data structures
+- **FR9.3**: Implement fleet availability tracking in memory
 - **FR9.4**: Cache active charging schedules with 5-minute expiration
-- **FR9.5**: Publish state changes via Redis pub/sub channels
+- **FR9.5**: Publish state changes via Kafka events (Redis pub/sub removed)
 
 #### FR10: TimescaleDB Historical Storage
 - **FR10.1**: Create continuous aggregates for hourly energy summaries
@@ -111,7 +111,7 @@ Commercial and industrial facilities face increasing demand charges that can rep
 
 #### NFR1: Latency Specifications
 - **NFR1.1**: End-to-end decision latency < 1000ms (p99)
-- **NFR1.2**: Redis operations < 5ms (p95)
+- **NFR1.2**: In-memory operations < 5ms (p95) (Redis removed)
 - **NFR1.3**: Database writes < 50ms (p95)
 - **NFR1.4**: WebSocket message transmission < 150ms (p95)
 - **NFR1.5**: API response time < 200ms for real-time endpoints
@@ -120,7 +120,7 @@ Commercial and industrial facilities face increasing demand charges that can rep
 - **NFR2.1**: Process 1000 optimization decisions per second
 - **NFR2.2**: Ingest 100,000 telemetry points per second
 - **NFR2.3**: Handle 50 concurrent API requests per server
-- **NFR2.4**: Support 10,000 WebSocket connections per instance
+- **NFR2.4**: Support 100 WebSocket connections per instance (simplified target)
 - **NFR2.5**: Execute 1000 database transactions per second
 
 ### Reliability Requirements
@@ -134,7 +134,7 @@ Commercial and industrial facilities face increasing demand charges that can rep
 
 #### NFR4: Fault Tolerance
 - **NFR4.1**: Continue operation with single component failure
-- **NFR4.2**: Graceful degradation during Redis unavailability
+- **NFR4.2**: Graceful degradation during component unavailability (Redis removed)
 - **NFR4.3**: Circuit breaker activation after 5 consecutive failures
 - **NFR4.4**: Automatic retry with exponential backoff
 - **NFR4.5**: Dead letter queue for unprocessable messages

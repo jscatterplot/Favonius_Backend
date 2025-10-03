@@ -41,18 +41,7 @@ WEBSOCKET_ERRORS_TOTAL = Counter(
     ["error_type", "station_id"]
 )
 
-REDIS_OPERATIONS_TOTAL = Counter(
-    "redis_operations_total",
-    "Total Redis operations",
-    ["operation", "status"]
-)
-
-REDIS_OPERATION_DURATION = Histogram(
-    "redis_operation_duration_seconds",
-    "Time spent on Redis operations",
-    ["operation"],
-    buckets=[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
-)
+# Redis metrics removed for simplification
 
 KAFKA_MESSAGES_SENT_TOTAL = Counter(
     "kafka_messages_sent_total",
@@ -250,12 +239,8 @@ class PerformanceTimer:
         if self.callback:
             self.callback(self.operation_name, self.duration, exc_type is None)
         
-        # Record in metrics
-        if "redis" in self.operation_name.lower():
-            metrics_collector.record_redis_operation(
-                self.operation_name, self.duration, exc_type is None
-            )
-        elif "kafka" in self.operation_name.lower():
+        # Record in metrics (Redis removed for simplification)
+        if "kafka" in self.operation_name.lower():
             metrics_collector.record_kafka_send(
                 self.operation_name, self.duration, exc_type is None
             )
@@ -367,13 +352,7 @@ health_checker = HealthChecker()
 def setup_health_checks(redis_client, kafka_producer, connection_manager) -> None:
     """Setup standard health checks."""
     
-    # Redis health check
-    if redis_client:
-        health_checker.register_check(
-            "redis", 
-            redis_client.health_check,
-            critical=True
-        )
+    # Redis health check removed for simplification
     
     # Kafka health check  
     if kafka_producer:

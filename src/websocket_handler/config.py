@@ -5,14 +5,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
-class RedisConfig(BaseModel):
-    """Redis configuration."""
-    url: str = Field(default="redis://localhost:6379", description="Redis connection URL")
-    password: Optional[str] = Field(default=None, description="Redis password")
-    max_connections: int = Field(default=100, description="Maximum Redis connections")
-    socket_timeout: int = Field(default=5, description="Socket timeout in seconds")
-    retry_on_timeout: bool = Field(default=True, description="Retry on timeout")
-    health_check_interval: int = Field(default=30, description="Health check interval")
+# Redis configuration removed for simplification
 
 
 class KafkaConfig(BaseModel):
@@ -35,7 +28,7 @@ class WebSocketConfig(BaseModel):
     """WebSocket server configuration."""
     port: int = Field(default=9000, description="WebSocket server port")
     host: str = Field(default="0.0.0.0", description="WebSocket server host")
-    max_connections: int = Field(default=10000, description="Maximum concurrent connections")
+    max_connections: int = Field(default=100, description="Maximum concurrent connections (simplified)")
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
     message_timeout: int = Field(default=60, description="Message timeout in seconds")
     max_message_size: int = Field(default=65536, description="Maximum message size in bytes")
@@ -85,7 +78,7 @@ class MonitoringConfig(BaseModel):
 
 class Config(BaseModel):
     """Main application configuration."""
-    redis: RedisConfig = Field(default_factory=RedisConfig)
+    # Redis removed for simplification
     kafka: KafkaConfig = Field(default_factory=KafkaConfig)
     tls: TLSConfig = Field(default_factory=TLSConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
@@ -101,12 +94,7 @@ class Config(BaseModel):
     def from_env(cls) -> "Config":
         """Create configuration from environment variables."""
         return cls(
-            redis=RedisConfig(
-                url=os.getenv("REDIS_URL", "redis://localhost:6379"),
-                password=os.getenv("REDIS_PASSWORD"),
-                max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "100")),
-                socket_timeout=int(os.getenv("REDIS_SOCKET_TIMEOUT", "5")),
-            ),
+            # Redis configuration removed for simplification
             kafka=KafkaConfig(
                 brokers=os.getenv("KAFKA_BROKERS", "localhost:9092").split(","),
                 charger_events_topic=os.getenv("KAFKA_CHARGER_EVENTS_TOPIC", "charger.events"),
@@ -122,7 +110,7 @@ class Config(BaseModel):
             websocket=WebSocketConfig(
                 port=int(os.getenv("WEBSOCKET_PORT", "9000")),
                 host=os.getenv("WEBSOCKET_HOST", "0.0.0.0"),
-                max_connections=int(os.getenv("MAX_CONNECTIONS", "10000")),
+                max_connections=int(os.getenv("MAX_CONNECTIONS", "100")),
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "65536")),
