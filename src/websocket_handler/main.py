@@ -19,6 +19,8 @@ from .database_schema import create_schema_from_config
 from .timescale_client import TimescaleClient
 from .timescale_schema import create_timescale_schema_from_config
 from .analytics_service import AnalyticsService
+from .price_feeder import PriceFeederService
+from .optimization_engine import OptimizationEngine
 
 
 class Application:
@@ -42,6 +44,8 @@ class Application:
         # TimescaleDB components
         self.timescale_client: Optional[TimescaleClient] = None
         self.analytics_service: Optional[AnalyticsService] = None
+        self.price_feeder: Optional[PriceFeederService] = None
+        self.optimization_engine: Optional[OptimizationEngine] = None
         
         # State
         self.running = False
@@ -80,6 +84,9 @@ class Application:
             
             # Start data sync service
             await self.data_sync_service.start()
+
+            # Create Timescale-dependent services (price feeder, optimization)
+            await self._initialize_timescale_components()
             
             # Start WebSocket server
             self.running = True
@@ -171,6 +178,22 @@ class Application:
             # Create analytics service
             self.analytics_service = AnalyticsService(self.config.timescale)
             await self.analytics_service.initialize()
+
+            if self.config.price_feeder.enabled:
+                self.price_feeder = PriceFeederService(
+                    config=self.config.price_feeder,
+                    timescale_client=self.timescale_client
+                )
+                await self.price_feeder.start()
+
+            if self.config.optimization.enabled:
+                self.optimization_engine = OptimizationEngine(
+                    config=self.config.optimization,
+                    timescale_client=self.timescale_client,
+                    supabase_client=self.supabase_client,
+                    connection_manager=None
+                )
+                await self.optimization_engine.start()
             
             # Initialize TimescaleDB schema if needed
             if self.config.environment == "development":

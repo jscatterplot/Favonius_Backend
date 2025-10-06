@@ -1,7 +1,7 @@
 """Configuration management for OCPP WebSocket handler."""
 
 import os
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel, Field
 
 
@@ -68,6 +68,32 @@ class MonitoringConfig(BaseModel):
     health_check_port: int = Field(default=8081, description="Health check port")
 
 
+class PriceFeederConfig(BaseModel):
+    """Price feeder configuration."""
+    enabled: bool = Field(default=True, description="Enable CAISO price feeder")
+    base_url: str = Field(
+        default="https://oasis.caiso.com/oasisapi/SingleZip",
+        description="CAISO OASIS API base URL"
+    )
+    nodes: List[str] = Field(
+        default_factory=lambda: ["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"],
+        description="Pricing nodes to monitor"
+    )
+    fetch_interval_seconds: int = Field(default=900, description="Price refresh interval in seconds")
+    lookahead_hours: int = Field(default=24, description="Forecast horizon in hours")
+
+
+class OptimizationServiceConfig(BaseModel):
+    """Optimization engine configuration."""
+    enabled: bool = Field(default=True, description="Enable optimization service")
+    horizon_hours: int = Field(default=4, description="Optimization horizon in hours")
+    timestep_minutes: int = Field(default=60, description="Optimization timestep in minutes")
+    soc_minimum: float = Field(default=0.2, description="Minimum allowed state of charge (fraction)")
+    soc_target: float = Field(default=0.8, description="Target state of charge before departure")
+    charge_power_kw: float = Field(default=22.0, description="Default charge power limit in kW")
+    discharge_power_kw: float = Field(default=10.0, description="Default discharge power limit in kW")
+
+
 class Config(BaseModel):
     """Main application configuration."""
     tls: TLSConfig = Field(default_factory=TLSConfig)
@@ -75,6 +101,8 @@ class Config(BaseModel):
     timescale: TimescaleConfig = Field(default_factory=TimescaleConfig)
     supabase: SupabaseConfig = Field(default_factory=SupabaseConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    price_feeder: PriceFeederConfig = Field(default_factory=PriceFeederConfig)
+    optimization: OptimizationServiceConfig = Field(default_factory=OptimizationServiceConfig)
     
     # Environment-specific settings
     environment: str = Field(default="development", description="Environment (development/staging/production)")
@@ -133,6 +161,22 @@ class Config(BaseModel):
                 log_level=os.getenv("LOG_LEVEL", "INFO"),
                 enable_telemetry=os.getenv("ENABLE_TELEMETRY", "true").lower() == "true",
                 health_check_port=int(os.getenv("HEALTH_CHECK_PORT", "8081")),
+            ),
+            price_feeder=PriceFeederConfig(
+                enabled=os.getenv("PRICE_FEEDER_ENABLED", "true").lower() == "true",
+                base_url=os.getenv("PRICE_FEEDER_BASE_URL", "https://oasis.caiso.com/oasisapi/SingleZip"),
+                nodes=[node.strip() for node in os.getenv("PRICE_FEEDER_NODES", "TH_SP15_GEN-APND,TH_NP15_GEN-APND").split(",") if node.strip()],
+                fetch_interval_seconds=int(os.getenv("PRICE_FEEDER_FETCH_INTERVAL", "900")),
+                lookahead_hours=int(os.getenv("PRICE_FEEDER_LOOKAHEAD_HOURS", "24")),
+            ),
+            optimization=OptimizationServiceConfig(
+                enabled=os.getenv("OPTIMIZATION_ENABLED", "true").lower() == "true",
+                horizon_hours=int(os.getenv("OPTIMIZATION_HORIZON_HOURS", "4")),
+                timestep_minutes=int(os.getenv("OPTIMIZATION_TIMESTEP_MINUTES", "60")),
+                soc_minimum=float(os.getenv("OPTIMIZATION_SOC_MIN", "0.2")),
+                soc_target=float(os.getenv("OPTIMIZATION_SOC_TARGET", "0.8")),
+                charge_power_kw=float(os.getenv("OPTIMIZATION_CHARGE_POWER_KW", "22.0")),
+                discharge_power_kw=float(os.getenv("OPTIMIZATION_DISCHARGE_POWER_KW", "10.0")),
             ),
             environment=os.getenv("ENVIRONMENT", "development"),
             debug=os.getenv("DEBUG", "false").lower() == "true",

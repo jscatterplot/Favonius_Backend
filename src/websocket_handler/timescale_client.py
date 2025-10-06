@@ -140,6 +140,61 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to insert telemetry batch: {e}")
             raise
+
+    # Electricity Prices
+    async def store_electricity_prices(self, price_points: List[Dict[str, Any]]) -> None:
+        """Store electricity price points."""
+        if not price_points:
+            return
+
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.copy_records_to_table(
+                    'electricity_prices',
+                    records=[(
+                        point['time'],
+                        point['node_id'],
+                        point['market_type'],
+                        point.get('lmp_price_mwh'),
+                        point.get('energy_component_mwh'),
+                        point.get('congestion_component_mwh'),
+                        point.get('loss_component_mwh'),
+                        point.get('ghg_adder_mwh'),
+                        point.get('price_confidence'),
+                        point.get('forecast_horizon_minutes')
+                    ) for point in price_points],
+                    columns=[
+                        'time', 'node_id', 'market_type', 'lmp_price_mwh',
+                        'energy_component_mwh', 'congestion_component_mwh',
+                        'loss_component_mwh', 'ghg_adder_mwh', 'price_confidence',
+                        'forecast_horizon_minutes'
+                    ]
+                )
+
+        except Exception as e:
+            self.logger.error(f"Failed to store electricity prices: {e}")
+            raise
+
+    async def get_latest_prices(self, nodes: List[str], start: datetime) -> List[Dict[str, Any]]:
+        """Fetch price data for nodes since a given time."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                query = """
+                    SELECT time, node_id, market_type, lmp_price_mwh,
+                           energy_component_mwh, congestion_component_mwh,
+                           loss_component_mwh, ghg_adder_mwh, price_confidence,
+                           forecast_horizon_minutes
+                    FROM electricity_prices
+                    WHERE node_id = ANY($1)
+                      AND time >= $2
+                    ORDER BY time ASC
+                """
+                rows = await conn.fetch(query, nodes, start)
+                return [dict(row) for row in rows]
+
+        except Exception as e:
+            self.logger.error(f"Failed to fetch electricity prices: {e}")
+            raise
     
     async def get_telemetry_data(self, station_id: str, start_time: datetime, 
                                end_time: datetime, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -339,6 +394,24 @@ class TimescaleClient:
                 
         except Exception as e:
             self.logger.error(f"Failed to store charging schedule: {e}")
+            raise
+
+    async def get_active_charging_sessions(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        """Retrieve charging sessions within a time window."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                query = """
+                    SELECT session_id, station_id, evse_id, connector_id,
+                           start_time, end_time, energy_delivered_kwh,
+                           energy_received_kwh, start_soc_percent, end_soc_percent
+                    FROM charging_sessions
+                    WHERE (start_time <= $2 AND (end_time IS NULL OR end_time >= $1))
+                """
+                rows = await conn.fetch(query, start, end)
+                return [dict(row) for row in rows]
+
+        except Exception as e:
+            self.logger.error(f"Failed to get active charging sessions: {e}")
             raise
     
     async def update_schedule_execution(self, schedule_id: str, executed_at: datetime, 

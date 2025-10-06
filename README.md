@@ -1,15 +1,17 @@
 # EV Charging Platform - WebSocket Handler
 
-A high-performance OCPP 2.1 WebSocket handler for Vehicle-to-Grid (V2G) electric vehicle charging platform. This service manages real-time bidirectional communication with EV chargers, supporting up to 10,000 concurrent connections with sub-second response times.
+A streamlined OCPP 2.1 WebSocket handler for Vehicle-to-Grid (V2G) electric vehicle charging pilot. This service manages bidirectional communication with EV chargers, supporting up to 100 concurrent connections with sub-second response times.
 
 ## Features
 
 ### Core Functionality
 - **OCPP 2.1 Protocol Support**: Full implementation of OCPP 2.1 messages including V2X operations
-- **High Performance**: Handles 10,000+ concurrent WebSocket connections using uvloop
+- **Pilot-Scale Performance**: Optimized for up to 100 concurrent WebSocket connections using uvloop
 - **Bidirectional Charging**: V2X controller supporting multiple operation modes
-- **Real-time State Management**: Redis-based state caching with pub/sub messaging
-- **Event Streaming**: Kafka integration for telemetry and optimization data
+- **Direct Persistence**: Writes charger telemetry and state directly to TimescaleDB
+- **Supabase Integration**: REST API with authentication, user management, and analytics
+- **Price Feeder**: CAISO OASIS data ingestion with 24-hour lookahead storage
+- **Optimization Engine**: Rolling horizon schedules respecting SOC targets and energy prices
 - **Comprehensive Monitoring**: Prometheus metrics and structured logging
 
 ### V2X Operation Modes
@@ -28,29 +30,17 @@ A high-performance OCPP 2.1 WebSocket handler for Vehicle-to-Grid (V2G) electric
 ## Architecture
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   EV Chargers   │◄──►│  WebSocket       │◄──►│  Optimization   │
-│   (OCPP 2.1)    │    │  Handler         │    │  Engine (Julia) │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │      Redis       │
-                       │  (Real-time      │
-                       │   State Cache)   │
-                       └──────────────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │      Kafka       │
-                       │ (Event Streaming)│
-                       └──────────────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │   TimescaleDB    │
-                       │ (Time Series DB) │
-                       └──────────────────┘
+┌─────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│   EV Chargers   │◄──►│  WebSocket       │    │   Supabase       │
+│   (OCPP 2.1)    │    │  Handler         │    │  (User DB & API) │
+└─────────────────┘    └────────▲─────────┘    └────────▲────────┘
+                                 │                           │
+                                 ▼                           │
+                         ┌──────────────────┐                │
+                         │  TimescaleDB     │◄──────────────┘
+                         │ (Telemetry &     │
+                         │  Analytics)      │
+                         └──────────────────┘
 ```
 
 ## Quick Start
@@ -83,31 +73,7 @@ docker-compose logs -f websocket-handler
 
 ### Kubernetes (Production)
 
-1. **Deploy Redis Cluster first**:
-```bash
-# Deploy Redis cluster with high availability
-./deploy-redis.sh --type kubernetes --env production \
-  --password "secure-redis-password" \
-  --storage-class "fast-ssd"
-```
-
-2. **Deploy WebSocket Handler**:
-```bash
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml  # Edit secrets first!
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-kubectl apply -f k8s/ingress.yaml
-kubectl apply -f k8s/autoscaling.yaml
-```
-
-3. **Verify deployment**:
-```bash
-kubectl get pods -n ev-charging
-kubectl get pods -n redis-cluster
-kubectl logs -f deployment/websocket-handler -n ev-charging
-```
+> Production manifests are maintained but currently include legacy Redis/Kafka references. Update them to match the simplified architecture before deployment.
 
 ## Configuration
 
@@ -116,10 +82,8 @@ kubectl logs -f deployment/websocket-handler -n ev-charging
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `WEBSOCKET_PORT` | WebSocket server port | 9000 |
-| `MAX_CONNECTIONS` | Maximum concurrent connections | 10000 |
+| `MAX_CONNECTIONS` | Maximum concurrent connections | 100 |
 | `HEARTBEAT_INTERVAL` | Heartbeat interval (seconds) | 30 |
-| `REDIS_URL` | Redis connection URL | redis://localhost:6379 |
-| `KAFKA_BROKERS` | Kafka broker list | localhost:9092 |
 | `LOG_LEVEL` | Logging level | INFO |
 | `ENVIRONMENT` | Environment (dev/staging/prod) | development |
 
@@ -172,8 +136,7 @@ export TLS_VERIFY_CLIENT=false
 - `websocket_connections_active` - Active connection count
 - `websocket_messages_received_total` - Messages received by type
 - `websocket_message_processing_seconds` - Processing latency
-- `redis_operations_total` - Redis operation metrics
-- `kafka_messages_sent_total` - Kafka message metrics
+- `timescaledb_query_duration_seconds` - Timescale query latency (see monitoring docs)
 
 ### Structured Logging
 All logs are output in JSON format with correlation IDs for distributed tracing:

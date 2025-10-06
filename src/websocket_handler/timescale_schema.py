@@ -175,6 +175,20 @@ class TimescaleSchema:
                 forecast_horizon_minutes INTEGER
             );
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS electricity_price_forecasts (
+                time TIMESTAMPTZ NOT NULL,
+                node_id VARCHAR(100) NOT NULL,
+                market_type VARCHAR(50) NOT NULL,
+                forecast_start TIMESTAMPTZ NOT NULL,
+                forecast_end TIMESTAMPTZ NOT NULL,
+                forecast_interval_minutes INTEGER NOT NULL,
+                lmp_price_mwh DECIMAL(10,2),
+                confidence_low DECIMAL(10,2),
+                confidence_high DECIMAL(10,2),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
         
         # Grid signals table
         await conn.execute("""
@@ -229,6 +243,10 @@ class TimescaleSchema:
             SELECT create_hypertable('electricity_prices', 'time', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
+        """)
+        await conn.execute(f"""
+            SELECT create_hypertable('electricity_price_forecasts', 'time', create_default_indexes => FALSE)
+            ON CONFLICT DO NOTHING;
         """)
         
         # Create hypertable for grid signals
@@ -303,6 +321,10 @@ class TimescaleSchema:
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_prices_node 
             ON electricity_prices(node_id, time DESC);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_price_forecasts_node_time
+            ON electricity_price_forecasts (node_id, time DESC);
         """)
         
         await conn.execute("""
@@ -438,6 +460,10 @@ class TimescaleSchema:
         await conn.execute("""
             SELECT add_compression_policy('electricity_prices', INTERVAL '30 days');
         """)
+        await conn.execute("""
+            SELECT add_compression_policy('electricity_price_forecasts', INTERVAL '30 days')
+            ON CONFLICT DO NOTHING;
+        """)
         
         # Enable compression on grid signals
         await conn.execute("""
@@ -485,6 +511,15 @@ class TimescaleSchema:
         # Retention policy for vehicle telemetry
         await conn.execute(f"""
             SELECT add_retention_policy('vehicle_telemetry', INTERVAL '{self.config.retention_period}');
+        """)
+        
+        # Retention policy for electricity prices
+        await conn.execute("""
+            SELECT add_retention_policy('electricity_prices', INTERVAL '2 years');
+        """)
+        await conn.execute("""
+            SELECT add_retention_policy('electricity_price_forecasts', INTERVAL '2 years')
+            ON CONFLICT DO NOTHING;
         """)
         
         # Keep optimization decisions indefinitely for model training
