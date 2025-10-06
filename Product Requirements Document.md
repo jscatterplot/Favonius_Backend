@@ -96,7 +96,7 @@ Commercial and industrial facilities face increasing demand charges that can rep
 - **FR9.2**: Store current vehicle states in local data structures
 - **FR9.3**: Implement fleet availability tracking in memory
 - **FR9.4**: Cache active charging schedules with 5-minute expiration
-- **FR9.5**: Publish state changes via Kafka events (Redis pub/sub removed)
+- **FR9.5**: Persist critical state changes directly to TimescaleDB (event bus deferred)
 
 #### FR10: TimescaleDB Historical Storage
 - **FR10.1**: Create continuous aggregates for hourly energy summaries

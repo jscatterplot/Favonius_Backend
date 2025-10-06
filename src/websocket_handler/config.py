@@ -1,19 +1,11 @@
 """Configuration management for OCPP WebSocket handler."""
 
 import os
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
-# Redis configuration removed for simplification
-
-
-class KafkaConfig(BaseModel):
-    """Kafka configuration."""
-    brokers: List[str] = Field(default=["localhost:9092"], description="Kafka brokers")
-    charger_events_topic: str = Field(default="charger.events", description="Charger events topic")
-    optimization_commands_topic: str = Field(default="optimization.commands", description="Optimization commands topic")
-    consumer_group: str = Field(default="websocket-handler", description="Consumer group ID")
+# Redis and Kafka configuration removed for simplification
 
 
 class TLSConfig(BaseModel):
@@ -78,8 +70,6 @@ class MonitoringConfig(BaseModel):
 
 class Config(BaseModel):
     """Main application configuration."""
-    # Redis removed for simplification
-    kafka: KafkaConfig = Field(default_factory=KafkaConfig)
     tls: TLSConfig = Field(default_factory=TLSConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
     timescale: TimescaleConfig = Field(default_factory=TimescaleConfig)
@@ -94,13 +84,6 @@ class Config(BaseModel):
     def from_env(cls) -> "Config":
         """Create configuration from environment variables."""
         return cls(
-            # Redis configuration removed for simplification
-            kafka=KafkaConfig(
-                brokers=os.getenv("KAFKA_BROKERS", "localhost:9092").split(","),
-                charger_events_topic=os.getenv("KAFKA_CHARGER_EVENTS_TOPIC", "charger.events"),
-                optimization_commands_topic=os.getenv("KAFKA_OPTIMIZATION_COMMANDS_TOPIC", "optimization.commands"),
-                consumer_group=os.getenv("KAFKA_CONSUMER_GROUP", "websocket-handler"),
-            ),
             tls=TLSConfig(
                 cert_path=os.getenv("TLS_CERT_PATH"),
                 key_path=os.getenv("TLS_KEY_PATH"),

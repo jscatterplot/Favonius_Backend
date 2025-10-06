@@ -10,7 +10,7 @@ from typing import Optional
 from .config import Config
 from .server import OCPPWebSocketServer
 from .health import HealthCheckServer
-from .monitoring import setup_monitoring, setup_health_checks, get_logger
+from .monitoring import setup_monitoring, get_logger
 from .supabase_client import SupabaseClient
 from .auth_manager import AuthManager
 from .data_sync import DataSyncService
@@ -18,7 +18,6 @@ from .api_server import APIServer
 from .database_schema import create_schema_from_config
 from .timescale_client import TimescaleClient
 from .timescale_schema import create_timescale_schema_from_config
-from .telemetry_ingestion import TelemetryIngestionService
 from .analytics_service import AnalyticsService
 
 
@@ -42,7 +41,6 @@ class Application:
         
         # TimescaleDB components
         self.timescale_client: Optional[TimescaleClient] = None
-        self.telemetry_ingestion_service: Optional[TelemetryIngestionService] = None
         self.analytics_service: Optional[AnalyticsService] = None
         
         # State
@@ -64,7 +62,7 @@ class Application:
             await self._initialize_timescale_components()
             
             # Create WebSocket server
-            self.websocket_server = OCPPWebSocketServer(self.config)
+            self.websocket_server = OCPPWebSocketServer(self.config, self.timescale_client)
             
             # Create health check server
             self.health_server = HealthCheckServer(self.config.monitoring.health_check_port)
@@ -76,23 +74,12 @@ class Application:
                 self.auth_manager
             )
             
-            # Setup health checks after components are created
-            if hasattr(self.websocket_server, 'kafka_producer'):
-                setup_health_checks(
-                    None,  # Redis removed
-                    self.websocket_server.kafka_producer,
-                    self.websocket_server.connection_manager
-                )
-            
             # Start components
             await self.health_server.start()
             await self.api_server.start(port=8080)
             
             # Start data sync service
             await self.data_sync_service.start()
-            
-            # Start telemetry ingestion service
-            await self.telemetry_ingestion_service.start()
             
             # Start WebSocket server
             self.running = True
@@ -116,9 +103,6 @@ class Application:
         
         # Stop components in reverse order
         stop_tasks = []
-        
-        if self.telemetry_ingestion_service:
-            stop_tasks.append(self.telemetry_ingestion_service.stop())
         
         if self.data_sync_service:
             stop_tasks.append(self.data_sync_service.stop())
@@ -264,8 +248,6 @@ def main() -> None:
         # Validate configuration
         logger.info("Loading configuration...")
         logger.info(f"WebSocket server will bind to {config.websocket.host}:{config.websocket.port}")
-        # Redis removed for simplification
-        logger.info(f"Kafka brokers: {', '.join(config.kafka.brokers)}")
         logger.info(f"Environment: {config.environment}")
         
         if config.debug:

@@ -12,13 +12,7 @@ services:
       - "8080:8080"   # Metrics
       - "8081:8081"   # Health checks
     environment:
-      # Redis removed for simplification
-      
-      # Kafka configuration
-      KAFKA_BROKERS: kafka:9092
-      KAFKA_CHARGER_EVENTS_TOPIC: charger.events
-      KAFKA_OPTIMIZATION_COMMANDS_TOPIC: optimization.commands
-      KAFKA_CONSUMER_GROUP: websocket-handler
+      # Simplified configuration (Kafka removed)
       
       # WebSocket configuration
       WEBSOCKET_HOST: 0.0.0.0
@@ -47,8 +41,6 @@ services:
       - ./data:/app/data
       # Uncomment for TLS certificates
       # - ./certs:/app/certs:ro
-    depends_on:
-      - kafka
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/liveness"]
@@ -65,53 +57,7 @@ services:
           memory: 1G
           cpus: '0.5'
 
-  # Redis removed for simplification
-
-  # Zookeeper for Kafka
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.4.0
-    container_name: ev-zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper/data
-      - zookeeper_logs:/var/lib/zookeeper/log
-    restart: unless-stopped
-    
-  # Kafka for event streaming
-  kafka:
-    image: confluentinc/cp-kafka:7.4.0
-    container_name: ev-kafka
-    ports:
-      - "9092:9092"
-      - "9093:9093"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_EXTERNAL://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_EXTERNAL://localhost:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
-      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
-      KAFKA_LOG_RETENTION_BYTES: 1073741824  # 1GB
-      KAFKA_COMPRESSION_TYPE: snappy
-    volumes:
-      - kafka_data:/var/lib/kafka/data
-    depends_on:
-      - zookeeper
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+  # Redis and Kafka removed for simplification
 
   # TimescaleDB for time series data (optional for local dev)
   timescaledb:
@@ -204,13 +150,7 @@ services:
     profiles: ["testing"]
 
 volumes:
-  # Redis volume removed for simplification
-  kafka_data:
-    driver: local
-  zookeeper_data:
-    driver: local
-  zookeeper_logs:
-    driver: local
+  # Redis and Kafka volumes removed for simplification
   timescaledb_data:
     driver: local
   prometheus_data:

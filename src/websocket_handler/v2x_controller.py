@@ -9,8 +9,6 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
 from .config import Config
-# Redis removed for simplification
-from .kafka_producer import KafkaProducer
 from .monitoring import get_logger
 
 
@@ -76,13 +74,11 @@ class V2XController:
     
     def __init__(
         self, 
-        kafka_producer: KafkaProducer,
         config: V2XControllerConfig,
         app_config: Config
     ):
         """Initialize V2X controller."""
         # Redis client removed for simplification
-        self.kafka_producer = kafka_producer
         self.v2x_config = config
         self.app_config = app_config
         self.logger = get_logger(__name__)

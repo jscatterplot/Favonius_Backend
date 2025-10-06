@@ -43,18 +43,6 @@ WEBSOCKET_ERRORS_TOTAL = Counter(
 
 # Redis metrics removed for simplification
 
-KAFKA_MESSAGES_SENT_TOTAL = Counter(
-    "kafka_messages_sent_total",
-    "Total messages sent to Kafka",
-    ["topic", "status"]
-)
-
-KAFKA_SEND_DURATION = Histogram(
-    "kafka_send_duration_seconds", 
-    "Time spent sending messages to Kafka",
-    ["topic"],
-    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
-)
 
 APPLICATION_INFO = Info(
     "websocket_handler_info",
@@ -188,15 +176,8 @@ class MetricsCollector:
         REDIS_OPERATION_DURATION.labels(operation=operation).observe(duration)
     
     def record_kafka_send(self, topic: str, duration: float, success: bool = True) -> None:
-        """Record Kafka message send."""
-        status = "success" if success else "error"
-        
-        KAFKA_MESSAGES_SENT_TOTAL.labels(
-            topic=topic,
-            status=status
-        ).inc()
-        
-        KAFKA_SEND_DURATION.labels(topic=topic).observe(duration)
+        """Record external message send (placeholder for future use)."""
+        pass
     
     def get_connection_count(self) -> int:
         """Get current connection count."""
@@ -349,24 +330,22 @@ class HealthChecker:
 health_checker = HealthChecker()
 
 
-def setup_health_checks(redis_client, kafka_producer, connection_manager) -> None:
+def setup_health_checks(connection_manager=None, timescale_client=None) -> None:
     """Setup standard health checks."""
-    
-    # Redis health check removed for simplification
-    
-    # Kafka health check  
-    if kafka_producer:
-        health_checker.register_check(
-            "kafka",
-            kafka_producer.health_check, 
-            critical=False
-        )
     
     # Connection manager health check
     if connection_manager:
         health_checker.register_check(
             "connections",
             connection_manager.get_health_status,
+            critical=True
+        )
+    
+    # TimescaleDB health check
+    if timescale_client:
+        health_checker.register_check(
+            "timescale",
+            timescale_client.health_check,
             critical=True
         )
     

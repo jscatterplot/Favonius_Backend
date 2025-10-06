@@ -8,9 +8,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from .config import Config
-# Redis removed for simplification - can be added back later
-from .kafka_producer import KafkaProducer
 from .monitoring import get_logger
+from .timescale_client import TimescaleClient
 
 
 class MessageHandler:
@@ -18,15 +17,15 @@ class MessageHandler:
     
     def __init__(
         self, 
-        kafka_producer: KafkaProducer,
         connection_manager: 'ConnectionManager',
-        config: Config
+        config: Config,
+        timescale_client: TimescaleClient
     ):
         """Initialize message handler."""
         # Redis removed for simplification
-        self.kafka_producer = kafka_producer
         self.connection_manager = connection_manager
         self.config = config
+        self.timescale_client = timescale_client
         self.logger = get_logger(__name__)
         
         # Message handlers mapping
@@ -82,15 +81,6 @@ class MessageHandler:
         """Handle BootNotification message."""
         # Redis integration removed for simplification
         
-        # Publish boot event to Kafka
-        event = {
-            "event_type": "station_boot",
-            "station_id": station_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": payload.get("chargingStation", {})
-        }
-        await self.kafka_producer.send_event("charger.events", event)
-        
         # Response
         return {
             "status": "Accepted",
@@ -119,19 +109,6 @@ class MessageHandler:
             "timestamp": timestamp,
             "error_code": payload.get("errorCode", "NoError"),
         }
-        
-        # Publish status change event
-        event = {
-            "event_type": "status_change",
-            "station_id": station_id,
-            "evse_id": evse_id,
-            "connector_id": connector_id,
-            "timestamp": timestamp,
-            "old_status": None,  # Would need to get from previous state
-            "new_status": connector_status,
-            "error_code": payload.get("errorCode")
-        }
-        await self.kafka_producer.send_event("charger.events", event)
         
         return {}  # Empty response for StatusNotification
     
@@ -162,17 +139,6 @@ class MessageHandler:
         for meter_value in meter_values:
             await self._process_meter_values(station_id, evse_id, meter_value, transaction_id)
         
-        # Publish transaction event
-        event = {
-            "event_type": f"transaction_{event_type.lower()}",
-            "station_id": station_id,
-            "transaction_id": transaction_id,
-            "evse_id": evse_id,
-            "timestamp": timestamp,
-            "data": transaction_data
-        }
-        await self.kafka_producer.send_event("charger.events", event)
-        
         return {}  # Empty response for TransactionEvent
     
     async def _handle_meter_values(
@@ -181,8 +147,6 @@ class MessageHandler:
         """Handle MeterValues message."""
         meter_values = payload.get("meterValue", [])
         
-        # Redis integration removed for simplification
-        # Process meter values directly to Kafka
         for meter_value in meter_values:
             await self._process_meter_values(station_id, 1, meter_value)
         
@@ -237,14 +201,29 @@ class MessageHandler:
         
         # Redis telemetry update removed for simplification
         
-        # Send telemetry to TimescaleDB via Kafka
-        telemetry_event = {
-            "event_type": "telemetry",
-            "station_id": station_id,
-            "timestamp": timestamp,
-            "data": telemetry_data
-        }
-        await self.kafka_producer.send_event("charger.telemetry", telemetry_event)
+        # Write telemetry directly to TimescaleDB
+        try:
+            await self.timescale_client.insert_telemetry_batch([
+                {
+                    'time': datetime.fromisoformat(timestamp.replace('Z', '+00:00')),
+                    'station_id': station_id,
+                    'evse_id': evse_id,
+                    'connector_id': meter_value.get('connectorId', 1),
+                    'session_id': transaction_id,
+                    'power_kw': telemetry_data.get('power_kw'),
+                    'energy_kwh': telemetry_data.get('energy_kwh'),
+                    'voltage_v': telemetry_data.get('voltage_v'),
+                    'current_a': telemetry_data.get('current_a'),
+                    'frequency_hz': telemetry_data.get('frequency_hz'),
+                    'soc_percent': telemetry_data.get('soc_percent'),
+                    'temperature_c': telemetry_data.get('temperature_c'),
+                    'grid_frequency_mhz': telemetry_data.get('grid_frequency_mhz'),
+                    'reactive_power_kvar': telemetry_data.get('reactive_power_kvar'),
+                    'power_factor': telemetry_data.get('power_factor')
+                }
+            ])
+        except Exception as e:
+            self.logger.error(f"Failed to write telemetry to TimescaleDB: {e}")
     
     async def _handle_ev_charging_needs(
         self, station_id: str, payload: Dict[str, Any], unique_id: str
@@ -263,16 +242,6 @@ class MessageHandler:
         }
         
         # Redis EV needs storage removed for simplification
-        
-        # Publish to optimization system
-        event = {
-            "event_type": "ev_charging_needs",
-            "station_id": station_id,
-            "evse_id": evse_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": ev_needs
-        }
-        await self.kafka_producer.send_event("optimization.inputs", event)
         
         return {"status": "Accepted"}
     
@@ -409,6 +378,4 @@ class MessageHandler:
             "success": response is not None,
         }
         
-        # Don't send full payload for high-frequency messages to reduce noise
-        if action not in ["MeterValues", "Heartbeat"]:
-            await self.kafka_producer.send_event("system.events", event)
+        # No external event bus in simplified architecture

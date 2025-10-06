@@ -16,9 +16,8 @@ from prometheus_client import Counter, Histogram, Gauge
 from .config import Config
 from .connection_manager import ConnectionManager
 from .message_handler import MessageHandler
-# Redis removed for simplification - can be added back later
-from .kafka_producer import KafkaProducer
 from .monitoring import setup_monitoring, get_logger
+from .timescale_client import TimescaleClient
 
 
 # Prometheus metrics
@@ -32,16 +31,15 @@ ERRORS_TOTAL = Counter("websocket_errors_total", "Total WebSocket errors", ["err
 class OCPPWebSocketServer:
     """High-performance OCPP 2.1 WebSocket server."""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, timescale_client: TimescaleClient):
         """Initialize the WebSocket server."""
         self.config = config
         self.logger = get_logger(__name__)
+        self.timescale_client = timescale_client
         
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
         self.message_handler: Optional[MessageHandler] = None
-        # Redis client removed for simplification
-        self.kafka_producer: Optional[KafkaProducer] = None
         
         # Server state
         self.server: Optional[websockets.WebSocketServer] = None
@@ -116,21 +114,10 @@ class OCPPWebSocketServer:
             self.server.close()
             await self.server.wait_closed()
         
-        # Cleanup components
-        if self.kafka_producer:
-            await self.kafka_producer.stop()
-        # Redis cleanup removed
-        
         self.logger.info("WebSocket server stopped")
     
     async def _initialize_components(self) -> None:
-        """Initialize Kafka and other components."""
-        # Redis removed for simplification
-        
-        # Initialize Kafka producer
-        self.kafka_producer = KafkaProducer(self.config.kafka)
-        await self.kafka_producer.start()
-        
+        """Initialize core components."""
         # Initialize connection manager
         self.connection_manager = ConnectionManager(
             config=self.config
@@ -138,9 +125,9 @@ class OCPPWebSocketServer:
         
         # Initialize message handler
         self.message_handler = MessageHandler(
-            kafka_producer=self.kafka_producer,
             connection_manager=self.connection_manager,
-            config=self.config
+            config=self.config,
+            timescale_client=self.timescale_client
         )
     
     def _setup_ssl_context(self) -> Optional[ssl.SSLContext]:
