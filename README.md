@@ -1,300 +1,148 @@
 # EV Charging Platform - WebSocket Handler
 
-A streamlined OCPP 2.1 WebSocket handler for Vehicle-to-Grid (V2G) electric vehicle charging pilot. This service manages bidirectional communication with EV chargers, supporting up to 100 concurrent connections with sub-second response times.
+A streamlined OCPP 2.1 WebSocket handler for Vehicle-to-Grid (V2G) pilots. The service maintains bidirectional communication with EV chargers, persists telemetry to TimescaleDB, synchronises user-facing data via Supabase, ingests market prices, and generates charging/discharging schedules.
 
 ## Features
 
 ### Core Functionality
-- **OCPP 2.1 Protocol Support**: Full implementation of OCPP 2.1 messages including V2X operations
-- **Pilot-Scale Performance**: Optimized for up to 100 concurrent WebSocket connections using uvloop
-- **Bidirectional Charging**: V2X controller supporting multiple operation modes
-- **Direct Persistence**: Writes charger telemetry and state directly to TimescaleDB
-- **Supabase Integration**: REST API with authentication, user management, and analytics
-- **Price Feeder**: CAISO OASIS data ingestion with 24-hour lookahead storage
-- **Optimization Engine**: Rolling horizon schedules respecting SOC targets and energy prices
-- **Comprehensive Monitoring**: Prometheus metrics and structured logging
+- **OCPP 2.1 Protocol Support**: Handles the primary message set required for V2X-capable chargers.
+- **Pilot-Scale Performance**: Tuned for up to 100 concurrent charger connections using `uvloop`.
+- **V2X Scheduling**: Generates and pushes charging profiles back to stations.
+- **Direct Persistence**: Telemetry and schedules are written straight to TimescaleDB.
+- **Supabase Integration**: Provides REST endpoints, authentication, and analytics for operators.
+- **CAISO Price Feeder**: Periodically fetches market prices and stores a 24-hour outlook.
+- **Optimization Loop**: Rolling-horizon scheduler that reacts to price or charger changes.
+- **Observability**: Prometheus metrics and structured JSON logging (via `monitoring.py`).
 
-### V2X Operation Modes
-- **CentralSetpoint**: Direct power control from cloud optimization
-- **LocalFrequency**: Autonomous frequency response
-- **LocalLoadBalancing**: Building-level optimization
-- **ExternalSetpoint**: Third-party EMS integration
+### Current V2X Operation Modes
+- **CentralSetpoint**: Cloud-originated power profiles dispatched via `SetChargingProfile`.
+- **LocalFrequency / LocalLoadBalancing / ExternalSetpoint**: Hooks are present in the V2X controller for future expansion.
 
-### Security & Reliability
-- TLS 1.3 support with client certificate validation
-- Rate limiting and connection management
-- Circuit breaker patterns for fault tolerance
-- Graceful degradation and automatic failover
-- Comprehensive health checks and monitoring
-
-## Architecture
+## Runtime Architecture
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│   EV Chargers   │◄──►│  WebSocket       │    │   Supabase       │
-│   (OCPP 2.1)    │    │  Handler         │    │  (User DB & API) │
-└─────────────────┘    └────────▲─────────┘    └────────▲────────┘
-                                 │                           │
-                                 ▼                           │
-                         ┌──────────────────┐                │
-                         │  TimescaleDB     │◄──────────────┘
-                         │ (Telemetry &     │
-                         │  Analytics)      │
-                         └──────────────────┘
+┌──────────────────┐       ┌────────────────────┐       ┌────────────────-────┐
+│   EV Chargers    │◄──-──►│  WebSocket Handler │──────►│ Deployment Targets  │
+│  (OCPP 2.1)      │       │  (server.py)       │       │ (SetChargingProfile)│
+└────────▲─────────┘       └─────────▲──────────┘       └─────────▲───────────┘
+         │                            │                           │
+         │ telemetry & events         │ schedules & control       │
+         ▼                            │                           │
+┌──────────────────┐      ┌───────────┴──────────┐       ┌────────────────────┐
+│ TimescaleDB      │◄──-──│  Optimization Engine │◄──────│  Price Feeder      │
+│ (telemetry,      │      │                      │       │  (CAISO OASIS)     │
+│prices, schedules)│      └───────────▲──────────┘       └────────────────────┘
+└────────▲─────────┘                  │
+         │ analytics & sync           │ Supabase REST/API
+         ▼                            ▼
+┌──────────────────┐       ┌────────────────────┐
+│ Analytics Service│◄──-──►│ Supabase Client    │
+│ REST endpoints   │       │ User/org data      │
+└──────────────────┘       └────────────────────┘
 ```
 
 ## Quick Start
 
-### Docker Compose (Development)
-
-1. **Clone and setup environment**:
+### Docker Compose (development)
+1. **Clone & configure**
 ```bash
 git clone <repository>
-cd websocket-handler
-cp .env.example .env  # Edit with your configuration
+   cd Favonius_Backend
+   cp .env.example .env  # fill in Supabase/Timescale credentials
 ```
-
-2. **Start services**:
+2. **Launch supporting services** (docker-compose provides TimescaleDB, Prometheus, Grafana, optional tools)
 ```bash
 docker-compose up -d
 ```
-
-3. **Verify deployment**:
+3. **Run the WebSocket handler**
 ```bash
-# Check WebSocket server
-curl http://localhost:8081/health
-
-# Check metrics
-curl http://localhost:8080/metrics
-
-# View logs
-docker-compose logs -f websocket-handler
+   python -m venv venv
+   source venv/bin/activate  # or venv\Scripts\activate on Windows
+   pip install -r requirements.txt
+   python -m src.websocket_handler.main
+   ```
+4. **Smoke check**
+```bash
+   curl http://localhost:8081/health   # health endpoints
+   curl http://localhost:8080/metrics  # Prometheus scrape
 ```
-
-### Kubernetes (Production)
-
-> Production manifests are maintained but currently include legacy Redis/Kafka references. Update them to match the simplified architecture before deployment.
 
 ## Configuration
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `WEBSOCKET_PORT` | WebSocket server port | 9000 |
-| `MAX_CONNECTIONS` | Maximum concurrent connections | 100 |
-| `HEARTBEAT_INTERVAL` | Heartbeat interval (seconds) | 30 |
-| `LOG_LEVEL` | Logging level | INFO |
-| `ENVIRONMENT` | Environment (dev/staging/prod) | development |
+| Variable                       | Description                                     | Default |
+|--------------------------------|-------------------------------------------------|---------|
+| `WEBSOCKET_PORT`               | OCPP server port                                | 9000    |
+| `MAX_CONNECTIONS`              | Max concurrent charger sessions                 | 100     |
+| `HEARTBEAT_INTERVAL`           | Heartbeat interval (seconds)                    | 30      |
+| `ENVIRONMENT`                  | `development`, `staging`, or `production`       | development |
+| `LOG_LEVEL`                    | Logging level (`INFO`, `DEBUG`, …)              | INFO    |
+| `SUPABASE_URL` / keys          | Supabase project credentials                    | –       |
+| `SUPABASE_DB_HOST` / creds     | Supabase Postgres details for direct access     | –       |
+| `TIMESCALE_SERVICE_URL`        | TimescaleDB connection URI                      | –       |
+| `PRICE_FEEDER_ENABLED`         | Enable CAISO price ingestion                    | true    |
+| `PRICE_FEEDER_NODES`           | CSV of CAISO nodes (e.g. `TH_SP15_GEN-APND`)    | TH_SP15_GEN-APND,TH_NP15_GEN-APND |
+| `PRICE_FEEDER_FETCH_INTERVAL`  | Price refresh interval (seconds)                | 900     |
+| `PRICE_FEEDER_LOOKAHEAD_HOURS` | Hours of price horizon                          | 24      |
+| `OPTIMIZATION_ENABLED`         | Enable schedule computation                     | true    |
+| `OPTIMIZATION_HORIZON_HOURS`   | Rolling-horizon length                          | 4       |
+| `OPTIMIZATION_TIMESTEP_MINUTES`| Decision interval length                        | 60      |
+| `OPTIMIZATION_SOC_MIN`         | Minimum allowed state-of-charge (fraction)      | 0.2     |
+| `OPTIMIZATION_SOC_TARGET`      | Target state-of-charge before departure         | 0.8     |
 
-### TLS Configuration (Optional)
+TLS-specific variables (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_VERIFY_CLIENT`) remain optional for local debugging.
 
-```bash
-# Generate self-signed certificates for testing
-openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes
+## Services & Responsibilities
 
-# Set environment variables
-export TLS_CERT_PATH=/path/to/server.crt
-export TLS_KEY_PATH=/path/to/server.key
-export TLS_VERIFY_CLIENT=false
-```
+| Module                               | Role                                                                        |
+|--------------------------------------|-----------------------------------------------------------------------------|
+| `main.py`                            | Dependency injection & lifecycle management                                 |
+| `server.py`                          | WebSocket server, connection lifecycle                                      |
+| `connection_manager.py`              | Tracks station sessions and pushes messages                                 |
+| `message_handler.py`                 | OCPP message parsing & telemetry persistence                                |
+| `timescale_client.py`                | Async access to TimescaleDB                                                 |
+| `price_feeder.py`                    | CAISO price ingestion & optimizer trigger                                   |
+| `optimization_engine.py`             | Heuristic scheduler that creates `SetChargingProfile` directives            |
+| `analytics_service.py`               | Aggregated metrics for the REST API                                         |
+| `supabase_client.py`                 | User/fleet queries for Supabase                                             |
+| `data_sync.py`                       | Periodic Timescale→Supabase summarisation                                   |
+| `monitoring.py`                      | Prometheus metrics, structured logging, health checks                       |
 
-## OCPP 2.1 Message Support
+## Development Notes
 
-### Supported Messages
-- **BootNotification**: Charger registration and capabilities
-- **StatusNotification**: Connector status updates
-- **TransactionEvent**: Charging session lifecycle
-- **MeterValues**: Real-time power and energy measurements
-- **NotifyEVChargingNeeds**: Vehicle energy requirements
-- **NotifyEVChargingSchedule**: EV proposed charging schedule
-- **Heartbeat**: Connection keep-alive
-- **Authorize**: User authentication
-- **DataTransfer**: Custom vendor messages
+- **TimescaleDB** is the primary state store. Schema creation in `timescale_schema.py` will run automatically in development mode.
+- **Supabase** provides user/org metadata. Populate it with demo data or connect to your project.
+- **Price feeder** requires outbound access to CAISO OASIS. In offline environments you may disable it via `PRICE_FEEDER_ENABLED=false`.
+- **Optimization engine** ships with a heuristic implementation. Integrate a Julia solver by adapting `optimization_engine.py` to call out to your own service and feed the results back through `ConnectionManager`.
 
-### Supported Commands
-- **SetChargingProfile**: V2G power setpoint control
-- **GetCompositeSchedule**: Current power schedule query
-- **RemoteStartTransaction**: Remote charging initiation
-- **RemoteStopTransaction**: Remote charging termination
+## Observability
 
-## API Endpoints
-
-### Health Checks
-- `GET /health` - Comprehensive health check
-- `GET /liveness` - Kubernetes liveness probe
-- `GET /readiness` - Kubernetes readiness probe
-- `GET /status` - Detailed status information
-
-### Metrics
-- `GET /metrics` - Prometheus metrics endpoint
-- `GET /metrics/summary` - Lightweight metrics summary
-
-## Monitoring & Observability
-
-### Prometheus Metrics
-- `websocket_connections_active` - Active connection count
-- `websocket_messages_received_total` - Messages received by type
-- `websocket_message_processing_seconds` - Processing latency
-- `timescaledb_query_duration_seconds` - Timescale query latency (see monitoring docs)
-
-### Structured Logging
-All logs are output in JSON format with correlation IDs for distributed tracing:
-
-```json
-{
-  "timestamp": "2024-01-15T10:30:00Z",
-  "level": "INFO",
-  "logger": "websocket_handler.server",
-  "message": "Connection established",
-  "station_id": "CS-001",
-  "connection_id": "uuid-123",
-  "client_ip": "192.168.1.100"
-}
-```
-
-## Development
-
-### Local Development Setup
-
-1. **Install dependencies**:
-```bash
-python -m venv venv
-source venv/bin/activate  # or venv\Scripts\activate on Windows
-pip install -r requirements.txt
-```
-
-2. **Start Redis and Kafka locally**:
-```bash
-docker-compose up -d redis kafka
-```
-
-3. **Run the application**:
-```bash
-export REDIS_URL=redis://localhost:6379
-export KAFKA_BROKERS=localhost:9092
-python -m src.websocket_handler.main
-```
-
-### Testing
-
-```bash
-# Run tests
-pytest tests/
-
-# Run with coverage
-pytest --cov=src tests/
-
-# Load testing
-python tests/load_test.py --connections 1000 --duration 300
-```
-
-### Code Quality
-
-```bash
-# Format code
-black src/ tests/
-isort src/ tests/
-
-# Type checking
-mypy src/
-
-# Linting
-flake8 src/ tests/
-```
-
-## Performance Tuning
-
-### System-Level Optimizations
-- Use uvloop for better async performance
-- Tune TCP parameters for high connection counts
-- Configure proper file descriptor limits
-- Use connection pooling for database connections
-
-### WebSocket Optimizations
-- Disable compression for better CPU utilization
-- Use binary message formats where possible
-- Implement proper backpressure handling
-- Monitor memory usage per connection
-
-### Redis Optimizations
-- **Enhanced Redis Client** with cluster support and atomic operations
-- **Time-series telemetry storage** with automatic retention
-- **Fleet management bitmaps** for O(1) availability queries
-- **Market data caching** with price forecasting
-- **Lua scripts** for atomic state management
-- **Redis Streams** for grid signals and event handling
-- **Connection pooling** and compression for optimal performance
-
-For detailed Redis implementation, see [REDIS_IMPLEMENTATION.md](REDIS_IMPLEMENTATION.md)
-
-## Deployment Considerations
-
-### Resource Requirements
-- **CPU**: 2-4 cores per instance
-- **Memory**: 4GB per instance (1GB per 2500 connections)
-- **Network**: 100Mbps per instance
-- **Storage**: 10GB for logs and temporary data
-
-### Scaling Guidelines
-- Scale horizontally based on connection count
-- Use session affinity for WebSocket connections
-- Monitor queue depths and processing latency
-- Consider connection draining for deployments
-
-### Security Recommendations
-- Enable TLS in production environments
-- Use client certificate authentication
-- Implement IP whitelisting where applicable
-- Regular security updates and vulnerability scanning
-- Secure secrets management (Kubernetes secrets, HashiCorp Vault)
+- **Health**: `GET /health`, `/readiness`, `/liveness` from `health.py`.
+- **Metrics**: Prometheus counters/gauges at `GET /metrics`.
+- **Logs**: JSON structured logs; configure sinks via standard logging handlers.
 
 ## Troubleshooting
 
-### Common Issues
-
-**High Memory Usage**:
-- Check connection count and message queue depths
-- Monitor for memory leaks in long-running connections
-- Verify proper message acknowledgments
-
-**Connection Drops**:
-- Check network connectivity and firewall settings
-- Verify heartbeat configuration
-- Monitor load balancer health checks
-
-**Slow Message Processing**:
-- Check Redis and Kafka latencies
-- Monitor CPU and memory utilization
-- Verify optimization engine performance
-
-### Debug Mode
-
-```bash
-export DEBUG=true
-export LOG_LEVEL=DEBUG
-python -m src.websocket_handler.main
-```
+| Issue                        | Checks                                                                    |
+|------------------------------|---------------------------------------------------------------------------|
+| Chargers fail to connect     | Verify OCPP subprotocol (`ocpp2.1`), TLS configuration, and heartbeat     |
+| Telemetry missing in DB      | Inspect `message_handler` logs, confirm Timescale credentials             |
+| Price feeder errors          | Confirm CAISO API reachability and node list formatting                   |
+| Schedules not applied        | Ensure optimization engine is enabled and `send_charging_profile` succeeds|
+| Supabase sync gaps           | Look at `data_sync.py` logs for batched upserts                           |
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes and add tests
-4. Commit your changes (`git commit -m 'Add amazing feature'`)
-5. Push to the branch (`git push origin feature/amazing-feature`)
-6. Open a Pull Request
+1. Fork the repository.
+2. Create a feature branch (`git checkout -b feature/my-change`).
+3. Make changes and add tests where feasible.
+4. Run lint/type checks (`black`, `isort`, `mypy`) and relevant pytest suites.
+5. Open a PR describing the change and its impact.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-For support and questions:
-- Create an issue in the repository
-- Contact the development team
-- Check the documentation and troubleshooting guides
+This project is licensed under the MIT License – see [LICENSE](LICENSE).
 
 ---
 
