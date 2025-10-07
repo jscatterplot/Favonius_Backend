@@ -138,24 +138,8 @@ class OptimizationEngine:
             }
             schedules.append(schedule)
             await self.timescale_client.store_charging_schedule(schedule)
-            if self.connection_manager:
-                await self.connection_manager.send_charging_profile(
-                    station_id,
-                    evse_id,
-                    {
-                        "id": schedule["profile_id"],
-                        "stackLevel": 0,
-                        "chargingProfilePurpose": "TxDefaultProfile",
-                        "chargingProfileKind": "Absolute",
-                        "chargingSchedule": {
-                            "id": schedule["profile_id"],
-                            "startSchedule": start_time.isoformat(),
-                            "duration": int((end_time - start_time).total_seconds()),
-                            "chargingRateUnit": "W",
-                            "chargingSchedulePeriod": periods,
-                        },
-                    },
-                )
+            # Note: Charging profile sending is now handled by the OCPP handler
+            # The optimization engine should trigger the profile sending through the server
 
         await self.timescale_client.store_optimization_decision(
             {

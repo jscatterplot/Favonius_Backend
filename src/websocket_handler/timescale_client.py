@@ -342,6 +342,144 @@ class TimescaleClient:
             self.logger.error(f"Failed to store optimization decision: {e}")
             raise
     
+    async def insert_station_info(self, station_info: Dict[str, Any]) -> None:
+        """Insert station information."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO station_info (
+                        station_id, serial_number, model, vendor_name, 
+                        firmware_version, modem, boot_reason, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (station_id) DO UPDATE SET
+                        serial_number = EXCLUDED.serial_number,
+                        model = EXCLUDED.model,
+                        vendor_name = EXCLUDED.vendor_name,
+                        firmware_version = EXCLUDED.firmware_version,
+                        modem = EXCLUDED.modem,
+                        boot_reason = EXCLUDED.boot_reason,
+                        timestamp = EXCLUDED.timestamp
+                """, 
+                station_info["station_id"],
+                station_info["serial_number"],
+                station_info["model"],
+                station_info["vendor_name"],
+                station_info.get("firmware_version"),
+                station_info.get("modem"),
+                station_info["boot_reason"],
+                station_info["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert station info: {e}")
+            raise
+    
+    async def insert_connector_status(self, status_data: Dict[str, Any]) -> None:
+        """Insert connector status."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO connector_status (
+                        station_id, connector_id, status, error_code, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5)
+                """,
+                status_data["station_id"],
+                status_data["connector_id"],
+                status_data["status"],
+                status_data["error_code"],
+                status_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert connector status: {e}")
+            raise
+    
+    async def insert_transaction_event(self, transaction_data: Dict[str, Any]) -> None:
+        """Insert transaction event."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO transaction_events (
+                        transaction_id, event_type, timestamp, station_id,
+                        evse_id, connector_id, charging_state, stopped_reason, remote_start_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                transaction_data["transaction_id"],
+                transaction_data["event_type"],
+                transaction_data["timestamp"],
+                transaction_data["station_id"],
+                transaction_data["evse_id"],
+                transaction_data["connector_id"],
+                transaction_data.get("charging_state"),
+                transaction_data.get("stopped_reason"),
+                transaction_data.get("remote_start_id")
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert transaction event: {e}")
+            raise
+    
+    async def insert_data_transfer(self, transfer_data: Dict[str, Any]) -> None:
+        """Insert data transfer information."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO data_transfers (
+                        station_id, vendor_id, message_id, data, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5)
+                """,
+                transfer_data["station_id"],
+                transfer_data["vendor_id"],
+                transfer_data["message_id"],
+                transfer_data.get("data"),
+                transfer_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert data transfer: {e}")
+            raise
+    
+    async def insert_ev_charging_needs(self, needs_data: Dict[str, Any]) -> None:
+        """Insert EV charging needs."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO ev_charging_needs (
+                        station_id, evse_id, requested_energy_transfer, departure_time,
+                        ac_charging_parameters, dc_charging_parameters, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                needs_data["station_id"],
+                needs_data["evse_id"],
+                needs_data.get("requested_energy_transfer"),
+                needs_data.get("departure_time"),
+                json.dumps(needs_data.get("ac_charging_parameters")) if needs_data.get("ac_charging_parameters") else None,
+                json.dumps(needs_data.get("dc_charging_parameters")) if needs_data.get("dc_charging_parameters") else None,
+                needs_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert EV charging needs: {e}")
+            raise
+    
+    async def insert_ev_charging_schedule(self, schedule_data: Dict[str, Any]) -> None:
+        """Insert EV charging schedule."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO ev_charging_schedules (
+                        station_id, evse_id, time_base, charging_schedule_period,
+                        duration, start_schedule, charging_rate_unit, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                schedule_data["station_id"],
+                schedule_data["evse_id"],
+                schedule_data["time_base"],
+                json.dumps(schedule_data.get("charging_schedule_period", [])),
+                schedule_data.get("duration"),
+                schedule_data.get("start_schedule"),
+                schedule_data.get("charging_rate_unit"),
+                schedule_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert EV charging schedule: {e}")
+            raise
+    
     async def get_optimization_decisions(self, fleet_operator_id: str, start_time: datetime,
                                        end_time: datetime) -> List[Dict[str, Any]]:
         """Get optimization decisions."""

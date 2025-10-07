@@ -1,6 +1,6 @@
 # Core WebSocket and OCPP dependencies
 websockets>=12.0
-ocpp>=0.21.0
+ocpp>=2.1.0
 uvloop>=0.19.0
 
 # Redis removed for simplification - can be added back later

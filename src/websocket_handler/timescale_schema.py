@@ -160,6 +160,95 @@ class TimescaleSchema:
             );
         """)
         
+        # Station info table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS station_info (
+                station_id VARCHAR(255) PRIMARY KEY,
+                serial_number VARCHAR(255),
+                model VARCHAR(255),
+                vendor_name VARCHAR(255),
+                firmware_version VARCHAR(255),
+                modem JSONB,
+                boot_reason VARCHAR(100),
+                timestamp TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Connector status table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS connector_status (
+                id SERIAL PRIMARY KEY,
+                station_id VARCHAR(255) NOT NULL,
+                connector_id INTEGER NOT NULL,
+                status VARCHAR(50) NOT NULL,
+                error_code VARCHAR(50),
+                timestamp TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Transaction events table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS transaction_events (
+                id SERIAL PRIMARY KEY,
+                transaction_id VARCHAR(255) NOT NULL,
+                event_type VARCHAR(50) NOT NULL,
+                timestamp TIMESTAMPTZ NOT NULL,
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                connector_id INTEGER NOT NULL,
+                charging_state VARCHAR(50),
+                stopped_reason VARCHAR(100),
+                remote_start_id VARCHAR(255),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Data transfers table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS data_transfers (
+                id SERIAL PRIMARY KEY,
+                station_id VARCHAR(255) NOT NULL,
+                vendor_id VARCHAR(255) NOT NULL,
+                message_id VARCHAR(255) NOT NULL,
+                data TEXT,
+                timestamp TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # EV charging needs table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ev_charging_needs (
+                id SERIAL PRIMARY KEY,
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                requested_energy_transfer DECIMAL(10,3),
+                departure_time TIMESTAMPTZ,
+                ac_charging_parameters JSONB,
+                dc_charging_parameters JSONB,
+                timestamp TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # EV charging schedules table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ev_charging_schedules (
+                id SERIAL PRIMARY KEY,
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                time_base TIMESTAMPTZ NOT NULL,
+                charging_schedule_period JSONB NOT NULL,
+                duration INTEGER,
+                start_schedule TIMESTAMPTZ,
+                charging_rate_unit VARCHAR(20),
+                timestamp TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
         # Electricity prices table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS electricity_prices (
