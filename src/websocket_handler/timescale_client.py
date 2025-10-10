@@ -8,6 +8,7 @@ import asyncpg
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
+from cryptography import x509
 
 from .config import TimescaleConfig
 from .monitoring import get_logger

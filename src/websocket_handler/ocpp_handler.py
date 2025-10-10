@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, List
 from ocpp.routing import on
 from ocpp.v21 import ChargePoint as OCPPChargePoint, call_result
 from ocpp.v21.enums import Action, ConnectorStatusEnumType, TransactionEventEnumType
-from ocpp.v21.datatypes import ChargingStationType, StatusInfoType
+from ocpp.v21.datatypes import ChargingStationType, StatusInfoType, IdTokenType
 from ocpp.exceptions import OCPPError, NotImplementedError, NotSupportedError
 
 from .config import Config
@@ -949,20 +949,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         
         return call_result.CustomerInformation()
 
-    @on(Action.delete_customer_information)
-    def on_delete_customer_information(self, request_id: int,
-                                     customer_certificate_id: Optional[str] = None,
-                                     id_token: Optional[IdTokenType] = None,
-                                     customer_identifier: Optional[str] = None, **kwargs):
-        """Handle DeleteCustomerInformation request."""
-        self.logger.info(f"DeleteCustomerInformation from {self.id}: {request_id}")
-        
-        # Process delete customer information request
-        asyncio.create_task(self._handle_delete_customer_information(
-            request_id, customer_certificate_id, id_token, customer_identifier
-        ))
-        
-        return call_result.DeleteCustomerInformation()
+    # Note: delete_customer_information is not supported in OCPP 2.1
     
     # ===== ASYNC HANDLERS =====
     

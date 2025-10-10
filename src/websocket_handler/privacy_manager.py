@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 
 from ocpp.v21.enums import GenericStatusEnumType, CustomerInformationStatusEnumType
-from ocpp.v21.datatypes import StatusInfoType, CustomerInformationType, IdTokenType
+from ocpp.v21.datatypes import StatusInfoType, IdTokenType
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
@@ -322,7 +322,7 @@ class PrivacyManager:
     async def _process_customer_information_request(self, station_id: str,
                                                   customer_certificate_id: Optional[str],
                                                   id_token: Optional[IdTokenType],
-                                                  customer_identifier: Optional[str]) -> CustomerInformationType:
+                                                  customer_identifier: Optional[str]) -> Dict[str, Any]:
         """Process customer information request."""
         # This would typically involve:
         # 1. Verifying customer identity
@@ -330,11 +330,11 @@ class PrivacyManager:
         # 3. Applying privacy filters
         # 4. Returning anonymized/pseudonymized data
         
-        customer_info = CustomerInformationType(
-            customer_identifier=customer_identifier or "ANONYMIZED",
-            id_token=id_token,
-            customer_certificate_id=customer_certificate_id
-        )
+        customer_info = {
+            "customer_identifier": customer_identifier or "ANONYMIZED",
+            "id_token": id_token,
+            "customer_certificate_id": customer_certificate_id
+        }
         
         return customer_info
 

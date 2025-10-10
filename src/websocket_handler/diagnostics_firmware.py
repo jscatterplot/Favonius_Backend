@@ -75,12 +75,6 @@ class EventType(Enum):
     V2G_CERTIFICATE_UPDATE_NOT_REQUIRED = "V2GCertificateUpdateNotRequired"
     V2G_CERTIFICATE_UPDATE_PENDING = "V2GCertificateUpdatePending"
     V2G_CERTIFICATE_UPDATE_IN_PROGRESS = "V2GCertificateUpdateInProgress"
-    V2G_CERTIFICATE_UPDATE_FAILED = "V2GCertificateUpdateFailed"
-    V2G_CERTIFICATE_UPDATE_SUCCESS = "V2GCertificateUpdateSuccess"
-    V2G_CERTIFICATE_UPDATE_REQUIRED = "V2GCertificateUpdateRequired"
-    V2G_CERTIFICATE_UPDATE_NOT_REQUIRED = "V2GCertificateUpdateNotRequired"
-    V2G_CERTIFICATE_UPDATE_PENDING = "V2GCertificateUpdatePending"
-    V2G_CERTIFICATE_UPDATE_IN_PROGRESS = "V2GCertificateUpdateInProgress"
 
 
 @dataclass

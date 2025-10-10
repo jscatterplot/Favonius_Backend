@@ -8,7 +8,7 @@ from enum import Enum
 from decimal import Decimal
 
 from ocpp.v21.enums import GenericStatusEnumType
-from ocpp.v21.datatypes import StatusInfoType, CostUpdatedType, CostType, SalesTariffType, SalesTariffEntryType, RelativeTimeIntervalType, ConsumedCostType, CostKindEnumType
+from ocpp.v21.datatypes import StatusInfoType, CostType, SalesTariffType, SalesTariffEntryType, TariffType, TariffEnergyType, TariffTimeType, TariffFixedType
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
@@ -187,7 +187,7 @@ class TariffManager:
 
     async def create_cost_updated_notification(self, station_id: str, transaction_id: str,
                                              evse_id: int, connector_id: int,
-                                             cost_data: Dict[str, Any]) -> CostUpdatedType:
+                                             cost_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create CostUpdated notification."""
         try:
             # Create cost breakdown
