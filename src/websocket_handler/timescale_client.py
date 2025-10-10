@@ -342,6 +342,144 @@ class TimescaleClient:
             self.logger.error(f"Failed to store optimization decision: {e}")
             raise
     
+    async def insert_station_info(self, station_info: Dict[str, Any]) -> None:
+        """Insert station information."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO station_info (
+                        station_id, serial_number, model, vendor_name, 
+                        firmware_version, modem, boot_reason, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (station_id) DO UPDATE SET
+                        serial_number = EXCLUDED.serial_number,
+                        model = EXCLUDED.model,
+                        vendor_name = EXCLUDED.vendor_name,
+                        firmware_version = EXCLUDED.firmware_version,
+                        modem = EXCLUDED.modem,
+                        boot_reason = EXCLUDED.boot_reason,
+                        timestamp = EXCLUDED.timestamp
+                """, 
+                station_info["station_id"],
+                station_info["serial_number"],
+                station_info["model"],
+                station_info["vendor_name"],
+                station_info.get("firmware_version"),
+                station_info.get("modem"),
+                station_info["boot_reason"],
+                station_info["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert station info: {e}")
+            raise
+    
+    async def insert_connector_status(self, status_data: Dict[str, Any]) -> None:
+        """Insert connector status."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO connector_status (
+                        station_id, connector_id, status, error_code, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5)
+                """,
+                status_data["station_id"],
+                status_data["connector_id"],
+                status_data["status"],
+                status_data["error_code"],
+                status_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert connector status: {e}")
+            raise
+    
+    async def insert_transaction_event(self, transaction_data: Dict[str, Any]) -> None:
+        """Insert transaction event."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO transaction_events (
+                        transaction_id, event_type, timestamp, station_id,
+                        evse_id, connector_id, charging_state, stopped_reason, remote_start_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                transaction_data["transaction_id"],
+                transaction_data["event_type"],
+                transaction_data["timestamp"],
+                transaction_data["station_id"],
+                transaction_data["evse_id"],
+                transaction_data["connector_id"],
+                transaction_data.get("charging_state"),
+                transaction_data.get("stopped_reason"),
+                transaction_data.get("remote_start_id")
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert transaction event: {e}")
+            raise
+    
+    async def insert_data_transfer(self, transfer_data: Dict[str, Any]) -> None:
+        """Insert data transfer information."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO data_transfers (
+                        station_id, vendor_id, message_id, data, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5)
+                """,
+                transfer_data["station_id"],
+                transfer_data["vendor_id"],
+                transfer_data["message_id"],
+                transfer_data.get("data"),
+                transfer_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert data transfer: {e}")
+            raise
+    
+    async def insert_ev_charging_needs(self, needs_data: Dict[str, Any]) -> None:
+        """Insert EV charging needs."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO ev_charging_needs (
+                        station_id, evse_id, requested_energy_transfer, departure_time,
+                        ac_charging_parameters, dc_charging_parameters, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                needs_data["station_id"],
+                needs_data["evse_id"],
+                needs_data.get("requested_energy_transfer"),
+                needs_data.get("departure_time"),
+                json.dumps(needs_data.get("ac_charging_parameters")) if needs_data.get("ac_charging_parameters") else None,
+                json.dumps(needs_data.get("dc_charging_parameters")) if needs_data.get("dc_charging_parameters") else None,
+                needs_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert EV charging needs: {e}")
+            raise
+    
+    async def insert_ev_charging_schedule(self, schedule_data: Dict[str, Any]) -> None:
+        """Insert EV charging schedule."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO ev_charging_schedules (
+                        station_id, evse_id, time_base, charging_schedule_period,
+                        duration, start_schedule, charging_rate_unit, timestamp
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                schedule_data["station_id"],
+                schedule_data["evse_id"],
+                schedule_data["time_base"],
+                json.dumps(schedule_data.get("charging_schedule_period", [])),
+                schedule_data.get("duration"),
+                schedule_data.get("start_schedule"),
+                schedule_data.get("charging_rate_unit"),
+                schedule_data["timestamp"]
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to insert EV charging schedule: {e}")
+            raise
+    
     async def get_optimization_decisions(self, fleet_operator_id: str, start_time: datetime,
                                        end_time: datetime) -> List[Dict[str, Any]]:
         """Get optimization decisions."""
@@ -644,3 +782,904 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to execute command: {e}")
             raise
+    
+    # ===== NEW OCPP 2.0.1 DATABASE METHODS =====
+    
+    async def create_device_component(self, station_id: str, component_name: str, instance: str) -> None:
+        """Create device component."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO device_components (station_id, component_name, instance, created_at)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (station_id, component_name, instance) DO NOTHING
+            """, station_id, component_name, instance, datetime.now(timezone.utc))
+    
+    async def get_device_variable(self, station_id: str, component_name: str, component_instance: str,
+                                variable_name: str, variable_instance: str, attribute_type: str) -> Optional[Dict[str, Any]]:
+        """Get device variable value."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT value FROM device_variables
+                WHERE station_id = $1 AND component_name = $2 AND component_instance = $3
+                AND variable_name = $4 AND variable_instance = $5 AND attribute_type = $6
+            """, station_id, component_name, component_instance, variable_name, variable_instance, attribute_type)
+            
+            return dict(row) if row else None
+    
+    async def set_device_variable(self, station_id: str, component_name: str, component_instance: str,
+                                variable_name: str, variable_instance: str, attribute_type: str, value: Any) -> None:
+        """Set device variable value."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO device_variables (
+                    station_id, component_name, component_instance, variable_name, 
+                    variable_instance, attribute_type, value, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (station_id, component_name, component_instance, variable_name, variable_instance, attribute_type)
+                DO UPDATE SET value = $7, updated_at = $8
+            """, station_id, component_name, component_instance, variable_name, 
+                variable_instance, attribute_type, str(value), datetime.now(timezone.utc))
+    
+    async def get_device_components(self, station_id: str) -> List[Dict[str, Any]]:
+        """Get device components."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT component_name, instance FROM device_components
+                WHERE station_id = $1 ORDER BY component_name, instance
+            """, station_id)
+            
+            return [dict(row) for row in rows]
+    
+    async def get_device_variables(self, station_id: str) -> List[Dict[str, Any]]:
+        """Get device variables."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT component_name, component_instance, variable_name, variable_instance,
+                       actual_value, target_value, default_value
+                FROM device_variables WHERE station_id = $1
+                ORDER BY component_name, variable_name
+            """, station_id)
+            
+            return [dict(row) for row in rows]
+    
+    async def store_device_report(self, station_id: str, request_id: int, generated_at: str,
+                                tbc: bool, seq_no: int, report_data: List[Dict[str, Any]]) -> None:
+        """Store device report."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO device_reports (
+                    station_id, request_id, generated_at, tbc, seq_no, report_data, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """, station_id, request_id, generated_at, tbc, seq_no, 
+                json.dumps(report_data), datetime.now(timezone.utc))
+    
+    async def store_charging_profile(self, profile_data: Dict[str, Any]) -> None:
+        """Store charging profile."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO charging_profiles (
+                    station_id, evse_id, profile_id, stack_level, purpose, kind,
+                    schedule, valid_from, valid_to, transaction_id, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (station_id, evse_id, profile_id)
+                DO UPDATE SET stack_level = $4, purpose = $5, kind = $6,
+                             schedule = $7, valid_from = $8, valid_to = $9,
+                             transaction_id = $10, updated_at = $11
+            """, 
+                profile_data["station_id"], profile_data["evse_id"], profile_data["profile_id"],
+                profile_data["stack_level"], profile_data["purpose"], profile_data["kind"],
+                json.dumps(profile_data["schedule"]), profile_data.get("valid_from"),
+                profile_data.get("valid_to"), profile_data.get("transaction_id"),
+                datetime.now(timezone.utc))
+    
+    async def remove_charging_profile(self, station_id: str, evse_id: int, profile_id: int) -> None:
+        """Remove charging profile."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM charging_profiles
+                WHERE station_id = $1 AND evse_id = $2 AND profile_id = $3
+            """, station_id, evse_id, profile_id)
+    
+    async def get_charging_profiles(self, station_id: str, evse_id: int,
+                                  profile_id: Optional[int] = None,
+                                  purpose: Optional[str] = None,
+                                  stack_level: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get charging profiles."""
+        async with self.pg_pool.acquire() as conn:
+            query = """
+                SELECT schedule FROM charging_profiles
+                WHERE station_id = $1 AND evse_id = $2
+            """
+            params = [station_id, evse_id]
+            
+            if profile_id is not None:
+                query += " AND profile_id = $3"
+                params.append(profile_id)
+            elif purpose is not None:
+                query += " AND purpose = $3"
+                params.append(purpose)
+            elif stack_level is not None:
+                query += " AND stack_level = $3"
+                params.append(stack_level)
+            
+            query += " ORDER BY stack_level DESC, created_at DESC"
+            
+            rows = await conn.fetch(query, *params)
+            return [{"schedule": json.loads(row["schedule"])} for row in rows]
+    
+    async def get_active_charging_profiles(self, station_id: str, evse_id: int, 
+                                         current_time: datetime) -> List[Dict[str, Any]]:
+        """Get active charging profiles."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT schedule FROM charging_profiles
+                WHERE station_id = $1 AND evse_id = $2
+                AND (valid_from IS NULL OR valid_from <= $3)
+                AND (valid_to IS NULL OR valid_to >= $3)
+                ORDER BY stack_level DESC, created_at DESC
+            """, station_id, evse_id, current_time)
+            
+            return [{"schedule": json.loads(row["schedule"])} for row in rows]
+    
+    async def store_reported_charging_profile(self, profile_data: Dict[str, Any]) -> None:
+        """Store reported charging profile."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO reported_charging_profiles (
+                    station_id, evse_id, request_id, profile, reported_at
+                ) VALUES ($1, $2, $3, $4, $5)
+            """, 
+                profile_data["station_id"], profile_data["evse_id"], 
+                profile_data["request_id"], json.dumps(profile_data["profile"]),
+                profile_data["reported_at"])
+    
+    async def store_transaction(self, transaction_data: Dict[str, Any]) -> None:
+        """Store transaction."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO transactions (
+                    station_id, transaction_id, evse_id, connector_id,
+                    id_token, id_token_type, charging_state, remote_start_id, started_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (station_id, transaction_id)
+                DO UPDATE SET charging_state = $7, updated_at = $9
+            """, 
+                transaction_data["station_id"], transaction_data["transaction_id"],
+                transaction_data["evse_id"], transaction_data["connector_id"],
+                transaction_data["id_token"], transaction_data["id_token_type"],
+                transaction_data["charging_state"], transaction_data.get("remote_start_id"),
+                transaction_data["started_at"])
+    
+    async def update_transaction(self, transaction_data: Dict[str, Any]) -> None:
+        """Update transaction."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE transactions SET
+                    charging_state = $3, stopped_reason = $4, time_spent_charging = $5,
+                    ended_at = $6, updated_at = $6
+                WHERE station_id = $1 AND transaction_id = $2
+            """, 
+                transaction_data["station_id"], transaction_data["transaction_id"],
+                transaction_data["charging_state"], transaction_data.get("stopped_reason"),
+                transaction_data.get("time_spent_charging"), transaction_data["ended_at"])
+    
+    async def get_transaction(self, station_id: str, transaction_id: str) -> Optional[Dict[str, Any]]:
+        """Get transaction."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT transaction_id, charging_state, time_spent_charging, stopped_reason,
+                       remote_start_id, evse_id, connector_id
+                FROM transactions WHERE station_id = $1 AND transaction_id = $2
+            """, station_id, transaction_id)
+            
+            return dict(row) if row else None
+    
+    async def store_transaction_event(self, event_data: Dict[str, Any]) -> None:
+        """Store transaction event."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO transaction_events (
+                    station_id, transaction_id, event_type, timestamp, charging_state,
+                    time_spent_charging, stopped_reason, remote_start_id, evse_id,
+                    connector_id, meter_value, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            """, 
+                event_data["station_id"], event_data["transaction_id"], event_data["event_type"],
+                event_data["timestamp"], event_data.get("charging_state"),
+                event_data.get("time_spent_charging"), event_data.get("stopped_reason"),
+                event_data.get("remote_start_id"), event_data.get("evse_id"),
+                event_data.get("connector_id"), json.dumps(event_data.get("meter_value", [])),
+                datetime.now(timezone.utc))
+    
+    async def get_id_token_info(self, id_token: str, token_type: str) -> Optional[Dict[str, Any]]:
+        """Get ID token information."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT cache_timeout, charging_priority, language1, language2,
+                       group_id_token, personal_message
+                FROM authorization_cache
+                WHERE id_token = $1 AND token_type = $2
+                AND expires_at > $3
+            """, id_token, token_type, datetime.now(timezone.utc))
+            
+            return dict(row) if row else None
+    
+    async def store_tariff(self, station_id: str, tariff_data: Dict[str, Any]) -> None:
+        """Store tariff."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tariffs (
+                    station_id, tariff_id, currency, tariff_element,
+                    start_date_time, end_date_time, min_price, max_price, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (station_id, tariff_id)
+                DO UPDATE SET currency = $3, tariff_element = $4,
+                             start_date_time = $5, end_date_time = $6,
+                             min_price = $7, max_price = $8, updated_at = $9
+            """, 
+                station_id, tariff_data["tariff_id"], tariff_data["currency"],
+                json.dumps(tariff_data["tariff_element"]), tariff_data.get("start_date_time"),
+                tariff_data.get("end_date_time"), tariff_data.get("min_price"),
+                tariff_data.get("max_price"), datetime.now(timezone.utc))
+    
+    async def get_tariff(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Get tariff."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT tariff_id, currency, tariff_element, start_date_time,
+                       end_date_time, min_price, max_price
+                FROM tariffs WHERE station_id = $1
+                ORDER BY created_at DESC LIMIT 1
+            """, station_id)
+            
+            if row:
+                data = dict(row)
+                data["tariff_element"] = json.loads(data["tariff_element"])
+                return data
+            
+            return None
+    
+    async def get_transaction_energy(self, station_id: str, transaction_id: str) -> Dict[str, Any]:
+        """Get transaction energy consumption."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT SUM(energy_kwh) as energy_kwh, SUM(power_kw) as power_kw
+                FROM telemetry
+                WHERE station_id = $1 AND session_id = $2
+                AND time >= (
+                    SELECT started_at FROM transactions 
+                    WHERE station_id = $1 AND transaction_id = $2
+                )
+            """, station_id, transaction_id)
+            
+            return dict(row) if row else {"energy_kwh": 0.0, "power_kw": 0.0}
+    
+    async def store_transaction_cost(self, cost_data: Dict[str, Any]) -> None:
+        """Store transaction cost."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO transaction_costs (
+                    station_id, transaction_id, total_cost, currency,
+                    cost_breakdown, calculated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (station_id, transaction_id)
+                DO UPDATE SET total_cost = $3, currency = $4,
+                             cost_breakdown = $5, calculated_at = $6
+            """, 
+                cost_data["station_id"], cost_data["transaction_id"],
+                cost_data["total_cost"], cost_data["currency"],
+                json.dumps(cost_data["cost_breakdown"]), cost_data["calculated_at"])
+    
+    async def get_evse_status(self, station_id: str, evse_id: int) -> Optional[Dict[str, Any]]:
+        """Get EVSE status."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT status FROM connector_status
+                WHERE station_id = $1 AND evse_id = $2
+                ORDER BY timestamp DESC LIMIT 1
+            """, station_id, evse_id)
+            
+            return dict(row) if row else None
+    
+    async def store_reset_request(self, reset_data: Dict[str, Any]) -> None:
+        """Store reset request."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO reset_requests (
+                    station_id, reset_type, evse_id, requested_at
+                ) VALUES ($1, $2, $3, $4)
+            """, 
+                reset_data["station_id"], reset_data["reset_type"],
+                reset_data.get("evse_id"), reset_data["requested_at"])
+    
+    async def store_availability_change(self, availability_data: Dict[str, Any]) -> None:
+        """Store availability change."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO availability_changes (
+                    station_id, evse_id, operational_status, changed_at
+                ) VALUES ($1, $2, $3, $4)
+            """, 
+                availability_data["station_id"], availability_data.get("evse_id"),
+                availability_data["operational_status"], availability_data["changed_at"])
+    
+    async def store_trigger_message(self, trigger_data: Dict[str, Any]) -> None:
+        """Store trigger message."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO trigger_messages (
+                    station_id, evse_id, requested_message, triggered_at
+                ) VALUES ($1, $2, $3, $4)
+            """, 
+                trigger_data["station_id"], trigger_data.get("evse_id"),
+                trigger_data["requested_message"], trigger_data["triggered_at"])
+    
+    async def store_unlock_connector(self, unlock_data: Dict[str, Any]) -> None:
+        """Store unlock connector request."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO unlock_connector_requests (
+                    station_id, evse_id, connector_id, unlocked_at
+                ) VALUES ($1, $2, $3, $4)
+            """, 
+                unlock_data["station_id"], unlock_data["evse_id"],
+                unlock_data["connector_id"], unlock_data["unlocked_at"])
+    
+    # ===== CERTIFICATE MANAGEMENT METHODS =====
+    
+    async def store_certificate(self, certificate_data: Dict[str, Any]) -> None:
+        """Store certificate."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO certificates (
+                    station_id, certificate_type, certificate_data, certificate_chain,
+                    issuer_name, subject_name, serial_number, valid_from, valid_to,
+                    status, installation_date, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (station_id, certificate_type, serial_number)
+                DO UPDATE SET certificate_data = $3, certificate_chain = $4,
+                             issuer_name = $5, subject_name = $6,
+                             valid_from = $8, valid_to = $9, status = $10,
+                             installation_date = $11, updated_at = $12
+            """, 
+                certificate_data["station_id"], certificate_data["certificate_type"],
+                certificate_data["certificate_data"], certificate_data["certificate_chain"],
+                certificate_data["issuer_name"], certificate_data["subject_name"],
+                certificate_data["serial_number"], certificate_data["valid_from"],
+                certificate_data["valid_to"], certificate_data["status"],
+                certificate_data["installation_date"], datetime.now(timezone.utc))
+    
+    async def get_certificate(self, station_id: str, certificate_type: str) -> Optional[Dict[str, Any]]:
+        """Get certificate."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT certificate_data, certificate_chain, issuer_name, subject_name,
+                       serial_number, valid_from, valid_to, status, installation_date
+                FROM certificates WHERE station_id = $1 AND certificate_type = $2
+                ORDER BY installation_date DESC LIMIT 1
+            """, station_id, certificate_type)
+            
+            return dict(row) if row else None
+    
+    async def count_certificates(self, station_id: str, certificate_type: str) -> int:
+        """Count certificates of a type."""
+        async with self.pg_pool.acquire() as conn:
+            count = await conn.fetchval("""
+                SELECT COUNT(*) FROM certificates
+                WHERE station_id = $1 AND certificate_type = $2
+            """, station_id, certificate_type)
+            
+            return count or 0
+    
+    async def get_installed_certificates(self, station_id: str, certificate_type: Optional[str]) -> List[Dict[str, Any]]:
+        """Get installed certificates."""
+        async with self.pg_pool.acquire() as conn:
+            if certificate_type:
+                rows = await conn.fetch("""
+                    SELECT certificate_type, certificate_data, certificate_chain,
+                           issuer_name, subject_name, serial_number, valid_from,
+                           valid_to, status, installation_date
+                    FROM certificates WHERE station_id = $1 AND certificate_type = $2
+                    ORDER BY installation_date DESC
+                """, station_id, certificate_type)
+            else:
+                rows = await conn.fetch("""
+                    SELECT certificate_type, certificate_data, certificate_chain,
+                           issuer_name, subject_name, serial_number, valid_from,
+                           valid_to, status, installation_date
+                    FROM certificates WHERE station_id = $1
+                    ORDER BY installation_date DESC
+                """, station_id)
+            
+            return [dict(row) for row in rows]
+    
+    async def find_certificate_by_hash(self, station_id: str, certificate_type: str,
+                                     hash_algorithm: str, issuer_name_hash: str,
+                                     issuer_key_hash: str, serial_number: str) -> Optional[str]:
+        """Find certificate by hash data."""
+        async with self.pg_pool.acquire() as conn:
+            certificate_id = await conn.fetchval("""
+                SELECT id FROM certificates
+                WHERE station_id = $1 AND certificate_type = $2
+                AND serial_number = $3
+                ORDER BY installation_date DESC LIMIT 1
+            """, station_id, certificate_type, serial_number)
+            
+            return str(certificate_id) if certificate_id else None
+    
+    async def delete_certificate(self, station_id: str, certificate_id: str) -> None:
+        """Delete certificate."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM certificates
+                WHERE station_id = $1 AND id = $2
+            """, station_id, certificate_id)
+    
+    # ===== SECURITY MANAGEMENT METHODS =====
+    
+    async def store_auth_token(self, token_data: Dict[str, Any]) -> None:
+        """Store authentication token."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO auth_tokens (
+                    station_id, token, token_type, expires_at, created_at
+                ) VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (station_id, token_type)
+                DO UPDATE SET token = $2, expires_at = $4, created_at = $5
+            """, 
+                token_data["station_id"], token_data["token"], token_data["token_type"],
+                token_data["expires_at"], token_data["created_at"])
+    
+    async def update_token_usage(self, station_id: str, token: str, last_used: datetime) -> None:
+        """Update token usage statistics."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE auth_tokens SET
+                    last_used = $3, usage_count = usage_count + 1
+                WHERE station_id = $1 AND token = $2
+            """, station_id, token, last_used)
+    
+    async def revoke_auth_token(self, station_id: str, revoked_at: datetime) -> None:
+        """Revoke authentication token."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE auth_tokens SET
+                    revoked_at = $2, expires_at = $2
+                WHERE station_id = $1 AND revoked_at IS NULL
+            """, station_id, revoked_at)
+    
+    async def store_security_event(self, event_data: Dict[str, Any]) -> None:
+        """Store security event."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO security_events (
+                    station_id, event_type, timestamp, tech_info, additional_info, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+            """, 
+                event_data["station_id"], event_data["event_type"], event_data["timestamp"],
+                event_data.get("tech_info"), json.dumps(event_data.get("additional_info", {})),
+                datetime.now(timezone.utc))
+    
+    async def get_security_events(self, station_id: Optional[str] = None,
+                                event_type: Optional[str] = None,
+                                start_time: Optional[datetime] = None,
+                                end_time: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """Get security events with filters."""
+        async with self.pg_pool.acquire() as conn:
+            query = "SELECT event_type, timestamp, tech_info, additional_info FROM security_events WHERE 1=1"
+            params = []
+            
+            if station_id:
+                query += " AND station_id = $" + str(len(params) + 1)
+                params.append(station_id)
+            
+            if event_type:
+                query += " AND event_type = $" + str(len(params) + 1)
+                params.append(event_type)
+            
+            if start_time:
+                query += " AND timestamp >= $" + str(len(params) + 1)
+                params.append(start_time)
+            
+            if end_time:
+                query += " AND timestamp <= $" + str(len(params) + 1)
+                params.append(end_time)
+            
+            query += " ORDER BY timestamp DESC LIMIT 1000"
+            
+            rows = await conn.fetch(query, *params)
+            return [dict(row) for row in rows]
+    
+    async def validate_api_key(self, station_id: str, api_key: str) -> bool:
+        """Validate API key."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id FROM api_keys
+                WHERE station_id = $1 AND api_key = $2 AND active = true
+                AND (expires_at IS NULL OR expires_at > $3)
+            """, station_id, api_key, datetime.now(timezone.utc))
+            
+            return row is not None
+    
+    async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
+        """Validate basic authentication credentials."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT password_hash FROM station_credentials
+                WHERE station_id = $1 AND username = $2 AND active = true
+            """, station_id, username)
+            
+            if not row:
+                return False
+            
+            # Verify password hash
+            import bcrypt
+            return bcrypt.checkpw(password.encode('utf-8'), row['password_hash'].encode('utf-8'))
+    
+    # ===== PLUG & CHARGE METHODS =====
+    
+    async def store_contract_info(self, contract_data: Dict[str, Any]) -> None:
+        """Store contract information."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO contracts (
+                    contract_id, ev_contract_id, certificate_chain, contract_certificate,
+                    valid_from, valid_to, status, energy_contract_id, tariff_id,
+                    max_power, max_energy, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (contract_id)
+                DO UPDATE SET ev_contract_id = $2, certificate_chain = $3,
+                             contract_certificate = $4, valid_from = $5, valid_to = $6,
+                             status = $7, energy_contract_id = $8, tariff_id = $9,
+                             max_power = $10, max_energy = $11, updated_at = $12
+            """, 
+                contract_data["contract_id"], contract_data["ev_contract_id"],
+                contract_data["certificate_chain"], contract_data["contract_certificate"],
+                contract_data["valid_from"], contract_data["valid_to"], contract_data["status"],
+                contract_data.get("energy_contract_id"), contract_data.get("tariff_id"),
+                contract_data.get("max_power"), contract_data.get("max_energy"),
+                datetime.now(timezone.utc))
+    
+    async def get_contract_info(self, contract_id: str) -> Optional[Dict[str, Any]]:
+        """Get contract information."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT contract_id, ev_contract_id, certificate_chain, contract_certificate,
+                       valid_from, valid_to, status, energy_contract_id, tariff_id,
+                       max_power, max_energy
+                FROM contracts WHERE contract_id = $1
+            """, contract_id)
+            
+            return dict(row) if row else None
+    
+    async def revoke_contract(self, contract_id: str, reason: str, revoked_at: datetime) -> None:
+        """Revoke contract."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE contracts SET
+                    status = 'Revoked', revoked_at = $2, revoked_reason = $3
+                WHERE contract_id = $1
+            """, contract_id, revoked_at, reason)
+    
+    async def get_trusted_root_certificates(self) -> List[x509.Certificate]:
+        """Get trusted root certificates."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT certificate_data FROM certificates
+                WHERE certificate_type = 'V2GRootCertificate' AND status = 'Valid'
+            """)
+            
+            certificates = []
+            for row in rows:
+                try:
+                    cert_bytes = base64.b64decode(row["certificate_data"])
+                    cert = x509.load_pem_x509_certificate(cert_bytes)
+                    certificates.append(cert)
+                except Exception as e:
+                    self.logger.error(f"Error loading trusted root certificate: {e}")
+            
+            return certificates
+    
+    async def get_energy_contract(self, energy_contract_id: str) -> Optional[Dict[str, Any]]:
+        """Get energy contract."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT energy_contract_id, active, valid_from, valid_to, max_power, max_energy
+                FROM energy_contracts WHERE energy_contract_id = $1
+            """, energy_contract_id)
+            
+            return dict(row) if row else None
+    
+    async def get_tariff_by_id(self, tariff_id: str) -> Optional[Dict[str, Any]]:
+        """Get tariff by ID."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT tariff_id, active, valid_from, valid_to, currency, tariff_element
+                FROM tariffs WHERE tariff_id = $1
+            """, tariff_id)
+            
+            return dict(row) if row else None
+    
+    async def get_evse_capabilities(self, station_id: str, evse_id: int) -> Optional[Dict[str, Any]]:
+        """Get EVSE capabilities."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT max_power, connector_types, supported_protocols, v2g_capable
+                FROM evse_capabilities WHERE station_id = $1 AND evse_id = $2
+            """, station_id, evse_id)
+            
+            return dict(row) if row else None
+    
+    async def get_token_balance(self, id_token: str) -> Optional[Dict[str, Any]]:
+        """Get token balance."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT balance, currency, last_updated
+                FROM token_balances WHERE id_token = $1
+            """, id_token)
+            
+            return dict(row) if row else None
+    
+    # ===== SMART CHARGING METHODS =====
+    
+    async def store_grid_constraint(self, constraint_data: Dict[str, Any]) -> None:
+        """Store grid constraint."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO grid_constraints (
+                    constraint_id, constraint_type, location, max_power, min_power,
+                    valid_from, valid_to, priority, description, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (constraint_id)
+                DO UPDATE SET constraint_type = $2, location = $3, max_power = $4,
+                             min_power = $5, valid_from = $6, valid_to = $7,
+                             priority = $8, description = $9, updated_at = $10
+            """, 
+                constraint_data["constraint_id"], constraint_data["constraint_type"],
+                constraint_data["location"], constraint_data["max_power"],
+                constraint_data["min_power"], constraint_data.get("valid_from"),
+                constraint_data.get("valid_to"), constraint_data["priority"],
+                constraint_data.get("description"), datetime.now(timezone.utc))
+    
+    async def remove_grid_constraint(self, constraint_id: str) -> None:
+        """Remove grid constraint."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM grid_constraints WHERE constraint_id = $1
+            """, constraint_id)
+    
+    async def get_active_grid_constraints(self, location: str) -> List[Dict[str, Any]]:
+        """Get active grid constraints for location."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT constraint_id, constraint_type, location, max_power, min_power,
+                       valid_from, valid_to, priority, description
+                FROM grid_constraints
+                WHERE location = $1 AND active = true
+                AND (valid_from IS NULL OR valid_from <= $2)
+                AND (valid_to IS NULL OR valid_to >= $2)
+                ORDER BY priority DESC
+            """, location, datetime.now(timezone.utc))
+            
+            return [dict(row) for row in rows]
+    
+    async def store_demand_response_event(self, event_data: Dict[str, Any]) -> None:
+        """Store demand response event."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO demand_response_events (
+                    event_id, signal, start_time, end_time, target_reduction,
+                    target_increase, affected_stations, priority, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """, 
+                event_data["event_id"], event_data["signal"], event_data["start_time"],
+                event_data["end_time"], event_data.get("target_reduction"),
+                event_data.get("target_increase"), event_data["affected_stations"],
+                event_data["priority"], datetime.now(timezone.utc))
+    
+    async def get_station_evse_ids(self, station_id: str) -> List[int]:
+        """Get all EVSE IDs for station."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT DISTINCT evse_id FROM evse_capabilities
+                WHERE station_id = $1 ORDER BY evse_id
+            """, station_id)
+            
+            return [row["evse_id"] for row in rows]
+    
+    async def get_evse_priority(self, station_id: str, evse_id: int) -> Optional[str]:
+        """Get EVSE priority."""
+        async with self.pg_pool.acquire() as conn:
+            priority = await conn.fetchval("""
+                SELECT priority FROM evse_priorities
+                WHERE station_id = $1 AND evse_id = $2
+            """, station_id, evse_id)
+            
+            return priority
+    
+    async def get_evse_price_sensitivity(self, station_id: str, evse_id: int) -> Optional[float]:
+        """Get EVSE price sensitivity."""
+        async with self.pg_pool.acquire() as conn:
+            sensitivity = await conn.fetchval("""
+                SELECT price_sensitivity FROM evse_configurations
+                WHERE station_id = $1 AND evse_id = $2
+            """, station_id, evse_id)
+            
+            return sensitivity
+    
+    async def get_current_evse_power(self, station_id: str, evse_id: int) -> Optional[float]:
+        """Get current EVSE power consumption."""
+        async with self.pg_pool.acquire() as conn:
+            power = await conn.fetchval("""
+                SELECT power_kw FROM telemetry
+                WHERE station_id = $1 AND evse_id = $2
+                ORDER BY time DESC LIMIT 1
+            """, station_id, evse_id)
+            
+            return power
+    
+    async def get_current_electricity_prices(self, station_id: str) -> Dict[str, float]:
+        """Get current electricity prices."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT current_price, forecast_prices FROM electricity_prices
+                WHERE station_id = $1
+                ORDER BY timestamp DESC LIMIT 1
+            """, station_id)
+            
+            if row:
+                return {
+                    "current": row["current_price"],
+                    "forecast": json.loads(row.get("forecast_prices", "{}"))
+                }
+            
+            return {}
+    
+    async def get_evse_v2g_capability(self, station_id: str, evse_id: int) -> Optional[bool]:
+        """Get EVSE V2G capability."""
+        async with self.pg_pool.acquire() as conn:
+            v2g_capable = await conn.fetchval("""
+                SELECT v2g_capable FROM evse_capabilities
+                WHERE station_id = $1 AND evse_id = $2
+            """, station_id, evse_id)
+            
+            return v2g_capable
+    
+    async def update_evse_power_limit(self, station_id: str, evse_id: int, multiplier: float) -> None:
+        """Update EVSE power limit."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE evse_capabilities SET
+                    current_power_limit = max_power * $3,
+                    updated_at = $4
+                WHERE station_id = $1 AND evse_id = $2
+            """, station_id, evse_id, multiplier, datetime.now(timezone.utc))
+    
+    # ===== ADVANCED METERING METHODS =====
+    
+    async def store_signed_meter_value(self, meter_data: Dict[str, Any]) -> None:
+        """Store signed meter value."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO signed_meter_values (
+                    station_id, evse_id, timestamp, sampled_value, reading_context,
+                    format, signature, signature_method, encoding_method, public_key,
+                    signed_data, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            """, 
+                meter_data["station_id"], meter_data["evse_id"], meter_data["timestamp"],
+                meter_data["sampled_value"], meter_data["reading_context"], meter_data["format"],
+                meter_data["signature"], meter_data["signature_method"], meter_data["encoding_method"],
+                meter_data["public_key"], meter_data["signed_data"], datetime.now(timezone.utc))
+    
+    async def store_energy_accounting(self, accounting_data: Dict[str, Any]) -> None:
+        """Store energy accounting."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO energy_accounting (
+                    station_id, evse_id, connector_id, transaction_id,
+                    energy_import_kwh, energy_export_kwh, reactive_energy_import_kvarh,
+                    reactive_energy_export_kvarh, start_time, end_time, billing_accuracy,
+                    created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (station_id, evse_id, connector_id, transaction_id)
+                DO UPDATE SET energy_import_kwh = $5, energy_export_kwh = $6,
+                             reactive_energy_import_kvarh = $7, reactive_energy_export_kvarh = $8,
+                             end_time = $10, billing_accuracy = $11, updated_at = $12
+            """, 
+                accounting_data["station_id"], accounting_data["evse_id"],
+                accounting_data["connector_id"], accounting_data.get("transaction_id"),
+                accounting_data["energy_import_kwh"], accounting_data["energy_export_kwh"],
+                accounting_data["reactive_energy_import_kvarh"], accounting_data["reactive_energy_export_kvarh"],
+                accounting_data["start_time"], accounting_data.get("end_time"),
+                accounting_data["billing_accuracy"], datetime.now(timezone.utc))
+    
+    async def get_energy_accounting(self, station_id: str, evse_id: int, 
+                                  transaction_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Get energy accounting."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT station_id, evse_id, connector_id, transaction_id,
+                       energy_import_kwh, energy_export_kwh, reactive_energy_import_kvarh,
+                       reactive_energy_export_kvarh, start_time, end_time, billing_accuracy
+                FROM energy_accounting
+                WHERE station_id = $1 AND evse_id = $2 AND connector_id = $3
+                AND (transaction_id = $4 OR ($4 IS NULL AND transaction_id IS NULL))
+                ORDER BY created_at DESC LIMIT 1
+            """, station_id, evse_id, 1, transaction_id)
+            
+            return dict(row) if row else None
+    
+    async def store_meter_calibration(self, calibration_data: Dict[str, Any]) -> None:
+        """Store meter calibration."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO meter_calibrations (
+                    station_id, calibration_data, calibrated_at, accuracy, created_at
+                ) VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (station_id)
+                DO UPDATE SET calibration_data = $2, calibrated_at = $3,
+                             accuracy = $4, updated_at = $5
+            """, 
+                calibration_data["station_id"], calibration_data["calibration_data"],
+                calibration_data["calibrated_at"], calibration_data["accuracy"],
+                datetime.now(timezone.utc))
+    
+    async def get_meter_calibration(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Get meter calibration."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT calibration_data, calibrated_at, accuracy
+                FROM meter_calibrations WHERE station_id = $1
+                ORDER BY calibrated_at DESC LIMIT 1
+            """, station_id)
+            
+            return dict(row) if row else None
+    
+    async def get_meter_accuracy(self, station_id: str) -> Optional[float]:
+        """Get meter accuracy."""
+        async with self.pg_pool.acquire() as conn:
+            accuracy = await conn.fetchval("""
+                SELECT accuracy FROM meter_calibrations
+                WHERE station_id = $1 ORDER BY calibrated_at DESC LIMIT 1
+            """, station_id)
+            
+            return accuracy
+    
+    async def store_power_quality_events(self, event_data: Dict[str, Any]) -> None:
+        """Store power quality events."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO power_quality_events (
+                    station_id, timestamp, events, voltage_l1, voltage_l2, voltage_l3,
+                    current_l1, current_l2, current_l3, frequency, power_factor,
+                    thd_voltage, thd_current, phase_imbalance, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            """, 
+                event_data["station_id"], event_data["timestamp"], json.dumps(event_data["events"]),
+                event_data.get("voltage_l1"), event_data.get("voltage_l2"), event_data.get("voltage_l3"),
+                event_data.get("current_l1"), event_data.get("current_l2"), event_data.get("current_l3"),
+                event_data.get("frequency"), event_data.get("power_factor"),
+                event_data.get("thd_voltage"), event_data.get("thd_current"),
+                event_data.get("phase_imbalance"), datetime.now(timezone.utc))
+    
+    async def get_power_quality_readings(self, station_id: str, start_time: datetime, 
+                                       end_time: datetime) -> List[Dict[str, Any]]:
+        """Get power quality readings."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT timestamp, events, voltage_l1, voltage_l2, voltage_l3,
+                       current_l1, current_l2, current_l3, frequency, power_factor,
+                       thd_voltage, thd_current, phase_imbalance
+                FROM power_quality_events
+                WHERE station_id = $1 AND timestamp >= $2 AND timestamp <= $3
+                ORDER BY timestamp
+            """, station_id, start_time, end_time)
+            
+            readings = []
+            for row in rows:
+                reading = dict(row)
+                reading["events"] = json.loads(reading["events"])
+                readings.append(reading)
+            
+            return readings

@@ -16,6 +16,7 @@ from prometheus_client import Counter, Histogram, Gauge
 from .config import Config
 from .connection_manager import ConnectionManager
 from .message_handler import MessageHandler
+from .ocpp_handler import EnhancedOCPPChargePoint
 from .monitoring import setup_monitoring, get_logger
 from .timescale_client import TimescaleClient
 
@@ -47,6 +48,7 @@ class OCPPWebSocketServer:
         
         # Connection tracking
         self.connections: Dict[str, WebSocketServerProtocol] = {}
+        self.charge_points: Dict[str, EnhancedOCPPChargePoint] = {}  # station_id -> charge_point
         self.station_connections: Dict[str, str] = {}  # station_id -> connection_id
         self.message_queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         
@@ -167,112 +169,43 @@ class OCPPWebSocketServer:
             ERRORS_TOTAL.labels(error_type="invalid_subprotocol").inc()
             return
         
+        # Extract station ID from path
+        station_id = path.strip("/") if path else f"station_{connection_id[:8]}"
+        
         # Store connection
         self.connections[connection_id] = websocket
+        self.station_connections[station_id] = connection_id
         CONNECTIONS_TOTAL.set(len(self.connections))
         
-        self.logger.info(f"New connection {connection_id} from {client_ip}")
+        # Create enhanced OCPP charge point
+        charge_point = EnhancedOCPPChargePoint(
+            station_id=station_id,
+            connection=websocket,
+            config=self.config,
+            timescale_client=self.timescale_client,
+            connection_manager=self.connection_manager
+        )
+        self.charge_points[station_id] = charge_point
+        
+        # Register with connection manager
+        await self.connection_manager.register_connection(
+            station_id, connection_id, client_ip, websocket
+        )
+        
+        self.logger.info(f"New connection {connection_id} from {client_ip} for station {station_id}")
         
         try:
-            await self._handle_messages(connection_id, websocket)
+            # Start the OCPP charge point
+            await charge_point.start()
         except websockets.exceptions.ConnectionClosed:
             self.logger.info(f"Connection {connection_id} closed normally")
         except Exception as e:
             self.logger.error(f"Error handling connection {connection_id}: {e}")
             ERRORS_TOTAL.labels(error_type="connection_error").inc()
         finally:
-            await self._cleanup_connection(connection_id, websocket)
+            await self._cleanup_connection(connection_id, websocket, station_id)
     
-    async def _handle_messages(self, connection_id: str, websocket: WebSocketServerProtocol) -> None:
-        """Handle incoming messages from a WebSocket connection."""
-        station_id = None
-        last_heartbeat = time.time()
-        
-        async for raw_message in websocket:
-            try:
-                # Rate limiting check
-                if not self._check_rate_limit(connection_id):
-                    self.logger.warning(f"Rate limit exceeded for connection {connection_id}")
-                    await websocket.close(1008, "Rate limit exceeded")
-                    ERRORS_TOTAL.labels(error_type="rate_limit_exceeded").inc()
-                    break
-                
-                # Parse OCPP message
-                try:
-                    message = json.loads(raw_message)
-                    if not isinstance(message, list) or len(message) < 3:
-                        raise ValueError("Invalid OCPP message format")
-                except (json.JSONDecodeError, ValueError) as e:
-                    self.logger.warning(f"Invalid message format from {connection_id}: {e}")
-                    await self._send_error(websocket, None, "FormationViolation", str(e))
-                    ERRORS_TOTAL.labels(error_type="invalid_message_format").inc()
-                    continue
-                
-                message_type_id, unique_id, action = message[:3]
-                payload = message[3] if len(message) > 3 else {}
-                
-                # Update metrics
-                MESSAGES_RECEIVED.labels(message_type=action).inc()
-                
-                # Process message
-                start_time = time.time()
-                try:
-                    # Handle boot notification to get station ID
-                    if action == "BootNotification" and not station_id:
-                        station_id = payload.get("chargingStation", {}).get("serialNumber")
-                        if station_id:
-                            self.station_connections[station_id] = connection_id
-                            await self.connection_manager.register_connection(
-                                station_id, connection_id, websocket.remote_address[0]
-                            )
-                    
-                    response = await self.message_handler.handle_message(
-                        station_id or connection_id,
-                        message_type_id,
-                        unique_id,
-                        action,
-                        payload
-                    )
-                    
-                    if response:
-                        await self._send_response(websocket, unique_id, response)
-                    
-                    last_heartbeat = time.time()
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing message {action} from {connection_id}: {e}")
-                    await self._send_error(websocket, unique_id, "InternalError", str(e))
-                    ERRORS_TOTAL.labels(error_type="message_processing_error").inc()
-                
-                # Record processing time
-                processing_time = time.time() - start_time
-                MESSAGE_PROCESSING_TIME.labels(message_type=action).observe(processing_time)
-                
-            except Exception as e:
-                self.logger.error(f"Unexpected error handling message from {connection_id}: {e}")
-                ERRORS_TOTAL.labels(error_type="unexpected_error").inc()
-                break
     
-    async def _send_response(self, websocket: WebSocketServerProtocol, unique_id: str, response: dict) -> None:
-        """Send OCPP response message."""
-        message = [3, unique_id, response]  # CALLRESULT
-        await self._send_message(websocket, message, "response")
-    
-    async def _send_error(self, websocket: WebSocketServerProtocol, unique_id: Optional[str], 
-                         error_code: str, error_description: str) -> None:
-        """Send OCPP error message."""
-        message = [4, unique_id or "", error_code, error_description, {}]  # CALLERROR
-        await self._send_message(websocket, message, "error")
-    
-    async def _send_message(self, websocket: WebSocketServerProtocol, message: list, message_type: str) -> None:
-        """Send message through WebSocket."""
-        try:
-            raw_message = json.dumps(message, separators=(',', ':'))
-            await websocket.send(raw_message)
-            MESSAGES_SENT.labels(message_type=message_type).inc()
-        except Exception as e:
-            self.logger.error(f"Failed to send message: {e}")
-            ERRORS_TOTAL.labels(error_type="send_error").inc()
     
     def _check_rate_limit(self, connection_id: str) -> bool:
         """Check if connection is within rate limits."""
@@ -292,21 +225,22 @@ class OCPPWebSocketServer:
         self.rate_limits[connection_id].append(now)
         return True
     
-    async def _cleanup_connection(self, connection_id: str, websocket: WebSocketServerProtocol) -> None:
+    async def _cleanup_connection(self, connection_id: str, websocket: WebSocketServerProtocol, station_id: str = None) -> None:
         """Cleanup connection resources."""
         # Remove from connections
         self.connections.pop(connection_id, None)
         CONNECTIONS_TOTAL.set(len(self.connections))
         
-        # Find and remove station connection
-        station_id = None
-        for sid, cid in self.station_connections.items():
-            if cid == connection_id:
-                station_id = sid
-                break
+        # Find station ID if not provided
+        if not station_id:
+            for sid, cid in self.station_connections.items():
+                if cid == connection_id:
+                    station_id = sid
+                    break
         
         if station_id:
             self.station_connections.pop(station_id, None)
+            self.charge_points.pop(station_id, None)
             if self.connection_manager:
                 await self.connection_manager.unregister_connection(station_id)
         
@@ -314,6 +248,41 @@ class OCPPWebSocketServer:
         self.rate_limits.pop(connection_id, None)
         
         self.logger.info(f"Cleaned up connection {connection_id} (station: {station_id})")
+    
+    def get_charge_point(self, station_id: str) -> Optional[EnhancedOCPPChargePoint]:
+        """Get charge point for a station."""
+        return self.charge_points.get(station_id)
+    
+    def get_all_charge_points(self) -> Dict[str, EnhancedOCPPChargePoint]:
+        """Get all charge points."""
+        return self.charge_points.copy()
+    
+    async def send_charging_profile(self, station_id: str, evse_id: int, charging_profile: Dict) -> bool:
+        """Send charging profile to a station."""
+        charge_point = self.get_charge_point(station_id)
+        if not charge_point:
+            self.logger.warning(f"No charge point found for station {station_id}")
+            return False
+        
+        return await charge_point.send_charging_profile(evse_id, charging_profile)
+    
+    async def send_der_control(self, station_id: str, der_control: Dict) -> bool:
+        """Send DER control to a station."""
+        charge_point = self.get_charge_point(station_id)
+        if not charge_point:
+            self.logger.warning(f"No charge point found for station {station_id}")
+            return False
+        
+        return await charge_point.send_der_control(der_control)
+    
+    async def clear_der_control(self, station_id: str) -> bool:
+        """Clear DER control for a station."""
+        charge_point = self.get_charge_point(station_id)
+        if not charge_point:
+            self.logger.warning(f"No charge point found for station {station_id}")
+            return False
+        
+        return await charge_point.clear_der_control()
     
     async def _close_connection_gracefully(self, websocket: WebSocketServerProtocol) -> None:
         """Close connection gracefully with proper cleanup."""
