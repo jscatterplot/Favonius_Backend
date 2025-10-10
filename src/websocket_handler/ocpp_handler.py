@@ -22,6 +22,11 @@ from .charging_profile_manager import ChargingProfileManager
 from .transaction_manager import TransactionManager
 from .certificate_manager import CertificateManager, CertificateType
 from .security_manager import SecurityManager, SecurityConfig
+from .diagnostics_firmware import DiagnosticsManager, FirmwareManager
+from .monitoring_manager import MonitoringManager
+from .display_manager import DisplayManager
+from .tariff_manager import TariffManager
+from .privacy_manager import PrivacyManager
 
 
 class EnhancedOCPPChargePoint(OCPPChargePoint):
@@ -67,6 +72,22 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Initialize security manager
         security_config = SecurityConfig()
         self.security_manager = SecurityManager(timescale_client, security_config)
+        
+        # Initialize diagnostics and firmware managers
+        self.diagnostics_manager = DiagnosticsManager(timescale_client)
+        self.firmware_manager = FirmwareManager(timescale_client)
+        
+        # Initialize monitoring manager
+        self.monitoring_manager = MonitoringManager(timescale_client)
+        
+        # Initialize display manager
+        self.display_manager = DisplayManager(timescale_client)
+        
+        # Initialize tariff manager
+        self.tariff_manager = TariffManager(timescale_client)
+        
+        # Initialize privacy manager
+        self.privacy_manager = PrivacyManager(timescale_client)
     
     @on(Action.boot_notification)
     def on_boot_notification(
@@ -92,8 +113,8 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Store in database
         asyncio.create_task(self._store_station_info())
         
-        # Initialize device model
-        asyncio.create_task(self._initialize_device_model())
+        # Initialize complete device model
+        asyncio.create_task(self._initialize_complete_device_model())
         
         return call_result.BootNotification(
             current_time=datetime.now(timezone.utc).isoformat(),
@@ -733,6 +754,216 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         
         return call_result.SecurityEventNotification()
     
+    @on(Action.get_log)
+    def on_get_log(self, log_type: str, request_id: int, retry_count: Optional[int] = None,
+                  retry_interval: Optional[int] = None, **kwargs):
+        """Handle GetLog request."""
+        self.logger.info(f"GetLog from {self.id}: {log_type}")
+        
+        # Process log request
+        asyncio.create_task(self._handle_get_log(log_type, request_id, retry_count, retry_interval))
+        
+        return call_result.GetLog()
+    
+    @on(Action.log_status_notification)
+    def on_log_status_notification(self, status: str, request_id: int, **kwargs):
+        """Handle LogStatusNotification."""
+        self.logger.info(f"LogStatusNotification from {self.id}: {status}")
+        
+        # Process log status notification
+        asyncio.create_task(self._handle_log_status_notification(status, request_id))
+        
+        return call_result.LogStatusNotification()
+    
+    @on(Action.notify_event)
+    def on_notify_event(self, event_type: str, timestamp: str, tech_info: Optional[str] = None,
+                       additional_info: Optional[Dict[str, Any]] = None, **kwargs):
+        """Handle NotifyEvent."""
+        self.logger.info(f"NotifyEvent from {self.id}: {event_type}")
+        
+        # Process notify event
+        asyncio.create_task(self._handle_notify_event(event_type, timestamp, tech_info, additional_info))
+        
+        return call_result.NotifyEvent()
+    
+    @on(Action.publish_firmware)
+    def on_publish_firmware(self, location: str, retrieve_date_time: str, request_id: int,
+                           retry_interval: Optional[int] = None, retries: Optional[int] = None,
+                           retry_back_off_random_range: Optional[int] = None,
+                           checksum: Optional[str] = None, checksum_algorithm: Optional[str] = None,
+                           signing_certificate: Optional[str] = None, signature: Optional[str] = None,
+                           signing_certificate_chain: Optional[List[str]] = None,
+                           request_start_time: Optional[str] = None,
+                           request_stop_time: Optional[str] = None, **kwargs):
+        """Handle PublishFirmware request."""
+        self.logger.info(f"PublishFirmware from {self.id}: {location}")
+        
+        # Process publish firmware request
+        asyncio.create_task(self._handle_publish_firmware(
+            location, retrieve_date_time, request_id, retry_interval, retries,
+            retry_back_off_random_range, checksum, checksum_algorithm,
+            signing_certificate, signature, signing_certificate_chain,
+            request_start_time, request_stop_time
+        ))
+        
+        return call_result.PublishFirmware()
+    
+    @on(Action.unpublish_firmware)
+    def on_unpublish_firmware(self, checksum: str, **kwargs):
+        """Handle UnpublishFirmware request."""
+        self.logger.info(f"UnpublishFirmware from {self.id}: {checksum}")
+        
+        # Process unpublish firmware request
+        asyncio.create_task(self._handle_unpublish_firmware(checksum))
+        
+        return call_result.UnpublishFirmware()
+    
+    @on(Action.update_firmware)
+    def on_update_firmware(self, location: str, retrieve_date_time: str, request_id: int,
+                          retry_interval: Optional[int] = None, retries: Optional[int] = None,
+                          retry_back_off_random_range: Optional[int] = None,
+                          checksum: Optional[str] = None, checksum_algorithm: Optional[str] = None,
+                          signing_certificate: Optional[str] = None, signature: Optional[str] = None,
+                          signing_certificate_chain: Optional[List[str]] = None,
+                          request_start_time: Optional[str] = None,
+                          request_stop_time: Optional[str] = None, **kwargs):
+        """Handle UpdateFirmware request."""
+        self.logger.info(f"UpdateFirmware from {self.id}: {location}")
+        
+        # Process update firmware request
+        asyncio.create_task(self._handle_update_firmware(
+            location, retrieve_date_time, request_id, retry_interval, retries,
+            retry_back_off_random_range, checksum, checksum_algorithm,
+            signing_certificate, signature, signing_certificate_chain,
+            request_start_time, request_stop_time
+        ))
+        
+        return call_result.UpdateFirmware()
+    
+    @on(Action.firmware_status_notification)
+    def on_firmware_status_notification(self, status: str, request_id: Optional[int] = None,
+                                      location: Optional[str] = None, **kwargs):
+        """Handle FirmwareStatusNotification."""
+        self.logger.info(f"FirmwareStatusNotification from {self.id}: {status}")
+        
+        # Process firmware status notification
+        asyncio.create_task(self._handle_firmware_status_notification(status, request_id, location))
+        
+        return call_result.FirmwareStatusNotification()
+
+    @on(Action.get_monitoring_report)
+    def on_get_monitoring_report(self, request_id: int, monitoring_base: str,
+                               monitoring_criterion: Optional[str] = None,
+                               component_name: Optional[str] = None,
+                               variable_name: Optional[str] = None, **kwargs):
+        """Handle GetMonitoringReport request."""
+        self.logger.info(f"GetMonitoringReport from {self.id}: {monitoring_base}")
+        
+        # Process monitoring report request
+        asyncio.create_task(self._handle_get_monitoring_report(
+            request_id, monitoring_base, monitoring_criterion, component_name, variable_name
+        ))
+        
+        return call_result.GetMonitoringReport()
+
+    @on(Action.set_variable_monitoring)
+    def on_set_variable_monitoring(self, component_name: str, variable_name: str,
+                                 monitoring_criterion: str, threshold: Optional[float] = None, **kwargs):
+        """Handle SetVariableMonitoring request."""
+        self.logger.info(f"SetVariableMonitoring from {self.id}: {component_name}.{variable_name}")
+        
+        # Process variable monitoring request
+        asyncio.create_task(self._handle_set_variable_monitoring(
+            component_name, variable_name, monitoring_criterion, threshold
+        ))
+        
+        return call_result.SetVariableMonitoring()
+
+    @on(Action.clear_variable_monitoring)
+    def on_clear_variable_monitoring(self, component_name: str, variable_name: str,
+                                   monitoring_criterion: str, **kwargs):
+        """Handle ClearVariableMonitoring request."""
+        self.logger.info(f"ClearVariableMonitoring from {self.id}: {component_name}.{variable_name}")
+        
+        # Process clear variable monitoring request
+        asyncio.create_task(self._handle_clear_variable_monitoring(
+            component_name, variable_name, monitoring_criterion
+        ))
+        
+        return call_result.ClearVariableMonitoring()
+
+    @on(Action.notify_monitoring_report)
+    def on_notify_monitoring_report(self, request_id: int, monitoring_base: str,
+                                  monitoring_criterion: Optional[str] = None,
+                                  component_name: Optional[str] = None,
+                                  variable_name: Optional[str] = None, **kwargs):
+        """Handle NotifyMonitoringReport notification."""
+        self.logger.info(f"NotifyMonitoringReport from {self.id}: {monitoring_base}")
+        
+        # Process monitoring report notification
+        asyncio.create_task(self._handle_notify_monitoring_report(
+            request_id, monitoring_base, monitoring_criterion, component_name, variable_name
+        ))
+        
+        return call_result.NotifyMonitoringReport()
+
+    @on(Action.set_display_message)
+    def on_set_display_message(self, message_info, evse_id: Optional[int] = None,
+                             connector_id: Optional[int] = None, **kwargs):
+        """Handle SetDisplayMessage request."""
+        self.logger.info(f"SetDisplayMessage from {self.id}: {message_info.id}")
+        
+        # Process display message request
+        asyncio.create_task(self._handle_set_display_message(
+            message_info, evse_id, connector_id
+        ))
+        
+        return call_result.SetDisplayMessage()
+
+    @on(Action.clear_display_message)
+    def on_clear_display_message(self, message_id: Optional[str] = None,
+                               evse_id: Optional[int] = None,
+                               connector_id: Optional[int] = None, **kwargs):
+        """Handle ClearDisplayMessage request."""
+        self.logger.info(f"ClearDisplayMessage from {self.id}: {message_id}")
+        
+        # Process clear display message request
+        asyncio.create_task(self._handle_clear_display_message(
+            message_id, evse_id, connector_id
+        ))
+        
+        return call_result.ClearDisplayMessage()
+
+    @on(Action.customer_information)
+    def on_customer_information(self, request_id: int,
+                              customer_certificate_id: Optional[str] = None,
+                              id_token: Optional[IdTokenType] = None,
+                              customer_identifier: Optional[str] = None, **kwargs):
+        """Handle CustomerInformation request."""
+        self.logger.info(f"CustomerInformation from {self.id}: {request_id}")
+        
+        # Process customer information request
+        asyncio.create_task(self._handle_customer_information(
+            request_id, customer_certificate_id, id_token, customer_identifier
+        ))
+        
+        return call_result.CustomerInformation()
+
+    @on(Action.delete_customer_information)
+    def on_delete_customer_information(self, request_id: int,
+                                     customer_certificate_id: Optional[str] = None,
+                                     id_token: Optional[IdTokenType] = None,
+                                     customer_identifier: Optional[str] = None, **kwargs):
+        """Handle DeleteCustomerInformation request."""
+        self.logger.info(f"DeleteCustomerInformation from {self.id}: {request_id}")
+        
+        # Process delete customer information request
+        asyncio.create_task(self._handle_delete_customer_information(
+            request_id, customer_certificate_id, id_token, customer_identifier
+        ))
+        
+        return call_result.DeleteCustomerInformation()
+    
     # ===== ASYNC HANDLERS =====
     
     async def _handle_get_variables(self, get_variable_data: list):
@@ -1010,11 +1241,11 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         except Exception as e:
             self.logger.error(f"Error handling UnlockConnector: {e}")
     
-    async def _initialize_device_model(self):
+    async def _initialize_complete_device_model(self):
         """Initialize device model for new station."""
         try:
-            await self.device_model.initialize_station_device_model(self.id, self.station_info)
-            self.logger.info(f"Initialized device model for station {self.id}")
+            await self.device_model.initialize_complete_device_model(self.id, self.station_info)
+            self.logger.info(f"Initialized complete device model for station {self.id}")
         except Exception as e:
             self.logger.error(f"Error initializing device model for {self.id}: {e}")
     
@@ -1141,3 +1372,289 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             
         except Exception as e:
             self.logger.error(f"Error handling SecurityEventNotification: {e}")
+    
+    async def _handle_get_log(self, log_type: str, request_id: int, retry_count: Optional[int],
+                            retry_interval: Optional[int]):
+        """Handle GetLog request."""
+        try:
+            from .diagnostics_firmware import LogType
+            
+            # Convert string to LogType enum
+            try:
+                log_type_enum = LogType(log_type)
+            except ValueError:
+                log_type_enum = LogType.CUSTOM_LOG
+            
+            result = await self.diagnostics_manager.get_log(
+                self.id, log_type_enum, request_id, retry_count, retry_interval
+            )
+            
+            # Send GetLogResponse
+            from ocpp.v21 import call
+            request = call.GetLogResponse(
+                status=result["status"],
+                status_info=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling GetLog: {e}")
+    
+    async def _handle_log_status_notification(self, status: str, request_id: int):
+        """Handle LogStatusNotification."""
+        try:
+            await self.diagnostics_manager.handle_log_status_notification(
+                self.id, request_id, status
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error handling LogStatusNotification: {e}")
+    
+    async def _handle_notify_event(self, event_type: str, timestamp: str, tech_info: Optional[str],
+                                 additional_info: Optional[Dict[str, Any]]):
+        """Handle NotifyEvent."""
+        try:
+            await self.diagnostics_manager.handle_notify_event(
+                self.id, event_type, timestamp, tech_info, additional_info
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error handling NotifyEvent: {e}")
+    
+    async def _handle_publish_firmware(self, location: str, retrieve_date_time: str, request_id: int,
+                                     retry_interval: Optional[int], retries: Optional[int],
+                                     retry_back_off_random_range: Optional[int],
+                                     checksum: Optional[str], checksum_algorithm: Optional[str],
+                                     signing_certificate: Optional[str], signature: Optional[str],
+                                     signing_certificate_chain: Optional[List[str]],
+                                     request_start_time: Optional[str], request_stop_time: Optional[str]):
+        """Handle PublishFirmware request."""
+        try:
+            result = await self.firmware_manager.publish_firmware(
+                self.id, location, retrieve_date_time, request_id, retry_interval, retries,
+                retry_back_off_random_range, checksum, checksum_algorithm,
+                signing_certificate, signature, signing_certificate_chain,
+                request_start_time, request_stop_time
+            )
+            
+            # Send PublishFirmwareResponse
+            from ocpp.v21 import call
+            request = call.PublishFirmwareResponse(
+                status=result["status"],
+                status_info=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling PublishFirmware: {e}")
+    
+    async def _handle_unpublish_firmware(self, checksum: str):
+        """Handle UnpublishFirmware request."""
+        try:
+            result = await self.firmware_manager.unpublish_firmware(self.id, checksum)
+            
+            # Send UnpublishFirmwareResponse
+            from ocpp.v21 import call
+            request = call.UnpublishFirmwareResponse(
+                status=result["status"],
+                status_info=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling UnpublishFirmware: {e}")
+    
+    async def _handle_update_firmware(self, location: str, retrieve_date_time: str, request_id: int,
+                                    retry_interval: Optional[int], retries: Optional[int],
+                                    retry_back_off_random_range: Optional[int],
+                                    checksum: Optional[str], checksum_algorithm: Optional[str],
+                                    signing_certificate: Optional[str], signature: Optional[str],
+                                    signing_certificate_chain: Optional[List[str]],
+                                    request_start_time: Optional[str], request_stop_time: Optional[str]):
+        """Handle UpdateFirmware request."""
+        try:
+            result = await self.firmware_manager.update_firmware(
+                self.id, location, retrieve_date_time, request_id, retry_interval, retries,
+                retry_back_off_random_range, checksum, checksum_algorithm,
+                signing_certificate, signature, signing_certificate_chain,
+                request_start_time, request_stop_time
+            )
+            
+            # Send UpdateFirmwareResponse
+            from ocpp.v21 import call
+            request = call.UpdateFirmwareResponse(
+                status=result["status"],
+                status_info=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling UpdateFirmware: {e}")
+    
+    async def _handle_firmware_status_notification(self, status: str, request_id: Optional[int],
+                                                 location: Optional[str]):
+        """Handle FirmwareStatusNotification."""
+        try:
+            await self.firmware_manager.handle_firmware_status_notification(
+                self.id, status, request_id, location
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error handling FirmwareStatusNotification: {e}")
+
+    async def _handle_get_monitoring_report(self, request_id: int, monitoring_base: str,
+                                          monitoring_criterion: Optional[str],
+                                          component_name: Optional[str],
+                                          variable_name: Optional[str]):
+        """Handle GetMonitoringReport request."""
+        try:
+            result = await self.monitoring_manager.get_monitoring_report(
+                self.id, request_id, monitoring_base, monitoring_criterion,
+                component_name, variable_name
+            )
+            
+            # Send GetMonitoringReportResponse
+            from ocpp.v21 import call
+            request = call.GetMonitoringReportResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo"),
+                monitoringData=result.get("monitoringData", [])
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling GetMonitoringReport: {e}")
+
+    async def _handle_set_variable_monitoring(self, component_name: str, variable_name: str,
+                                            monitoring_criterion: str, threshold: Optional[float]):
+        """Handle SetVariableMonitoring request."""
+        try:
+            result = await self.monitoring_manager.set_variable_monitoring(
+                self.id, component_name, variable_name, monitoring_criterion, threshold
+            )
+            
+            # Send SetVariableMonitoringResponse
+            from ocpp.v21 import call
+            request = call.SetVariableMonitoringResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling SetVariableMonitoring: {e}")
+
+    async def _handle_clear_variable_monitoring(self, component_name: str, variable_name: str,
+                                              monitoring_criterion: str):
+        """Handle ClearVariableMonitoring request."""
+        try:
+            result = await self.monitoring_manager.clear_variable_monitoring(
+                self.id, component_name, variable_name, monitoring_criterion
+            )
+            
+            # Send ClearVariableMonitoringResponse
+            from ocpp.v21 import call
+            request = call.ClearVariableMonitoringResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling ClearVariableMonitoring: {e}")
+
+    async def _handle_notify_monitoring_report(self, request_id: int, monitoring_base: str,
+                                             monitoring_criterion: Optional[str],
+                                             component_name: Optional[str],
+                                             variable_name: Optional[str]):
+        """Handle NotifyMonitoringReport notification."""
+        try:
+            await self.monitoring_manager.notify_monitoring_report(
+                self.id, request_id, monitoring_base, monitoring_criterion,
+                component_name, variable_name
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error handling NotifyMonitoringReport: {e}")
+
+    async def _handle_set_display_message(self, message_info, evse_id: Optional[int],
+                                        connector_id: Optional[int]):
+        """Handle SetDisplayMessage request."""
+        try:
+            result = await self.display_manager.set_display_message(
+                self.id, message_info, evse_id, connector_id
+            )
+            
+            # Send SetDisplayMessageResponse
+            from ocpp.v21 import call
+            request = call.SetDisplayMessageResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling SetDisplayMessage: {e}")
+
+    async def _handle_clear_display_message(self, message_id: Optional[str],
+                                          evse_id: Optional[int],
+                                          connector_id: Optional[int]):
+        """Handle ClearDisplayMessage request."""
+        try:
+            result = await self.display_manager.clear_display_message(
+                self.id, message_id, evse_id, connector_id
+            )
+            
+            # Send ClearDisplayMessageResponse
+            from ocpp.v21 import call
+            request = call.ClearDisplayMessageResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling ClearDisplayMessage: {e}")
+
+    async def _handle_customer_information(self, request_id: int,
+                                         customer_certificate_id: Optional[str],
+                                         id_token: Optional[IdTokenType],
+                                         customer_identifier: Optional[str]):
+        """Handle CustomerInformation request."""
+        try:
+            result = await self.privacy_manager.handle_customer_information_request(
+                self.id, request_id, customer_certificate_id, id_token, customer_identifier
+            )
+            
+            # Send CustomerInformationResponse
+            from ocpp.v21 import call
+            request = call.CustomerInformationResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo"),
+                customer_information=result.get("customer_information")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling CustomerInformation: {e}")
+
+    async def _handle_delete_customer_information(self, request_id: int,
+                                                customer_certificate_id: Optional[str],
+                                                id_token: Optional[IdTokenType],
+                                                customer_identifier: Optional[str]):
+        """Handle DeleteCustomerInformation request."""
+        try:
+            result = await self.privacy_manager.handle_delete_customer_information_request(
+                self.id, request_id, customer_certificate_id, id_token, customer_identifier
+            )
+            
+            # Send DeleteCustomerInformationResponse
+            from ocpp.v21 import call
+            request = call.DeleteCustomerInformationResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling DeleteCustomerInformation: {e}")

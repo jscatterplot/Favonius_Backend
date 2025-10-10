@@ -26,6 +26,12 @@ class ComponentType(Enum):
     SMART_CHARGING = "SmartCharging"
     TARIFF_COST = "TariffCost"
     V2X_CONTROLLER = "V2XController"
+    METER = "Meter"
+    NETWORK = "Network"
+    FIRMWARE = "Firmware"
+    DIAGNOSTICS = "Diagnostics"
+    ALARM = "Alarm"
+    CUSTOM = "Custom"
 
 
 class VariableType(Enum):
@@ -36,6 +42,695 @@ class VariableType(Enum):
     BOOLEAN = "boolean"
     DATETIME = "dateTime"
     ENUM = "enum"
+
+
+class VariableAccess(Enum):
+    """Variable access types."""
+    READ_ONLY = "ReadOnly"
+    READ_WRITE = "ReadWrite"
+    WRITE_ONLY = "WriteOnly"
+
+
+@dataclass
+class StandardOCPPVariables:
+    """Standardized OCPP variables by component."""
+    
+    @staticmethod
+    def get_charging_station_variables() -> List[Dict[str, Any]]:
+        """Get standardized ChargingStation variables."""
+        return [
+            {
+                "name": "VendorName",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Manufacturer name",
+                "required": True
+            },
+            {
+                "name": "Model",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Charging station model",
+                "required": True
+            },
+            {
+                "name": "SerialNumber",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Charging station serial number",
+                "required": True
+            },
+            {
+                "name": "FirmwareVersion",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Current firmware version",
+                "required": False
+            },
+            {
+                "name": "Modem",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Modem configuration",
+                "required": False
+            },
+            {
+                "name": "MeterType",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Type of energy meter",
+                "required": False
+            },
+            {
+                "name": "MeterSerialNumber",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Energy meter serial number",
+                "required": False
+            },
+            {
+                "name": "SupportedFeatureProfiles",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Comma-separated list of supported feature profiles",
+                "required": True
+            },
+            {
+                "name": "SupportedProtocolVersions",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Comma-separated list of supported OCPP versions",
+                "required": True
+            },
+            {
+                "name": "HeartbeatInterval",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Heartbeat interval in seconds",
+                "default_value": "300",
+                "min_value": "30",
+                "max_value": "86400",
+                "required": False
+            },
+            {
+                "name": "MessageTimeout",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Message timeout in seconds",
+                "default_value": "30",
+                "min_value": "5",
+                "max_value": "300",
+                "required": False
+            },
+            {
+                "name": "RetryBackOffRandomRange",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Random range for retry backoff in seconds",
+                "default_value": "10",
+                "min_value": "1",
+                "max_value": "60",
+                "required": False
+            },
+            {
+                "name": "RetryBackOffRepeatTimes",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Number of retry attempts",
+                "default_value": "3",
+                "min_value": "1",
+                "max_value": "10",
+                "required": False
+            },
+            {
+                "name": "RetryBackOffWaitMinimum",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Minimum wait time between retries in seconds",
+                "default_value": "10",
+                "min_value": "1",
+                "max_value": "300",
+                "required": False
+            },
+            {
+                "name": "RetryBackOffWaitMaximum",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum wait time between retries in seconds",
+                "default_value": "60",
+                "min_value": "1",
+                "max_value": "600",
+                "required": False
+            },
+            {
+                "name": "WebSocketPingInterval",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "WebSocket ping interval in seconds",
+                "default_value": "60",
+                "min_value": "10",
+                "max_value": "300",
+                "required": False
+            },
+            {
+                "name": "AuthorizeRemoteTxRequests",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Allow remote transaction start requests",
+                "default_value": "true",
+                "required": False
+            },
+            {
+                "name": "LocalAuthListEnabled",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Enable local authorization list",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "LocalAuthListMaxLength",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum length of local authorization list",
+                "default_value": "100",
+                "min_value": "1",
+                "max_value": "1000",
+                "required": False
+            },
+            {
+                "name": "LocalPreAuthorize",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Enable local pre-authorization",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "StopTransactionOnEVSideDisconnect",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Stop transaction when EV disconnects",
+                "default_value": "true",
+                "required": False
+            },
+            {
+                "name": "StopTransactionOnInvalidId",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Stop transaction on invalid ID token",
+                "default_value": "true",
+                "required": False
+            },
+            {
+                "name": "StopTxnAlignedData",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Align stop transaction data to clock",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "StopTxnAlignedDataMaxLength",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum length of aligned data",
+                "default_value": "4",
+                "min_value": "1",
+                "max_value": "10",
+                "required": False
+            },
+            {
+                "name": "StopTxnSampledData",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Comma-separated list of sampled data for stop transaction",
+                "required": False
+            },
+            {
+                "name": "StopTxnSampledDataMaxLength",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum length of sampled data",
+                "default_value": "4",
+                "min_value": "1",
+                "max_value": "10",
+                "required": False
+            },
+            {
+                "name": "MeterValueSampleInterval",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Meter value sampling interval in seconds",
+                "default_value": "60",
+                "min_value": "1",
+                "max_value": "3600",
+                "required": False
+            },
+            {
+                "name": "MeterValuesSampledData",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Comma-separated list of sampled data for meter values",
+                "required": False
+            },
+            {
+                "name": "MeterValuesAlignedData",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Comma-separated list of aligned data for meter values",
+                "required": False
+            },
+            {
+                "name": "MeterValuesAlignedDataMaxLength",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum length of aligned data for meter values",
+                "default_value": "4",
+                "min_value": "1",
+                "max_value": "10",
+                "required": False
+            },
+            {
+                "name": "MeterValuesSampledDataMaxLength",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum length of sampled data for meter values",
+                "default_value": "4",
+                "min_value": "1",
+                "max_value": "10",
+                "required": False
+            },
+            {
+                "name": "ResetRetries",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Number of reset retry attempts",
+                "default_value": "3",
+                "min_value": "1",
+                "max_value": "10",
+                "required": False
+            },
+            {
+                "name": "ConnectorPhaseRotation",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Phase rotation configuration for connectors",
+                "required": False
+            },
+            {
+                "name": "ConnectorPhaseRotationMaxLength",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum length of phase rotation configuration",
+                "default_value": "3",
+                "min_value": "1",
+                "max_value": "10",
+                "required": False
+            },
+            {
+                "name": "MaxEnergyOnInvalidId",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum energy allowed with invalid ID token in kWh",
+                "default_value": "0.0",
+                "min_value": "0.0",
+                "max_value": "100.0",
+                "required": False
+            }
+        ]
+    
+    @staticmethod
+    def get_evse_variables() -> List[Dict[str, Any]]:
+        """Get standardized EVSE variables."""
+        return [
+            {
+                "name": "AvailabilityState",
+                "type": VariableType.ENUM.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Current availability state of the EVSE",
+                "allowed_values": ["Inoperative", "Operative"],
+                "required": True
+            },
+            {
+                "name": "Enabled",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Whether the EVSE is enabled",
+                "default_value": "true",
+                "required": True
+            },
+            {
+                "name": "Power",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum power of the EVSE in kW",
+                "required": True
+            },
+            {
+                "name": "PowerRampUp",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Power ramp-up rate in kW/s",
+                "default_value": "1.0",
+                "min_value": "0.1",
+                "max_value": "10.0",
+                "required": False
+            },
+            {
+                "name": "PowerRampDown",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Power ramp-down rate in kW/s",
+                "default_value": "1.0",
+                "min_value": "0.1",
+                "max_value": "10.0",
+                "required": False
+            },
+            {
+                "name": "ReservationUpdateInterval",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Reservation update interval in seconds",
+                "default_value": "60",
+                "min_value": "10",
+                "max_value": "3600",
+                "required": False
+            },
+            {
+                "name": "UnavailableWhenEvDisconnected",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Set EVSE unavailable when EV disconnects",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "V2XCapability",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Whether the EVSE supports V2X",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxPower",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X power in kW",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMinPower",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Minimum V2X power in kW",
+                "default_value": "0.0",
+                "required": False
+            }
+        ]
+    
+    @staticmethod
+    def get_connector_variables() -> List[Dict[str, Any]]:
+        """Get standardized Connector variables."""
+        return [
+            {
+                "name": "AvailabilityState",
+                "type": VariableType.ENUM.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Current availability state of the connector",
+                "allowed_values": ["Inoperative", "Operative"],
+                "required": True
+            },
+            {
+                "name": "Enabled",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Whether the connector is enabled",
+                "default_value": "true",
+                "required": True
+            },
+            {
+                "name": "ConnectorType",
+                "type": VariableType.ENUM.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Type of connector",
+                "allowed_values": ["cCCS1", "cCCS2", "cG105", "cTesla", "cType1", "cType2", "s309-1P-16A", "s309-1P-32A", "s309-3P-16A", "s309-3P-32A", "sBS1361", "sCEE-7-7", "sType2", "sType3", "Other1PhMax16A", "Other1PhOver16A", "Other3Ph", "Pan", "wInductive", "wResonant", "Undetermined", "Unknown"],
+                "required": True
+            },
+            {
+                "name": "ConnectorFormat",
+                "type": VariableType.ENUM.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Format of the connector",
+                "allowed_values": ["Socket", "Cable"],
+                "required": True
+            },
+            {
+                "name": "ConnectorPowerType",
+                "type": VariableType.ENUM.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Power type of the connector",
+                "allowed_values": ["AC1", "AC3", "DC"],
+                "required": True
+            },
+            {
+                "name": "MaxVoltage",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum voltage in V",
+                "required": True
+            },
+            {
+                "name": "MaxAmperage",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum amperage in A",
+                "required": True
+            },
+            {
+                "name": "MaxElectricPower",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum electric power in W",
+                "required": True
+            },
+            {
+                "name": "MaxOfferedCurrent",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum offered current in A",
+                "required": False
+            },
+            {
+                "name": "MaxOfferedPower",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum offered power in W",
+                "required": False
+            },
+            {
+                "name": "MinOfferedCurrent",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Minimum offered current in A",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "MinOfferedPower",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Minimum offered power in W",
+                "default_value": "0",
+                "required": False
+            }
+        ]
+    
+    @staticmethod
+    def get_smart_charging_variables() -> List[Dict[str, Any]]:
+        """Get standardized SmartCharging variables."""
+        return [
+            {
+                "name": "ChargingScheduleAllowedChargingRateUnit",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Allowed charging rate units",
+                "default_value": "W,A",
+                "required": False
+            },
+            {
+                "name": "ChargingScheduleMaxPeriods",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum number of periods in charging schedule",
+                "default_value": "1024",
+                "min_value": "1",
+                "max_value": "1024",
+                "required": False
+            },
+            {
+                "name": "ConnectorSwitch3to1PhaseSupported",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Support for switching from 3-phase to 1-phase",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "MaxChargingProfilesInstalled",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Maximum number of charging profiles that can be installed",
+                "default_value": "10",
+                "min_value": "1",
+                "max_value": "100",
+                "required": False
+            }
+        ]
+    
+    @staticmethod
+    def get_v2x_controller_variables() -> List[Dict[str, Any]]:
+        """Get standardized V2XController variables."""
+        return [
+            {
+                "name": "V2XCapability",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Whether V2X is supported",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxPower",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X power in kW",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMinPower",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Minimum V2X power in kW",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxDischargePower",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X discharge power in kW",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxChargePower",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X charge power in kW",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxEnergy",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X energy in kWh",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMinEnergy",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Minimum V2X energy in kWh",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxDischargeEnergy",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X discharge energy in kWh",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxChargeEnergy",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X charge energy in kWh",
+                "default_value": "0.0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxVoltage",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X voltage in V",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMinVoltage",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Minimum V2X voltage in V",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxCurrent",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X current in A",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMinCurrent",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Minimum V2X current in A",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxDischargeCurrent",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X discharge current in A",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxChargeCurrent",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X charge current in A",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxDischargeVoltage",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X discharge voltage in V",
+                "default_value": "0",
+                "required": False
+            },
+            {
+                "name": "V2XCapabilityMaxChargeVoltage",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum V2X charge voltage in V",
+                "default_value": "0",
+                "required": False
+            }
+        ]
 
 
 @dataclass
@@ -191,6 +886,274 @@ class DeviceModel:
         )
         
         self.variable_cache[component][name] = variable
+    
+    async def initialize_complete_device_model(self, station_id: str, station_info: Dict[str, Any]) -> None:
+        """Initialize complete device model with full component hierarchy."""
+        try:
+            self.logger.info(f"Initializing complete device model for station {station_id}")
+            
+            # Initialize ChargingStation component
+            await self._initialize_charging_station_component(station_id, station_info)
+            
+            # Initialize EVSE components
+            await self._initialize_evse_components(station_id, station_info)
+            
+            # Initialize Connector components
+            await self._initialize_connector_components(station_id, station_info)
+            
+            # Initialize SmartCharging component
+            await self._initialize_smart_charging_component(station_id)
+            
+            # Initialize V2XController component
+            await self._initialize_v2x_controller_component(station_id)
+            
+            # Initialize Security component
+            await self._initialize_security_component(station_id)
+            
+            # Initialize Display component
+            await self._initialize_display_component(station_id)
+            
+            # Initialize Meter component
+            await self._initialize_meter_component(station_id)
+            
+            # Initialize Network component
+            await self._initialize_network_component(station_id)
+            
+            # Initialize Firmware component
+            await self._initialize_firmware_component(station_id)
+            
+            # Initialize Diagnostics component
+            await self._initialize_diagnostics_component(station_id)
+            
+            self.logger.info(f"Complete device model initialized for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error initializing complete device model: {e}")
+            raise
+    
+    async def _initialize_charging_station_component(self, station_id: str, station_info: Dict[str, Any]) -> None:
+        """Initialize ChargingStation component."""
+        await self._add_component(station_id, "ChargingStation", "")
+        
+        # Add all ChargingStation variables
+        variables = StandardOCPPVariables.get_charging_station_variables()
+        for var_def in variables:
+            await self._set_variable(
+                station_id, "ChargingStation", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+        
+        # Set station-specific values
+        await self._set_variable(station_id, "ChargingStation", "", "VendorName", "", 
+                               AttributeEnumType.Actual, station_info.get("vendor_name", "Unknown"))
+        await self._set_variable(station_id, "ChargingStation", "", "Model", "", 
+                               AttributeEnumType.Actual, station_info.get("model", "Unknown"))
+        await self._set_variable(station_id, "ChargingStation", "", "SerialNumber", "", 
+                               AttributeEnumType.Actual, station_info.get("serial_number", "Unknown"))
+        await self._set_variable(station_id, "ChargingStation", "", "FirmwareVersion", "", 
+                               AttributeEnumType.Actual, station_info.get("firmware_version", "1.0.0"))
+        await self._set_variable(station_id, "ChargingStation", "", "SupportedFeatureProfiles", "", 
+                               AttributeEnumType.Actual, "Core,SmartCharging,RemoteTrigger,Reservation,LocalAuthListManagement,SoC,RemoteControl,DisplayMessages,ISO15118Pnc,ISO15118Common,DeviceData,Monitoring,LocalListManagement,ExtendedTriggerMessage,ISO15118PnC,ISO15118Common,DeviceData,Monitoring,LocalListManagement,ExtendedTriggerMessage")
+        await self._set_variable(station_id, "ChargingStation", "", "SupportedProtocolVersions", "", 
+                               AttributeEnumType.Actual, "2.0.1")
+    
+    async def _initialize_evse_components(self, station_id: str, station_info: Dict[str, Any]) -> None:
+        """Initialize EVSE components."""
+        # Get number of EVSEs from station info or default to 1
+        num_evses = station_info.get("num_evses", 1)
+        
+        for evse_id in range(1, num_evses + 1):
+            await self._add_component(station_id, "EVSE", str(evse_id))
+            
+            # Add all EVSE variables
+            variables = StandardOCPPVariables.get_evse_variables()
+            for var_def in variables:
+                await self._set_variable(
+                    station_id, "EVSE", str(evse_id), var_def["name"], "",
+                    AttributeEnumType.Actual, var_def.get("default_value", "")
+                )
+            
+            # Set EVSE-specific values
+            await self._set_variable(station_id, "EVSE", str(evse_id), "AvailabilityState", "", 
+                                   AttributeEnumType.Actual, "Operative")
+            await self._set_variable(station_id, "EVSE", str(evse_id), "Enabled", "", 
+                                   AttributeEnumType.Actual, "true")
+            await self._set_variable(station_id, "EVSE", str(evse_id), "Power", "", 
+                                   AttributeEnumType.Actual, str(station_info.get("max_power", 22.0)))
+            await self._set_variable(station_id, "EVSE", str(evse_id), "V2XCapability", "", 
+                                   AttributeEnumType.Actual, str(station_info.get("v2x_capable", False)).lower())
+    
+    async def _initialize_connector_components(self, station_id: str, station_info: Dict[str, Any]) -> None:
+        """Initialize Connector components."""
+        # Get number of connectors from station info or default to 1
+        num_connectors = station_info.get("num_connectors", 1)
+        
+        for connector_id in range(1, num_connectors + 1):
+            await self._add_component(station_id, "Connector", str(connector_id))
+            
+            # Add all Connector variables
+            variables = StandardOCPPVariables.get_connector_variables()
+            for var_def in variables:
+                await self._set_variable(
+                    station_id, "Connector", str(connector_id), var_def["name"], "",
+                    AttributeEnumType.Actual, var_def.get("default_value", "")
+                )
+            
+            # Set Connector-specific values
+            await self._set_variable(station_id, "Connector", str(connector_id), "AvailabilityState", "", 
+                                   AttributeEnumType.Actual, "Operative")
+            await self._set_variable(station_id, "Connector", str(connector_id), "Enabled", "", 
+                                   AttributeEnumType.Actual, "true")
+            await self._set_variable(station_id, "Connector", str(connector_id), "ConnectorType", "", 
+                                   AttributeEnumType.Actual, station_info.get("connector_type", "cType2"))
+            await self._set_variable(station_id, "Connector", str(connector_id), "ConnectorFormat", "", 
+                                   AttributeEnumType.Actual, "Socket")
+            await self._set_variable(station_id, "Connector", str(connector_id), "ConnectorPowerType", "", 
+                                   AttributeEnumType.Actual, "AC3")
+            await self._set_variable(station_id, "Connector", str(connector_id), "MaxVoltage", "", 
+                                   AttributeEnumType.Actual, str(station_info.get("max_voltage", 400)))
+            await self._set_variable(station_id, "Connector", str(connector_id), "MaxAmperage", "", 
+                                   AttributeEnumType.Actual, str(station_info.get("max_amperage", 32)))
+            await self._set_variable(station_id, "Connector", str(connector_id), "MaxElectricPower", "", 
+                                   AttributeEnumType.Actual, str(station_info.get("max_power", 22000)))
+    
+    async def _initialize_smart_charging_component(self, station_id: str) -> None:
+        """Initialize SmartCharging component."""
+        await self._add_component(station_id, "SmartCharging", "")
+        
+        # Add all SmartCharging variables
+        variables = StandardOCPPVariables.get_smart_charging_variables()
+        for var_def in variables:
+            await self._set_variable(
+                station_id, "SmartCharging", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_v2x_controller_component(self, station_id: str) -> None:
+        """Initialize V2XController component."""
+        await self._add_component(station_id, "V2XController", "")
+        
+        # Add all V2XController variables
+        variables = StandardOCPPVariables.get_v2x_controller_variables()
+        for var_def in variables:
+            await self._set_variable(
+                station_id, "V2XController", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_security_component(self, station_id: str) -> None:
+        """Initialize Security component."""
+        await self._add_component(station_id, "Security", "")
+        
+        # Add Security variables
+        security_variables = [
+            {"name": "SecurityProfile", "type": VariableType.INTEGER.value, "default_value": "3"},
+            {"name": "AdditionalRootCertificateCheck", "type": VariableType.BOOLEAN.value, "default_value": "true"},
+            {"name": "CertificateSignedMaxChainSize", "type": VariableType.INTEGER.value, "default_value": "5"},
+            {"name": "CertificateStoreMaxLength", "type": VariableType.INTEGER.value, "default_value": "100"},
+            {"name": "CpoName", "type": VariableType.STRING.value, "default_value": "FavoniusEnergy"},
+            {"name": "SupportedFileTransferProtocols", "type": VariableType.STRING.value, "default_value": "HTTPS"},
+            {"name": "TlsCipherSuite", "type": VariableType.STRING.value, "default_value": "TLS_AES_256_GCM_SHA384"}
+        ]
+        
+        for var_def in security_variables:
+            await self._set_variable(
+                station_id, "Security", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_display_component(self, station_id: str) -> None:
+        """Initialize Display component."""
+        await self._add_component(station_id, "Display", "")
+        
+        # Add Display variables
+        display_variables = [
+            {"name": "SupportedDisplayMessageTypes", "type": VariableType.STRING.value, "default_value": "Normal,Info,Warning,Error"},
+            {"name": "SupportedLanguages", "type": VariableType.STRING.value, "default_value": "en,de,fr,es"},
+            {"name": "MaxDisplayMessageLength", "type": VariableType.INTEGER.value, "default_value": "160"},
+            {"name": "NumberOfDisplays", "type": VariableType.INTEGER.value, "default_value": "1"}
+        ]
+        
+        for var_def in display_variables:
+            await self._set_variable(
+                station_id, "Display", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_meter_component(self, station_id: str) -> None:
+        """Initialize Meter component."""
+        await self._add_component(station_id, "Meter", "")
+        
+        # Add Meter variables
+        meter_variables = [
+            {"name": "MeterType", "type": VariableType.STRING.value, "default_value": "EnergyMeter"},
+            {"name": "MeterSerialNumber", "type": VariableType.STRING.value, "default_value": "METER001"},
+            {"name": "MeterCalibration", "type": VariableType.STRING.value, "default_value": "Class1"},
+            {"name": "MeterAccuracy", "type": VariableType.DECIMAL.value, "default_value": "0.1"},
+            {"name": "MeterSamplingInterval", "type": VariableType.INTEGER.value, "default_value": "60"}
+        ]
+        
+        for var_def in meter_variables:
+            await self._set_variable(
+                station_id, "Meter", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_network_component(self, station_id: str) -> None:
+        """Initialize Network component."""
+        await self._add_component(station_id, "Network", "")
+        
+        # Add Network variables
+        network_variables = [
+            {"name": "NetworkInterface", "type": VariableType.STRING.value, "default_value": "Ethernet,WiFi,4G"},
+            {"name": "NetworkSecurity", "type": VariableType.STRING.value, "default_value": "WPA2,TLS"},
+            {"name": "NetworkTimeout", "type": VariableType.INTEGER.value, "default_value": "30"},
+            {"name": "NetworkRetryCount", "type": VariableType.INTEGER.value, "default_value": "3"}
+        ]
+        
+        for var_def in network_variables:
+            await self._set_variable(
+                station_id, "Network", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_firmware_component(self, station_id: str) -> None:
+        """Initialize Firmware component."""
+        await self._add_component(station_id, "Firmware", "")
+        
+        # Add Firmware variables
+        firmware_variables = [
+            {"name": "FirmwareVersion", "type": VariableType.STRING.value, "default_value": "1.0.0"},
+            {"name": "FirmwareUpdateStatus", "type": VariableType.ENUM.value, "default_value": "Idle"},
+            {"name": "FirmwareUpdateProgress", "type": VariableType.INTEGER.value, "default_value": "0"},
+            {"name": "FirmwareUpdateRetryCount", "type": VariableType.INTEGER.value, "default_value": "3"},
+            {"name": "FirmwareUpdateTimeout", "type": VariableType.INTEGER.value, "default_value": "3600"}
+        ]
+        
+        for var_def in firmware_variables:
+            await self._set_variable(
+                station_id, "Firmware", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_diagnostics_component(self, station_id: str) -> None:
+        """Initialize Diagnostics component."""
+        await self._add_component(station_id, "Diagnostics", "")
+        
+        # Add Diagnostics variables
+        diagnostics_variables = [
+            {"name": "LogLevel", "type": VariableType.ENUM.value, "default_value": "Info"},
+            {"name": "LogMaxEntries", "type": VariableType.INTEGER.value, "default_value": "1000"},
+            {"name": "LogRetentionDays", "type": VariableType.INTEGER.value, "default_value": "30"},
+            {"name": "DiagnosticStatus", "type": VariableType.ENUM.value, "default_value": "Idle"},
+            {"name": "DiagnosticProgress", "type": VariableType.INTEGER.value, "default_value": "0"}
+        ]
+        
+        for var_def in diagnostics_variables:
+            await self._set_variable(
+                station_id, "Diagnostics", "", var_def["name"], "",
+                AttributeEnumType.Actual, var_def.get("default_value", "")
+            )
     
     async def get_variables(self, station_id: str, get_variable_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Get variables for a station."""

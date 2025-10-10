@@ -455,6 +455,243 @@ CREATE TABLE IF NOT EXISTS power_quality_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Log Requests Table
+CREATE TABLE IF NOT EXISTS log_requests (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    log_type VARCHAR(50) NOT NULL,
+    request_id INTEGER NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 3,
+    retry_interval INTEGER NOT NULL DEFAULT 60,
+    status VARCHAR(50) NOT NULL DEFAULT 'Accepted',
+    additional_info TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(station_id, request_id)
+);
+
+-- Log Files Table
+CREATE TABLE IF NOT EXISTS log_files (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    request_id INTEGER NOT NULL,
+    log_type VARCHAR(50) NOT NULL,
+    file_path VARCHAR(500) NOT NULL,
+    file_size BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Notify Events Table
+CREATE TABLE IF NOT EXISTS notify_events (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    tech_info TEXT,
+    additional_info JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Diagnostic Logs Table
+CREATE TABLE IF NOT EXISTS diagnostic_logs (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    level VARCHAR(20) NOT NULL,
+    message TEXT NOT NULL,
+    component VARCHAR(100),
+    event_type VARCHAR(100),
+    additional_info JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Firmware Status Logs Table
+CREATE TABLE IF NOT EXISTS firmware_status_logs (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    additional_info TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Local List Logs Table
+CREATE TABLE IF NOT EXISTS local_list_logs (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    id_token VARCHAR(255) NOT NULL,
+    additional_info JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Station Capabilities Table
+CREATE TABLE IF NOT EXISTS station_capabilities (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    supported_log_types VARCHAR(500),
+    supported_firmware_types VARCHAR(500),
+    max_firmware_size BIGINT,
+    supported_checksum_algorithms VARCHAR(200),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(station_id)
+);
+
+-- Firmware Requests Table
+CREATE TABLE IF NOT EXISTS firmware_requests (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    request_id INTEGER NOT NULL,
+    location VARCHAR(500) NOT NULL,
+    retrieve_date_time TIMESTAMPTZ NOT NULL,
+    retry_interval INTEGER,
+    retries INTEGER,
+    retry_back_off_random_range INTEGER,
+    checksum VARCHAR(255),
+    checksum_algorithm VARCHAR(50),
+    signing_certificate TEXT,
+    signature TEXT,
+    signing_certificate_chain JSONB,
+    request_start_time TIMESTAMPTZ,
+    request_stop_time TIMESTAMPTZ,
+    status VARCHAR(50) NOT NULL DEFAULT 'Accepted',
+    additional_info TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(station_id, request_id)
+);
+
+-- Firmware Update Events Table
+CREATE TABLE IF NOT EXISTS firmware_update_events (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    tech_info TEXT,
+    additional_info JSONB,
+    timestamp TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Firmware Failure Events Table
+CREATE TABLE IF NOT EXISTS firmware_failure_events (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    request_id INTEGER,
+    failure_type VARCHAR(100) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Reset Events Table
+CREATE TABLE IF NOT EXISTS reset_events (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    reset_type VARCHAR(50) NOT NULL,
+    tech_info TEXT,
+    timestamp TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Monitoring Reports Table
+CREATE TABLE IF NOT EXISTS monitoring_reports (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    request_id INTEGER NOT NULL,
+    monitoring_base VARCHAR(50) NOT NULL,
+    monitoring_criteria JSONB,
+    component_variable JSONB,
+    generated_at TIMESTAMPTZ NOT NULL,
+    tbc BOOLEAN NOT NULL DEFAULT false,
+    seq_no INTEGER NOT NULL DEFAULT 1,
+    report_data JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Notified Monitoring Reports Table
+CREATE TABLE IF NOT EXISTS notified_monitoring_reports (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    request_id INTEGER NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL,
+    tbc BOOLEAN NOT NULL DEFAULT false,
+    seq_no INTEGER NOT NULL DEFAULT 1,
+    report_data JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Variable Monitoring Table
+CREATE TABLE IF NOT EXISTS variable_monitoring (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    component_name VARCHAR(255) NOT NULL,
+    component_instance VARCHAR(255) NOT NULL DEFAULT '',
+    variable_name VARCHAR(255) NOT NULL,
+    variable_instance VARCHAR(255) NOT NULL DEFAULT '',
+    monitoring_criterion VARCHAR(50) NOT NULL,
+    severity VARCHAR(20) NOT NULL,
+    threshold DECIMAL(10,4),
+    delta DECIMAL(10,4),
+    period INTEGER,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(station_id, component_name, component_instance, variable_name, variable_instance)
+);
+
+-- Periodic Monitoring Data Table
+CREATE TABLE IF NOT EXISTS periodic_monitoring_data (
+    id SERIAL PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    component_name VARCHAR(255) NOT NULL,
+    variable_name VARCHAR(255) NOT NULL,
+    value TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Alert Rules Table
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id SERIAL PRIMARY KEY,
+    rule_id VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    component_name VARCHAR(255) NOT NULL,
+    variable_name VARCHAR(255) NOT NULL,
+    condition VARCHAR(10) NOT NULL,
+    threshold DECIMAL(10,4) NOT NULL,
+    severity VARCHAR(20) NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    cooldown_minutes INTEGER NOT NULL DEFAULT 5,
+    notification_channels JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(rule_id)
+);
+
+-- Alerts Table
+CREATE TABLE IF NOT EXISTS alerts (
+    id SERIAL PRIMARY KEY,
+    alert_id VARCHAR(255) NOT NULL,
+    rule_id VARCHAR(255),
+    station_id VARCHAR(255) NOT NULL,
+    component_name VARCHAR(255) NOT NULL,
+    variable_name VARCHAR(255) NOT NULL,
+    current_value TEXT NOT NULL,
+    threshold_value DECIMAL(10,4) NOT NULL,
+    severity VARCHAR(20) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'Active',
+    message TEXT NOT NULL,
+    triggered_at TIMESTAMPTZ NOT NULL,
+    acknowledged_at TIMESTAMPTZ,
+    resolved_at TIMESTAMPTZ,
+    acknowledged_by VARCHAR(255),
+    resolved_by VARCHAR(255),
+    additional_info JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(alert_id)
+);
+
 -- ===== INDEXES =====
 
 -- Device Components Indexes
@@ -604,10 +841,427 @@ CREATE INDEX IF NOT EXISTS idx_power_quality_events_station_id ON power_quality_
 CREATE INDEX IF NOT EXISTS idx_power_quality_events_timestamp ON power_quality_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_power_quality_events_events ON power_quality_events USING GIN(events);
 
+-- Log Requests Indexes
+CREATE INDEX IF NOT EXISTS idx_log_requests_station_id ON log_requests(station_id);
+CREATE INDEX IF NOT EXISTS idx_log_requests_log_type ON log_requests(log_type);
+CREATE INDEX IF NOT EXISTS idx_log_requests_status ON log_requests(status);
+CREATE INDEX IF NOT EXISTS idx_log_requests_created_at ON log_requests(created_at);
+
+-- Log Files Indexes
+CREATE INDEX IF NOT EXISTS idx_log_files_station_id ON log_files(station_id);
+CREATE INDEX IF NOT EXISTS idx_log_files_log_type ON log_files(log_type);
+CREATE INDEX IF NOT EXISTS idx_log_files_created_at ON log_files(created_at);
+
+-- Notify Events Indexes
+CREATE INDEX IF NOT EXISTS idx_notify_events_station_id ON notify_events(station_id);
+CREATE INDEX IF NOT EXISTS idx_notify_events_event_type ON notify_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_notify_events_timestamp ON notify_events(timestamp);
+
+-- Diagnostic Logs Indexes
+CREATE INDEX IF NOT EXISTS idx_diagnostic_logs_station_id ON diagnostic_logs(station_id);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_logs_timestamp ON diagnostic_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_logs_level ON diagnostic_logs(level);
+
+-- Firmware Status Logs Indexes
+CREATE INDEX IF NOT EXISTS idx_firmware_status_logs_station_id ON firmware_status_logs(station_id);
+CREATE INDEX IF NOT EXISTS idx_firmware_status_logs_timestamp ON firmware_status_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_firmware_status_logs_status ON firmware_status_logs(status);
+
+-- Local List Logs Indexes
+CREATE INDEX IF NOT EXISTS idx_local_list_logs_station_id ON local_list_logs(station_id);
+CREATE INDEX IF NOT EXISTS idx_local_list_logs_timestamp ON local_list_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_local_list_logs_action ON local_list_logs(action);
+
+-- Station Capabilities Indexes
+CREATE INDEX IF NOT EXISTS idx_station_capabilities_station_id ON station_capabilities(station_id);
+
+-- Firmware Requests Indexes
+CREATE INDEX IF NOT EXISTS idx_firmware_requests_station_id ON firmware_requests(station_id);
+CREATE INDEX IF NOT EXISTS idx_firmware_requests_status ON firmware_requests(status);
+CREATE INDEX IF NOT EXISTS idx_firmware_requests_created_at ON firmware_requests(created_at);
+
+-- Firmware Update Events Indexes
+CREATE INDEX IF NOT EXISTS idx_firmware_update_events_station_id ON firmware_update_events(station_id);
+CREATE INDEX IF NOT EXISTS idx_firmware_update_events_timestamp ON firmware_update_events(timestamp);
+
+-- Firmware Failure Events Indexes
+CREATE INDEX IF NOT EXISTS idx_firmware_failure_events_station_id ON firmware_failure_events(station_id);
+CREATE INDEX IF NOT EXISTS idx_firmware_failure_events_timestamp ON firmware_failure_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_firmware_failure_events_failure_type ON firmware_failure_events(failure_type);
+
+-- Reset Events Indexes
+CREATE INDEX IF NOT EXISTS idx_reset_events_station_id ON reset_events(station_id);
+CREATE INDEX IF NOT EXISTS idx_reset_events_timestamp ON reset_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_reset_events_reset_type ON reset_events(reset_type);
+
+-- Monitoring Reports Indexes
+CREATE INDEX IF NOT EXISTS idx_monitoring_reports_station_id ON monitoring_reports(station_id);
+CREATE INDEX IF NOT EXISTS idx_monitoring_reports_request_id ON monitoring_reports(request_id);
+CREATE INDEX IF NOT EXISTS idx_monitoring_reports_monitoring_base ON monitoring_reports(monitoring_base);
+CREATE INDEX IF NOT EXISTS idx_monitoring_reports_created_at ON monitoring_reports(created_at);
+
+-- Notified Monitoring Reports Indexes
+CREATE INDEX IF NOT EXISTS idx_notified_monitoring_reports_station_id ON notified_monitoring_reports(station_id);
+CREATE INDEX IF NOT EXISTS idx_notified_monitoring_reports_request_id ON notified_monitoring_reports(request_id);
+CREATE INDEX IF NOT EXISTS idx_notified_monitoring_reports_created_at ON notified_monitoring_reports(created_at);
+
+-- Variable Monitoring Indexes
+CREATE INDEX IF NOT EXISTS idx_variable_monitoring_station_id ON variable_monitoring(station_id);
+CREATE INDEX IF NOT EXISTS idx_variable_monitoring_component_variable ON variable_monitoring(component_name, variable_name);
+CREATE INDEX IF NOT EXISTS idx_variable_monitoring_criterion ON variable_monitoring(monitoring_criterion);
+CREATE INDEX IF NOT EXISTS idx_variable_monitoring_enabled ON variable_monitoring(enabled);
+
+-- Periodic Monitoring Data Indexes
+CREATE INDEX IF NOT EXISTS idx_periodic_monitoring_data_station_id ON periodic_monitoring_data(station_id);
+CREATE INDEX IF NOT EXISTS idx_periodic_monitoring_data_timestamp ON periodic_monitoring_data(timestamp);
+CREATE INDEX IF NOT EXISTS idx_periodic_monitoring_data_component_variable ON periodic_monitoring_data(component_name, variable_name);
+
+-- Alert Rules Indexes
+CREATE INDEX IF NOT EXISTS idx_alert_rules_rule_id ON alert_rules(rule_id);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_component_variable ON alert_rules(component_name, variable_name);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_severity ON alert_rules(severity);
+
+-- Alerts Indexes
+CREATE INDEX IF NOT EXISTS idx_alerts_alert_id ON alerts(alert_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_station_id ON alerts(station_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
+CREATE INDEX IF NOT EXISTS idx_alerts_triggered_at ON alerts(triggered_at);
+CREATE INDEX IF NOT EXISTS idx_alerts_component_variable ON alerts(component_name, variable_name);
+
+-- ===== DISPLAY MESSAGE MANAGEMENT =====
+
+-- Display Messages Table
+CREATE TABLE IF NOT EXISTS display_messages (
+    message_id VARCHAR(255) PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    evse_id INTEGER,
+    connector_id INTEGER,
+    message_type VARCHAR(50) NOT NULL, -- Normal, Info, Warning, Error
+    message_content TEXT NOT NULL,
+    language VARCHAR(10) DEFAULT 'en',
+    priority INTEGER DEFAULT 0,
+    state VARCHAR(50) DEFAULT 'active', -- active, inactive, expired
+    valid_from TIMESTAMP WITH TIME ZONE,
+    valid_to TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Display Message History Table
+CREATE TABLE IF NOT EXISTS display_message_history (
+    id SERIAL PRIMARY KEY,
+    message_id VARCHAR(255) NOT NULL,
+    station_id VARCHAR(255) NOT NULL,
+    action VARCHAR(50) NOT NULL, -- created, updated, cleared, expired
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    details JSONB
+);
+
+-- Display Message Indexes
+CREATE INDEX IF NOT EXISTS idx_display_messages_station_id ON display_messages(station_id);
+CREATE INDEX IF NOT EXISTS idx_display_messages_evse_id ON display_messages(evse_id);
+CREATE INDEX IF NOT EXISTS idx_display_messages_connector_id ON display_messages(connector_id);
+CREATE INDEX IF NOT EXISTS idx_display_messages_state ON display_messages(state);
+CREATE INDEX IF NOT EXISTS idx_display_messages_priority ON display_messages(priority);
+CREATE INDEX IF NOT EXISTS idx_display_messages_valid_from ON display_messages(valid_from);
+CREATE INDEX IF NOT EXISTS idx_display_messages_valid_to ON display_messages(valid_to);
+CREATE INDEX IF NOT EXISTS idx_display_messages_created_at ON display_messages(created_at);
+
+-- Display Message History Indexes
+CREATE INDEX IF NOT EXISTS idx_display_message_history_message_id ON display_message_history(message_id);
+CREATE INDEX IF NOT EXISTS idx_display_message_history_station_id ON display_message_history(station_id);
+CREATE INDEX IF NOT EXISTS idx_display_message_history_timestamp ON display_message_history(timestamp);
+
+-- ===== TARIFF AND COST MANAGEMENT =====
+
+-- Tariffs Table
+CREATE TABLE IF NOT EXISTS tariffs (
+    tariff_id VARCHAR(255) PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    tariff_description VARCHAR(500),
+    tariff_currency VARCHAR(3) DEFAULT 'USD',
+    tariff_priority INTEGER DEFAULT 0,
+    valid_from TIMESTAMP WITH TIME ZONE,
+    valid_to TIMESTAMP WITH TIME ZONE,
+    tariff_data JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Tariff Elements Table
+CREATE TABLE IF NOT EXISTS tariff_elements (
+    element_id VARCHAR(255) PRIMARY KEY,
+    tariff_id VARCHAR(255) NOT NULL REFERENCES tariffs(tariff_id) ON DELETE CASCADE,
+    element_type VARCHAR(50) NOT NULL, -- Energy, Time, Parking, Power
+    price_per_unit DECIMAL(10,4) NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    unit VARCHAR(20) NOT NULL, -- kWh, hour, minute, kW
+    valid_from TIMESTAMP WITH TIME ZONE,
+    valid_to TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Time-of-Use Periods Table
+CREATE TABLE IF NOT EXISTS tou_periods (
+    period_id VARCHAR(255) PRIMARY KEY,
+    tariff_id VARCHAR(255) NOT NULL REFERENCES tariffs(tariff_id) ON DELETE CASCADE,
+    period_name VARCHAR(100) NOT NULL,
+    start_time TIME NOT NULL,
+    end_time TIME NOT NULL,
+    day_of_week INTEGER, -- 0=Sunday, 1=Monday, etc.
+    month INTEGER, -- 1-12
+    day_of_month INTEGER, -- 1-31
+    price_multiplier DECIMAL(5,2) DEFAULT 1.0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Cost Updates Table
+CREATE TABLE IF NOT EXISTS cost_updates (
+    update_id VARCHAR(255) PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    transaction_id VARCHAR(255),
+    evse_id INTEGER,
+    connector_id INTEGER,
+    total_cost DECIMAL(10,4) NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    cost_breakdown JSONB,
+    calculated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Tariff Indexes
+CREATE INDEX IF NOT EXISTS idx_tariffs_station_id ON tariffs(station_id);
+CREATE INDEX IF NOT EXISTS idx_tariffs_valid_from ON tariffs(valid_from);
+CREATE INDEX IF NOT EXISTS idx_tariffs_valid_to ON tariffs(valid_to);
+CREATE INDEX IF NOT EXISTS idx_tariffs_priority ON tariffs(tariff_priority);
+
+-- Tariff Elements Indexes
+CREATE INDEX IF NOT EXISTS idx_tariff_elements_tariff_id ON tariff_elements(tariff_id);
+CREATE INDEX IF NOT EXISTS idx_tariff_elements_type ON tariff_elements(element_type);
+CREATE INDEX IF NOT EXISTS idx_tariff_elements_valid_from ON tariff_elements(valid_from);
+CREATE INDEX IF NOT EXISTS idx_tariff_elements_valid_to ON tariff_elements(valid_to);
+
+-- TOU Periods Indexes
+CREATE INDEX IF NOT EXISTS idx_tou_periods_tariff_id ON tou_periods(tariff_id);
+CREATE INDEX IF NOT EXISTS idx_tou_periods_day_of_week ON tou_periods(day_of_week);
+CREATE INDEX IF NOT EXISTS idx_tou_periods_start_time ON tou_periods(start_time);
+CREATE INDEX IF NOT EXISTS idx_tou_periods_end_time ON tou_periods(end_time);
+
+-- Cost Updates Indexes
+CREATE INDEX IF NOT EXISTS idx_cost_updates_station_id ON cost_updates(station_id);
+CREATE INDEX IF NOT EXISTS idx_cost_updates_transaction_id ON cost_updates(transaction_id);
+CREATE INDEX IF NOT EXISTS idx_cost_updates_evse_id ON cost_updates(evse_id);
+CREATE INDEX IF NOT EXISTS idx_cost_updates_connector_id ON cost_updates(connector_id);
+CREATE INDEX IF NOT EXISTS idx_cost_updates_calculated_at ON cost_updates(calculated_at);
+
+-- ===== GDPR COMPLIANCE =====
+
+-- Customer Information Table
+CREATE TABLE IF NOT EXISTS customer_information (
+    request_id VARCHAR(255) PRIMARY KEY,
+    station_id VARCHAR(255) NOT NULL,
+    customer_certificate_id VARCHAR(255),
+    id_token VARCHAR(255),
+    customer_identifier VARCHAR(255),
+    request_type VARCHAR(50) NOT NULL, -- CustomerInformation, DeleteCustomerInformation
+    status VARCHAR(50) DEFAULT 'pending', -- pending, processing, completed, failed
+    requested_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processed_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    error_message TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Data Retention Policies Table
+CREATE TABLE IF NOT EXISTS data_retention_policies (
+    policy_id VARCHAR(255) PRIMARY KEY,
+    data_type VARCHAR(100) NOT NULL, -- transaction_data, meter_values, logs, certificates
+    retention_period_days INTEGER NOT NULL,
+    anonymization_required BOOLEAN DEFAULT false,
+    deletion_method VARCHAR(50) DEFAULT 'soft', -- soft, hard, anonymize
+    policy_description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Consent Management Table
+CREATE TABLE IF NOT EXISTS consent_records (
+    consent_id VARCHAR(255) PRIMARY KEY,
+    customer_identifier VARCHAR(255) NOT NULL,
+    consent_type VARCHAR(100) NOT NULL, -- data_processing, marketing, analytics, third_party
+    consent_status VARCHAR(50) NOT NULL, -- granted, revoked, expired
+    consent_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    revocation_date TIMESTAMP WITH TIME ZONE,
+    expiry_date TIMESTAMP WITH TIME ZONE,
+    consent_method VARCHAR(50), -- explicit, implicit, opt_in, opt_out
+    consent_source VARCHAR(100), -- web_portal, mobile_app, charging_station, email
+    legal_basis VARCHAR(100), -- consent, legitimate_interest, contract, legal_obligation
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- PII Anonymization Log Table
+CREATE TABLE IF NOT EXISTS pii_anonymization_log (
+    log_id VARCHAR(255) PRIMARY KEY,
+    customer_identifier VARCHAR(255) NOT NULL,
+    data_type VARCHAR(100) NOT NULL,
+    anonymization_method VARCHAR(50) NOT NULL, -- hash, mask, delete, pseudonymize
+    original_value_hash VARCHAR(255), -- Hash of original value for audit
+    anonymized_value VARCHAR(255),
+    anonymization_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    retention_policy_id VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Data Subject Rights Requests Table
+CREATE TABLE IF NOT EXISTS data_subject_requests (
+    request_id VARCHAR(255) PRIMARY KEY,
+    customer_identifier VARCHAR(255) NOT NULL,
+    request_type VARCHAR(50) NOT NULL, -- access, rectification, erasure, portability, restriction
+    request_status VARCHAR(50) DEFAULT 'pending', -- pending, in_progress, completed, rejected
+    request_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    completion_date TIMESTAMP WITH TIME ZONE,
+    verification_method VARCHAR(100), -- email, phone, id_document, certificate
+    verification_status VARCHAR(50) DEFAULT 'pending',
+    request_details JSONB,
+    response_data JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Customer Information Indexes
+CREATE INDEX IF NOT EXISTS idx_customer_information_station_id ON customer_information(station_id);
+CREATE INDEX IF NOT EXISTS idx_customer_information_customer_id ON customer_information(customer_identifier);
+CREATE INDEX IF NOT EXISTS idx_customer_information_status ON customer_information(status);
+CREATE INDEX IF NOT EXISTS idx_customer_information_requested_at ON customer_information(requested_at);
+
+-- Data Retention Policies Indexes
+CREATE INDEX IF NOT EXISTS idx_data_retention_policies_data_type ON data_retention_policies(data_type);
+CREATE INDEX IF NOT EXISTS idx_data_retention_policies_retention_period ON data_retention_policies(retention_period_days);
+
+-- Consent Records Indexes
+CREATE INDEX IF NOT EXISTS idx_consent_records_customer_id ON consent_records(customer_identifier);
+CREATE INDEX IF NOT EXISTS idx_consent_records_consent_type ON consent_records(consent_type);
+CREATE INDEX IF NOT EXISTS idx_consent_records_status ON consent_records(consent_status);
+CREATE INDEX IF NOT EXISTS idx_consent_records_consent_date ON consent_records(consent_date);
+
+-- PII Anonymization Log Indexes
+CREATE INDEX IF NOT EXISTS idx_pii_anonymization_customer_id ON pii_anonymization_log(customer_identifier);
+CREATE INDEX IF NOT EXISTS idx_pii_anonymization_data_type ON pii_anonymization_log(data_type);
+CREATE INDEX IF NOT EXISTS idx_pii_anonymization_date ON pii_anonymization_log(anonymization_date);
+
+-- Data Subject Requests Indexes
+CREATE INDEX IF NOT EXISTS idx_data_subject_requests_customer_id ON data_subject_requests(customer_identifier);
+CREATE INDEX IF NOT EXISTS idx_data_subject_requests_type ON data_subject_requests(request_type);
+CREATE INDEX IF NOT EXISTS idx_data_subject_requests_status ON data_subject_requests(request_status);
+CREATE INDEX IF NOT EXISTS idx_data_subject_requests_date ON data_subject_requests(request_date);
+
+-- ===== ERROR HANDLING AND RESILIENCE =====
+
+-- Circuit Breaker States Table
+CREATE TABLE IF NOT EXISTS circuit_breaker_states (
+    service_name VARCHAR(100) PRIMARY KEY,
+    state VARCHAR(20) NOT NULL, -- closed, open, half_open
+    failure_count INTEGER DEFAULT 0,
+    last_failure_time TIMESTAMP WITH TIME ZONE,
+    last_success_time TIMESTAMP WITH TIME ZONE,
+    failure_threshold INTEGER DEFAULT 5,
+    timeout_seconds INTEGER DEFAULT 60,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Dead Letter Queue Table
+CREATE TABLE IF NOT EXISTS dead_letter_queue (
+    message_id VARCHAR(255) PRIMARY KEY,
+    original_message JSONB NOT NULL,
+    error_message TEXT NOT NULL,
+    error_type VARCHAR(100) NOT NULL,
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
+    next_retry_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processed_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Retry Attempts Table
+CREATE TABLE IF NOT EXISTS retry_attempts (
+    attempt_id VARCHAR(255) PRIMARY KEY,
+    message_id VARCHAR(255) NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    error_message TEXT,
+    attempt_time TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    success BOOLEAN DEFAULT false,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Health Check Results Table
+CREATE TABLE IF NOT EXISTS health_check_results (
+    check_id VARCHAR(255) PRIMARY KEY,
+    service_name VARCHAR(100) NOT NULL,
+    check_type VARCHAR(50) NOT NULL, -- database, external_api, websocket, system
+    status VARCHAR(20) NOT NULL, -- healthy, unhealthy, degraded
+    response_time_ms INTEGER,
+    error_message TEXT,
+    check_time TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Graceful Degradation Rules Table
+CREATE TABLE IF NOT EXISTS degradation_rules (
+    rule_id VARCHAR(255) PRIMARY KEY,
+    service_name VARCHAR(100) NOT NULL,
+    trigger_condition VARCHAR(200) NOT NULL,
+    degradation_action VARCHAR(100) NOT NULL, -- disable_feature, use_fallback, reduce_functionality
+    fallback_config JSONB,
+    enabled BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Circuit Breaker Indexes
+CREATE INDEX IF NOT EXISTS idx_circuit_breaker_states_state ON circuit_breaker_states(state);
+CREATE INDEX IF NOT EXISTS idx_circuit_breaker_states_last_failure ON circuit_breaker_states(last_failure_time);
+
+-- Dead Letter Queue Indexes
+CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_error_type ON dead_letter_queue(error_type);
+CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_next_retry ON dead_letter_queue(next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_created_at ON dead_letter_queue(created_at);
+
+-- Retry Attempts Indexes
+CREATE INDEX IF NOT EXISTS idx_retry_attempts_message_id ON retry_attempts(message_id);
+CREATE INDEX IF NOT EXISTS idx_retry_attempts_attempt_time ON retry_attempts(attempt_time);
+
+-- Health Check Results Indexes
+CREATE INDEX IF NOT EXISTS idx_health_check_results_service ON health_check_results(service_name);
+CREATE INDEX IF NOT EXISTS idx_health_check_results_status ON health_check_results(status);
+CREATE INDEX IF NOT EXISTS idx_health_check_results_check_time ON health_check_results(check_time);
+
+-- Degradation Rules Indexes
+CREATE INDEX IF NOT EXISTS idx_degradation_rules_service ON degradation_rules(service_name);
+CREATE INDEX IF NOT EXISTS idx_degradation_rules_enabled ON degradation_rules(enabled);
+
 -- ===== TIMESCALE HYPERTABLES =====
 
 -- Convert time-series tables to hypertables
 SELECT create_hypertable('device_reports', 'created_at', if_not_exists => TRUE);
+SELECT create_hypertable('monitoring_reports', 'created_at', if_not_exists => TRUE);
+SELECT create_hypertable('notified_monitoring_reports', 'created_at', if_not_exists => TRUE);
+SELECT create_hypertable('periodic_monitoring_data', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('alerts', 'triggered_at', if_not_exists => TRUE);
+SELECT create_hypertable('display_messages', 'created_at', if_not_exists => TRUE);
+SELECT create_hypertable('display_message_history', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('cost_updates', 'calculated_at', if_not_exists => TRUE);
+SELECT create_hypertable('customer_information', 'requested_at', if_not_exists => TRUE);
+SELECT create_hypertable('consent_records', 'consent_date', if_not_exists => TRUE);
+SELECT create_hypertable('pii_anonymization_log', 'anonymization_date', if_not_exists => TRUE);
+SELECT create_hypertable('data_subject_requests', 'request_date', if_not_exists => TRUE);
+SELECT create_hypertable('dead_letter_queue', 'created_at', if_not_exists => TRUE);
+SELECT create_hypertable('retry_attempts', 'attempt_time', if_not_exists => TRUE);
+SELECT create_hypertable('health_check_results', 'check_time', if_not_exists => TRUE);
 SELECT create_hypertable('transaction_events', 'timestamp', if_not_exists => TRUE);
 SELECT create_hypertable('transaction_costs', 'calculated_at', if_not_exists => TRUE);
 SELECT create_hypertable('reset_requests', 'requested_at', if_not_exists => TRUE);
@@ -619,6 +1273,13 @@ SELECT create_hypertable('demand_response_events', 'start_time', if_not_exists =
 SELECT create_hypertable('electricity_prices', 'timestamp', if_not_exists => TRUE);
 SELECT create_hypertable('signed_meter_values', 'timestamp', if_not_exists => TRUE);
 SELECT create_hypertable('power_quality_events', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('notify_events', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('diagnostic_logs', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('firmware_status_logs', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('local_list_logs', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('firmware_update_events', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('firmware_failure_events', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('reset_events', 'timestamp', if_not_exists => TRUE);
 
 -- ===== COMPRESSION POLICIES =====
 
@@ -635,6 +1296,13 @@ SELECT add_compression_policy('demand_response_events', INTERVAL '30 days', if_n
 SELECT add_compression_policy('electricity_prices', INTERVAL '7 days', if_not_exists => TRUE);
 SELECT add_compression_policy('signed_meter_values', INTERVAL '7 days', if_not_exists => TRUE);
 SELECT add_compression_policy('power_quality_events', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT add_compression_policy('notify_events', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT add_compression_policy('diagnostic_logs', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_compression_policy('firmware_status_logs', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT add_compression_policy('local_list_logs', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT add_compression_policy('firmware_update_events', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT add_compression_policy('firmware_failure_events', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT add_compression_policy('reset_events', INTERVAL '30 days', if_not_exists => TRUE);
 
 -- ===== RETENTION POLICIES =====
 
@@ -651,6 +1319,13 @@ SELECT add_retention_policy('demand_response_events', INTERVAL '2 years', if_not
 SELECT add_retention_policy('electricity_prices', INTERVAL '1 year', if_not_exists => TRUE);
 SELECT add_retention_policy('signed_meter_values', INTERVAL '7 years', if_not_exists => TRUE);
 SELECT add_retention_policy('power_quality_events', INTERVAL '2 years', if_not_exists => TRUE);
+SELECT add_retention_policy('notify_events', INTERVAL '2 years', if_not_exists => TRUE);
+SELECT add_retention_policy('diagnostic_logs', INTERVAL '1 year', if_not_exists => TRUE);
+SELECT add_retention_policy('firmware_status_logs', INTERVAL '2 years', if_not_exists => TRUE);
+SELECT add_retention_policy('local_list_logs', INTERVAL '2 years', if_not_exists => TRUE);
+SELECT add_retention_policy('firmware_update_events', INTERVAL '2 years', if_not_exists => TRUE);
+SELECT add_retention_policy('firmware_failure_events', INTERVAL '2 years', if_not_exists => TRUE);
+SELECT add_retention_policy('reset_events', INTERVAL '2 years', if_not_exists => TRUE);
 """
 
 
