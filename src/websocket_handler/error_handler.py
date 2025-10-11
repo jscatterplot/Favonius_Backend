@@ -454,8 +454,10 @@ class ErrorHandler:
     async def _check_websocket_health(self) -> bool:
         """Check WebSocket health."""
         try:
-            # Check if WebSocket server is running
-            # This would depend on the specific WebSocket implementation
+            # Check if connection manager is available and has active connections
+            if hasattr(self, 'connection_manager') and self.connection_manager:
+                health_status = await self.connection_manager.get_health_status()
+                return health_status.get('total_connections', 0) >= 0
             return True
         except Exception:
             return False

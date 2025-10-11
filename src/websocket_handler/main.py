@@ -84,9 +84,6 @@ class Application:
             
             # Start data sync service
             await self.data_sync_service.start()
-
-            # Create Timescale-dependent services (price feeder, optimization)
-            await self._initialize_timescale_components()
             
             # Start WebSocket server
             self.running = True
@@ -169,11 +166,7 @@ class Application:
             self.timescale_client = TimescaleClient(self.config.timescale)
             await self.timescale_client.connect()
             
-            # Create telemetry ingestion service
-            self.telemetry_ingestion_service = TelemetryIngestionService(
-                self.config.timescale,
-                self.config.kafka
-            )
+            # Telemetry ingestion service removed for simplification
             
             # Create analytics service
             self.analytics_service = AnalyticsService(self.config.timescale)

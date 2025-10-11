@@ -31,9 +31,7 @@ class ConnectionManager:
         # Background tasks
         self._monitoring_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
-        
-        # Start background monitoring
-        self._start_monitoring()
+        self._started = False
     
     def _start_monitoring(self) -> None:
         """Start background monitoring tasks."""
@@ -43,6 +41,11 @@ class ConnectionManager:
     async def register_connection(self, station_id: str, connection_id: str, 
                                 client_ip: str, websocket: WebSocketServerProtocol) -> None:
         """Register a new WebSocket connection."""
+        # Start monitoring if not already started
+        if not self._started:
+            self._start_monitoring()
+            self._started = True
+            
         try:
             # Store connection locally
             self.connections[connection_id] = websocket

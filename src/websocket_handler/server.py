@@ -195,6 +195,12 @@ class OCPPWebSocketServer:
         self.logger.info(f"New connection {connection_id} from {client_ip} for station {station_id}")
         
         try:
+            # Check rate limit before processing
+            if not self._check_rate_limit(connection_id):
+                self.logger.warning(f"Rate limit exceeded for connection {connection_id}")
+                await websocket.close(1008, "Rate limit exceeded")
+                return
+            
             # Start the OCPP charge point
             await charge_point.start()
         except websockets.exceptions.ConnectionClosed:

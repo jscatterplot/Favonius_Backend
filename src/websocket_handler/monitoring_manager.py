@@ -288,13 +288,17 @@ class MonitoringManager:
 
     async def _monitoring_loop(self, station_id: str) -> None:
         """Main monitoring loop for a station."""
-        while True:
-            try:
-                await self._check_monitoring_rules(station_id)
-                await asyncio.sleep(30)  # Check every 30 seconds
-            except Exception as e:
-                self.logger.error(f"Error in monitoring loop for {station_id}: {e}")
-                await asyncio.sleep(60)  # Wait longer on error
+        try:
+            while True:
+                try:
+                    await self._check_monitoring_rules(station_id)
+                    await asyncio.sleep(30)  # Check every 30 seconds
+                except Exception as e:
+                    self.logger.error(f"Error in monitoring loop for {station_id}: {e}")
+                    await asyncio.sleep(60)  # Wait longer on error
+        finally:
+            # Clean up task reference when loop exits
+            self.monitoring_tasks.pop(station_id, None)
 
     async def _check_monitoring_rules(self, station_id: str) -> None:
         """Check monitoring rules and trigger alerts if needed."""
