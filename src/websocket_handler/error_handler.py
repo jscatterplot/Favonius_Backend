@@ -1,18 +1,17 @@
-"""Error Handling and Resilience Management for OCPP 2.0.1."""
+"""Enhanced error handling and resilience for OCPP communication."""
 
 import asyncio
-import uuid
 import time
-from typing import Any, Dict, List, Optional, Callable, TypeVar, Union
-from datetime import datetime, timezone, timedelta
+import logging
 from enum import Enum
+from typing import Any, Callable, Dict, Optional, List, Union
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+import random
+import backoff
 from functools import wraps
-import json
 
 from .monitoring import get_logger
-from .timescale_client import TimescaleClient
-
-T = TypeVar('T')
 
 
 class CircuitBreakerState(Enum):
@@ -22,483 +21,463 @@ class CircuitBreakerState(Enum):
     HALF_OPEN = "half_open"
 
 
-class HealthStatus(Enum):
-    """Health check status."""
-    HEALTHY = "healthy"
-    UNHEALTHY = "unhealthy"
-    DEGRADED = "degraded"
+class ErrorSeverity(Enum):
+    """Error severity levels."""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
 
 
-class DegradationAction(Enum):
-    """Degradation actions."""
-    DISABLE_FEATURE = "disable_feature"
-    USE_FALLBACK = "use_fallback"
-    REDUCE_FUNCTIONALITY = "reduce_functionality"
+@dataclass
+class ErrorContext:
+    """Context information for error handling."""
+    error_type: str
+    message: str
+    station_id: Optional[str] = None
+    action: Optional[str] = None
+    severity: ErrorSeverity = ErrorSeverity.MEDIUM
+    timestamp: datetime = None
+    retry_count: int = 0
+    max_retries: int = 3
+    backoff_factor: float = 2.0
+    additional_info: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now(timezone.utc)
 
 
 class CircuitBreaker:
-    """Circuit breaker implementation."""
-
-    def __init__(self, service_name: str, failure_threshold: int = 5,
-                 timeout_seconds: int = 60, timescale_client: Optional[TimescaleClient] = None):
-        """Initialize circuit breaker."""
-        self.service_name = service_name
+    """Circuit breaker implementation for service resilience."""
+    
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        recovery_timeout: int = 60,
+        expected_exception: type = Exception
+    ):
+        self.name = name
         self.failure_threshold = failure_threshold
-        self.timeout_seconds = timeout_seconds
-        self.timescale_client = timescale_client
-        self.logger = get_logger(__name__)
+        self.recovery_timeout = recovery_timeout
+        self.expected_exception = expected_exception
         
-        # In-memory state (will be synced with database)
-        self.state = CircuitBreakerState.CLOSED
         self.failure_count = 0
         self.last_failure_time = None
-        self.last_success_time = None
-
-    async def call(self, func: Callable[..., T], *args, **kwargs) -> T:
+        self.state = CircuitBreakerState.CLOSED
+        self.logger = get_logger(f"circuit_breaker.{name}")
+        
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
         """Execute function with circuit breaker protection."""
         if self.state == CircuitBreakerState.OPEN:
             if self._should_attempt_reset():
                 self.state = CircuitBreakerState.HALF_OPEN
-                self.logger.info(f"Circuit breaker {self.service_name} transitioning to HALF_OPEN")
+                self.logger.info(f"Circuit breaker {self.name} entering half-open state")
             else:
-                raise CircuitBreakerOpenError(f"Circuit breaker {self.service_name} is OPEN")
-
+                raise Exception(f"Circuit breaker {self.name} is OPEN")
+        
         try:
             result = await func(*args, **kwargs)
-            await self._on_success()
+            self._on_success()
             return result
-        except Exception as e:
-            await self._on_failure(e)
-            raise
-
+        except self.expected_exception as e:
+            self._on_failure()
+            raise e
+    
     def _should_attempt_reset(self) -> bool:
         """Check if circuit breaker should attempt reset."""
         if self.last_failure_time is None:
             return True
-        
-        time_since_failure = time.time() - self.last_failure_time
-        return time_since_failure >= self.timeout_seconds
-
-    async def _on_success(self):
+        return time.time() - self.last_failure_time >= self.recovery_timeout
+    
+    def _on_success(self):
         """Handle successful call."""
         self.failure_count = 0
-        self.last_success_time = time.time()
-        
         if self.state == CircuitBreakerState.HALF_OPEN:
             self.state = CircuitBreakerState.CLOSED
-            self.logger.info(f"Circuit breaker {self.service_name} reset to CLOSED")
-        
-        # Update database state
-        if self.timescale_client:
-            await self._update_circuit_breaker_state()
-
-    async def _on_failure(self, error: Exception):
+            self.logger.info(f"Circuit breaker {self.name} reset to CLOSED")
+    
+    def _on_failure(self):
         """Handle failed call."""
         self.failure_count += 1
         self.last_failure_time = time.time()
         
         if self.failure_count >= self.failure_threshold:
             self.state = CircuitBreakerState.OPEN
-            self.logger.warning(f"Circuit breaker {self.service_name} opened after {self.failure_count} failures")
-        
-        # Update database state
-        if self.timescale_client:
-            await self._update_circuit_breaker_state()
-
-    async def _update_circuit_breaker_state(self):
-        """Update circuit breaker state in database."""
-        try:
-            state_data = {
-                "service_name": self.service_name,
-                "state": self.state.value,
-                "failure_count": self.failure_count,
-                "last_failure_time": datetime.fromtimestamp(self.last_failure_time, timezone.utc) if self.last_failure_time else None,
-                "last_success_time": datetime.fromtimestamp(self.last_success_time, timezone.utc) if self.last_success_time else None,
-                "failure_threshold": self.failure_threshold,
-                "timeout_seconds": self.timeout_seconds,
-                "created_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc)
-            }
-            
-            await self.timescale_client.store_circuit_breaker_state(state_data)
-        except Exception as e:
-            self.logger.error(f"Failed to update circuit breaker state: {e}")
-
-
-class CircuitBreakerOpenError(Exception):
-    """Raised when circuit breaker is open."""
-    pass
+            self.logger.warning(
+                f"Circuit breaker {self.name} opened after {self.failure_count} failures"
+            )
 
 
 class RetryManager:
-    """Manages retry logic with exponential backoff."""
-
-    def __init__(self, timescale_client: TimescaleClient):
-        """Initialize retry manager."""
-        self.timescale_client = timescale_client
-        self.logger = get_logger(__name__)
-
-    async def execute_with_retry(self, func: Callable[..., T], *args, 
-                               max_retries: int = 3, base_delay: float = 1.0,
-                               max_delay: float = 60.0, backoff_factor: float = 2.0,
-                               **kwargs) -> T:
+    """Advanced retry management with exponential backoff."""
+    
+    def __init__(self, max_retries: int = 3, base_delay: float = 1.0):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.logger = get_logger("retry_manager")
+    
+    async def execute_with_retry(
+        self,
+        func: Callable,
+        *args,
+        max_retries: Optional[int] = None,
+        base_delay: Optional[float] = None,
+        max_delay: float = 60.0,
+        exponential_base: float = 2.0,
+        jitter: bool = True,
+        **kwargs
+    ) -> Any:
         """Execute function with retry logic."""
+        retries = max_retries or self.max_retries
+        delay = base_delay or self.base_delay
+        
         last_exception = None
         
-        for attempt in range(max_retries + 1):
+        for attempt in range(retries + 1):
             try:
                 return await func(*args, **kwargs)
             except Exception as e:
                 last_exception = e
                 
-                if attempt == max_retries:
-                    # Log final failure
-                    await self._log_retry_attempt(
-                        str(uuid.uuid4()), attempt + 1, str(e), False
-                    )
-                    break
+                if attempt == retries:
+                    self.logger.error(f"Max retries ({retries}) exceeded for {func.__name__}")
+                    raise e
                 
                 # Calculate delay with exponential backoff
-                delay = min(base_delay * (backoff_factor ** attempt), max_delay)
-                
-                # Log retry attempt
-                await self._log_retry_attempt(
-                    str(uuid.uuid4()), attempt + 1, str(e), False
+                current_delay = min(
+                    delay * (exponential_base ** attempt),
+                    max_delay
                 )
                 
-                self.logger.warning(f"Attempt {attempt + 1} failed, retrying in {delay}s: {e}")
-                await asyncio.sleep(delay)
+                # Add jitter to prevent thundering herd
+                if jitter:
+                    current_delay *= (0.5 + random.random() * 0.5)
+                
+                self.logger.warning(
+                    f"Attempt {attempt + 1} failed for {func.__name__}: {e}. "
+                    f"Retrying in {current_delay:.2f}s"
+                )
+                
+                await asyncio.sleep(current_delay)
         
         raise last_exception
 
-    async def _log_retry_attempt(self, message_id: str, attempt_number: int,
-                               error_message: str, success: bool):
-        """Log retry attempt."""
-        try:
-            attempt_data = {
-                "attempt_id": str(uuid.uuid4()),
-                "message_id": message_id,
-                "attempt_number": attempt_number,
-                "error_message": error_message,
-                "attempt_time": datetime.now(timezone.utc),
-                "success": success,
-                "created_at": datetime.now(timezone.utc)
-            }
-            
-            await self.timescale_client.store_retry_attempt(attempt_data)
-        except Exception as e:
-            self.logger.error(f"Failed to log retry attempt: {e}")
-
 
 class DeadLetterQueue:
-    """Manages dead letter queue for failed messages."""
-
-    def __init__(self, timescale_client: TimescaleClient):
-        """Initialize dead letter queue."""
-        self.timescale_client = timescale_client
-        self.logger = get_logger(__name__)
-
-    async def add_message(self, original_message: Dict[str, Any], error_message: str,
-                         error_type: str, max_retries: int = 3) -> str:
+    """Dead letter queue for failed messages."""
+    
+    def __init__(self, max_size: int = 1000):
+        self.max_size = max_size
+        self.queue: List[Dict[str, Any]] = []
+        self.logger = get_logger("dead_letter_queue")
+    
+    async def add_message(
+        self,
+        message: Dict[str, Any],
+        error: Exception,
+        retry_count: int = 0
+    ) -> None:
         """Add message to dead letter queue."""
-        message_id = str(uuid.uuid4())
+        if len(self.queue) >= self.max_size:
+            # Remove oldest message
+            self.queue.pop(0)
         
-        # Calculate next retry time (exponential backoff)
-        next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=5)
-        
-        dlq_data = {
-            "message_id": message_id,
-            "original_message": original_message,
-            "error_message": error_message,
-            "error_type": error_type,
-            "retry_count": 0,
-            "max_retries": max_retries,
-            "next_retry_at": next_retry_at,
-            "created_at": datetime.now(timezone.utc)
+        dlq_entry = {
+            "message": message,
+            "error": str(error),
+            "error_type": type(error).__name__,
+            "retry_count": retry_count,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "id": f"dlq_{int(time.time())}_{len(self.queue)}"
         }
         
-        await self.timescale_client.store_dead_letter_message(dlq_data)
-        self.logger.warning(f"Added message {message_id} to dead letter queue: {error_message}")
-        
-        return message_id
-
-    async def process_retryable_messages(self) -> None:
-        """Process messages that are ready for retry."""
-        try:
-            messages = await self.timescale_client.get_retryable_dlq_messages()
-            
-            for message in messages:
-                await self._retry_message(message)
-                
-        except Exception as e:
-            self.logger.error(f"Error processing retryable messages: {e}")
-
-    async def _retry_message(self, message: Dict[str, Any]) -> None:
-        """Retry a dead letter queue message."""
-        try:
-            # Increment retry count
-            new_retry_count = message["retry_count"] + 1
-            
-            if new_retry_count > message["max_retries"]:
-                # Message exceeded max retries, mark as processed
-                await self.timescale_client.mark_dlq_message_processed(message["message_id"])
-                self.logger.error(f"Message {message['message_id']} exceeded max retries, giving up")
-                return
-            
-            # Calculate next retry time
-            delay_minutes = min(5 * (2 ** (new_retry_count - 1)), 60)  # Max 1 hour
-            next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
-            
-            # Update message
-            await self.timescale_client.update_dlq_message_retry(
-                message["message_id"], new_retry_count, next_retry_at
-            )
-            
-            self.logger.info(f"Retry {new_retry_count} scheduled for message {message['message_id']}")
-            
-        except Exception as e:
-            self.logger.error(f"Error retrying message {message['message_id']}: {e}")
-
-
-class HealthChecker:
-    """Manages health checks for system components."""
-
-    def __init__(self, timescale_client: TimescaleClient):
-        """Initialize health checker."""
-        self.timescale_client = timescale_client
-        self.logger = get_logger(__name__)
-        self.health_checks: Dict[str, Callable] = {}
-
-    def register_health_check(self, service_name: str, check_func: Callable):
-        """Register a health check function."""
-        self.health_checks[service_name] = check_func
-
-    async def run_health_checks(self) -> Dict[str, Dict[str, Any]]:
-        """Run all registered health checks."""
-        results = {}
-        
-        for service_name, check_func in self.health_checks.items():
-            try:
-                start_time = time.time()
-                result = await check_func()
-                response_time = int((time.time() - start_time) * 1000)
-                
-                if result:
-                    status = HealthStatus.HEALTHY
-                    error_message = None
-                else:
-                    status = HealthStatus.UNHEALTHY
-                    error_message = "Health check failed"
-                
-                results[service_name] = {
-                    "status": status.value,
-                    "response_time_ms": response_time,
-                    "error_message": error_message
-                }
-                
-                # Store result in database
-                await self._store_health_check_result(
-                    service_name, "system", status.value, response_time, error_message
-                )
-                
-            except Exception as e:
-                results[service_name] = {
-                    "status": HealthStatus.UNHEALTHY.value,
-                    "response_time_ms": None,
-                    "error_message": str(e)
-                }
-                
-                # Store result in database
-                await self._store_health_check_result(
-                    service_name, "system", HealthStatus.UNHEALTHY.value, None, str(e)
-                )
-                
-                self.logger.error(f"Health check failed for {service_name}: {e}")
-        
-        return results
-
-    async def _store_health_check_result(self, service_name: str, check_type: str,
-                                       status: str, response_time_ms: Optional[int],
-                                       error_message: Optional[str]):
-        """Store health check result."""
-        try:
-            result_data = {
-                "check_id": str(uuid.uuid4()),
-                "service_name": service_name,
-                "check_type": check_type,
-                "status": status,
-                "response_time_ms": response_time_ms,
-                "error_message": error_message,
-                "check_time": datetime.now(timezone.utc),
-                "created_at": datetime.now(timezone.utc)
-            }
-            
-            await self.timescale_client.store_health_check_result(result_data)
-        except Exception as e:
-            self.logger.error(f"Failed to store health check result: {e}")
-
-
-class GracefulDegradationManager:
-    """Manages graceful degradation when services fail."""
-
-    def __init__(self, timescale_client: TimescaleClient):
-        """Initialize degradation manager."""
-        self.timescale_client = timescale_client
-        self.logger = get_logger(__name__)
-        self.degradation_rules: Dict[str, Dict[str, Any]] = {}
-
-    async def load_degradation_rules(self) -> None:
-        """Load degradation rules from database."""
-        try:
-            rules = await self.timescale_client.get_degradation_rules()
-            
-            for rule in rules:
-                if rule["enabled"]:
-                    self.degradation_rules[rule["service_name"]] = rule
-                    
-            self.logger.info(f"Loaded {len(self.degradation_rules)} degradation rules")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to load degradation rules: {e}")
-
-    async def check_degradation(self, service_name: str, condition: str) -> Optional[Dict[str, Any]]:
-        """Check if service should be degraded."""
-        if service_name not in self.degradation_rules:
-            return None
-        
-        rule = self.degradation_rules[service_name]
-        
-        # Simple condition matching (can be enhanced)
-        if condition in rule["trigger_condition"]:
-            self.logger.warning(f"Degradation triggered for {service_name}: {condition}")
-            return rule
-        
-        return None
-
-    async def apply_degradation(self, service_name: str, action: str,
-                              fallback_config: Optional[Dict[str, Any]] = None) -> None:
-        """Apply degradation action."""
-        self.logger.info(f"Applying degradation for {service_name}: {action}")
-        
-        if action == DegradationAction.DISABLE_FEATURE.value:
-            # Disable feature
-            pass
-        elif action == DegradationAction.USE_FALLBACK.value:
-            # Use fallback configuration
-            if fallback_config:
-                # Apply fallback config
-                pass
-        elif action == DegradationAction.REDUCE_FUNCTIONALITY.value:
-            # Reduce functionality
-            pass
+        self.queue.append(dlq_entry)
+        self.logger.warning(f"Message added to DLQ: {dlq_entry['id']}")
+    
+    async def get_messages(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get messages from dead letter queue."""
+        return self.queue[-limit:] if self.queue else []
+    
+    async def remove_message(self, message_id: str) -> bool:
+        """Remove message from dead letter queue."""
+        for i, entry in enumerate(self.queue):
+            if entry["id"] == message_id:
+                self.queue.pop(i)
+                return True
+        return False
 
 
 class ErrorHandler:
-    """Main error handling and resilience manager."""
-
-    def __init__(self, timescale_client: TimescaleClient):
-        """Initialize error handler."""
+    """Centralized error handling and resilience management."""
+    
+    def __init__(self, timescale_client=None):
         self.timescale_client = timescale_client
-        self.logger = get_logger(__name__)
-        
-        # Initialize components
-        self.retry_manager = RetryManager(timescale_client)
-        self.dead_letter_queue = DeadLetterQueue(timescale_client)
-        self.health_checker = HealthChecker(timescale_client)
-        self.degradation_manager = GracefulDegradationManager(timescale_client)
+        self.logger = get_logger("error_handler")
         
         # Circuit breakers for different services
-        self.circuit_breakers: Dict[str, CircuitBreaker] = {}
-
-    def get_circuit_breaker(self, service_name: str, failure_threshold: int = 5,
-                          timeout_seconds: int = 60) -> CircuitBreaker:
-        """Get or create circuit breaker for service."""
-        if service_name not in self.circuit_breakers:
-            self.circuit_breakers[service_name] = CircuitBreaker(
-                service_name, failure_threshold, timeout_seconds, self.timescale_client
-            )
+        self.circuit_breakers = {
+            "database": CircuitBreaker("database", failure_threshold=3, recovery_timeout=30),
+            "websocket": CircuitBreaker("websocket", failure_threshold=5, recovery_timeout=60),
+            "external_api": CircuitBreaker("external_api", failure_threshold=3, recovery_timeout=120),
+            "ocpp_message": CircuitBreaker("ocpp_message", failure_threshold=10, recovery_timeout=30),
+        }
         
-        return self.circuit_breakers[service_name]
-
-    async def initialize(self) -> None:
-        """Initialize error handling system."""
-        try:
-            # Load degradation rules
-            await self.degradation_manager.load_degradation_rules()
-            
-            # Register default health checks
-            self._register_default_health_checks()
-            
-            self.logger.info("Error handling system initialized")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize error handling system: {e}")
-
-    def _register_default_health_checks(self) -> None:
-        """Register default health checks."""
-        # Database health check
-        self.health_checker.register_health_check("database", self._check_database_health)
+        # Retry manager
+        self.retry_manager = RetryManager(max_retries=3, base_delay=1.0)
         
-        # WebSocket health check
-        self.health_checker.register_health_check("websocket", self._check_websocket_health)
-
-    async def _check_database_health(self) -> bool:
-        """Check database health."""
-        try:
-            # Simple query to check database connectivity
-            await self.timescale_client.pg_pool.fetch("SELECT 1")
-            return True
-        except Exception:
-            return False
-
-    async def _check_websocket_health(self) -> bool:
-        """Check WebSocket health."""
-        try:
-            # Check if WebSocket server is running
-            # This would depend on the specific WebSocket implementation
-            return True
-        except Exception:
-            return False
-
-    async def cleanup_expired_data(self) -> None:
-        """Clean up expired error handling data."""
-        try:
-            # Clean up old health check results (keep last 24 hours)
-            cutoff_date = datetime.now(timezone.utc) - timedelta(hours=24)
-            await self.timescale_client.cleanup_old_health_check_results(cutoff_date)
-            
-            # Clean up old retry attempts (keep last 7 days)
-            cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
-            await self.timescale_client.cleanup_old_retry_attempts(cutoff_date)
-            
-            self.logger.info("Cleaned up expired error handling data")
-            
-        except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
-
-
-# Decorator for automatic error handling
-def with_error_handling(error_handler: ErrorHandler, service_name: str,
-                       max_retries: int = 3, use_circuit_breaker: bool = True):
-    """Decorator to add error handling to functions."""
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args, **kwargs) -> T:
+        # Dead letter queue
+        self.dlq = DeadLetterQueue(max_size=1000)
+        
+        # Error statistics
+        self.error_stats = {
+            "total_errors": 0,
+            "errors_by_type": {},
+            "errors_by_station": {},
+            "circuit_breaker_trips": 0,
+        }
+    
+    def get_circuit_breaker(self, service_name: str) -> CircuitBreaker:
+        """Get circuit breaker for service."""
+        return self.circuit_breakers.get(service_name, self.circuit_breakers["ocpp_message"])
+    
+    async def handle_error(
+        self,
+        error: Exception,
+        context: ErrorContext,
+        retry_func: Optional[Callable] = None
+    ) -> Any:
+        """Handle error with appropriate strategy."""
+        self.error_stats["total_errors"] += 1
+        
+        # Update error statistics
+        error_type = type(error).__name__
+        self.error_stats["errors_by_type"][error_type] = \
+            self.error_stats["errors_by_type"].get(error_type, 0) + 1
+        
+        if context.station_id:
+            self.error_stats["errors_by_station"][context.station_id] = \
+                self.error_stats["errors_by_station"].get(context.station_id, 0) + 1
+        
+        # Log error
+        self.logger.error(
+            f"Error in {context.action or 'unknown'}: {error}",
+            extra={
+                "error_type": error_type,
+                "station_id": context.station_id,
+                "action": context.action,
+                "severity": context.severity.value,
+                "retry_count": context.retry_count,
+            }
+        )
+        
+        # Store error in database if available
+        if self.timescale_client:
+            await self._store_error_in_db(error, context)
+        
+        # Handle based on severity
+        if context.severity == ErrorSeverity.CRITICAL:
+            await self._handle_critical_error(error, context)
+        elif context.severity == ErrorSeverity.HIGH:
+            await self._handle_high_severity_error(error, context, retry_func)
+        else:
+            await self._handle_standard_error(error, context, retry_func)
+    
+    async def _handle_critical_error(self, error: Exception, context: ErrorContext):
+        """Handle critical errors."""
+        self.logger.critical(f"Critical error: {error}")
+        
+        # Alert operations team
+        await self._send_alert("CRITICAL", f"Critical error: {error}", context)
+        
+        # Add to dead letter queue
+        await self.dlq.add_message(
+            {"action": context.action, "station_id": context.station_id},
+            error,
+            context.retry_count
+        )
+    
+    async def _handle_high_severity_error(
+        self, 
+        error: Exception, 
+        context: ErrorContext, 
+        retry_func: Optional[Callable]
+    ):
+        """Handle high severity errors with retry."""
+        if retry_func and context.retry_count < context.max_retries:
             try:
-                if use_circuit_breaker:
-                    circuit_breaker = error_handler.get_circuit_breaker(service_name)
-                    return await circuit_breaker.call(func, *args, **kwargs)
-                else:
-                    return await error_handler.retry_manager.execute_with_retry(
-                        func, *args, max_retries=max_retries, **kwargs
-                    )
-            except Exception as e:
-                # Add to dead letter queue if retries exhausted
-                await error_handler.dead_letter_queue.add_message(
-                    {"function": func.__name__, "args": str(args), "kwargs": str(kwargs)},
-                    str(e), type(e).__name__
+                # Use retry manager
+                return await self.retry_manager.execute_with_retry(
+                    retry_func,
+                    max_retries=context.max_retries - context.retry_count
                 )
-                raise
+            except Exception as retry_error:
+                self.logger.error(f"Retry failed: {retry_error}")
+                await self.dlq.add_message(
+                    {"action": context.action, "station_id": context.station_id},
+                    retry_error,
+                    context.retry_count + 1
+                )
+        else:
+            await self.dlq.add_message(
+                {"action": context.action, "station_id": context.station_id},
+                error,
+                context.retry_count
+            )
+    
+    async def _handle_standard_error(
+        self, 
+        error: Exception, 
+        context: ErrorContext, 
+        retry_func: Optional[Callable]
+    ):
+        """Handle standard errors."""
+        if retry_func and context.retry_count < context.max_retries:
+            # Simple retry with exponential backoff
+            delay = context.backoff_factor ** context.retry_count
+            await asyncio.sleep(delay)
+            
+            try:
+                return await retry_func()
+            except Exception as retry_error:
+                context.retry_count += 1
+                await self.handle_error(retry_error, context, retry_func)
+    
+    async def _store_error_in_db(self, error: Exception, context: ErrorContext):
+        """Store error information in database."""
+        try:
+            error_data = {
+                "timestamp": context.timestamp,
+                "station_id": context.station_id,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "action": context.action,
+                "severity": context.severity.value,
+                "retry_count": context.retry_count,
+                "additional_info": context.additional_info or {},
+            }
+            
+            # Store in error_logs table (would need to be created)
+            await self.timescale_client.execute_query(
+                """
+                INSERT INTO error_logs (
+                    timestamp, station_id, error_type, error_message, 
+                    action, severity, retry_count, additional_info
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    error_data["timestamp"],
+                    error_data["station_id"],
+                    error_data["error_type"],
+                    error_data["error_message"],
+                    error_data["action"],
+                    error_data["severity"],
+                    error_data["retry_count"],
+                    error_data["additional_info"],
+                )
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to store error in database: {e}")
+    
+    async def _send_alert(self, level: str, message: str, context: ErrorContext):
+        """Send alert to operations team."""
+        # In a real implementation, this would integrate with alerting systems
+        # like PagerDuty, Slack, email, etc.
+        self.logger.warning(f"ALERT [{level}]: {message}")
+    
+    def get_error_stats(self) -> Dict[str, Any]:
+        """Get error statistics."""
+        return self.error_stats.copy()
+    
+    async def get_dlq_messages(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get dead letter queue messages."""
+        return await self.dlq.get_messages(limit)
+    
+    async def reprocess_dlq_message(self, message_id: str, retry_func: Callable) -> bool:
+        """Reprocess a message from dead letter queue."""
+        messages = await self.dlq.get_messages(1000)  # Get all messages
+        message = next((m for m in messages if m["id"] == message_id), None)
+        
+        if not message:
+            return False
+        
+        try:
+            await retry_func(message["message"])
+            await self.dlq.remove_message(message_id)
+            self.logger.info(f"Successfully reprocessed DLQ message {message_id}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to reprocess DLQ message {message_id}: {e}")
+            return False
+
+
+def with_error_handling(
+    error_handler: ErrorHandler,
+    action: str,
+    severity: ErrorSeverity = ErrorSeverity.MEDIUM,
+    retry_on_failure: bool = True
+):
+    """Decorator for automatic error handling."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            context = ErrorContext(
+                error_type="Unknown",
+                message=f"Error in {func.__name__}",
+                action=action,
+                severity=severity,
+                station_id=kwargs.get("station_id"),
+            )
+            
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                retry_func = None
+                if retry_on_failure:
+                    retry_func = lambda: func(*args, **kwargs)
+                
+                await error_handler.handle_error(e, context, retry_func)
+                raise e
+        
+        return wrapper
+    return decorator
+
+
+def with_circuit_breaker(service_name: str, error_handler: ErrorHandler):
+    """Decorator for circuit breaker protection."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            circuit_breaker = error_handler.get_circuit_breaker(service_name)
+            return await circuit_breaker.call(func, *args, **kwargs)
+        
+        return wrapper
+    return decorator
+
+
+def with_retry(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    exponential_base: float = 2.0,
+    jitter: bool = True
+):
+    """Decorator for retry logic."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            retry_manager = RetryManager(max_retries, base_delay)
+            return await retry_manager.execute_with_retry(
+                func,
+                *args,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                max_delay=max_delay,
+                exponential_base=exponential_base,
+                jitter=jitter,
+                **kwargs
+            )
         
         return wrapper
     return decorator

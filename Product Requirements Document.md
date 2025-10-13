@@ -29,8 +29,8 @@ Commercial and industrial facilities face increasing demand charges that can rep
 
 ### Data Ingestion Layer
 
-#### FR1: OCPP 2.1 WebSocket Handler
-- **FR1.1**: Establish persistent WebSocket connections with OCPP 2.1 compliant chargers
+#### FR1: OCPP 2+ WebSocket Handler
+- **FR1.1**: Establish persistent WebSocket connections with OCPP 2+ compliant chargers
 - **FR1.2**: Process BootNotification, StatusNotification, and TransactionEvent messages
 - **FR1.3**: Handle MeterValues with 30-second sampling frequency
 - **FR1.4**: Support 100 concurrent charger connections per server instance (simplified for initial implementation)
