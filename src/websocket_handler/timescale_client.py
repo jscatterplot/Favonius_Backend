@@ -30,45 +30,59 @@ class TimescaleClient:
         self.connected = False
         
     async def connect(self) -> None:
-        """Establish connections to TimescaleDB."""
-        try:
-            # Create asyncpg connection pool
-            self.pg_pool = await asyncpg.create_pool(
-                host=self.config.host,
-                port=self.config.port,
-                database=self.config.database,
-                user=self.config.user,
-                password=self.config.password,
-                ssl=self.config.sslmode,
-                min_size=1,
-                max_size=self.config.max_connections,
-                command_timeout=self.config.statement_timeout,
-                server_settings={
-                    'statement_timeout': f'{self.config.statement_timeout}s',
-                    'idle_in_transaction_session_timeout': f'{self.config.idle_timeout}s'
-                }
-            )
-            
-            # Create SQLAlchemy engine for pandas operations
-            self.sqlalchemy_engine = create_engine(
-                self.config.service_url,
-                poolclass=QueuePool,
-                pool_size=self.config.pool_size,
-                max_overflow=self.config.max_connections - self.config.pool_size,
-                pool_timeout=30,
-                pool_recycle=3600,
-                echo=False
-            )
-            
-            # Test connections
-            await self._test_connections()
-            
-            self.connected = True
-            self.logger.info("TimescaleDB client connected successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to connect to TimescaleDB: {e}")
-            raise
+        """Establish connections to TimescaleDB with retry logic."""
+        await self._connect_with_retry()
+    
+    async def _connect_with_retry(self, max_retries: int = 3, base_delay: float = 1.0) -> None:
+        """Connect with exponential backoff retry."""
+        for attempt in range(max_retries):
+            try:
+                await self._establish_connections()
+                await self._verify_timescale_extension()
+                await self._test_connections()
+                
+                self.connected = True
+                self.logger.info("TimescaleDB client connected successfully")
+                return
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.logger.error(f"Failed to connect to TimescaleDB after {max_retries} attempts: {e}")
+                    raise
+                
+                delay = base_delay * (2 ** attempt)
+                self.logger.warning(f"TimescaleDB connection attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s")
+                await asyncio.sleep(delay)
+    
+    async def _establish_connections(self) -> None:
+        """Establish the actual database connections."""
+        # Create asyncpg connection pool
+        self.pg_pool = await asyncpg.create_pool(
+            host=self.config.host,
+            port=self.config.port,
+            database=self.config.database,
+            user=self.config.user,
+            password=self.config.password,
+            ssl=self.config.sslmode,
+            min_size=1,
+            max_size=self.config.max_connections,
+            command_timeout=self.config.statement_timeout,
+            server_settings={
+                'statement_timeout': f'{self.config.statement_timeout}s',
+                'idle_in_transaction_session_timeout': f'{self.config.idle_timeout}s'
+            }
+        )
+        
+        # Create SQLAlchemy engine for pandas operations
+        self.sqlalchemy_engine = create_engine(
+            self.config.service_url,
+            poolclass=QueuePool,
+            pool_size=self.config.pool_size,
+            max_overflow=self.config.max_connections - self.config.pool_size,
+            pool_timeout=30,
+            pool_recycle=3600,
+            echo=False
+        )
     
     async def disconnect(self) -> None:
         """Close all connections."""
@@ -80,6 +94,43 @@ class TimescaleClient:
         
         self.connected = False
         self.logger.info("TimescaleDB client disconnected")
+    
+    async def _verify_timescale_extension(self) -> None:
+        """Verify TimescaleDB extension is installed."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                # Check if TimescaleDB extension exists
+                result = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')"
+                )
+                if not result:
+                    self.logger.warning("TimescaleDB extension not found, attempting to create it")
+                    await conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb")
+                    self.logger.info("TimescaleDB extension created successfully")
+                else:
+                    self.logger.info("TimescaleDB extension verified")
+        except Exception as e:
+            self.logger.error(f"Failed to verify TimescaleDB extension: {e}")
+            raise
+    
+    async def health_check(self) -> bool:
+        """Check connection health."""
+        try:
+            if not self.connected or not self.pg_pool:
+                return False
+            
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+            return True
+        except Exception as e:
+            self.logger.warning(f"TimescaleDB health check failed: {e}")
+            return False
+    
+    async def reconnect(self) -> None:
+        """Reconnect to TimescaleDB."""
+        self.logger.info("Attempting to reconnect to TimescaleDB")
+        await self.disconnect()
+        await self.connect()
     
     async def _test_connections(self) -> None:
         """Test all connections."""

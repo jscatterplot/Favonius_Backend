@@ -11,6 +11,7 @@ from .config import Config
 from .server import OCPPWebSocketServer
 from .health import HealthCheckServer
 from .monitoring import setup_monitoring, get_logger
+from .connection_monitor import ConnectionMonitor
 from .supabase_client import SupabaseClient
 from .auth_manager import AuthManager
 from .data_sync import DataSyncService
@@ -46,6 +47,9 @@ class Application:
         self.analytics_service: Optional[AnalyticsService] = None
         self.price_feeder: Optional[PriceFeederService] = None
         self.optimization_engine: Optional[OptimizationEngine] = None
+        
+        # Connection monitoring
+        self.connection_monitor: Optional[ConnectionMonitor] = None
         
         # State
         self.running = False
@@ -89,6 +93,14 @@ class Application:
             # Start data sync service
             await self.data_sync_service.start()
             
+            # Initialize connection monitoring
+            self.connection_monitor = ConnectionMonitor(
+                timescale_client=self.timescale_client,
+                supabase_client=self.supabase_client,
+                check_interval=30
+            )
+            await self.connection_monitor.start_monitoring()
+            
             # Start WebSocket server
             self.running = True
             
@@ -122,6 +134,10 @@ class Application:
         
         # Stop components in reverse order
         stop_tasks = []
+        
+        # Stop connection monitoring
+        if self.connection_monitor:
+            stop_tasks.append(self.connection_monitor.stop_monitoring())
         
         if self.data_sync_service:
             stop_tasks.append(self.data_sync_service.stop())

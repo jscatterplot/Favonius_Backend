@@ -31,41 +31,54 @@ class SupabaseClient:
         self.connected = False
         
     async def connect(self) -> None:
-        """Establish connections to Supabase."""
-        try:
-            # Initialize Supabase client
-            self.client = create_client(
-                self.config.url,
-                self.config.service_key
-            )
-            
-            # Initialize async client for real-time subscriptions
-            self.async_client = AsyncClient(
-                self.config.url,
-                self.config.service_key
-            )
-            
-            # Create PostgreSQL connection pool
-            self.pg_pool = await asyncpg.create_pool(
-                host=self.config.db_host,
-                port=self.config.db_port,
-                database=self.config.db_name,
-                user=self.config.db_user,
-                password=self.config.db_password,
-                min_size=1,
-                max_size=self.config.max_connections,
-                command_timeout=self.config.connection_timeout,
-            )
-            
-            # Test connections
-            await self._test_connections()
-            
-            self.connected = True
-            self.logger.info("Supabase client connected successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to connect to Supabase: {e}")
-            raise
+        """Establish connections to Supabase with retry logic."""
+        await self._connect_with_retry()
+    
+    async def _connect_with_retry(self, max_retries: int = 3, base_delay: float = 1.0) -> None:
+        """Connect with exponential backoff retry."""
+        for attempt in range(max_retries):
+            try:
+                await self._establish_connections()
+                await self._test_connections()
+                
+                self.connected = True
+                self.logger.info("Supabase client connected successfully")
+                return
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.logger.error(f"Failed to connect to Supabase after {max_retries} attempts: {e}")
+                    raise
+                
+                delay = base_delay * (2 ** attempt)
+                self.logger.warning(f"Supabase connection attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s")
+                await asyncio.sleep(delay)
+    
+    async def _establish_connections(self) -> None:
+        """Establish the actual Supabase connections."""
+        # Initialize Supabase client
+        self.client = create_client(
+            self.config.url,
+            self.config.service_key
+        )
+        
+        # Initialize async client for real-time subscriptions
+        self.async_client = AsyncClient(
+            self.config.url,
+            self.config.service_key
+        )
+        
+        # Create PostgreSQL connection pool
+        self.pg_pool = await asyncpg.create_pool(
+            host=self.config.db_host,
+            port=self.config.db_port,
+            database=self.config.db_name,
+            user=self.config.db_user,
+            password=self.config.db_password,
+            min_size=1,
+            max_size=self.config.max_connections,
+            command_timeout=self.config.connection_timeout,
+        )
     
     async def disconnect(self) -> None:
         """Close all connections."""
@@ -77,6 +90,33 @@ class SupabaseClient:
         
         self.connected = False
         self.logger.info("Supabase client disconnected")
+    
+    async def health_check(self) -> bool:
+        """Check connection health."""
+        try:
+            if not self.connected or not self.pg_pool:
+                return False
+            
+            # Test PostgreSQL connection
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+            
+            # Test Supabase REST client
+            if self.client:
+                # Simple test query
+                response = self.client.table('_supabase_migrations').select('*').limit(1).execute()
+                # If we get here without exception, connection is healthy
+            
+            return True
+        except Exception as e:
+            self.logger.warning(f"Supabase health check failed: {e}")
+            return False
+    
+    async def reconnect(self) -> None:
+        """Reconnect to Supabase."""
+        self.logger.info("Attempting to reconnect to Supabase")
+        await self.disconnect()
+        await self.connect()
     
     async def _test_connections(self) -> None:
         """Test all connections."""
