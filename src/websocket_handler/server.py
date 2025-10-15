@@ -32,11 +32,12 @@ ERRORS_TOTAL = Counter("websocket_errors_total", "Total WebSocket errors", ["err
 class OCPPWebSocketServer:
     """High-performance OCPP 2.1 WebSocket server."""
     
-    def __init__(self, config: Config, timescale_client: TimescaleClient):
+    def __init__(self, config: Config, timescale_client: TimescaleClient, optimization_engine=None):
         """Initialize the WebSocket server."""
         self.config = config
         self.logger = get_logger(__name__)
         self.timescale_client = timescale_client
+        self.optimization_engine = optimization_engine
         
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
@@ -55,6 +56,10 @@ class OCPPWebSocketServer:
         # Rate limiting
         self.rate_limits: Dict[str, list] = defaultdict(list)
         
+        # Background task tracking
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._rate_limit_task: Optional[asyncio.Task] = None
+    
     async def start(self) -> None:
         """Start the WebSocket server and initialize components."""
         self.logger.info("Starting OCPP WebSocket server...")
@@ -62,6 +67,10 @@ class OCPPWebSocketServer:
         try:
             # Initialize components
             await self._initialize_components()
+            
+            # Wire optimization engine to connection manager
+            if self.optimization_engine and self.connection_manager:
+                self.optimization_engine.set_connection_manager(self.connection_manager)
             
             # Setup SSL context if TLS is configured
             ssl_context = self._setup_ssl_context()
@@ -85,8 +94,8 @@ class OCPPWebSocketServer:
             )
             
             # Start background tasks
-            asyncio.create_task(self._heartbeat_monitor())
-            asyncio.create_task(self._rate_limit_cleanup())
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor())
+            self._rate_limit_task = asyncio.create_task(self._rate_limit_cleanup())
             
             # Keep server running
             await self.server.wait_closed()
@@ -101,6 +110,20 @@ class OCPPWebSocketServer:
         self.logger.info("Stopping WebSocket server...")
         
         self.running = False
+        
+        # Cancel background tasks
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        if self._rate_limit_task:
+            self._rate_limit_task.cancel()
+            try:
+                await self._rate_limit_task
+            except asyncio.CancelledError:
+                pass
         
         # Close all connections
         close_tasks = []
@@ -131,6 +154,12 @@ class OCPPWebSocketServer:
             config=self.config,
             timescale_client=self.timescale_client
         )
+    
+    def set_optimization_engine(self, optimization_engine) -> None:
+        """Set optimization engine and wire it to connection manager."""
+        if optimization_engine and self.connection_manager:
+            optimization_engine.set_connection_manager(self.connection_manager)
+            self.logger.info("Optimization engine wired to connection manager")
     
     def _setup_ssl_context(self) -> Optional[ssl.SSLContext]:
         """Setup SSL context for TLS connections."""
@@ -170,7 +199,19 @@ class OCPPWebSocketServer:
             return
         
         # Extract station ID from path
-        station_id = path.strip("/") if path else f"station_{connection_id[:8]}"
+        if path.strip("/"):
+            station_id = path.strip("/")
+        else:
+            # Use full UUID to avoid collisions
+            station_id = f"station_{connection_id}"
+        
+        # Check if station already connected and clean up old connection
+        if station_id in self.station_connections:
+            old_connection_id = self.station_connections[station_id]
+            self.logger.warning(f"Station {station_id} reconnecting, cleaning up old connection")
+            # Clean up old connection
+            if old_connection_id in self.connections:
+                await self._cleanup_connection(old_connection_id, self.connections[old_connection_id], station_id)
         
         # Store connection
         self.connections[connection_id] = websocket

@@ -1,6 +1,7 @@
 """CAISO price feeder service."""
 
 import asyncio
+import contextlib
 import csv
 import io
 import zipfile

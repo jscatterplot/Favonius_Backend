@@ -21,6 +21,11 @@ class CircuitBreakerState(Enum):
     HALF_OPEN = "half_open"
 
 
+class CircuitBreakerOpenError(Exception):
+    """Raised when circuit breaker is open."""
+    pass
+
+
 class ErrorSeverity(Enum):
     """Error severity levels."""
     LOW = "low"

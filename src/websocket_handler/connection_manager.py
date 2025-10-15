@@ -31,9 +31,11 @@ class ConnectionManager:
         # Background tasks
         self._monitoring_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._started = False
+        self._running = False
         
-        # Start background monitoring
-        self._start_monitoring()
+        # Add lock for thread safety
+        self._lock = asyncio.Lock()
     
     def _start_monitoring(self) -> None:
         """Start background monitoring tasks."""
@@ -43,31 +45,38 @@ class ConnectionManager:
     async def register_connection(self, station_id: str, connection_id: str, 
                                 client_ip: str, websocket: WebSocketServerProtocol) -> None:
         """Register a new WebSocket connection."""
-        try:
-            # Store connection locally
-            self.connections[connection_id] = websocket
-            self.station_connections[station_id] = connection_id
-            self.last_heartbeats[station_id] = time.time()
+        # Start monitoring if not already started
+        if not self._started:
+            self._start_monitoring()
+            self._started = True
+            self._running = True
             
-            # Initialize connection stats
-            self.connection_stats[connection_id] = {
-                "station_id": station_id,
-                "client_ip": client_ip,
-                "connected_at": time.time(),
-                "messages_received": 0,
-                "messages_sent": 0,
-                "bytes_received": 0,
-                "bytes_sent": 0,
-                "last_activity": time.time(),
-            }
-            
-            # Redis registration removed for simplification
-            
-            self.logger.info(f"Registered connection {connection_id} for station {station_id} from {client_ip}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to register connection {connection_id}: {e}")
-            raise
+        async with self._lock:
+            try:
+                # Store connection locally
+                self.connections[connection_id] = websocket
+                self.station_connections[station_id] = connection_id
+                self.last_heartbeats[station_id] = time.time()
+                
+                # Initialize connection stats
+                self.connection_stats[connection_id] = {
+                    "station_id": station_id,
+                    "client_ip": client_ip,
+                    "connected_at": time.time(),
+                    "messages_received": 0,
+                    "messages_sent": 0,
+                    "bytes_received": 0,
+                    "bytes_sent": 0,
+                    "last_activity": time.time(),
+                }
+                
+                # Redis registration removed for simplification
+                
+                self.logger.info(f"Registered connection {connection_id} for station {station_id} from {client_ip}")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to register connection {connection_id}: {e}")
+                raise
     
     async def unregister_connection(self, station_id: str, connection_id: Optional[str] = None) -> None:
         """Unregister a WebSocket connection."""
@@ -222,16 +231,17 @@ class ConnectionManager:
     
     async def _monitor_connections(self) -> None:
         """Monitor connection health in background."""
-        while True:
+        while self._running:
             try:
                 now = time.time()
                 stale_threshold = now - (self.config.websocket.heartbeat_interval * 3)
                 stale_stations = []
                 
-                # Check for stale connections
-                for station_id, last_heartbeat in self.last_heartbeats.items():
-                    if last_heartbeat < stale_threshold:
-                        stale_stations.append(station_id)
+                # Use copy to avoid dict modification during iteration
+                async with self._lock:
+                    for station_id, last_heartbeat in self.last_heartbeats.copy().items():
+                        if last_heartbeat < stale_threshold:
+                            stale_stations.append(station_id)
                 
                 # Cleanup stale connections
                 for station_id in stale_stations:
@@ -248,21 +258,23 @@ class ConnectionManager:
     
     async def _cleanup_stale_connections(self) -> None:
         """Cleanup stale connections periodically."""
-        while True:
+        while self._running:
             try:
                 # Clean up connection stats for closed connections
                 closed_connections = []
-                for connection_id, websocket in self.connections.items():
-                    if websocket.closed:
-                        closed_connections.append(connection_id)
+                async with self._lock:
+                    for connection_id, websocket in self.connections.items():
+                        if websocket.closed:
+                            closed_connections.append(connection_id)
                 
                 for connection_id in closed_connections:
                     # Find station ID
                     station_id = None
-                    for sid, cid in self.station_connections.items():
-                        if cid == connection_id:
-                            station_id = sid
-                            break
+                    async with self._lock:
+                        for sid, cid in self.station_connections.items():
+                            if cid == connection_id:
+                                station_id = sid
+                                break
                     
                     if station_id:
                         await self.unregister_connection(station_id, connection_id)
@@ -292,27 +304,40 @@ class ConnectionManager:
         """Shutdown connection manager."""
         self.logger.info("Shutting down connection manager...")
         
+        # Stop background loops
+        self._running = False
+        
         # Cancel background tasks
         if self._monitoring_task:
             self._monitoring_task.cancel()
+            try:
+                await self._monitoring_task
+            except asyncio.CancelledError:
+                pass
         if self._cleanup_task:
             self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
         
         # Close all connections
         close_tasks = []
-        for station_id in list(self.station_connections.keys()):
-            connection = await self.get_connection(station_id)
-            if connection and not connection.closed:
-                close_tasks.append(connection.close(1001, "Server shutdown"))
+        async with self._lock:
+            for station_id in list(self.station_connections.keys()):
+                connection = await self.get_connection(station_id)
+                if connection and not connection.closed:
+                    close_tasks.append(connection.close(1001, "Server shutdown"))
         
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         
         # Clear local state
-        self.connections.clear()
-        self.station_connections.clear()
-        self.last_heartbeats.clear()
-        self.connection_stats.clear()
+        async with self._lock:
+            self.connections.clear()
+            self.station_connections.clear()
+            self.last_heartbeats.clear()
+            self.connection_stats.clear()
         
         self.logger.info("Connection manager shutdown complete")
     

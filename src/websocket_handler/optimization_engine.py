@@ -1,6 +1,7 @@
 """Simplified optimization engine coordinating charging schedules."""
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -43,6 +44,11 @@ class OptimizationEngine:
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
+    def set_connection_manager(self, connection_manager: ConnectionManager) -> None:
+        """Set the connection manager (called after server initialization)."""
+        self.connection_manager = connection_manager
+        self.logger.info("Connection manager set for optimization engine")
+    
     async def start(self) -> None:
         if not self.config.enabled:
             self.logger.info("Optimization engine disabled via configuration")
@@ -121,7 +127,7 @@ class OptimizationEngine:
                         "numberPhases": 3,
                     }
                 )
-                soc = min(1.0, max(0.0, soc + (power_kw * (self.config.timestep_minutes / 60.0)) / self.config.charge_power_kw))
+                soc = min(1.0, max(0.0, soc + (power_kw * (self.config.timestep_minutes / 60.0)) / self.config.battery_capacity_kwh))
                 current_time += timedelta(minutes=self.config.timestep_minutes)
 
             schedule = {

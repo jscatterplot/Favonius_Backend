@@ -65,8 +65,12 @@ class Application:
             # Initialize TimescaleDB components
             await self._initialize_timescale_components()
             
-            # Create WebSocket server
-            self.websocket_server = OCPPWebSocketServer(self.config, self.timescale_client)
+            # Create WebSocket server and pass optimization engine for wiring
+            self.websocket_server = OCPPWebSocketServer(
+                self.config,
+                self.timescale_client,
+                self.optimization_engine  # Pass optimization engine so it can be wired to connection manager
+            )
             
             # Create health check server
             self.health_server = HealthCheckServer(self.config.monitoring.health_check_port)
@@ -84,9 +88,6 @@ class Application:
             
             # Start data sync service
             await self.data_sync_service.start()
-
-            # Create Timescale-dependent services (price feeder, optimization)
-            await self._initialize_timescale_components()
             
             # Start WebSocket server
             self.running = True
@@ -96,7 +97,18 @@ class Application:
             )
             
             # Start WebSocket server (this blocks until shutdown)
-            await self.websocket_server.start()
+            # Check running flag periodically for graceful shutdown
+            while self.running:
+                try:
+                    # Start server and wait for it to complete
+                    await self.websocket_server.start()
+                    break  # Server completed normally
+                except Exception as e:
+                    if self.running:
+                        self.logger.error(f"WebSocket server error: {e}")
+                        await asyncio.sleep(1)  # Brief pause before retry
+                    else:
+                        break  # Shutdown requested
             
         except Exception as e:
             self.logger.error(f"Failed to start application: {e}")
@@ -169,31 +181,32 @@ class Application:
             self.timescale_client = TimescaleClient(self.config.timescale)
             await self.timescale_client.connect()
             
-            # Create telemetry ingestion service
-            self.telemetry_ingestion_service = TelemetryIngestionService(
-                self.config.timescale,
-                self.config.kafka
-            )
+            # Telemetry ingestion service removed for simplification
             
             # Create analytics service
             self.analytics_service = AnalyticsService(self.config.timescale)
             await self.analytics_service.initialize()
 
-            if self.config.price_feeder.enabled:
-                self.price_feeder = PriceFeederService(
-                    config=self.config.price_feeder,
-                    timescale_client=self.timescale_client
-                )
-                await self.price_feeder.start()
-
+            # Initialize optimization engine
             if self.config.optimization.enabled:
                 self.optimization_engine = OptimizationEngine(
                     config=self.config.optimization,
                     timescale_client=self.timescale_client,
                     supabase_client=self.supabase_client,
-                    connection_manager=None
+                    connection_manager=None  # Will be set later after WebSocket server created
                 )
                 await self.optimization_engine.start()
+            
+            # Initialize price feeder and link to optimization engine
+            if self.config.price_feeder.enabled:
+                self.price_feeder = PriceFeederService(
+                    config=self.config.price_feeder,
+                    timescale_client=self.timescale_client
+                )
+                # Link price feeder to optimization engine
+                if self.optimization_engine:
+                    self.price_feeder.set_optimization_engine(self.optimization_engine)
+                await self.price_feeder.start()
             
             # Initialize TimescaleDB schema if needed
             if self.config.environment == "development":
@@ -213,10 +226,8 @@ class Application:
         """Setup signal handlers for graceful shutdown."""
         def signal_handler(signum, frame):
             self.logger.info(f"Received signal {signum}, initiating shutdown...")
-            
-            # Create shutdown task
-            loop = asyncio.get_event_loop()
-            loop.create_task(self.stop())
+            # Set flag instead of creating async task from signal handler
+            self.running = False
         
         # Register signal handlers
         signal.signal(signal.SIGINT, signal_handler)

@@ -16,30 +16,7 @@ WEBSOCKET_CONNECTIONS = Gauge(
     "Number of active WebSocket connections"
 )
 
-MESSAGES_RECEIVED_TOTAL = Counter(
-    "websocket_messages_received_total",
-    "Total messages received",
-    ["station_id", "message_type"]
-)
-
-MESSAGES_SENT_TOTAL = Counter(
-    "websocket_messages_sent_total",
-    "Total messages sent", 
-    ["station_id", "message_type"]
-)
-
-MESSAGE_PROCESSING_DURATION = Histogram(
-    "websocket_message_processing_seconds",
-    "Time spent processing messages",
-    ["message_type"],
-    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
-)
-
-WEBSOCKET_ERRORS_TOTAL = Counter(
-    "websocket_errors_total",
-    "Total WebSocket errors",
-    ["error_type", "station_id"]
-)
+# Note: Other metrics are defined in server.py to avoid duplication
 
 # Redis metrics removed for simplification
 
@@ -152,14 +129,13 @@ class MetricsCollector:
     
     def record_message_processing_time(self, message_type: str, duration: float) -> None:
         """Record message processing time."""
-        MESSAGE_PROCESSING_DURATION.labels(message_type=message_type).observe(duration)
+        # Use the metric from server.py instead
+        pass  # This will be handled by the server's MESSAGE_PROCESSING_TIME metric
     
     def record_error(self, error_type: str, station_id: str = "unknown") -> None:
         """Record error event."""
-        WEBSOCKET_ERRORS_TOTAL.labels(
-            error_type=error_type,
-            station_id=station_id
-        ).inc()
+        # Use the metric from server.py instead
+        pass  # This will be handled by the server's ERRORS_TOTAL metric
         
         key = f"{error_type}:{station_id}"
         self._error_counts[key] = self._error_counts.get(key, 0) + 1

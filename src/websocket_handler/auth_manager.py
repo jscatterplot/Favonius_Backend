@@ -276,7 +276,7 @@ def require_auth(auth_manager: AuthManager):
     return decorator
 
 
-def require_permission(auth_manager: AuthManager, resource: str, action: str):
+def require_permission(resource: str, action: str):
     """Decorator to require specific permission."""
     def decorator(func):
         @wraps(func)
@@ -284,6 +284,11 @@ def require_permission(auth_manager: AuthManager, resource: str, action: str):
             user = kwargs.get('user')
             if not user:
                 return {'error': 'User not authenticated'}, 401
+            
+            # Get auth manager from the first argument (self)
+            auth_manager = args[0].auth_manager if hasattr(args[0], 'auth_manager') else None
+            if not auth_manager:
+                return {'error': 'Auth manager not available'}, 500
             
             # Check authorization
             if not await auth_manager.authorize_action(user, resource, action):
@@ -295,7 +300,7 @@ def require_permission(auth_manager: AuthManager, resource: str, action: str):
     return decorator
 
 
-def require_role(auth_manager: AuthManager, required_roles: List[str]):
+def require_role(required_roles: List[str]):
     """Decorator to require specific role."""
     def decorator(func):
         @wraps(func)

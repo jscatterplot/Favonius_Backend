@@ -92,6 +92,7 @@ class OptimizationServiceConfig(BaseModel):
     soc_target: float = Field(default=0.8, description="Target state of charge before departure")
     charge_power_kw: float = Field(default=22.0, description="Default charge power limit in kW")
     discharge_power_kw: float = Field(default=10.0, description="Default discharge power limit in kW")
+    battery_capacity_kwh: float = Field(default=75.0, description="Default battery capacity in kWh")
 
 
 class Config(BaseModel):
@@ -177,6 +178,7 @@ class Config(BaseModel):
                 soc_target=float(os.getenv("OPTIMIZATION_SOC_TARGET", "0.8")),
                 charge_power_kw=float(os.getenv("OPTIMIZATION_CHARGE_POWER_KW", "22.0")),
                 discharge_power_kw=float(os.getenv("OPTIMIZATION_DISCHARGE_POWER_KW", "10.0")),
+                battery_capacity_kwh=float(os.getenv("OPTIMIZATION_BATTERY_CAPACITY_KWH", "75.0")),
             ),
             environment=os.getenv("ENVIRONMENT", "development"),
             debug=os.getenv("DEBUG", "false").lower() == "true",
