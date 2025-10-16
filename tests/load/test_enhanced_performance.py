@@ -14,7 +14,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from tests.e2e.citrineos_simulator import CitrineOSSimulator, CitrineOSFleetSimulator
-from websocket_handler.server import WebSocketServer
+from websocket_handler.server import OCPPWebSocketServer
 from websocket_handler.config import Config
 from websocket_handler.monitoring import MetricsCollector
 
@@ -31,7 +31,7 @@ class TestLoadPerformance:
     async def test_server(self):
         """Start test WebSocket server."""
         config = Config()
-        server = WebSocketServer(config)
+        server = OCPPWebSocketServer(config)
         
         try:
             await server.start()
@@ -420,7 +420,7 @@ class TestLoadTestRunner:
         logger.info("Starting comprehensive load test suite")
         
         config = Config()
-        server = WebSocketServer(config)
+        server = OCPPWebSocketServer(config)
         
         try:
             await server.start()

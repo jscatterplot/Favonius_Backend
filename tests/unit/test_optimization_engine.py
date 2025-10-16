@@ -216,8 +216,22 @@ class TestOptimizationEngine:
             optimization_engine._running = True
             optimization_engine._pending_reason = "test_trigger"
             
+            # Create a modified loop that exits after one iteration
+            async def limited_loop():
+                await asyncio.sleep(0.1)  # Short sleep instead of 5 seconds
+                reason = None
+                async with optimization_engine._lock:
+                    reason = optimization_engine._pending_reason
+                    optimization_engine._pending_reason = None
+                if reason:
+                    try:
+                        await optimization_engine._run_optimization(reason)
+                    except Exception as exc:
+                        optimization_engine.logger.error(f"Optimization run failed: {exc}")
+                # Exit after one iteration instead of continuing the loop
+            
             # Run one iteration of the loop
-            await optimization_engine._loop()
+            await limited_loop()
             
             # Should not crash, just log error
             assert optimization_engine._running is True

@@ -15,7 +15,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from tests.e2e.citrineos_simulator import CitrineOSSimulator
-from websocket_handler.server import WebSocketServer
+from websocket_handler.server import OCPPWebSocketServer
 from websocket_handler.config import Config
 from websocket_handler.security_manager import SecurityManager
 from websocket_handler.privacy_manager import PrivacyManager

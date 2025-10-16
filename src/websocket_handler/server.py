@@ -10,8 +10,7 @@ from collections import defaultdict
 from typing import Dict, Optional, Set
 import uvloop
 import websockets
-from websockets.server import WebSocketServerProtocol
-from prometheus_client import Counter, Histogram, Gauge
+from websockets import WebSocketServerProtocol
 
 from .config import Config
 from .connection_manager import ConnectionManager
@@ -21,12 +20,14 @@ from .monitoring import setup_monitoring, get_logger
 from .timescale_client import TimescaleClient
 
 
-# Prometheus metrics
-CONNECTIONS_TOTAL = Gauge("websocket_connections_active_total", "Total active WebSocket connections")
-MESSAGES_RECEIVED = Counter("websocket_messages_received_total", "Total messages received", ["message_type"])
-MESSAGES_SENT = Counter("websocket_messages_sent_total", "Total messages sent", ["message_type"])
-MESSAGE_PROCESSING_TIME = Histogram("websocket_message_processing_seconds", "Message processing time", ["message_type"])
-ERRORS_TOTAL = Counter("websocket_errors_total", "Total WebSocket errors", ["error_type"])
+# Prometheus metrics - imported from monitoring module
+from .monitoring import (
+    WEBSOCKET_CONNECTIONS as CONNECTIONS_TOTAL,
+    MESSAGES_RECEIVED_TOTAL as MESSAGES_RECEIVED,
+    MESSAGES_SENT_TOTAL as MESSAGES_SENT,
+    REDIS_OPERATION_DURATION as MESSAGE_PROCESSING_TIME,
+    REDIS_OPERATIONS_TOTAL as ERRORS_TOTAL
+)
 
 
 class OCPPWebSocketServer:

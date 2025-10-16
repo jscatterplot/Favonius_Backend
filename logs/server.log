@@ -1,0 +1,14 @@
+2025-10-16 08:48:35,623 - __main__ - INFO - Loading configuration...
+2025-10-16 08:48:35,623 - __main__ - INFO - WebSocket server will bind to 0.0.0.0:9000
+2025-10-16 08:48:35,623 - __main__ - INFO - Environment: development
+2025-10-16 08:48:35,623 - __main__ - INFO - Starting application...
+2025-10-16 08:48:35 [info     ] Starting EV Charging WebSocket Handler...
+2025-10-16 08:48:35,865 - src.websocket_handler.supabase_client - WARNING - {"event": "Supabase connection attempt 1 failed: [Errno 8] nodename nor servname provided, or not known. Retrying in 1.0s", "logger": "src.websocket_handler.supabase_client", "level": "warning", "timestamp": "2025-10-16T15:48:35.865616Z"}
+2025-10-16 08:48:36,902 - src.websocket_handler.supabase_client - WARNING - {"event": "Supabase connection attempt 2 failed: [Errno 8] nodename nor servname provided, or not known. Retrying in 2.0s", "logger": "src.websocket_handler.supabase_client", "level": "warning", "timestamp": "2025-10-16T15:48:36.902684Z"}
+2025-10-16 08:48:38,922 - src.websocket_handler.supabase_client - ERROR - {"event": "Failed to connect to Supabase after 3 attempts: [Errno 8] nodename nor servname provided, or not known", "logger": "src.websocket_handler.supabase_client", "level": "error", "timestamp": "2025-10-16T15:48:38.922478Z"}
+2025-10-16 08:48:38,923 - __main__ - ERROR - {"event": "Failed to initialize Supabase components: [Errno 8] nodename nor servname provided, or not known", "logger": "__main__", "level": "error", "timestamp": "2025-10-16T15:48:38.923322Z"}
+2025-10-16 08:48:38,923 - __main__ - ERROR - {"event": "Failed to start application: [Errno 8] nodename nor servname provided, or not known", "logger": "__main__", "level": "error", "timestamp": "2025-10-16T15:48:38.923378Z"}
+2025-10-16 08:48:38,923 - __main__ - ERROR - {"event": "Application error: [Errno 8] nodename nor servname provided, or not known", "logger": "__main__", "level": "error", "timestamp": "2025-10-16T15:48:38.923453Z"}
+2025-10-16 08:48:38,923 - __main__ - INFO - {"event": "Shutting down application...", "logger": "__main__", "level": "info", "timestamp": "2025-10-16T15:48:38.923489Z"}
+2025-10-16 08:48:38,923 - __main__ - INFO - {"event": "Application shutdown complete", "logger": "__main__", "level": "info", "timestamp": "2025-10-16T15:48:38.923802Z"}
+2025-10-16 08:48:38,924 - __main__ - ERROR - Application startup failed: [Errno 8] nodename nor servname provided, or not known

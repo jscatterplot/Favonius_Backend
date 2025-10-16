@@ -592,3 +592,38 @@ async def get_timescale_schema_info(config: TimescaleConfig) -> Dict[str, Any]:
     """Get TimescaleDB schema information."""
     schema = TimescaleSchema(config)
     return await schema.get_schema_info()
+
+
+async def create_tables(client) -> None:
+    """Create tables for testing - simplified version."""
+    # This is a simplified version for testing
+    # In real usage, use create_timescale_schema_from_config
+    try:
+        await client.connect()
+        # Basic table creation for testing
+        await client.execute("""
+            CREATE TABLE IF NOT EXISTS charging_stations (
+                id SERIAL PRIMARY KEY,
+                station_id VARCHAR(255) UNIQUE NOT NULL,
+                vendor_name VARCHAR(255),
+                model VARCHAR(255),
+                serial_number VARCHAR(255),
+                firmware_version VARCHAR(255),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await client.execute("""
+            CREATE TABLE IF NOT EXISTS charging_transactions (
+                id SERIAL PRIMARY KEY,
+                transaction_id VARCHAR(255) UNIQUE NOT NULL,
+                station_id VARCHAR(255) NOT NULL,
+                connector_id INTEGER,
+                start_time TIMESTAMPTZ,
+                end_time TIMESTAMPTZ,
+                energy_delivered DECIMAL(10,3),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+    except Exception as e:
+        print(f"Error creating tables: {e}")
+        raise

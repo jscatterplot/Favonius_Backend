@@ -1,0 +1,6 @@
+INFO:__main__:Starting test server...
+2025-10-16 08:49:19 [warning  ] TimescaleDB connection attempt 1 failed: Multiple exceptions: [Errno 61] Connect call failed ('127.0.0.1', 5432), [Errno 61] Connect call failed ('::1', 5432, 0, 0). Retrying in 1.0s
+2025-10-16 08:49:20 [warning  ] TimescaleDB connection attempt 2 failed: Multiple exceptions: [Errno 61] Connect call failed ('127.0.0.1', 5432), [Errno 61] Connect call failed ('::1', 5432, 0, 0). Retrying in 2.0s
+2025-10-16 08:49:22 [error    ] Failed to connect to TimescaleDB after 3 attempts: Multiple exceptions: [Errno 61] Connect call failed ('127.0.0.1', 5432), [Errno 61] Connect call failed ('::1', 5432, 0, 0)
+ERROR:__main__:Server error: Multiple exceptions: [Errno 61] Connect call failed ('127.0.0.1', 5432), [Errno 61] Connect call failed ('::1', 5432, 0, 0)
+2025-10-16 08:49:22 [info     ] TimescaleDB client disconnected

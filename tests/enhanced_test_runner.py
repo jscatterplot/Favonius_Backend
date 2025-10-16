@@ -16,8 +16,13 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
-from tests.e2e.citrineos_simulator import CitrineOSSimulator, CitrineOSFleetSimulator
-from websocket_handler.server import WebSocketServer
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
+
+from e2e.citrineos_simulator import CitrineOSSimulator, CitrineOSFleetSimulator
+from websocket_handler.server import OCPPWebSocketServer
 from websocket_handler.config import Config
 
 

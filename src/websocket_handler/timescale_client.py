@@ -74,15 +74,19 @@ class TimescaleClient:
         )
         
         # Create SQLAlchemy engine for pandas operations
-        self.sqlalchemy_engine = create_engine(
-            self.config.service_url,
-            poolclass=QueuePool,
-            pool_size=self.config.pool_size,
-            max_overflow=self.config.max_connections - self.config.pool_size,
-            pool_timeout=30,
-            pool_recycle=3600,
-            echo=False
-        )
+        try:
+            self.sqlalchemy_engine = create_engine(
+                self.config.service_url,
+                poolclass=QueuePool,
+                pool_size=self.config.pool_size,
+                max_overflow=self.config.max_connections - self.config.pool_size,
+                pool_timeout=30,
+                pool_recycle=3600,
+                echo=False
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to create SQLAlchemy engine: {e}. Continuing with asyncpg only.")
+            self.sqlalchemy_engine = None
     
     async def disconnect(self) -> None:
         """Close all connections."""
@@ -140,11 +144,12 @@ class TimescaleClient:
             if result != 1:
                 raise Exception("AsyncPG connection test failed")
         
-        # Test SQLAlchemy connection
-        with self.sqlalchemy_engine.connect() as conn:
-            result = conn.execute(text('SELECT 1')).scalar()
-            if result != 1:
-                raise Exception("SQLAlchemy connection test failed")
+        # Test SQLAlchemy connection (if available)
+        if self.sqlalchemy_engine:
+            with self.sqlalchemy_engine.connect() as conn:
+                result = conn.execute(text('SELECT 1')).scalar()
+                if result != 1:
+                    raise Exception("SQLAlchemy connection test failed")
     
     # Telemetry Data Operations
     async def insert_telemetry_batch(self, telemetry_data: List[Dict[str, Any]]) -> None:

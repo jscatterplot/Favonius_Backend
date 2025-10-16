@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from typing import Dict, Optional, Set
-from websockets.server import WebSocketServerProtocol
+from websockets import WebSocketServerProtocol
 
 from .config import Config
 # Redis removed for simplification

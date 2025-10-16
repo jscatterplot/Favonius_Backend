@@ -32,20 +32,22 @@ class TestDatabaseIntegration:
     async def temp_db_client(self):
         """Create temporary database client for testing."""
         # Use in-memory SQLite for testing
-        client = TimescaleClient(
-            host=":memory:",
-            port=0,
+        config = TimescaleConfig(
+            service_url="sqlite:///:memory:",
+            host="localhost",
+            port=5432,
             database="test_db",
             user="test",
             password="test"
         )
+        client = TimescaleClient(config)
         
         try:
-            await client.initialize()
+            await client.connect()
             await create_tables(client)
             yield client
         finally:
-            await client.close()
+            await client.disconnect()
 
     @pytest.fixture
     def test_config(self):
@@ -68,9 +70,9 @@ class TestDatabaseIntegration:
         )
 
     @pytest.fixture
-    def connection_manager(self):
+    def connection_manager(self, test_config):
         """Create connection manager."""
-        return ConnectionManager()
+        return ConnectionManager(test_config)
 
     @pytest.fixture
     def ocpp_handler(self, test_config, temp_db_client, connection_manager):
