@@ -521,7 +521,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Process variables request
         asyncio.create_task(self._handle_get_variables(get_variable_data))
         
-        return call_result.GetVariables()
+        return call_result.GetVariables(get_variable_result=[])
     
     @on(Action.set_variables)
     def on_set_variables(self, set_variable_data: list, **kwargs):
@@ -531,7 +531,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Process variables set request
         asyncio.create_task(self._handle_set_variables(set_variable_data))
         
-        return call_result.SetVariables()
+        return call_result.SetVariables(set_variable_result=[])
     
     @on(Action.get_base_report)
     def on_get_base_report(self, request_id: int, report_base: str, **kwargs):
@@ -570,7 +570,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             charging_profile_purpose, stack_level
         ))
         
-        return call_result.GetChargingProfiles()
+        return call_result.GetChargingProfiles(status="Accepted")
     
     @on(Action.clear_charging_profile)
     def on_clear_charging_profile(self, charging_profile_id: Optional[int] = None,
@@ -584,7 +584,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             charging_profile_id, charging_profile_purpose, stack_level
         ))
         
-        return call_result.ClearChargingProfile()
+        return call_result.ClearChargingProfile(status="Accepted")
     
     @on(Action.get_composite_schedule)
     def on_get_composite_schedule(self, request_id: int, evse_id: int, duration: int,
@@ -625,7 +625,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             evse_id, id_token, remote_start_id, charging_profile, evse_id_token
         ))
         
-        return call_result.RequestStartTransaction()
+        return call_result.RequestStartTransaction(status="Accepted")
     
     @on(Action.request_stop_transaction)
     def on_request_stop_transaction(self, transaction_id: str, reason: Optional[str] = None, **kwargs):
@@ -645,7 +645,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Process reset request
         asyncio.create_task(self._handle_reset(type, evse_id))
         
-        return call_result.Reset()
+        return call_result.Reset(status="Accepted")
     
     @on(Action.change_availability)
     def on_change_availability(self, operational_status: str, evse: Optional[dict] = None, **kwargs):
@@ -655,7 +655,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Process change availability request
         asyncio.create_task(self._handle_change_availability(operational_status, evse))
         
-        return call_result.ChangeAvailability()
+        return call_result.ChangeAvailability(status="Accepted")
     
     @on(Action.trigger_message)
     def on_trigger_message(self, requested_message: str, evse: Optional[dict] = None, **kwargs):
@@ -864,7 +864,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             request_id, monitoring_base, monitoring_criterion, component_name, variable_name
         ))
         
-        return call_result.GetMonitoringReport()
+        return call_result.GetMonitoringReport(status="Accepted")
 
     @on(Action.set_variable_monitoring)
     def on_set_variable_monitoring(self, component_name: str, variable_name: str,
@@ -918,7 +918,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             message_info, evse_id, connector_id
         ))
         
-        return call_result.SetDisplayMessage()
+        return call_result.SetDisplayMessage(status="Accepted")
 
     @on(Action.clear_display_message)
     def on_clear_display_message(self, message_id: Optional[str] = None,
@@ -947,7 +947,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             request_id, customer_certificate_id, id_token, customer_identifier
         ))
         
-        return call_result.CustomerInformation()
+        return call_result.CustomerInformation(status="Accepted")
 
     # Note: delete_customer_information is not supported in OCPP 2.1
     

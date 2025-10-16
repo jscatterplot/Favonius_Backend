@@ -228,7 +228,7 @@ class MonitoringManager:
                     monitoring_data.append(MonitoringDataType(
                         component=ComponentType(name=var["component_name"]),
                         variable=VariableType(name=var["variable_name"]),
-                        variable_value=var["actual_value"]
+                        variable_monitoring=[]
                     ))
             else:
                 # Get all configuration data
@@ -237,7 +237,7 @@ class MonitoringManager:
                     monitoring_data.append(MonitoringDataType(
                         component=ComponentType(name=var["component_name"]),
                         variable=VariableType(name=var["variable_name"]),
-                        variable_value=var["actual_value"]
+                        variable_monitoring=[]
                     ))
 
         elif monitoring_base == "Operational":

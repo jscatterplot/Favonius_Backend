@@ -3,6 +3,7 @@
 import logging
 import sys
 import time
+import asyncio
 from typing import Dict, Any
 import structlog
 from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
@@ -14,6 +15,26 @@ from .config import MonitoringConfig
 WEBSOCKET_CONNECTIONS = Gauge(
     "websocket_connections_active", 
     "Number of active WebSocket connections"
+)
+
+MESSAGES_RECEIVED_TOTAL = Counter(
+    "websocket_messages_received_total",
+    "Total number of WebSocket messages received"
+)
+
+MESSAGES_SENT_TOTAL = Counter(
+    "websocket_messages_sent_total", 
+    "Total number of WebSocket messages sent"
+)
+
+REDIS_OPERATION_DURATION = Histogram(
+    "redis_operation_duration_seconds",
+    "Duration of Redis operations"
+)
+
+REDIS_OPERATIONS_TOTAL = Counter(
+    "redis_operations_total",
+    "Total number of Redis operations"
 )
 
 # Note: Other metrics are defined in server.py to avoid duplication
@@ -213,16 +234,28 @@ def timer(operation_name: str):
     return decorator
 
 
-async def async_timer(operation_name: str):
+class AsyncTimer:
     """Async context manager for timing operations."""
-    start_time = time.time()
-    try:
-        yield
-    finally:
-        duration = time.time() - start_time
-        if "message" in operation_name.lower():
-            message_type = operation_name.split("_")[-1] if "_" in operation_name else "unknown"
-            metrics_collector.record_message_processing_time(message_type, duration)
+    
+    def __init__(self, operation_name: str):
+        self.operation_name = operation_name
+        self.start_time = None
+    
+    async def __aenter__(self):
+        self.start_time = time.time()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.start_time:
+            duration = time.time() - self.start_time
+            if "message" in self.operation_name.lower():
+                message_type = self.operation_name.split("_")[-1] if "_" in self.operation_name else "unknown"
+                metrics_collector.record_message_processing_time(message_type, duration)
+
+
+def async_timer(operation_name: str):
+    """Create async timer context manager."""
+    return AsyncTimer(operation_name)
 
 
 class HealthChecker:

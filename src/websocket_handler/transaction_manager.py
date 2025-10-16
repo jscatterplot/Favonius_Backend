@@ -233,14 +233,14 @@ class TransactionManager:
         """Authorize ID token."""
         try:
             # Check cache first
-            cache_key = f"{id_token.type.value}:{id_token.id_token}"
+            cache_key = f"{id_token.type}:{id_token.id_token}"
             if cache_key in self.auth_cache:
                 cached_auth = self.auth_cache[cache_key]
                 if datetime.now(timezone.utc) < cached_auth["expires_at"]:
                     return cached_auth["result"]
             
             # Check database for token
-            token_info = await self.timescale_client.get_id_token_info(id_token.id_token, id_token.type.value)
+            token_info = await self.timescale_client.get_id_token_info(id_token.id_token, id_token.type)
             
             if token_info:
                 # Token found and valid
@@ -372,7 +372,7 @@ class TransactionManager:
             "evse_id": transaction_info.evse_id,
             "connector_id": transaction_info.connector_id,
             "id_token": id_token.id_token,
-            "id_token_type": id_token.type.value,
+            "id_token_type": id_token.type,
             "charging_state": transaction_info.charging_state.value if transaction_info.charging_state else None,
             "remote_start_id": transaction_info.remote_start_id,
             "started_at": datetime.now(timezone.utc)

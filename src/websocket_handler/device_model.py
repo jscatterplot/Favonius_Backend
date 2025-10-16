@@ -7,6 +7,8 @@ from enum import Enum
 from typing import Dict, List, Optional, Any, Set
 import json
 
+from ocpp.v21.enums import AttributeEnumType
+
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
 
@@ -806,7 +808,7 @@ class DeviceModel:
         self._add_standard_variable("ChargingStation", "SupportedUnitTypes", VariableType.STRING, "ReadOnly")
         self._add_standard_variable("ChargingStation", "SupportedV2GModes", VariableType.STRING, "ReadOnly")
         self._add_standard_variable("ChargingStation", "SupportedV2XChargingCtrlrTypes", VariableType.STRING, "ReadOnly")
-        self._add_standard_variable("ChargingStation", "SupportedV2XChargingCtrlrTypes", VariableType.STRING, "ReadOnly")
+        self._add_standard_variable("ChargingStation", "HeartbeatInterval", VariableType.INTEGER, "ReadWrite")
         
         # EVSE variables
         self._add_standard_variable("EVSE", "AvailabilityState", VariableType.ENUM, "ReadWrite")
@@ -887,6 +889,18 @@ class DeviceModel:
         
         self.variable_cache[component][name] = variable
     
+    def _add_component(self, station_id: str, component: str, evse_id: str = "") -> None:
+        """Add a component to the device model."""
+        component_key = f"{station_id}:{component}:{evse_id}"
+        if station_id not in self.device_cache:
+            self.device_cache[station_id] = {}
+        if component not in self.device_cache[station_id]:
+            self.device_cache[station_id][component] = {}
+        if evse_id not in self.device_cache[station_id][component]:
+            self.device_cache[station_id][component][evse_id] = {}
+        
+        self.logger.debug(f"Added component {component} for station {station_id}, evse {evse_id}")
+
     async def initialize_complete_device_model(self, station_id: str, station_info: Dict[str, Any]) -> None:
         """Initialize complete device model with full component hierarchy."""
         try:
@@ -933,29 +947,29 @@ class DeviceModel:
     
     async def _initialize_charging_station_component(self, station_id: str, station_info: Dict[str, Any]) -> None:
         """Initialize ChargingStation component."""
-        await self._add_component(station_id, "ChargingStation", "")
+        self._add_component(station_id, "ChargingStation", "")
         
         # Add all ChargingStation variables
         variables = StandardOCPPVariables.get_charging_station_variables()
         for var_def in variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "ChargingStation", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
         
         # Set station-specific values
-        await self._set_variable(station_id, "ChargingStation", "", "VendorName", "", 
-                               AttributeEnumType.Actual, station_info.get("vendor_name", "Unknown"))
-        await self._set_variable(station_id, "ChargingStation", "", "Model", "", 
-                               AttributeEnumType.Actual, station_info.get("model", "Unknown"))
-        await self._set_variable(station_id, "ChargingStation", "", "SerialNumber", "", 
-                               AttributeEnumType.Actual, station_info.get("serial_number", "Unknown"))
-        await self._set_variable(station_id, "ChargingStation", "", "FirmwareVersion", "", 
-                               AttributeEnumType.Actual, station_info.get("firmware_version", "1.0.0"))
-        await self._set_variable(station_id, "ChargingStation", "", "SupportedFeatureProfiles", "", 
-                               AttributeEnumType.Actual, "Core,SmartCharging,RemoteTrigger,Reservation,LocalAuthListManagement,SoC,RemoteControl,DisplayMessages,ISO15118Pnc,ISO15118Common,DeviceData,Monitoring,LocalListManagement,ExtendedTriggerMessage,ISO15118PnC,ISO15118Common,DeviceData,Monitoring,LocalListManagement,ExtendedTriggerMessage")
-        await self._set_variable(station_id, "ChargingStation", "", "SupportedProtocolVersions", "", 
-                               AttributeEnumType.Actual, "2.0.1")
+        await self._set_variable_value(station_id, "ChargingStation", "", "VendorName", "", 
+                               AttributeEnumType.actual, station_info.get("vendor_name", "Unknown"))
+        await self._set_variable_value(station_id, "ChargingStation", "", "Model", "", 
+                               AttributeEnumType.actual, station_info.get("model", "Unknown"))
+        await self._set_variable_value(station_id, "ChargingStation", "", "SerialNumber", "", 
+                               AttributeEnumType.actual, station_info.get("serial_number", "Unknown"))
+        await self._set_variable_value(station_id, "ChargingStation", "", "FirmwareVersion", "", 
+                               AttributeEnumType.actual, station_info.get("firmware_version", "1.0.0"))
+        await self._set_variable_value(station_id, "ChargingStation", "", "SupportedFeatureProfiles", "", 
+                               AttributeEnumType.actual, "Core,SmartCharging,RemoteTrigger,Reservation,LocalAuthListManagement,SoC,RemoteControl,DisplayMessages,ISO15118Pnc,ISO15118Common,DeviceData,Monitoring,LocalListManagement,ExtendedTriggerMessage,ISO15118PnC,ISO15118Common,DeviceData,Monitoring,LocalListManagement,ExtendedTriggerMessage")
+        await self._set_variable_value(station_id, "ChargingStation", "", "SupportedProtocolVersions", "", 
+                               AttributeEnumType.actual, "2.0.1")
     
     async def _initialize_evse_components(self, station_id: str, station_info: Dict[str, Any]) -> None:
         """Initialize EVSE components."""
@@ -963,25 +977,25 @@ class DeviceModel:
         num_evses = station_info.get("num_evses", 1)
         
         for evse_id in range(1, num_evses + 1):
-            await self._add_component(station_id, "EVSE", str(evse_id))
+            self._add_component(station_id, "EVSE", str(evse_id))
             
             # Add all EVSE variables
             variables = StandardOCPPVariables.get_evse_variables()
             for var_def in variables:
-                await self._set_variable(
+                await self._set_variable_value(
                     station_id, "EVSE", str(evse_id), var_def["name"], "",
-                    AttributeEnumType.Actual, var_def.get("default_value", "")
+                    AttributeEnumType.actual, var_def.get("default_value", "")
                 )
             
             # Set EVSE-specific values
-            await self._set_variable(station_id, "EVSE", str(evse_id), "AvailabilityState", "", 
-                                   AttributeEnumType.Actual, "Operative")
-            await self._set_variable(station_id, "EVSE", str(evse_id), "Enabled", "", 
-                                   AttributeEnumType.Actual, "true")
-            await self._set_variable(station_id, "EVSE", str(evse_id), "Power", "", 
-                                   AttributeEnumType.Actual, str(station_info.get("max_power", 22.0)))
-            await self._set_variable(station_id, "EVSE", str(evse_id), "V2XCapability", "", 
-                                   AttributeEnumType.Actual, str(station_info.get("v2x_capable", False)).lower())
+            await self._set_variable_value(station_id, "EVSE", str(evse_id), "AvailabilityState", "", 
+                                   AttributeEnumType.actual, "Operative")
+            await self._set_variable_value(station_id, "EVSE", str(evse_id), "Enabled", "", 
+                                   AttributeEnumType.actual, "true")
+            await self._set_variable_value(station_id, "EVSE", str(evse_id), "Power", "", 
+                                   AttributeEnumType.actual, str(station_info.get("max_power", 22.0)))
+            await self._set_variable_value(station_id, "EVSE", str(evse_id), "V2XCapability", "", 
+                                   AttributeEnumType.actual, str(station_info.get("v2x_capable", False)).lower())
     
     async def _initialize_connector_components(self, station_id: str, station_info: Dict[str, Any]) -> None:
         """Initialize Connector components."""
@@ -989,61 +1003,61 @@ class DeviceModel:
         num_connectors = station_info.get("num_connectors", 1)
         
         for connector_id in range(1, num_connectors + 1):
-            await self._add_component(station_id, "Connector", str(connector_id))
+            self._add_component(station_id, "Connector", str(connector_id))
             
             # Add all Connector variables
             variables = StandardOCPPVariables.get_connector_variables()
             for var_def in variables:
-                await self._set_variable(
+                await self._set_variable_value(
                     station_id, "Connector", str(connector_id), var_def["name"], "",
-                    AttributeEnumType.Actual, var_def.get("default_value", "")
+                    AttributeEnumType.actual, var_def.get("default_value", "")
                 )
             
             # Set Connector-specific values
-            await self._set_variable(station_id, "Connector", str(connector_id), "AvailabilityState", "", 
-                                   AttributeEnumType.Actual, "Operative")
-            await self._set_variable(station_id, "Connector", str(connector_id), "Enabled", "", 
-                                   AttributeEnumType.Actual, "true")
-            await self._set_variable(station_id, "Connector", str(connector_id), "ConnectorType", "", 
-                                   AttributeEnumType.Actual, station_info.get("connector_type", "cType2"))
-            await self._set_variable(station_id, "Connector", str(connector_id), "ConnectorFormat", "", 
-                                   AttributeEnumType.Actual, "Socket")
-            await self._set_variable(station_id, "Connector", str(connector_id), "ConnectorPowerType", "", 
-                                   AttributeEnumType.Actual, "AC3")
-            await self._set_variable(station_id, "Connector", str(connector_id), "MaxVoltage", "", 
-                                   AttributeEnumType.Actual, str(station_info.get("max_voltage", 400)))
-            await self._set_variable(station_id, "Connector", str(connector_id), "MaxAmperage", "", 
-                                   AttributeEnumType.Actual, str(station_info.get("max_amperage", 32)))
-            await self._set_variable(station_id, "Connector", str(connector_id), "MaxElectricPower", "", 
-                                   AttributeEnumType.Actual, str(station_info.get("max_power", 22000)))
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "AvailabilityState", "", 
+                                   AttributeEnumType.actual, "Operative")
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "Enabled", "", 
+                                   AttributeEnumType.actual, "true")
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "ConnectorType", "", 
+                                   AttributeEnumType.actual, station_info.get("connector_type", "cType2"))
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "ConnectorFormat", "", 
+                                   AttributeEnumType.actual, "Socket")
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "ConnectorPowerType", "", 
+                                   AttributeEnumType.actual, "AC3")
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "MaxVoltage", "", 
+                                   AttributeEnumType.actual, str(station_info.get("max_voltage", 400)))
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "MaxAmperage", "", 
+                                   AttributeEnumType.actual, str(station_info.get("max_amperage", 32)))
+            await self._set_variable_value(station_id, "Connector", str(connector_id), "MaxElectricPower", "", 
+                                   AttributeEnumType.actual, str(station_info.get("max_power", 22000)))
     
     async def _initialize_smart_charging_component(self, station_id: str) -> None:
         """Initialize SmartCharging component."""
-        await self._add_component(station_id, "SmartCharging", "")
+        self._add_component(station_id, "SmartCharging", "")
         
         # Add all SmartCharging variables
         variables = StandardOCPPVariables.get_smart_charging_variables()
         for var_def in variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "SmartCharging", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def _initialize_v2x_controller_component(self, station_id: str) -> None:
         """Initialize V2XController component."""
-        await self._add_component(station_id, "V2XController", "")
+        self._add_component(station_id, "V2XController", "")
         
         # Add all V2XController variables
         variables = StandardOCPPVariables.get_v2x_controller_variables()
         for var_def in variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "V2XController", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def _initialize_security_component(self, station_id: str) -> None:
         """Initialize Security component."""
-        await self._add_component(station_id, "Security", "")
+        self._add_component(station_id, "Security", "")
         
         # Add Security variables
         security_variables = [
@@ -1057,14 +1071,14 @@ class DeviceModel:
         ]
         
         for var_def in security_variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "Security", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def _initialize_display_component(self, station_id: str) -> None:
         """Initialize Display component."""
-        await self._add_component(station_id, "Display", "")
+        self._add_component(station_id, "Display", "")
         
         # Add Display variables
         display_variables = [
@@ -1075,14 +1089,14 @@ class DeviceModel:
         ]
         
         for var_def in display_variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "Display", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def _initialize_meter_component(self, station_id: str) -> None:
         """Initialize Meter component."""
-        await self._add_component(station_id, "Meter", "")
+        self._add_component(station_id, "Meter", "")
         
         # Add Meter variables
         meter_variables = [
@@ -1094,14 +1108,14 @@ class DeviceModel:
         ]
         
         for var_def in meter_variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "Meter", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def _initialize_network_component(self, station_id: str) -> None:
         """Initialize Network component."""
-        await self._add_component(station_id, "Network", "")
+        self._add_component(station_id, "Network", "")
         
         # Add Network variables
         network_variables = [
@@ -1112,14 +1126,14 @@ class DeviceModel:
         ]
         
         for var_def in network_variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "Network", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def _initialize_firmware_component(self, station_id: str) -> None:
         """Initialize Firmware component."""
-        await self._add_component(station_id, "Firmware", "")
+        self._add_component(station_id, "Firmware", "")
         
         # Add Firmware variables
         firmware_variables = [
@@ -1131,14 +1145,14 @@ class DeviceModel:
         ]
         
         for var_def in firmware_variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "Firmware", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def _initialize_diagnostics_component(self, station_id: str) -> None:
         """Initialize Diagnostics component."""
-        await self._add_component(station_id, "Diagnostics", "")
+        self._add_component(station_id, "Diagnostics", "")
         
         # Add Diagnostics variables
         diagnostics_variables = [
@@ -1150,9 +1164,9 @@ class DeviceModel:
         ]
         
         for var_def in diagnostics_variables:
-            await self._set_variable(
+            await self._set_variable_value(
                 station_id, "Diagnostics", "", var_def["name"], "",
-                AttributeEnumType.Actual, var_def.get("default_value", "")
+                AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
     async def get_variables(self, station_id: str, get_variable_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
