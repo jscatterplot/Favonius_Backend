@@ -45,14 +45,32 @@ class MockOCPPServer:
                         }]
                     elif action == "Heartbeat":
                         response = [3, message_id, {
-                            "currentTime": "2024-01-01T00:00:00.000Z"
+                            "currentTime": "2024-01-01T00:00:00.000Z",
+                            "status": "Accepted"
                         }]
                     elif action == "StatusNotification":
-                        response = [3, message_id, {}]
+                        # StatusNotification has no response in OCPP
+                        continue
                     elif action == "MeterValues":
-                        response = [3, message_id, {}]
+                        # MeterValues has no response in OCPP
+                        continue
                     elif action == "TransactionEvent":
-                        response = [3, message_id, {}]
+                        # Generate a transaction ID for transaction events
+                        transaction_id = f"TXN_{station_id}_{message_id}"
+                        response = [3, message_id, {
+                            "status": "Accepted",
+                            "transactionId": transaction_id
+                        }]
+                    elif action == "RequestStartTransaction":
+                        # Generate a transaction ID for start transaction requests
+                        transaction_id = f"TXN_{station_id}_{message_id}"
+                        response = [3, message_id, {
+                            "status": "Accepted",
+                            "transactionId": transaction_id
+                        }]
+                    elif action == "InvalidMessage":
+                        # Return error message for invalid messages
+                        response = [4, message_id, "InvalidMessage", "Invalid message format"]
                     else:
                         # Generic response for other actions
                         response = [3, message_id, {"status": "Accepted"}]

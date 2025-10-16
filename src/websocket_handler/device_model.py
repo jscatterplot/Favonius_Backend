@@ -593,6 +593,386 @@ class StandardOCPPVariables:
         ]
     
     @staticmethod
+    def get_v2x_charging_ctrlr_variables() -> List[Dict[str, Any]]:
+        """Get standardized V2XChargingCtrlr variables."""
+        return [
+            {
+                "name": "Enabled",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Activate/deactivate V2X functionality",
+                "default_value": "false",
+                "required": True
+            },
+            {
+                "name": "SupportedEnergyTransferModes",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Lists supported energy transfer services (AC_BPT, DC_BPT, etc.)",
+                "default_value": "AC_BPT,DC_BPT",
+                "required": True
+            },
+            {
+                "name": "SupportedOperationModes",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Supported operation modes",
+                "default_value": "ChargingOnly,CentralSetpoint,LocalFrequency,LocalLoadBalancing",
+                "required": True
+            },
+            {
+                "name": "LocalFrequencyUpdateThreshold",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Net frequency change threshold to trigger setpoint recalculation in mHz",
+                "default_value": "50",
+                "min_value": "1",
+                "max_value": "1000",
+                "required": True
+            },
+            {
+                "name": "TxStartedMeasurands",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Measurands for transaction started events",
+                "default_value": "Power.Active.Import,Power.Active.Export,SoC",
+                "required": False
+            },
+            {
+                "name": "TxEndedMeasurands",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Measurands for transaction ended events",
+                "default_value": "Energy.Active.Import.Register,Energy.Active.Export.Register",
+                "required": False
+            },
+            {
+                "name": "TxUpdatedMeasurands",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Measurands for transaction updated events",
+                "default_value": "Power.Active.Import,Power.Active.Export,SoC,Frequency",
+                "required": False
+            },
+            {
+                "name": "TxEndedInterval",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Interval for transaction ended events in seconds",
+                "default_value": "60",
+                "min_value": "1",
+                "max_value": "3600",
+                "required": False
+            },
+            {
+                "name": "TxUpdatedInterval",
+                "type": VariableType.INTEGER.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Interval for transaction updated events in seconds",
+                "default_value": "30",
+                "min_value": "1",
+                "max_value": "3600",
+                "required": False
+            },
+            {
+                "name": "LocalLoadBalancing.UpperThreshold",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Upper threshold for local load balancing in Watts",
+                "default_value": "10000.0",
+                "required": True
+            },
+            {
+                "name": "LocalLoadBalancing.LowerThreshold",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Lower threshold for local load balancing in Watts",
+                "default_value": "5000.0",
+                "required": True
+            },
+            {
+                "name": "LocalLoadBalancing.UpperOffset",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Upper offset for local load balancing in Watts",
+                "default_value": "1000.0",
+                "required": True
+            },
+            {
+                "name": "LocalLoadBalancing.LowerOffset",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Lower offset for local load balancing in Watts",
+                "default_value": "1000.0",
+                "required": True
+            }
+        ]
+    
+    @staticmethod
+    def get_dc_der_ctrlr_variables() -> List[Dict[str, Any]]:
+        """Get standardized DCDERCtrlr variables."""
+        return [
+            # Power Ratings
+            {
+                "name": "MaxW",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Active power rating at unity power factor in Watts",
+                "required": True
+            },
+            {
+                "name": "OverExcitedW",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Active power at specified over-excited power factor in Watts",
+                "required": True
+            },
+            {
+                "name": "OverExcitedPF",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Over-excited power factor",
+                "required": True
+            },
+            {
+                "name": "UnderExcitedW",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Active power at specified under-excited power factor in Watts",
+                "required": True
+            },
+            {
+                "name": "UnderExcitedPF",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Under-excited power factor",
+                "required": True
+            },
+            {
+                "name": "MaxVA",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum apparent power rating in VA",
+                "required": True
+            },
+            {
+                "name": "MaxVar",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum injected reactive power in var",
+                "required": True
+            },
+            {
+                "name": "MaxVarNeg",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum absorbed reactive power in var",
+                "required": True
+            },
+            {
+                "name": "MaxChargeRateW",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum active power charge rating in Watts",
+                "required": True
+            },
+            {
+                "name": "MaxChargeRateVA",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum apparent power charge rating in VA",
+                "required": True
+            },
+            # Voltage Ratings
+            {
+                "name": "VNom",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Nominal AC voltage rating in Volts RMS",
+                "required": False
+            },
+            {
+                "name": "MaxV",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Maximum AC voltage rating in Volts RMS",
+                "required": False
+            },
+            {
+                "name": "MinV",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Minimum AC voltage rating in Volts RMS",
+                "required": False
+            },
+            # Control Support
+            {
+                "name": "ModesSupported",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Supported control mode functions",
+                "default_value": "FixedPFInject,VoltVar,WattVar,FixedVar,VoltWatt,FreqDroop",
+                "required": True
+            },
+            # Hardware Information
+            {
+                "name": "InverterManufacturer",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Inverter manufacturer",
+                "required": True
+            },
+            {
+                "name": "InverterModel",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Inverter model",
+                "required": True
+            },
+            {
+                "name": "InverterSerialNumber",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Inverter serial number",
+                "required": False
+            },
+            {
+                "name": "InverterSwVersion",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Inverter software version",
+                "required": True
+            },
+            {
+                "name": "InverterHwVersion",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Inverter hardware version",
+                "required": True
+            },
+            # Grid Protection
+            {
+                "name": "IslandingDetectionMethod",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Islanding detection method",
+                "default_value": "Passive",
+                "required": False
+            },
+            {
+                "name": "IslandingDetectionTripTime",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Islanding detection trip time in seconds",
+                "default_value": "2.0",
+                "required": False
+            },
+            {
+                "name": "ReactiveSusceptance",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "Reactive susceptance in cease to energize state",
+                "required": True
+            }
+        ]
+    
+    @staticmethod
+    def get_ac_der_ctrlr_variables() -> List[Dict[str, Any]]:
+        """Get standardized ACDERCtrlr variables."""
+        return [
+            {
+                "name": "modesSupported",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_ONLY.value,
+                "description": "DER controls that can be locally emulated via ChargeLoop",
+                "default_value": "FixedPFInject,VoltVar,WattVar,FixedVar,VoltWatt",
+                "required": True
+            }
+        ]
+    
+    @staticmethod
+    def get_data_collector_variables() -> List[Dict[str, Any]]:
+        """Get standardized DataCollector variables."""
+        return [
+            {
+                "name": "Enabled",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Activate/deactivate data collection",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "DateTime.Start",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Collection start time",
+                "required": False
+            },
+            {
+                "name": "DateTime.End",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Collection end time",
+                "required": False
+            },
+            {
+                "name": "SampledMeasurands",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Measurands to collect",
+                "default_value": "Power.Active.Import,Power.Active.Export,Frequency,Voltage",
+                "required": False
+            },
+            {
+                "name": "SamplingInterval",
+                "type": VariableType.DECIMAL.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Sampling frequency in seconds",
+                "default_value": "0.1",
+                "min_value": "0.01",
+                "max_value": "1.0",
+                "required": False
+            }
+        ]
+    
+    @staticmethod
+    def get_frequency_simulator_variables() -> List[Dict[str, Any]]:
+        """Get standardized FrequencySimulator variables."""
+        return [
+            {
+                "name": "Enabled",
+                "type": VariableType.BOOLEAN.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Enable frequency simulation",
+                "default_value": "false",
+                "required": False
+            },
+            {
+                "name": "DateTime.Start",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Simulation start time",
+                "required": False
+            },
+            {
+                "name": "DateTime.End",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Simulation end time",
+                "required": False
+            },
+            {
+                "name": "FrequencySchedule",
+                "type": VariableType.STRING.value,
+                "access": VariableAccess.READ_WRITE.value,
+                "description": "Simulated frequency profile as JSON",
+                "default_value": '[{"time": 0, "freq": 50.0}, {"time": 60, "freq": 49.2}]',
+                "required": False
+            }
+        ]
+    
+    @staticmethod
     def get_v2x_controller_variables() -> List[Dict[str, Any]]:
         """Get standardized V2XController variables."""
         return [
@@ -921,8 +1301,22 @@ class DeviceModel:
             # Initialize V2XController component
             await self._initialize_v2x_controller_component(station_id)
             
+            # Initialize V2G-specific components
+            await self._initialize_v2x_charging_ctrlr_component(station_id)
+            await self._initialize_dc_der_ctrlr_component(station_id)
+            await self._initialize_ac_der_ctrlr_component(station_id)
+            
+            # Initialize per-EVSE V2G components
+            num_evses = station_info.get("num_evses", 1)
+            for evse_id in range(1, num_evses + 1):
+                await self._initialize_data_collector_component(station_id, evse_id)
+                await self._initialize_frequency_simulator_component(station_id, evse_id)
+            
             # Initialize Security component
             await self._initialize_security_component(station_id)
+            
+            # Initialize ISO15118Ctrlr component
+            await self._initialize_iso15118_ctrlr_component(station_id)
             
             # Initialize Display component
             await self._initialize_display_component(station_id)
@@ -1042,6 +1436,22 @@ class DeviceModel:
                 station_id, "SmartCharging", "", var_def["name"], "",
                 AttributeEnumType.actual, var_def.get("default_value", "")
             )
+        
+        # Add V2G-specific SmartCharging variables
+        v2g_smart_charging_variables = [
+            {"name": "ExternalControlSignalsEnabled", "type": VariableType.BOOLEAN.value, "default_value": "false"},
+            {"name": "ExternalConstraintsProfileDisallowed", "type": VariableType.BOOLEAN.value, "default_value": "false"},
+            {"name": "NotifyChargingLimitWithSchedules", "type": VariableType.BOOLEAN.value, "default_value": "true"},
+            {"name": "SetpointPriority", "type": VariableType.STRING.value, "default_value": "ExternalSystem"},
+            {"name": "MaxExternalConstraintsId", "type": VariableType.INTEGER.value, "default_value": "100"},
+            {"name": "LimitChangeSignificance", "type": VariableType.DECIMAL.value, "default_value": "5.0"}
+        ]
+        
+        for var_def in v2g_smart_charging_variables:
+            await self._set_variable_value(
+                station_id, "SmartCharging", "", var_def["name"], "",
+                AttributeEnumType.actual, var_def.get("default_value", "")
+            )
     
     async def _initialize_v2x_controller_component(self, station_id: str) -> None:
         """Initialize V2XController component."""
@@ -1052,6 +1462,66 @@ class DeviceModel:
         for var_def in variables:
             await self._set_variable_value(
                 station_id, "V2XController", "", var_def["name"], "",
+                AttributeEnumType.actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_v2x_charging_ctrlr_component(self, station_id: str) -> None:
+        """Initialize V2XChargingCtrlr component."""
+        self._add_component(station_id, "V2XChargingCtrlr", "")
+        
+        # Add all V2XChargingCtrlr variables
+        variables = StandardOCPPVariables.get_v2x_charging_ctrlr_variables()
+        for var_def in variables:
+            await self._set_variable_value(
+                station_id, "V2XChargingCtrlr", "", var_def["name"], "",
+                AttributeEnumType.actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_dc_der_ctrlr_component(self, station_id: str) -> None:
+        """Initialize DCDERCtrlr component."""
+        self._add_component(station_id, "DCDERCtrlr", "")
+        
+        # Add all DCDERCtrlr variables
+        variables = StandardOCPPVariables.get_dc_der_ctrlr_variables()
+        for var_def in variables:
+            await self._set_variable_value(
+                station_id, "DCDERCtrlr", "", var_def["name"], "",
+                AttributeEnumType.actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_ac_der_ctrlr_component(self, station_id: str) -> None:
+        """Initialize ACDERCtrlr component."""
+        self._add_component(station_id, "ACDERCtrlr", "")
+        
+        # Add all ACDERCtrlr variables
+        variables = StandardOCPPVariables.get_ac_der_ctrlr_variables()
+        for var_def in variables:
+            await self._set_variable_value(
+                station_id, "ACDERCtrlr", "", var_def["name"], "",
+                AttributeEnumType.actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_data_collector_component(self, station_id: str, evse_id: int) -> None:
+        """Initialize DataCollector component."""
+        self._add_component(station_id, "DataCollector", str(evse_id))
+        
+        # Add all DataCollector variables
+        variables = StandardOCPPVariables.get_data_collector_variables()
+        for var_def in variables:
+            await self._set_variable_value(
+                station_id, "DataCollector", str(evse_id), var_def["name"], "",
+                AttributeEnumType.actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_frequency_simulator_component(self, station_id: str, evse_id: int) -> None:
+        """Initialize FrequencySimulator component."""
+        self._add_component(station_id, "FrequencySimulator", str(evse_id))
+        
+        # Add all FrequencySimulator variables
+        variables = StandardOCPPVariables.get_frequency_simulator_variables()
+        for var_def in variables:
+            await self._set_variable_value(
+                station_id, "FrequencySimulator", str(evse_id), var_def["name"], "",
                 AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
@@ -1073,6 +1543,30 @@ class DeviceModel:
         for var_def in security_variables:
             await self._set_variable_value(
                 station_id, "Security", "", var_def["name"], "",
+                AttributeEnumType.actual, var_def.get("default_value", "")
+            )
+    
+    async def _initialize_iso15118_ctrlr_component(self, station_id: str) -> None:
+        """Initialize ISO15118Ctrlr component."""
+        self._add_component(station_id, "ISO15118Ctrlr", "")
+        
+        # Add ISO15118Ctrlr variables
+        iso15118_variables = [
+            {"name": "SeccId", "type": VariableType.STRING.value, "default_value": "SECC001"},
+            {"name": "ISO15118PnCEnabled", "type": VariableType.BOOLEAN.value, "default_value": "true"},
+            {"name": "CentralContractValidationAllowed", "type": VariableType.BOOLEAN.value, "default_value": "true"},
+            {"name": "ContractValidationOffline", "type": VariableType.BOOLEAN.value, "default_value": "false"},
+            {"name": "SupportedFeatures", "type": VariableType.STRING.value, "default_value": "PnC,ContractCertificate,Payment"},
+            {"name": "SupportedPaymentMethods", "type": VariableType.STRING.value, "default_value": "Contract,ExternalPayment"},
+            {"name": "MaxContractIdLength", "type": VariableType.INTEGER.value, "default_value": "36"},
+            {"name": "MaxCertificateChainSize", "type": VariableType.INTEGER.value, "default_value": "5"},
+            {"name": "CertificateInstallationTimeout", "type": VariableType.INTEGER.value, "default_value": "300"},
+            {"name": "CertificateUpdateTimeout", "type": VariableType.INTEGER.value, "default_value": "60"}
+        ]
+        
+        for var_def in iso15118_variables:
+            await self._set_variable_value(
+                station_id, "ISO15118Ctrlr", "", var_def["name"], "",
                 AttributeEnumType.actual, var_def.get("default_value", "")
             )
     

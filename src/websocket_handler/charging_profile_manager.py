@@ -17,7 +17,33 @@ class ChargingProfilePurpose(Enum):
     CHARGING_STATION_MAX_PROFILE = "ChargingStationMaxProfile"
     TX_DEFAULT_PROFILE = "TxDefaultProfile"
     TX_PROFILE = "TxProfile"
-    V2X_PROFILE = "V2XProfile"
+    PRIORITY_CHARGING = "PriorityCharging"
+    LOCAL_GENERATION = "LocalGeneration"
+
+
+class OperationModeEnumType(Enum):
+    """V2G operation modes."""
+    CHARGING_ONLY = "ChargingOnly"
+    CENTRAL_SETPOINT = "CentralSetpoint"
+    CENTRAL_FREQUENCY = "CentralFrequency"
+    LOCAL_FREQUENCY = "LocalFrequency"
+    EXTERNAL_SETPOINT = "ExternalSetpoint"
+    EXTERNAL_LIMITS = "ExternalLimits"
+    LOCAL_LOAD_BALANCING = "LocalLoadBalancing"
+    IDLE = "Idle"
+
+
+class EnergyTransferModeEnumType(Enum):
+    """Energy transfer modes."""
+    AC_SINGLE_PHASE = "AC_single_phase"
+    AC_TWO_PHASE = "AC_two_phase"
+    AC_THREE_PHASE = "AC_three_phase"
+    DC = "DC"
+    DC_ACDP = "DC_ACDP"
+    DC_BPT = "DC_BPT"
+    DC_ACDP_BPT = "DC_ACDP_BPT"
+    AC_BPT = "AC_BPT"
+    AC_BPT_DER = "AC_BPT_DER"
 
 
 class ChargingProfileKind(Enum):
@@ -35,10 +61,18 @@ class ChargingRateUnit(Enum):
 
 @dataclass
 class ChargingSchedulePeriod:
-    """Charging schedule period."""
+    """Charging schedule period with V2G extensions."""
     start_period: int
-    limit: float
+    limit: float  # positive only, max charge limit
+    discharging_limit: Optional[float] = None  # negative only, max discharge limit
+    setpoint: Optional[float] = None  # positive=charge, negative=discharge
+    setpoint_reactive: Optional[float] = None  # reactive power setpoint
     number_phases: Optional[int] = None
+    phase_to_use: Optional[int] = None
+    operation_mode: Optional[str] = None  # OperationModeEnumType
+    v2x_freq_watt_curve: Optional[List[Dict[str, float]]] = None
+    v2x_signal_watt_curve: Optional[List[Dict[str, float]]] = None
+    v2x_baseline: Optional[float] = None
 
 
 @dataclass
@@ -81,7 +115,8 @@ class ChargingProfileManager:
             "ChargingStationMaxProfile": 1,
             "TxDefaultProfile": 1,
             "TxProfile": 1,
-            "V2XProfile": 4,
+            "PriorityCharging": 1,
+            "LocalGeneration": 1,
             "ChargingStationExternalConstraints": 1
         }
     
@@ -264,7 +299,15 @@ class ChargingProfileManager:
             period = ChargingSchedulePeriod(
                 start_period=period_data["startPeriod"],
                 limit=period_data["limit"],
-                number_phases=period_data.get("numberPhases")
+                discharging_limit=period_data.get("dischargingLimit"),
+                setpoint=period_data.get("setpoint"),
+                setpoint_reactive=period_data.get("setpointReactive"),
+                number_phases=period_data.get("numberPhases"),
+                phase_to_use=period_data.get("phaseToUse"),
+                operation_mode=period_data.get("operationMode"),
+                v2x_freq_watt_curve=period_data.get("v2xFreqWattCurve"),
+                v2x_signal_watt_curve=period_data.get("v2xSignalWattCurve"),
+                v2x_baseline=period_data.get("v2xBaseline")
             )
             periods.append(period)
         
@@ -309,7 +352,15 @@ class ChargingProfileManager:
                     {
                         "startPeriod": p.start_period,
                         "limit": p.limit,
-                        "numberPhases": p.number_phases
+                        "dischargingLimit": p.discharging_limit,
+                        "setpoint": p.setpoint,
+                        "setpointReactive": p.setpoint_reactive,
+                        "numberPhases": p.number_phases,
+                        "phaseToUse": p.phase_to_use,
+                        "operationMode": p.operation_mode,
+                        "v2xFreqWattCurve": p.v2x_freq_watt_curve,
+                        "v2xSignalWattCurve": p.v2x_signal_watt_curve,
+                        "v2xBaseline": p.v2x_baseline
                     }
                     for p in profile.charging_schedule.charging_schedule_period
                 ],
@@ -364,6 +415,30 @@ class ChargingProfileManager:
                     "reason_code": "PropertyConstraintViolation",
                     "message": f"Period {i} limit must be >= 0"
                 }
+            
+            # Validate discharging limit (must be negative or None)
+            if period.discharging_limit is not None and period.discharging_limit > 0:
+                return {
+                    "valid": False,
+                    "reason_code": "PropertyConstraintViolation",
+                    "message": f"Period {i} dischargingLimit must be <= 0"
+                }
+            
+            # Validate setpoint constraints
+            if period.setpoint is not None:
+                # Setpoint can be positive (charge) or negative (discharge)
+                if period.limit > 0 and period.setpoint > period.limit:
+                    return {
+                        "valid": False,
+                        "reason_code": "PropertyConstraintViolation",
+                        "message": f"Period {i} setpoint exceeds charge limit"
+                    }
+                if period.discharging_limit is not None and period.setpoint < period.discharging_limit:
+                    return {
+                        "valid": False,
+                        "reason_code": "PropertyConstraintViolation",
+                        "message": f"Period {i} setpoint exceeds discharge limit"
+                    }
         
         # Validate time constraints
         if profile.valid_from and profile.valid_to:
@@ -411,45 +486,60 @@ class ChargingProfileManager:
     
     async def _calculate_composite_schedule(self, profiles: List[ChargingProfile], 
                                          duration: int, charging_rate_unit: Optional[str]) -> Dict[str, Any]:
-        """Calculate composite schedule from multiple profiles."""
+        """Calculate composite schedule from multiple profiles with V2G support."""
         # Sort profiles by stack level (highest first)
         sorted_profiles = sorted(profiles, key=lambda p: p.stack_level, reverse=True)
         
-        # Create time slots
+        # Create time slots with V2G support
         time_slots = {}
         for i in range(0, duration, 60):  # 1-minute intervals
-            time_slots[i] = {"power": 0.0, "source": None}
+            time_slots[i] = {
+                "charge_limit": 0.0,
+                "discharge_limit": 0.0,
+                "setpoint": None,
+                "setpoint_reactive": None,
+                "operation_mode": None,
+                "v2x_freq_watt_curve": None,
+                "v2x_signal_watt_curve": None,
+                "v2x_baseline": None,
+                "source": None,
+                "priority": 0
+            }
         
-        # Apply profiles in order
+        # Apply profiles in order with V2G stacking rules
         for profile in sorted_profiles:
-            await self._apply_profile_to_slots(profile, time_slots, duration)
+            await self._apply_profile_to_slots_v2g(profile, time_slots, duration)
         
-        # Convert to charging schedule periods
+        # Convert to charging schedule periods with V2G fields
         periods = []
-        current_power = None
+        current_state = None
         start_period = 0
         
         for time_slot in sorted(time_slots.keys()):
-            power = time_slots[time_slot]["power"]
+            slot_data = time_slots[time_slot]
             
-            if current_power != power:
-                if current_power is not None:
-                    periods.append({
-                        "startPeriod": start_period,
-                        "limit": current_power,
-                        "numberPhases": 3
-                    })
+            # Create state key for comparison
+            state_key = (
+                slot_data["charge_limit"],
+                slot_data["discharge_limit"],
+                slot_data["setpoint"],
+                slot_data["operation_mode"]
+            )
+            
+            if current_state != state_key:
+                if current_state is not None:
+                    periods.append(self._create_period_from_slot_data(
+                        start_period, time_slots[start_period]
+                    ))
                 
-                current_power = power
+                current_state = state_key
                 start_period = time_slot
         
         # Add final period
-        if current_power is not None:
-            periods.append({
-                "startPeriod": start_period,
-                "limit": current_power,
-                "numberPhases": 3
-            })
+        if current_state is not None:
+            periods.append(self._create_period_from_slot_data(
+                start_period, time_slots[start_period]
+            ))
         
         return {
             "start_time": datetime.now(timezone.utc).isoformat(),
@@ -475,6 +565,103 @@ class ChargingProfileManager:
                     if time_slots[slot]["source"] is None or profile.stack_level > time_slots[slot]["source"]:
                         time_slots[slot]["power"] = period.limit
                         time_slots[slot]["source"] = profile.stack_level
+    
+    async def _apply_profile_to_slots_v2g(self, profile: ChargingProfile, 
+                                        time_slots: Dict[int, Dict[str, Any]], duration: int) -> None:
+        """Apply a profile to time slots with V2G support."""
+        for period in profile.charging_schedule.charging_schedule_period:
+            start_time = period.start_period
+            end_time = min(start_time + 60, duration)  # Assume 1-minute periods
+            
+            for slot in range(start_time, end_time, 60):
+                if slot in time_slots:
+                    slot_data = time_slots[slot]
+                    
+                    # Determine if this profile should override based on V2G stacking rules
+                    should_override = self._should_override_slot_v2g(
+                        profile, slot_data, period
+                    )
+                    
+                    if should_override:
+                        # Apply V2G-specific fields
+                        slot_data["charge_limit"] = period.limit
+                        slot_data["discharge_limit"] = period.discharging_limit
+                        slot_data["setpoint"] = period.setpoint
+                        slot_data["setpoint_reactive"] = period.setpoint_reactive
+                        slot_data["operation_mode"] = period.operation_mode
+                        slot_data["v2x_freq_watt_curve"] = period.v2x_freq_watt_curve
+                        slot_data["v2x_signal_watt_curve"] = period.v2x_signal_watt_curve
+                        slot_data["v2x_baseline"] = period.v2x_baseline
+                        slot_data["source"] = profile.stack_level
+                        slot_data["priority"] = self._get_profile_priority(profile)
+    
+    def _should_override_slot_v2g(self, profile: ChargingProfile, 
+                                 slot_data: Dict[str, Any], period: ChargingSchedulePeriod) -> bool:
+        """Determine if profile should override slot based on V2G stacking rules."""
+        # Higher stack level always overrides lower
+        if slot_data["source"] is None or profile.stack_level > slot_data["source"]:
+            return True
+        
+        # Same stack level - check V2G-specific rules
+        if profile.stack_level == slot_data["source"]:
+            # Priority charging overrides other profiles
+            if profile.charging_profile_purpose == ChargingProfilePurpose.PRIORITY_CHARGING:
+                return True
+            
+            # Local generation adds capacity (doesn't override limits)
+            if profile.charging_profile_purpose == ChargingProfilePurpose.LOCAL_GENERATION:
+                return False
+            
+            # External constraints have priority over transaction profiles
+            if (profile.charging_profile_purpose == ChargingProfilePurpose.CHARGING_STATION_EXTERNAL_CONSTRAINTS and
+                slot_data["priority"] < self._get_profile_priority(profile)):
+                return True
+        
+        return False
+    
+    def _get_profile_priority(self, profile: ChargingProfile) -> int:
+        """Get profile priority for V2G stacking."""
+        priority_map = {
+            ChargingProfilePurpose.CHARGING_STATION_EXTERNAL_CONSTRAINTS: 100,
+            ChargingProfilePurpose.CHARGING_STATION_MAX_PROFILE: 90,
+            ChargingProfilePurpose.PRIORITY_CHARGING: 80,
+            ChargingProfilePurpose.TX_PROFILE: 70,
+            ChargingProfilePurpose.TX_DEFAULT_PROFILE: 60,
+            ChargingProfilePurpose.LOCAL_GENERATION: 50
+        }
+        return priority_map.get(profile.charging_profile_purpose, 0)
+    
+    def _create_period_from_slot_data(self, start_period: int, slot_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create charging schedule period from slot data."""
+        period = {
+            "startPeriod": start_period,
+            "limit": slot_data["charge_limit"],
+            "numberPhases": 3
+        }
+        
+        # Add V2G-specific fields if present
+        if slot_data["discharge_limit"] is not None:
+            period["dischargingLimit"] = slot_data["discharge_limit"]
+        
+        if slot_data["setpoint"] is not None:
+            period["setpoint"] = slot_data["setpoint"]
+        
+        if slot_data["setpoint_reactive"] is not None:
+            period["setpointReactive"] = slot_data["setpoint_reactive"]
+        
+        if slot_data["operation_mode"] is not None:
+            period["operationMode"] = slot_data["operation_mode"]
+        
+        if slot_data["v2x_freq_watt_curve"] is not None:
+            period["v2xFreqWattCurve"] = slot_data["v2x_freq_watt_curve"]
+        
+        if slot_data["v2x_signal_watt_curve"] is not None:
+            period["v2xSignalWattCurve"] = slot_data["v2x_signal_watt_curve"]
+        
+        if slot_data["v2x_baseline"] is not None:
+            period["v2xBaseline"] = slot_data["v2x_baseline"]
+        
+        return period
     
     async def _store_profile(self, station_id: str, evse_id: int, profile: ChargingProfile) -> None:
         """Store charging profile in database."""
@@ -563,3 +750,66 @@ class ChargingProfileManager:
             "profile": self._profile_to_dict(profile),
             "reported_at": datetime.now(timezone.utc)
         })
+
+    async def update_dynamic_schedule(self, station_id: str, charging_profile_id: int,
+                                    limit: Optional[float] = None,
+                                    discharging_limit: Optional[float] = None,
+                                    setpoint: Optional[float] = None,
+                                    setpoint_reactive: Optional[float] = None) -> Dict[str, Any]:
+        """Update dynamic schedule for a charging profile."""
+        try:
+            # Get existing profile
+            profiles = await self.timescale_client.get_charging_profiles(
+                station_id, None, None, None
+            )
+            
+            # Find the profile to update
+            profile_to_update = None
+            for profile_data in profiles:
+                if profile_data["profile_id"] == charging_profile_id:
+                    profile_to_update = profile_data
+                    break
+            
+            if not profile_to_update:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": "NotFound",
+                        "additionalInfo": f"Charging profile {charging_profile_id} not found"
+                    }
+                }
+            
+            # Parse existing profile
+            profile_dict = json.loads(profile_to_update["schedule"])
+            profile = self._parse_charging_profile(profile_dict)
+            
+            # Update the first period with new values
+            if profile.charging_schedule.charging_schedule_period:
+                period = profile.charging_schedule.charging_schedule_period[0]
+                if limit is not None:
+                    period.limit = limit
+                if discharging_limit is not None:
+                    period.discharging_limit = discharging_limit
+                if setpoint is not None:
+                    period.setpoint = setpoint
+                if setpoint_reactive is not None:
+                    period.setpoint_reactive = setpoint_reactive
+            
+            # Store updated profile
+            await self.timescale_client.store_charging_profile(
+                station_id, profile_to_update["evse_id"], profile
+            )
+            
+            return {
+                "status": "Accepted"
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update dynamic schedule: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }

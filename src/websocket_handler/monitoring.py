@@ -19,12 +19,14 @@ WEBSOCKET_CONNECTIONS = Gauge(
 
 MESSAGES_RECEIVED_TOTAL = Counter(
     "websocket_messages_received_total",
-    "Total number of WebSocket messages received"
+    "Total number of WebSocket messages received",
+    ["station_id", "message_type"]
 )
 
 MESSAGES_SENT_TOTAL = Counter(
     "websocket_messages_sent_total", 
-    "Total number of WebSocket messages sent"
+    "Total number of WebSocket messages sent",
+    ["station_id", "message_type"]
 )
 
 REDIS_OPERATION_DURATION = Histogram(
@@ -34,7 +36,8 @@ REDIS_OPERATION_DURATION = Histogram(
 
 REDIS_OPERATIONS_TOTAL = Counter(
     "redis_operations_total",
-    "Total number of Redis operations"
+    "Total number of Redis operations",
+    ["operation_type"]
 )
 
 # Note: Other metrics are defined in server.py to avoid duplication

@@ -18,6 +18,12 @@ from .message_handler import MessageHandler
 from .ocpp_handler import EnhancedOCPPChargePoint
 from .monitoring import setup_monitoring, get_logger
 from .timescale_client import TimescaleClient
+from .charging_profile_manager import ChargingProfileManager
+from .der_control_manager import DERControlManager
+from .priority_charging_manager import PriorityChargingManager
+from .external_control_manager import ExternalControlManager
+from .certificate_manager import CertificateManager
+from .v2x_controller import V2XController
 
 
 # Prometheus metrics - imported from monitoring module
@@ -43,6 +49,14 @@ class OCPPWebSocketServer:
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
         self.message_handler: Optional[MessageHandler] = None
+        
+        # V2G managers
+        self.charging_profile_manager: Optional[ChargingProfileManager] = None
+        self.der_control_manager: Optional[DERControlManager] = None
+        self.priority_charging_manager: Optional[PriorityChargingManager] = None
+        self.external_control_manager: Optional[ExternalControlManager] = None
+        self.certificate_manager: Optional[CertificateManager] = None
+        self.v2x_controller: Optional[V2XController] = None
         
         # Server state
         self.server: Optional[websockets.WebSocketServer] = None
@@ -103,7 +117,7 @@ class OCPPWebSocketServer:
             
         except Exception as e:
             self.logger.error(f"Failed to start WebSocket server: {e}")
-            ERRORS_TOTAL.labels(error_type="startup_error").inc()
+            REDIS_OPERATIONS_TOTAL.labels(operation_type="startup_error").inc()
             raise
     
     async def stop(self) -> None:
@@ -143,7 +157,7 @@ class OCPPWebSocketServer:
         self.logger.info("WebSocket server stopped")
     
     async def _initialize_components(self) -> None:
-        """Initialize core components."""
+        """Initialize core components and V2G managers."""
         # Initialize connection manager
         self.connection_manager = ConnectionManager(
             config=self.config
@@ -155,6 +169,16 @@ class OCPPWebSocketServer:
             config=self.config,
             timescale_client=self.timescale_client
         )
+        
+        # Initialize V2G managers
+        self.charging_profile_manager = ChargingProfileManager(self.timescale_client)
+        self.der_control_manager = DERControlManager(self.timescale_client)
+        self.priority_charging_manager = PriorityChargingManager(self.timescale_client)
+        self.external_control_manager = ExternalControlManager(self.timescale_client)
+        self.certificate_manager = CertificateManager(self.timescale_client)
+        self.v2x_controller = V2XController(self.timescale_client)
+        
+        self.logger.info("All V2G managers initialized successfully")
     
     def set_optimization_engine(self, optimization_engine) -> None:
         """Set optimization engine and wire it to connection manager."""
@@ -189,14 +213,14 @@ class OCPPWebSocketServer:
         if len(self.connections) >= self.config.websocket.max_connections:
             self.logger.warning(f"Connection limit exceeded, rejecting {client_ip}")
             await websocket.close(1008, "Server overloaded")
-            ERRORS_TOTAL.labels(error_type="connection_limit_exceeded").inc()
+            REDIS_OPERATIONS_TOTAL.labels(operation_type="connection_limit_exceeded").inc()
             return
         
         # Validate OCPP subprotocol
         if websocket.subprotocol != "ocpp2.1":
             self.logger.warning(f"Invalid subprotocol from {client_ip}: {websocket.subprotocol}")
             await websocket.close(1002, "Invalid subprotocol")
-            ERRORS_TOTAL.labels(error_type="invalid_subprotocol").inc()
+            REDIS_OPERATIONS_TOTAL.labels(operation_type="invalid_subprotocol").inc()
             return
         
         # Extract station ID from path
@@ -225,7 +249,13 @@ class OCPPWebSocketServer:
             connection=websocket,
             config=self.config,
             timescale_client=self.timescale_client,
-            connection_manager=self.connection_manager
+            connection_manager=self.connection_manager,
+            charging_profile_manager=self.charging_profile_manager,
+            der_control_manager=self.der_control_manager,
+            priority_charging_manager=self.priority_charging_manager,
+            external_control_manager=self.external_control_manager,
+            certificate_manager=self.certificate_manager,
+            v2x_controller=self.v2x_controller
         )
         self.charge_points[station_id] = charge_point
         
@@ -243,7 +273,7 @@ class OCPPWebSocketServer:
             self.logger.info(f"Connection {connection_id} closed normally")
         except Exception as e:
             self.logger.error(f"Error handling connection {connection_id}: {e}")
-            ERRORS_TOTAL.labels(error_type="connection_error").inc()
+            REDIS_OPERATIONS_TOTAL.labels(operation_type="connection_error").inc()
         finally:
             await self._cleanup_connection(connection_id, websocket, station_id)
     

@@ -5,26 +5,22 @@ import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
-import aiokafka
-from aiokafka import AIOKafkaConsumer
 
-from .config import TimescaleConfig, KafkaConfig
+from .config import TimescaleConfig
 from .timescale_client import TimescaleClient
 from .monitoring import get_logger
 
 
 class TelemetryIngestionService:
-    """Service for ingesting telemetry data from Kafka to TimescaleDB."""
+    """Service for ingesting telemetry data directly to TimescaleDB."""
     
-    def __init__(self, timescale_config: TimescaleConfig, kafka_config: KafkaConfig):
+    def __init__(self, timescale_config: TimescaleConfig):
         """Initialize telemetry ingestion service."""
         self.timescale_config = timescale_config
-        self.kafka_config = kafka_config
         self.logger = get_logger(__name__)
         
         # Components
         self.timescale_client: Optional[TimescaleClient] = None
-        self.kafka_consumer: Optional[AIOKafkaConsumer] = None
         
         # Configuration
         self.batch_size = 1000
@@ -49,24 +45,9 @@ class TelemetryIngestionService:
             self.timescale_client = TimescaleClient(self.timescale_config)
             await self.timescale_client.connect()
             
-            # Initialize Kafka consumer
-            self.kafka_consumer = AIOKafkaConsumer(
-                self.kafka_config.charger_events_topic,
-                bootstrap_servers=self.kafka_config.brokers,
-                group_id=f"{self.kafka_config.consumer_group}-telemetry",
-                auto_offset_reset='latest',
-                enable_auto_commit=True,
-                auto_commit_interval_ms=5000,
-                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-                key_deserializer=lambda x: x.decode('utf-8') if x else None
-            )
-            
-            await self.kafka_consumer.start()
-            
             self.running = True
             
             # Start background tasks
-            asyncio.create_task(self._process_messages())
             asyncio.create_task(self._batch_processor())
             
             self.logger.info("Telemetry ingestion service started")
@@ -83,60 +64,61 @@ class TelemetryIngestionService:
         await self._flush_all_batches()
         
         # Close connections
-        if self.kafka_consumer:
-            await self.kafka_consumer.stop()
-        
         if self.timescale_client:
             await self.timescale_client.disconnect()
         
         self.logger.info("Telemetry ingestion service stopped")
     
-    async def _process_messages(self) -> None:
-        """Process messages from Kafka."""
+    async def ingest_telemetry_data(self, data: Dict[str, Any]) -> None:
+        """Ingest telemetry data directly."""
         try:
-            async for message in self.kafka_consumer:
-                if not self.running:
-                    break
-                
-                try:
-                    await self._handle_message(message)
-                    self.messages_processed += 1
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing message: {e}")
-                    self.errors_count += 1
-                    
+            await self._handle_telemetry_message(data)
+            self.messages_processed += 1
+            
         except Exception as e:
-            self.logger.error(f"Error in message processing loop: {e}")
+            self.logger.error(f"Error processing telemetry data: {e}")
+            self.errors_count += 1
             raise
     
-    async def _handle_message(self, message: aiokafka.ConsumerRecord) -> None:
-        """Handle individual Kafka message."""
+    async def ingest_session_data(self, data: Dict[str, Any]) -> None:
+        """Ingest session data directly."""
         try:
-            data = message.value
-            
-            # Determine message type and route accordingly
             message_type = data.get('type', 'unknown')
             
-            if message_type == 'telemetry':
-                await self._handle_telemetry_message(data)
-            elif message_type == 'session_start':
+            if message_type == 'session_start':
                 await self._handle_session_start(data)
             elif message_type == 'session_end':
                 await self._handle_session_end(data)
-            elif message_type == 'optimization_decision':
+            else:
+                self.logger.warning(f"Unknown session message type: {message_type}")
+                
+        except Exception as e:
+            self.logger.error(f"Error handling session data: {e}")
+            raise
+    
+    async def ingest_optimization_data(self, data: Dict[str, Any]) -> None:
+        """Ingest optimization data directly."""
+        try:
+            message_type = data.get('type', 'unknown')
+            
+            if message_type == 'optimization_decision':
                 await self._handle_optimization_decision(data)
             elif message_type == 'charging_schedule':
                 await self._handle_charging_schedule(data)
-            elif message_type == 'electricity_price':
-                await self._handle_electricity_price(data)
-            elif message_type == 'grid_signal':
-                await self._handle_grid_signal(data)
             else:
-                self.logger.warning(f"Unknown message type: {message_type}")
+                self.logger.warning(f"Unknown optimization message type: {message_type}")
                 
         except Exception as e:
-            self.logger.error(f"Error handling message: {e}")
+            self.logger.error(f"Error handling optimization data: {e}")
+            raise
+    
+    async def ingest_price_data(self, data: Dict[str, Any]) -> None:
+        """Ingest electricity price data directly."""
+        try:
+            await self._handle_electricity_price(data)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling price data: {e}")
             raise
     
     async def _handle_telemetry_message(self, data: Dict[str, Any]) -> None:
@@ -369,21 +351,9 @@ class TelemetryIngestionService:
             # Check TimescaleDB connection
             timescale_health = await self.timescale_client.health_check()
             
-            # Check Kafka consumer
-            kafka_status = "healthy"
-            try:
-                if self.kafka_consumer:
-                    # Check if consumer is still running
-                    pass  # Kafka consumer doesn't have explicit health check
-                else:
-                    kafka_status = "not_initialized"
-            except Exception as e:
-                kafka_status = f"unhealthy: {str(e)}"
-            
             return {
-                "status": "healthy" if timescale_health["status"] == "healthy" and kafka_status == "healthy" else "degraded",
+                "status": "healthy" if timescale_health["status"] == "healthy" else "degraded",
                 "timescale": timescale_health,
-                "kafka": kafka_status,
                 "metrics": await self.get_metrics()
             }
             

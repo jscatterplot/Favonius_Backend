@@ -219,7 +219,217 @@ class TimescaleSchema:
             );
         """)
         
+        # V2G-specific tables
+        await self._create_v2g_tables(conn)
+        
         self.logger.info("All tables created successfully")
+    
+    async def _create_v2g_tables(self, conn: asyncpg.Connection) -> None:
+        """Create V2G-specific tables."""
+        
+        # Enhanced charging profiles table with V2G fields
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS charging_profiles_v2g (
+                profile_id INTEGER PRIMARY KEY,
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                stack_level INTEGER NOT NULL,
+                purpose VARCHAR(50) NOT NULL,
+                kind VARCHAR(50) NOT NULL,
+                schedule JSONB NOT NULL,
+                valid_from TIMESTAMPTZ,
+                valid_to TIMESTAMPTZ,
+                transaction_id VARCHAR(255),
+                discharging_limit DECIMAL(8,2),
+                setpoint DECIMAL(8,2),
+                setpoint_reactive DECIMAL(8,2),
+                operation_mode VARCHAR(50),
+                v2x_freq_watt_curve JSONB,
+                v2x_signal_watt_curve JSONB,
+                v2x_baseline DECIMAL(8,2),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Enhanced EV charging needs table with V2G parameters
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ev_charging_needs_v2g (
+                need_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                transaction_id VARCHAR(255),
+                ev_maximum_discharge_power DECIMAL(8,2),
+                ev_minimum_discharge_power DECIMAL(8,2),
+                ev_maximum_charge_power DECIMAL(8,2),
+                ev_minimum_charge_power DECIMAL(8,2),
+                ev_target_energy_request DECIMAL(10,3),
+                ev_maximum_energy_request DECIMAL(10,3),
+                ev_minimum_energy_request DECIMAL(10,3),
+                ev_present_active_power DECIMAL(8,2),
+                ev_present_reactive_power DECIMAL(8,2),
+                soc DECIMAL(5,2),
+                capacity DECIMAL(10,3),
+                control_mode VARCHAR(50),
+                v2x_charging_parameters JSONB,
+                der_charging_parameters JSONB,
+                timestamp TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # DER controls table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS der_controls (
+                control_id INTEGER PRIMARY KEY,
+                station_id VARCHAR(255) NOT NULL,
+                control_type VARCHAR(50) NOT NULL,
+                priority INTEGER NOT NULL,
+                start_time TIMESTAMPTZ NOT NULL,
+                duration INTEGER,
+                is_superseded BOOLEAN DEFAULT FALSE,
+                is_default BOOLEAN DEFAULT FALSE,
+                control_data JSONB NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # DER events table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS der_events (
+                event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                station_id VARCHAR(255) NOT NULL,
+                event_type VARCHAR(50) NOT NULL,
+                control_id INTEGER,
+                grid_event_fault VARCHAR(50),
+                timestamp TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # External charging limits table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS external_charging_limits (
+                limit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                source VARCHAR(50) NOT NULL,
+                is_grid_critical BOOLEAN DEFAULT FALSE,
+                is_local_generation BOOLEAN DEFAULT FALSE,
+                schedule_data JSONB,
+                timestamp TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Enhanced transaction events table with V2G fields
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS transaction_events_v2g (
+                event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                transaction_id VARCHAR(255) NOT NULL,
+                event_type VARCHAR(50) NOT NULL,
+                timestamp TIMESTAMPTZ NOT NULL,
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                connector_id INTEGER NOT NULL,
+                charging_state VARCHAR(50),
+                stopped_reason VARCHAR(50),
+                remote_start_id VARCHAR(255),
+                trigger_reason VARCHAR(50),
+                is_v2g_event BOOLEAN DEFAULT FALSE,
+                operation_mode VARCHAR(50),
+                v2g_meter_data JSONB,
+                offline BOOLEAN DEFAULT FALSE,
+                number_of_phases_used INTEGER,
+                cable_max_current DECIMAL(8,2),
+                reservation_id VARCHAR(255),
+                evse JSONB,
+                id_token JSONB,
+                certificate TEXT,
+                iso15118_certificate_hash_data JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Enhanced telemetry data table with V2G measurands
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS telemetry_data_v2g (
+                time TIMESTAMPTZ NOT NULL,
+                station_id VARCHAR(255) NOT NULL,
+                evse_id INTEGER NOT NULL,
+                connector_id INTEGER NOT NULL,
+                session_id UUID,
+                power_kw DECIMAL(8,2),
+                power_discharge_kw DECIMAL(8,2),
+                power_setpoint_kw DECIMAL(8,2),
+                power_residual_kw DECIMAL(8,2),
+                energy_kwh DECIMAL(10,3),
+                energy_discharged_kwh DECIMAL(10,3),
+                voltage_v DECIMAL(6,2),
+                current_a DECIMAL(8,2),
+                current_discharge_a DECIMAL(8,2),
+                frequency_hz DECIMAL(5,2),
+                soc_percent DECIMAL(5,2),
+                temperature_c DECIMAL(5,2),
+                reactive_power_import_kvar DECIMAL(8,2),
+                reactive_power_export_kvar DECIMAL(8,2),
+                power_factor DECIMAL(3,2),
+                operation_mode VARCHAR(50)
+            );
+        """)
+        
+        # Device model variables table for V2G components
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_model_variables_v2g (
+                variable_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                station_id VARCHAR(255) NOT NULL,
+                component_name VARCHAR(100) NOT NULL,
+                variable_name VARCHAR(100) NOT NULL,
+                variable_type VARCHAR(50) NOT NULL,
+                variable_access VARCHAR(50) NOT NULL,
+                default_value TEXT,
+                required BOOLEAN DEFAULT FALSE,
+                value TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(station_id, component_name, variable_name)
+            );
+        """)
+        
+        # ISO 15118 certificates table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS iso15118_certificates (
+                certificate_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                station_id VARCHAR(255) NOT NULL,
+                certificate_type VARCHAR(50) NOT NULL,
+                certificate_data TEXT NOT NULL,
+                certificate_chain JSONB,
+                issuer_name VARCHAR(500),
+                subject_name VARCHAR(500),
+                serial_number VARCHAR(100),
+                valid_from TIMESTAMPTZ,
+                valid_to TIMESTAMPTZ,
+                status VARCHAR(20) DEFAULT 'Valid',
+                installation_date TIMESTAMPTZ DEFAULT NOW(),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Authorization records table for Plug & Charge
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS authorization_records (
+                auth_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                station_id VARCHAR(255) NOT NULL,
+                emaid VARCHAR(255) NOT NULL,
+                contract_certificate TEXT NOT NULL,
+                charging_needs JSONB,
+                authorization_time TIMESTAMPTZ DEFAULT NOW(),
+                status VARCHAR(20) DEFAULT 'authorized',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        self.logger.info("V2G tables created successfully")
     
     async def _create_hypertables(self, conn: asyncpg.Connection) -> None:
         """Create TimescaleDB hypertables."""
@@ -263,7 +473,43 @@ class TimescaleSchema:
                 if_not_exists => TRUE);
         """)
         
+        # Create V2G hypertables
+        await self._create_v2g_hypertables(conn)
+        
         self.logger.info("All hypertables created successfully")
+    
+    async def _create_v2g_hypertables(self, conn: asyncpg.Connection) -> None:
+        """Create V2G-specific hypertables."""
+        
+        # Create hypertable for V2G telemetry data
+        await conn.execute(f"""
+            SELECT create_hypertable('telemetry_data_v2g', 'time', 
+                chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
+                if_not_exists => TRUE);
+        """)
+        
+        # Create hypertable for transaction events V2G
+        await conn.execute(f"""
+            SELECT create_hypertable('transaction_events_v2g', 'timestamp', 
+                chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
+                if_not_exists => TRUE);
+        """)
+        
+        # Create hypertable for DER events
+        await conn.execute(f"""
+            SELECT create_hypertable('der_events', 'timestamp', 
+                chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
+                if_not_exists => TRUE);
+        """)
+        
+        # Create hypertable for external charging limits
+        await conn.execute(f"""
+            SELECT create_hypertable('external_charging_limits', 'timestamp', 
+                chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
+                if_not_exists => TRUE);
+        """)
+        
+        self.logger.info("V2G hypertables created successfully")
     
     async def _create_indexes(self, conn: asyncpg.Connection) -> None:
         """Create database indexes for performance."""
@@ -349,7 +595,119 @@ class TimescaleSchema:
             ON vehicle_telemetry(organization_id, time DESC);
         """)
         
+        # V2G-specific indexes
+        await self._create_v2g_indexes(conn)
+        
         self.logger.info("All indexes created successfully")
+    
+    async def _create_v2g_indexes(self, conn: asyncpg.Connection) -> None:
+        """Create V2G-specific indexes."""
+        
+        # Charging profiles V2G indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_charging_profiles_v2g_station 
+            ON charging_profiles_v2g(station_id, evse_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_charging_profiles_v2g_purpose 
+            ON charging_profiles_v2g(purpose, stack_level);
+        """)
+        
+        # EV charging needs V2G indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ev_charging_needs_v2g_station 
+            ON ev_charging_needs_v2g(station_id, evse_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ev_charging_needs_v2g_timestamp 
+            ON ev_charging_needs_v2g(timestamp DESC);
+        """)
+        
+        # DER controls indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_der_controls_station 
+            ON der_controls(station_id, control_type);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_der_controls_priority 
+            ON der_controls(priority, start_time);
+        """)
+        
+        # DER events indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_der_events_station 
+            ON der_events(station_id, event_type);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_der_events_timestamp 
+            ON der_events(timestamp DESC);
+        """)
+        
+        # External charging limits indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_external_limits_station 
+            ON external_charging_limits(station_id, evse_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_external_limits_source 
+            ON external_charging_limits(source, is_grid_critical);
+        """)
+        
+        # Transaction events V2G indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transaction_events_v2g_station 
+            ON transaction_events_v2g(station_id, evse_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transaction_events_v2g_transaction 
+            ON transaction_events_v2g(transaction_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transaction_events_v2g_v2g 
+            ON transaction_events_v2g(is_v2g_event, trigger_reason);
+        """)
+        
+        # Telemetry data V2G indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_telemetry_v2g_station 
+            ON telemetry_data_v2g(station_id, evse_id, time DESC);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_telemetry_v2g_session 
+            ON telemetry_data_v2g(session_id, time DESC);
+        """)
+        
+        # Device model variables V2G indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_device_model_v2g_station 
+            ON device_model_variables_v2g(station_id, component_name);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_device_model_v2g_variable 
+            ON device_model_variables_v2g(component_name, variable_name);
+        """)
+        
+        # ISO 15118 certificates indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_certificates_station 
+            ON iso15118_certificates(station_id, certificate_type);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_certificates_status 
+            ON iso15118_certificates(status, valid_to);
+        """)
+        
+        # Authorization records indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_auth_records_station 
+            ON authorization_records(station_id, emaid);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_auth_records_time 
+            ON authorization_records(authorization_time DESC);
+        """)
+        
+        self.logger.info("V2G indexes created successfully")
     
     async def _create_continuous_aggregates(self, conn: asyncpg.Connection) -> None:
         """Create continuous aggregates for performance."""

@@ -1,9 +1,11 @@
 """Enhanced end-to-end tests with CitrineOS simulator and failure scenarios."""
 
 import pytest
+import pytest_asyncio
 import asyncio
 import json
 import websockets
+import socket
 from unittest.mock import Mock, AsyncMock, patch
 from datetime import datetime, timezone, timedelta
 import logging
@@ -23,14 +25,30 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def find_free_port():
+    """Find a free port for testing."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
 class TestCitrineOSEnhanced:
     """Enhanced CitrineOS simulation tests with failure scenarios."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def test_server(self):
         """Start test WebSocket server."""
-        config = Config()
-        server = WebSocketServer(config)
+        # Create test configuration with required fields
+        config = Config.from_env()
+        # Use a different port for testing to avoid conflicts
+        config.websocket.port = find_free_port()
+        
+        # Create mock TimescaleDB client for testing
+        mock_timescale_client = AsyncMock()
+        
+        server = OCPPWebSocketServer(config, mock_timescale_client)
         
         try:
             await server.start()
@@ -38,10 +56,10 @@ class TestCitrineOSEnhanced:
         finally:
             await server.stop()
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     def simulator(self):
         """Create CitrineOS simulator."""
-        return CitrineOSSimulator("ENHANCED_TEST_001", "ws://localhost:9000")
+        return CitrineOSSimulator("ENHANCED_TEST_001", "ws://localhost:9001")
 
     @pytest.mark.asyncio
     async def test_connection_failure_scenarios(self, test_server):
@@ -54,7 +72,7 @@ class TestCitrineOSEnhanced:
             await invalid_simulator.connect()
         
         # Test 2: Connection timeout
-        timeout_simulator = CitrineOSSimulator("TIMEOUT_TEST", "ws://localhost:9000")
+        timeout_simulator = CitrineOSSimulator("TIMEOUT_TEST", "ws://localhost:9001")
         
         # Mock websockets.connect to simulate timeout
         with patch('websockets.connect', side_effect=asyncio.TimeoutError()):
@@ -172,7 +190,7 @@ class TestCitrineOSEnhanced:
         # Create multiple simulators
         simulators = []
         for i in range(5):
-            simulator = CitrineOSSimulator(f"CONCURRENT_TEST_{i+1:03d}", "ws://localhost:9000")
+            simulator = CitrineOSSimulator(f"CONCURRENT_TEST_{i+1:03d}", "ws://localhost:9001")
             simulators.append(simulator)
         
         try:
@@ -211,7 +229,7 @@ class TestCitrineOSEnhanced:
         """Test scaling scenarios with many connections."""
         
         # Create fleet simulator with many stations
-        fleet = CitrineOSFleetSimulator(num_stations=20, server_url="ws://localhost:9000")
+        fleet = CitrineOSFleetSimulator(num_stations=20, server_url="ws://localhost:9001")
         
         try:
             # Connect all stations
@@ -252,7 +270,7 @@ class TestCitrineOSEnhanced:
     async def test_stress_scenarios(self, test_server):
         """Test stress scenarios with rapid message sending."""
         
-        simulator = CitrineOSSimulator("STRESS_TEST_001", "ws://localhost:9000")
+        simulator = CitrineOSSimulator("STRESS_TEST_001", "ws://localhost:9001")
         
         await simulator.connect()
         
@@ -373,7 +391,7 @@ class TestCitrineOSEnhanced:
     async def test_performance_scenarios(self, test_server):
         """Test performance scenarios."""
         
-        simulator = CitrineOSSimulator("PERFORMANCE_TEST_001", "ws://localhost:9000")
+        simulator = CitrineOSSimulator("PERFORMANCE_TEST_001", "ws://localhost:9001")
         
         await simulator.connect()
         
@@ -417,11 +435,18 @@ class TestCitrineOSEnhanced:
 class TestEVerestSimulation:
     """Test EVerest simulator integration."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def test_server(self):
         """Start test WebSocket server."""
-        config = Config()
-        server = WebSocketServer(config)
+        # Create test configuration with required fields
+        config = Config.from_env()
+        # Use a different port for testing to avoid conflicts
+        config.websocket.port = find_free_port()
+        
+        # Create mock TimescaleDB client for testing
+        mock_timescale_client = AsyncMock()
+        
+        server = OCPPWebSocketServer(config, mock_timescale_client)
         
         try:
             await server.start()
@@ -467,7 +492,7 @@ class TestEVerestSimulation:
         ]
         
         # Create simulator and connect
-        simulator = CitrineOSSimulator("EVEREST_TEST_001", "ws://localhost:9000")
+        simulator = CitrineOSSimulator("EVEREST_TEST_001", "ws://localhost:9001")
         await simulator.connect()
         
         try:
@@ -511,7 +536,7 @@ class TestEVerestSimulation:
         # Create simulators for fleet
         simulators = []
         for station_data in fleet_data:
-            simulator = CitrineOSSimulator(station_data["station_id"], "ws://localhost:9000")
+            simulator = CitrineOSSimulator(station_data["station_id"], "ws://localhost:9001")
             simulators.append(simulator)
         
         try:
@@ -540,11 +565,18 @@ class TestEVerestSimulation:
 class TestMobileHouseSimulation:
     """Test MobileHouse Python OCPP library simulation."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def test_server(self):
         """Start test WebSocket server."""
-        config = Config()
-        server = WebSocketServer(config)
+        # Create test configuration with required fields
+        config = Config.from_env()
+        # Use a different port for testing to avoid conflicts
+        config.websocket.port = find_free_port()
+        
+        # Create mock TimescaleDB client for testing
+        mock_timescale_client = AsyncMock()
+        
+        server = OCPPWebSocketServer(config, mock_timescale_client)
         
         try:
             await server.start()
@@ -587,7 +619,7 @@ class TestMobileHouseSimulation:
             }]
         
         # Create simulator and connect
-        simulator = CitrineOSSimulator("MOBILEHOUSE_TEST_001", "ws://localhost:9000")
+        simulator = CitrineOSSimulator("MOBILEHOUSE_TEST_001", "ws://localhost:9001")
         await simulator.connect()
         
         try:
@@ -647,7 +679,7 @@ class TestMobileHouseSimulation:
         # Simulate multiple stations concurrently
         tasks = []
         for i in range(3):
-            task = simulate_station(f"MH_STATION_{i+1:03d}", "ws://localhost:9000")
+            task = simulate_station(f"MH_STATION_{i+1:03d}", "ws://localhost:9001")
             tasks.append(task)
         
         # Run all simulations concurrently

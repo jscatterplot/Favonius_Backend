@@ -38,14 +38,28 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         connection, 
         config: Config,
         timescale_client: TimescaleClient,
-        connection_manager: ConnectionManager
+        connection_manager: ConnectionManager,
+        charging_profile_manager: Optional[ChargingProfileManager] = None,
+        der_control_manager: Optional[Any] = None,
+        priority_charging_manager: Optional[Any] = None,
+        external_control_manager: Optional[Any] = None,
+        certificate_manager: Optional[CertificateManager] = None,
+        v2x_controller: Optional[Any] = None
     ):
-        """Initialize enhanced charge point."""
+        """Initialize enhanced charge point with V2G capabilities."""
         super().__init__(station_id, connection)
         self.config = config
         self.timescale_client = timescale_client
         self.connection_manager = connection_manager
         self.logger = get_logger(__name__)
+        
+        # V2G managers
+        self.charging_profile_manager = charging_profile_manager
+        self.der_control_manager = der_control_manager
+        self.priority_charging_manager = priority_charging_manager
+        self.external_control_manager = external_control_manager
+        self.certificate_manager = certificate_manager
+        self.v2x_controller = v2x_controller
         
         # Station state
         self.station_info: Optional[Dict] = None
@@ -156,7 +170,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         transaction_info: Dict,
         **kwargs
     ):
-        """Handle TransactionEvent message."""
+        """Handle TransactionEvent message with V2G extensions."""
         self.logger.info(f"Transaction event from {self.id}: {event_type.value}")
         
         transaction_id = transaction_info.get("transactionId")
@@ -169,9 +183,9 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         elif event_type == TransactionEventEnumType.ended:
             self.active_transactions.pop(connector_id, None)
         
-        # Store transaction in database
-        asyncio.create_task(self._store_transaction_event(
-            transaction_id, event_type.value, timestamp, transaction_info, evse_id, connector_id
+        # Store transaction in database with V2G extensions
+        asyncio.create_task(self._store_transaction_event_v2g(
+            transaction_id, event_type.value, timestamp, transaction_info, evse_id, connector_id, kwargs
         ))
         
         return call_result.TransactionEvent()
@@ -389,6 +403,148 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         except Exception as e:
             self.logger.error(f"Failed to store transaction event: {e}")
     
+    async def _store_transaction_event_v2g(
+        self,
+        transaction_id: str,
+        event_type: str,
+        timestamp: str,
+        transaction_info: Dict,
+        evse_id: int,
+        connector_id: int,
+        kwargs: Dict
+    ):
+        """Store transaction event in database with V2G extensions."""
+        try:
+            # Extract V2G-specific fields
+            charging_state = transaction_info.get("chargingState")
+            trigger_reason = kwargs.get("triggerReason")
+            meter_values = kwargs.get("meterValue", [])
+            
+            # Handle V2G-specific trigger reasons
+            v2g_trigger_reasons = [
+                "OperationModeChanged",
+                "EnergyLimitReached",
+                "DischargingStarted",
+                "DischargingStopped",
+                "V2XModeChanged"
+            ]
+            
+            is_v2g_event = trigger_reason in v2g_trigger_reasons if trigger_reason else False
+            
+            # Extract operation mode if present
+            operation_mode = None
+            if "operationMode" in transaction_info:
+                operation_mode = transaction_info["operationMode"]
+            elif trigger_reason == "OperationModeChanged":
+                # Extract from meter values or other sources
+                operation_mode = self._extract_operation_mode_from_meter_values(meter_values)
+            
+            # Process V2G-specific meter values
+            v2g_meter_data = {}
+            if meter_values:
+                v2g_meter_data = await self._process_v2g_meter_values(meter_values)
+            
+            transaction_data = {
+                "transaction_id": transaction_id,
+                "event_type": event_type,
+                "timestamp": datetime.fromisoformat(timestamp.replace('Z', '+00:00')),
+                "station_id": self.id,
+                "evse_id": evse_id,
+                "connector_id": connector_id,
+                "charging_state": charging_state,
+                "stopped_reason": transaction_info.get("stoppedReason"),
+                "remote_start_id": transaction_info.get("remoteStartId"),
+                "trigger_reason": trigger_reason,
+                "is_v2g_event": is_v2g_event,
+                "operation_mode": operation_mode,
+                "v2g_meter_data": json.dumps(v2g_meter_data) if v2g_meter_data else None,
+                "offline": kwargs.get("offline", False),
+                "number_of_phases_used": kwargs.get("numberOfPhasesUsed"),
+                "cable_max_current": kwargs.get("cableMaxCurrent"),
+                "reservation_id": kwargs.get("reservationId"),
+                "evse": json.dumps(kwargs.get("evse", {})),
+                "id_token": json.dumps(kwargs.get("idToken", {})),
+                "certificate": kwargs.get("certificate"),
+                "iso15118_certificate_hash_data": json.dumps(kwargs.get("iso15118CertificateHashData", []))
+            }
+            
+            await self.timescale_client.insert_transaction_event_v2g(transaction_data)
+            
+            # Log V2G-specific events
+            if is_v2g_event:
+                self.logger.info(f"V2G transaction event: {trigger_reason} for transaction {transaction_id}")
+                if operation_mode:
+                    self.logger.info(f"Operation mode changed to: {operation_mode}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to store V2G transaction event: {e}")
+    
+    def _extract_operation_mode_from_meter_values(self, meter_values: List[Dict]) -> Optional[str]:
+        """Extract operation mode from meter values."""
+        try:
+            for meter_value in meter_values:
+                sampled_values = meter_value.get("sampledValue", [])
+                for sampled_value in sampled_values:
+                    measurand = sampled_value.get("measurand", "")
+                    if "OperationMode" in measurand:
+                        return sampled_value.get("value")
+            return None
+        except Exception:
+            return None
+    
+    async def _process_v2g_meter_values(self, meter_values: List[Dict]) -> Dict[str, Any]:
+        """Process V2G-specific meter values."""
+        try:
+            v2g_data = {
+                "power_active_export": None,
+                "energy_active_export": None,
+                "power_active_setpoint": None,
+                "power_active_residual": None,
+                "power_reactive_export": None,
+                "power_reactive_import": None,
+                "operation_mode": None,
+                "frequency": None,
+                "voltage": None,
+                "current": None
+            }
+            
+            for meter_value in meter_values:
+                timestamp = meter_value.get("timestamp")
+                sampled_values = meter_value.get("sampledValue", [])
+                
+                for sampled_value in sampled_values:
+                    measurand = sampled_value.get("measurand", "")
+                    value = sampled_value.get("value")
+                    unit = sampled_value.get("unitOfMeasure", {}).get("unit", "")
+                    
+                    # Map V2G-specific measurands
+                    if measurand == "Power.Active.Export":
+                        v2g_data["power_active_export"] = float(value) if value else None
+                    elif measurand == "Energy.Active.Export.Register":
+                        v2g_data["energy_active_export"] = float(value) if value else None
+                    elif measurand == "Power.Active.Setpoint":
+                        v2g_data["power_active_setpoint"] = float(value) if value else None
+                    elif measurand == "Power.Active.Residual":
+                        v2g_data["power_active_residual"] = float(value) if value else None
+                    elif measurand == "Power.Reactive.Export":
+                        v2g_data["power_reactive_export"] = float(value) if value else None
+                    elif measurand == "Power.Reactive.Import":
+                        v2g_data["power_reactive_import"] = float(value) if value else None
+                    elif "OperationMode" in measurand:
+                        v2g_data["operation_mode"] = value
+                    elif measurand == "Frequency":
+                        v2g_data["frequency"] = float(value) if value else None
+                    elif measurand == "Voltage":
+                        v2g_data["voltage"] = float(value) if value else None
+                    elif measurand == "Current.Import" or measurand == "Current.Export":
+                        v2g_data["current"] = float(value) if value else None
+            
+            return v2g_data
+            
+        except Exception as e:
+            self.logger.error(f"Error processing V2G meter values: {e}")
+            return {}
+    
     async def _process_meter_values(self, evse_id: int, meter_values: list):
         """Process meter values and store in database."""
         try:
@@ -412,13 +568,19 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                     value = sampled_value.get("value")
                     unit = sampled_value.get("unitOfMeasure", {}).get("unit", "Wh")
                     
-                    # Map OCPP measurands to our telemetry format
+                    # Map OCPP measurands to our telemetry format (including V2G)
                     if measurand == "Power.Active.Import":
                         telemetry_data["power_kw"] = float(value) / 1000 if unit == "W" else float(value)
                     elif measurand == "Power.Active.Export":
-                        telemetry_data["power_kw"] = -float(value) / 1000 if unit == "W" else -float(value)
+                        telemetry_data["power_discharge_kw"] = float(value) / 1000 if unit == "W" else float(value)
+                    elif measurand == "Power.Active.Setpoint":
+                        telemetry_data["power_setpoint_kw"] = float(value) / 1000 if unit == "W" else float(value)
+                    elif measurand == "Power.Active.Residual":
+                        telemetry_data["power_residual_kw"] = float(value) / 1000 if unit == "W" else float(value)
                     elif measurand == "Energy.Active.Import.Register":
                         telemetry_data["energy_kwh"] = float(value) / 1000 if unit == "Wh" else float(value)
+                    elif measurand == "Energy.Active.Export.Register":
+                        telemetry_data["energy_discharged_kwh"] = float(value) / 1000 if unit == "Wh" else float(value)
                     elif measurand == "SoC":
                         telemetry_data["soc_percent"] = float(value)
                     elif measurand == "Voltage":
@@ -426,15 +588,19 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                     elif measurand == "Current.Import":
                         telemetry_data["current_a"] = float(value)
                     elif measurand == "Current.Export":
-                        telemetry_data["current_a"] = -float(value)
+                        telemetry_data["current_discharge_a"] = float(value)
                     elif measurand == "Frequency":
                         telemetry_data["frequency_hz"] = float(value)
                     elif measurand == "Temperature":
                         telemetry_data["temperature_c"] = float(value)
                     elif measurand == "Power.Reactive.Import":
-                        telemetry_data["reactive_power_kvar"] = float(value) / 1000 if unit == "var" else float(value)
+                        telemetry_data["reactive_power_import_kvar"] = float(value) / 1000 if unit == "var" else float(value)
+                    elif measurand == "Power.Reactive.Export":
+                        telemetry_data["reactive_power_export_kvar"] = float(value) / 1000 if unit == "var" else float(value)
                     elif measurand == "Power.Factor":
                         telemetry_data["power_factor"] = float(value)
+                    elif "OperationMode" in measurand:
+                        telemetry_data["operation_mode"] = value
                 
                 telemetry_batch.append(telemetry_data)
             
@@ -459,8 +625,41 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             self.logger.error(f"Failed to store data transfer: {e}")
     
     async def _store_ev_charging_needs(self, evse_id: int, charging_needs: Dict):
-        """Store EV charging needs."""
+        """Store EV charging needs with V2G parameter extraction."""
         try:
+            # Extract V2G-specific parameters
+            v2x_charging_parameters = charging_needs.get("v2xChargingParameters")
+            der_charging_parameters = charging_needs.get("derChargingParameters")
+            
+            # Extract V2X charging parameters
+            v2x_params = {}
+            if v2x_charging_parameters:
+                v2x_params = {
+                    "ev_maximum_discharge_power": v2x_charging_parameters.get("evMaximumDischargePower"),
+                    "ev_minimum_discharge_power": v2x_charging_parameters.get("evMinimumDischargePower"),
+                    "ev_maximum_charge_power": v2x_charging_parameters.get("evMaximumChargePower"),
+                    "ev_minimum_charge_power": v2x_charging_parameters.get("evMinimumChargePower"),
+                    "ev_target_energy_request": v2x_charging_parameters.get("evTargetEnergyRequest"),
+                    "ev_maximum_energy_request": v2x_charging_parameters.get("evMaximumEnergyRequest"),
+                    "ev_minimum_energy_request": v2x_charging_parameters.get("evMinimumEnergyRequest"),
+                    "ev_present_active_power": v2x_charging_parameters.get("evPresentActivePower"),
+                    "ev_present_reactive_power": v2x_charging_parameters.get("evPresentReactivePower"),
+                    "soc": v2x_charging_parameters.get("soc"),
+                    "capacity": v2x_charging_parameters.get("capacity"),
+                    "control_mode": v2x_charging_parameters.get("controlMode")  # ScheduledControl | DynamicControl
+                }
+            
+            # Extract DER charging parameters
+            der_params = {}
+            if der_charging_parameters:
+                der_params = {
+                    "max_w": der_charging_parameters.get("maxW"),
+                    "max_var": der_charging_parameters.get("maxVar"),
+                    "inverter_manufacturer": der_charging_parameters.get("inverterManufacturer"),
+                    "inverter_model": der_charging_parameters.get("inverterModel"),
+                    "supported_controls": der_charging_parameters.get("supportedControls")  # Array of DERControlEnumType
+                }
+            
             needs_data = {
                 "station_id": self.id,
                 "evse_id": evse_id,
@@ -468,9 +667,19 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                 "departure_time": charging_needs.get("departureTime"),
                 "ac_charging_parameters": charging_needs.get("acChargingParameters"),
                 "dc_charging_parameters": charging_needs.get("dcChargingParameters"),
+                "v2x_charging_parameters": v2x_params,
+                "der_charging_parameters": der_params,
+                "control_mode": v2x_params.get("control_mode"),
                 "timestamp": datetime.now(timezone.utc)
             }
+            
             await self.timescale_client.insert_ev_charging_needs(needs_data)
+            
+            # Log V2G parameters if present
+            if v2x_params or der_params:
+                self.logger.info(f"V2G charging needs detected for {self.id}, EVSE {evse_id}: "
+                               f"V2X params: {bool(v2x_params)}, DER params: {bool(der_params)}")
+                
         except Exception as e:
             self.logger.error(f"Failed to store EV charging needs: {e}")
     
@@ -950,6 +1159,104 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         return call_result.CustomerInformation(status="Accepted")
 
     # Note: delete_customer_information is not supported in OCPP 2.1
+    
+    # V2G-specific message handlers
+    @on(Action.update_dynamic_schedule)
+    def on_update_dynamic_schedule(self, charging_profile_id: int, 
+                                  limit: Optional[float] = None,
+                                  discharging_limit: Optional[float] = None,
+                                  setpoint: Optional[float] = None,
+                                  setpoint_reactive: Optional[float] = None, **kwargs):
+        """Handle UpdateDynamicSchedule request."""
+        asyncio.create_task(self._handle_update_dynamic_schedule(charging_profile_id, limit, 
+                                                          discharging_limit, setpoint, setpoint_reactive))
+        return call_result.UpdateDynamicSchedule(status="Accepted")
+    
+    @on(Action.pull_dynamic_schedule_update)
+    def on_pull_dynamic_schedule_update(self, charging_profile_id: int, **kwargs):
+        """Handle PullDynamicScheduleUpdate request."""
+        asyncio.create_task(self._handle_pull_dynamic_schedule_update(charging_profile_id))
+        return call_result.PullDynamicScheduleUpdate(status="Accepted")
+    
+    @on(Action.notify_charging_limit)
+    def on_notify_charging_limit(self, charging_schedule: Optional[List] = None,
+                                evse_id: Optional[int] = None,
+                                charging_limit: Dict = None, **kwargs):
+        """Handle NotifyChargingLimit request."""
+        asyncio.create_task(self._handle_notify_charging_limit(charging_schedule, evse_id, charging_limit))
+        return call_result.NotifyChargingLimit(status="Accepted")
+    
+    @on(Action.cleared_charging_limit)
+    def on_cleared_charging_limit(self, charging_limit_source: str,
+                                 evse_id: Optional[int] = None, **kwargs):
+        """Handle ClearedChargingLimit request."""
+        asyncio.create_task(self._handle_cleared_charging_limit(charging_limit_source, evse_id))
+        return call_result.ClearedChargingLimit(status="Accepted")
+    
+    @on(Action.use_priority_charging)
+    def on_use_priority_charging(self, transaction_id: str, activate: bool, **kwargs):
+        """Handle UsePriorityCharging request."""
+        asyncio.create_task(self._handle_use_priority_charging(transaction_id, activate))
+        return call_result.UsePriorityCharging(status="Accepted")
+    
+    @on(Action.notify_priority_charging)
+    def on_notify_priority_charging(self, transaction_id: str, activated: bool, **kwargs):
+        """Handle NotifyPriorityCharging request."""
+        asyncio.create_task(self._handle_notify_priority_charging(transaction_id, activated))
+        return call_result.NotifyPriorityCharging(status="Accepted")
+    
+    @on(Action.notify_allowed_energy_transfer)
+    def on_notify_allowed_energy_transfer(self, allowed_energy_transfer: List[str], **kwargs):
+        """Handle NotifyAllowedEnergyTransfer request."""
+        asyncio.create_task(self._handle_notify_allowed_energy_transfer(allowed_energy_transfer))
+        return call_result.NotifyAllowedEnergyTransfer(status="Accepted")
+    
+    # DER Control message handlers
+    @on(Action.set_der_control)
+    def on_set_der_control(self, der_control: Dict, **kwargs):
+        """Handle SetDERControl request."""
+        asyncio.create_task(self._handle_set_der_control(der_control))
+        return call_result.SetDERControl(status="Accepted")
+    
+    @on(Action.get_der_control)
+    def on_get_der_control(self, control_id: Optional[int] = None, **kwargs):
+        """Handle GetDERControl request."""
+        asyncio.create_task(self._handle_get_der_control(control_id))
+        return call_result.GetDERControl(status="Accepted")
+    
+    @on(Action.report_der_control)
+    def on_report_der_control(self, der_control: List[Dict], **kwargs):
+        """Handle ReportDERControl request."""
+        asyncio.create_task(self._handle_report_der_control(der_control))
+        return call_result.ReportDERControl(status="Accepted")
+    
+    @on(Action.clear_der_control)
+    def on_clear_der_control(self, control_id: Optional[int] = None, **kwargs):
+        """Handle ClearDERControl request."""
+        asyncio.create_task(self._handle_clear_der_control(control_id))
+        return call_result.ClearDERControl(status="Accepted")
+    
+    @on(Action.notify_der_alarm)
+    def on_notify_der_alarm(self, control_type: str, alarm_ended: bool,
+                            grid_event_fault: Optional[str] = None,
+                            timestamp: str = None, **kwargs):
+        """Handle NotifyDERAlarm request."""
+        asyncio.create_task(self._handle_notify_der_alarm(control_type, alarm_ended, grid_event_fault, timestamp))
+        return call_result.NotifyDERAlarm(status="Accepted")
+    
+    @on(Action.notify_der_start_stop)
+    def on_notify_der_start_stop(self, control_id: int, started: bool,
+                                 superseded_id: Optional[int] = None,
+                                 timestamp: str = None, **kwargs):
+        """Handle NotifyDERStartStop request."""
+        asyncio.create_task(self._handle_notify_der_start_stop(control_id, started, superseded_id, timestamp))
+        return call_result.NotifyDERStartStop(status="Accepted")
+    
+    @on(Action.afrr_signal)
+    def on_afrr_signal(self, signal: float, timestamp: str, **kwargs):
+        """Handle AFRRSignal request."""
+        asyncio.create_task(self._handle_afrr_signal(signal, timestamp))
+        return call_result.AFRRSignal(status="Accepted")
     
     # ===== ASYNC HANDLERS =====
     
@@ -1645,3 +1952,320 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             
         except Exception as e:
             self.logger.error(f"Error handling DeleteCustomerInformation: {e}")
+    
+    # V2G-specific async handlers
+    async def _handle_update_dynamic_schedule(self, charging_profile_id: int, 
+                                            limit: Optional[float] = None,
+                                            discharging_limit: Optional[float] = None,
+                                            setpoint: Optional[float] = None,
+                                            setpoint_reactive: Optional[float] = None):
+        """Handle UpdateDynamicSchedule request."""
+        try:
+            self.logger.info(f"UpdateDynamicSchedule from {self.id}: profile_id={charging_profile_id}, "
+                           f"limit={limit}, discharging_limit={discharging_limit}, "
+                           f"setpoint={setpoint}, setpoint_reactive={setpoint_reactive}")
+            
+            # Update the charging profile with new dynamic values
+            if self.charging_profile_manager:
+                result = await self.charging_profile_manager.update_dynamic_schedule(
+                    self.id, charging_profile_id, limit, discharging_limit, 
+                    setpoint, setpoint_reactive
+                )
+                self.logger.info(f"Updated dynamic schedule for profile {charging_profile_id}: {result}")
+            else:
+                self.logger.warning("Charging profile manager not available")
+            
+            # Send UpdateDynamicScheduleResponse
+            from ocpp.v21 import call
+            request = call.UpdateDynamicScheduleResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling UpdateDynamicSchedule: {e}")
+    
+    async def _handle_pull_dynamic_schedule_update(self, charging_profile_id: int):
+        """Handle PullDynamicScheduleUpdate request."""
+        try:
+            self.logger.info(f"PullDynamicScheduleUpdate from {self.id}: profile_id={charging_profile_id}")
+            
+            # Get the current dynamic schedule
+            result = await self.charging_profile_manager.pull_dynamic_schedule_update(
+                self.id, charging_profile_id
+            )
+            
+            # Send PullDynamicScheduleUpdateResponse
+            from ocpp.v21 import call
+            request = call.PullDynamicScheduleUpdateResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo"),
+                charging_schedule=result.get("charging_schedule")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling PullDynamicScheduleUpdate: {e}")
+    
+    async def _handle_notify_charging_limit(self, charging_schedule: Optional[List] = None,
+                                          evse_id: Optional[int] = None,
+                                          charging_limit: Dict = None):
+        """Handle NotifyChargingLimit request."""
+        try:
+            self.logger.info(f"NotifyChargingLimit from {self.id}: evse_id={evse_id}, "
+                           f"charging_limit={charging_limit}")
+            
+            # Store the external charging limit
+            result = await self.charging_profile_manager.notify_charging_limit(
+                self.id, evse_id, charging_limit, charging_schedule
+            )
+            
+            # Send NotifyChargingLimitResponse
+            from ocpp.v21 import call
+            request = call.NotifyChargingLimitResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling NotifyChargingLimit: {e}")
+    
+    async def _handle_cleared_charging_limit(self, charging_limit_source: str,
+                                           evse_id: Optional[int] = None):
+        """Handle ClearedChargingLimit request."""
+        try:
+            self.logger.info(f"ClearedChargingLimit from {self.id}: source={charging_limit_source}, "
+                           f"evse_id={evse_id}")
+            
+            # Clear the external charging limit
+            result = await self.charging_profile_manager.cleared_charging_limit(
+                self.id, charging_limit_source, evse_id
+            )
+            
+            # Send ClearedChargingLimitResponse
+            from ocpp.v21 import call
+            request = call.ClearedChargingLimitResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling ClearedChargingLimit: {e}")
+    
+    async def _handle_use_priority_charging(self, transaction_id: str, activate: bool):
+        """Handle UsePriorityCharging request."""
+        try:
+            self.logger.info(f"UsePriorityCharging from {self.id}: transaction_id={transaction_id}, "
+                           f"activate={activate}")
+            
+            # Process priority charging request
+            if self.priority_charging_manager:
+                result = await self.priority_charging_manager.use_priority_charging(
+                    self.id, transaction_id, activate
+                )
+                self.logger.info(f"Priority charging {'activated' if activate else 'deactivated'} for transaction {transaction_id}: {result}")
+            else:
+                self.logger.warning("Priority charging manager not available")
+            
+            # Send UsePriorityChargingResponse
+            from ocpp.v21 import call
+            request = call.UsePriorityChargingResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling UsePriorityCharging: {e}")
+    
+    async def _handle_notify_priority_charging(self, transaction_id: str, activated: bool):
+        """Handle NotifyPriorityCharging request."""
+        try:
+            self.logger.info(f"NotifyPriorityCharging from {self.id}: transaction_id={transaction_id}, "
+                           f"activated={activated}")
+            
+            # Store priority charging status
+            result = await self.charging_profile_manager.notify_priority_charging(
+                self.id, transaction_id, activated
+            )
+            
+            # Send NotifyPriorityChargingResponse
+            from ocpp.v21 import call
+            request = call.NotifyPriorityChargingResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling NotifyPriorityCharging: {e}")
+    
+    async def _handle_notify_allowed_energy_transfer(self, allowed_energy_transfer: List[str]):
+        """Handle NotifyAllowedEnergyTransfer request."""
+        try:
+            self.logger.info(f"NotifyAllowedEnergyTransfer from {self.id}: "
+                           f"allowed_energy_transfer={allowed_energy_transfer}")
+            
+            # Store allowed energy transfer modes
+            result = await self.v2x_controller.notify_allowed_energy_transfer(
+                self.id, allowed_energy_transfer
+            )
+            
+            # Send NotifyAllowedEnergyTransferResponse
+            from ocpp.v21 import call
+            request = call.NotifyAllowedEnergyTransferResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling NotifyAllowedEnergyTransfer: {e}")
+    
+    # DER Control async handlers
+    async def _handle_set_der_control(self, der_control: Dict):
+        """Handle SetDERControl request."""
+        try:
+            self.logger.info(f"SetDERControl from {self.id}: der_control={der_control}")
+            
+            # Process DER control request
+            result = await self.v2x_controller.set_der_control(self.id, der_control)
+            
+            # Send SetDERControlResponse
+            from ocpp.v21 import call
+            request = call.SetDERControlResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling SetDERControl: {e}")
+    
+    async def _handle_get_der_control(self, control_id: Optional[int] = None):
+        """Handle GetDERControl request."""
+        try:
+            self.logger.info(f"GetDERControl from {self.id}: control_id={control_id}")
+            
+            # Get DER control information
+            result = await self.v2x_controller.get_der_control(self.id, control_id)
+            
+            # Send GetDERControlResponse
+            from ocpp.v21 import call
+            request = call.GetDERControlResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo"),
+                der_control=result.get("der_control")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling GetDERControl: {e}")
+    
+    async def _handle_report_der_control(self, der_control: List[Dict]):
+        """Handle ReportDERControl request."""
+        try:
+            self.logger.info(f"ReportDERControl from {self.id}: der_control={der_control}")
+            
+            # Store DER control report
+            result = await self.v2x_controller.report_der_control(self.id, der_control)
+            
+            # Send ReportDERControlResponse
+            from ocpp.v21 import call
+            request = call.ReportDERControlResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling ReportDERControl: {e}")
+    
+    async def _handle_clear_der_control(self, control_id: Optional[int] = None):
+        """Handle ClearDERControl request."""
+        try:
+            self.logger.info(f"ClearDERControl from {self.id}: control_id={control_id}")
+            
+            # Clear DER control
+            result = await self.v2x_controller.clear_der_control(self.id, control_id)
+            
+            # Send ClearDERControlResponse
+            from ocpp.v21 import call
+            request = call.ClearDERControlResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling ClearDERControl: {e}")
+    
+    async def _handle_notify_der_alarm(self, control_type: str, alarm_ended: bool,
+                                     grid_event_fault: Optional[str] = None,
+                                     timestamp: str = None):
+        """Handle NotifyDERAlarm request."""
+        try:
+            self.logger.info(f"NotifyDERAlarm from {self.id}: control_type={control_type}, "
+                           f"alarm_ended={alarm_ended}, grid_event_fault={grid_event_fault}")
+            
+            # Store DER alarm notification
+            result = await self.v2x_controller.notify_der_alarm(
+                self.id, control_type, alarm_ended, grid_event_fault, timestamp
+            )
+            
+            # Send NotifyDERAlarmResponse
+            from ocpp.v21 import call
+            request = call.NotifyDERAlarmResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling NotifyDERAlarm: {e}")
+    
+    async def _handle_notify_der_start_stop(self, control_id: int, started: bool,
+                                          superseded_id: Optional[int] = None,
+                                          timestamp: str = None):
+        """Handle NotifyDERStartStop request."""
+        try:
+            self.logger.info(f"NotifyDERStartStop from {self.id}: control_id={control_id}, "
+                           f"started={started}, superseded_id={superseded_id}")
+            
+            # Store DER start/stop notification
+            result = await self.v2x_controller.notify_der_start_stop(
+                self.id, control_id, started, superseded_id, timestamp
+            )
+            
+            # Send NotifyDERStartStopResponse
+            from ocpp.v21 import call
+            request = call.NotifyDERStartStopResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling NotifyDERStartStop: {e}")
+    
+    async def _handle_afrr_signal(self, signal: float, timestamp: str):
+        """Handle AFRRSignal request."""
+        try:
+            self.logger.info(f"AFRRSignal from {self.id}: signal={signal}, timestamp={timestamp}")
+            
+            # Process AFRR signal
+            result = await self.v2x_controller.afrr_signal(self.id, signal, timestamp)
+            
+            # Send AFRRSignalResponse
+            from ocpp.v21 import call
+            request = call.AFRRSignalResponse(
+                status=result["status"],
+                statusInfo=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling AFRRSignal: {e}")

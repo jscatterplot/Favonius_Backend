@@ -32,6 +32,11 @@ class CertificateType(Enum):
     V2G_CERTIFICATE_CHAIN = "V2GCertificateChain"
     CONTRACT_CERTIFICATE = "ContractCertificate"
     CHARGING_STATION_CERTIFICATE = "ChargingStationCertificate"
+    SECC_CERTIFICATE = "SECCCertificate"  # Supply Equipment Communication Controller
+    V2G_ROOT_CERTIFICATE = "V2GRootCertificate"  # Alias for V2G_ROOT_CA
+    MO_SUB_CERTIFICATE = "MOSubCertificate"  # Alias for MO_SUB_CA_1
+    OEM_SUB_CERTIFICATE = "OEMSubCertificate"  # Alias for OEM_SUB_CA_1
+    CPO_SUB_CERTIFICATE = "CPOSubCertificate"  # Alias for CPO_SUB_CA_1
 
 
 class CertificateStatus(Enum):
@@ -689,3 +694,355 @@ class CertificateManager:
         except Exception as e:
             self.logger.error(f"Error signing certificate request: {e}")
             raise
+    
+    # V2G-specific certificate validation methods
+    async def validate_contract_certificate(self, station_id: str, contract_certificate: str, 
+                                          emaid: Optional[str] = None) -> Dict[str, Any]:
+        """Validate contract certificate for V2G operations."""
+        try:
+            self.logger.info(f"Validating contract certificate for station {station_id}")
+            
+            # Parse certificate
+            certificate_info = await self._parse_certificate(contract_certificate)
+            
+            # Validate certificate chain
+            if certificate_info.certificate_chain:
+                chain_validation = await self._validate_certificate_chain(certificate_info.certificate_chain)
+                if not chain_validation["valid"]:
+                    return {
+                        "valid": False,
+                        "reason_code": chain_validation["reason_code"],
+                        "message": chain_validation["message"]
+                    }
+            
+            # Validate certificate
+            cert_validation = await self._validate_certificate(certificate_info)
+            if not cert_validation["valid"]:
+                return cert_validation
+            
+            # Validate eMAID if provided
+            if emaid:
+                emaid_validation = await self._validate_emaid(certificate_info, emaid)
+                if not emaid_validation["valid"]:
+                    return emaid_validation
+            
+            # Check V2G-specific requirements
+            v2g_validation = await self._validate_v2g_certificate_requirements(certificate_info)
+            if not v2g_validation["valid"]:
+                return v2g_validation
+            
+            return {
+                "valid": True,
+                "certificate_info": {
+                    "subject_name": certificate_info.subject_name,
+                    "issuer_name": certificate_info.issuer_name,
+                    "serial_number": certificate_info.serial_number,
+                    "valid_from": certificate_info.valid_from.isoformat() if certificate_info.valid_from else None,
+                    "valid_to": certificate_info.valid_to.isoformat() if certificate_info.valid_to else None
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error validating contract certificate: {e}")
+            return {
+                "valid": False,
+                "reason_code": "InternalError",
+                "message": str(e)
+            }
+    
+    async def get_v2g_certificate_chain(self, station_id: str, certificate_type: CertificateType) -> Dict[str, Any]:
+        """Get V2G certificate chain."""
+        try:
+            certificates = await self._get_installed_certificates(station_id, certificate_type)
+            
+            if not certificates:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": "UnknownCertificate",
+                        "additionalInfo": f"No {certificate_type.value} certificates found"
+                    }
+                }
+            
+            # Build certificate chain
+            certificate_chain = []
+            for cert in certificates:
+                if cert.certificate_chain:
+                    certificate_chain.extend(cert.certificate_chain)
+                else:
+                    certificate_chain.append(cert.certificate_data)
+            
+            return {
+                "status": "Accepted",
+                "certificateChain": certificate_chain,
+                "statusInfo": {
+                    "reasonCode": "NoError"
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting V2G certificate chain: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def validate_emaid(self, certificate_info: CertificateInfo, emaid: str) -> Dict[str, Any]:
+        """Validate e-Mobility Account ID (eMAID) against certificate."""
+        try:
+            # Parse certificate to extract eMAID
+            cert_bytes = base64.b64decode(certificate_info.certificate_data)
+            certificate = x509.load_pem_x509_certificate(cert_bytes)
+            
+            # Extract eMAID from certificate extensions or subject
+            cert_emaid = await self._extract_emaid_from_certificate(certificate)
+            
+            if not cert_emaid:
+                return {
+                    "valid": False,
+                    "reason_code": "PropertyConstraintViolation",
+                    "message": "eMAID not found in certificate"
+                }
+            
+            if cert_emaid != emaid:
+                return {
+                    "valid": False,
+                    "reason_code": "PropertyConstraintViolation",
+                    "message": f"eMAID mismatch: expected {cert_emaid}, got {emaid}"
+                }
+            
+            return {"valid": True}
+            
+        except Exception as e:
+            self.logger.error(f"Error validating eMAID: {e}")
+            return {
+                "valid": False,
+                "reason_code": "InternalError",
+                "message": str(e)
+            }
+    
+    async def handle_pnc_authorization(self, station_id: str, contract_certificate: str, 
+                                    emaid: str, charging_needs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle Plug & Charge authorization flow."""
+        try:
+            self.logger.info(f"Handling PnC authorization for station {station_id}, eMAID: {emaid}")
+            
+            # Validate contract certificate
+            cert_validation = await self.validate_contract_certificate(station_id, contract_certificate, emaid)
+            if not cert_validation["valid"]:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": cert_validation["reason_code"],
+                        "additionalInfo": cert_validation["message"]
+                    }
+                }
+            
+            # Check authorization status
+            auth_status = await self._check_authorization_status(station_id, emaid)
+            if not auth_status["authorized"]:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": "NotAuthorized",
+                        "additionalInfo": auth_status["reason"]
+                    }
+                }
+            
+            # Store authorization record
+            await self._store_authorization_record(station_id, emaid, contract_certificate, charging_needs)
+            
+            return {
+                "status": "Accepted",
+                "statusInfo": {
+                    "reasonCode": "NoError"
+                },
+                "authorization_data": {
+                    "emaid": emaid,
+                    "contract_id": cert_validation["certificate_info"]["serial_number"],
+                    "valid_until": cert_validation["certificate_info"]["valid_to"]
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error handling PnC authorization: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def install_v2g_certificate(self, station_id: str, certificate_type: CertificateType,
+                                    certificate: str, certificate_chain: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Install V2G-specific certificate."""
+        try:
+            # Parse certificate
+            certificate_info = await self._parse_certificate(certificate)
+            
+            # Validate V2G-specific requirements
+            v2g_validation = await self._validate_v2g_certificate_requirements(certificate_info)
+            if not v2g_validation["valid"]:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": v2g_validation["reason_code"],
+                        "additionalInfo": v2g_validation["message"]
+                    }
+                }
+            
+            # Install certificate
+            installation_result = await self._install_certificate(
+                station_id, certificate_type, certificate_info, 
+                certificate_chain or [certificate]
+            )
+            
+            if installation_result["status"] == "Accepted":
+                self.logger.info(f"Installed V2G {certificate_type.value} certificate for {station_id}")
+            
+            return installation_result
+            
+        except Exception as e:
+            self.logger.error(f"Error installing V2G certificate: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def _validate_v2g_certificate_requirements(self, certificate_info: CertificateInfo) -> Dict[str, Any]:
+        """Validate V2G-specific certificate requirements."""
+        try:
+            # Parse certificate
+            cert_bytes = base64.b64decode(certificate_info.certificate_data)
+            certificate = x509.load_pem_x509_certificate(cert_bytes)
+            
+            # Check extended key usage for V2G
+            try:
+                ext_key_usage = certificate.extensions.get_extension_for_oid(ExtendedKeyUsageOID.CLIENT_AUTH)
+                if not ext_key_usage:
+                    return {
+                        "valid": False,
+                        "reason_code": "PropertyConstraintViolation",
+                        "message": "Certificate missing client authentication extended key usage"
+                    }
+            except x509.ExtensionNotFound:
+                return {
+                    "valid": False,
+                    "reason_code": "PropertyConstraintViolation",
+                    "message": "Certificate missing extended key usage extension"
+                }
+            
+            # Check certificate type specific requirements
+            if certificate_info.certificate_type == CertificateType.CONTRACT_CERTIFICATE:
+                # Validate contract certificate specific requirements
+                if not await self._validate_contract_certificate_requirements(certificate):
+                    return {
+                        "valid": False,
+                        "reason_code": "PropertyConstraintViolation",
+                        "message": "Contract certificate does not meet V2G requirements"
+                    }
+            
+            return {"valid": True}
+            
+        except Exception as e:
+            return {
+                "valid": False,
+                "reason_code": "CertificateValidationError",
+                "message": f"V2G certificate validation failed: {e}"
+            }
+    
+    async def _validate_contract_certificate_requirements(self, certificate: x509.Certificate) -> bool:
+        """Validate contract certificate specific requirements."""
+        try:
+            # Check subject name format
+            subject_name = certificate.subject.rfc4514_string()
+            
+            # Contract certificates should have specific subject name format
+            # This is a simplified check - in practice, you'd have more specific requirements
+            if not any(attr.oid == NameOID.COMMON_NAME for attr in certificate.subject):
+                return False
+            
+            # Check validity period (contract certificates should be valid for reasonable period)
+            validity_period = certificate.not_valid_after - certificate.not_valid_before
+            if validity_period.days > 365 * 3:  # More than 3 years
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    async def _extract_emaid_from_certificate(self, certificate: x509.Certificate) -> Optional[str]:
+        """Extract eMAID from certificate."""
+        try:
+            # Check subject alternative name extension
+            try:
+                san_ext = certificate.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+                for name in san_ext.value:
+                    if isinstance(name, x509.RFC822Name):
+                        # eMAID might be in email format
+                        if name.value.endswith("@emaid"):
+                            return name.value
+            except x509.ExtensionNotFound:
+                pass
+            
+            # Check subject name
+            for attr in certificate.subject:
+                if attr.oid == NameOID.COMMON_NAME:
+                    # eMAID might be in CN
+                    if "@emaid" in attr.value:
+                        return attr.value
+            
+            return None
+            
+        except Exception:
+            return None
+    
+    async def _check_authorization_status(self, station_id: str, emaid: str) -> Dict[str, Any]:
+        """Check authorization status for eMAID."""
+        try:
+            # This would integrate with your authorization system
+            # For now, return authorized for all valid eMAIDs
+            if emaid and "@emaid" in emaid:
+                return {
+                    "authorized": True,
+                    "reason": "Valid eMAID"
+                }
+            else:
+                return {
+                    "authorized": False,
+                    "reason": "Invalid eMAID format"
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Error checking authorization status: {e}")
+            return {
+                "authorized": False,
+                "reason": f"Authorization check failed: {e}"
+            }
+    
+    async def _store_authorization_record(self, station_id: str, emaid: str, 
+                                        contract_certificate: str, charging_needs: Optional[Dict[str, Any]]) -> None:
+        """Store authorization record."""
+        try:
+            # Store authorization record in database
+            auth_data = {
+                "station_id": station_id,
+                "emaid": emaid,
+                "contract_certificate": contract_certificate,
+                "charging_needs": json.dumps(charging_needs) if charging_needs else None,
+                "authorization_time": datetime.now(timezone.utc),
+                "status": "authorized"
+            }
+            
+            await self.timescale_client.store_authorization_record(auth_data)
+            
+        except Exception as e:
+            self.logger.error(f"Error storing authorization record: {e}")

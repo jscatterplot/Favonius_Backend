@@ -14,10 +14,14 @@ from .monitoring import get_logger
 
 class V2XOperationMode(Enum):
     """V2X operation modes as defined in OCPP 2.1."""
+    CHARGING_ONLY = "ChargingOnly"
     CENTRAL_SETPOINT = "CentralSetpoint"
-    LOCAL_FREQUENCY = "LocalFrequency" 
-    LOCAL_LOAD_BALANCING = "LocalLoadBalancing"
+    CENTRAL_FREQUENCY = "CentralFrequency"
+    LOCAL_FREQUENCY = "LocalFrequency"
     EXTERNAL_SETPOINT = "ExternalSetpoint"
+    EXTERNAL_LIMITS = "ExternalLimits"
+    LOCAL_LOAD_BALANCING = "LocalLoadBalancing"
+    IDLE = "Idle"
 
 
 @dataclass
@@ -36,10 +40,14 @@ class V2XControllerConfig:
         
         if self.update_interval is None:
             self.update_interval = {
+                V2XOperationMode.CHARGING_ONLY.value: 60,
                 V2XOperationMode.CENTRAL_SETPOINT.value: 30,
+                V2XOperationMode.CENTRAL_FREQUENCY.value: 1,
                 V2XOperationMode.LOCAL_FREQUENCY.value: 1,
+                V2XOperationMode.EXTERNAL_SETPOINT.value: 10,
+                V2XOperationMode.EXTERNAL_LIMITS.value: 5,
                 V2XOperationMode.LOCAL_LOAD_BALANCING.value: 5,
-                V2XOperationMode.EXTERNAL_SETPOINT.value: 10
+                V2XOperationMode.IDLE.value: 300
             }
         
         if self.power_limits is None:
@@ -97,10 +105,14 @@ class V2XController:
     def _initialize_mode_controllers(self) -> None:
         """Initialize controllers for different V2X modes."""
         self.mode_controllers = {
+            V2XOperationMode.CHARGING_ONLY: ChargingOnlyController(self),
             V2XOperationMode.CENTRAL_SETPOINT: CentralSetpointController(self),
+            V2XOperationMode.CENTRAL_FREQUENCY: CentralFrequencyController(self),
             V2XOperationMode.LOCAL_FREQUENCY: LocalFrequencyController(self),
+            V2XOperationMode.EXTERNAL_SETPOINT: ExternalSetpointController(self),
+            V2XOperationMode.EXTERNAL_LIMITS: ExternalLimitsController(self),
             V2XOperationMode.LOCAL_LOAD_BALANCING: LocalLoadBalancingController(self),
-            V2XOperationMode.EXTERNAL_SETPOINT: ExternalSetpointController(self)
+            V2XOperationMode.IDLE: IdleController(self)
         }
     
     async def start(self) -> None:
@@ -202,6 +214,207 @@ class V2XController:
         except Exception as e:
             self.logger.error(f"Failed to clear V2X setpoint for {station_id}: {e}")
             return False
+    
+    # DER Control Integration Methods
+    async def set_der_control(self, station_id: str, der_control_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Set DER control for station."""
+        try:
+            # Import DER control manager (circular import handling)
+            from .der_control_manager import DERControlManager
+            
+            # Create DER control manager instance
+            der_manager = DERControlManager(self.timescale_client)
+            
+            # Set DER control
+            result = await der_manager.set_der_control(station_id, der_control_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error setting DER control: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def get_der_control(self, station_id: str, control_id: Optional[int] = None) -> Dict[str, Any]:
+        """Get DER control for station."""
+        try:
+            # Import DER control manager
+            from .der_control_manager import DERControlManager
+            
+            # Create DER control manager instance
+            der_manager = DERControlManager(self.timescale_client)
+            
+            # Get DER control
+            result = await der_manager.get_der_control(station_id, control_id)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error getting DER control: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def report_der_control(self, station_id: str, der_controls: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Report DER control status."""
+        try:
+            # Import DER control manager
+            from .der_control_manager import DERControlManager
+            
+            # Create DER control manager instance
+            der_manager = DERControlManager(self.timescale_client)
+            
+            # Report DER control
+            result = await der_manager.report_der_control(station_id, der_controls)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error reporting DER control: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def clear_der_control(self, station_id: str, control_id: Optional[int] = None) -> Dict[str, Any]:
+        """Clear DER control for station."""
+        try:
+            # Import DER control manager
+            from .der_control_manager import DERControlManager
+            
+            # Create DER control manager instance
+            der_manager = DERControlManager(self.timescale_client)
+            
+            # Clear DER control
+            result = await der_manager.clear_der_control(station_id, control_id)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error clearing DER control: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def notify_der_alarm(self, station_id: str, control_type: str, alarm_ended: bool,
+                             grid_event_fault: Optional[str] = None, timestamp: Optional[str] = None) -> Dict[str, Any]:
+        """Handle DER alarm notification."""
+        try:
+            # Import DER control manager
+            from .der_control_manager import DERControlManager
+            
+            # Create DER control manager instance
+            der_manager = DERControlManager(self.timescale_client)
+            
+            # Notify DER alarm
+            result = await der_manager.notify_der_alarm(station_id, control_type, alarm_ended, 
+                                                      grid_event_fault, timestamp)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error handling DER alarm notification: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def notify_der_start_stop(self, station_id: str, control_id: int, started: bool,
+                                  superseded_id: Optional[int] = None, timestamp: Optional[str] = None) -> Dict[str, Any]:
+        """Handle DER start/stop notification."""
+        try:
+            # Import DER control manager
+            from .der_control_manager import DERControlManager
+            
+            # Create DER control manager instance
+            der_manager = DERControlManager(self.timescale_client)
+            
+            # Notify DER start/stop
+            result = await der_manager.notify_der_start_stop(station_id, control_id, started, 
+                                                           superseded_id, timestamp)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error handling DER start/stop notification: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def afrr_signal(self, station_id: str, signal: float, timestamp: str) -> Dict[str, Any]:
+        """Handle AFRR signal."""
+        try:
+            self.logger.info(f"AFRR signal received for {station_id}: {signal} at {timestamp}")
+            
+            # Process AFRR signal - this would typically trigger frequency response
+            # For now, we'll just acknowledge the signal
+            
+            return {
+                "status": "Accepted",
+                "statusInfo": {
+                    "reasonCode": "Success",
+                    "additionalInfo": "AFRR signal processed"
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error handling AFRR signal: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
+    
+    async def notify_allowed_energy_transfer(self, station_id: str, allowed_energy_transfer: List[str]) -> Dict[str, Any]:
+        """Handle allowed energy transfer notification."""
+        try:
+            self.logger.info(f"Allowed energy transfer modes for {station_id}: {allowed_energy_transfer}")
+            
+            # Store allowed energy transfer modes
+            # This would typically update the station's capabilities
+            
+            return {
+                "status": "Accepted",
+                "statusInfo": {
+                    "reasonCode": "Success",
+                    "additionalInfo": "Allowed energy transfer modes updated"
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error handling allowed energy transfer notification: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": str(e)
+                }
+            }
     
     def _validate_setpoint(self, setpoint: V2XSetpoint) -> bool:
         """Validate V2X setpoint."""
@@ -682,3 +895,273 @@ class ExternalSetpointController:
         except Exception as e:
             self.logger.error(f"Error validating external command: {e}")
             return False
+
+
+class ChargingOnlyController:
+    """Charging-only mode controller (no V2G)."""
+    
+    def __init__(self, v2x_controller: V2XController):
+        self.v2x_controller = v2x_controller
+        self.logger = get_logger(f"{__name__}.charging_only")
+    
+    async def run(self) -> None:
+        """Run charging-only controller."""
+        while self.v2x_controller.running:
+            try:
+                # In charging-only mode, we just monitor for any V2G attempts
+                await self._monitor_v2g_attempts()
+                
+                interval = self.v2x_controller.v2x_config.update_interval[V2XOperationMode.CHARGING_ONLY.value]
+                await asyncio.sleep(interval)
+                
+            except Exception as e:
+                self.logger.error(f"Charging-only controller error: {e}")
+                await asyncio.sleep(5)
+    
+    async def _monitor_v2g_attempts(self) -> None:
+        """Monitor for V2G attempts and reject them."""
+        try:
+            # Check for any pending V2G setpoints and clear them
+            for station_id in list(self.v2x_controller.active_setpoints.keys()):
+                setpoint = self.v2x_controller.active_setpoints[station_id]
+                if setpoint.power_kw < 0:  # Discharge attempt
+                    await self.v2x_controller.clear_setpoint(station_id)
+                    self.logger.info(f"Cleared V2G discharge attempt for {station_id} (charging-only mode)")
+            
+        except Exception as e:
+            self.logger.error(f"Error monitoring V2G attempts: {e}")
+
+
+class CentralFrequencyController:
+    """Central frequency control controller."""
+    
+    def __init__(self, v2x_controller: V2XController):
+        self.v2x_controller = v2x_controller
+        self.logger = get_logger(f"{__name__}.central_frequency")
+        self.nominal_frequency = 50.0  # Hz
+    
+    async def run(self) -> None:
+        """Run central frequency controller."""
+        while self.v2x_controller.running:
+            try:
+                # Monitor central frequency commands
+                await self._process_central_frequency_commands()
+                
+                interval = self.v2x_controller.v2x_config.update_interval[V2XOperationMode.CENTRAL_FREQUENCY.value]
+                await asyncio.sleep(interval)
+                
+            except Exception as e:
+                self.logger.error(f"Central frequency controller error: {e}")
+                await asyncio.sleep(1)
+    
+    async def _process_central_frequency_commands(self) -> None:
+        """Process central frequency commands."""
+        try:
+            # Get central frequency commands from grid operator
+            commands = await self._get_central_frequency_commands()
+            
+            for command in commands:
+                await self._process_central_frequency_command(command)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing central frequency commands: {e}")
+    
+    async def _get_central_frequency_commands(self) -> List[Dict[str, Any]]:
+        """Get central frequency commands from grid operator."""
+        try:
+            # This would integrate with grid operator systems
+            # For now, return empty list
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"Error getting central frequency commands: {e}")
+            return []
+    
+    async def _process_central_frequency_command(self, command: Dict[str, Any]) -> None:
+        """Process individual central frequency command."""
+        try:
+            # Extract command parameters
+            frequency_setpoint = command.get("frequency_setpoint", self.nominal_frequency)
+            power_response = command.get("power_response", 0.0)
+            duration = command.get("duration_seconds", 60)
+            
+            # Apply frequency response to all V2G-capable stations
+            v2g_stations = await self._get_v2g_capable_stations()
+            
+            for station_id in v2g_stations:
+                setpoint = V2XSetpoint(
+                    station_id=station_id,
+                    evse_id=1,
+                    power_kw=power_response,
+                    mode=V2XOperationMode.CENTRAL_FREQUENCY,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    duration_seconds=duration
+                )
+                
+                await self.v2x_controller.set_power_setpoint(setpoint)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing central frequency command: {e}")
+    
+    async def _get_v2g_capable_stations(self) -> List[str]:
+        """Get list of V2G-capable stations."""
+        try:
+            # This would query the database for V2G-capable stations
+            # For now, return empty list
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"Error getting V2G-capable stations: {e}")
+            return []
+
+
+class ExternalLimitsController:
+    """External limits controller for grid constraints."""
+    
+    def __init__(self, v2x_controller: V2XController):
+        self.v2x_controller = v2x_controller
+        self.logger = get_logger(f"{__name__}.external_limits")
+    
+    async def run(self) -> None:
+        """Run external limits controller."""
+        while self.v2x_controller.running:
+            try:
+                # Monitor external limit signals
+                await self._process_external_limits()
+                
+                interval = self.v2x_controller.v2x_config.update_interval[V2XOperationMode.EXTERNAL_LIMITS.value]
+                await asyncio.sleep(interval)
+                
+            except Exception as e:
+                self.logger.error(f"External limits controller error: {e}")
+                await asyncio.sleep(5)
+    
+    async def _process_external_limits(self) -> None:
+        """Process external limit signals."""
+        try:
+            # Get external limit signals from grid operator
+            limit_signals = await self._get_external_limit_signals()
+            
+            for signal in limit_signals:
+                await self._process_external_limit_signal(signal)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing external limits: {e}")
+    
+    async def _get_external_limit_signals(self) -> List[Dict[str, Any]]:
+        """Get external limit signals from grid operator."""
+        try:
+            # This would integrate with grid operator systems
+            # For now, return empty list
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"Error getting external limit signals: {e}")
+            return []
+    
+    async def _process_external_limit_signal(self, signal: Dict[str, Any]) -> None:
+        """Process individual external limit signal."""
+        try:
+            # Extract signal parameters
+            station_id = signal.get("station_id")
+            max_charge_power = signal.get("max_charge_power")
+            max_discharge_power = signal.get("max_discharge_power")
+            duration = signal.get("duration_seconds", 3600)
+            
+            if station_id and (max_charge_power is not None or max_discharge_power is not None):
+                # Apply external limits as charging profile constraints
+                await self._apply_external_limits(station_id, max_charge_power, max_discharge_power, duration)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing external limit signal: {e}")
+    
+    async def _apply_external_limits(self, station_id: str, max_charge_power: Optional[float], 
+                                   max_discharge_power: Optional[float], duration: int) -> None:
+        """Apply external limits to station."""
+        try:
+            # Create external constraints charging profile
+            charging_profile = {
+                "id": int(time.time()),
+                "stackLevel": 1,
+                "chargingProfilePurpose": "ChargingStationExternalConstraints",
+                "chargingProfileKind": "Absolute",
+                "chargingSchedule": {
+                    "id": int(time.time()),
+                    "startSchedule": datetime.now(timezone.utc).isoformat(),
+                    "duration": duration,
+                    "chargingRateUnit": "W",
+                    "chargingSchedulePeriod": [
+                        {
+                            "startPeriod": 0,
+                            "limit": int((max_charge_power or 0) * 1000),  # Convert to W
+                            "dischargingLimit": int((max_discharge_power or 0) * 1000),  # Convert to W
+                            "numberPhases": 3
+                        }
+                    ]
+                }
+            }
+            
+            # Store external constraints profile
+            await self._store_external_constraints_profile(station_id, charging_profile)
+            
+            self.logger.info(f"Applied external limits to {station_id}: "
+                           f"max_charge={max_charge_power}kW, max_discharge={max_discharge_power}kW")
+            
+        except Exception as e:
+            self.logger.error(f"Error applying external limits: {e}")
+    
+    async def _store_external_constraints_profile(self, station_id: str, profile: Dict[str, Any]) -> None:
+        """Store external constraints profile."""
+        try:
+            # This would store the profile in the database
+            # For now, just log it
+            self.logger.info(f"Stored external constraints profile for {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error storing external constraints profile: {e}")
+
+
+class IdleController:
+    """Idle mode controller (no active V2G operations)."""
+    
+    def __init__(self, v2x_controller: V2XController):
+        self.v2x_controller = v2x_controller
+        self.logger = get_logger(f"{__name__}.idle")
+    
+    async def run(self) -> None:
+        """Run idle controller."""
+        while self.v2x_controller.running:
+            try:
+                # In idle mode, we just monitor system status
+                await self._monitor_system_status()
+                
+                interval = self.v2x_controller.v2x_config.update_interval[V2XOperationMode.IDLE.value]
+                await asyncio.sleep(interval)
+                
+            except Exception as e:
+                self.logger.error(f"Idle controller error: {e}")
+                await asyncio.sleep(10)
+    
+    async def _monitor_system_status(self) -> None:
+        """Monitor system status in idle mode."""
+        try:
+            # Check for any active V2G operations and log them
+            active_count = len(self.v2x_controller.active_setpoints)
+            if active_count > 0:
+                self.logger.info(f"Idle mode: {active_count} active V2G setpoints detected")
+            
+            # Monitor for any system alerts or maintenance requirements
+            await self._check_system_alerts()
+            
+        except Exception as e:
+            self.logger.error(f"Error monitoring system status: {e}")
+    
+    async def _check_system_alerts(self) -> None:
+        """Check for system alerts or maintenance requirements."""
+        try:
+            # This would check for system health, maintenance schedules, etc.
+            # For now, just log that we're checking
+            pass
+            
+        except Exception as e:
+            self.logger.error(f"Error checking system alerts: {e}")
