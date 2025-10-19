@@ -8,6 +8,7 @@ import uvloop
 from typing import Optional
 
 from .config import Config
+from .config_validator import ConfigValidator
 from .server import OCPPWebSocketServer
 from .health import HealthCheckServer
 from .monitoring import setup_monitoring, get_logger
@@ -22,6 +23,8 @@ from .timescale_schema import create_timescale_schema_from_config
 from .analytics_service import AnalyticsService
 from .price_feeder import PriceFeederService
 from .optimization_engine import OptimizationEngine
+from .resilience_manager import resilience_manager
+from .enhanced_error_handler import error_handler
 
 
 class Application:
@@ -60,8 +63,14 @@ class Application:
         self.logger.info("Starting EV Charging WebSocket Handler...")
         
         try:
+            # Validate configuration first
+            await self._validate_configuration()
+            
             # Setup monitoring first
             setup_monitoring(self.config.monitoring)
+            
+            # Initialize resilience manager
+            await self._initialize_resilience()
             
             # Initialize Supabase components
             await self._initialize_supabase_components()
@@ -125,6 +134,41 @@ class Application:
         except Exception as e:
             self.logger.error(f"Failed to start application: {e}")
             raise
+    
+    async def _validate_configuration(self) -> None:
+        """Validate configuration before starting."""
+        self.logger.info("Validating configuration...")
+        
+        validator = ConfigValidator(self.config)
+        is_valid = await validator.validate_all()
+        
+        if not is_valid:
+            report = validator.get_validation_report()
+            self.logger.error(f"Configuration validation failed: {report}")
+            raise Exception("Configuration validation failed")
+        
+        self.logger.info("Configuration validation passed")
+    
+    async def _initialize_resilience(self) -> None:
+        """Initialize resilience manager and error handling."""
+        self.logger.info("Initializing resilience manager...")
+        
+        # Add health checks
+        from .health_checks import create_health_checks
+        health_checks = create_health_checks(self.config)
+        
+        for health_check in health_checks:
+            resilience_manager.add_health_check(health_check)
+        
+        # Add circuit breakers
+        resilience_manager.add_circuit_breaker("timescale", failure_threshold=5, recovery_timeout=60.0)
+        resilience_manager.add_circuit_breaker("supabase", failure_threshold=3, recovery_timeout=30.0)
+        resilience_manager.add_circuit_breaker("websocket", failure_threshold=10, recovery_timeout=120.0)
+        
+        # Start resilience monitoring
+        await resilience_manager.start()
+        
+        self.logger.info("Resilience manager initialized")
     
     async def stop(self) -> None:
         """Stop all application components gracefully."""

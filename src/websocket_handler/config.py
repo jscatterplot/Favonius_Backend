@@ -2,7 +2,8 @@
 
 import os
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
+from .secrets_manager import SecretsManager, SecretsConfig
 
 
 # Redis and Kafka configuration removed for simplification
@@ -109,9 +110,30 @@ class Config(BaseModel):
     environment: str = Field(default="development", description="Environment (development/staging/production)")
     debug: bool = Field(default=False, description="Debug mode")
     
+    # Secrets management
+    secrets_manager: Optional[SecretsManager] = None
+    
+    @validator('timescale', 'supabase', pre=True, always=True)
+    def validate_credentials(cls, v, values):
+        """Validate that required credentials are present."""
+        if hasattr(v, 'password') and not v.password:
+            raise ValueError("Database password is required")
+        if hasattr(v, 'service_key') and not v.service_key:
+            raise ValueError("Supabase service key is required")
+        return v
+    
     @classmethod
     def from_env(cls) -> "Config":
         """Create configuration from environment variables."""
+        # Initialize secrets manager
+        secrets_config = SecretsConfig(
+            secrets_file=os.getenv("SECRETS_FILE"),
+            encryption_key=os.getenv("SECRETS_ENCRYPTION_KEY"),
+            use_kubernetes_secrets=os.getenv("USE_KUBERNETES_SECRETS", "true").lower() == "true",
+            fallback_to_env=os.getenv("FALLBACK_TO_ENV", "true").lower() == "true"
+        )
+        secrets_manager = SecretsManager(secrets_config)
+        
         return cls(
             tls=TLSConfig(
                 cert_path=os.getenv("TLS_CERT_PATH"),
@@ -129,32 +151,32 @@ class Config(BaseModel):
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
             ),
             timescale=TimescaleConfig(
-                service_url=os.getenv("TIMESCALE_SERVICE_URL", "postgres://tsdbadmin:lyqgv8a0j1bt1zaa@avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com:32634/tsdb?sslmode=require"),
-                host=os.getenv("PGHOST", "avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com"),
-                port=int(os.getenv("PGPORT", "32634")),
-                database=os.getenv("PGDATABASE", "tsdb"),
-                user=os.getenv("PGUSER", "tsdbadmin"),
-                password=os.getenv("PGPASSWORD", "lyqgv8a0j1bt1zaa"),
-                sslmode=os.getenv("PGSSLMODE", "require"),
-                max_connections=int(os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")),
-                pool_size=int(os.getenv("TIMESCALE_POOL_SIZE", "20")),
-                statement_timeout=int(os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")),
-                idle_timeout=int(os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")),
-                chunk_time_interval=os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
-                compression_after=os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
-                retention_period=os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
+                service_url=secrets_manager.get_secret("TIMESCALE_SERVICE_URL") or os.getenv("TIMESCALE_SERVICE_URL"),
+                host=secrets_manager.get_secret("PGHOST") or os.getenv("PGHOST"),
+                port=int(secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT", "5432")),
+                database=secrets_manager.get_secret("PGDATABASE") or os.getenv("PGDATABASE", "tsdb"),
+                user=secrets_manager.get_secret("PGUSER") or os.getenv("PGUSER"),
+                password=secrets_manager.get_secret("PGPASSWORD") or os.getenv("PGPASSWORD"),
+                sslmode=secrets_manager.get_secret("PGSSLMODE") or os.getenv("PGSSLMODE", "require"),
+                max_connections=int(secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS") or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")),
+                pool_size=int(secrets_manager.get_secret("TIMESCALE_POOL_SIZE") or os.getenv("TIMESCALE_POOL_SIZE", "20")),
+                statement_timeout=int(secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT") or os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")),
+                idle_timeout=int(secrets_manager.get_secret("TIMESCALE_IDLE_TIMEOUT") or os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")),
+                chunk_time_interval=secrets_manager.get_secret("TIMESCALE_CHUNK_INTERVAL") or os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
+                compression_after=secrets_manager.get_secret("TIMESCALE_COMPRESSION_AFTER") or os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
+                retention_period=secrets_manager.get_secret("TIMESCALE_RETENTION_PERIOD") or os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
             ),
             supabase=SupabaseConfig(
-                url=os.getenv("SUPABASE_URL", ""),
-                anon_key=os.getenv("SUPABASE_ANON_KEY", ""),
-                service_key=os.getenv("SUPABASE_SERVICE_KEY", ""),
-                db_host=os.getenv("SUPABASE_DB_HOST", "aws-1-us-east-2.pooler.supabase.com"),
-                db_port=int(os.getenv("SUPABASE_DB_PORT", "6543")),
-                db_name=os.getenv("SUPABASE_DB_NAME", "postgres"),
-                db_user=os.getenv("SUPABASE_DB_USER", "postgres.evdehwjbbgdgiwdvjqfk"),
-                db_password=os.getenv("SUPABASE_DB_PASSWORD", "1NDLK5slwkI8Ka7b"),
-                max_connections=int(os.getenv("SUPABASE_MAX_CONNECTIONS", "20")),
-                connection_timeout=int(os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")),
+                url=secrets_manager.get_secret("SUPABASE_URL") or os.getenv("SUPABASE_URL"),
+                anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY"),
+                service_key=secrets_manager.get_secret("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_KEY"),
+                db_host=secrets_manager.get_secret("SUPABASE_DB_HOST") or os.getenv("SUPABASE_DB_HOST"),
+                db_port=int(secrets_manager.get_secret("SUPABASE_DB_PORT") or os.getenv("SUPABASE_DB_PORT", "6543")),
+                db_name=secrets_manager.get_secret("SUPABASE_DB_NAME") or os.getenv("SUPABASE_DB_NAME", "postgres"),
+                db_user=secrets_manager.get_secret("SUPABASE_DB_USER") or os.getenv("SUPABASE_DB_USER"),
+                db_password=secrets_manager.get_secret("SUPABASE_DB_PASSWORD") or os.getenv("SUPABASE_DB_PASSWORD"),
+                max_connections=int(secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS") or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")),
+                connection_timeout=int(secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT") or os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")),
                 enable_realtime=os.getenv("SUPABASE_ENABLE_REALTIME", "true").lower() == "true",
             ),
             monitoring=MonitoringConfig(
@@ -182,4 +204,5 @@ class Config(BaseModel):
             ),
             environment=os.getenv("ENVIRONMENT", "development"),
             debug=os.getenv("DEBUG", "false").lower() == "true",
+            secrets_manager=secrets_manager,
         )
