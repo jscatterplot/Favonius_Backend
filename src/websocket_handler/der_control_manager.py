@@ -488,76 +488,391 @@ class DERControlManager:
         
         return control_dict
     
-    # Database methods (to be implemented with actual TimescaleDB queries)
+    # Database methods with actual TimescaleDB queries
     async def _store_der_control(self, station_id: str, der_control: DERControlType) -> None:
         """Store DER control in database."""
-        # TODO: Implement actual database storage
-        self.logger.debug(f"Storing DER control {der_control.control_id} for station {station_id}")
+        try:
+            query = """
+                INSERT INTO der_controls (
+                    station_id, control_id, is_default, control_type, priority,
+                    start_time, duration, is_superseded, over_freq, under_freq,
+                    over_droop, under_droop, response_time, curve_data,
+                    pct_max_discharge_power, created_at, updated_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+                )
+                ON CONFLICT (station_id, control_id) 
+                DO UPDATE SET
+                    is_default = EXCLUDED.is_default,
+                    control_type = EXCLUDED.control_type,
+                    priority = EXCLUDED.priority,
+                    start_time = EXCLUDED.start_time,
+                    duration = EXCLUDED.duration,
+                    is_superseded = EXCLUDED.is_superseded,
+                    over_freq = EXCLUDED.over_freq,
+                    under_freq = EXCLUDED.under_freq,
+                    over_droop = EXCLUDED.over_droop,
+                    under_droop = EXCLUDED.under_droop,
+                    response_time = EXCLUDED.response_time,
+                    curve_data = EXCLUDED.curve_data,
+                    pct_max_discharge_power = EXCLUDED.pct_max_discharge_power,
+                    updated_at = EXCLUDED.updated_at
+            """
+            
+            curve_data = None
+            if der_control.curve:
+                curve_data = json.dumps({
+                    "curveType": der_control.curve.curve_type.value,
+                    "curvePoints": [{"x": p.x, "y": p.y} for p in der_control.curve.points],
+                    "curveUnitX": der_control.curve.curve_unit_x,
+                    "curveUnitY": der_control.curve.curve_unit_y
+                })
+            
+            await self.timescale_client.execute_query(
+                query,
+                station_id, der_control.control_id, der_control.is_default,
+                der_control.control_type.value, der_control.priority,
+                der_control.start_time, der_control.duration, der_control.is_superseded,
+                der_control.over_freq, der_control.under_freq, der_control.over_droop,
+                der_control.under_droop, der_control.response_time, curve_data,
+                der_control.pct_max_discharge_power, der_control.created_at, der_control.updated_at
+            )
+            
+            self.logger.debug(f"Stored DER control {der_control.control_id} for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error storing DER control: {e}")
+            raise
     
     async def _get_der_control_by_id(self, station_id: str, control_id: int) -> Optional[DERControlType]:
         """Get DER control by ID."""
-        # TODO: Implement actual database query
-        self.logger.debug(f"Getting DER control {control_id} for station {station_id}")
-        return None
+        try:
+            query = """
+                SELECT control_id, is_default, control_type, priority, start_time,
+                       duration, is_superseded, over_freq, under_freq, over_droop,
+                       under_droop, response_time, curve_data, pct_max_discharge_power,
+                       created_at, updated_at
+                FROM der_controls
+                WHERE station_id = $1 AND control_id = $2
+            """
+            
+            result = await self.timescale_client.fetch_one(query, station_id, control_id)
+            if not result:
+                return None
+            
+            return self._row_to_der_control(result)
+            
+        except Exception as e:
+            self.logger.error(f"Error getting DER control by ID: {e}")
+            return None
     
     async def _get_active_der_controls(self, station_id: str) -> List[DERControlType]:
         """Get active DER controls for station."""
-        # TODO: Implement actual database query
-        self.logger.debug(f"Getting active DER controls for station {station_id}")
-        return []
+        try:
+            query = """
+                SELECT control_id, is_default, control_type, priority, start_time,
+                       duration, is_superseded, over_freq, under_freq, over_droop,
+                       under_droop, response_time, curve_data, pct_max_discharge_power,
+                       created_at, updated_at
+                FROM der_controls
+                WHERE station_id = $1 AND is_superseded = false
+                ORDER BY priority DESC, created_at ASC
+            """
+            
+            results = await self.timescale_client.fetch_all(query, station_id)
+            return [self._row_to_der_control(row) for row in results]
+            
+        except Exception as e:
+            self.logger.error(f"Error getting active DER controls: {e}")
+            return []
     
     async def _update_der_control(self, station_id: str, der_control: DERControlType) -> None:
         """Update DER control in database."""
-        # TODO: Implement actual database update
-        self.logger.debug(f"Updating DER control {der_control.control_id} for station {station_id}")
+        try:
+            query = """
+                UPDATE der_controls SET
+                    is_default = $3, control_type = $4, priority = $5,
+                    start_time = $6, duration = $7, is_superseded = $8,
+                    over_freq = $9, under_freq = $10, over_droop = $11,
+                    under_droop = $12, response_time = $13, curve_data = $14,
+                    pct_max_discharge_power = $15, updated_at = $16
+                WHERE station_id = $1 AND control_id = $2
+            """
+            
+            curve_data = None
+            if der_control.curve:
+                curve_data = json.dumps({
+                    "curveType": der_control.curve.curve_type.value,
+                    "curvePoints": [{"x": p.x, "y": p.y} for p in der_control.curve.points],
+                    "curveUnitX": der_control.curve.curve_unit_x,
+                    "curveUnitY": der_control.curve.curve_unit_y
+                })
+            
+            await self.timescale_client.execute_query(
+                query, station_id, der_control.control_id, der_control.is_default,
+                der_control.control_type.value, der_control.priority,
+                der_control.start_time, der_control.duration, der_control.is_superseded,
+                der_control.over_freq, der_control.under_freq, der_control.over_droop,
+                der_control.under_droop, der_control.response_time, curve_data,
+                der_control.pct_max_discharge_power, der_control.updated_at
+            )
+            
+            self.logger.debug(f"Updated DER control {der_control.control_id} for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error updating DER control: {e}")
+            raise
     
     async def _clear_der_control_by_id(self, station_id: str, control_id: int) -> bool:
         """Clear DER control by ID."""
-        # TODO: Implement actual database deletion
-        self.logger.debug(f"Clearing DER control {control_id} for station {station_id}")
-        return True
+        try:
+            query = "DELETE FROM der_controls WHERE station_id = $1 AND control_id = $2"
+            result = await self.timescale_client.execute_query(query, station_id, control_id)
+            
+            # Check if any rows were affected
+            count_query = "SELECT COUNT(*) FROM der_controls WHERE station_id = $1 AND control_id = $2"
+            count_result = await self.timescale_client.fetch_one(count_query, station_id, control_id)
+            
+            success = count_result[0] == 0
+            self.logger.debug(f"Cleared DER control {control_id} for station {station_id}: {success}")
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"Error clearing DER control by ID: {e}")
+            return False
     
     async def _clear_all_der_controls(self, station_id: str) -> int:
         """Clear all DER controls for station."""
-        # TODO: Implement actual database deletion
-        self.logger.debug(f"Clearing all DER controls for station {station_id}")
-        return 0
+        try:
+            # Get count before deletion
+            count_query = "SELECT COUNT(*) FROM der_controls WHERE station_id = $1"
+            count_result = await self.timescale_client.fetch_one(count_query, station_id)
+            count = count_result[0] if count_result else 0
+            
+            # Delete all controls
+            query = "DELETE FROM der_controls WHERE station_id = $1"
+            await self.timescale_client.execute_query(query, station_id)
+            
+            self.logger.debug(f"Cleared {count} DER controls for station {station_id}")
+            return count
+            
+        except Exception as e:
+            self.logger.error(f"Error clearing all DER controls: {e}")
+            return 0
     
     async def _update_control_cache(self, station_id: str) -> None:
         """Update control cache for station."""
-        # TODO: Implement cache update logic
-        self.logger.debug(f"Updating control cache for station {station_id}")
+        try:
+            # Refresh active controls cache
+            self.active_controls[station_id] = await self._get_active_der_controls(station_id)
+            self.logger.debug(f"Updated control cache for station {station_id}: {len(self.active_controls[station_id])} controls")
+        except Exception as e:
+            self.logger.error(f"Error updating control cache: {e}")
     
     async def _get_station_der_capabilities(self, station_id: str) -> Dict[str, Any]:
         """Get station DER capabilities."""
-        # TODO: Implement actual capability query
-        return {
-            "modesSupported": ["FixedPFInject", "VoltVar", "WattVar", "FixedVar", "VoltWatt", "FreqDroop"]
-        }
+        try:
+            query = """
+                SELECT capabilities FROM charging_stations 
+                WHERE station_id = $1
+            """
+            result = await self.timescale_client.fetch_one(query, station_id)
+            
+            if result and result[0]:
+                return result[0]
+            
+            # Default capabilities if not found
+            return {
+                "modesSupported": ["FixedPFInject", "VoltVar", "WattVar", "FixedVar", "VoltWatt", "FreqDroop", "LimitMaxDischarge", "LimitMaxCharge"]
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting station DER capabilities: {e}")
+            return {
+                "modesSupported": ["FixedPFInject", "VoltVar", "WattVar", "FixedVar", "VoltWatt", "FreqDroop"]
+            }
     
     async def _store_reported_der_controls(self, station_id: str, controls: List[DERControlType]) -> None:
         """Store reported DER controls."""
-        # TODO: Implement actual database storage
-        self.logger.debug(f"Storing {len(controls)} reported DER controls for station {station_id}")
+        try:
+            for control in controls:
+                # Store as reported control with special flag
+                query = """
+                    INSERT INTO der_controls_reported (
+                        station_id, control_id, control_type, priority, start_time,
+                        duration, is_superseded, curve_data, pct_max_discharge_power,
+                        reported_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                    )
+                    ON CONFLICT (station_id, control_id) 
+                    DO UPDATE SET
+                        control_type = EXCLUDED.control_type,
+                        priority = EXCLUDED.priority,
+                        start_time = EXCLUDED.start_time,
+                        duration = EXCLUDED.duration,
+                        is_superseded = EXCLUDED.is_superseded,
+                        curve_data = EXCLUDED.curve_data,
+                        pct_max_discharge_power = EXCLUDED.pct_max_discharge_power,
+                        reported_at = EXCLUDED.reported_at
+                """
+                
+                curve_data = None
+                if control.curve:
+                    curve_data = json.dumps({
+                        "curveType": control.curve.curve_type.value,
+                        "curvePoints": [{"x": p.x, "y": p.y} for p in control.curve.points],
+                        "curveUnitX": control.curve.curve_unit_x,
+                        "curveUnitY": control.curve.curve_unit_y
+                    })
+                
+                await self.timescale_client.execute_query(
+                    query, station_id, control.control_id, control.control_type.value,
+                    control.priority, control.start_time, control.duration,
+                    control.is_superseded, curve_data, control.pct_max_discharge_power,
+                    datetime.now(timezone.utc)
+                )
+            
+            self.logger.debug(f"Stored {len(controls)} reported DER controls for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error storing reported DER controls: {e}")
+            raise
     
     async def _store_der_alarm_event(self, station_id: str, control_type: str, alarm_ended: bool,
                                    grid_event_fault: Optional[str], timestamp: Optional[str]) -> None:
         """Store DER alarm event."""
-        # TODO: Implement actual database storage
-        self.logger.debug(f"Storing DER alarm event for station {station_id}")
+        try:
+            query = """
+                INSERT INTO der_events (
+                    station_id, event_type, control_type, alarm_ended,
+                    grid_event_fault, timestamp, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """
+            
+            event_timestamp = datetime.now(timezone.utc)
+            if timestamp:
+                try:
+                    event_timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                except ValueError:
+                    self.logger.warning(f"Invalid timestamp format: {timestamp}")
+            
+            await self.timescale_client.execute_query(
+                query, station_id, "DER_ALARM", control_type, alarm_ended,
+                grid_event_fault, event_timestamp, datetime.now(timezone.utc)
+            )
+            
+            self.logger.debug(f"Stored DER alarm event for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error storing DER alarm event: {e}")
+            raise
     
     async def _store_der_start_stop_event(self, station_id: str, control_id: int, started: bool,
                                         superseded_id: Optional[int], timestamp: Optional[str]) -> None:
         """Store DER start/stop event."""
-        # TODO: Implement actual database storage
-        self.logger.debug(f"Storing DER start/stop event for station {station_id}")
+        try:
+            query = """
+                INSERT INTO der_events (
+                    station_id, event_type, control_id, started,
+                    superseded_id, timestamp, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """
+            
+            event_timestamp = datetime.now(timezone.utc)
+            if timestamp:
+                try:
+                    event_timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                except ValueError:
+                    self.logger.warning(f"Invalid timestamp format: {timestamp}")
+            
+            await self.timescale_client.execute_query(
+                query, station_id, "DER_START_STOP", control_id, started,
+                superseded_id, event_timestamp, datetime.now(timezone.utc)
+            )
+            
+            self.logger.debug(f"Stored DER start/stop event for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error storing DER start/stop event: {e}")
+            raise
     
     async def _activate_der_control(self, station_id: str, control_id: int) -> None:
         """Activate DER control."""
-        # TODO: Implement actual activation logic
-        self.logger.debug(f"Activating DER control {control_id} for station {station_id}")
+        try:
+            query = """
+                UPDATE der_controls SET
+                    is_active = true, activated_at = $3, updated_at = $4
+                WHERE station_id = $1 AND control_id = $2
+            """
+            
+            now = datetime.now(timezone.utc)
+            await self.timescale_client.execute_query(query, station_id, control_id, now, now)
+            
+            # Update cache
+            await self._update_control_cache(station_id)
+            
+            self.logger.debug(f"Activated DER control {control_id} for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error activating DER control: {e}")
+            raise
     
     async def _deactivate_der_control(self, station_id: str, control_id: int) -> None:
         """Deactivate DER control."""
-        # TODO: Implement actual deactivation logic
-        self.logger.debug(f"Deactivating DER control {control_id} for station {station_id}")
+        try:
+            query = """
+                UPDATE der_controls SET
+                    is_active = false, deactivated_at = $3, updated_at = $4
+                WHERE station_id = $1 AND control_id = $2
+            """
+            
+            now = datetime.now(timezone.utc)
+            await self.timescale_client.execute_query(query, station_id, control_id, now, now)
+            
+            # Update cache
+            await self._update_control_cache(station_id)
+            
+            self.logger.debug(f"Deactivated DER control {control_id} for station {station_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error deactivating DER control: {e}")
+            raise
+    
+    def _row_to_der_control(self, row) -> DERControlType:
+        """Convert database row to DERControlType."""
+        control = DERControlType(
+            control_id=row[0],
+            is_default=row[1],
+            control_type=DERControlEnumType(row[2]),
+            priority=row[3],
+            start_time=row[4],
+            duration=row[5],
+            is_superseded=row[6],
+            over_freq=row[7],
+            under_freq=row[8],
+            over_droop=row[9],
+            under_droop=row[10],
+            response_time=row[11],
+            created_at=row[14],
+            updated_at=row[15]
+        )
+        
+        # Parse curve data
+        if row[12]:
+            try:
+                curve_data = json.loads(row[12])
+                points = [DERCurvePoint(x=p["x"], y=p["y"]) for p in curve_data.get("curvePoints", [])]
+                control.curve = DERCurve(
+                    curve_type=DERCurveType(curve_data.get("curveType", "FreqDroop")),
+                    points=points,
+                    curve_unit_x=curve_data.get("curveUnitX", "Hz"),
+                    curve_unit_y=curve_data.get("curveUnitY", "W")
+                )
+            except (json.JSONDecodeError, KeyError) as e:
+                self.logger.warning(f"Error parsing curve data: {e}")
+        
+        # Set LimitMaxDischarge-specific field
+        control.pct_max_discharge_power = row[13]
+        
+        return control

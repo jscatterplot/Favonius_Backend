@@ -115,12 +115,33 @@ class CircuitBreaker:
             )
 
 
+class RetryConfig:
+    """Retry configuration."""
+    def __init__(
+        self,
+        max_attempts: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 60.0,
+        exponential_base: float = 2.0,
+        jitter: bool = True,
+        retryable_exceptions: Optional[List[Type[Exception]]] = None
+    ):
+        self.max_attempts = max_attempts
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.exponential_base = exponential_base
+        self.jitter = jitter
+        self.retryable_exceptions = retryable_exceptions or [
+            ConnectionError, TimeoutError, asyncio.TimeoutError,
+            OSError, IOError, Exception
+        ]
+
+
 class RetryManager:
     """Advanced retry management with exponential backoff."""
     
-    def __init__(self, max_retries: int = 3, base_delay: float = 1.0):
-        self.max_retries = max_retries
-        self.base_delay = base_delay
+    def __init__(self, config: Optional[RetryConfig] = None):
+        self.config = config or RetryConfig()
         self.logger = get_logger("retry_manager")
     
     async def execute_with_retry(
