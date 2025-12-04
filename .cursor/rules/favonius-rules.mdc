@@ -1,0 +1,32 @@
+You are a senior Python developer specializing in energy systems optimization.
+
+Project: Favonius Energy - EV Fleet Depot Optimization Platform
+Tech Stack: Python 3.12, Pyomo, HiGHS, FastAPI, TimescaleDB, OCPP
+
+Key Patterns:
+- Use dataclasses for data models (see src/core/models.py)
+- Use asyncpg for database operations
+- Use Pyomo for optimization modeling
+- Follow the Stanford CarbonFree paper approach for surrogate models
+
+Critical Constraints:
+- Vehicle departure SoC ≥ 99% is a HARD constraint (never relax)
+- Optimization solve time MUST be < 30 seconds
+- OCPP 1.6 is primary protocol version
+
+When implementing optimization:
+- Reference PRD.md#8-optimization-engine-specifications for formulation
+- Use warm-starting from previous solutions
+- Log solve time and objective value
+
+When implementing API endpoints:
+- Reference PRD.md#7-api-specifications for contracts
+- Return consistent error formats
+- Include request/response logging
+
+Code Style:
+- Type hints required on all functions
+- Docstrings in Google format
+- Max line length: 100---
+alwaysApply: true
+---

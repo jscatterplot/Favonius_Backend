@@ -1,44 +1,66 @@
-# EV Charging Platform - WebSocket Handler
+# Favonius Energy - EV Fleet Depot Optimization Platform
 
-A streamlined OCPP 2.1 WebSocket handler for Vehicle-to-Grid (V2G) pilots. The service maintains bidirectional communication with EV chargers, persists telemetry to TimescaleDB, synchronises user-facing data via Supabase, ingests market prices, and generates charging/discharging schedules.
+An integrated depot energy management platform that coordinates EV charging schedules, stationary batteries, and building loads to reduce electricity costs by 30-50% for commercial fleet operators. The system supports OCPP 1.6/2.0.1 communication with chargers, V2G capabilities, and MILP-based optimization.
 
 ## Features
 
 ### Core Functionality
-- **OCPP 2.1 Protocol Support**: Handles the primary message set required for V2X-capable chargers.
-- **Pilot-Scale Performance**: Tuned for up to 100 concurrent charger connections using `uvloop`.
-- **V2X Scheduling**: Generates and pushes charging profiles back to stations.
-- **Direct Persistence**: Telemetry and schedules are written straight to TimescaleDB.
-- **Supabase Integration**: Provides REST endpoints, authentication, and analytics for operators.
-- **CAISO Price Feeder**: Periodically fetches market prices and stores a 24-hour outlook.
-- **Optimization Loop**: Rolling-horizon scheduler that reacts to price or charger changes.
-- **Observability**: Prometheus metrics and structured JSON logging (via `monitoring.py`).
+- **OCPP 1.6/2.0.1 Protocol Support**: Primary support for OCPP 1.6 with 2.0.1 ready for smart charging profiles.
+- **Fleet Depot Optimization**: MILP-based optimization engine (Pyomo + HiGHS) for demand charge reduction.
+- **V2G Support**: Vehicle-to-Grid capabilities for bidirectional charging and grid services.
+- **Energy Consumption Surrogate Model**: Gaussian Process model for predicting vehicle energy consumption.
+- **Demand Charge Minimization**: Optimizes charging schedules to reduce peak demand charges (30-50% reduction target).
+- **Stationary Battery Dispatch**: Coordinates battery storage for peak shaving.
+- **CAISO Price Integration**: Real-time and day-ahead market price feeds for TOU arbitrage.
+- **Inter-Depot Vehicle Handoff**: Messaging system for multi-depot fleet coordination.
+- **Observability**: Prometheus metrics and structured JSON logging.
 
-### Current V2X Operation Modes
-- **CentralSetpoint**: Cloud-originated power profiles dispatched via `SetChargingProfile`.
-- **LocalFrequency / LocalLoadBalancing / ExternalSetpoint**: Hooks are present in the V2X controller for future expansion.
+### Optimization Capabilities
+- **24-hour Rolling Horizon**: Optimizes charging schedules with 15-minute timesteps.
+- **Hard Constraints**: Ensures vehicles reach ≥99% SoC by departure time.
+- **Demand Charge Tracking**: Tracks and minimizes monthly peak demand.
+- **Re-optimization Triggers**: Automatic re-optimization on price spikes, SoC deviations, and schedule changes.
 
 ## Runtime Architecture
 
 ```
-┌──────────────────┐       ┌────────────────────┐       ┌────────────────-────┐
-│   EV Chargers    │◄──-──►│  WebSocket Handler │──────►│ Deployment Targets  │
-│  (OCPP 2.1)      │       │  (server.py)       │       │ (SetChargingProfile)│
-└────────▲─────────┘       └─────────▲──────────┘       └─────────▲───────────┘
-         │                            │                           │
-         │ telemetry & events         │ schedules & control       │
-         ▼                            │                           │
-┌──────────────────┐      ┌───────────┴──────────┐       ┌────────────────────┐
-│ TimescaleDB      │◄──-──│  Optimization Engine │◄──────│  Price Feeder      │
-│ (telemetry,      │      │                      │       │  (CAISO OASIS)     │
-│prices, schedules)│      └───────────▲──────────┘       └────────────────────┘
-└────────▲─────────┘                  │
-         │ analytics & sync           │ Supabase REST/API
-         ▼                            ▼
-┌──────────────────┐       ┌────────────────────┐
-│ Analytics Service│◄──-──►│ Supabase Client    │
-│ REST endpoints   │       │ User/org data      │
-└──────────────────┘       └────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         EXTERNAL INPUTS                             │
+├─────────┬─────────┬─────────┬─────────┬─────────┬─────────────────┤
+│ Weather │ Market/ │  Fleet  │ Vehicle │ Inter-  │ Building Load   │
+│   API   │ Utility │  Mgmt   │Telemetry│  Depot  │  (optional)     │
+└────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────────┬────────┘
+     │         │         │         │         │             │
+     ▼         ▼         ▼         ▼         ▼             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              ENERGY CONSUMPTION SURROGATE MODEL                     │
+│              (Gaussian Process / MLP)                               │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        STATE ASSEMBLER                              │
+│  • Current SoC (vehicles + battery)                                 │
+│  • Price schedule (TOU / CAISO DAM)                                 │
+│  • Vehicle availability windows                                     │
+│  • Energy consumption forecasts                                     │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       MILP OPTIMIZER                                │
+│                       (Pyomo + HiGHS)                               │
+│  Objective: min(Energy Cost + Demand Charges)                       │
+│  Solve time target: < 30 seconds                                    │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    CONTROL OUTPUT LAYER                             │
+├─────────────────┬─────────────────┬─────────────────────────────────┤
+│ OCPP Commands   │ Battery Modbus  │ Data Logging (TimescaleDB)      │
+│ SetChargingProf │ Charge/Discharge│ Telemetry, Results, Triggers    │
+└─────────────────┴─────────────────┴─────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -114,7 +136,7 @@ TLS-specific variables (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_VERIFY_CLIENT`) re
 - **TimescaleDB** is the primary state store. Schema creation in `timescale_schema.py` will run automatically in development mode.
 - **Supabase** provides user/org metadata. Populate it with demo data or connect to your project.
 - **Price feeder** requires outbound access to CAISO OASIS. In offline environments you may disable it via `PRICE_FEEDER_ENABLED=false`.
-- **Optimization engine** ships with a heuristic implementation. Integrate a Julia solver by adapting `optimization_engine.py` to call out to your own service and feed the results back through `ConnectionManager`.
+- **Optimization engine** uses Pyomo + HiGHS for MILP optimization. Julia solver available as alternative via `julia_bridge.py`.
 
 ## Observability
 
@@ -126,7 +148,7 @@ TLS-specific variables (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_VERIFY_CLIENT`) re
 
 | Issue                        | Checks                                                                    |
 |------------------------------|---------------------------------------------------------------------------|
-| Chargers fail to connect     | Verify OCPP subprotocol (`ocpp2.1`), TLS configuration, and heartbeat     |
+| Chargers fail to connect     | Verify OCPP subprotocol (`ocpp1.6` or `ocpp2.1`), TLS configuration, and heartbeat     |
 | Telemetry missing in DB      | Inspect `message_handler` logs, confirm Timescale credentials             |
 | Price feeder errors          | Confirm CAISO API reachability and node list formatting                   |
 | Schedules not applied        | Ensure optimization engine is enabled and `send_charging_profile` succeeds|
