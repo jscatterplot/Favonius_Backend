@@ -17,6 +17,7 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
+from .cache_manager import CacheManager
 
 
 class CertificateType(Enum):
@@ -73,11 +74,14 @@ class CertificateInstallationResult:
 class CertificateManager:
     """Manages ISO 15118 certificates for V2G Plug & Charge."""
     
-    def __init__(self, timescale_client: TimescaleClient):
+    def __init__(self, timescale_client: TimescaleClient, cache_manager: Optional[CacheManager] = None):
         self.timescale_client = timescale_client
         self.logger = get_logger(__name__)
         
-        # Certificate cache
+        # Initialize cache manager
+        self.cache_manager = cache_manager or CacheManager(max_size=500, default_ttl=timedelta(seconds=600))
+        
+        # Legacy certificate cache for backward compatibility
         self.certificate_cache: Dict[str, CertificateInfo] = {}
         
         # Certificate validation cache
@@ -189,6 +193,19 @@ class CertificateManager:
                                 certificate: str) -> Dict[str, Any]:
         """Install certificate."""
         try:
+            # Convert string certificate type to enum if needed
+            if isinstance(certificate_type, str):
+                try:
+                    certificate_type = CertificateType(certificate_type)
+                except ValueError:
+                    return {
+                        "status": "Rejected",
+                        "statusInfo": {
+                            "reasonCode": "InvalidCertificateType",
+                            "additionalInfo": f"Invalid certificate type: {certificate_type}"
+                        }
+                    }
+            
             # Parse certificate
             certificate_info = await self._parse_certificate(certificate)
             
@@ -352,6 +369,13 @@ class CertificateManager:
         """Get certificate from cache or database."""
         cache_key = f"{station_id}:{certificate_type.value}"
         
+        # Check new cache manager first
+        cached_cert = await self.cache_manager.get(cache_key)
+        if cached_cert:
+            self.logger.debug(f"Certificate {cache_key} found in cache")
+            return cached_cert
+        
+        # Check legacy cache
         if cache_key in self.certificate_cache:
             return self.certificate_cache[cache_key]
         
@@ -372,7 +396,8 @@ class CertificateManager:
                 installation_date=certificate_data.get("installation_date")
             )
             
-            # Cache certificate
+            # Cache certificate in both caches
+            await self.cache_manager.set(cache_key, certificate_info, ttl=timedelta(seconds=600))
             self.certificate_cache[cache_key] = certificate_info
             
             return certificate_info
@@ -392,8 +417,8 @@ class CertificateManager:
             issuer_name = certificate.issuer.rfc4514_string()
             subject_name = certificate.subject.rfc4514_string()
             serial_number = str(certificate.serial_number)
-            valid_from = certificate.not_valid_before
-            valid_to = certificate.not_valid_after
+            valid_from = certificate.not_valid_before_utc
+            valid_to = certificate.not_valid_after_utc
             
             # Determine certificate type based on extensions
             certificate_type = await self._determine_certificate_type(certificate)

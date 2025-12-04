@@ -40,6 +40,7 @@ class TestLoadPerformance:
             await server.stop()
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
     async def test_burst_load_scenario(self, test_server):
         """Test burst load scenario with rapid connection spikes."""
         
@@ -76,6 +77,7 @@ class TestLoadPerformance:
             await asyncio.gather(*[sim.disconnect() for sim in burst_simulators])
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(120)
     async def test_soak_load_scenario(self, test_server):
         """Test soak load scenario with sustained connections."""
         

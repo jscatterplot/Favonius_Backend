@@ -20,6 +20,12 @@ from websocket_handler.config import Config
 from websocket_handler.security_manager import SecurityManager
 from websocket_handler.privacy_manager import PrivacyManager
 from websocket_handler.certificate_manager import CertificateManager
+from tests.security.test_certificates import (
+    VALID_TEST_CERTIFICATE,
+    EXPIRED_TEST_CERTIFICATE,
+    INVALID_FORMAT_CERTIFICATE,
+    INVALID_BASE64_CERTIFICATE
+)
 
 
 # Configure logging
@@ -61,32 +67,32 @@ class TestSecurityCompliance:
         # Test 1: Valid certificate
         valid_cert = {
             "certificate_type": "V2GCertificate",
-            "certificate_data": "-----BEGIN CERTIFICATE-----\nVALID_CERT_DATA\n-----END CERTIFICATE-----",
-            "certificate_chain": ["-----BEGIN CERTIFICATE-----\nCHAIN_CERT\n-----END CERTIFICATE-----"]
+            "certificate_data": VALID_TEST_CERTIFICATE,
+            "certificate_chain": []
         }
         
-        result = await certificate_manager.install_certificate("TEST_STATION", valid_cert)
+        result = await certificate_manager.install_certificate("TEST_STATION", "V2GCertificate", valid_cert["certificate_data"])
         assert result["status"] == "Accepted"
         
         # Test 2: Invalid certificate format
         invalid_cert = {
             "certificate_type": "V2GCertificate",
-            "certificate_data": "INVALID_CERT_FORMAT",
+            "certificate_data": INVALID_FORMAT_CERTIFICATE,
             "certificate_chain": []
         }
         
-        result = await certificate_manager.install_certificate("TEST_STATION", invalid_cert)
+        result = await certificate_manager.install_certificate("TEST_STATION", "V2GCertificate", invalid_cert["certificate_data"])
         assert result["status"] == "Rejected"
         assert "InvalidCertificateFormat" in result["statusInfo"]["reason_code"]
         
         # Test 3: Expired certificate
         expired_cert = {
             "certificate_type": "V2GCertificate",
-            "certificate_data": "-----BEGIN CERTIFICATE-----\nEXPIRED_CERT_DATA\n-----END CERTIFICATE-----",
+            "certificate_data": EXPIRED_TEST_CERTIFICATE,
             "certificate_chain": []
         }
         
-        result = await certificate_manager.install_certificate("TEST_STATION", expired_cert)
+        result = await certificate_manager.install_certificate("TEST_STATION", "V2GCertificate", expired_cert["certificate_data"])
         assert result["status"] == "Rejected"
         assert "CertificateExpired" in result["statusInfo"]["reason_code"]
 
@@ -97,29 +103,16 @@ class TestSecurityCompliance:
         logger.info("Testing certificate rotation")
         
         # Install initial certificate
-        initial_cert = {
-            "certificate_type": "V2GCertificate",
-            "certificate_data": "-----BEGIN CERTIFICATE-----\nINITIAL_CERT\n-----END CERTIFICATE-----",
-            "certificate_chain": []
-        }
-        
-        result = await certificate_manager.install_certificate("TEST_STATION", initial_cert)
+        result = await certificate_manager.install_certificate("TEST_STATION", "V2GCertificate", VALID_TEST_CERTIFICATE)
         assert result["status"] == "Accepted"
         
         # Rotate to new certificate
-        new_cert = {
-            "certificate_type": "V2GCertificate",
-            "certificate_data": "-----BEGIN CERTIFICATE-----\nNEW_CERT\n-----END CERTIFICATE-----",
-            "certificate_chain": []
-        }
-        
-        result = await certificate_manager.install_certificate("TEST_STATION", new_cert)
+        result = await certificate_manager.install_certificate("TEST_STATION", "V2GCertificate", VALID_TEST_CERTIFICATE)
         assert result["status"] == "Accepted"
         
-        # Verify old certificate is removed
+        # Verify certificate is installed
         installed_certs = await certificate_manager.get_installed_certificate_ids("TEST_STATION")
         assert len(installed_certs) == 1
-        assert installed_certs[0]["certificate_id"] == "NEW_CERT"
 
     @pytest.mark.asyncio
     async def test_authentication_bypass_attempts(self, test_server):

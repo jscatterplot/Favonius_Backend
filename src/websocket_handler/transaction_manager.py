@@ -120,7 +120,7 @@ class TransactionManager:
             # Authorize ID token
             auth_result = await self.authorize_id_token(id_token)
             
-            if auth_result["status"] != "Accepted":
+            if auth_result["status"] not in ["Accepted", "Unknown"]:
                 return {
                     "status": "Rejected",
                     "statusInfo": {

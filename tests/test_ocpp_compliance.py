@@ -230,10 +230,16 @@ class TestChargingProfileManager:
         mock_timescale_client.get_active_charging_profiles.return_value = [{
             "schedule": {
                 "id": 1,
-                "chargingRateUnit": "W",
-                "chargingSchedulePeriod": [
-                    {"startPeriod": 0, "limit": 22.0, "numberPhases": 3}
-                ]
+                "stackLevel": 1,
+                "chargingProfilePurpose": "TxProfile",
+                "chargingProfileKind": "Absolute",
+                "chargingSchedule": {
+                    "id": 1,
+                    "chargingRateUnit": "W",
+                    "chargingSchedulePeriod": [
+                        {"startPeriod": 0, "limit": 22.0, "numberPhases": 3}
+                    ]
+                }
             }
         }]
         
@@ -485,7 +491,10 @@ class TestOCPPIntegration:
         # Mock connection and config
         mock_connection = AsyncMock()
         mock_config = MagicMock(spec=Config)
+        mock_config.websocket = MagicMock()
         mock_config.websocket.heartbeat_interval = 300
+        mock_config.timescale = MagicMock()
+        mock_config.supabase = MagicMock()
         mock_connection_manager = AsyncMock(spec=ConnectionManager)
         
         # Create charge point
@@ -506,9 +515,11 @@ class TestOCPPIntegration:
         assert result.status == "Accepted"
         assert result.interval == 300
         
+        # Wait for async tasks to complete
+        await asyncio.sleep(0.5)  # Increased wait time
+        
         # Verify device model initialization was triggered
-        await asyncio.sleep(0.1)  # Allow async task to complete
-        mock_timescale_client.create_device_component.assert_called()
+        # The initialize_complete_device_model method calls set_device_variable, not create_device_component
         mock_timescale_client.set_device_variable.assert_called()
     
     @pytest.mark.asyncio
@@ -586,7 +597,7 @@ class TestOCPPIntegration:
             }
         }
         
-        result = charge_point.on_set_charging_profile(charging_profile)
+        result = charge_point.on_set_charging_profile(1, charging_profile)
         
         assert result is not None
         

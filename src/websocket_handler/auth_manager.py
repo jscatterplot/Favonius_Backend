@@ -10,23 +10,27 @@ import json
 from .config import SupabaseConfig
 from .supabase_client import SupabaseClient
 from .monitoring import get_logger
+from .cache_manager import CacheManager
 
 
 class AuthManager:
     """Authentication and authorization manager."""
     
-    def __init__(self, config: SupabaseConfig, supabase_client: SupabaseClient):
+    def __init__(self, config: SupabaseConfig, supabase_client: SupabaseClient, cache_manager: Optional[CacheManager] = None):
         """Initialize auth manager."""
         self.config = config
         self.supabase_client = supabase_client
         self.logger = get_logger(__name__)
+        
+        # Initialize cache manager
+        self.cache_manager = cache_manager or CacheManager(max_size=1000, default_ttl=timedelta(seconds=300))
         
         # JWT settings
         self.jwt_secret = config.service_key
         self.jwt_algorithm = "HS256"
         self.token_expiry = timedelta(minutes=15)
         
-        # Cache for user sessions
+        # Legacy cache for backward compatibility
         self.user_cache: Dict[str, Dict[str, Any]] = {}
         self.cache_ttl = timedelta(minutes=5)
     
@@ -47,9 +51,16 @@ class AuthManager:
             
             # Check cache first
             cache_key = f"user:{user_id}"
+            cached_user = await self.cache_manager.get(cache_key)
+            if cached_user:
+                self.logger.debug(f"User {user_id} found in cache")
+                return cached_user
+            
+            # Check legacy cache
             if cache_key in self.user_cache:
                 cached_data = self.user_cache[cache_key]
                 if datetime.now(timezone.utc) - cached_data['cached_at'] < self.cache_ttl:
+                    self.logger.debug(f"User {user_id} found in legacy cache")
                     return cached_data['user']
             
             # Get user from Supabase
@@ -57,7 +68,8 @@ class AuthManager:
             if not user_data:
                 return None
             
-            # Cache user data
+            # Cache user data in both caches
+            await self.cache_manager.set(cache_key, user_data, ttl=timedelta(seconds=300))
             self.user_cache[cache_key] = {
                 'user': user_data,
                 'cached_at': datetime.now(timezone.utc)

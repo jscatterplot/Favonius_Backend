@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Any, Set
 import json
@@ -11,6 +11,7 @@ from ocpp.v21.enums import AttributeEnumType
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
+from .cache_manager import CacheManager
 
 
 class ComponentType(Enum):
@@ -1153,11 +1154,14 @@ class DeviceVariable:
 class DeviceModel:
     """OCPP 2.0.1 device model manager."""
     
-    def __init__(self, timescale_client: TimescaleClient):
+    def __init__(self, timescale_client: TimescaleClient, cache_manager: Optional[CacheManager] = None):
         self.timescale_client = timescale_client
         self.logger = get_logger(__name__)
         
-        # In-memory cache for device components and variables
+        # Initialize cache manager
+        self.cache_manager = cache_manager or CacheManager(max_size=2000, default_ttl=timedelta(seconds=300))
+        
+        # Legacy in-memory cache for device components and variables
         self.device_cache: Dict[str, Dict[str, Any]] = {}
         self.variable_cache: Dict[str, Dict[str, DeviceVariable]] = {}
         
@@ -1167,7 +1171,7 @@ class DeviceModel:
     def _initialize_standard_variables(self) -> None:
         """Initialize standardized OCPP variables."""
         # Charging Station variables
-        self._add_standard_variable("ChargingStation", "Model", VariableType.STRING, "ReadOnly")
+        self._add_standard_variable("ChargingStation", "Model", VariableType.STRING, "ReadWrite")
         self._add_standard_variable("ChargingStation", "VendorName", VariableType.STRING, "ReadOnly")
         self._add_standard_variable("ChargingStation", "SerialNumber", VariableType.STRING, "ReadOnly")
         self._add_standard_variable("ChargingStation", "FirmwareVersion", VariableType.STRING, "ReadOnly")
@@ -1235,10 +1239,10 @@ class DeviceModel:
         # V2X Controller variables
         self._add_standard_variable("V2XController", "Enabled", VariableType.BOOLEAN, "ReadWrite")
         self._add_standard_variable("V2XController", "SupportedOperationModes", VariableType.STRING, "ReadOnly")
-        self._add_standard_variable("V2XController", "TxUpdatedInterval", VariableType.STRING, "ReadWrite")
-        self._add_standard_variable("V2XController", "TxUpdatedInterval", VariableType.STRING, "ReadWrite")
-        self._add_standard_variable("V2XController", "TxUpdatedInterval", VariableType.STRING, "ReadWrite")
-        self._add_standard_variable("V2XController", "TxUpdatedInterval", VariableType.STRING, "ReadWrite")
+        
+        # Monitoring variables
+        self._add_standard_variable("Monitoring", "HeartbeatInterval", VariableType.INTEGER, "ReadWrite")
+        self._add_standard_variable("Monitoring", "ClockAlignedDataInterval", VariableType.INTEGER, "ReadWrite")
         
         # Security variables
         self._add_standard_variable("Security", "AdditionalRootCertificateCheck", VariableType.BOOLEAN, "ReadWrite")
@@ -1748,10 +1752,23 @@ class DeviceModel:
         """Get a variable value from cache or database."""
         try:
             # Check cache first
-            cache_key = f"{station_id}:{component_name}:{component_instance}:{variable_name}:{variable_instance}"
+            cache_key = f"{station_id}:{component_name}:{component_instance}:{variable_name}:{variable_instance}:{attribute_type}"
             
-            if cache_key in self.device_cache:
-                cached_value = self.device_cache[cache_key]
+            # Check new cache manager first
+            cached_value = await self.cache_manager.get(cache_key)
+            if cached_value:
+                self.logger.debug(f"Variable {cache_key} found in cache")
+                return {
+                    "status": "Accepted",
+                    "value": cached_value.get("value"),
+                    "reason_code": None,
+                    "additional_info": None
+                }
+            
+            # Check legacy cache
+            legacy_cache_key = f"{station_id}:{component_name}:{component_instance}:{variable_name}:{variable_instance}"
+            if legacy_cache_key in self.device_cache:
+                cached_value = self.device_cache[legacy_cache_key]
                 if cached_value.get("attribute_type") == attribute_type:
                     return {
                         "status": "Accepted",
@@ -1767,12 +1784,14 @@ class DeviceModel:
             )
             
             if var_data:
-                # Cache the result
-                self.device_cache[cache_key] = {
+                # Cache the result in both caches
+                cache_data = {
                     "value": var_data["value"],
                     "attribute_type": attribute_type,
                     "timestamp": datetime.now(timezone.utc)
                 }
+                await self.cache_manager.set(cache_key, cache_data, ttl=timedelta(seconds=300))
+                self.device_cache[legacy_cache_key] = cache_data
                 
                 return {
                     "status": "Accepted",
@@ -1975,7 +1994,8 @@ class DeviceModel:
                 {"name": "Connector", "instance": "1"},
                 {"name": "SmartCharging", "instance": ""},
                 {"name": "Security", "instance": ""},
-                {"name": "V2XController", "instance": ""}
+                {"name": "V2XController", "instance": ""},
+                {"name": "Monitoring", "instance": ""}
             ]
             
             # Store components
@@ -2016,6 +2036,10 @@ class DeviceModel:
                 "V2XController": {
                     "Enabled": True,
                     "SupportedOperationModes": "CentralSetpoint"
+                },
+                "Monitoring": {
+                    "HeartbeatInterval": 300,
+                    "ClockAlignedDataInterval": 900
                 }
             }
             

@@ -22,7 +22,11 @@ class TimescaleClient:
         self.config = config
         self.logger = get_logger(__name__)
         
-        # Connection pools
+        # Enhanced connection pool
+        from .connection_pool import EnhancedConnectionPool
+        self.connection_pool: Optional[EnhancedConnectionPool] = None
+        
+        # Legacy connection pools (for backward compatibility)
         self.pg_pool: Optional[asyncpg.Pool] = None
         self.sqlalchemy_engine = None
         
@@ -56,40 +60,21 @@ class TimescaleClient:
     
     async def _establish_connections(self) -> None:
         """Establish the actual database connections."""
-        # Create asyncpg connection pool
-        self.pg_pool = await asyncpg.create_pool(
-            host=self.config.host,
-            port=self.config.port,
-            database=self.config.database,
-            user=self.config.user,
-            password=self.config.password,
-            ssl=self.config.sslmode,
-            min_size=1,
-            max_size=self.config.max_connections,
-            command_timeout=self.config.statement_timeout,
-            server_settings={
-                'statement_timeout': f'{self.config.statement_timeout}s',
-                'idle_in_transaction_session_timeout': f'{self.config.idle_timeout}s'
-            }
-        )
+        # Create enhanced connection pool
+        from .connection_pool import EnhancedConnectionPool, PoolStrategy
+        self.connection_pool = EnhancedConnectionPool(self.config, PoolStrategy.HYBRID)
+        await self.connection_pool.initialize()
         
-        # Create SQLAlchemy engine for pandas operations
-        try:
-            self.sqlalchemy_engine = create_engine(
-                self.config.service_url,
-                poolclass=QueuePool,
-                pool_size=self.config.pool_size,
-                max_overflow=self.config.max_connections - self.config.pool_size,
-                pool_timeout=30,
-                pool_recycle=3600,
-                echo=False
-            )
-        except Exception as e:
-            self.logger.warning(f"Failed to create SQLAlchemy engine: {e}. Continuing with asyncpg only.")
-            self.sqlalchemy_engine = None
+        # Set legacy pools for backward compatibility
+        self.pg_pool = self.connection_pool.asyncpg_pool
+        self.sqlalchemy_engine = self.connection_pool.sqlalchemy_engine
     
     async def disconnect(self) -> None:
         """Close all connections."""
+        if self.connection_pool:
+            await self.connection_pool.close()
+        
+        # Legacy cleanup
         if self.pg_pool:
             await self.pg_pool.close()
         
@@ -821,7 +806,15 @@ class TimescaleClient:
     
     # Utility Methods
     async def execute_query(self, query: str, *args) -> List[Dict[str, Any]]:
-        """Execute a custom query."""
+        """Execute a custom query with enhanced performance monitoring."""
+        if self.connection_pool:
+            return await self.connection_pool.execute_query(query, *args)
+        else:
+            # Fallback to legacy method
+            return await self._legacy_execute_query(query, *args)
+    
+    async def _legacy_execute_query(self, query: str, *args) -> List[Dict[str, Any]]:
+        """Legacy query execution method."""
         try:
             async with self.pg_pool.acquire() as conn:
                 rows = await conn.fetch(query, *args)
@@ -2949,9 +2942,213 @@ class TimescaleClient:
                 DELETE FROM health_check_results WHERE check_time < $1
             """, cutoff_date)
 
-    async def cleanup_old_retry_attempts(self, cutoff_date: datetime) -> None:
-        """Clean up old retry attempts."""
+    # Vehicle Routes and Fleet Management Methods
+    
+    async def store_vehicle_route(self, route_data: Dict[str, Any]) -> None:
+        """Store vehicle route data."""
         async with self.pg_pool.acquire() as conn:
             await conn.execute("""
-                DELETE FROM retry_attempts WHERE attempt_time < $1
-            """, cutoff_date)
+                INSERT INTO vehicle_routes (
+                    route_id, vehicle_id, station_id, departure_time, arrival_time,
+                    destination, route_distance_km, required_soc_percent, actual_soc_percent,
+                    route_status, route_priority, estimated_duration_hours,
+                    override_type, override_reason, operator_id, created_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            """,
+                route_data["route_id"], route_data["vehicle_id"], route_data["station_id"],
+                route_data["departure_time"], route_data.get("arrival_time"),
+                route_data.get("destination"), route_data.get("route_distance_km"),
+                route_data["required_soc_percent"], route_data.get("actual_soc_percent"),
+                route_data.get("route_status", "scheduled"), route_data.get("route_priority", 1),
+                route_data.get("estimated_duration_hours"), route_data.get("override_type"),
+                route_data.get("override_reason"), route_data.get("operator_id"),
+                route_data["created_at"], route_data.get("updated_at", route_data["created_at"])
+            )
+    
+    async def get_vehicle_routes(self, vehicle_id: str) -> List[Dict[str, Any]]:
+        """Get all routes for a vehicle."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM vehicle_routes 
+                WHERE vehicle_id = $1 
+                ORDER BY departure_time DESC
+            """, vehicle_id)
+            return [dict(row) for row in rows]
+    
+    async def update_vehicle_route(self, update_data: Dict[str, Any]) -> None:
+        """Update vehicle route data."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE vehicle_routes SET
+                    departure_time = COALESCE($2, departure_time),
+                    arrival_time = COALESCE($3, arrival_time),
+                    destination = COALESCE($4, destination),
+                    route_distance_km = COALESCE($5, route_distance_km),
+                    required_soc_percent = COALESCE($6, required_soc_percent),
+                    actual_soc_percent = COALESCE($7, actual_soc_percent),
+                    route_status = COALESCE($8, route_status),
+                    route_priority = COALESCE($9, route_priority),
+                    estimated_duration_hours = COALESCE($10, estimated_duration_hours),
+                    override_type = COALESCE($11, override_type),
+                    override_reason = COALESCE($12, override_reason),
+                    operator_id = COALESCE($13, operator_id),
+                    updated_at = $14
+                WHERE route_id = $1
+            """,
+                update_data["route_id"], update_data.get("departure_time"),
+                update_data.get("arrival_time"), update_data.get("destination"),
+                update_data.get("route_distance_km"), update_data.get("required_soc_percent"),
+                update_data.get("actual_soc_percent"), update_data.get("route_status"),
+                update_data.get("route_priority"), update_data.get("estimated_duration_hours"),
+                update_data.get("override_type"), update_data.get("override_reason"),
+                update_data.get("operator_id"), update_data["updated_at"]
+            )
+    
+    async def cancel_vehicle_routes(self, vehicle_id: str) -> None:
+        """Cancel all routes for a vehicle."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE vehicle_routes SET
+                    route_status = 'cancelled',
+                    updated_at = NOW()
+                WHERE vehicle_id = $1 AND route_status IN ('scheduled', 'in_progress')
+            """, vehicle_id)
+    
+    async def get_active_routes(self) -> List[Dict[str, Any]]:
+        """Get all active routes."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM vehicle_routes 
+                WHERE route_status IN ('scheduled', 'in_progress')
+                AND departure_time > NOW()
+                ORDER BY departure_time ASC
+            """)
+            return [dict(row) for row in rows]
+    
+    async def store_vehicle_fleet(self, vehicle_data: Dict[str, Any]) -> None:
+        """Store vehicle fleet data."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO vehicle_fleet (
+                    vehicle_id, station_id, battery_capacity_kwh, max_charge_rate_kw,
+                    max_discharge_rate_kw, current_soc_kwh, min_soc_kwh,
+                    charge_efficiency, discharge_efficiency, vehicle_type,
+                    make, model, year, is_active, created_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                ON CONFLICT (vehicle_id) DO UPDATE SET
+                    station_id = EXCLUDED.station_id,
+                    battery_capacity_kwh = EXCLUDED.battery_capacity_kwh,
+                    max_charge_rate_kw = EXCLUDED.max_charge_rate_kw,
+                    max_discharge_rate_kw = EXCLUDED.max_discharge_rate_kw,
+                    current_soc_kwh = EXCLUDED.current_soc_kwh,
+                    min_soc_kwh = EXCLUDED.min_soc_kwh,
+                    charge_efficiency = EXCLUDED.charge_efficiency,
+                    discharge_efficiency = EXCLUDED.discharge_efficiency,
+                    vehicle_type = EXCLUDED.vehicle_type,
+                    make = EXCLUDED.make,
+                    model = EXCLUDED.model,
+                    year = EXCLUDED.year,
+                    is_active = EXCLUDED.is_active,
+                    updated_at = EXCLUDED.updated_at
+            """,
+                vehicle_data["vehicle_id"], vehicle_data["station_id"],
+                vehicle_data["battery_capacity_kwh"], vehicle_data["max_charge_rate_kw"],
+                vehicle_data["max_discharge_rate_kw"], vehicle_data.get("current_soc_kwh"),
+                vehicle_data.get("min_soc_kwh", 15.0), vehicle_data.get("charge_efficiency", 0.95),
+                vehicle_data.get("discharge_efficiency", 0.90), vehicle_data.get("vehicle_type"),
+                vehicle_data.get("make"), vehicle_data.get("model"), vehicle_data.get("year"),
+                vehicle_data.get("is_active", True), vehicle_data["created_at"], vehicle_data.get("updated_at", vehicle_data["created_at"])
+            )
+    
+    async def get_all_vehicles(self) -> List[Dict[str, Any]]:
+        """Get all vehicles."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM vehicle_fleet 
+                WHERE is_active = true
+                ORDER BY vehicle_id
+            """)
+            return [dict(row) for row in rows]
+    
+    async def get_active_vehicles(self) -> List[Dict[str, Any]]:
+        """Get active vehicles."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT vf.*, vr.departure_time, vr.required_soc_percent
+                FROM vehicle_fleet vf
+                LEFT JOIN vehicle_routes vr ON vf.vehicle_id = vr.vehicle_id
+                WHERE vf.is_active = true
+                AND (vr.route_status IS NULL OR vr.route_status IN ('scheduled', 'in_progress'))
+                ORDER BY vf.vehicle_id
+            """)
+            return [dict(row) for row in rows]
+    
+    async def store_price_forecast(self, forecast_data: Dict[str, Any]) -> None:
+        """Store price forecast data."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO price_forecasts (
+                    forecast_id, forecast_time, horizon_start, horizon_end,
+                    node_id, market_type, forecast_prices, confidence_intervals,
+                    model_version, accuracy_score, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            """,
+                forecast_data["forecast_id"], forecast_data["forecast_time"],
+                forecast_data["horizon_start"], forecast_data["horizon_end"],
+                forecast_data["node_id"], forecast_data["market_type"],
+                json.dumps(forecast_data["forecast_prices"]),
+                json.dumps(forecast_data.get("confidence_intervals")) if forecast_data.get("confidence_intervals") else None,
+                forecast_data.get("model_version"), forecast_data.get("accuracy_score"),
+                forecast_data["created_at"]
+            )
+    
+    async def store_demand_forecast(self, forecast_data: Dict[str, Any]) -> None:
+        """Store demand forecast data."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO demand_forecasts (
+                    forecast_id, forecast_time, horizon_start, horizon_end,
+                    station_id, forecast_demand, confidence_intervals,
+                    model_version, accuracy_score, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """,
+                forecast_data["forecast_id"], forecast_data["forecast_time"],
+                forecast_data["horizon_start"], forecast_data["horizon_end"],
+                forecast_data["station_id"], json.dumps(forecast_data["forecast_demand"]),
+                json.dumps(forecast_data.get("confidence_intervals")) if forecast_data.get("confidence_intervals") else None,
+                forecast_data.get("model_version"), forecast_data.get("accuracy_score"),
+                forecast_data["created_at"]
+            )
+    
+    async def get_optimization_status(self) -> Dict[str, Any]:
+        """Get current optimization status."""
+        async with self.pg_pool.acquire() as conn:
+            # Get latest optimization decision
+            latest_decision = await conn.fetchrow("""
+                SELECT objective_value, computation_time_ms, time, constraints_satisfied
+                FROM optimization_decisions
+                ORDER BY time DESC
+                LIMIT 1
+            """)
+            
+            # Get active vehicles count
+            active_vehicles = await conn.fetchval("""
+                SELECT COUNT(*) FROM vehicle_fleet WHERE is_active = true
+            """)
+            
+            # Get pending routes count
+            pending_routes = await conn.fetchval("""
+                SELECT COUNT(*) FROM vehicle_routes 
+                WHERE route_status = 'scheduled' AND departure_time > NOW()
+            """)
+            
+            return {
+                "is_running": False,  # TODO: Implement actual running status
+                "last_run_time": latest_decision["time"] if latest_decision else None,
+                "next_run_time": None,  # TODO: Implement next run time calculation
+                "active_vehicles": active_vehicles or 0,
+                "pending_routes": pending_routes or 0,
+                "solver_status": "optimal" if latest_decision and latest_decision["constraints_satisfied"] else "unknown",
+                "last_objective_value": float(latest_decision["objective_value"]) if latest_decision and latest_decision["objective_value"] else None,
+                "last_solve_time_ms": float(latest_decision["computation_time_ms"]) if latest_decision and latest_decision["computation_time_ms"] else None
+            }

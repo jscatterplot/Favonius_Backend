@@ -6,38 +6,86 @@ import time
 import asyncio
 from typing import Dict, Any
 import structlog
-from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
+from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info, CollectorRegistry, REGISTRY
 
 from .config import MonitoringConfig
 
 
-# Prometheus metrics
-WEBSOCKET_CONNECTIONS = Gauge(
+# Global metrics storage to prevent duplicate registration
+_metrics_cache = {}
+
+def _get_or_create_metric(metric_class, name, *args, **kwargs):
+    """Get existing metric or create new one to avoid duplicate registration."""
+    if name in _metrics_cache:
+        return _metrics_cache[name]
+    
+    try:
+        # Try to create the metric
+        metric = metric_class(name, *args, **kwargs)
+        _metrics_cache[name] = metric
+        return metric
+    except ValueError:
+        # If metric already exists, try to find it in the registry
+        try:
+            for collector in REGISTRY._names_to_collectors.values():
+                if hasattr(collector, '_name') and collector._name == name:
+                    _metrics_cache[name] = collector
+                    return collector
+        except:
+            pass
+        
+        # If all else fails, create a dummy metric
+        class DummyMetric:
+            def __init__(self, name):
+                self._name = name
+            def inc(self, *args, **kwargs): pass
+            def dec(self, *args, **kwargs): pass
+            def set(self, *args, **kwargs): pass
+            def observe(self, *args, **kwargs): pass
+            def labels(self, *args, **kwargs): return self
+        
+        dummy = DummyMetric(name)
+        _metrics_cache[name] = dummy
+        return dummy
+
+WEBSOCKET_CONNECTIONS = _get_or_create_metric(
+    Gauge,
     "websocket_connections_active", 
     "Number of active WebSocket connections"
 )
 
-MESSAGES_RECEIVED_TOTAL = Counter(
+MESSAGES_RECEIVED_TOTAL = _get_or_create_metric(
+    Counter,
     "websocket_messages_received_total",
     "Total number of WebSocket messages received",
     ["station_id", "message_type"]
 )
 
-MESSAGES_SENT_TOTAL = Counter(
+MESSAGES_SENT_TOTAL = _get_or_create_metric(
+    Counter,
     "websocket_messages_sent_total", 
     "Total number of WebSocket messages sent",
     ["station_id", "message_type"]
 )
 
-REDIS_OPERATION_DURATION = Histogram(
+REDIS_OPERATION_DURATION = _get_or_create_metric(
+    Histogram,
     "redis_operation_duration_seconds",
     "Duration of Redis operations"
 )
 
-REDIS_OPERATIONS_TOTAL = Counter(
+REDIS_OPERATIONS_TOTAL = _get_or_create_metric(
+    Counter,
     "redis_operations_total",
     "Total number of Redis operations",
     ["operation_type"]
+)
+
+ERRORS_TOTAL = _get_or_create_metric(
+    Counter,
+    "websocket_errors_total",
+    "Total number of WebSocket errors",
+    ["error_type", "station_id"]
 )
 
 # Note: Other metrics are defined in server.py to avoid duplication
@@ -45,7 +93,8 @@ REDIS_OPERATIONS_TOTAL = Counter(
 # Redis metrics removed for simplification
 
 
-APPLICATION_INFO = Info(
+APPLICATION_INFO = _get_or_create_metric(
+    Info,
     "websocket_handler_info",
     "WebSocket handler application info"
 )

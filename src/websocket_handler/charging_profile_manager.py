@@ -9,6 +9,7 @@ import json
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
+from .cache_manager import CacheManager
 
 
 class ChargingProfilePurpose(Enum):
@@ -103,11 +104,14 @@ class ChargingProfile:
 class ChargingProfileManager:
     """Manages OCPP charging profiles with validation and stacking."""
     
-    def __init__(self, timescale_client: TimescaleClient):
+    def __init__(self, timescale_client: TimescaleClient, cache_manager: Optional[CacheManager] = None):
         self.timescale_client = timescale_client
         self.logger = get_logger(__name__)
         
-        # Profile cache per station
+        # Initialize cache manager
+        self.cache_manager = cache_manager or CacheManager(max_size=1000, default_ttl=timedelta(seconds=300))
+        
+        # Legacy profile cache per station
         self.profile_cache: Dict[str, List[ChargingProfile]] = {}
         
         # Stacking limits per station
@@ -182,13 +186,8 @@ class ChargingProfileManager:
             )
             
             if not profiles_to_clear:
-                return {
-                    "status": "Rejected",
-                    "statusInfo": {
-                        "reasonCode": "UnknownChargingProfile",
-                        "additionalInfo": "No matching profiles found"
-                    }
-                }
+                # According to OCPP 2.0.1, clearing non-existent profiles should return Accepted (idempotent)
+                return {"status": "Accepted"}
             
             # Clear profiles
             for profile in profiles_to_clear:
@@ -701,6 +700,19 @@ class ChargingProfileManager:
     
     async def _get_active_profiles(self, station_id: str, evse_id: int) -> List[ChargingProfile]:
         """Get active charging profiles."""
+        cache_key = f"active_profiles:{station_id}:{evse_id}"
+        
+        # Check new cache manager first
+        cached_profiles = await self.cache_manager.get(cache_key)
+        if cached_profiles:
+            self.logger.debug(f"Active profiles for {station_id}:{evse_id} found in cache")
+            return cached_profiles
+        
+        # Check legacy cache
+        legacy_cache_key = f"{station_id}:{evse_id}"
+        if legacy_cache_key in self.profile_cache:
+            return self.profile_cache[legacy_cache_key]
+        
         now = datetime.now(timezone.utc)
         
         profiles_data = await self.timescale_client.get_active_charging_profiles(
@@ -711,6 +723,10 @@ class ChargingProfileManager:
         for profile_data in profiles_data:
             profile = self._parse_charging_profile(profile_data["schedule"])
             profiles.append(profile)
+        
+        # Cache profiles in both caches
+        await self.cache_manager.set(cache_key, profiles, ttl=timedelta(seconds=300))
+        self.profile_cache[legacy_cache_key] = profiles
         
         return profiles
     

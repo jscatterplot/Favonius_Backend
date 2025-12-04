@@ -1,6 +1,7 @@
 """Load tests for concurrent connections and performance."""
 
 import pytest
+import pytest_asyncio
 import asyncio
 import time
 import statistics
@@ -14,26 +15,46 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from websocket_handler.ocpp_handler import EnhancedOCPPChargePoint
 from websocket_handler.timescale_client import TimescaleClient
+from websocket_handler.config import Config, TimescaleConfig, SupabaseConfig
+from websocket_handler.connection_manager import ConnectionManager
 
 
 class TestLoadPerformance:
     """Load tests for system performance."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def timescale_client(self):
-        """Create TimescaleClient for load tests."""
-        client = TimescaleClient(
-            host="localhost",
-            port=5432,
-            database="test_favonius",
-            user="postgres",
-            password="password"
-        )
-        await client.initialize()
-        yield client
-        await client.close()
+        """Create mock TimescaleClient for load tests."""
+        # Create a mock client instead of real database connection
+        mock_client = Mock(spec=TimescaleClient)
+        
+        # Mock all the methods that load tests will use
+        mock_client.connect = AsyncMock()
+        mock_client.disconnect = AsyncMock()
+        mock_client.health_check = AsyncMock(return_value={"status": "healthy"})
+        
+        # Mock database operations
+        mock_client.store_session_data = AsyncMock()
+        mock_client.store_meter_values = AsyncMock()
+        mock_client.store_transaction_event = AsyncMock()
+        mock_client.get_device_variable = AsyncMock(return_value={"value": "TestValue"})
+        mock_client.set_device_variable = AsyncMock()
+        mock_client.get_charging_profiles = AsyncMock(return_value=[])
+        mock_client.set_charging_profile = AsyncMock()
+        mock_client.clear_charging_profile = AsyncMock()
+        mock_client.get_certificate = AsyncMock(return_value=None)
+        mock_client.store_certificate = AsyncMock()
+        mock_client.delete_certificate = AsyncMock()
+        
+        # Mock connection pool
+        mock_client.connection_pool = Mock()
+        mock_client.connection_pool.get_connection = AsyncMock()
+        mock_client.connection_pool.release_connection = AsyncMock()
+        
+        return mock_client
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(30)
     async def test_concurrent_boot_notifications(self, timescale_client):
         """Test concurrent boot notifications."""
         num_stations = 100
@@ -42,14 +63,33 @@ class TestLoadPerformance:
         # Create multiple station handlers
         for i in range(num_stations):
             station_id = f"LOAD_TEST_STATION_{i:03d}"
-            handler = EnhancedOCPPChargePoint(station_id, timescale_client)
+            # Create mock objects for required parameters
+            mock_connection = Mock()
+            config = Config(
+                timescale=TimescaleConfig(
+                    service_url="postgresql://test:test@localhost:5432/test",
+                    host="localhost",
+                    user="test",
+                    password="test"
+                ),
+                supabase=SupabaseConfig(
+                    url="https://test.supabase.co",
+                    anon_key="test_anon_key",
+                    service_key="test_service_key",
+                    db_host="test.db.host",
+                    db_user="test_user",
+                    db_password="test_password"
+                )
+            )
+            connection_manager = ConnectionManager(config)
+            handler = EnhancedOCPPChargePoint(station_id, mock_connection, config, timescale_client, connection_manager)
             stations.append(handler)
 
         # Execute boot notifications concurrently
         start_time = time.time()
         
-        tasks = []
-        for i, handler in enumerate(stations):
+        # Create tasks for concurrent execution
+        async def process_boot_notification(handler, i):
             from ocpp.v21.datatypes import ChargingStationType
             
             charging_station = ChargingStationType(
@@ -59,9 +99,13 @@ class TestLoadPerformance:
                 firmware_version="1.0.0"
             )
             
-            task = handler.on_boot_notification(
-                charging_station, "1.6", "2023-01-01T00:00:00Z"
-            )
+            # Call the synchronous method and return the result
+            result = handler.on_boot_notification(charging_station, "PowerUp")
+            return result
+
+        tasks = []
+        for i, handler in enumerate(stations):
+            task = asyncio.create_task(process_boot_notification(handler, i))
             tasks.append(task)
 
         results = await asyncio.gather(*tasks)
@@ -70,7 +114,7 @@ class TestLoadPerformance:
         # Verify all boot notifications succeeded
         assert len(results) == num_stations
         for result in results:
-            assert result["status"] == "Accepted"
+            assert result.status == "Accepted"
 
         # Performance metrics
         total_time = end_time - start_time
@@ -95,7 +139,26 @@ class TestLoadPerformance:
         # Create station handlers
         for i in range(num_stations):
             station_id = f"METER_TEST_STATION_{i:03d}"
-            handler = EnhancedOCPPChargePoint(station_id, timescale_client)
+            # Create mock objects for required parameters
+            mock_connection = Mock()
+            config = Config(
+                timescale=TimescaleConfig(
+                    service_url="postgresql://test:test@localhost:5432/test",
+                    host="localhost",
+                    user="test",
+                    password="test"
+                ),
+                supabase=SupabaseConfig(
+                    url="https://test.supabase.co",
+                    anon_key="test_anon_key",
+                    service_key="test_service_key",
+                    db_host="test.db.host",
+                    db_user="test_user",
+                    db_password="test_password"
+                )
+            )
+            connection_manager = ConnectionManager(config)
+            handler = EnhancedOCPPChargePoint(station_id, mock_connection, config, timescale_client, connection_manager)
             stations.append(handler)
 
         # Execute meter values concurrently
@@ -157,7 +220,26 @@ class TestLoadPerformance:
         # Create station handlers
         for i in range(num_transactions):
             station_id = f"TXN_TEST_STATION_{i:03d}"
-            handler = EnhancedOCPPChargePoint(station_id, timescale_client)
+            # Create mock objects for required parameters
+            mock_connection = Mock()
+            config = Config(
+                timescale=TimescaleConfig(
+                    service_url="postgresql://test:test@localhost:5432/test",
+                    host="localhost",
+                    user="test",
+                    password="test"
+                ),
+                supabase=SupabaseConfig(
+                    url="https://test.supabase.co",
+                    anon_key="test_anon_key",
+                    service_key="test_service_key",
+                    db_host="test.db.host",
+                    db_user="test_user",
+                    db_password="test_password"
+                )
+            )
+            connection_manager = ConnectionManager(config)
+            handler = EnhancedOCPPChargePoint(station_id, mock_connection, config, timescale_client, connection_manager)
             stations.append(handler)
 
         # Execute transaction events concurrently
@@ -213,7 +295,26 @@ class TestLoadPerformance:
         # Create station handlers
         for i in range(num_stations):
             station_id = f"MIXED_TEST_STATION_{i:03d}"
-            handler = EnhancedOCPPChargePoint(station_id, timescale_client)
+            # Create mock objects for required parameters
+            mock_connection = Mock()
+            config = Config(
+                timescale=TimescaleConfig(
+                    service_url="postgresql://test:test@localhost:5432/test",
+                    host="localhost",
+                    user="test",
+                    password="test"
+                ),
+                supabase=SupabaseConfig(
+                    url="https://test.supabase.co",
+                    anon_key="test_anon_key",
+                    service_key="test_service_key",
+                    db_host="test.db.host",
+                    db_user="test_user",
+                    db_password="test_password"
+                )
+            )
+            connection_manager = ConnectionManager(config)
+            handler = EnhancedOCPPChargePoint(station_id, mock_connection, config, timescale_client, connection_manager)
             stations.append(handler)
 
         # Execute mixed messages concurrently
@@ -328,7 +429,11 @@ class TestLoadPerformance:
             # Create station handlers
             for i in range(num_stations_per_iteration):
                 station_id = f"MEMORY_TEST_STATION_{iteration}_{i:03d}"
-                handler = EnhancedOCPPChargePoint(station_id, timescale_client)
+                # Create mock objects for required parameters
+                mock_connection = Mock()
+                config = Config()
+                connection_manager = ConnectionManager(config)
+                handler = EnhancedOCPPChargePoint(station_id, mock_connection, config, timescale_client, connection_manager)
                 stations.append(handler)
 
             # Execute operations

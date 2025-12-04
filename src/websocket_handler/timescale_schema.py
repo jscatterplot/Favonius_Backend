@@ -140,6 +140,84 @@ class TimescaleSchema:
             );
         """)
         
+        # Vehicle routes table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS vehicle_routes (
+                route_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                vehicle_id VARCHAR(255) NOT NULL,
+                station_id VARCHAR(255) NOT NULL,
+                departure_time TIMESTAMPTZ NOT NULL,
+                arrival_time TIMESTAMPTZ,
+                destination TEXT,
+                route_distance_km DECIMAL(8,2),
+                required_soc_percent DECIMAL(5,2) NOT NULL,
+                actual_soc_percent DECIMAL(5,2),
+                route_status VARCHAR(20) DEFAULT 'scheduled',
+                route_priority INTEGER DEFAULT 1,
+                estimated_duration_hours DECIMAL(4,2),
+                override_type VARCHAR(20),
+                override_reason TEXT,
+                operator_id VARCHAR(255),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Vehicle fleet table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS vehicle_fleet (
+                vehicle_id VARCHAR(255) PRIMARY KEY,
+                station_id VARCHAR(255) NOT NULL,
+                battery_capacity_kwh DECIMAL(8,2) NOT NULL,
+                max_charge_rate_kw DECIMAL(8,2) NOT NULL,
+                max_discharge_rate_kw DECIMAL(8,2) NOT NULL,
+                current_soc_kwh DECIMAL(8,2),
+                min_soc_kwh DECIMAL(8,2) DEFAULT 15.0,
+                charge_efficiency DECIMAL(3,2) DEFAULT 0.95,
+                discharge_efficiency DECIMAL(3,2) DEFAULT 0.90,
+                vehicle_type VARCHAR(50),
+                make VARCHAR(100),
+                model VARCHAR(100),
+                year INTEGER,
+                is_active BOOLEAN DEFAULT true,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Price forecasts table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS price_forecasts (
+                forecast_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                forecast_time TIMESTAMPTZ NOT NULL,
+                horizon_start TIMESTAMPTZ NOT NULL,
+                horizon_end TIMESTAMPTZ NOT NULL,
+                node_id VARCHAR(100) NOT NULL,
+                market_type VARCHAR(20) NOT NULL,
+                forecast_prices JSONB NOT NULL,
+                confidence_intervals JSONB,
+                model_version VARCHAR(50),
+                accuracy_score DECIMAL(5,4),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
+        # Demand forecasts table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS demand_forecasts (
+                forecast_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                forecast_time TIMESTAMPTZ NOT NULL,
+                horizon_start TIMESTAMPTZ NOT NULL,
+                horizon_end TIMESTAMPTZ NOT NULL,
+                station_id VARCHAR(255) NOT NULL,
+                forecast_demand JSONB NOT NULL,
+                confidence_intervals JSONB,
+                model_version VARCHAR(50),
+                accuracy_score DECIMAL(5,4),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        
         # Charging schedules table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_schedules (
@@ -550,6 +628,55 @@ class TimescaleSchema:
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_optimization_sync_status 
             ON optimization_decisions(sync_status, created_at);
+        """)
+        
+        # Vehicle routes indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_routes_vehicle 
+            ON vehicle_routes(vehicle_id, departure_time DESC);
+        """)
+        
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_routes_station 
+            ON vehicle_routes(station_id, departure_time DESC);
+        """)
+        
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_routes_status 
+            ON vehicle_routes(route_status, created_at);
+        """)
+        
+        # Vehicle fleet indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fleet_station 
+            ON vehicle_fleet(station_id, is_active);
+        """)
+        
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fleet_active 
+            ON vehicle_fleet(is_active, updated_at DESC);
+        """)
+        
+        # Price forecasts indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_price_forecasts_time 
+            ON price_forecasts(forecast_time DESC, horizon_start);
+        """)
+        
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_price_forecasts_node 
+            ON price_forecasts(node_id, forecast_time DESC);
+        """)
+        
+        # Demand forecasts indexes
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_demand_forecasts_time 
+            ON demand_forecasts(forecast_time DESC, horizon_start);
+        """)
+        
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_demand_forecasts_station 
+            ON demand_forecasts(station_id, forecast_time DESC);
         """)
         
         # Charging schedules indexes

@@ -12,7 +12,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from websocket_handler.ocpp_handler import EnhancedOCPPChargePoint
-from websocket_handler.config import Config, TimescaleConfig
+from websocket_handler.config import Config, TimescaleConfig, SupabaseConfig
 from websocket_handler.connection_manager import ConnectionManager
 from websocket_handler.timescale_client import TimescaleClient
 
@@ -24,19 +24,21 @@ class TestOCPPIntegration:
     async def timescale_client(self):
         """Create real TimescaleClient for integration tests."""
         # Use test database configuration
-        client = TimescaleClient(
+        config = TimescaleConfig(
+            service_url="postgresql://postgres:password@localhost:5432/test_favonius",
             host="localhost",
             port=5432,
             database="test_favonius",
             user="postgres",
             password="password"
         )
-        await client.initialize()
+        client = TimescaleClient(config)
+        await client.connect()
         yield client
-        await client.close()
+        await client.disconnect()
 
     @pytest.fixture
-    def ocpp_handler(self, timescale_client):
+    async def ocpp_handler(self, timescale_client):
         """Create EnhancedOCPPChargePoint instance."""
         config = Config(
             timescale=TimescaleConfig(
@@ -44,28 +46,42 @@ class TestOCPPIntegration:
                 host="localhost",
                 user="test",
                 password="test"
+            ),
+            supabase=SupabaseConfig(
+                url="https://test.supabase.co",
+                anon_key="test_anon_key",
+                service_key="test_service_key",
+                db_host="test.db.host",
+                db_user="test_user",
+                db_password="test_password"
             )
         )
-        connection_manager = ConnectionManager()
-        return EnhancedOCPPChargePoint("TEST_STATION_001", config, timescale_client, connection_manager)
+        connection_manager = ConnectionManager(config)
+        mock_connection = Mock()
+        client = await timescale_client.__anext__()
+        return EnhancedOCPPChargePoint("TEST_STATION_001", mock_connection, config, client, connection_manager)
 
     @pytest.mark.asyncio
     async def test_complete_charging_session_flow(self, ocpp_handler, timescale_client):
         """Test complete charging session from boot to transaction end."""
         
+        # Await the async fixtures
+        handler = await ocpp_handler
+        client = await timescale_client.__anext__()
+        
         # 1. Boot Notification
         from ocpp.v21.datatypes import ChargingStationType
         from ocpp.v21.enums import RegistrationStatusEnumType
-
+        
         charging_station = ChargingStationType(
             model="TestModel",
             vendor_name="TestVendor",
             serial_number="SN123456",
             firmware_version="1.0.0"
         )
-
-        boot_result = await ocpp_handler.on_boot_notification(
-            charging_station, "1.6", "2023-01-01T00:00:00Z"
+        
+        boot_result = handler.on_boot_notification(
+            charging_station, "PowerUp"
         )
         assert boot_result["status"] == RegistrationStatusEnumType.accepted
 

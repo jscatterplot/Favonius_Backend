@@ -3,12 +3,78 @@
 import asyncio
 import json
 import time
-from typing import Dict, Optional, Set
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Set, Tuple
 from websockets import WebSocketServerProtocol
 
 from .config import Config
 # Redis removed for simplification
 from .monitoring import get_logger
+
+
+class RateLimiter:
+    """Token bucket rate limiter for WebSocket connections."""
+    
+    def __init__(self, max_stations: int = 100):
+        """
+        Initialize rate limiter.
+        
+        Args:
+            max_stations: Expected number of charging stations (default 100)
+                         Rate limits will be set to 100x this value
+        """
+        self.requests_per_minute = max_stations * 100  # 100 requests per station per minute
+        self.burst_allowance = max_stations * 10  # Allow burst of 10x normal rate
+        
+        # Track requests per station: {station_id: [(timestamp, count), ...]}
+        self.request_history: Dict[str, list] = defaultdict(list)
+        self.cleanup_interval = 60  # seconds
+        self.last_cleanup = datetime.now()
+    
+    async def check_rate_limit(self, station_id: str) -> Tuple[bool, str]:
+        """
+        Check if station is within rate limits.
+        
+        Returns:
+            (allowed: bool, reason: str)
+        """
+        now = datetime.now()
+        
+        # Cleanup old entries periodically
+        if (now - self.last_cleanup).seconds > self.cleanup_interval:
+            await self._cleanup_old_entries()
+            self.last_cleanup = now
+        
+        # Get requests in last minute
+        one_minute_ago = now - timedelta(minutes=1)
+        recent_requests = [
+            req for req in self.request_history[station_id]
+            if req > one_minute_ago
+        ]
+        
+        # Check rate limit
+        if len(recent_requests) >= self.requests_per_minute:
+            return False, f"Rate limit exceeded: {len(recent_requests)} requests in last minute"
+        
+        # Add current request
+        self.request_history[station_id].append(now)
+        return True, ""
+    
+    async def _cleanup_old_entries(self):
+        """Remove entries older than 1 minute."""
+        now = datetime.now()
+        one_minute_ago = now - timedelta(minutes=1)
+        
+        for station_id in list(self.request_history.keys()):
+            self.request_history[station_id] = [
+                req for req in self.request_history[station_id]
+                if req > one_minute_ago
+            ]
+            
+            # Remove empty entries
+            if not self.request_history[station_id]:
+                del self.request_history[station_id]
 
 
 class ConnectionManager:
@@ -27,6 +93,10 @@ class ConnectionManager:
         # Connection health monitoring
         self.last_heartbeats: Dict[str, float] = {}
         self.connection_stats: Dict[str, Dict] = {}
+        
+        # Initialize rate limiter with expected station count from config
+        expected_stations = getattr(self.config.monitoring, 'expected_stations', 100)
+        self.rate_limiter = RateLimiter(max_stations=expected_stations)
         
         # Background tasks
         self._monitoring_task: Optional[asyncio.Task] = None
@@ -209,8 +279,19 @@ class ConnectionManager:
         self.last_heartbeats[station_id] = time.time()
         # Redis heartbeat update removed for simplification
     
+    async def check_message_rate_limit(self, station_id: str) -> Tuple[bool, str]:
+        """
+        Check if station is within rate limits for message processing.
+        
+        Returns:
+            (allowed: bool, reason: str)
+        """
+        if not getattr(self.config.monitoring, 'rate_limit_enabled', True):
+            return True, ""
+        
+        return await self.rate_limiter.check_rate_limit(station_id)
+    
     async def record_message_received(self, station_id: str, message_size: int) -> None:
-        """Record statistics for received message."""
         connection_id = self.station_connections.get(station_id)
         if connection_id and connection_id in self.connection_stats:
             self.connection_stats[connection_id]["messages_received"] += 1

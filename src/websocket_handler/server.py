@@ -7,7 +7,7 @@ import ssl
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Tuple, Set
 import uvloop
 import websockets
 from websockets import WebSocketServerProtocol
@@ -24,6 +24,7 @@ from .priority_charging_manager import PriorityChargingManager
 from .external_control_manager import ExternalControlManager
 from .certificate_manager import CertificateManager
 from .v2x_controller import V2XController
+from .cache_manager import CacheManager
 
 
 # Prometheus metrics - imported from monitoring module
@@ -31,8 +32,7 @@ from .monitoring import (
     WEBSOCKET_CONNECTIONS as CONNECTIONS_TOTAL,
     MESSAGES_RECEIVED_TOTAL as MESSAGES_RECEIVED,
     MESSAGES_SENT_TOTAL as MESSAGES_SENT,
-    REDIS_OPERATION_DURATION as MESSAGE_PROCESSING_TIME,
-    REDIS_OPERATIONS_TOTAL as ERRORS_TOTAL
+    ERRORS_TOTAL
 )
 
 
@@ -49,6 +49,9 @@ class OCPPWebSocketServer:
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
         self.message_handler: Optional[MessageHandler] = None
+        
+        # Cache manager for performance optimization
+        self.cache_manager: Optional[CacheManager] = None
         
         # V2G managers
         self.charging_profile_manager: Optional[ChargingProfileManager] = None
@@ -68,8 +71,8 @@ class OCPPWebSocketServer:
         self.station_connections: Dict[str, str] = {}  # station_id -> connection_id
         self.message_queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         
-        # Rate limiting
-        self.rate_limits: Dict[str, list] = defaultdict(list)
+        # Rate limiting - use connection manager's rate limiter
+        # self.rate_limits: Dict[str, list] = defaultdict(list)  # Removed - using RateLimiter class
         
         # Background task tracking
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -117,7 +120,7 @@ class OCPPWebSocketServer:
             
         except Exception as e:
             self.logger.error(f"Failed to start WebSocket server: {e}")
-            REDIS_OPERATIONS_TOTAL.labels(operation_type="startup_error").inc()
+            ERRORS_TOTAL.labels(operation_type="startup_error").inc()
             raise
     
     async def stop(self) -> None:
@@ -158,6 +161,9 @@ class OCPPWebSocketServer:
     
     async def _initialize_components(self) -> None:
         """Initialize core components and V2G managers."""
+        # Initialize cache manager for performance optimization
+        self.cache_manager = CacheManager(max_size=5000, ttl_seconds=300)
+        
         # Initialize connection manager
         self.connection_manager = ConnectionManager(
             config=self.config
@@ -170,13 +176,23 @@ class OCPPWebSocketServer:
             timescale_client=self.timescale_client
         )
         
-        # Initialize V2G managers
-        self.charging_profile_manager = ChargingProfileManager(self.timescale_client)
+        # Initialize V2G managers with cache manager
+        self.charging_profile_manager = ChargingProfileManager(self.timescale_client, self.cache_manager)
         self.der_control_manager = DERControlManager(self.timescale_client)
         self.priority_charging_manager = PriorityChargingManager(self.timescale_client)
         self.external_control_manager = ExternalControlManager(self.timescale_client)
-        self.certificate_manager = CertificateManager(self.timescale_client)
-        self.v2x_controller = V2XController(self.timescale_client)
+        self.certificate_manager = CertificateManager(self.timescale_client, self.cache_manager)
+        # Create V2X controller config from app config
+        from websocket_handler.v2x_controller import V2XControllerConfig
+        v2x_config = V2XControllerConfig(
+            enabled=True,
+            supported_modes=["V2G", "V2H", "V2B"],
+            update_interval={"V2G": 60, "V2H": 300, "V2B": 300},
+            power_limits={"max_charge": 150.0, "max_discharge": 150.0},
+            frequency_deadband=0.05,
+            voltage_limits={"min": 360.0, "max": 420.0}
+        )
+        self.v2x_controller = V2XController(v2x_config, self.config)
         
         self.logger.info("All V2G managers initialized successfully")
     
@@ -213,14 +229,14 @@ class OCPPWebSocketServer:
         if len(self.connections) >= self.config.websocket.max_connections:
             self.logger.warning(f"Connection limit exceeded, rejecting {client_ip}")
             await websocket.close(1008, "Server overloaded")
-            REDIS_OPERATIONS_TOTAL.labels(operation_type="connection_limit_exceeded").inc()
+            ERRORS_TOTAL.labels(operation_type="connection_limit_exceeded").inc()
             return
         
         # Validate OCPP subprotocol
         if websocket.subprotocol != "ocpp2.1":
             self.logger.warning(f"Invalid subprotocol from {client_ip}: {websocket.subprotocol}")
             await websocket.close(1002, "Invalid subprotocol")
-            REDIS_OPERATIONS_TOTAL.labels(operation_type="invalid_subprotocol").inc()
+            ERRORS_TOTAL.labels(operation_type="invalid_subprotocol").inc()
             return
         
         # Extract station ID from path
@@ -273,29 +289,15 @@ class OCPPWebSocketServer:
             self.logger.info(f"Connection {connection_id} closed normally")
         except Exception as e:
             self.logger.error(f"Error handling connection {connection_id}: {e}")
-            REDIS_OPERATIONS_TOTAL.labels(operation_type="connection_error").inc()
+            ERRORS_TOTAL.labels(operation_type="connection_error").inc()
         finally:
             await self._cleanup_connection(connection_id, websocket, station_id)
     
     
     
-    def _check_rate_limit(self, connection_id: str) -> bool:
-        """Check if connection is within rate limits."""
-        now = time.time()
-        minute_ago = now - 60
-        
-        # Clean old entries
-        self.rate_limits[connection_id] = [
-            ts for ts in self.rate_limits[connection_id] if ts > minute_ago
-        ]
-        
-        # Check limit
-        if len(self.rate_limits[connection_id]) >= self.config.websocket.rate_limit_per_minute:
-            return False
-        
-        # Add current request
-        self.rate_limits[connection_id].append(now)
-        return True
+    async def _check_rate_limit(self, station_id: str) -> Tuple[bool, str]:
+        """Check if station is within rate limits using connection manager's rate limiter."""
+        return await self.connection_manager.check_message_rate_limit(station_id)
     
     async def _cleanup_connection(self, connection_id: str, websocket: WebSocketServerProtocol, station_id: str = None) -> None:
         """Cleanup connection resources."""
@@ -316,8 +318,8 @@ class OCPPWebSocketServer:
             if self.connection_manager:
                 await self.connection_manager.unregister_connection(station_id)
         
-        # Clean rate limit data
-        self.rate_limits.pop(connection_id, None)
+        # Clean rate limit data - handled by RateLimiter class cleanup
+        # self.rate_limits.pop(connection_id, None)  # Removed - using RateLimiter class
         
         self.logger.info(f"Cleaned up connection {connection_id} (station: {station_id})")
     
@@ -378,18 +380,7 @@ class OCPPWebSocketServer:
         """Cleanup old rate limit entries periodically."""
         while self.running:
             try:
-                now = time.time()
-                minute_ago = now - 60
-                
-                for connection_id in list(self.rate_limits.keys()):
-                    self.rate_limits[connection_id] = [
-                        ts for ts in self.rate_limits[connection_id] if ts > minute_ago
-                    ]
-                    
-                    # Remove empty entries
-                    if not self.rate_limits[connection_id]:
-                        del self.rate_limits[connection_id]
-                
+                # Rate limiter handles its own cleanup
                 await asyncio.sleep(60)  # Clean every minute
                 
             except Exception as e:

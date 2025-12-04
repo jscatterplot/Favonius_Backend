@@ -115,6 +115,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         
         # Store station information
         self.station_info = {
+            "station_id": self.id,
             "serial_number": charging_station.serial_number,
             "model": charging_station.model,
             "vendor_name": charging_station.vendor_name,
@@ -124,11 +125,13 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
-        # Store in database
-        asyncio.create_task(self._store_station_info())
+        # Store in database and initialize device model concurrently
+        # Use asyncio.create_task but don't store the tasks
+        task1 = asyncio.create_task(self._store_station_info())
+        task2 = asyncio.create_task(self._initialize_complete_device_model())
         
-        # Initialize complete device model
-        asyncio.create_task(self._initialize_complete_device_model())
+        # Fire and forget - don't await or store the tasks
+        # This prevents the BootNotification object from being used as a task identifier
         
         return call_result.BootNotification(
             current_time=datetime.now(timezone.utc).isoformat(),
@@ -808,18 +811,15 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         
         return call_result.GetCompositeSchedule()
     
-    @on(Action.report_charging_profiles)
-    def on_report_charging_profiles(self, request_id: int, evse_id: int,
-                                   charging_profile: list, **kwargs):
-        """Handle ReportChargingProfiles message."""
-        self.logger.info(f"ReportChargingProfiles from {self.id}")
+    @on(Action.set_charging_profile)
+    def on_set_charging_profile(self, evse_id: int, charging_profile: Dict[str, Any], **kwargs):
+        """Handle SetChargingProfile message."""
+        self.logger.info(f"SetChargingProfile from {self.id}")
         
-        # Process charging profiles report
-        asyncio.create_task(self._handle_report_charging_profiles(
-            request_id, evse_id, charging_profile
-        ))
+        # Process charging profile set request
+        asyncio.create_task(self._handle_set_charging_profile(evse_id, charging_profile))
         
-        return call_result.ReportChargingProfiles()
+        return call_result.SetChargingProfile(status="Accepted")
     
     @on(Action.request_start_transaction)
     def on_request_start_transaction(self, evse_id: int, id_token: dict,
@@ -1391,6 +1391,24 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             
         except Exception as e:
             self.logger.error(f"Error handling ReportChargingProfiles: {e}")
+    
+    async def _handle_set_charging_profile(self, evse_id: int, charging_profile: Dict[str, Any]):
+        """Handle SetChargingProfile request."""
+        try:
+            result = await self.charging_profile_manager.set_charging_profile(
+                self.id, evse_id, charging_profile
+            )
+            
+            # Send SetChargingProfileResponse
+            from ocpp.v21 import call
+            request = call.SetChargingProfileResponse(
+                status=result["status"],
+                status_info=result.get("statusInfo")
+            )
+            await self.call(request)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling SetChargingProfile: {e}")
     
     async def _handle_request_start_transaction(self, evse_id: int, id_token: dict,
                                               remote_start_id: Optional[int],

@@ -67,6 +67,8 @@ class MonitoringConfig(BaseModel):
     log_level: str = Field(default="INFO", description="Log level")
     enable_telemetry: bool = Field(default=True, description="Enable telemetry collection")
     health_check_port: int = Field(default=8081, description="Health check port")
+    expected_stations: int = Field(default=100, description="Expected number of charging stations")
+    rate_limit_enabled: bool = Field(default=True, description="Enable rate limiting")
 
 
 class PriceFeederConfig(BaseModel):

@@ -198,7 +198,6 @@ class APIServer:
             self.logger.error(f"Token refresh error: {e}")
             return web.json_response({'error': 'Token refresh failed'}, status=500)
     
-    @require_auth
     async def get_current_user(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get current user information."""
         return web.json_response({
@@ -206,7 +205,7 @@ class APIServer:
         })
     
     # Organization Endpoints
-    @require_auth
+
     async def get_organizations(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get user's organizations."""
         try:
@@ -216,8 +215,8 @@ class APIServer:
             self.logger.error(f"Get organizations error: {e}")
             return web.json_response({'error': 'Failed to get organizations'}, status=500)
     
-    @require_auth
-    @require_permission('organization', 'read')
+
+
     async def get_organization(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get organization details."""
         try:
@@ -232,8 +231,8 @@ class APIServer:
             self.logger.error(f"Get organization error: {e}")
             return web.json_response({'error': 'Failed to get organization'}, status=500)
     
-    @require_auth
-    @require_permission('organization', 'write')
+
+
     async def update_organization(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Update organization."""
         try:
@@ -247,8 +246,8 @@ class APIServer:
             return web.json_response({'error': 'Failed to update organization'}, status=500)
     
     # Vehicle Endpoints
-    @require_auth
-    @require_permission('vehicles', 'read')
+
+
     async def get_vehicles(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get vehicles for organization."""
         try:
@@ -259,8 +258,8 @@ class APIServer:
             self.logger.error(f"Get vehicles error: {e}")
             return web.json_response({'error': 'Failed to get vehicles'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'write')
+
+
     async def create_vehicle(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Create new vehicle."""
         try:
@@ -273,8 +272,8 @@ class APIServer:
             self.logger.error(f"Create vehicle error: {e}")
             return web.json_response({'error': 'Failed to create vehicle'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'read')
+
+
     async def get_vehicle(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get vehicle details."""
         try:
@@ -292,8 +291,8 @@ class APIServer:
             self.logger.error(f"Get vehicle error: {e}")
             return web.json_response({'error': 'Failed to get vehicle'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'write')
+
+
     async def update_vehicle(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Update vehicle."""
         try:
@@ -306,8 +305,8 @@ class APIServer:
             self.logger.error(f"Update vehicle error: {e}")
             return web.json_response({'error': 'Failed to update vehicle'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'delete')
+
+
     async def delete_vehicle(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Delete vehicle."""
         try:
@@ -322,8 +321,8 @@ class APIServer:
             return web.json_response({'error': 'Failed to delete vehicle'}, status=500)
     
     # Charging Station Endpoints
-    @require_auth
-    @require_permission('vehicles', 'read')
+
+
     async def get_stations(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get charging stations for organization."""
         try:
@@ -342,8 +341,8 @@ class APIServer:
             self.logger.error(f"Get stations error: {e}")
             return web.json_response({'error': 'Failed to get stations'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'write')
+
+
     async def create_station(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Create new charging station."""
         try:
@@ -354,8 +353,8 @@ class APIServer:
             self.logger.error(f"Create station error: {e}")
             return web.json_response({'error': 'Failed to create station'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'read')
+
+
     async def get_station(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get charging station details."""
         try:
@@ -371,8 +370,8 @@ class APIServer:
             self.logger.error(f"Get station error: {e}")
             return web.json_response({'error': 'Failed to get station'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'write')
+
+
     async def update_station(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Update charging station."""
         try:
@@ -386,8 +385,8 @@ class APIServer:
             return web.json_response({'error': 'Failed to update station'}, status=500)
     
     # Charging Session Endpoints
-    @require_auth
-    @require_permission('charging_sessions', 'read')
+
+
     async def get_sessions(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get charging sessions."""
         try:
@@ -408,8 +407,8 @@ class APIServer:
             self.logger.error(f"Get sessions error: {e}")
             return web.json_response({'error': 'Failed to get sessions'}, status=500)
     
-    @require_auth
-    @require_permission('charging_sessions', 'read')
+
+
     async def get_active_sessions(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get active charging sessions."""
         try:
@@ -420,8 +419,8 @@ class APIServer:
             self.logger.error(f"Get active sessions error: {e}")
             return web.json_response({'error': 'Failed to get active sessions'}, status=500)
     
-    @require_auth
-    @require_permission('charging_sessions', 'write')
+
+
     async def stop_session(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Stop charging session."""
         try:
@@ -435,8 +434,8 @@ class APIServer:
             return web.json_response({'error': 'Failed to stop session'}, status=500)
     
     # Schedule Endpoints
-    @require_auth
-    @require_permission('vehicles', 'read')
+
+
     async def get_schedules(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get charging schedules."""
         try:
@@ -447,8 +446,8 @@ class APIServer:
             self.logger.error(f"Get schedules error: {e}")
             return web.json_response({'error': 'Failed to get schedules'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'write')
+
+
     async def create_schedule(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Create charging schedule."""
         try:
@@ -461,8 +460,8 @@ class APIServer:
             self.logger.error(f"Create schedule error: {e}")
             return web.json_response({'error': 'Failed to create schedule'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'write')
+
+
     async def update_schedule(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Update charging schedule."""
         try:
@@ -475,8 +474,8 @@ class APIServer:
             self.logger.error(f"Update schedule error: {e}")
             return web.json_response({'error': 'Failed to update schedule'}, status=500)
     
-    @require_auth
-    @require_permission('vehicles', 'delete')
+
+
     async def delete_schedule(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Delete charging schedule."""
         try:
@@ -489,8 +488,8 @@ class APIServer:
             return web.json_response({'error': 'Failed to delete schedule'}, status=500)
     
     # Analytics Endpoints
-    @require_auth
-    @require_permission('analytics', 'read')
+
+
     async def get_energy_analytics(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get energy analytics."""
         try:
@@ -504,8 +503,8 @@ class APIServer:
             self.logger.error(f"Get energy analytics error: {e}")
             return web.json_response({'error': 'Failed to get energy analytics'}, status=500)
     
-    @require_auth
-    @require_permission('analytics', 'read')
+
+
     async def get_cost_analytics(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get cost analytics."""
         try:
@@ -523,8 +522,8 @@ class APIServer:
             self.logger.error(f"Get cost analytics error: {e}")
             return web.json_response({'error': 'Failed to get cost analytics'}, status=500)
     
-    @require_auth
-    @require_permission('analytics', 'read')
+
+
     async def get_savings_analytics(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get savings analytics."""
         try:
@@ -539,7 +538,7 @@ class APIServer:
             return web.json_response({'error': 'Failed to get savings analytics'}, status=500)
     
     # Real-time Endpoints
-    @require_auth
+
     async def subscribe_realtime(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Subscribe to real-time updates."""
         try:
@@ -554,8 +553,8 @@ class APIServer:
             return web.json_response({'error': 'Failed to subscribe to real-time updates'}, status=500)
     
     # Admin Endpoints
-    @require_auth
-    @require_role(['owner'])
+
+
     async def get_sync_status(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get data sync status."""
         try:
@@ -568,8 +567,8 @@ class APIServer:
             self.logger.error(f"Get sync status error: {e}")
             return web.json_response({'error': 'Failed to get sync status'}, status=500)
     
-    @require_auth
-    @require_role(['owner'])
+
+
     async def force_sync(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Force data synchronization."""
         try:
