@@ -572,6 +572,7 @@ class DepotState:
     vehicle_availability: dict[str, list[bool]]
     energy_requirements: dict[str, float]    # vehicle_id -> kWh needed
     departure_times: dict[str, int]          # vehicle_id -> timestep index
+    building_power: list[float]              # Building load per timestep (kW)
 
 
 @dataclass
