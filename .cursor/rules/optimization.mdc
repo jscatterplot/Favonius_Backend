@@ -1,0 +1,142 @@
+# Optimization Engine Rules
+
+## Reference
+Primary reference: PRD.md#8-optimization-engine-specifications
+
+## Mathematical Formulation
+
+### Objective Function
+The optimization minimizes total electricity cost:
+```
+minimize:
+    Σ_t (price[t] × P_grid[t] × Δt)           # Energy cost
+  + demand_rate × P_max_grid                   # Demand charge
+```
+
+Reference: PRD Section 8.1
+
+### Decision Variables
+- `P_charge[b,t]`: Charging power for vehicle b at time t (kW) - ℝ≥0
+- `SoC[b,t]`: State of charge for vehicle b at time t - [0.1, 1.0]
+- `y_charge[b,t]`: Binary indicator if vehicle b is charging at time t - {0,1}
+- `P_batt[t]`: Battery power (+discharge, -charge) - [-P_max, P_max]
+- `SoC_batt[t]`: Battery state of charge - [0.2, 0.8]
+- `P_grid[t]`: Grid power draw at time t - ℝ≥0
+- `P_max_grid`: Maximum grid power (demand) - ℝ≥0
+
+Reference: PRD Section 8.1
+
+### Constraints (MUST BE ENFORCED)
+
+1. **SoC Dynamics:**
+   ```
+   SoC[b,t] = SoC[b,t-1] + (η × P_charge[b,t-1] × Δt) / E_batt[b]
+   ```
+
+2. **Vehicle Availability:**
+   ```
+   P_charge[b,t] = 0   if available[b,t] = 0
+   ```
+
+3. **Departure SoC (HARD CONSTRAINT - NEVER RELAX):**
+   ```
+   SoC[b, t_depart[b]] ≥ 0.99
+   ```
+   This is a HARD constraint per PRD Section 8.1. Never allow solutions that violate this.
+
+4. **Charger Linking:**
+   ```
+   P_charge[b,t] ≤ P_charger × y_charge[b,t]
+   ```
+
+5. **Charger Capacity:**
+   ```
+   Σ_b y_charge[b,t] ≤ n_chargers
+   ```
+
+6. **Grid Power Balance:**
+   ```
+   P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt[t]
+   ```
+
+7. **Demand Tracking:**
+   ```
+   P_max_grid ≥ P_grid[t]   ∀t
+   P_max_grid ≥ current_month_peak   (moving limit)
+   ```
+
+8. **Battery Dynamics:**
+   ```
+   SoC_batt[t] = SoC_batt[t-1] + (P_batt[t-1] × Δt) / E_batt_storage
+   0.2 ≤ SoC_batt[t] ≤ 0.8
+   ```
+
+Reference: PRD Section 8.1
+
+## Pyomo Implementation Patterns
+
+### Model Structure
+```python
+import pyomo.environ as pyo
+
+model = pyo.ConcreteModel("DepotCharging")
+
+# Sets
+model.T = pyo.RangeSet(0, n_timesteps - 1)
+model.B = pyo.Set(initialize=vehicle_ids)
+
+# Parameters
+model.price = pyo.Param(model.T, initialize=prices)
+model.E_batt = pyo.Param(model.B, initialize=capacities)
+
+# Variables
+model.P_charge = pyo.Var(model.B, model.T, domain=pyo.NonNegativeReals)
+model.SoC = pyo.Var(model.B, model.T, bounds=(0.1, 1.0))
+model.y_charge = pyo.Var(model.B, model.T, domain=pyo.Binary)
+```
+
+### Solver Configuration
+```python
+solver = pyo.SolverFactory('appsi_highs')
+solver.options['time_limit'] = 30.0      # seconds (PRD Section 8.3)
+solver.options['mip_rel_gap'] = 0.01     # 1% optimality gap
+solver.options['threads'] = 4            # parallel threads
+solver.options['presolve'] = 'on'        # preprocessing
+```
+
+Reference: PRD Section 8.2
+
+## Performance Targets
+
+| Metric | Target | Test Configuration |
+|--------|--------|-------------------|
+| Solve time | < 30 seconds | 20 vehicles, 96 timesteps |
+| Memory | < 2 GB | Same configuration |
+| Optimality gap | < 1% | Required for deployment |
+| Warm-start speedup | > 3x | Use previous solution |
+
+Reference: PRD Section 8.3
+
+## Warm-Starting
+
+Always use warm-starting from previous solutions when available:
+- Initialize `P_charge[b,t]` from previous schedule
+- Initialize `y_charge[b,t]` based on previous charging activity
+- This provides > 3x speedup per PRD Section 8.3
+
+## Surrogate Model Integration
+
+Energy consumption predictions come from the surrogate model (PRD Section 8.4):
+- Use predicted energy requirements for `energy_requirements` dict
+- R² ≥ 0.85 on validation set required
+- Uncertainty estimates available for robust optimization
+
+## Validation
+
+Before accepting any optimization solution:
+1. Verify all departure SoC constraints satisfied (≥ 0.99)
+2. Check solve time < 30 seconds
+3. Verify objective value is reasonable
+4. Log solve time and objective value for monitoring
+
+Reference: PRD Section 11.1 (Acceptance Criteria)

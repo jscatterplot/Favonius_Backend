@@ -1,0 +1,154 @@
+# TimescaleDB Best Practices
+
+## Reference
+Primary reference: PRD.md#6-data-models
+
+## Hypertable Creation
+
+All time-series tables MUST be converted to hypertables:
+```sql
+CREATE TABLE telemetry (
+    time TIMESTAMPTZ NOT NULL,
+    vehicle_id UUID NOT NULL,
+    soc DOUBLE PRECISION,
+    -- other columns
+);
+SELECT create_hypertable('telemetry', 'time');
+```
+
+Required hypertables per PRD Section 6.1:
+- `telemetry` - Vehicle telemetry data
+- `prices` - Electricity prices
+- `weather_forecasts` - Weather forecast data
+
+## Schema Patterns
+
+### Reference Data Tables
+- `depots` - Depot configuration
+- `vehicles` - Vehicle fleet data
+- `chargers` - Charger configuration
+- `battery_storage` - Stationary battery specs
+
+### Time-Series Tables (Hypertables)
+- `telemetry` - Vehicle SoC, location, charging status
+- `prices` - Energy and demand prices per timestep
+- `weather_forecasts` - Weather data for surrogate model
+
+### Operational Tables
+- `schedules` - Vehicle route schedules
+- `optimization_runs` - Optimization results and metadata
+- `charging_commands` - OCPP command history
+- `interdepot_messages` - Vehicle handoff messages
+
+Reference: PRD Section 6.1
+
+## Indexing Strategy
+
+Create indexes for common query patterns:
+```sql
+-- Vehicle telemetry queries
+CREATE INDEX idx_telemetry_vehicle ON telemetry (vehicle_id, time DESC);
+
+-- Schedule lookups
+CREATE INDEX idx_schedules_vehicle_depart ON schedules (vehicle_id, departure_time);
+```
+
+## Time-Series Query Optimization
+
+### Latest Value Queries
+Use `DISTINCT ON` for latest telemetry per vehicle:
+```sql
+SELECT DISTINCT ON (vehicle_id) 
+    vehicle_id, soc, time
+FROM telemetry
+WHERE vehicle_id IN (...)
+ORDER BY vehicle_id, time DESC;
+```
+
+### Time Range Queries
+Always use time-based WHERE clauses for hypertable efficiency:
+```sql
+SELECT * FROM telemetry
+WHERE time >= NOW() - INTERVAL '24 hours'
+  AND vehicle_id = '...'
+ORDER BY time DESC;
+```
+
+## Data Types
+
+- Use `TIMESTAMPTZ` for all time columns (timezone-aware)
+- Use `DOUBLE PRECISION` for floating-point values (SoC, power, prices)
+- Use `UUID` for primary keys and foreign keys
+- Use `JSONB` for flexible schema (optimization results, charging profiles)
+
+Reference: PRD Section 6.1
+
+## Compression and Retention
+
+Configure compression for old data:
+```sql
+-- Enable compression on hypertable
+ALTER TABLE telemetry SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'vehicle_id'
+);
+
+-- Add compression policy (compress data older than 7 days)
+SELECT add_compression_policy('telemetry', INTERVAL '7 days');
+```
+
+Configure retention for very old data:
+```sql
+-- Drop data older than 1 year
+SELECT add_retention_policy('telemetry', INTERVAL '1 year');
+```
+
+## Connection Patterns
+
+Use `asyncpg` for async database operations:
+```python
+import asyncpg
+
+pool = await asyncpg.create_pool(dsn=...)
+
+async with pool.acquire() as conn:
+    rows = await conn.fetch(query, params)
+```
+
+## Data Ingestion
+
+For high-frequency telemetry (MeterValues every 15 seconds):
+- Use batch inserts for efficiency
+- Consider using `COPY` for bulk loads
+- Monitor ingestion rate (target: 100 msg/sec per PRD Section 10.4)
+
+## Query Performance
+
+Target query times per PRD Section 10.1:
+- Database query time: < 100 ms (average)
+- Latest SoC lookup: < 50 ms
+- Price range queries: < 100 ms
+
+## Integration with Optimization
+
+State assembler queries (PRD Section 5.3):
+1. Latest vehicle SoCs from `telemetry`
+2. Price schedule from `prices` table
+3. Schedules from `schedules` table
+4. Store optimization results in `optimization_runs` table
+
+## Data Durability
+
+Per PRD Section 10.2:
+- Data durability: 99.99% (TimescaleDB replication)
+- Ensure proper backup configuration
+- Monitor replication lag
+
+## Migration Patterns
+
+When adding new columns to hypertables:
+- Use `ALTER TABLE` with default values
+- Avoid locking operations during peak hours
+- Test migrations on development environment first
+
+Reference: PRD Section 6.1 for complete schema definitions

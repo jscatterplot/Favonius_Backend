@@ -1,0 +1,44 @@
+# Depot Configuration Template
+# Customize this file for each depot deployment
+
+depot:
+  name: "Example Depot"
+  depot_id: "00000000-0000-0000-0000-000000000000"
+  latitude: 37.7749  # San Francisco
+  longitude: -122.4194
+  timezone: "America/Los_Angeles"
+  utility_id: "PG&E"
+  max_grid_kw: 1000.0
+  demand_charge_rate_kw: 20.0  # $/kW per month
+
+chargers:
+  n_chargers: 10
+  rated_power_kw: 80.0
+  efficiency: 0.95
+  connector_type: "CCS"
+
+battery_storage:
+  capacity_kwh: 500.0
+  max_power_kw: 100.0
+  efficiency: 0.92
+  soc_min: 0.2
+  soc_max: 0.8
+
+optimization:
+  horizon_hours: 24
+  timestep_minutes: 15
+  solve_time_limit_seconds: 30.0
+  mip_rel_gap: 0.01
+
+# Example vehicle types
+vehicle_types:
+  bus_large:
+    battery_kwh: 324.0
+    max_charge_kw: 80.0
+  bus_small:
+    battery_kwh: 180.0
+    max_charge_kw: 50.0
+  van:
+    battery_kwh: 100.0
+    max_charge_kw: 50.0
+

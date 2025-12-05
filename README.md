@@ -154,13 +154,60 @@ TLS-specific variables (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_VERIFY_CLIENT`) re
 | Schedules not applied        | Ensure optimization engine is enabled and `send_charging_profile` succeeds|
 | Supabase sync gaps           | Look at `data_sync.py` logs for batched upserts                           |
 
+## Development Environment
+
+### AI-Assisted Development (Cursor IDE)
+
+This project uses Cursor IDE with custom rules for AI-assisted development:
+
+- **Root configuration:** `.cursorrules` - Main AI assistant persona and PRD references
+- **Domain-specific rules:** `.cursor/rules/` - Specialized patterns for optimization, OCPP, and TimescaleDB
+  - `optimization.mdc` - MILP formulation patterns (PRD Section 8)
+  - `ocpp.mdc` - OCPP protocol patterns (PRD Section 9.1)
+  - `timescale.mdc` - TimescaleDB best practices (PRD Section 6)
+
+**Using Cursor:**
+- Reference PRD sections using `@PRD.md#section-name`
+- AI suggestions automatically follow PRD constraints and patterns
+- Domain-specific rules provide detailed implementation guidance
+
+### Git Hooks
+
+**Pre-commit hooks** (via pre-commit framework):
+- Code formatting (black, isort)
+- Linting (ruff)
+- Type checking (mypy)
+- Security checks (bandit)
+
+**Commit message validation:**
+- Enforces conventional commit format: `type(scope): description`
+- Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
+- Scope examples: `optimizer`, `ocpp`, `api`, `db`
+
+**Setup:**
+```bash
+# Install pre-commit hooks
+pre-commit install
+
+# Run hooks manually
+pre-commit run --all-files
+```
+
+### Code Quality
+
+- **Type hints:** Required on all functions
+- **Docstrings:** Google format
+- **Line length:** 100 characters max
+- **Testing:** pytest with ≥80% coverage target
+
 ## Contributing
 
 1. Fork the repository.
 2. Create a feature branch (`git checkout -b feature/my-change`).
 3. Make changes and add tests where feasible.
 4. Run lint/type checks (`black`, `isort`, `mypy`) and relevant pytest suites.
-5. Open a PR describing the change and its impact.
+5. Use conventional commit format for commit messages (enforced by git hooks).
+6. Open a PR describing the change and its impact.
 
 ## License
 

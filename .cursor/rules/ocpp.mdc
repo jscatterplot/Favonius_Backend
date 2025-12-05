@@ -1,0 +1,109 @@
+# OCPP Protocol Rules
+
+## Reference
+Primary reference: PRD.md#9-1-ocpp-integration
+
+## Protocol Versions
+
+- **OCPP 1.6-J**: Primary protocol version (MUST support)
+- **OCPP 2.0.1**: Future-ready (optional for MVP)
+
+Reference: PRD Section 9.1
+
+## Connection Flow
+
+Standard OCPP connection sequence:
+```
+1. Charger connects: ws://platform:9000/{ocpp_id}
+2. Platform sends: BootNotificationResponse (Accepted, interval=300)
+3. Charger sends: StatusNotification (every 5 min)
+4. Charger sends: MeterValues (every 15 sec when charging)
+5. Platform sends: SetChargingProfile (after optimization)
+```
+
+Reference: PRD Section 9.1
+
+## Message Patterns
+
+### BootNotification
+Charger registration message. Always respond with:
+- `status`: "Accepted"
+- `interval`: 300 (5 minutes heartbeat)
+
+### StatusNotification
+Charger status updates. Handle:
+- `connectorId`: Connector identifier
+- `errorCode`: Error status
+- `status`: Current status (Available, Preparing, Charging, etc.)
+
+### MeterValues
+Energy and SoC readings. Extract:
+- `SoC`: State of charge (0-100%, convert to 0.0-1.0)
+- `Power.Active.Import`: Charging power (W, convert to kW)
+- Store in TimescaleDB telemetry table (PRD Section 6.1)
+
+### SetChargingProfile
+Dispatch charging schedule from optimization. Structure:
+```json
+{
+    "connectorId": 1,
+    "csChargingProfiles": {
+        "chargingProfileId": 1,
+        "stackLevel": 0,
+        "chargingProfilePurpose": "TxProfile",
+        "chargingProfileKind": "Absolute",
+        "chargingSchedule": {
+            "chargingRateUnit": "W",
+            "chargingSchedulePeriod": [
+                {"startPeriod": 0, "limit": 80000, "numberPhases": 3},
+                {"startPeriod": 900, "limit": 60000, "numberPhases": 3},
+                {"startPeriod": 1800, "limit": 80000, "numberPhases": 3}
+            ]
+        }
+    }
+}
+```
+
+Reference: PRD Section 9.1
+
+## Charging Profile Conversion
+
+When converting optimization results to OCPP SetChargingProfile:
+- Power in optimization: kW
+- Power in OCPP: W (multiply by 1000)
+- `startPeriod`: seconds from schedule start
+- `limit`: power limit in Watts
+- `numberPhases`: typically 3 for AC charging
+
+## WebSocket Handling
+
+- Use `ocpp` library (mobilityhouse) for OCPP 1.6/2.0.1 support
+- Handle connection lifecycle: connect, disconnect, reconnect
+- Implement heartbeat mechanism (interval=300 seconds)
+- Handle subprotocol negotiation: `ocpp1.6` or `ocpp2.1`
+
+## Error Handling
+
+- Log all OCPP message errors
+- Handle charger disconnections gracefully
+- Retry SetChargingProfile on failure
+- Store command status in `charging_commands` table (PRD Section 6.1)
+
+## Integration with Optimization
+
+After optimization completes:
+1. Convert schedule to SetChargingProfile format
+2. Send to each charger via OCPP
+3. Store command in `charging_commands` table
+4. Monitor for acceptance/rejection
+
+Reference: PRD Section 5.3 (Data Flow)
+
+## Testing
+
+- Test with OCPP simulator (e.g., Steve)
+- Verify all required messages handled
+- Test connection recovery scenarios
+- Validate charging profile dispatch
+
+Reference: PRD Section 11.3 (Integration Test Requirements)

@@ -1,0 +1,42 @@
+# Utility Tariff Configuration Template
+# Example: PG&E E-19 Rate Structure
+
+utility:
+  name: "PG&E"
+  rate_schedule: "E-19"
+  billing_period_days: 30
+
+# Time-of-Use (TOU) Rate Structure
+tou_rates:
+  # Peak period: 4 PM - 9 PM (weekdays)
+  peak:
+    hours: [16, 17, 18, 19, 20]  # 4 PM - 9 PM
+    days: [0, 1, 2, 3, 4]  # Monday - Friday
+    energy_rate_kwh: 0.25  # $/kWh
+    demand_rate_kw: 20.0  # $/kW per month
+
+  # Partial-peak period: 9 AM - 4 PM, 9 PM - 12 AM (weekdays)
+  partial_peak:
+    hours: [9, 10, 11, 12, 13, 14, 15, 21, 22, 23]  # 9 AM - 4 PM, 9 PM - 12 AM
+    days: [0, 1, 2, 3, 4]  # Monday - Friday
+    energy_rate_kwh: 0.15  # $/kWh
+    demand_rate_kw: 20.0  # $/kW per month
+
+  # Off-peak period: All other hours
+  off_peak:
+    energy_rate_kwh: 0.10  # $/kWh
+    demand_rate_kw: 20.0  # $/kW per month
+
+# CAISO Day-Ahead Market (alternative to TOU)
+caiso:
+  enabled: true
+  default_node: "TH_SP15_GEN-APND"
+  fetch_interval_minutes: 15
+  lookahead_hours: 24
+
+# Demand charge calculation
+demand_charge:
+  period_minutes: 15  # 15-minute demand charge period
+  rate_per_kw: 20.0  # $/kW per month
+  reset_monthly: true
+

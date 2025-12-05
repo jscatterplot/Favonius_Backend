@@ -1,32 +1,68 @@
-You are a senior Python developer specializing in energy systems optimization.
+# Favonius Energy Project Rules
 
-Project: Favonius Energy - EV Fleet Depot Optimization Platform
-Tech Stack: Python 3.12, Pyomo, HiGHS, FastAPI, TimescaleDB, OCPP
+This file complements the root `.cursorrules` file and domain-specific rules in this directory.
 
-Key Patterns:
-- Use dataclasses for data models (see src/core/models.py)
+## Project Context
+
+**Project:** Favonius Energy - EV Fleet Depot Optimization Platform
+**Tech Stack:** Python 3.12, Pyomo, HiGHS, FastAPI, TimescaleDB, OCPP 1.6/2.0.1
+
+## Primary References
+
+- **Root rules:** `.cursorrules` - Main AI assistant configuration
+- **PRD:** `PRD.md` - Single source of truth for all specifications
+- **Domain rules:** See `.cursor/rules/optimization.mdc`, `.cursor/rules/ocpp.mdc`, `.cursor/rules/timescale.mdc`
+
+## Key Patterns
+
+- Use dataclasses for data models (see PRD Section 6.2)
 - Use asyncpg for database operations
-- Use Pyomo for optimization modeling
-- Follow the Stanford CarbonFree paper approach for surrogate models
+- Use Pyomo for optimization modeling (see `.cursor/rules/optimization.mdc`)
+- Follow the Stanford CarbonFree paper approach for surrogate models (PRD Section 8.4)
 
-Critical Constraints:
-- Vehicle departure SoC ≥ 99% is a HARD constraint (never relax)
-- Optimization solve time MUST be < 30 seconds
-- OCPP 1.6 is primary protocol version
+## Critical Constraints (HARD REQUIREMENTS)
 
-When implementing optimization:
+These constraints MUST NEVER be relaxed:
+- **Vehicle departure SoC ≥ 99%** - Hard constraint per PRD Section 8.1
+- **Optimization solve time < 30 seconds** - Required per PRD Section 8.3
+- **OCPP 1.6 is primary protocol** - Per PRD Section 9.1
+
+## Implementation Guidelines
+
+### Optimization
 - Reference PRD.md#8-optimization-engine-specifications for formulation
-- Use warm-starting from previous solutions
+- See `.cursor/rules/optimization.mdc` for detailed patterns
+- Use warm-starting from previous solutions (PRD Section 8.3)
 - Log solve time and objective value
 
-When implementing API endpoints:
+### API Endpoints
 - Reference PRD.md#7-api-specifications for contracts
 - Return consistent error formats
 - Include request/response logging
 
-Code Style:
+### OCPP Integration
+- Reference PRD.md#9-1-ocpp-integration for message formats
+- See `.cursor/rules/ocpp.mdc` for protocol patterns
+- OCPP 1.6 primary, 2.0.1 ready
+
+### Database Operations
+- Reference PRD.md#6-data-models for schema
+- See `.cursor/rules/timescale.mdc` for best practices
+- Use hypertables for time-series data
+
+## Code Style
+
 - Type hints required on all functions
 - Docstrings in Google format
-- Max line length: 100---
+- Max line length: 100 characters
+- Use async/await for I/O operations
+
+## Testing
+
+- Unit tests: ≥ 80% coverage for optimizer, ≥ 85% for surrogate model (PRD Section 11.2)
+- Integration tests: Full pipeline validation (PRD Section 11.3)
+- Performance tests: Solve time < 30s for 20 vehicles (PRD Section 8.3)
+
+---
 alwaysApply: true
 ---
