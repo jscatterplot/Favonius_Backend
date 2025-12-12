@@ -105,7 +105,14 @@ def _validate_inputs(state: DepotState, config: DepotConfig) -> None:
 def _compute_tighter_soc_bounds(
     state: DepotState, config: DepotConfig, vehicle_id: str, timestep: int
 ) -> tuple[float, float]:
-    """Compute tighter SoC bounds for a vehicle at a specific timestep.
+    """Compute SoC bounds for a vehicle at a specific timestep.
+
+    Uses conservative default bounds to avoid infeasibility.
+    The departure SoC requirement (0.99) is enforced via a constraint,
+    not through variable bounds.
+
+    Note: We use wide bounds (0.1, 1.0) to allow warm-starting from
+    various solution states without bound conflicts.
 
     Args:
         state: Current depot state
@@ -116,40 +123,10 @@ def _compute_tighter_soc_bounds(
     Returns:
         Tuple of (lower_bound, upper_bound)
     """
-    current_soc = state.vehicle_socs[vehicle_id]
-    capacity = config.vehicle_capacities[vehicle_id]
-    delta_t = config.delta_t
-    charger_power = config.charger_power
-    efficiency = config.charger_efficiency
-
-    # Compute maximum energy that can be consumed by this timestep
-    # (sum of energy requirements up to this point)
-    max_consumption = 0.0
-    if vehicle_id in state.energy_requirements:
-        max_consumption = state.energy_requirements[vehicle_id]
-
-    # Compute maximum energy that can be charged by this timestep
-    # (charger power * efficiency * delta_t * available timesteps)
-    available_timesteps = sum(
-        1
-        for t in range(timestep + 1)
-        if state.vehicle_availability[vehicle_id][t]
-    )
-    max_charge_energy = charger_power * efficiency * delta_t * available_timesteps
-
-    # Lower bound: current SoC minus max consumption
-    lower_bound = max(0.1, current_soc - max_consumption / capacity)
-
-    # Upper bound: current SoC plus max charging
-    upper_bound = min(1.0, current_soc + max_charge_energy / capacity)
-
-    # Account for departure requirement
-    t_depart = state.departure_times.get(vehicle_id)
-    if t_depart is not None and timestep == t_depart:
-        # Must reach at least 0.99 by departure
-        lower_bound = max(lower_bound, 0.99)
-
-    return (lower_bound, upper_bound)
+    # Use conservative default bounds for all timesteps
+    # The initial SoC is enforced via the soc_init_con constraint
+    # The departure SoC is enforced via the departure_soc constraint
+    return (0.1, 1.0)
 
 
 def build_optimization_model(
@@ -290,10 +267,11 @@ def build_optimization_model(
     model.charger_capacity = pyo.Constraint(model.T, rule=charger_capacity_rule)
 
     # Symmetry breaking constraints (performance optimization)
-    # Order charger assignments: if vehicle i < vehicle j (by ID), then
-    # y_charge[i,t] >= y_charge[j,t] when both are available
+    # Only apply when number of vehicles <= number of chargers to avoid infeasibility
+    # When vehicles > chargers, the constraint y_charge[i,t] >= y_charge[j,t] can
+    # force more vehicles to charge than there are chargers available
     vehicle_list = sorted(list(model.B))  # Sort by vehicle ID
-    if len(vehicle_list) > 1:
+    if len(vehicle_list) > 1 and len(vehicle_list) <= config.n_chargers:
         logger.debug("Adding symmetry breaking constraints")
 
         def symmetry_break_rule(m, i_idx, t):
@@ -312,6 +290,11 @@ def build_optimization_model(
 
         model.symmetry_break = pyo.Constraint(
             range(len(vehicle_list) - 1), model.T, rule=symmetry_break_rule
+        )
+    elif len(vehicle_list) > config.n_chargers:
+        logger.debug(
+            f"Skipping symmetry breaking: {len(vehicle_list)} vehicles > "
+            f"{config.n_chargers} chargers"
         )
 
     # Grid power balance
@@ -371,7 +354,7 @@ def build_optimization_model(
 
     logger.info(
         f"Model built: {len(model.B)} vehicles, {len(model.T)} timesteps, "
-        f"{len(model.component_objects(pyo.Constraint))} constraints"
+        f"{len(list(model.component_objects(pyo.Constraint)))} constraints"
     )
 
     return model

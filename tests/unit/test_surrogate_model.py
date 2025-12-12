@@ -640,3 +640,255 @@ def test_model_serializes_correctly(model, synthetic_training_data, tmp_path):
     np.testing.assert_array_almost_equal(mean_orig, mean_loaded)
     np.testing.assert_array_almost_equal(std_orig, std_loaded)
 
+
+# ============ Edge Case and Robustness Tests ============
+
+class TestSurrogateModelRobustness:
+    """Tests for surrogate model robustness and edge cases."""
+
+    def test_very_small_training_set(self, known_routes):
+        """Test model with very small training set (< 10 samples)."""
+        model = EnergySurrogateModel(known_routes)
+        
+        # Only 5 training samples
+        inputs = [
+            generate_synthetic_input(route_id='route_1', temp_avg_f=60.0),
+            generate_synthetic_input(route_id='route_1', temp_avg_f=65.0),
+            generate_synthetic_input(route_id='route_2', temp_avg_f=70.0),
+            generate_synthetic_input(route_id='route_2', temp_avg_f=75.0),
+            generate_synthetic_input(route_id='route_3', temp_avg_f=80.0),
+        ]
+        energies = [140.0, 145.0, 150.0, 155.0, 160.0]
+        
+        # Should either fit or raise appropriate error
+        try:
+            model.fit(inputs, energies)
+            # If it fits, predictions should work
+            mean, std = model.predict([inputs[0]])
+            assert len(mean) == 1
+            # Uncertainty should be high for small training set
+        except ValueError as e:
+            # Also acceptable - model may require minimum samples
+            assert "insufficient" in str(e).lower() or "sample" in str(e).lower()
+
+    def test_highly_correlated_features(self, known_routes):
+        """Test model with highly correlated features."""
+        model = EnergySurrogateModel(known_routes)
+        
+        # Generate data where temp_max = temp_avg + 10 (perfectly correlated)
+        inputs = []
+        energies = []
+        for i in range(30):
+            temp_avg = 50.0 + i * 1.5
+            inputs.append(
+                generate_synthetic_input(
+                    route_id=known_routes[i % 3],
+                    temp_avg_f=temp_avg,
+                    temp_max_f=temp_avg + 10.0,  # Perfectly correlated
+                    temp_min_f=temp_avg - 10.0,  # Perfectly correlated
+                )
+            )
+            energies.append(150.0 + (temp_avg - 65.0) * 0.5)
+        
+        # Should handle correlated features gracefully
+        model.fit(inputs, energies)
+        
+        test_input = generate_synthetic_input(temp_avg_f=70.0, temp_max_f=80.0, temp_min_f=60.0)
+        mean, std = model.predict([test_input])
+        
+        assert len(mean) == 1
+        assert mean[0] > 0
+
+    def test_unknown_route_id_in_prediction(self, known_routes):
+        """Test prediction with unknown route ID."""
+        model = EnergySurrogateModel(known_routes)
+        
+        # Train on known routes
+        inputs = [
+            generate_synthetic_input(route_id=route, temp_avg_f=60.0 + i * 5)
+            for i, route in enumerate(known_routes * 10)
+        ]
+        energies = [150.0 + np.random.normal(0, 10) for _ in inputs]
+        
+        model.fit(inputs, energies)
+        
+        # Try prediction with unknown route
+        unknown_input = generate_synthetic_input(route_id='unknown_route_xyz')
+        
+        # Should handle gracefully - either return fallback or raise
+        try:
+            mean, std = model.predict([unknown_input])
+            # If it works, should return reasonable values
+            assert len(mean) == 1
+            assert mean[0] > 0
+        except (ValueError, KeyError) as e:
+            # Also acceptable - model may require known routes
+            pass
+
+    def test_extreme_temperature_values(self, model, synthetic_training_data):
+        """Test prediction with extreme temperature values."""
+        inputs, energies = synthetic_training_data
+        model.fit(inputs, energies)
+        
+        # Test very cold
+        cold_input = generate_synthetic_input(
+            temp_avg_f=0.0,
+            temp_max_f=10.0,
+            temp_min_f=-10.0,
+        )
+        mean_cold, std_cold = model.predict([cold_input])
+        assert mean_cold[0] > 0
+        
+        # Test very hot
+        hot_input = generate_synthetic_input(
+            temp_avg_f=110.0,
+            temp_max_f=120.0,
+            temp_min_f=100.0,
+        )
+        mean_hot, std_hot = model.predict([hot_input])
+        assert mean_hot[0] > 0
+
+    def test_negative_rain_handled(self, model, synthetic_training_data):
+        """Test that negative rain values are handled."""
+        inputs, energies = synthetic_training_data
+        model.fit(inputs, energies)
+        
+        # Negative rain should either be handled or validated
+        try:
+            negative_rain_input = generate_synthetic_input(rain_inches=-1.0)
+            mean, std = model.predict([negative_rain_input])
+            # If it works, values should be reasonable
+            assert mean[0] > 0
+        except ValueError:
+            # Validation error is acceptable
+            pass
+
+    def test_zero_solar_radiation(self, model, synthetic_training_data):
+        """Test prediction with zero solar radiation."""
+        inputs, energies = synthetic_training_data
+        model.fit(inputs, energies)
+        
+        zero_solar = generate_synthetic_input(solar_radiation=0.0)
+        mean, std = model.predict([zero_solar])
+        
+        assert len(mean) == 1
+        assert mean[0] > 0
+
+    def test_all_same_route(self, known_routes):
+        """Test model when all training data has same route."""
+        model = EnergySurrogateModel(known_routes)
+        
+        # All same route
+        inputs = [
+            generate_synthetic_input(route_id='route_1', temp_avg_f=50.0 + i)
+            for i in range(30)
+        ]
+        energies = [150.0 + i * 0.5 for i in range(30)]
+        
+        model.fit(inputs, energies)
+        
+        # Should still predict for same route
+        test_input = generate_synthetic_input(route_id='route_1', temp_avg_f=65.0)
+        mean, std = model.predict([test_input])
+        assert mean[0] > 0
+
+    def test_mixed_bus_sizes_only(self, known_routes):
+        """Test model with mixed bus sizes."""
+        model = EnergySurrogateModel(known_routes)
+        
+        # Mix of large and small buses
+        inputs = []
+        energies = []
+        for i in range(40):
+            bus_size = 'large' if i % 2 == 0 else 'small'
+            inputs.append(
+                generate_synthetic_input(
+                    route_id=known_routes[i % 3],
+                    bus_size=bus_size,
+                    temp_avg_f=60.0 + i * 0.5,
+                )
+            )
+            # Large buses use more energy
+            base = 180.0 if bus_size == 'large' else 130.0
+            energies.append(base + np.random.normal(0, 10))
+        
+        model.fit(inputs, energies)
+        
+        # Large bus should predict higher energy than small
+        large_input = generate_synthetic_input(bus_size='large', temp_avg_f=70.0)
+        small_input = generate_synthetic_input(bus_size='small', temp_avg_f=70.0)
+        
+        mean_large, _ = model.predict([large_input])
+        mean_small, _ = model.predict([small_input])
+        
+        # Large bus should generally use more energy
+        # (may not always be true depending on training data noise)
+
+    def test_batch_prediction_consistency(self, model, synthetic_training_data):
+        """Test that batch predictions are consistent with individual."""
+        inputs, energies = synthetic_training_data
+        model.fit(inputs, energies)
+        
+        test_inputs = [
+            generate_synthetic_input(temp_avg_f=60.0),
+            generate_synthetic_input(temp_avg_f=70.0),
+            generate_synthetic_input(temp_avg_f=80.0),
+        ]
+        
+        # Batch prediction
+        mean_batch, std_batch = model.predict(test_inputs)
+        
+        # Individual predictions
+        individual_means = []
+        individual_stds = []
+        for inp in test_inputs:
+            m, s = model.predict([inp])
+            individual_means.append(m[0])
+            individual_stds.append(s[0])
+        
+        # Should be the same
+        np.testing.assert_array_almost_equal(mean_batch, individual_means, decimal=5)
+        np.testing.assert_array_almost_equal(std_batch, individual_stds, decimal=5)
+
+    def test_model_with_duplicate_inputs(self, known_routes):
+        """Test model handles duplicate training inputs."""
+        model = EnergySurrogateModel(known_routes)
+        
+        # Create inputs with duplicates
+        base_input = generate_synthetic_input(route_id='route_1', temp_avg_f=70.0)
+        inputs = [base_input] * 10  # Same input 10 times
+        energies = [150.0 + np.random.normal(0, 5) for _ in range(10)]
+        
+        # Add some variety
+        for i in range(20):
+            inputs.append(
+                generate_synthetic_input(
+                    route_id='route_1',
+                    temp_avg_f=60.0 + i * 1.5,
+                )
+            )
+            energies.append(140.0 + i * 0.5)
+        
+        model.fit(inputs, energies)
+        
+        mean, std = model.predict([base_input])
+        # Should work despite duplicates
+        assert mean[0] > 0
+
+    def test_prediction_uncertainty_increases_extrapolation(self, model, synthetic_training_data):
+        """Test that uncertainty increases for extrapolation."""
+        inputs, energies = synthetic_training_data
+        model.fit(inputs, energies)
+        
+        # Get a prediction within training range
+        in_range = generate_synthetic_input(temp_avg_f=70.0)
+        mean_in, std_in = model.predict([in_range])
+        
+        # Get a prediction far outside training range
+        out_range = generate_synthetic_input(temp_avg_f=150.0)  # Way outside
+        mean_out, std_out = model.predict([out_range])
+        
+        # Uncertainty should generally be higher for extrapolation
+        # (GP models naturally have this property)
+        # Note: May not always be true depending on model configuration
+

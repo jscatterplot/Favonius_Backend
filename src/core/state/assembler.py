@@ -27,6 +27,32 @@ class StateAssembler:
     into a DepotState object for the optimization engine.
 
     Reference: PRD Section 5.2, Development plan Step 4.1
+
+    Example:
+        ```python
+        from src.core.models import DepotConfig
+        from src.core.state.assembler import StateAssembler
+        import asyncpg
+
+        # Initialize
+        pool = await asyncpg.create_pool("postgresql://...")
+        config = DepotConfig(
+            vehicle_capacities={'bus_1': 324.0},
+            charger_power=80.0,
+            charger_efficiency=0.95,
+            n_chargers=5,
+            battery_capacity=500.0,
+            battery_power=100.0,
+            max_site_power=800.0,
+        )
+        assembler = StateAssembler(pool, depot_id="depot_123", config=config)
+
+        # Assemble state
+        state = await assembler.get_current_state(horizon_hours=24)
+
+        # Use state for optimization
+        # ...
+        ```
     """
 
     def __init__(
@@ -57,8 +83,18 @@ class StateAssembler:
             DepotState object ready for optimization
 
         Raises:
+            ValueError: If horizon_hours is invalid
             Exception: If database queries fail
         """
+        # Validate horizon
+        if horizon_hours <= 0 or horizon_hours > 48:
+            raise ValueError(
+                f"horizon_hours must be in (0, 48], got {horizon_hours}"
+            )
+
+        import time
+
+        start_time = time.time()
         now = datetime.utcnow()
         horizon_end = now + timedelta(hours=horizon_hours)
         n_steps = int(horizon_hours / self.config.delta_t)
@@ -70,6 +106,29 @@ class StateAssembler:
 
         # Fetch vehicle SoCs from latest telemetry
         vehicle_socs = await self._get_vehicle_socs()
+
+        # Validate vehicle_socs matches config
+        if not vehicle_socs:
+            logger.warning(
+                f"No vehicle SoC data found for depot {self.depot_id}, "
+                "using default SoC for all configured vehicles"
+            )
+            # Use default SoC for all configured vehicles
+            vehicle_socs = {
+                vid: 0.5  # Default SoC
+                for vid in self.config.vehicle_capacities.keys()
+            }
+
+        # Ensure all vehicles in config have SoC data
+        missing_vehicles = set(self.config.vehicle_capacities.keys()) - set(
+            vehicle_socs.keys()
+        )
+        if missing_vehicles:
+            logger.warning(
+                f"Missing SoC for vehicles: {missing_vehicles}, using default 0.5"
+            )
+            for vid in missing_vehicles:
+                vehicle_socs[vid] = 0.5
 
         # Fetch battery SoC
         battery_soc = await self._get_battery_soc()
@@ -104,9 +163,18 @@ class StateAssembler:
             building_power=building_power,
         )
 
+        assembly_time = time.time() - start_time
         logger.info(
             f"State assembled: {len(vehicle_socs)} vehicles, "
-            f"{len(prices)} price points, {len(schedules)} schedules"
+            f"{len(prices)} price points, {len(schedules)} schedules "
+            f"(took {assembly_time:.3f}s)",
+            extra={
+                'depot_id': self.depot_id,
+                'assembly_time_seconds': assembly_time,
+                'n_vehicles': len(vehicle_socs),
+                'n_price_points': len(prices),
+                'n_schedules': len(schedules),
+            },
         )
         return state
 
@@ -115,6 +183,9 @@ class StateAssembler:
 
         Returns:
             Dictionary mapping vehicle_id (str) to SoC (float 0-1)
+
+        Raises:
+            asyncpg.PostgresError: If database query fails
         """
         query = """
         SELECT DISTINCT ON (vehicle_id) 
@@ -124,12 +195,18 @@ class StateAssembler:
         WHERE v.depot_id = $1
         ORDER BY vehicle_id, time DESC
         """
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(query, self.depot_id)
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id)
 
-        result = {str(row['vehicle_id']): float(row['soc']) for row in rows}
-        logger.debug(f"Retrieved SoC for {len(result)} vehicles")
-        return result
+            result = {str(row['vehicle_id']): float(row['soc']) for row in rows}
+            logger.debug(f"Retrieved SoC for {len(result)} vehicles")
+            return result
+        except asyncpg.PostgresError as e:
+            logger.error(
+                f"Database error fetching vehicle SoCs for depot {self.depot_id}: {e}"
+            )
+            raise
 
     async def _get_battery_soc(self) -> float:
         """Get stationary battery SoC.
@@ -138,15 +215,22 @@ class StateAssembler:
             Battery SoC (float 0-1)
 
         Note:
-            For MVP, returns fixed value. Future: query from battery_storage table.
+            For MVP, returns fixed value. Future: query from battery telemetry table.
+            Battery SoC would be tracked in a time-series table similar to vehicle
+            telemetry, or computed from last optimization result's battery_dispatch.
         """
-        # TODO: Query from battery_storage table when implemented
+        # TODO: Query from battery_telemetry table when implemented
+        # For now, could query from optimization_runs to get last known battery state
+        # Or compute from last optimization result's battery_dispatch
+
+        # MVP: return fixed value
+        logger.debug("Using default battery SoC 0.5 (MVP)")
         return 0.5
 
     async def _get_prices(
         self, start: datetime, end: datetime, n_steps: int
     ) -> list[float]:
-        """Get electricity prices for horizon.
+        """Get electricity prices for horizon with proper interpolation.
 
         Args:
             start: Start time
@@ -155,6 +239,13 @@ class StateAssembler:
 
         Returns:
             List of prices in $/kWh, one per timestep
+
+        Note:
+            Handles missing price data by forward-filling from last known price
+            within 1 hour. Falls back to default $0.15/kWh if no data available.
+
+        Raises:
+            asyncpg.PostgresError: If database query fails
         """
         query = """
         SELECT time, energy_kwh as price_per_kwh
@@ -162,22 +253,53 @@ class StateAssembler:
         WHERE depot_id = $1 AND time >= $2 AND time < $3
         ORDER BY time
         """
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(query, self.depot_id, start, end)
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id, start, end)
+        except asyncpg.PostgresError as e:
+            logger.error(
+                f"Database error fetching prices for depot {self.depot_id}: {e}. "
+                "Using default prices."
+            )
+            # Fallback to default prices on database error
+            return [0.15] * n_steps
 
-        # Interpolate to match optimization timesteps
         if not rows:
-            logger.warning("No price data found, using default $0.15/kWh")
+            logger.warning(
+                f"No price data found for depot {self.depot_id} "
+                f"between {start} and {end}, using default $0.15/kWh"
+            )
             return [0.15] * n_steps  # Default price
 
-        # Simplified: use hourly prices, repeat for 15-min steps
-        prices = []
-        for row in rows:
-            price = float(row['price_per_kwh'])
-            # Repeat price for 4 timesteps (1 hour = 4 x 15 min)
-            prices.extend([price] * 4)
+        # Build time-indexed price map
+        price_map = {row['time']: float(row['price_per_kwh']) for row in rows}
 
-        # Trim to exact number of timesteps
+        # Generate prices for each timestep
+        delta_t = timedelta(hours=self.config.delta_t)
+        prices = []
+        last_price = 0.15  # Default fallback
+
+        for t in range(n_steps):
+            step_time = start + t * delta_t
+
+            # Find closest price (exact match or forward-fill)
+            if step_time in price_map:
+                last_price = price_map[step_time]
+            # Forward-fill: use last known price if within 1 hour
+            elif price_map:
+                closest_time = min(
+                    price_map.keys(),
+                    key=lambda x: abs((x - step_time).total_seconds()),
+                )
+                time_diff = abs((closest_time - step_time).total_seconds())
+                if time_diff < 3600:  # Within 1 hour
+                    last_price = price_map[closest_time]
+
+            prices.append(last_price)
+
+        logger.debug(
+            f"Price interpolation: {len(price_map)} price points -> {len(prices)} timesteps"
+        )
         return prices[:n_steps]
 
     async def _get_schedules(
@@ -191,6 +313,9 @@ class StateAssembler:
 
         Returns:
             List of schedule dictionaries
+
+        Raises:
+            asyncpg.PostgresError: If database query fails
         """
         query = """
         SELECT vehicle_id::text, departure_time, return_time, 
@@ -202,12 +327,18 @@ class StateAssembler:
           AND s.departure_time < $3
         ORDER BY departure_time
         """
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(query, self.depot_id, start, end)
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id, start, end)
 
-        schedules = [dict(row) for row in rows]
-        logger.debug(f"Retrieved {len(schedules)} schedules")
-        return schedules
+            schedules = [dict(row) for row in rows]
+            logger.debug(f"Retrieved {len(schedules)} schedules")
+            return schedules
+        except asyncpg.PostgresError as e:
+            logger.error(
+                f"Database error fetching schedules for depot {self.depot_id}: {e}"
+            )
+            raise
 
     def _compute_availability(
         self, schedules: list[dict], start: datetime, n_steps: int
@@ -310,16 +441,32 @@ class StateAssembler:
         return peak
 
     async def _get_demand_charge_rate(self) -> float:
-        """Get demand charge rate ($/kW).
+        """Get demand charge rate ($/kW) from depot configuration.
 
         Returns:
             Demand charge rate in $/kW
 
         Note:
-            For MVP, hardcoded PG&E E-19 rate. Future: query from depot config.
+            Falls back to default $20/kW if depot not found or rate is NULL.
         """
-        # TODO: Query from depots table when demand_charge_rate_kw column exists
-        return 20.0  # $/kW
+        query = """
+        SELECT demand_charge_rate_kw
+        FROM depots
+        WHERE depot_id = $1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, self.depot_id)
+
+        if row and row['demand_charge_rate_kw'] is not None:
+            rate = float(row['demand_charge_rate_kw'])
+            logger.debug(f"Demand charge rate from DB: ${rate}/kW")
+            return rate
+
+        # Fallback to default if not found
+        logger.warning(
+            f"Depot {self.depot_id} not found or rate is NULL, using default $20/kW"
+        )
+        return 20.0  # Default PG&E E-19 rate
 
     async def _get_building_power(
         self, start: datetime, end: datetime, n_steps: int
@@ -339,4 +486,129 @@ class StateAssembler:
         """
         # TODO: Query from building_loads table when implemented
         return [0.0] * n_steps
+
+    @classmethod
+    async def load_depot_config(
+        cls, pool: asyncpg.Pool, depot_id: str | UUID
+    ) -> tuple[DepotConfig, dict[str, str]]:
+        """Load depot configuration from database.
+
+        This is an optional enhancement that allows loading DepotConfig
+        from the database instead of passing it in during initialization.
+
+        Args:
+            pool: Database connection pool
+            depot_id: Depot identifier
+
+        Returns:
+            Tuple of (DepotConfig, vehicle_id_to_ocpp_id mapping)
+
+        Raises:
+            ValueError: If depot not found or configuration is invalid
+
+        Note:
+            This method queries depots, vehicles, chargers, and battery_storage
+            tables to construct a complete DepotConfig object.
+        """
+        depot_id_str = str(depot_id)
+
+        # Query depot configuration
+        depot_query = """
+        SELECT max_grid_kw, demand_charge_rate_kw
+        FROM depots
+        WHERE depot_id = $1
+        """
+        async with pool.acquire() as conn:
+            depot_row = await conn.fetchrow(depot_query, depot_id_str)
+
+        if not depot_row:
+            raise ValueError(f"Depot {depot_id_str} not found")
+
+        max_site_power = float(depot_row['max_grid_kw'])
+
+        # Query vehicles
+        vehicles_query = """
+        SELECT vehicle_id::text, battery_kwh, max_charge_kw, ocpp_id
+        FROM vehicles
+        WHERE depot_id = $1
+        """
+        async with pool.acquire() as conn:
+            vehicle_rows = await conn.fetch(vehicles_query, depot_id_str)
+
+        if not vehicle_rows:
+            raise ValueError(f"No vehicles found for depot {depot_id_str}")
+
+        vehicle_capacities = {}
+        vehicle_to_ocpp = {}
+        for row in vehicle_rows:
+            vid = row['vehicle_id']
+            vehicle_capacities[vid] = float(row['battery_kwh'])
+            if row['ocpp_id']:
+                vehicle_to_ocpp[vid] = row['ocpp_id']
+
+        # Query chargers
+        chargers_query = """
+        SELECT rated_kw, efficiency
+        FROM chargers
+        WHERE depot_id = $1
+        ORDER BY rated_kw DESC
+        LIMIT 1
+        """
+        async with pool.acquire() as conn:
+            charger_row = await conn.fetchrow(chargers_query, depot_id_str)
+
+        if charger_row:
+            charger_power = float(charger_row['rated_kw'])
+            charger_efficiency = float(charger_row['efficiency'])
+        else:
+            # Defaults if no chargers found
+            logger.warning(f"No chargers found for depot {depot_id_str}, using defaults")
+            charger_power = 80.0
+            charger_efficiency = 0.95
+
+        # Count chargers
+        n_chargers_query = """
+        SELECT COUNT(*) as count
+        FROM chargers
+        WHERE depot_id = $1
+        """
+        async with pool.acquire() as conn:
+            n_chargers_row = await conn.fetchrow(n_chargers_query, depot_id_str)
+        n_chargers = int(n_chargers_row['count']) if n_chargers_row else 0
+
+        # Query battery storage
+        battery_query = """
+        SELECT capacity_kwh, max_power_kw
+        FROM battery_storage
+        WHERE depot_id = $1
+        LIMIT 1
+        """
+        async with pool.acquire() as conn:
+            battery_row = await conn.fetchrow(battery_query, depot_id_str)
+
+        if battery_row:
+            battery_capacity = float(battery_row['capacity_kwh'])
+            battery_power = float(battery_row['max_power_kw'])
+        else:
+            # Defaults if no battery found
+            logger.warning(f"No battery storage found for depot {depot_id_str}, using defaults")
+            battery_capacity = 0.0
+            battery_power = 0.0
+
+        config = DepotConfig(
+            vehicle_capacities=vehicle_capacities,
+            charger_power=charger_power,
+            charger_efficiency=charger_efficiency,
+            n_chargers=n_chargers,
+            battery_capacity=battery_capacity,
+            battery_power=battery_power,
+            max_site_power=max_site_power,
+        )
+
+        logger.info(
+            f"Loaded depot config: {len(vehicle_capacities)} vehicles, "
+            f"{n_chargers} chargers, {battery_capacity} kWh battery"
+        )
+
+        return config, vehicle_to_ocpp
 

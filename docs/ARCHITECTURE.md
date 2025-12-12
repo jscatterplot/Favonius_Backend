@@ -66,6 +66,7 @@ This document is extracted from the Product Requirements Document. For the autho
 │  Price change               │ > 25% AND > $25/MWh                   │
 │  Vehicle return time        │ > 15 minutes                          │
 │  Scheduled (default)        │ Hourly 7AM-11PM                       │
+│  Cooldown period            │ 5 minutes (prevents rapid re-opt)     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -111,6 +112,8 @@ This document is extracted from the Product Requirements Document. For the autho
 - Compare: actual SoC vs. expected SoC
 - Compare: current prices vs. baseline prices
 - Trigger: re-optimization if thresholds exceeded
+- Cooldown: 5-minute minimum between triggers to prevent rapid re-optimization
+- Logging: All trigger events logged with context for analysis
 
 ## Implementation Structure
 
@@ -118,7 +121,7 @@ The codebase is organized as follows:
 
 - `src/core/optimizer/` - MILP optimization engine
 - `src/core/surrogate/` - Energy consumption model
-- `src/core/state/` - State assembler
+- `src/core/state/` - State assembler and trigger monitor
 - `src/adapters/ocpp/` - OCPP client/server
 - `src/adapters/caiso/` - CAISO price feeds
 - `src/adapters/weather/` - Weather API integration

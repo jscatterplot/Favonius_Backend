@@ -12,6 +12,7 @@ AND new schedule shifts charging away from high-price period
 import pytest
 import asyncio
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock, AsyncMock
 
 from src.core.models import DepotConfig, DepotState
 from src.core.optimizer import optimize
@@ -102,7 +103,13 @@ class TestAT03PriceSpikeReoptimization:
             price_change_percent=0.25,  # 25%
             price_change_absolute=25.0,  # $25/MWh
         )
-        monitor = TriggerMonitor(config, on_trigger)
+        
+        # Create mock assembler for TriggerMonitor
+        mock_assembler = MagicMock()
+        mock_assembler.config = MagicMock()
+        mock_assembler.config.delta_t = 0.25
+        
+        monitor = TriggerMonitor(config, on_trigger, assembler=mock_assembler)
 
         # Run initial optimization
         initial_result = optimize(initial_state, depot_config, time_limit=30.0)

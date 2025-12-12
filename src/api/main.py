@@ -3,18 +3,26 @@
 Reference: PRD.md#7-api-specifications
 """
 
+import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import Message
+from pydantic import BaseModel, Field, field_validator
 
 from ..core.controller import DepotController
+from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.state.assembler import StateAssembler
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -25,14 +33,95 @@ logger = logging.getLogger(__name__)
 # Database connection pool
 db_pool: Optional[asyncpg.Pool] = None
 
-# Depot controllers cache
-depot_controllers: dict[str, DepotController] = {}
+
+# ============ Input Validation Utilities ============
+
+def validate_uuid(value: str, field_name: str = "id") -> str:
+    """Validate UUID format.
+
+    Args:
+        value: String to validate
+        field_name: Name of the field for error messages
+
+    Returns:
+        Validated UUID string
+
+    Raises:
+        HTTPException 400: If value is not a valid UUID
+    """
+    try:
+        UUID(value)
+        return value
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name}: must be valid UUID format, got: {value}"
+        )
+
+
+def validate_depot_id(depot_id: str) -> str:
+    """Validate depot_id is a valid UUID.
+
+    Args:
+        depot_id: Depot identifier to validate
+
+    Returns:
+        Validated depot_id
+
+    Raises:
+        HTTPException 400: If depot_id is not a valid UUID
+    """
+    return validate_uuid(depot_id, "depot_id")
+
+
+def validate_vehicle_id(vehicle_id: str) -> str:
+    """Validate vehicle_id is a valid UUID.
+
+    Args:
+        vehicle_id: Vehicle identifier to validate
+
+    Returns:
+        Validated vehicle_id
+
+    Raises:
+        HTTPException 400: If vehicle_id is not a valid UUID
+    """
+    return validate_uuid(vehicle_id, "vehicle_id")
+
+
+def validate_horizon_hours(horizon_hours: int) -> int:
+    """Validate horizon_hours is in valid range.
+
+    Args:
+        horizon_hours: Horizon hours to validate
+
+    Returns:
+        Validated horizon_hours
+
+    Raises:
+        HTTPException 400: If horizon_hours is out of range
+    """
+    if not (1 <= horizon_hours <= 48):
+        raise HTTPException(
+            status_code=400,
+            detail=f"horizon_hours must be between 1 and 48, got: {horizon_hours}"
+        )
+    return horizon_hours
+
+# Controller manager and OCPP server
+controller_manager: Optional[ControllerManager] = None
+ocpp_server: Optional[object] = None  # OCPPServer type
+
+# Depot config cache (to reduce database queries)
+_depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (config, timestamp)
+_config_cache_ttl: float = 300.0  # 5 minutes
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global db_pool
+    global db_pool, controller_manager, ocpp_server
+    
     # Initialize database connection pool
     database_url = os.getenv(
         'DATABASE_URL',
@@ -44,9 +133,77 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize database pool: {e}")
         db_pool = None
+        yield
+        return
+
+    # Initialize OCPP server (if enabled)
+    ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
+    if ocpp_enabled and db_pool:
+        try:
+            from ..adapters.ocpp.server import OCPPServer
+            
+            ocpp_host = os.getenv("OCPP_SERVER_HOST", "0.0.0.0")
+            ocpp_port = int(os.getenv("OCPP_SERVER_PORT", "9000"))
+            
+            ocpp_server = OCPPServer(
+                host=ocpp_host,
+                port=ocpp_port,
+                pool=db_pool,
+            )
+            
+            # Start OCPP server in background
+            # Note: OCPPServer.start() runs forever, so we start it as a background task
+            async def run_ocpp_server():
+                try:
+                    await ocpp_server.start()
+                except Exception as e:
+                    logger.error(f"OCPP server error: {e}", exc_info=True)
+            
+            ocpp_task = asyncio.create_task(run_ocpp_server())
+            logger.info(f"OCPP server starting on {ocpp_host}:{ocpp_port}")
+        except Exception as e:
+            logger.error(f"Failed to start OCPP server: {e}", exc_info=True)
+            ocpp_server = None
+
+    # Initialize controller manager
+    if db_pool:
+        try:
+            controller_manager = ControllerManager(
+                pool=db_pool,
+                ocpp_server=ocpp_server,
+            )
+            
+            # Start all controllers
+            await controller_manager.start_all_controllers()
+            logger.info("Controller manager initialized and controllers started")
+        except Exception as e:
+            logger.error(
+                f"Failed to initialize controller manager: {e}",
+                exc_info=True
+            )
+            controller_manager = None
 
     yield
 
+    # Graceful shutdown
+    logger.info("Shutting down application...")
+    
+    # Stop all controllers
+    if controller_manager:
+        try:
+            await controller_manager.stop_all_controllers()
+            logger.info("All controllers stopped")
+        except Exception as e:
+            logger.error(f"Error stopping controllers: {e}", exc_info=True)
+    
+    # Stop OCPP server
+    if ocpp_server:
+        try:
+            await ocpp_server.stop()
+            logger.info("OCPP server stopped")
+        except Exception as e:
+            logger.error(f"Error stopping OCPP server: {e}", exc_info=True)
+    
     # Close database connection pool
     if db_pool:
         await db_pool.close()
@@ -56,122 +213,579 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Favonius Energy API",
     version="0.1.0",
-    description="EV Fleet Depot Optimization Platform API",
+    description="""
+    EV Fleet Depot Optimization Platform API
+    
+    This API provides endpoints for:
+    - Charging schedule optimization
+    - Depot state queries
+    - Inter-depot vehicle handoff
+    - System health monitoring
+    
+    Reference: PRD.md#7-api-specifications
+    """,
     lifespan=lifespan,
+    tags_metadata=[
+        {
+            "name": "optimization",
+            "description": "Charging schedule optimization operations. Generate optimal charging schedules to minimize electricity costs while ensuring vehicles are ready for departure.",
+        },
+        {
+            "name": "depots",
+            "description": "Depot state and schedule queries. Get current state of depots, vehicle SoCs, and active charging schedules.",
+        },
+        {
+            "name": "health",
+            "description": "System health and monitoring endpoints. Check API and component health status.",
+        },
+    ],
+)
+
+# Add logging middleware
+app.add_middleware(LoggingMiddleware)
+
+# Add CORS middleware
+cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins if "*" not in cors_origins else ["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
 class OptimizationRequest(BaseModel):
-    """Request to run optimization."""
+    """Request to run optimization.
 
-    depot_id: str
-    horizon_hours: int = 24
-    force: bool = False
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """
+
+    depot_id: str = Field(
+        ...,
+        description="Depot identifier (UUID format)",
+        examples=["550e8400-e29b-41d4-a716-446655440000"]
+    )
+    horizon_hours: int = Field(
+        default=24,
+        ge=1,
+        le=48,
+        description="Optimization horizon in hours (1-48)",
+        examples=[24]
+    )
+    force: bool = Field(
+        default=False,
+        description="Force re-optimization even if recent schedule exists"
+    )
+
+    @field_validator('depot_id')
+    @classmethod
+    def validate_depot_id(cls, v: str) -> str:
+        """Validate depot_id is a valid UUID."""
+        try:
+            UUID(v)
+            return v
+        except ValueError:
+            raise ValueError(f"depot_id must be a valid UUID, got: {v}")
 
 
 class OptimizationResponse(BaseModel):
-    """Optimization result response."""
+    """Optimization result response.
 
-    run_id: str
-    depot_id: str
-    status: str
-    objective_value: float
-    solve_time_seconds: float
-    peak_demand_kw: float
-    schedule: dict
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """
+
+    run_id: str = Field(..., description="Optimization run identifier (UUID)")
+    depot_id: str = Field(..., description="Depot identifier (UUID)")
+    status: str = Field(..., description="Optimization status (e.g., 'completed')")
+    objective_value: float = Field(..., description="Optimized objective value ($)")
+    solve_time_seconds: float = Field(..., ge=0, description="Solver execution time (seconds)")
+    peak_demand_kw: float = Field(..., ge=0, description="Peak demand in kW")
+    schedule: dict = Field(
+        ...,
+        description="Charging schedule per vehicle",
+        examples=[{
+            "bus_1": {
+                "charging_power": [0, 0, 80, 80],
+                "soc": [0.3, 0.3, 0.35, 0.40]
+            }
+        }]
+    )
 
 
 class DepotStateResponse(BaseModel):
-    """Depot state response."""
+    """Depot state response.
 
-    depot_id: str
-    timestamp: str
-    vehicle_socs: dict[str, float]
-    battery_soc: float
-    current_month_peak_kw: float
-    current_price_kwh: float
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """
+
+    depot_id: str = Field(..., description="Depot identifier (UUID)")
+    timestamp: str = Field(
+        ...,
+        description="Timestamp in ISO 8601 format",
+        examples=["2025-12-04T10:00:00Z"]
+    )
+    vehicle_socs: dict[str, float] = Field(
+        ...,
+        description="Vehicle state of charge (0.0-1.0) by vehicle_id"
+    )
+    battery_soc: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Stationary battery state of charge (0.0-1.0)"
+    )
+    current_month_peak_kw: float = Field(
+        ...,
+        ge=0.0,
+        description="Current month peak demand (kW)"
+    )
+    current_price_kwh: float = Field(
+        ...,
+        ge=0.0,
+        description="Current electricity price ($/kWh)"
+    )
 
 
 class ScheduleResponse(BaseModel):
-    """Schedule response."""
+    """Schedule response.
 
-    depot_id: str
-    run_id: str
-    generated_at: str
-    horizon_start: str
-    horizon_end: str
-    schedule: dict
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """
+
+    depot_id: str = Field(..., description="Depot identifier (UUID)")
+    run_id: str = Field(..., description="Optimization run identifier (UUID)")
+    generated_at: str = Field(
+        ...,
+        description="Schedule generation timestamp (ISO 8601)",
+        examples=["2025-12-04T09:00:00Z"]
+    )
+    horizon_start: str = Field(
+        ...,
+        description="Optimization horizon start (ISO 8601)",
+        examples=["2025-12-04T09:00:00Z"]
+    )
+    horizon_end: str = Field(
+        ...,
+        description="Optimization horizon end (ISO 8601)",
+        examples=["2025-12-05T09:00:00Z"]
+    )
+    schedule: dict = Field(
+        ...,
+        description="Charging schedule per vehicle"
+    )
 
 
 class HandoffRequest(BaseModel):
-    """Inter-depot handoff request."""
+    """Inter-depot handoff request.
 
-    dest_depot_id: str
-    expected_soc: float
-    arrival_time: datetime
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """
+
+    dest_depot_id: str = Field(
+        ...,
+        description="Destination depot identifier (UUID)",
+        examples=["550e8400-e29b-41d4-a716-446655440000"]
+    )
+    expected_soc: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Expected state of charge at arrival (0.0-1.0)"
+    )
+    arrival_time: datetime = Field(
+        ...,
+        description="Expected arrival time (ISO 8601)",
+        examples=["2025-12-04T14:30:00Z"]
+    )
+
+    @field_validator('dest_depot_id')
+    @classmethod
+    def validate_dest_depot_id(cls, v: str) -> str:
+        """Validate dest_depot_id is a valid UUID."""
+        try:
+            UUID(v)
+            return v
+        except ValueError:
+            raise ValueError(f"dest_depot_id must be a valid UUID, got: {v}")
 
 
 class HandoffResponse(BaseModel):
-    """Inter-depot handoff response."""
+    """Inter-depot handoff response.
 
-    message_id: str
-    status: str
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """
+
+    message_id: str = Field(..., description="Handoff message identifier (UUID)")
+    status: str = Field(..., description="Message status (e.g., 'sent')")
+
+
+class ErrorResponse(BaseModel):
+    """Error response model matching PRD format."""
+
+    detail: str = Field(..., description="Error message")
+    error_code: Optional[str] = Field(None, description="Error code for programmatic handling")
+    timestamp: str = Field(..., description="Error timestamp (ISO 8601)")
+
+
+# ============ Custom Exceptions ============
+
+class DepotNotFoundError(ValueError):
+    """Raised when depot is not found in database."""
+
+    pass
+
+
+class OptimizationError(Exception):
+    """Raised when optimization fails."""
+
+    pass
+
+
+class DatabaseError(Exception):
+    """Raised when database operation fails."""
+
+    pass
+
+
+# ============ Exception Handlers ============
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Handle Pydantic validation errors."""
+    errors = exc.errors()
+    error_details = "; ".join(
+        f"{err['loc']}: {err['msg']}" for err in errors
+    )
+    logger.warning(f"Validation error on {request.url.path}: {error_details}")
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=ErrorResponse(
+            detail=f"Validation error: {error_details}",
+            error_code="VALIDATION_ERROR",
+            timestamp=datetime.utcnow().isoformat(),
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
+    """Handle ValueError exceptions (e.g., invalid UUID, depot not found)."""
+    error_msg = str(exc)
+    if "not found" in error_msg.lower() or isinstance(exc, DepotNotFoundError):
+        status_code = status.HTTP_404_NOT_FOUND
+        error_code = "DEPOT_NOT_FOUND"
+    else:
+        status_code = status.HTTP_400_BAD_REQUEST
+        error_code = "INVALID_INPUT"
+
+    logger.warning(f"ValueError on {request.url.path}: {error_msg}")
+    return JSONResponse(
+        status_code=status_code,
+        content=ErrorResponse(
+            detail=error_msg,
+            error_code=error_code,
+            timestamp=datetime.utcnow().isoformat(),
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(OptimizationError)
+async def optimization_error_handler(
+    request: Request, exc: OptimizationError
+) -> JSONResponse:
+    """Handle optimization failures."""
+    error_msg = str(exc)
+    logger.error(f"Optimization error on {request.url.path}: {error_msg}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=ErrorResponse(
+            detail=f"Optimization failed: {error_msg}",
+            error_code="OPTIMIZATION_ERROR",
+            timestamp=datetime.utcnow().isoformat(),
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(DatabaseError)
+async def database_error_handler(
+    request: Request, exc: DatabaseError
+) -> JSONResponse:
+    """Handle database operation failures."""
+    error_msg = str(exc)
+    logger.error(f"Database error on {request.url.path}: {error_msg}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=ErrorResponse(
+            detail=f"Database error: {error_msg}",
+            error_code="DATABASE_ERROR",
+            timestamp=datetime.utcnow().isoformat(),
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(asyncpg.PostgresError)
+async def postgres_error_handler(
+    request: Request, exc: asyncpg.PostgresError
+) -> JSONResponse:
+    """Handle PostgreSQL-specific errors."""
+    logger.error(f"PostgreSQL error on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=ErrorResponse(
+            detail="Database operation failed",
+            error_code="DATABASE_ERROR",
+            timestamp=datetime.utcnow().isoformat(),
+        ).model_dump(),
+    )
+
+
+# ============ Logging Middleware ============
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware to log all requests and responses."""
+
+    async def dispatch(self, request: Request, call_next):
+        """Process request and log details."""
+        start_time = time.time()
+
+        # Log request
+        logger.info(
+            "Incoming request",
+            extra={
+                "method": request.method,
+                "path": str(request.url.path),
+                "query_params": dict(request.query_params),
+                "client": request.client.host if request.client else None,
+            }
+        )
+
+        # Process request
+        try:
+            response = await call_next(request)
+            process_time = time.time() - start_time
+
+            # Log response (exclude sensitive endpoints)
+            if request.url.path not in ["/metrics", "/health"]:
+                logger.info(
+                    "Request completed",
+                    extra={
+                        "method": request.method,
+                        "path": str(request.url.path),
+                        "status_code": response.status_code,
+                        "process_time": f"{process_time:.3f}s",
+                    }
+                )
+            else:
+                # Log health/metrics with less detail
+                logger.debug(
+                    f"{request.method} {request.url.path} - {response.status_code} "
+                    f"({process_time:.3f}s)"
+                )
+
+            return response
+
+        except Exception as e:
+            process_time = time.time() - start_time
+            logger.error(
+                "Request failed",
+                extra={
+                    "method": request.method,
+                    "path": str(request.url.path),
+                    "error": str(e),
+                    "process_time": f"{process_time:.3f}s",
+                },
+                exc_info=True,
+            )
+            raise
 
 
 async def _get_depot_config(depot_id: str) -> DepotConfig:
     """Get depot configuration from database.
 
+    Uses StateAssembler.load_depot_config() to query depots, vehicles,
+    chargers, and battery_storage tables. Implements caching to reduce
+    database queries.
+
     Args:
-        depot_id: Depot identifier
+        depot_id: Depot identifier (must be valid UUID)
 
     Returns:
         DepotConfig object
 
     Raises:
-        HTTPException: If depot not found or config invalid
+        HTTPException 404: If depot not found
+        HTTPException 500: If configuration is invalid
+        HTTPException 503: If database is not available
     """
     if not db_pool:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    # For MVP: Use default config or fetch from database
-    # TODO: Query from depots, vehicles, chargers, battery_storage tables
-    # For now, return a default config
-    return DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-        charger_power=80.0,
-        charger_efficiency=0.95,
-        n_chargers=10,
-        battery_capacity=500.0,
-        battery_power=100.0,
-        max_site_power=800.0,
+    # Check cache first
+    current_time = time.time()
+    if depot_id in _depot_config_cache:
+        config, cache_time = _depot_config_cache[depot_id]
+        if current_time - cache_time < _config_cache_ttl:
+            logger.debug(f"Using cached config for depot {depot_id}")
+            return config
+        else:
+            # Cache expired, remove it
+            del _depot_config_cache[depot_id]
+
+    try:
+        # Load from database using StateAssembler
+        config, _ = await StateAssembler.load_depot_config(db_pool, depot_id)
+
+        # Validate minimum requirements
+        if not config.vehicle_capacities:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Depot {depot_id} has no vehicles configured"
+            )
+        if config.n_chargers == 0:
+            logger.warning(
+                f"Depot {depot_id} has no chargers configured, "
+                "optimization may fail"
+            )
+
+        # Cache the config
+        _depot_config_cache[depot_id] = (config, current_time)
+        logger.info(
+            f"Loaded depot config for {depot_id}: "
+            f"{len(config.vehicle_capacities)} vehicles, "
+            f"{config.n_chargers} chargers"
+        )
+
+        return config
+
+    except ValueError as e:
+        # Depot not found or invalid configuration
+        error_msg = str(e)
+        if "not found" in error_msg.lower():
+            logger.warning(f"Depot not found: {depot_id}")
+            raise HTTPException(status_code=404, detail=error_msg)
+        else:
+            logger.error(f"Invalid depot configuration: {error_msg}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid depot configuration: {error_msg}"
+            )
+    except Exception as e:
+        logger.error(f"Failed to load depot config: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load depot configuration: {str(e)}"
     )
 
 
-@app.post("/optimize", response_model=OptimizationResponse)
+@app.post(
+    "/optimize",
+    response_model=OptimizationResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["optimization"],
+    summary="Trigger depot charging optimization",
+    description="""
+    Trigger optimization for a depot to generate charging schedules.
+    
+    **Request:**
+    - `depot_id`: Depot identifier (UUID)
+    - `horizon_hours`: Optimization horizon (1-48 hours, default 24)
+    - `force`: Force re-optimization even if recent schedule exists
+    
+    **Response:**
+    - `run_id`: Optimization run identifier
+    - `status`: Optimization status (e.g., 'completed')
+    - `objective_value`: Optimized objective value ($)
+    - `solve_time_seconds`: Solver execution time
+    - `peak_demand_kw`: Peak demand in kW
+    - `schedule`: Charging schedule per vehicle
+    
+    **Error Codes:**
+    - 400: Invalid request (missing depot_id, invalid horizon_hours)
+    - 404: Depot not found
+    - 500: Optimization failed (infeasible, timeout)
+    - 503: Database not available
+    
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid request"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        500: {"model": ErrorResponse, "description": "Optimization failed"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
 async def run_optimization(request: OptimizationRequest):
     """Trigger depot charging optimization.
 
     Reference: PRD.md#7-1-rest-api-endpoints
     """
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise DatabaseError("Database not available")
+
+    # Input validation (Pydantic handles most, but we add explicit checks)
+    validate_depot_id(request.depot_id)
+    validate_horizon_hours(request.horizon_hours)
+
+    # Log optimization request
+    logger.info(
+        "Optimization request",
+        extra={
+            "depot_id": request.depot_id,
+            "horizon_hours": request.horizon_hours,
+            "force": request.force,
+        }
+    )
 
     try:
-        # Get depot config
+        # Get depot config (raises 404 if depot not found)
         config = await _get_depot_config(request.depot_id)
 
-        # Get or create controller
-        if request.depot_id not in depot_controllers:
-            depot_controllers[request.depot_id] = DepotController(
-                pool=db_pool,
-                depot_id=request.depot_id,
-                config=config,
+        # Validate depot has vehicles
+        if not config.vehicle_capacities:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Depot {request.depot_id} has no vehicles configured"
             )
 
-        controller = depot_controllers[request.depot_id]
+        # Get or create controller from manager
+        if not controller_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Controller manager not initialized"
+            )
+        
+        controller = await controller_manager.get_or_create_controller(
+            request.depot_id
+        )
 
         # Run optimization
+        try:
         result = await controller.run_optimization("api_request")
+        except Exception as opt_error:
+            # Handle optimization-specific errors
+            error_msg = str(opt_error)
+            if "timeout" in error_msg.lower() or "time limit" in error_msg.lower():
+                raise OptimizationError(f"Optimization timeout: {error_msg}")
+            elif "infeasible" in error_msg.lower():
+                raise OptimizationError(f"Optimization infeasible: {error_msg}")
+            else:
+                raise OptimizationError(f"Optimization failed: {error_msg}")
+
+        # Log optimization result
+        logger.info(
+            "Optimization completed",
+            extra={
+                "depot_id": request.depot_id,
+                "run_id": str(result.run_id),
+                "objective_value": result.objective_value,
+                "solve_time": result.solve_time,
+                "peak_demand": result.peak_demand,
+            }
+        )
 
         return OptimizationResponse(
             run_id=str(result.run_id),
@@ -183,50 +797,159 @@ async def run_optimization(request: OptimizationRequest):
             schedule=result.schedule,
         )
 
+    except HTTPException:
+        # Re-raise HTTP exceptions (already properly formatted)
+        raise
+    except ValueError as e:
+        # Depot not found or invalid configuration
+        error_msg = str(e)
+        if "not found" in error_msg.lower():
+            raise DepotNotFoundError(error_msg)
+        raise ValueError(error_msg)
+    except OptimizationError:
+        # Re-raise optimization errors (handled by exception handler)
+        raise
     except Exception as e:
-        logger.error(f"Optimization failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Unexpected errors
+        logger.error(
+            f"Unexpected error in optimization: {e}",
+            exc_info=True,
+            extra={"depot_id": request.depot_id}
+        )
+        raise OptimizationError(f"Unexpected error: {str(e)}")
 
 
-@app.get("/depots/{depot_id}/state", response_model=DepotStateResponse)
+@app.get(
+    "/depots/{depot_id}/state",
+    response_model=DepotStateResponse,
+    tags=["depots"],
+    summary="Get current depot state",
+    description="""
+    Get current state of a depot including vehicle SoCs, battery state,
+    current month peak demand, and current electricity price.
+    
+    **Response:**
+    - `depot_id`: Depot identifier
+    - `timestamp`: Current timestamp (ISO 8601)
+    - `vehicle_socs`: Vehicle state of charge by vehicle_id (0.0-1.0)
+    - `battery_soc`: Stationary battery state of charge (0.0-1.0)
+    - `current_month_peak_kw`: Current month peak demand (kW)
+    - `current_price_kwh`: Current electricity price ($/kWh)
+    
+    **Error Codes:**
+    - 404: Depot not found
+    - 500: Server error
+    - 503: Database not available
+    
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """,
+    responses={
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
 async def get_depot_state(depot_id: str):
     """Get current depot state.
 
     Reference: PRD.md#7-1-rest-api-endpoints
     """
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise DatabaseError("Database not available")
+
+    # Validate depot_id format
+    validate_depot_id(depot_id)
 
     try:
+        # Get depot config (raises 404 if depot not found)
         config = await _get_depot_config(depot_id)
+
+        # Assemble state
         assembler = StateAssembler(db_pool, depot_id, config)
         state = await assembler.get_current_state(24)
 
-        # Get current price (first timestep)
+        # Get current price (first timestep) or default
         current_price = state.prices[0] if state.prices else 0.15
+
+        # Handle empty state gracefully
+        vehicle_socs = state.vehicle_socs if state.vehicle_socs else {}
+
+        logger.debug(
+            f"Retrieved depot state for {depot_id}: "
+            f"{len(vehicle_socs)} vehicles, "
+            f"peak: {state.current_month_peak} kW, "
+            f"price: ${current_price:.3f}/kWh"
+        )
 
         return DepotStateResponse(
             depot_id=depot_id,
             timestamp=datetime.utcnow().isoformat(),
-            vehicle_socs=state.vehicle_socs,
+            vehicle_socs=vehicle_socs,
             battery_soc=state.battery_soc,
             current_month_peak_kw=state.current_month_peak,
             current_price_kwh=current_price,
         )
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except ValueError as e:
+        # Depot not found
+        error_msg = str(e)
+        if "not found" in error_msg.lower():
+            raise DepotNotFoundError(error_msg)
+        raise ValueError(error_msg)
     except Exception as e:
-        logger.error(f"Failed to get depot state: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            f"Failed to get depot state: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id}
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get depot state: {str(e)}"
+        )
 
 
-@app.get("/depots/{depot_id}/schedule", response_model=ScheduleResponse)
+@app.get(
+    "/depots/{depot_id}/schedule",
+    response_model=ScheduleResponse,
+    tags=["depots"],
+    summary="Get current charging schedule",
+    description="""
+    Get the most recent charging schedule for a depot.
+    
+    **Response:**
+    - `depot_id`: Depot identifier
+    - `run_id`: Optimization run identifier
+    - `generated_at`: Schedule generation timestamp (ISO 8601)
+    - `horizon_start`: Optimization horizon start (ISO 8601)
+    - `horizon_end`: Optimization horizon end (ISO 8601)
+    - `schedule`: Charging schedule per vehicle
+    
+    **Error Codes:**
+    - 404: No schedule found for depot
+    - 500: Server error
+    - 503: Database not available
+    
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """,
+    responses={
+        404: {"model": ErrorResponse, "description": "No schedule found"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
 async def get_depot_schedule(depot_id: str):
     """Get current charging schedule.
 
     Reference: PRD.md#7-1-rest-api-endpoints
     """
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise DatabaseError("Database not available")
+
+    # Validate depot_id format
+    validate_depot_id(depot_id)
 
     try:
         # Get latest optimization result from database
@@ -241,29 +964,102 @@ async def get_depot_schedule(depot_id: str):
             row = await conn.fetchrow(query, depot_id)
 
         if not row:
+            logger.info(f"No schedule found for depot {depot_id}")
             raise HTTPException(
-                status_code=404, detail="No schedule found for depot"
+                status_code=404,
+                detail=f"No schedule found for depot {depot_id}"
+            )
+
+        # Validate schedule JSON structure
+        schedule_json = row['schedule_json']
+        if not isinstance(schedule_json, dict):
+            logger.warning(
+                f"Invalid schedule JSON structure for depot {depot_id}: "
+                f"expected dict, got {type(schedule_json)}"
+            )
+            # Still return it, but log the warning
+
+        # Ensure timestamps are properly formatted
+        generated_at = row['run_time']
+        horizon_start = row['horizon_start']
+        horizon_end = row['horizon_end']
+
+        if not isinstance(generated_at, datetime):
+            raise ValueError("Invalid run_time format in database")
+        if not isinstance(horizon_start, datetime):
+            raise ValueError("Invalid horizon_start format in database")
+        if not isinstance(horizon_end, datetime):
+            raise ValueError("Invalid horizon_end format in database")
+
+        logger.debug(
+            f"Retrieved schedule for depot {depot_id}: "
+            f"run_id={row['run_id']}, "
+            f"generated_at={generated_at.isoformat()}"
             )
 
         return ScheduleResponse(
             depot_id=depot_id,
             run_id=str(row['run_id']),
-            generated_at=row['run_time'].isoformat(),
-            horizon_start=row['horizon_start'].isoformat(),
-            horizon_end=row['horizon_end'].isoformat(),
-            schedule=row['schedule_json'],
+            generated_at=generated_at.isoformat(),
+            horizon_start=horizon_start.isoformat(),
+            horizon_end=horizon_end.isoformat(),
+            schedule=schedule_json,
         )
 
     except HTTPException:
+        # Re-raise HTTP exceptions
         raise
+    except asyncpg.PostgresError as e:
+        logger.error(
+            f"Database error getting schedule: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id}
+        )
+        raise DatabaseError(f"Database error: {str(e)}")
     except Exception as e:
-        logger.error(f"Failed to get schedule: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            f"Failed to get schedule: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id}
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get schedule: {str(e)}"
+        )
 
 
 @app.post(
     "/depots/{depot_id}/vehicles/{vehicle_id}/handoff",
     response_model=HandoffResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["depots"],
+    summary="Send inter-depot handoff message",
+    description="""
+    Send a handoff message when a vehicle is departing from one depot
+    to another depot. The destination depot will receive notification
+    to plan charging for the arriving vehicle.
+    
+    **Request:**
+    - `dest_depot_id`: Destination depot identifier (UUID)
+    - `expected_soc`: Expected state of charge at arrival (0.0-1.0)
+    - `arrival_time`: Expected arrival time (ISO 8601)
+    
+    **Response:**
+    - `message_id`: Handoff message identifier (UUID)
+    - `status`: Message status (e.g., 'sent')
+    
+    **Error Codes:**
+    - 400: Invalid request (invalid UUID, invalid SoC)
+    - 500: Server error
+    - 503: Database not available
+    
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid request"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
 )
 async def send_handoff(
     depot_id: str, vehicle_id: str, request: HandoffRequest
@@ -273,7 +1069,12 @@ async def send_handoff(
     Reference: PRD.md#7-1-rest-api-endpoints
     """
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise DatabaseError("Database not available")
+
+    # Validate UUIDs
+    validate_depot_id(depot_id)
+    validate_vehicle_id(vehicle_id)
+    validate_depot_id(request.dest_depot_id)
 
     try:
         from uuid import uuid4
@@ -299,36 +1100,142 @@ async def send_handoff(
             )
 
         logger.info(
-            f"Handoff message sent: {message_id} from {depot_id} "
-            f"to {request.dest_depot_id} for vehicle {vehicle_id}"
+            "Handoff message sent",
+            extra={
+                "message_id": str(message_id),
+                "origin_depot_id": depot_id,
+                "dest_depot_id": request.dest_depot_id,
+                "vehicle_id": vehicle_id,
+            }
         )
 
         return HandoffResponse(message_id=str(message_id), status="sent")
 
+    except asyncpg.PostgresError as e:
+        logger.error(
+            f"Database error sending handoff: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id, "vehicle_id": vehicle_id}
+        )
+        raise DatabaseError(f"Database error: {str(e)}")
     except Exception as e:
-        logger.error(f"Failed to send handoff: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            f"Failed to send handoff: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id, "vehicle_id": vehicle_id}
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send handoff: {str(e)}"
+        )
 
 
-@app.get("/health")
+async def check_database_health() -> str:
+    """Check database connectivity.
+
+    Returns:
+        "healthy" if database is accessible, "unavailable" otherwise
+    """
+    if not db_pool:
+        return "unavailable"
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return "healthy"
+    except Exception as e:
+        logger.warning(f"Database health check failed: {e}")
+        return "unavailable"
+
+
+async def check_ocpp_server_health() -> str:
+    """Check OCPP server health.
+
+    Returns:
+        "healthy", "unavailable", or "unknown"
+    """
+    global ocpp_server
+    
+    if ocpp_server is None:
+        return "unknown"
+    
+    try:
+        # Check if server is running
+        if hasattr(ocpp_server, '_running') and ocpp_server._running:
+            # Check if any charge points are connected
+            if hasattr(ocpp_server, 'charge_points'):
+                connected_count = len(ocpp_server.charge_points)
+                if connected_count > 0:
+                    return "healthy"
+                else:
+                    return "unavailable"  # Running but no connections
+            return "healthy"
+        else:
+            return "unavailable"
+    except Exception as e:
+        logger.debug(f"OCPP server health check error: {e}")
+        return "unknown"
+
+
+@app.get(
+    "/health",
+    tags=["health"],
+    summary="Health check endpoint",
+    description="""
+    Check the health status of the API and its components.
+    
+    **Response:**
+    - `status`: Overall status ("healthy")
+    - `timestamp`: Current timestamp (ISO 8601)
+    - `components`: Status of individual components
+      - `database`: "healthy" or "unavailable"
+      - `ocpp_server`: "healthy", "unavailable", or "unknown"
+    
+    Always returns 200 status code with component details.
+    
+    Reference: PRD.md#7-1-rest-api-endpoints
+    """,
+)
 async def health_check():
     """Health check endpoint.
 
     Reference: PRD.md#7-1-rest-api-endpoints
     """
-    db_status = "healthy" if db_pool else "unavailable"
+    # Check component health
+    db_status = await check_database_health()
+    ocpp_status = await check_ocpp_server_health()
+
+    # Overall status is healthy if database is healthy
+    overall_status = "healthy" if db_status == "healthy" else "degraded"
 
     return {
-        "status": "healthy",
+        "status": overall_status,
         "timestamp": datetime.utcnow().isoformat(),
         "components": {
             "database": db_status,
-            "ocpp_server": "unknown",
+            "ocpp_server": ocpp_status,
         },
     }
 
 
-@app.get("/metrics")
+@app.get(
+    "/metrics",
+    tags=["health"],
+    summary="Prometheus metrics endpoint",
+    description="""
+    Expose Prometheus metrics for monitoring and observability.
+    
+    Returns metrics in Prometheus text format including:
+    - Optimization run counts and durations
+    - Vehicle SoC metrics
+    - Grid power and peak demand
+    - System performance metrics
+    - Control loop metrics
+    
+    Reference: Development plan Step 7.2
+    """,
+    include_in_schema=False,  # Hide from OpenAPI docs (internal endpoint)
+)
 async def metrics():
     """Prometheus metrics endpoint.
 
@@ -337,4 +1244,76 @@ async def metrics():
     return Response(
         content=generate_latest(), media_type=CONTENT_TYPE_LATEST
     )
+
+
+@app.get(
+    "/admin/controllers",
+    tags=["admin"],
+    summary="List active controllers",
+    description="""
+    List all active depot controllers managed by the controller manager.
+    
+    **Response:**
+    - `controllers`: List of depot IDs with active controllers
+    - `count`: Number of active controllers
+    
+    Reference: Development plan Step 5.2
+    """,
+    include_in_schema=True,
+)
+async def list_controllers():
+    """List active controllers."""
+    if not controller_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Controller manager not initialized"
+        )
+    
+    controllers = controller_manager.list_controllers()
+    return {
+        "controllers": controllers,
+        "count": len(controllers),
+    }
+
+
+@app.get(
+    "/admin/controllers/{depot_id}/health",
+    tags=["admin"],
+    summary="Get controller health status",
+    description="""
+    Get health status for a specific depot controller.
+    
+    **Response:**
+    - `depot_id`: Depot identifier
+    - `status`: Controller status (healthy, degraded, error)
+    - `running`: Whether controller is running
+    - `last_run_time`: Last optimization run time
+    - `optimization_failures`: Number of consecutive failures
+    - `circuit_breaker_open`: Whether circuit breaker is open
+    
+    Reference: Development plan Step 5.2
+    """,
+)
+async def get_controller_health(depot_id: str):
+    """Get controller health status."""
+    if not controller_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Controller manager not initialized"
+        )
+    
+    validate_depot_id(depot_id)
+    
+    health = await controller_manager.health_check()
+    
+    if depot_id not in health:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Controller not found for depot {depot_id}"
+        )
+    
+    return {
+        "depot_id": depot_id,
+        **health[depot_id],
+    }
 

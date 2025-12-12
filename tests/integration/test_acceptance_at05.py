@@ -10,6 +10,7 @@ AND depot_B's next optimization includes bus_1
 """
 
 import pytest
+import pytest_asyncio
 import asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -26,7 +27,7 @@ from src.core.optimizer import optimize
 class TestAT05InterDepotHandoff:
     """AT-05: Inter-Depot Handoff acceptance test."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def test_db_pool(self):
         """Create test database connection pool."""
         import os
@@ -40,7 +41,7 @@ class TestAT05InterDepotHandoff:
         yield pool
         await pool.close()
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def depot_a_id(self, test_db_pool):
         """Create depot_A."""
         depot_id = uuid4()
@@ -71,7 +72,7 @@ class TestAT05InterDepotHandoff:
             await conn.execute('DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1', depot_id)
             await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def depot_b_id(self, test_db_pool):
         """Create depot_B."""
         depot_id = uuid4()
@@ -102,7 +103,7 @@ class TestAT05InterDepotHandoff:
             await conn.execute('DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1', depot_id)
             await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def bus_1_id(self, test_db_pool, depot_a_id):
         """Create bus_1 in depot_A."""
         vehicle_id = uuid4()

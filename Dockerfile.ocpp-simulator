@@ -1,0 +1,18 @@
+# OCPP Charger Simulator Dockerfile
+# Reference: Development Plan Step 7.3
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    websockets>=12.0 \
+    ocpp>=0.27.0 \
+    asyncio
+
+# Copy simulator script
+COPY scripts/ocpp_simulator.py ./
+
+# Run simulator
+CMD ["python", "ocpp_simulator.py"]

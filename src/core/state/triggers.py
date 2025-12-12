@@ -9,7 +9,12 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+import asyncpg
+
+if TYPE_CHECKING:
+    from .assembler import StateAssembler
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +49,75 @@ class TriggerMonitor:
     - Vehicle return time delays
 
     Triggers re-optimization when thresholds are exceeded.
+
+    Example:
+        ```python
+        from src.core.state.triggers import TriggerConfig, TriggerMonitor
+        from src.core.state.assembler import StateAssembler
+
+        # Initialize
+        config = TriggerConfig(
+            soc_deviation_threshold=0.05,  # 5%
+            price_change_percent=0.25,     # 25%
+            price_change_absolute=25.0,    # $25/MWh
+        )
+
+        async def on_trigger(reason: str):
+            print(f"Re-optimization triggered: {reason}")
+            # Run optimization...
+
+        assembler = StateAssembler(pool, depot_id, depot_config)
+        monitor = TriggerMonitor(config, on_trigger, assembler=assembler)
+
+        # Update expected state after optimization
+        monitor.update_expected_state(
+            expected_socs={'bus_1': 0.60},
+            expected_return_times={'bus_1': datetime.utcnow() + timedelta(hours=2)}
+        )
+
+        # Start monitoring (runs in background)
+        await monitor.run()
+        ```
     """
 
     def __init__(
         self,
         config: TriggerConfig,
         on_trigger: Callable[[str], None],  # async callback
+        assembler: Optional['StateAssembler'] = None,
+        pool: Optional[asyncpg.Pool] = None,
+        depot_id: Optional[str] = None,
     ):
         """Initialize trigger monitor.
 
         Args:
             config: Trigger configuration
             on_trigger: Async callback function(reason: str) -> None
+            assembler: Optional StateAssembler for fetching current state
+            pool: Optional database pool (required if assembler not provided)
+            depot_id: Optional depot ID (required if assembler not provided)
+
+        Raises:
+            ValueError: If neither assembler nor (pool + depot_id) provided
         """
         self.config = config
         self.on_trigger = on_trigger
+        self.assembler = assembler
+        self.pool = pool
+        self.depot_id = depot_id
         self.last_prices: dict[datetime, float] = {}
         self.expected_socs: dict[str, float] = {}
         self.expected_return_times: dict[str, datetime] = {}
         self._running = False
+        self._last_trigger_time: Optional[datetime] = None
+        self._trigger_cooldown_sec: float = 300.0  # 5 minutes
+
+        # Validate that we have a way to fetch state
+        if assembler is None and (pool is None or depot_id is None):
+            raise ValueError(
+                "Either assembler or (pool + depot_id) must be provided"
+            )
+
         logger.info("Initialized TriggerMonitor")
 
     def update_expected_state(
@@ -174,6 +229,139 @@ class TriggerMonitor:
                     return reason
         return None
 
+    async def _get_current_vehicle_socs(self) -> dict[str, float]:
+        """Get current vehicle SoCs from database.
+
+        Returns:
+            Dictionary mapping vehicle_id to current SoC
+
+        Note:
+            Returns empty dict on error to allow monitoring to continue.
+        """
+        if self.assembler:
+            # Use assembler if available
+            try:
+                return await self.assembler._get_vehicle_socs()
+            except Exception as e:
+                logger.error(
+                    f"Error fetching vehicle SoCs via assembler: {e}",
+                    exc_info=True,
+                )
+                return {}
+
+        # Otherwise query directly
+        if not self.pool or not self.depot_id:
+            logger.warning("Cannot fetch SoCs: missing pool or depot_id")
+            return {}
+
+        query = """
+        SELECT DISTINCT ON (vehicle_id) 
+            vehicle_id::text, soc
+        FROM telemetry t
+        JOIN vehicles v ON t.vehicle_id = v.vehicle_id
+        WHERE v.depot_id = $1
+        ORDER BY vehicle_id, time DESC
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id)
+            return {str(row['vehicle_id']): float(row['soc']) for row in rows}
+        except asyncio.TimeoutError as e:
+            logger.warning(f"Timeout fetching vehicle SoCs: {e}")
+            return {}
+        except asyncpg.PostgresError as e:
+            logger.error(f"Database error fetching vehicle SoCs: {e}")
+            return {}
+        except Exception as e:
+            logger.error(f"Unexpected error fetching vehicle SoCs: {e}", exc_info=True)
+            return {}
+
+    async def _get_current_prices(self) -> dict[datetime, float]:
+        """Get current prices from database.
+
+        Returns:
+            Dictionary mapping timestamp to price ($/kWh)
+
+        Note:
+            Returns empty dict on error to allow monitoring to continue.
+        """
+        if self.assembler:
+            # Use assembler to get state
+            try:
+                state = await self.assembler.get_current_state(horizon_hours=24)
+                # Convert price list to dict with timestamps
+                now = datetime.utcnow()
+                delta_t_hours = self.assembler.config.delta_t
+                return {
+                    now + timedelta(hours=i * delta_t_hours): price
+                    for i, price in enumerate(state.prices[:24])
+                }
+            except Exception as e:
+                logger.error(
+                    f"Error fetching prices via assembler: {e}",
+                    exc_info=True,
+                )
+                return {}
+
+        # Otherwise query directly
+        if not self.pool or not self.depot_id:
+            logger.warning("Cannot fetch prices: missing pool or depot_id")
+            return {}
+
+        query = """
+        SELECT time, energy_kwh as price_per_kwh
+        FROM prices
+        WHERE depot_id = $1 
+          AND time >= NOW() 
+          AND time < NOW() + INTERVAL '24 hours'
+        ORDER BY time
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id)
+            return {row['time']: float(row['price_per_kwh']) for row in rows}
+        except Exception as e:
+            logger.error(f"Error fetching prices: {e}")
+            return {}
+
+    async def _get_actual_return_times(self) -> dict[str, datetime]:
+        """Get actual return times for vehicles that have returned.
+
+        Returns:
+            Dictionary mapping vehicle_id to actual return time
+
+        Note:
+            Returns empty dict on error to allow monitoring to continue.
+        """
+        if not self.pool or not self.depot_id:
+            logger.warning("Cannot fetch return times: missing pool or depot_id")
+            return {}
+
+        # Query schedules where return_time has passed recently
+        query = """
+        SELECT DISTINCT ON (s.vehicle_id)
+            s.vehicle_id::text, s.return_time
+        FROM schedules s
+        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
+        WHERE v.depot_id = $1
+          AND s.return_time <= NOW()
+          AND s.return_time >= NOW() - INTERVAL '1 hour'
+        ORDER BY s.vehicle_id, s.return_time DESC
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id)
+            return {str(row['vehicle_id']): row['return_time'] for row in rows}
+        except asyncio.TimeoutError as e:
+            logger.warning(f"Timeout fetching return times: {e}")
+            return {}
+        except asyncpg.PostgresError as e:
+            logger.error(f"Database error fetching return times: {e}")
+            return {}
+        except Exception as e:
+            logger.error(f"Unexpected error fetching return times: {e}", exc_info=True)
+            return {}
+
     async def run(self) -> None:
         """Main monitoring loop.
 
@@ -185,15 +373,60 @@ class TriggerMonitor:
 
         while self._running:
             try:
-                # Note: In production, these would be injected via methods
-                # that fetch current state from database/telemetry
-                # For now, the controller will call check methods directly
-                # with current state data
+                # Fetch current state
+                current_socs = await self._get_current_vehicle_socs()
+                current_prices = await self._get_current_prices()
+                actual_returns = await self._get_actual_return_times()
+
+                # Check all triggers
+                soc_trigger = await self.check_soc_deviation(current_socs)
+                price_trigger = await self.check_price_change(current_prices)
+                return_trigger = await self.check_return_time_deviation(
+                    actual_returns
+                )
+
+                # Fire callback if any trigger detected (with cooldown)
+                if soc_trigger or price_trigger or return_trigger:
+                    reason = soc_trigger or price_trigger or return_trigger
+
+                    # Check cooldown to prevent rapid-fire triggers
+                    now = datetime.utcnow()
+                    if (
+                        self._last_trigger_time is None
+                        or (now - self._last_trigger_time).total_seconds()
+                        >= self._trigger_cooldown_sec
+                    ):
+                        logger.info(
+                            f"Trigger fired: {reason}",
+                            extra={
+                                'trigger_type': (
+                                    'soc_deviation'
+                                    if soc_trigger
+                                    else 'price_change'
+                                    if price_trigger
+                                    else 'return_delay'
+                                ),
+                                'depot_id': self.depot_id,
+                            },
+                        )
+                        await self.on_trigger(reason)
+                        self._last_trigger_time = now
+                    else:
+                        time_since_last = (
+                            now - self._last_trigger_time
+                        ).total_seconds()
+                        logger.debug(
+                            f"Trigger suppressed (cooldown): {reason} "
+                            f"(last trigger {time_since_last:.0f}s ago, "
+                            f"cooldown: {self._trigger_cooldown_sec}s)"
+                        )
 
                 await asyncio.sleep(self.config.check_interval_sec)
 
             except Exception as e:
                 logger.error(f"Trigger monitor error: {e}", exc_info=True)
+                # Continue monitoring even if one check fails
+                await asyncio.sleep(self.config.check_interval_sec)
 
         logger.info("Trigger monitor stopped")
 

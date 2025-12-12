@@ -1,0 +1,101 @@
+version: '3.8'
+
+# Test environment for Favonius Backend
+# Reference: PRD.md#6-data-models, Development Plan Step 7.3
+
+services:
+  # TimescaleDB for integration tests
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: favonius_test_db
+    environment:
+      POSTGRES_USER: favonius_test
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: favonius_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./scripts/db/init_test.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - timescale_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U favonius_test -d favonius_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - favonius_test
+
+  # Mock OCPP Charger Simulator
+  ocpp-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.ocpp-simulator
+    container_name: favonius_ocpp_simulator
+    environment:
+      OCPP_SERVER_URL: ws://favonius-api:8000/ocpp
+      NUM_CHARGERS: 10
+      CHARGER_PREFIX: test_charger_
+      SIMULATION_MODE: "responsive"
+    depends_on:
+      favonius-api:
+        condition: service_healthy
+    networks:
+      - favonius_test
+
+  # Favonius API for E2E tests
+  favonius-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: favonius_test_api
+    environment:
+      DATABASE_URL: postgresql://favonius_test:test_password@timescaledb:5432/favonius_test
+      OCPP_SERVER_HOST: 0.0.0.0
+      OCPP_SERVER_PORT: 9000
+      LOG_LEVEL: DEBUG
+      OPTIMIZATION_TIMEOUT: 30
+      TRIGGER_COOLDOWN_MINUTES: 0
+    ports:
+      - "8001:8000"
+      - "9001:9000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - favonius_test
+
+  # Test runner container
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: favonius_test_runner
+    environment:
+      TEST_DATABASE_URL: postgresql://favonius_test:test_password@timescaledb:5432/favonius_test
+      TEST_API_URL: http://favonius-api:8000
+      TEST_OCPP_URL: ws://favonius-api:9000/ocpp
+      PYTEST_ARGS: ${PYTEST_ARGS:-tests/}
+    depends_on:
+      favonius-api:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./src:/app/src:ro
+      - test_results:/app/test-results
+    networks:
+      - favonius_test
+
+networks:
+  favonius_test:
+    driver: bridge
+
+volumes:
+  timescale_test_data:
+  test_results:

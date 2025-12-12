@@ -287,6 +287,9 @@ class EnergySurrogateModel:
         data = joblib.load(path)
         model = cls(data['routes'])
         model.pipeline = data['pipeline']
+        # Restore fitted components from the loaded pipeline
+        model.preprocessor = model.pipeline.named_steps['preprocess']
+        model.gp = model.pipeline.named_steps['gp']
         model._is_fitted = True
 
         logger.info(f"Model loaded from {path}")
