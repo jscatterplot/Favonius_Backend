@@ -1,6 +1,6 @@
 # Product Requirements Document
 ## Favonius Energy — EV Fleet Depot Optimization Platform
-### Version 2.0 (MVP) | December 2025
+### Version 2.1 (MVP) | December 2025
 
 ---
 
@@ -11,7 +11,7 @@ This PRD serves as the **single source of truth** for building the Favonius MVP.
 2. **AI coding agents (Cursor, Claude Code)** — Precise specifications, code patterns, and validation rules
 
 **How to use this document with Cursor IDE:**
-- Reference sections using `@PRD.md#section-name`
+- Reference sections using `@PRD_v2.md#section-name`
 - AI agents should check acceptance criteria before marking tasks complete
 - Data models are authoritative — do not deviate without updating this document
 
@@ -916,7 +916,7 @@ Health check endpoint.
 
 ### 7.2 WebSocket API (OCPP)
 
-The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{charger_id}`.
+The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{ocpp_id}`.
 
 **Supported Messages:**
 | Direction | Message | Purpose |
@@ -1093,18 +1093,29 @@ The demand charge rate used in optimization is resolved in this priority order:
 11. **Battery Dynamics:**
     ```
     SoC_batt[0] = current_battery_soc   (initial condition)
-    
-    SoC_batt[t] = SoC_batt[t-1] - (P_batt[t-1] × Δt) / (E_batt_storage × η_batt)   ∀t > 0
+
+    SoC_batt[t] = SoC_batt[t-1] - (P_batt[t-1] × Δt) / E_batt_storage   ∀t > 0
     soc_min ≤ SoC_batt[t] ≤ soc_max   ∀t
-    
+
     Where:
     - P_batt[t] > 0 means discharging (reducing SoC)
     - P_batt[t] < 0 means charging (increasing SoC)
     - E_batt_storage is the battery capacity (kWh)
-    - η_batt is the round-trip efficiency (typically 0.92, from DepotConfig.battery_efficiency)
-    
-    Note: For MVP, we use a single efficiency value for both charge and discharge.
-    Future versions may model charge/discharge efficiencies separately.
+
+    Efficiency Handling:
+    For MVP, round-trip efficiency (η_batt, typically 0.92 from DepotConfig.battery_efficiency)
+    is modeled as a power loss during discharge only:
+    - Grid receives: P_batt × η_batt when P_batt > 0 (discharge)
+    - Grid provides: |P_batt| when P_batt < 0 (charge)
+
+    This means the grid power balance (Constraint 8) should use:
+    P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt_effective[t]
+
+    Where P_batt_effective[t] = P_batt[t] × η_batt if P_batt[t] > 0, else P_batt[t]
+
+    Note: For MVP simplification, implementations may omit efficiency entirely from
+    battery dynamics and note this as a modeling limitation. Future versions will
+    model charge/discharge efficiencies separately for higher accuracy.
     ```
 
 12. **Incoming Vehicle Availability:**
@@ -1295,7 +1306,7 @@ When a StartTransaction is received:
 - Update: Daily at 10:00 AM PT
 
 **Utility TOU (Fallback):**
-- PG&E E-19: Peak (4-9 PM), Partial-Peak (9 AM-4 PM, 9-12 PM), Off-Peak
+- PG&E E-19: Peak (4-9 PM), Partial-Peak (9 AM-4 PM, 9 PM-12 AM), Off-Peak
 - Store in depot configuration
 
 ### 9.4 Building Load Integration
@@ -1531,14 +1542,14 @@ Critical Constraints:
 - Building load is REQUIRED in grid power calculation
 
 When implementing optimization:
-- Reference PRD.md#8-optimization-engine-specifications for formulation
+- Reference PRD_v2.md#8-optimization-engine-specifications for formulation
 - Use Gurobi solver with specified options (TimeLimit=60, MIPGap=0.01)
 - Use warm-starting from previous solutions
 - Log solve time and objective value
 - Vehicle max_charge_kw comes from OCPP or config (see Section 8.4)
 
 When implementing API endpoints:
-- Reference PRD.md#7-api-specifications for contracts
+- Reference PRD_v2.md#7-api-specifications for contracts
 - Return consistent error formats
 - Include request/response logging
 
@@ -1557,7 +1568,7 @@ Code Style:
 
 Place these in your Cursor project for automatic context:
 
-1. `docs/PRD.md` — This document
+1. `docs/PRD_v2.md` — This document
 2. `docs/ARCHITECTURE.md` — System architecture diagram
 3. `docs/API.md` — OpenAPI specification
 4. `src/core/models.py` — Data models
@@ -1567,19 +1578,19 @@ Place these in your Cursor project for automatic context:
 
 **For implementing a new feature:**
 ```
-Implement US-02 (Demand Charge Reduction) following the specifications in @PRD.md#4-user-stories--use-cases.
-Use the optimization formulation from @PRD.md#8-optimization-engine-specifications.
+Implement US-02 (Demand Charge Reduction) following the specifications in @PRD_v2.md#4-user-stories--use-cases.
+Use the optimization formulation from @PRD_v2.md#8-optimization-engine-specifications.
 ```
 
 **For debugging optimization:**
 ```
-The optimizer is returning infeasible. Check constraints against @PRD.md#8-1-mathematical-formulation.
+The optimizer is returning infeasible. Check constraints against @PRD_v2.md#8-1-mathematical-formulation.
 Verify departure SoC constraint is correctly implemented.
 ```
 
 **For adding a new API endpoint:**
 ```
-Add the endpoint specified in @PRD.md#7-1-rest-api-endpoints.
+Add the endpoint specified in @PRD_v2.md#7-1-rest-api-endpoints.
 Follow the existing patterns in src/api/main.py.
 ```
 
@@ -1591,6 +1602,7 @@ Follow the existing patterns in src/api/main.py.
 |---------|------|--------|---------|
 | 1.0 | 2025-12-04 | Claude + Joris | Initial MVP PRD |
 | 2.0 | 2025-12-12 | Claude + Joris | Reconciled with dev plan; added Gurobi config, building load, inter-depot handoffs, return time trigger, charger-vehicle access, vehicle max_charge_kw from OCPP |
+| 2.1 | 2025-12-12 | Claude | Fixed inconsistencies: corrected OCPP WebSocket URL to use `{ocpp_id}`, clarified TOU pricing hours, fixed battery dynamics formula (removed incorrect efficiency division), updated all document references from PRD.md to PRD_v2.md |
 
 ---
 
