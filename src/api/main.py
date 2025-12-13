@@ -771,7 +771,7 @@ async def run_optimization(request: OptimizationRequest):
 
         # Run optimization
         try:
-        result = await controller.run_optimization("api_request")
+            result = await controller.run_optimization("api_request")
         except Exception as opt_error:
             # Handle optimization-specific errors
             error_msg = str(opt_error)
