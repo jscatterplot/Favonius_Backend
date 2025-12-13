@@ -199,12 +199,12 @@ CREATE TABLE telemetry (
     vehicle_id      UUID NOT NULL,
     charger_id      UUID REFERENCES chargers(charger_id),  -- Which charger reported this telemetry
     soc             DOUBLE PRECISION CHECK (soc >= 0 AND soc <= 1),
-    location_lat    DOUBLE PRECISION,
-    location_lon    DOUBLE PRECISION,
+    location_lat    DOUBLE PRECISION CHECK (location_lat >= -90 AND location_lat <= 90),
+    location_lon    DOUBLE PRECISION CHECK (location_lon >= -180 AND location_lon <= 180),
     is_plugged      BOOLEAN,
     charging_kw     DOUBLE PRECISION CHECK (charging_kw >= 0),
     odometer_km     DOUBLE PRECISION CHECK (odometer_km >= 0),
-    max_charge_kw   DOUBLE PRECISION CHECK (max_charge_kw >= 0)  -- From OCPP MeterValues
+    max_charge_kw   DOUBLE PRECISION CHECK (max_charge_kw > 0)  -- From OCPP MeterValues
 );
 SELECT create_hypertable('telemetry', 'time');
 CREATE INDEX idx_telemetry_vehicle ON telemetry (vehicle_id, time DESC);
@@ -329,7 +329,7 @@ Create `src/core/models.py` (copy from PRD Section 6.2):
 """Core data models for Favonius optimization platform.
 
 These dataclasses are the authoritative representation of system state.
-See PRD.md Section 6.2 for full specification.
+See PRD_v2.md Section 6.2 for full specification.
 """
 from __future__ import annotations
 
@@ -416,7 +416,7 @@ class DepotConfig:
     Chargers are aggregated by rated_kw for optimization to reduce variable count.
     After optimization, power is allocated back to individual chargers.
     
-    See PRD.md Section 8.3 for aggregation strategy.
+    See PRD_v2.md Section 8.3 for aggregation strategy.
     """
     vehicle_capacities: dict[str, float]      # vehicle_id -> kWh
     vehicle_max_charge_kw: dict[str, float]   # vehicle_id -> max charge rate (kW)
@@ -425,6 +425,7 @@ class DepotConfig:
     charger_vehicle_access: dict[str, set[str]]  # charger_id -> accessible vehicle_ids
     battery_capacity: float
     battery_power: float
+    battery_efficiency: float = 0.92  # Round-trip efficiency for stationary battery
     battery_soc_min: float = 0.2
     battery_soc_max: float = 0.8
     max_site_power: float = 1000.0
@@ -437,7 +438,7 @@ class DepotState:
     """Dynamic state for optimization.
     
     Assembled from database queries before each optimization run.
-    See PRD.md Section 5.3 for data flow.
+    See PRD_v2.md Section 5.3 for data flow.
     """
     vehicle_socs: dict[str, float]            # vehicle_id -> SoC [0,1]
     battery_soc: float
@@ -455,7 +456,7 @@ class DepotState:
 class OptimizationResult:
     """Output from optimization.
     
-    See PRD.md Section 8.1 for variable definitions.
+    See PRD_v2.md Section 8.1 for variable definitions.
     """
     run_id: UUID
     schedule: dict[str, dict]  # vehicle_id -> {charging_power: [], soc: []}
@@ -480,8 +481,8 @@ Create `src/core/optimizer/milp_model.py`:
 ```python
 """MILP optimization model for depot charging scheduling.
 
-Implements the formulation from PRD.md Section 8.1.
-Uses Gurobi solver with configuration from PRD.md Section 8.2.
+Implements the formulation from PRD_v2.md Section 8.1.
+Uses Gurobi solver with configuration from PRD_v2.md Section 8.2.
 """
 from __future__ import annotations
 
@@ -497,7 +498,7 @@ def build_optimization_model(
 ) -> pyo.ConcreteModel:
     """Build Pyomo MILP model for depot charging optimization.
     
-    See PRD.md Section 8.1 for mathematical formulation.
+    See PRD_v2.md Section 8.1 for mathematical formulation.
     
     Args:
         state: Current depot state (SoCs, prices, availability, building load)
@@ -618,7 +619,7 @@ def build_optimization_model(
     # For MVP, we use a linearized approximation with separate discharge/charge vars.
 
     # Split battery power into charge and discharge components
-    eta_batt = 0.92  # Battery round-trip efficiency (from config)
+    eta_batt = config.battery_efficiency  # From DepotConfig (default 0.92)
     model.P_batt_discharge = pyo.Var(model.T, domain=pyo.NonNegativeReals, bounds=(0, config.battery_power))
     model.P_batt_charge = pyo.Var(model.T, domain=pyo.NonNegativeReals, bounds=(0, config.battery_power))
 
@@ -812,7 +813,7 @@ def warm_start_model(
 ) -> None:
     """Initialize model variables from previous solution.
     
-    See PRD.md Section 8.5 for performance targets.
+    See PRD_v2.md Section 8.5 for performance targets.
     Expected speedup: >3x with warm-starting.
     
     Args:
@@ -854,7 +855,7 @@ Create `src/core/optimizer/allocator.py`:
 Allocates aggregated charging power to individual physical chargers,
 respecting physical accessibility constraints.
 
-See PRD.md Section 8.3 for aggregation strategy.
+See PRD_v2.md Section 8.3 for aggregation strategy.
 """
 from __future__ import annotations
 
@@ -964,7 +965,7 @@ Create `src/triggers/monitor.py`:
 ```python
 """Re-optimization trigger monitoring.
 
-Monitors conditions that require re-optimization per PRD.md Section 5.1.
+Monitors conditions that require re-optimization per PRD_v2.md Section 5.1.
 Trigger thresholds:
 - SoC deviation: >5%
 - Price change: >25% OR >$25/MWh
@@ -1005,7 +1006,7 @@ class TriggerEvent:
 class TriggerMonitor:
     """Monitors conditions requiring re-optimization.
     
-    See PRD.md Section 5.1 for trigger thresholds.
+    See PRD_v2.md Section 5.1 for trigger thresholds.
     """
     
     # Thresholds from PRD
@@ -1195,7 +1196,7 @@ Create `src/adapters/handoff/manager.py`:
 ```python
 """Inter-depot vehicle handoff management.
 
-Implements PRD.md Section 5.4 for inter-depot coordination.
+Implements PRD_v2.md Section 5.4 for inter-depot coordination.
 """
 from __future__ import annotations
 
@@ -1228,7 +1229,7 @@ class HandoffMessage:
 class HandoffManager:
     """Manages inter-depot vehicle handoffs.
     
-    See PRD.md Section 5.4 for handoff flow.
+    See PRD_v2.md Section 5.4 for handoff flow.
     """
     
     def __init__(self, depot_endpoints: dict[UUID, str]):
@@ -1331,8 +1332,8 @@ Create `src/adapters/ocpp/handlers.py` (excerpt for max_charge_kw handling):
 ```python
 """OCPP message handlers.
 
-See PRD.md Section 7.2 for supported messages.
-See PRD.md Section 8.4 for vehicle max_charge_kw resolution.
+See PRD_v2.md Section 7.2 for supported messages.
+See PRD_v2.md Section 8.4 for vehicle max_charge_kw resolution.
 """
 from __future__ import annotations
 
@@ -1357,6 +1358,7 @@ class OCPPHandler:
     async def handle_meter_values(
         self,
         charger_ocpp_id: str,
+        charger_id: UUID,
         vehicle_id: Optional[UUID],
         soc: Optional[float],
         power_kw: Optional[float],
@@ -1364,17 +1366,17 @@ class OCPPHandler:
         timestamp: datetime,
     ) -> None:
         """Process MeterValues message from charger.
-        
+
         If max_charge_kw is reported, it's stored and takes precedence
         over static config for optimization.
         """
-        # Store telemetry
+        # Store telemetry (charger_id tracks which charger reported this)
         await self.db.execute(
             """
-            INSERT INTO telemetry (time, vehicle_id, soc, charging_kw, max_charge_kw)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO telemetry (time, vehicle_id, charger_id, soc, charging_kw, max_charge_kw)
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
-            timestamp, vehicle_id, soc, power_kw, max_charge_kw
+            timestamp, vehicle_id, charger_id, soc, power_kw, max_charge_kw
         )
         
         # Cache max_charge_kw if reported
@@ -1710,10 +1712,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# Maximum age for data to be considered fresh
+# Maximum age for data to be considered fresh (per PRD Section 5.3)
 MAX_TELEMETRY_AGE = timedelta(minutes=15)
-MAX_PRICE_AGE = timedelta(hours=1)
+MAX_PRICE_AGE = timedelta(hours=24)
 MAX_WEATHER_AGE = timedelta(hours=6)
+MAX_BUILDING_LOAD_AGE = timedelta(minutes=30)
 
 
 def check_data_freshness(
@@ -1784,7 +1787,7 @@ Create `tests/fixtures/realistic_depot.py`:
 ```python
 """Realistic test fixtures using UUIDs and production-like data.
 
-See PRD.md Section 11 for acceptance criteria these tests validate.
+See PRD_v2.md Section 11 for acceptance criteria these tests validate.
 """
 from __future__ import annotations
 
@@ -1947,7 +1950,7 @@ Create `tests/unit/test_optimizer.py`:
 ```python
 """Unit tests for MILP optimizer.
 
-Validates PRD.md Section 8 requirements.
+Validates PRD_v2.md Section 8 requirements.
 """
 import pytest
 from src.core.optimizer.milp_model import (
@@ -2071,7 +2074,7 @@ Create `tests/unit/test_triggers.py`:
 ```python
 """Unit tests for trigger monitoring.
 
-Validates PRD.md Section 5.1 trigger thresholds.
+Validates PRD_v2.md Section 5.1 trigger thresholds.
 """
 import pytest
 from datetime import datetime, timedelta
@@ -2230,7 +2233,7 @@ Create `tests/integration/test_full_pipeline.py`:
 ```python
 """Integration tests for full optimization pipeline.
 
-Validates PRD.md Section 11.1 acceptance tests.
+Validates PRD_v2.md Section 11.1 acceptance tests.
 """
 import pytest
 from uuid import uuid4
@@ -2493,6 +2496,7 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 | 1.0 | 2025-12-04 | Claude + Joris | Initial development plan |
 | 2.0 | 2025-12-12 | Claude + Joris | Reconciled with PRD v2; Gurobi config, triggers with OR logic, building load required, inter-depot handoffs, return time trigger, realistic tests |
 | 2.1 | 2025-12-13 | Claude | Aligned with PRD v2.2: Fixed Vehicle.id_tag field, added CHECK constraints to SQL schema, added charger_id to telemetry, added 'degraded' status, added power limit constraint to MILP, updated grid balance for P_batt_effective with efficiency handling, added infeasibility handling to solve_model, added PHASE 4.5 for security (input validation, rate limiting, SQL injection prevention, data freshness) |
+| 2.2 | 2025-12-13 | Claude | Final alignment fixes: Added battery_efficiency to DepotConfig, fixed data freshness thresholds (prices: 24h, building load: 30min), added lat/lon CHECK constraints to telemetry, added charger_id to OCPP handler, updated all PRD.md refs to PRD_v2.md, use config.battery_efficiency in MILP |
 
 ---
 
