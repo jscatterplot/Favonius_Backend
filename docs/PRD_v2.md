@@ -1,6 +1,6 @@
 # Product Requirements Document
 ## Favonius Energy — EV Fleet Depot Optimization Platform
-### Version 2.1 (MVP) | December 2025
+### Version 2.2 (MVP) | December 2025
 
 ---
 
@@ -354,6 +354,16 @@ SO THAT charging can be planned before arrival
 2. STATE ASSEMBLY (before each optimization)
    Query: latest telemetry, prices, schedules, depot config, building load
    Query: pending inter-depot incoming vehicles (where arrival_time < horizon_end)
+
+   **Data Freshness Requirements:**
+   | Data Type | Max Age | Fallback if Stale |
+   |-----------|---------|-------------------|
+   | Vehicle SoC (telemetry) | 15 minutes | Use last known + log warning |
+   | Prices | 24 hours | Use cached TOU schedule |
+   | Weather forecast | 6 hours | Use last forecast |
+   | Building load | 30 minutes | Use forecast model |
+   | Schedules | N/A (static) | Required, fail if missing |
+
    For each incoming vehicle:
      - Add to vehicle_socs with expected_soc
      - Set availability to False before arrival_time, True after
@@ -498,12 +508,13 @@ CREATE TABLE charger_vehicle_access (
 CREATE TABLE battery_storage (
     battery_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     depot_id        UUID NOT NULL REFERENCES depots(depot_id),
-    capacity_kwh    DOUBLE PRECISION NOT NULL,
-    max_power_kw    DOUBLE PRECISION NOT NULL,
-    efficiency      DOUBLE PRECISION DEFAULT 0.92,
-    soc_min         DOUBLE PRECISION DEFAULT 0.2,
-    soc_max         DOUBLE PRECISION DEFAULT 0.8,
-    created_at      TIMESTAMPTZ DEFAULT NOW()
+    capacity_kwh    DOUBLE PRECISION NOT NULL CHECK (capacity_kwh > 0),
+    max_power_kw    DOUBLE PRECISION NOT NULL CHECK (max_power_kw > 0),
+    efficiency      DOUBLE PRECISION DEFAULT 0.92 CHECK (efficiency > 0 AND efficiency <= 1),
+    soc_min         DOUBLE PRECISION DEFAULT 0.2 CHECK (soc_min >= 0 AND soc_min < 1),
+    soc_max         DOUBLE PRECISION DEFAULT 0.8 CHECK (soc_max > 0 AND soc_max <= 1),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT battery_soc_range CHECK (soc_min < soc_max)
 );
 
 -- ============ TIME-SERIES DATA ============
@@ -512,13 +523,13 @@ CREATE TABLE telemetry (
     time            TIMESTAMPTZ NOT NULL,
     vehicle_id      UUID NOT NULL,
     charger_id      UUID REFERENCES chargers(charger_id),  -- Charger that reported this telemetry
-    soc             DOUBLE PRECISION,  -- 0.0 to 1.0
-    location_lat    DOUBLE PRECISION,
-    location_lon    DOUBLE PRECISION,
+    soc             DOUBLE PRECISION CHECK (soc >= 0 AND soc <= 1),  -- 0.0 to 1.0
+    location_lat    DOUBLE PRECISION CHECK (location_lat >= -90 AND location_lat <= 90),
+    location_lon    DOUBLE PRECISION CHECK (location_lon >= -180 AND location_lon <= 180),
     is_plugged      BOOLEAN,
-    charging_kw     DOUBLE PRECISION,
-    odometer_km     DOUBLE PRECISION,
-    max_charge_kw   DOUBLE PRECISION  -- From OCPP MeterValues, overrides vehicle config
+    charging_kw     DOUBLE PRECISION CHECK (charging_kw >= 0),
+    odometer_km     DOUBLE PRECISION CHECK (odometer_km >= 0),
+    max_charge_kw   DOUBLE PRECISION CHECK (max_charge_kw > 0)  -- From OCPP MeterValues
 );
 SELECT create_hypertable('telemetry', 'time');
 CREATE INDEX idx_telemetry_vehicle ON telemetry (vehicle_id, time DESC);
@@ -602,14 +613,16 @@ CREATE TABLE interdepot_messages (
     dest_depot_id   UUID NOT NULL REFERENCES depots(depot_id),
     vehicle_id      UUID NOT NULL REFERENCES vehicles(vehicle_id),
     departure_time  TIMESTAMPTZ NOT NULL,
-    expected_soc    DOUBLE PRECISION NOT NULL,
+    expected_soc    DOUBLE PRECISION NOT NULL CHECK (expected_soc >= 0 AND expected_soc <= 1),
     arrival_time    TIMESTAMPTZ NOT NULL,
-    battery_kwh     DOUBLE PRECISION NOT NULL,  -- Vehicle battery capacity
-    max_charge_kw   DOUBLE PRECISION NOT NULL,  -- Vehicle max charge rate
-    status          VARCHAR(20) DEFAULT 'pending',  -- 'pending', 'acknowledged', 'arrived'
+    battery_kwh     DOUBLE PRECISION NOT NULL CHECK (battery_kwh > 0),
+    max_charge_kw   DOUBLE PRECISION NOT NULL CHECK (max_charge_kw > 0),
+    status          VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'acknowledged', 'arrived')),
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     acknowledged_at TIMESTAMPTZ,
-    arrived_at      TIMESTAMPTZ
+    arrived_at      TIMESTAMPTZ,
+    CONSTRAINT valid_depot_pair CHECK (origin_depot_id != dest_depot_id),
+    CONSTRAINT valid_timing CHECK (arrival_time > departure_time)
 );
 CREATE INDEX idx_interdepot_dest_status ON interdepot_messages (dest_depot_id, status);
 
@@ -753,7 +766,8 @@ class OptimizationResult:
     peak_demand_kw: float  # Maximum grid power (kW)
     objective_value: float
     solve_time_s: float
-    status: str  # 'optimal', 'feasible', 'infeasible', 'timeout'
+    status: str  # 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'
+    # 'degraded' = solved with relaxed constraints (see Section 8.5.1)
 ```
 
 ---
@@ -1001,9 +1015,16 @@ The demand charge rate used in optimization is resolved in this priority order:
 
 1. **SoC Initialization:**
    ```
-   SoC[b, 0] = current_measured_soc[b]   ∀b
-   
+   For existing depot vehicles:
+   SoC[b, 0] = current_measured_soc[b]   ∀b in depot_vehicles
+
    Where current_measured_soc[b] is the latest telemetry value, clamped to [0.0, 1.0]
+
+   For incoming vehicles (from inter-depot handoff):
+   SoC[b, t] is unconstrained for t < t_arrive[b]  (vehicle not yet at depot)
+   SoC[b, t_arrive[b]] = expected_soc[b]           (fixed at arrival)
+
+   See Constraint 12 for full incoming vehicle handling.
    ```
 
 2. **SoC Dynamics:**
@@ -1046,16 +1067,23 @@ The demand charge rate used in optimization is resolved in this priority order:
    - Already capped at charger rated_kw in resolution step
    ```
 
-7. **Charger Capacity (Aggregated by Power):**
+7. **Charger Capacity (Aggregated by Power and Count):**
    ```
+   Power limit:
    Σ_b P_charge[b,t] ≤ Σ_g (n_chargers[g] × P_g)   ∀t
-   
+
+   Vehicle count limit:
+   Σ_b y_charge[b,t] ≤ Σ_g n_chargers[g]   ∀t
+
    Where:
    - g indexes charger groups (grouped by rated_kw)
    - n_chargers[g] is the count of chargers in group g
    - P_g is the rated power (kW) for group g
-   - P_charge[b,t] is only non-zero if vehicle b can use a charger in group g
-   
+   - y_charge[b,t] is binary: 1 if vehicle b is charging at time t
+
+   Both constraints are required: the power limit prevents exceeding total capacity,
+   while the count limit prevents more vehicles charging than available chargers.
+
    Note: For MVP, the MILP does not enforce per-charger physical accessibility.
    Physical accessibility is enforced deterministically in the post-optimization
    allocation phase (Section 8.3). Acceptance criteria around "physical
@@ -1064,9 +1092,14 @@ The demand charge rate used in optimization is resolved in this priority order:
 
 8. **Grid Power Balance:**
    ```
+   P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt_effective[t]
+
+   Where:
+   - P_building[t] is the building load at timestep t (kW)
+   - P_batt_effective[t] is the grid-side battery power (see Constraint 11 for efficiency handling)
+
+   For MVP simplification, if efficiency is omitted:
    P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt[t]
-   
-   Where P_building[t] is the building load at timestep t (kW)
    ```
 
 9. **Site Power Limit:**
@@ -1229,6 +1262,50 @@ def get_effective_max_charge_kw(vehicle_id: str, charger_rated_kw: float,
 | Optimality gap | < 1% | Required for deployment |
 | Warm-start speedup | > 3x | Use previous solution |
 
+### 8.5.1 Infeasibility Handling
+
+When optimization cannot satisfy all constraints (typically: insufficient time to charge a vehicle to 99% SoC):
+
+**Detection:**
+- Gurobi returns `TerminationCondition.infeasible`
+- Log infeasibility with depot_id, trigger_reason, and constraint analysis
+
+**Response Strategy (in priority order):**
+
+1. **Identify conflicting vehicles:**
+   - Use Gurobi's IIS (Irreducible Inconsistent Subsystem) to identify which departure constraints cannot be met
+   - Log affected vehicle_ids with expected vs achievable SoC
+
+2. **Relaxed solve (fallback):**
+   - Relax departure SoC from 99% to 90% for affected vehicles only
+   - Re-solve with relaxed constraints
+   - Mark result as `status: 'degraded'`
+
+3. **Alert generation:**
+   - Create high-priority alert for operations team
+   - Include: affected vehicles, expected SoC shortfall, departure times
+   - Suggest: delay departure, pre-position vehicle at charger, manual override
+
+4. **Never silently fail:**
+   - Always return a schedule (even if degraded)
+   - `OptimizationResult.status` must be one of: 'optimal', 'feasible', 'degraded', 'infeasible'
+   - 'infeasible' only returned if even relaxed solve fails
+
+**Logging:**
+```json
+{
+  "event": "optimization_infeasible",
+  "depot_id": "uuid",
+  "trigger_reason": "scheduled",
+  "affected_vehicles": [
+    {"vehicle_id": "bus_101", "target_soc": 0.99, "achievable_soc": 0.85, "departure_time": "2025-12-04T06:00:00Z"}
+  ],
+  "action_taken": "relaxed_solve",
+  "relaxed_target_soc": 0.90,
+  "result_status": "degraded"
+}
+```
+
 ### 8.6 Surrogate Model Specification
 
 **Model Type:** Gaussian Process Regression (fallback: 2-layer MLP)
@@ -1380,11 +1457,45 @@ When a StartTransaction is received:
 
 | Requirement | Implementation |
 |-------------|---------------|
-| API authentication | JWT tokens |
-| OCPP authentication | Basic auth + TLS |
-| Database access | Role-based, encrypted connections |
+| API authentication | JWT tokens with expiration (1 hour access, 24 hour refresh) |
+| OCPP authentication | Basic auth + TLS 1.3 (wss:// required in production) |
+| Database access | Role-based, encrypted connections (SSL required) |
 | Secrets management | Environment variables, Vault (future) |
-| Audit logging | All API calls, optimization runs |
+| Audit logging | All API calls, optimization runs, handoff messages |
+| Transport security | HTTPS required for all API endpoints in production |
+| Inter-depot auth | Mutual TLS or signed JWT for handoff messages |
+
+**Input Validation Requirements:**
+
+| Endpoint/Field | Validation |
+|----------------|------------|
+| All UUIDs | Valid UUID v4 format |
+| SoC values | Range [0.0, 1.0], reject out-of-bounds |
+| Power values (kW) | Non-negative, ≤ max_site_power |
+| Timestamps | ISO 8601 format, within reasonable range (±30 days) |
+| depot_id in path | Must match authenticated user's depot access |
+| vehicle_id | Must belong to specified depot |
+| Handoff requests | Origin depot must own the vehicle |
+
+**Rate Limiting:**
+
+| Resource | Limit | Window |
+|----------|-------|--------|
+| API endpoints (general) | 100 requests | per minute |
+| POST /optimize | 10 requests | per minute |
+| Trigger-induced optimizations | 1 optimization | per 5 minutes per depot |
+| Inter-depot handoff | 50 messages | per hour per depot pair |
+| Failed auth attempts | 5 attempts | per 15 minutes, then lockout |
+
+**SQL Injection Prevention:**
+- All database queries use parameterized statements (asyncpg $1, $2 syntax)
+- No string concatenation for SQL queries
+- ORM/query builder validates field names against schema
+
+**OCPP Security:**
+- Charger ocpp_id validated against registered chargers
+- Unregistered chargers rejected at BootNotification
+- SetChargingProfile only sent to chargers in 'Available' or 'Charging' status
 
 ### 10.4 Scalability
 
@@ -1603,6 +1714,7 @@ Follow the existing patterns in src/api/main.py.
 | 1.0 | 2025-12-04 | Claude + Joris | Initial MVP PRD |
 | 2.0 | 2025-12-12 | Claude + Joris | Reconciled with dev plan; added Gurobi config, building load, inter-depot handoffs, return time trigger, charger-vehicle access, vehicle max_charge_kw from OCPP |
 | 2.1 | 2025-12-12 | Claude | Fixed inconsistencies: corrected OCPP WebSocket URL to use `{ocpp_id}`, clarified TOU pricing hours, fixed battery dynamics formula (removed incorrect efficiency division), updated all document references from PRD.md to PRD_v2.md |
+| 2.2 | 2025-12-13 | Claude | Security & logic hardening: added vehicle count constraint to MILP, fixed grid power balance to use P_batt_effective, clarified incoming vehicle SoC initialization, added comprehensive security requirements (input validation, rate limiting, SQL injection prevention), added database CHECK constraints, added infeasibility handling specification, added data freshness requirements |
 
 ---
 
