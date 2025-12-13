@@ -174,10 +174,11 @@ spec:
           mountPath: /app/logs
         - name: data
           mountPath: /app/data
-        # Uncomment for TLS certificates
-        # - name: tls-certs
-        #   mountPath: /app/certs
-        #   readOnly: true
+        # TLS certificates required for production per PRD Section 10.3
+        # OCPP authentication: Basic auth + TLS 1.3 (wss:// required in production)
+        - name: tls-certs
+          mountPath: /app/certs
+          readOnly: true
         
         securityContext:
           allowPrivilegeEscalation: false
@@ -193,11 +194,11 @@ spec:
       - name: data
         emptyDir:
           sizeLimit: 100Mi
-      # Uncomment for TLS certificates
-      # - name: tls-certs
-      #   secret:
-      #     secretName: websocket-handler-tls
-      #     defaultMode: 0400
+      # TLS certificates required for production per PRD Section 10.3
+      - name: tls-certs
+        secret:
+          secretName: websocket-handler-tls
+          defaultMode: 0400
       
       affinity:
         podAntiAffinity:

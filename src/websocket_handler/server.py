@@ -23,7 +23,7 @@ from .der_control_manager import DERControlManager
 from .priority_charging_manager import PriorityChargingManager
 from .external_control_manager import ExternalControlManager
 from .certificate_manager import CertificateManager
-from .v2x_controller import V2XController
+# V2X removed - out of scope for MVP per PRD Section 1.2
 from .cache_manager import CacheManager
 
 
@@ -59,7 +59,7 @@ class OCPPWebSocketServer:
         self.priority_charging_manager: Optional[PriorityChargingManager] = None
         self.external_control_manager: Optional[ExternalControlManager] = None
         self.certificate_manager: Optional[CertificateManager] = None
-        self.v2x_controller: Optional[V2XController] = None
+        # V2X removed - out of scope for MVP
         
         # Server state
         self.server: Optional[websockets.WebSocketServer] = None

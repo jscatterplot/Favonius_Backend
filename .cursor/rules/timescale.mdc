@@ -1,7 +1,7 @@
 # TimescaleDB Best Practices
 
 ## Reference
-Primary reference: PRD.md#6-data-models
+Primary reference: PRD_v2.md#6-data-models
 
 ## Hypertable Creation
 
@@ -17,9 +17,10 @@ SELECT create_hypertable('telemetry', 'time');
 ```
 
 Required hypertables per PRD Section 6.1:
-- `telemetry` - Vehicle telemetry data
+- `telemetry` - Vehicle telemetry data (includes charger_id, max_charge_kw)
 - `prices` - Electricity prices
 - `weather_forecasts` - Weather forecast data
+- `building_load` - Building power consumption (REQUIRED per PRD Section 9.4)
 
 ## Schema Patterns
 
@@ -30,15 +31,17 @@ Required hypertables per PRD Section 6.1:
 - `battery_storage` - Stationary battery specs
 
 ### Time-Series Tables (Hypertables)
-- `telemetry` - Vehicle SoC, location, charging status
+- `telemetry` - Vehicle SoC, location, charging status, max_charge_kw (from OCPP)
 - `prices` - Energy and demand prices per timestep
 - `weather_forecasts` - Weather data for surrogate model
+- `building_load` - Building power consumption (REQUIRED)
 
 ### Operational Tables
-- `schedules` - Vehicle route schedules
-- `optimization_runs` - Optimization results and metadata
+- `schedules` - Vehicle route schedules (includes actual_return_time)
+- `optimization_runs` - Optimization results and metadata (includes status: 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout', and solver_used: 'gurobi' or 'highs')
 - `charging_commands` - OCPP command history
-- `interdepot_messages` - Vehicle handoff messages
+- `interdepot_messages` - Vehicle handoff messages (includes status: 'pending', 'acknowledged', 'arrived')
+- `trigger_log` - Re-optimization trigger events
 
 Reference: PRD Section 6.1
 
@@ -59,11 +62,14 @@ CREATE INDEX idx_schedules_vehicle_depart ON schedules (vehicle_id, departure_ti
 Use `DISTINCT ON` for latest telemetry per vehicle:
 ```sql
 SELECT DISTINCT ON (vehicle_id) 
-    vehicle_id, soc, time
+    vehicle_id, charger_id, soc, max_charge_kw, time
 FROM telemetry
 WHERE vehicle_id IN (...)
+  AND time >= NOW() - INTERVAL '15 minutes'  -- Data freshness check
 ORDER BY vehicle_id, time DESC;
 ```
+
+Note: Include charger_id and max_charge_kw for vehicle max charge rate resolution (PRD Section 8.4).
 
 ### Time Range Queries
 Always use time-based WHERE clauses for hypertable efficiency:
@@ -132,10 +138,16 @@ Target query times per PRD Section 10.1:
 ## Integration with Optimization
 
 State assembler queries (PRD Section 5.3):
-1. Latest vehicle SoCs from `telemetry`
-2. Price schedule from `prices` table
-3. Schedules from `schedules` table
-4. Store optimization results in `optimization_runs` table
+1. Latest vehicle SoCs from `telemetry` (max age: 15 minutes)
+2. Price schedule from `prices` table (max age: 24 hours)
+3. Weather forecast from `weather_forecasts` table (max age: 6 hours)
+4. Building load from `building_load` table (max age: 30 minutes, REQUIRED)
+5. Schedules from `schedules` table
+6. Pending inter-depot incoming vehicles from `interdepot_messages` table
+7. Store optimization results in `optimization_runs` table
+   - Include `solver_used` field in OptimizationResult (stored in schedule_json metadata)
+   - Track which solver was used for monitoring and analysis
+8. Store trigger events in `trigger_log` table
 
 ## Data Durability
 

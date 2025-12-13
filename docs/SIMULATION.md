@@ -241,7 +241,9 @@ Located in `tests/integration/test_simulation_acceptance.py`:
 - `test_at02_demand_charge_reduction`: AT-02 validation
 - `test_at03_price_spike_reoptimization`: AT-03 validation
 - `test_at04_soc_deviation_handling`: AT-04 validation
-- `test_at05_inter_depot_handoff`: AT-05 validation
+- `test_at05_return_time_deviation_handling`: AT-05 validation
+- `test_at06_inter_depot_handoff`: AT-06 validation
+- `test_at07_building_load_integration`: AT-07 validation
 - `test_unmanaged_vs_optimized_comparison`: Cost savings validation
 
 ### Running Tests
@@ -275,9 +277,9 @@ Located in `tests/integration/test_performance_benchmarks.py`:
 
 ### PRD Performance Targets
 
-- **Solve time**: < 30 seconds for 20 vehicles
+- **Solve time**: < 60 seconds for 20 vehicles (PRD Section 8.3)
 - **Memory usage**: < 2 GB for 20 vehicles
-- **Warm-start speedup**: > 3x faster than cold-start
+- **Warm-start speedup**: > 3x faster than cold-start (PRD Section 8.5)
 - **Optimality gap**: < 1% for deployment
 
 ## Examples
@@ -391,7 +393,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 - Development Plan Step 6.1: Simulation Harness
 - Development Plan Step 6.2: Integration Tests
-- PRD Section 11.1: MVP Acceptance Tests
-- PRD Section 11.3: Integration Test Requirements
-- PRD Section 8.3: Performance Targets
+- PRD_v2.md Section 11.1: MVP Acceptance Tests
+- PRD_v2.md Section 11.3: Integration Test Requirements
+- PRD_v2.md Section 8.5: Performance Targets
 

@@ -12,7 +12,7 @@ from uuid import UUID
 
 import asyncpg
 
-from ..models import DepotConfig, DepotState
+from ..models import DepotConfig, DepotState, IncomingVehicle
 
 if TYPE_CHECKING:
     pass
@@ -148,8 +148,35 @@ class StateAssembler:
         # Get demand charge rate
         demand_charge_rate = await self._get_demand_charge_rate()
 
-        # Get building power (default to zero for MVP)
+        # Get building power (REQUIRED per PRD Section 9.4)
         building_power = await self._get_building_power(now, horizon_end, n_steps)
+
+        # Get incoming vehicles from inter-depot handoffs (per PRD Section 5.3)
+        incoming_vehicles = await self._get_incoming_vehicles(now, horizon_end)
+
+        # Integrate incoming vehicles into state
+        # Per PRD Section 8.1 Constraint 12: Add to vehicle_socs with expected_soc at arrival
+        for incoming in incoming_vehicles:
+            vehicle_id_str = str(incoming.vehicle_id)
+            # Add to vehicle_socs with expected_soc (will be fixed at arrival time)
+            vehicle_socs[vehicle_id_str] = incoming.expected_soc
+            # Add to vehicle_capacities if not present
+            if vehicle_id_str not in self.config.vehicle_capacities:
+                self.config.vehicle_capacities[vehicle_id_str] = incoming.battery_kwh
+            # Add to vehicle_max_charge_kw if not present
+            if vehicle_id_str not in self.config.vehicle_max_charge_kw:
+                self.config.vehicle_max_charge_kw[vehicle_id_str] = incoming.max_charge_kw
+            # Set availability: False before arrival, True after (per PRD Section 8.1 Constraint 12)
+            arrival_timestep = int((incoming.arrival_time - now).total_seconds() / (self.config.delta_t * 3600))
+            if 0 <= arrival_timestep < n_steps:
+                if vehicle_id_str not in availability:
+                    availability[vehicle_id_str] = [False] * n_steps
+                # Vehicle unavailable before arrival
+                for t in range(min(arrival_timestep, n_steps)):
+                    availability[vehicle_id_str][t] = False
+                # Vehicle available after arrival
+                for t in range(arrival_timestep, n_steps):
+                    availability[vehicle_id_str][t] = True
 
         state = DepotState(
             vehicle_socs=vehicle_socs,
@@ -161,6 +188,7 @@ class StateAssembler:
             energy_requirements=energy_requirements,
             departure_times=departure_times,
             building_power=building_power,
+            incoming_vehicles=incoming_vehicles,
         )
 
         assembly_time = time.time() - start_time
@@ -482,10 +510,165 @@ class StateAssembler:
             List of building power in kW, one per timestep
 
         Note:
-            For MVP, returns zero. Future: query from building_loads table.
+            Per PRD Section 9.4, building load is REQUIRED for accurate grid power calculation.
+            Queries building_load table with fallback to forecast model if meter unavailable.
         """
-        # TODO: Query from building_loads table when implemented
-        return [0.0] * n_steps
+        query = """
+        SELECT time, power_kw
+        FROM building_load
+        WHERE depot_id = $1 AND time >= $2 AND time < $3
+        ORDER BY time
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id, start, end)
+        except asyncpg.PostgresError as e:
+            logger.warning(
+                f"Database error fetching building load for depot {self.depot_id}: {e}. "
+                "Using forecast model fallback."
+            )
+            # Fallback to forecast model (simplified: use average pattern)
+            return self._get_building_power_forecast(start, end, n_steps)
+
+        if not rows:
+            logger.warning(
+                f"No building load data found for depot {self.depot_id} "
+                f"between {start} and {end}, using forecast model"
+            )
+            return self._get_building_power_forecast(start, end, n_steps)
+
+        # Build time-indexed power map
+        power_map = {row['time']: float(row['power_kw']) for row in rows}
+
+        # Generate power for each timestep with interpolation
+        delta_t = timedelta(hours=self.config.delta_t)
+        building_power = []
+        last_power = 0.0  # Default fallback
+
+        for t in range(n_steps):
+            step_time = start + t * delta_t
+
+            # Find closest power reading (exact match or forward-fill)
+            if step_time in power_map:
+                last_power = power_map[step_time]
+            # Forward-fill: use last known power if within 30 minutes (per PRD Section 5.3)
+            elif power_map:
+                closest_time = min(
+                    power_map.keys(),
+                    key=lambda x: abs((x - step_time).total_seconds()),
+                )
+                time_diff = abs((closest_time - step_time).total_seconds())
+                if time_diff < 1800:  # Within 30 minutes
+                    last_power = power_map[closest_time]
+
+            building_power.append(last_power)
+
+        logger.debug(
+            f"Building load interpolation: {len(power_map)} data points -> "
+            f"{len(building_power)} timesteps, avg={sum(building_power)/len(building_power):.1f}kW"
+        )
+        return building_power[:n_steps]
+
+    def _get_building_power_forecast(
+        self, start: datetime, end: datetime, n_steps: int
+    ) -> list[float]:
+        """Forecast building load using simplified pattern (fallback).
+
+        Per PRD Section 9.4, if meter unavailable, use forecast model.
+        This is a simplified implementation - production would use historical patterns.
+
+        Args:
+            start: Start time
+            end: End time
+            n_steps: Number of timesteps
+
+        Returns:
+            List of forecasted building power in kW
+        """
+        # Simplified forecast: higher during business hours (8 AM - 6 PM)
+        building_power = []
+        delta_t = timedelta(hours=self.config.delta_t)
+
+        for t in range(n_steps):
+            step_time = start + t * delta_t
+            hour = step_time.hour
+
+            # Business hours pattern: 50-80 kW during day, 20 kW baseline
+            if 8 <= hour < 18:
+                power = 50.0 + (hour - 8) * 3  # 50-80 kW
+            else:
+                power = 20.0  # Baseline
+
+            building_power.append(power)
+
+        logger.info(
+            f"Using building load forecast (meter unavailable): "
+            f"avg={sum(building_power)/len(building_power):.1f}kW"
+        )
+        return building_power
+
+    async def _get_incoming_vehicles(
+        self, start: datetime, end: datetime
+    ) -> list[IncomingVehicle]:
+        """Get incoming vehicles from inter-depot handoffs.
+
+        Per PRD Section 5.3, queries pending inter-depot arrivals where
+        arrival_time < horizon_end.
+
+        Args:
+            start: Start time of optimization horizon
+            end: End time of optimization horizon
+
+        Returns:
+            List of IncomingVehicle objects
+
+        Note:
+            Only includes vehicles with status='acknowledged' or 'pending'
+            that arrive within the optimization horizon.
+        """
+        query = """
+        SELECT 
+            vehicle_id,
+            (SELECT external_id FROM vehicles WHERE vehicle_id = im.vehicle_id) as external_id,
+            expected_soc,
+            arrival_time,
+            battery_kwh,
+            max_charge_kw,
+            origin_depot_id
+        FROM interdepot_messages im
+        WHERE dest_depot_id = $1
+          AND arrival_time >= $2
+          AND arrival_time < $3
+          AND status IN ('pending', 'acknowledged')
+        ORDER BY arrival_time
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, self.depot_id, start, end)
+
+            incoming_vehicles = []
+            for row in rows:
+                incoming = IncomingVehicle(
+                    vehicle_id=row['vehicle_id'],
+                    external_id=row['external_id'] or f"vehicle_{row['vehicle_id']}",
+                    expected_soc=float(row['expected_soc']),
+                    arrival_time=row['arrival_time'],
+                    battery_kwh=float(row['battery_kwh']),
+                    max_charge_kw=float(row['max_charge_kw']),
+                    origin_depot_id=row['origin_depot_id'],
+                )
+                incoming_vehicles.append(incoming)
+
+            if incoming_vehicles:
+                logger.info(
+                    f"Found {len(incoming_vehicles)} incoming vehicles from inter-depot handoffs"
+                )
+            return incoming_vehicles
+        except asyncpg.PostgresError as e:
+            logger.error(
+                f"Database error fetching incoming vehicles for depot {self.depot_id}: {e}"
+            )
+            return []
 
     @classmethod
     async def load_depot_config(
@@ -546,39 +729,39 @@ class StateAssembler:
             if row['ocpp_id']:
                 vehicle_to_ocpp[vid] = row['ocpp_id']
 
-        # Query chargers
+        # Query chargers - aggregate by rated_kw per PRD Section 8.3
         chargers_query = """
-        SELECT rated_kw, efficiency
+        SELECT rated_kw, efficiency, COUNT(*) as count
         FROM chargers
         WHERE depot_id = $1
+        GROUP BY rated_kw, efficiency
         ORDER BY rated_kw DESC
-        LIMIT 1
         """
         async with pool.acquire() as conn:
-            charger_row = await conn.fetchrow(chargers_query, depot_id_str)
+            charger_rows = await conn.fetch(chargers_query, depot_id_str)
 
-        if charger_row:
-            charger_power = float(charger_row['rated_kw'])
-            charger_efficiency = float(charger_row['efficiency'])
-        else:
-            # Defaults if no chargers found
+        if not charger_rows:
             logger.warning(f"No chargers found for depot {depot_id_str}, using defaults")
-            charger_power = 80.0
+            charger_groups = {80.0: 1}  # Default: 1 charger at 80kW
             charger_efficiency = 0.95
-
-        # Count chargers
-        n_chargers_query = """
-        SELECT COUNT(*) as count
-        FROM chargers
-        WHERE depot_id = $1
-        """
-        async with pool.acquire() as conn:
-            n_chargers_row = await conn.fetchrow(n_chargers_query, depot_id_str)
-        n_chargers = int(n_chargers_row['count']) if n_chargers_row else 0
+        else:
+            # Build charger_groups dict: rated_kw -> count
+            charger_groups = {}
+            charger_efficiency = None
+            for row in charger_rows:
+                rated_kw = float(row['rated_kw'])
+                count = int(row['count'])
+                charger_groups[rated_kw] = count
+                # Use efficiency from first charger (assumed uniform per PRD)
+                if charger_efficiency is None:
+                    charger_efficiency = float(row['efficiency'])
+            
+            if charger_efficiency is None:
+                charger_efficiency = 0.95  # Default
 
         # Query battery storage
         battery_query = """
-        SELECT capacity_kwh, max_power_kw
+        SELECT capacity_kwh, max_power_kw, efficiency, soc_min, soc_max
         FROM battery_storage
         WHERE depot_id = $1
         LIMIT 1
@@ -589,25 +772,65 @@ class StateAssembler:
         if battery_row:
             battery_capacity = float(battery_row['capacity_kwh'])
             battery_power = float(battery_row['max_power_kw'])
+            battery_efficiency = float(battery_row.get('efficiency', 0.92))
+            battery_soc_min = float(battery_row.get('soc_min', 0.2))
+            battery_soc_max = float(battery_row.get('soc_max', 0.8))
         else:
             # Defaults if no battery found
             logger.warning(f"No battery storage found for depot {depot_id_str}, using defaults")
             battery_capacity = 0.0
             battery_power = 0.0
+            battery_efficiency = 0.92
+            battery_soc_min = 0.2
+            battery_soc_max = 0.8
+
+        # Query charger-vehicle accessibility (per PRD Section 6.1)
+        access_query = """
+        SELECT charger_id::text, vehicle_id::text
+        FROM charger_vehicle_access
+        WHERE charger_id IN (
+            SELECT charger_id FROM chargers WHERE depot_id = $1
+        )
+        AND is_accessible = TRUE
+        """
+        async with pool.acquire() as conn:
+            access_rows = await conn.fetch(access_query, depot_id_str)
+
+        # Build charger_vehicle_access dict: charger_id -> set of vehicle_ids
+        charger_vehicle_access = {}
+        for row in access_rows:
+            charger_id = row['charger_id']
+            vehicle_id = row['vehicle_id']
+            if charger_id not in charger_vehicle_access:
+                charger_vehicle_access[charger_id] = set()
+            charger_vehicle_access[charger_id].add(vehicle_id)
+
+        # Build vehicle_max_charge_kw dict
+        vehicle_max_charge_kw = {}
+        for row in vehicle_rows:
+            vid = row['vehicle_id']
+            vehicle_max_charge_kw[vid] = float(row['max_charge_kw'])
 
         config = DepotConfig(
             vehicle_capacities=vehicle_capacities,
-            charger_power=charger_power,
+            vehicle_max_charge_kw=vehicle_max_charge_kw,
+            charger_groups=charger_groups,
             charger_efficiency=charger_efficiency,
-            n_chargers=n_chargers,
+            charger_vehicle_access=charger_vehicle_access,
             battery_capacity=battery_capacity,
             battery_power=battery_power,
+            battery_efficiency=battery_efficiency,
+            battery_soc_min=battery_soc_min,
+            battery_soc_max=battery_soc_max,
             max_site_power=max_site_power,
+            delta_t=0.25,  # 15 minutes per PRD
+            n_timesteps=96,  # 24 hours
         )
 
+        total_chargers = sum(charger_groups.values())
         logger.info(
             f"Loaded depot config: {len(vehicle_capacities)} vehicles, "
-            f"{n_chargers} chargers, {battery_capacity} kWh battery"
+            f"{total_chargers} chargers ({charger_groups}), {battery_capacity} kWh battery"
         )
 
         return config, vehicle_to_ocpp

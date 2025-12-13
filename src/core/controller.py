@@ -1,6 +1,6 @@
 """Main control loop for depot optimization.
 
-Reference: Development plan Step 5.2, PRD.md#5-system-architecture
+Reference: Development plan Step 5.2, PRD_v2.md#5-system-architecture
 """
 
 from __future__ import annotations
@@ -299,8 +299,8 @@ class DepotController:
                 )
 
                 logger.info(
-                    f"Optimization complete. Objective: ${result.objective_value:.2f}, "
-                    f"solve time: {result.solve_time:.2f}s, "
+                    f"Optimization complete ({result.solver_used}). Objective: ${result.objective_value:.2f}, "
+                    f"solve time: {result.solve_time_s:.2f}s, "
                     f"total duration: {optimization_duration:.2f}s"
                 )
                 return result
@@ -609,14 +609,15 @@ class DepotController:
                 trigger_reason,
                 horizon_start,
                 horizon_end,
-                result.solve_time,
+                result.solve_time_s,
                 result.objective_value,
-                result.peak_demand,
+                result.peak_demand_kw,
                 result.status,
                 json.dumps({
                     'schedule': result.schedule,
                     'battery_dispatch': result.battery_dispatch,
                     'grid_power': result.grid_power,
+                    'solver_used': result.solver_used,
                 }),
             )
 

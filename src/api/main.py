@@ -1,6 +1,6 @@
 """FastAPI REST API application.
 
-Reference: PRD.md#7-api-specifications
+Reference: PRD_v2.md#7-api-specifications
 """
 
 import asyncio
@@ -13,6 +13,7 @@ from typing import Optional
 from uuid import UUID
 
 import asyncpg
+import httpx
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -222,7 +223,7 @@ app = FastAPI(
     - Inter-depot vehicle handoff
     - System health monitoring
     
-    Reference: PRD.md#7-api-specifications
+    Reference: PRD_v2.md#7-api-specifications
     """,
     lifespan=lifespan,
     tags_metadata=[
@@ -259,7 +260,7 @@ app.add_middleware(
 class OptimizationRequest(BaseModel):
     """Request to run optimization.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
 
     depot_id: str = Field(
@@ -293,15 +294,16 @@ class OptimizationRequest(BaseModel):
 class OptimizationResponse(BaseModel):
     """Optimization result response.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
 
     run_id: str = Field(..., description="Optimization run identifier (UUID)")
     depot_id: str = Field(..., description="Depot identifier (UUID)")
-    status: str = Field(..., description="Optimization status (e.g., 'completed')")
+    status: str = Field(..., description="Optimization status: 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'")
     objective_value: float = Field(..., description="Optimized objective value ($)")
     solve_time_seconds: float = Field(..., ge=0, description="Solver execution time (seconds)")
     peak_demand_kw: float = Field(..., ge=0, description="Peak demand in kW")
+    solver_used: str = Field(default='gurobi', description="Solver used: 'gurobi' or 'highs'")
     schedule: dict = Field(
         ...,
         description="Charging schedule per vehicle",
@@ -317,7 +319,7 @@ class OptimizationResponse(BaseModel):
 class DepotStateResponse(BaseModel):
     """Depot state response.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
 
     depot_id: str = Field(..., description="Depot identifier (UUID)")
@@ -351,7 +353,7 @@ class DepotStateResponse(BaseModel):
 class ScheduleResponse(BaseModel):
     """Schedule response.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
 
     depot_id: str = Field(..., description="Depot identifier (UUID)")
@@ -380,7 +382,8 @@ class ScheduleResponse(BaseModel):
 class HandoffRequest(BaseModel):
     """Inter-depot handoff request.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
+    Per PRD Section 5.4, must include battery_kwh and max_charge_kw.
     """
 
     dest_depot_id: str = Field(
@@ -399,6 +402,10 @@ class HandoffRequest(BaseModel):
         description="Expected arrival time (ISO 8601)",
         examples=["2025-12-04T14:30:00Z"]
     )
+    battery_kwh: float = Field(
+        ..., gt=0, description="Vehicle battery capacity (kWh)"
+    )
+    max_charge_kw: float = Field(..., gt=0, description="Vehicle max charge rate (kW)")
 
     @field_validator('dest_depot_id')
     @classmethod
@@ -414,7 +421,7 @@ class HandoffRequest(BaseModel):
 class HandoffResponse(BaseModel):
     """Inter-depot handoff response.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
 
     message_id: str = Field(..., description="Handoff message identifier (UUID)")
@@ -709,7 +716,7 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
     - 500: Optimization failed (infeasible, timeout)
     - 503: Database not available
     
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
     responses={
         400: {"model": ErrorResponse, "description": "Invalid request"},
@@ -721,7 +728,7 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
 async def run_optimization(request: OptimizationRequest):
     """Trigger depot charging optimization.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
     if not db_pool:
         raise DatabaseError("Database not available")
@@ -782,8 +789,9 @@ async def run_optimization(request: OptimizationRequest):
                 "depot_id": request.depot_id,
                 "run_id": str(result.run_id),
                 "objective_value": result.objective_value,
-                "solve_time": result.solve_time,
-                "peak_demand": result.peak_demand,
+                "solve_time_s": result.solve_time_s,
+                "peak_demand_kw": result.peak_demand_kw,
+                "solver_used": result.solver_used,
             }
         )
 
@@ -792,8 +800,9 @@ async def run_optimization(request: OptimizationRequest):
             depot_id=request.depot_id,
             status=result.status,
             objective_value=result.objective_value,
-            solve_time_seconds=result.solve_time,
-            peak_demand_kw=result.peak_demand,
+            solve_time_seconds=result.solve_time_s,
+            peak_demand_kw=result.peak_demand_kw,
+            solver_used=result.solver_used,
             schedule=result.schedule,
         )
 
@@ -841,7 +850,7 @@ async def run_optimization(request: OptimizationRequest):
     - 500: Server error
     - 503: Database not available
     
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
     responses={
         404: {"model": ErrorResponse, "description": "Depot not found"},
@@ -852,7 +861,7 @@ async def run_optimization(request: OptimizationRequest):
 async def get_depot_state(depot_id: str):
     """Get current depot state.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
     if not db_pool:
         raise DatabaseError("Database not available")
@@ -932,7 +941,7 @@ async def get_depot_state(depot_id: str):
     - 500: Server error
     - 503: Database not available
     
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
     responses={
         404: {"model": ErrorResponse, "description": "No schedule found"},
@@ -943,7 +952,7 @@ async def get_depot_state(depot_id: str):
 async def get_depot_schedule(depot_id: str):
     """Get current charging schedule.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
     if not db_pool:
         raise DatabaseError("Database not available")
@@ -1053,7 +1062,7 @@ async def get_depot_schedule(depot_id: str):
     - 500: Server error
     - 503: Database not available
     
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
     responses={
         400: {"model": ErrorResponse, "description": "Invalid request"},
@@ -1066,7 +1075,7 @@ async def send_handoff(
 ):
     """Send inter-depot handoff message.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
     if not db_pool:
         raise DatabaseError("Database not available")
@@ -1078,14 +1087,37 @@ async def send_handoff(
 
     try:
         from uuid import uuid4
+        import httpx
 
         message_id = uuid4()
+        departure_time = datetime.utcnow()
 
+        # Get vehicle details for handoff message
+        vehicle_query = """
+        SELECT external_id, battery_kwh, max_charge_kw
+        FROM vehicles
+        WHERE vehicle_id = $1 AND depot_id = $2
+        """
+        async with db_pool.acquire() as conn:
+            vehicle_row = await conn.fetchrow(vehicle_query, vehicle_id, depot_id)
+
+        if not vehicle_row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Vehicle {vehicle_id} not found in depot {depot_id}"
+            )
+
+        external_id = vehicle_row['external_id']
+        # Use request values (required per PRD Section 5.4), fall back to vehicle table if not provided
+        battery_kwh = getattr(request, 'battery_kwh', None) or float(vehicle_row['battery_kwh'])
+        max_charge_kw = getattr(request, 'max_charge_kw', None) or float(vehicle_row['max_charge_kw'])
+
+        # Store message in database with status='pending'
         query = """
         INSERT INTO interdepot_messages
             (message_id, origin_depot_id, dest_depot_id, vehicle_id,
-             departure_time, expected_soc, arrival_time)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+             departure_time, expected_soc, arrival_time, battery_kwh, max_charge_kw, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         """
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -1094,20 +1126,70 @@ async def send_handoff(
                 depot_id,
                 request.dest_depot_id,
                 vehicle_id,
-                datetime.utcnow(),
+                departure_time,
                 request.expected_soc,
                 request.arrival_time,
+                battery_kwh,
+                max_charge_kw,
+                'pending',
             )
 
-        logger.info(
-            "Handoff message sent",
-            extra={
-                "message_id": str(message_id),
-                "origin_depot_id": depot_id,
-                "dest_depot_id": request.dest_depot_id,
-                "vehicle_id": vehicle_id,
-            }
+        # Call destination depot's receive endpoint (per PRD Section 5.4)
+        # Get destination depot endpoint from environment or config
+        dest_depot_endpoint = os.getenv(
+            f"DEPOT_{request.dest_depot_id}_ENDPOINT",
+            os.getenv("DEFAULT_DEPOT_ENDPOINT", "http://localhost:8000")
         )
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                receive_url = f"{dest_depot_endpoint}/depots/{request.dest_depot_id}/handoff/receive"
+                receive_payload = {
+                    "message_id": str(message_id),
+                    "origin_depot_id": depot_id,
+                    "vehicle_id": vehicle_id,
+                    "external_id": external_id,
+                    "expected_soc": request.expected_soc,
+                    "arrival_time": request.arrival_time.isoformat(),
+                    "battery_kwh": battery_kwh,
+                    "max_charge_kw": max_charge_kw,
+                }
+                response = await client.post(receive_url, json=receive_payload)
+                response.raise_for_status()
+                ack_data = response.json()
+
+                # Update message status to 'acknowledged'
+                update_query = """
+                UPDATE interdepot_messages
+                SET status = 'acknowledged', acknowledged_at = $1
+                WHERE message_id = $2
+                """
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        update_query,
+                        datetime.fromisoformat(ack_data['acknowledged_at'].replace('Z', '+00:00')),
+                        message_id,
+                    )
+
+                logger.info(
+                    "Handoff message sent and acknowledged",
+                    extra={
+                        "message_id": str(message_id),
+                        "origin_depot_id": depot_id,
+                        "dest_depot_id": request.dest_depot_id,
+                        "vehicle_id": vehicle_id,
+                    }
+                )
+        except httpx.RequestError as e:
+            logger.warning(
+                f"Failed to call destination depot receive endpoint: {e}. "
+                "Message stored locally but not acknowledged.",
+                extra={
+                    "message_id": str(message_id),
+                    "dest_depot_id": request.dest_depot_id,
+                }
+            )
+            # Message is stored but not acknowledged - will be retried or handled manually
 
         return HandoffResponse(message_id=str(message_id), status="sent")
 
@@ -1127,6 +1209,178 @@ async def send_handoff(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to send handoff: {str(e)}"
+        )
+
+
+class HandoffReceiveRequest(BaseModel):
+    """Request to receive inter-depot handoff message.
+
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
+    """
+
+    message_id: Optional[str] = Field(
+        None, description="Message identifier (UUID, optional)"
+    )
+    origin_depot_id: str = Field(
+        ..., description="Origin depot identifier (UUID)"
+    )
+    vehicle_id: str = Field(..., description="Vehicle identifier (UUID)")
+    external_id: str = Field(..., description="Vehicle external ID (e.g., 'bus_101')")
+    expected_soc: float = Field(
+        ..., ge=0.0, le=1.0, description="Expected SoC at arrival (0.0-1.0)"
+    )
+    arrival_time: datetime = Field(..., description="Expected arrival time (ISO 8601)")
+    battery_kwh: float = Field(..., gt=0, description="Vehicle battery capacity (kWh)")
+    max_charge_kw: float = Field(..., gt=0, description="Vehicle max charge rate (kW)")
+
+    @field_validator('origin_depot_id', 'vehicle_id')
+    @classmethod
+    def validate_uuid(cls, v: str) -> str:
+        """Validate UUID format."""
+        try:
+            UUID(v)
+            return v
+        except ValueError:
+            raise ValueError(f"Must be a valid UUID, got: {v}")
+
+
+class HandoffReceiveResponse(BaseModel):
+    """Response to handoff receive request.
+
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
+    """
+
+    status: str = Field(..., description="Status: 'acknowledged'")
+    message_id: str = Field(..., description="Message identifier (UUID)")
+    acknowledged_at: datetime = Field(..., description="Acknowledgment timestamp")
+
+
+@app.post(
+    "/depots/{depot_id}/handoff/receive",
+    response_model=HandoffReceiveResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["depots"],
+    summary="Receive inter-depot handoff message",
+    description="""
+    Receive a handoff message from another depot when a vehicle is en route.
+    The destination depot stores the message and incorporates the vehicle
+    into the next optimization run.
+    
+    **Request:**
+    - `origin_depot_id`: Origin depot identifier (UUID)
+    - `vehicle_id`: Vehicle identifier (UUID)
+    - `external_id`: Vehicle external ID
+    - `expected_soc`: Expected SoC at arrival (0.0-1.0)
+    - `arrival_time`: Expected arrival time (ISO 8601)
+    - `battery_kwh`: Vehicle battery capacity (kWh)
+    - `max_charge_kw`: Vehicle max charge rate (kW)
+    
+    **Response:**
+    - `status`: 'acknowledged'
+    - `message_id`: Handoff message identifier (UUID)
+    - `acknowledged_at`: Acknowledgment timestamp
+    
+    **Error Codes:**
+    - 400: Invalid request (invalid UUID, invalid SoC)
+    - 500: Server error
+    - 503: Database not available
+    
+    Reference: PRD_v2.md#7-1-rest-api-endpoints, Section 5.4
+    """,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid request"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def receive_handoff(depot_id: str, request: HandoffReceiveRequest):
+    """Receive inter-depot handoff message.
+
+    Per PRD Section 5.4, the destination depot:
+    1. Validates the request
+    2. Stores message in interdepot_messages with status='acknowledged'
+    3. Returns acknowledgment with acknowledged_at timestamp
+
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
+    """
+    if not db_pool:
+        raise DatabaseError("Database not available")
+
+    # Validate UUIDs
+    validate_depot_id(depot_id)
+    validate_depot_id(request.origin_depot_id)
+    validate_vehicle_id(request.vehicle_id)
+
+    # Validate SoC range
+    if not (0.0 <= request.expected_soc <= 1.0):
+        raise HTTPException(
+            status_code=400,
+            detail=f"expected_soc must be between 0.0 and 1.0, got {request.expected_soc}"
+        )
+
+    try:
+        from uuid import uuid4
+
+        message_id = uuid4()
+        acknowledged_at = datetime.utcnow()
+
+        # Store message in database with status='acknowledged'
+        query = """
+        INSERT INTO interdepot_messages
+            (message_id, origin_depot_id, dest_depot_id, vehicle_id,
+             departure_time, expected_soc, arrival_time, battery_kwh,
+             max_charge_kw, status, acknowledged_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        """
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                query,
+                message_id,
+                request.origin_depot_id,
+                depot_id,
+                request.vehicle_id,
+                acknowledged_at,  # Use acknowledged_at as departure_time approximation
+                request.expected_soc,
+                request.arrival_time,
+                request.battery_kwh,
+                request.max_charge_kw,
+                'acknowledged',
+                acknowledged_at,
+            )
+
+        logger.info(
+            "Handoff message received and acknowledged",
+            extra={
+                "message_id": str(message_id),
+                "origin_depot_id": request.origin_depot_id,
+                "dest_depot_id": depot_id,
+                "vehicle_id": request.vehicle_id,
+                "external_id": request.external_id,
+            }
+        )
+
+        return HandoffReceiveResponse(
+            status="acknowledged",
+            message_id=str(message_id),
+            acknowledged_at=acknowledged_at,
+        )
+
+    except asyncpg.PostgresError as e:
+        logger.error(
+            f"Database error receiving handoff: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id, "vehicle_id": request.vehicle_id}
+        )
+        raise DatabaseError(f"Database error: {str(e)}")
+    except Exception as e:
+        logger.error(
+            f"Failed to receive handoff: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id, "vehicle_id": request.vehicle_id}
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to receive handoff: {str(e)}"
         )
 
 
@@ -1193,13 +1447,13 @@ async def check_ocpp_server_health() -> str:
     
     Always returns 200 status code with component details.
     
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
 )
 async def health_check():
     """Health check endpoint.
 
-    Reference: PRD.md#7-1-rest-api-endpoints
+    Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
     # Check component health
     db_status = await check_database_health()

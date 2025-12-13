@@ -137,7 +137,7 @@ class TestAssembledStateFeasibility:
         """Test that charger limit is respected at all times."""
         result = optimize(realistic_depot_state, depot_config, time_limit=60.0)
         
-        n_chargers = depot_config.n_chargers
+        n_chargers = sum(depot_config.charger_groups.values())  # Total charger count
         n_t = depot_config.n_timesteps
         
         for t in range(n_t):

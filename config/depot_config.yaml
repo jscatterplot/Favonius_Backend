@@ -1,5 +1,8 @@
 # Depot Configuration Template
 # Customize this file for each depot deployment
+#
+# Reference: PRD_v2.md Section 6.2 (DepotConfig dataclass)
+#            PRD_v2.md Section 8.3 (Charger Aggregation Strategy)
 
 depot:
   name: "Example Depot"
@@ -8,36 +11,49 @@ depot:
   longitude: -122.4194
   timezone: "America/Los_Angeles"
   utility_id: "PG&E"
-  max_grid_kw: 1000.0
+  max_grid_kw: 1000.0  # max_site_power (kW) - per PRD Section 8.1 Constraint 9
   demand_charge_rate_kw: 20.0  # $/kW per month
 
-chargers:
-  n_chargers: 10
-  rated_power_kw: 80.0
-  efficiency: 0.95
-  connector_type: "CCS"
+# Charger Configuration
+# Per PRD Section 8.3, chargers are aggregated by rated_kw for optimization
+# Format: rated_kw -> count of chargers with that rating
+charger_groups:
+  50.0: 3   # 3 chargers @ 50kW
+  80.0: 5   # 5 chargers @ 80kW
+  150.0: 2  # 2 chargers @ 150kW
 
+charger_efficiency: 0.95  # Uniform efficiency across all chargers (per PRD)
+connector_type: "CCS"  # MVP: CCS only (per PRD Section 3.2)
+
+# Battery Storage Configuration
+# Per PRD Section 8.1 Constraint 11 (Battery Dynamics)
 battery_storage:
   capacity_kwh: 500.0
   max_power_kw: 100.0
-  efficiency: 0.92
+  efficiency: 0.92  # Round-trip efficiency (per PRD Section 8.1)
   soc_min: 0.2
   soc_max: 0.8
 
+# Optimization Parameters
+# Per PRD Section 8.2 (Solver Configuration)
 optimization:
-  horizon_hours: 24
-  timestep_minutes: 15
-  solve_time_limit_seconds: 30.0
-  mip_rel_gap: 0.01
+  horizon_hours: 24  # 24-hour rolling horizon (per PRD Section 3.2)
+  timestep_minutes: 15  # 15-minute timestep (Δt) - per PRD Section 3.2
+  solve_time_limit_seconds: 60.0  # < 60 seconds per PRD Section 8.3
+  mip_rel_gap: 0.01  # 1% optimality gap (per PRD Section 8.2)
+  solver_primary: "gurobi"  # Primary solver (per PRD Section 8.2)
+  solver_fallback: "highs"  # Fallback solver (per PRD Section 8.2)
 
-# Example vehicle types
+# Vehicle Type Templates
+# Per PRD Section 6.1 (vehicles table schema)
+# Note: max_charge_kw can be overridden by OCPP MeterValues (per PRD Section 8.4)
 vehicle_types:
   bus_large:
     battery_kwh: 324.0
-    max_charge_kw: 80.0
+    max_charge_kw: 150.0  # Default, can be updated from OCPP
   bus_small:
     battery_kwh: 180.0
-    max_charge_kw: 50.0
+    max_charge_kw: 100.0
   van:
     battery_kwh: 100.0
     max_charge_kw: 50.0

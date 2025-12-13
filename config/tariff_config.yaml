@@ -1,5 +1,8 @@
 # Utility Tariff Configuration Template
 # Example: PG&E E-19 Rate Structure
+#
+# Reference: PRD_v2.md Section 9.3 (Price Data)
+#            PRD_v2.md Section 8.1 (Demand Charge Rate Resolution)
 
 utility:
   name: "PG&E"
@@ -7,8 +10,10 @@ utility:
   billing_period_days: 30
 
 # Time-of-Use (TOU) Rate Structure
+# Per PRD Section 9.3, TOU rates are used as fallback when CAISO unavailable
 tou_rates:
   # Peak period: 4 PM - 9 PM (weekdays)
+  # Per PRD Section 9.3: PG&E E-19 peak hours
   peak:
     hours: [16, 17, 18, 19, 20]  # 4 PM - 9 PM
     days: [0, 1, 2, 3, 4]  # Monday - Friday
@@ -16,6 +21,7 @@ tou_rates:
     demand_rate_kw: 20.0  # $/kW per month
 
   # Partial-peak period: 9 AM - 4 PM, 9 PM - 12 AM (weekdays)
+  # Per PRD Section 9.3: PG&E E-19 partial-peak hours
   partial_peak:
     hours: [9, 10, 11, 12, 13, 14, 15, 21, 22, 23]  # 9 AM - 4 PM, 9 PM - 12 AM
     days: [0, 1, 2, 3, 4]  # Monday - Friday
@@ -28,15 +34,19 @@ tou_rates:
     demand_rate_kw: 20.0  # $/kW per month
 
 # CAISO Day-Ahead Market (alternative to TOU)
+# Per PRD Section 9.3: CAISO OASIS integration
 caiso:
   enabled: true
-  default_node: "TH_SP15_GEN-APND"
+  default_node: "TH_SP15_GEN-APND"  # Example node - customize per depot
   fetch_interval_minutes: 15
   lookahead_hours: 24
+  # Update frequency: Daily at 10:00 AM PT (per PRD Section 9.3)
 
 # Demand charge calculation
+# Per PRD Section 8.1: Demand charge rate resolution
+# Priority: 1) prices.demand_kw (if not null), 2) depots.demand_charge_rate_kw
 demand_charge:
-  period_minutes: 15  # 15-minute demand charge period
-  rate_per_kw: 20.0  # $/kW per month
+  period_minutes: 15  # 15-minute demand charge period (matches optimization timestep)
+  rate_per_kw: 20.0  # $/kW per month (default, can be overridden by prices.demand_kw)
   reset_monthly: true
 

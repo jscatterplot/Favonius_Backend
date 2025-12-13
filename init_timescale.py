@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""TimescaleDB initialization script for Tiger Cloud."""
+"""TimescaleDB initialization script.
+
+Reference: PRD_v2.md Section 6.1 (Database Schema - TimescaleDB hypertables)
+           favonius_development_plan_v2.md Step 0.4
+"""
 
 import asyncio
 import os

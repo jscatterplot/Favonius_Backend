@@ -1,5 +1,6 @@
-# Multi-stage Docker build for EV Charging WebSocket Handler
-FROM python:3.11-slim as builder
+# Multi-stage Docker build for Favonius Energy EV Fleet Depot Optimization Platform
+# Per PRD_v2.md: Python 3.12, Pyomo + Gurobi (primary) with HiGHS fallback
+FROM python:3.12-slim as builder
 
 # Set build arguments
 ARG DEBIAN_FRONTEND=noninteractive
@@ -29,9 +30,11 @@ FROM python:3.11-slim as runtime
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Install runtime dependencies
+# Gurobi requires specific system libraries (per PRD Section 8.2)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r appuser && useradd -r -g appuser appuser
 
@@ -39,7 +42,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy Python packages from builder
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
@@ -75,4 +78,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 EXPOSE ${WEBSOCKET_PORT} ${METRICS_PORT} ${HEALTH_CHECK_PORT}
 
 # Run the application
-CMD ["python", "-m", "websocket_handler.main"]
+# Per PRD_v2.md Section 7.1: FastAPI REST API server
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

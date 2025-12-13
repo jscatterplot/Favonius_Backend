@@ -1,0 +1,56 @@
+# Optimization Implementation
+
+## Primary Implementation
+
+**Per PRD_v2.md Section 3.2 and Section 8.2**, the primary optimization implementation is:
+
+- **Language**: Python 3.12
+- **Modeling Library**: Pyomo
+- **Primary Solver**: Gurobi (commercial, high performance)
+- **Fallback Solver**: HiGHS (open-source, automatic fallback on Gurobi failure)
+
+**Location**: `src/core/optimizer/`
+
+**Reference**: PRD_v2.md Section 8 (Optimization Engine Specifications)
+
+## Julia Reference Implementation
+
+The `mip_solver.jl` file in this directory is a **reference implementation** using:
+
+- **Language**: Julia
+- **Modeling Library**: JuMP
+- **Solver**: HiGHS
+
+**Status**: This is a reference/prototype implementation and is **not** the primary production implementation. It may be useful for:
+- Algorithm validation
+- Performance benchmarking
+- Research/development purposes
+
+**Note**: The production system uses Python + Pyomo + Gurobi (with HiGHS fallback) as specified in PRD_v2.md Section 8.2.
+
+## Solver Configuration
+
+### Primary: Gurobi
+- Time limit: 60 seconds
+- MIP optimality gap: 1% (0.01)
+- Threads: 4 (adjustable)
+- Presolve: Aggressive (2)
+- NumericFocus: 3 (highest accuracy)
+- WarmStart: Enabled
+
+### Fallback: HiGHS
+- Time limit: 60 seconds
+- MIP relative gap: 1% (0.01)
+- Threads: 4 (adjustable)
+- Presolve: Enabled
+
+**Reference**: PRD_v2.md Section 8.2 (Solver Configuration)
+
+## Solver Reliability
+
+Per PRD Section 8.2, the system automatically falls back to HiGHS if Gurobi fails (license failure, connection issues, or solver errors). This ensures graceful degradation rather than complete system failure.
+
+The `solver_used` field in `OptimizationResult` tracks which solver was used for monitoring and analysis.
+
+**Reference**: PRD_v2.md Section 8.2 (Solver Selection Logic)
+

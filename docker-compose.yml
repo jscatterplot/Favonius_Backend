@@ -1,7 +1,71 @@
 version: '3.8'
 
 services:
-  # Main WebSocket handler service
+  # Main API service (FastAPI + Optimization Engine)
+  # Per PRD_v2.md Section 7.1: REST API endpoints
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ev-api
+    ports:
+      - "8000:8000"   # REST API (HTTPS in production per PRD Section 10.3)
+      - "9000:9000"   # OCPP WebSocket (WSS in production per PRD Section 10.3)
+      - "8080:8080"   # Metrics
+      - "8081:8081"   # Health checks
+    environment:
+      # Database configuration
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@timescaledb:5432/ev_charging
+      
+      # Gurobi license (required for primary solver per PRD Section 8.2)
+      GUROBI_LICENSE_FILE: /opt/gurobi/gurobi.lic
+      
+      # API configuration
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      OCPP_PORT: 9000
+      
+      # Optimization configuration (per PRD Section 8.2)
+      OPTIMIZATION_TIMEOUT: 60  # seconds
+      OPTIMIZATION_MIP_GAP: 0.01  # 1%
+      
+      # TLS configuration (required for production per PRD Section 10.3)
+      # TLS_CERT_PATH: /app/certs/server.crt
+      # TLS_KEY_PATH: /app/certs/server.key
+      # TLS_VERIFY_CLIENT: false
+      # REQUIRE_TLS: "true"
+      
+      # Monitoring
+      METRICS_PORT: 8080
+      HEALTH_CHECK_PORT: 8081
+      LOG_LEVEL: INFO
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./gurobi.lic:/opt/gurobi/gurobi.lic:ro  # Gurobi license file
+      # Uncomment for TLS certificates (required for production)
+      # - ./certs:/app/certs:ro
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+
+  # OCPP WebSocket handler service (legacy - may be merged with api service)
   websocket-handler:
     build:
       context: .
@@ -98,7 +162,7 @@ services:
       - '--web.enable-lifecycle'
     restart: unless-stopped
     depends_on:
-      - websocket-handler
+      - api
 
   # Grafana for monitoring dashboards (optional)
   grafana:
@@ -128,9 +192,9 @@ services:
       STEVE_DB_URL: jdbc:mysql://mysql:3306/stevedb
       STEVE_DB_USER: steve
       STEVE_DB_PASSWORD: changeme
-      STEVE_OCPP_SERVER_URL: ws://websocket-handler:9000/
+      STEVE_OCPP_SERVER_URL: ws://api:9000/
     depends_on:
-      - websocket-handler
+      - api
       - mysql
     restart: unless-stopped
     profiles: ["testing"]

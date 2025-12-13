@@ -1,6 +1,8 @@
 """Depot simulation for testing optimization.
 
-Reference: Development plan Step 6.1, PRD.md#11-acceptance-criteria
+Reference: PRD_v2.md Section 11.1 (MVP Acceptance Tests)
+           docs/SIMULATION.md
+           favonius_development_plan_v2.md Step 6.1
 """
 
 import asyncio
@@ -108,7 +110,9 @@ class DepotSimulator:
     Simulates vehicle charging, route operations, and energy consumption
     for testing optimization algorithms.
 
-    Reference: Development plan Step 6.1
+    Reference: PRD_v2.md Section 11.1 (MVP Acceptance Tests)
+               docs/SIMULATION.md
+               favonius_development_plan_v2.md Step 6.1
     """
 
     def __init__(
@@ -363,7 +367,8 @@ class DepotSimulator:
 
         # Update solve time metrics
         self.metrics.optimization_count += 1
-        self.metrics.total_solve_time += result.solve_time
+        # Per PRD Section 6.2: OptimizationResult uses solve_time_s field
+        self.metrics.total_solve_time += result.solve_time_s
         self.metrics.update_avg_solve_time()
 
         # Calculate energy cost from grid power and prices
@@ -378,11 +383,13 @@ class DepotSimulator:
         self.metrics.total_energy_cost += energy_cost
 
         # Update peak demand
-        if result.peak_demand > self.metrics.peak_demand_kw:
-            self.metrics.peak_demand_kw = result.peak_demand
+        # Per PRD Section 6.2: OptimizationResult uses peak_demand_kw field
+        if result.peak_demand_kw > self.metrics.peak_demand_kw:
+            self.metrics.peak_demand_kw = result.peak_demand_kw
 
         # Calculate demand charge cost
-        demand_cost = 20.0 * result.peak_demand  # $20/kW
+        # Per PRD Section 6.2: OptimizationResult uses peak_demand_kw field
+        demand_cost = 20.0 * result.peak_demand_kw  # $20/kW
         self.metrics.total_demand_cost += demand_cost
 
         # Check vehicle readiness at departures

@@ -1,6 +1,6 @@
 """OCPP WebSocket server for charge point connections.
 
-Reference: Development plan Step 3.1, PRD.md#9-1-ocpp-integration
+Reference: Development plan Step 3.1, PRD_v2.md#9-1-ocpp-integration
 """
 
 from __future__ import annotations
@@ -140,6 +140,7 @@ class OCPPServer:
         soc: float,
         power_kw: float,
         timestamp: datetime,
+        max_charge_kw: Optional[float] = None,
     ) -> None:
         """Handle meter values callback.
 
@@ -149,18 +150,28 @@ class OCPPServer:
             soc: State of charge (0.0-1.0)
             power_kw: Charging power in kW
             timestamp: Meter reading timestamp
+            max_charge_kw: Optional max charge rate from OCPP (kW) - per PRD Section 8.4
         """
         logger.debug(
             f"Meter values: {charge_point_id}, connector {connector_id}, "
             f"SoC={soc:.2f}, Power={power_kw:.2f}kW"
+            + (f", max_charge_kw={max_charge_kw:.2f}kW" if max_charge_kw else "")
         )
 
         # Call user-provided callback if available
         if self.on_meter_values:
             try:
-                await self.on_meter_values(
-                    charge_point_id, connector_id, soc, power_kw, timestamp
-                )
+                # Support both old signature (4 args) and new signature (5 args with max_charge_kw)
+                import inspect
+                sig = inspect.signature(self.on_meter_values)
+                if len(sig.parameters) >= 5:
+                    await self.on_meter_values(
+                        charge_point_id, connector_id, soc, power_kw, timestamp, max_charge_kw
+                    )
+                else:
+                    await self.on_meter_values(
+                        charge_point_id, connector_id, soc, power_kw, timestamp
+                    )
             except Exception as e:
                 logger.error(f"Error in meter values callback: {e}")
 
@@ -168,7 +179,7 @@ class OCPPServer:
         if self.pool:
             try:
                 await self._store_meter_values(
-                    charge_point_id, connector_id, soc, power_kw, timestamp
+                    charge_point_id, connector_id, soc, power_kw, timestamp, max_charge_kw
                 )
             except Exception as e:
                 logger.error(f"Error storing meter values: {e}")
@@ -180,8 +191,12 @@ class OCPPServer:
         soc: float,
         power_kw: float,
         timestamp: datetime,
+        max_charge_kw: Optional[float] = None,
     ) -> None:
         """Store meter values in database.
+        
+        Per PRD Section 8.4, if max_charge_kw is provided, it will be
+        dynamically updated in the vehicles table.
 
         Args:
             charge_point_id: Charge point identifier
@@ -189,20 +204,44 @@ class OCPPServer:
             soc: State of charge (0.0-1.0)
             power_kw: Charging power in kW
             timestamp: Meter reading timestamp
+            max_charge_kw: Optional max charge rate from OCPP (kW)
         """
         if not self.pool:
             return
 
-        # Note: This assumes a vehicle_id mapping exists
-        # In production, you'd look up vehicle_id from charge_point_id + connector_id
-        # For now, we'll use charge_point_id as a placeholder
-        query = """
-        INSERT INTO telemetry (time, vehicle_id, soc, charging_kw, is_plugged)
-        VALUES ($1, $2::uuid, $3, $4, $5)
-        ON CONFLICT DO NOTHING
-        """
-        # Use charge_point_id as vehicle_id placeholder (should be mapped properly)
-        vehicle_id = charge_point_id  # TODO: Map to actual vehicle_id
+        # Import telemetry storage function
+        from .telemetry import store_meter_values
+        
+        # Look up vehicle_id and charger_id
+        try:
+            async with self.pool.acquire() as conn:
+                # Get charger_id
+                charger_row = await conn.fetchrow(
+                    "SELECT charger_id FROM chargers WHERE ocpp_id = $1",
+                    charge_point_id
+                )
+                charger_id = charger_row['charger_id'] if charger_row else None
+                
+                # Get vehicle_id (simplified - should use proper mapping)
+                # TODO: Implement proper vehicle-charger mapping
+                vehicle_id = None  # Will be resolved in store_meter_values
+                
+        except Exception as e:
+            logger.debug(f"Could not resolve charger/vehicle IDs: {e}")
+            charger_id = None
+        
+        # Use centralized telemetry storage function
+        await store_meter_values(
+            self.pool,
+            charge_point_id,
+            connector_id,
+            soc,
+            power_kw,
+            timestamp,
+            vehicle_id=vehicle_id,
+            max_charge_kw=max_charge_kw,
+            charger_id=charger_id,
+        )
         is_plugged = power_kw > 0.1  # Consider plugged if charging
 
         try:

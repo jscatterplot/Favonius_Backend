@@ -1,7 +1,7 @@
 # OCPP Protocol Rules
 
 ## Reference
-Primary reference: PRD.md#9-1-ocpp-integration
+Primary reference: PRD_v2.md#9-1-ocpp-integration
 
 ## Protocol Versions
 
@@ -40,7 +40,9 @@ Charger status updates. Handle:
 Energy and SoC readings. Extract:
 - `SoC`: State of charge (0-100%, convert to 0.0-1.0)
 - `Power.Active.Import`: Charging power (W, convert to kW)
-- Store in TimescaleDB telemetry table (PRD Section 6.1)
+- `maxChargingRate`: Vehicle max charge rate (W, convert to kW) - if available from smart charging capable chargers
+- Store in TimescaleDB telemetry table with charger_id (PRD Section 6.1)
+- Update vehicle's effective max_charge_kw for optimization (PRD Section 8.4)
 
 ### SetChargingProfile
 Dispatch charging schedule from optimization. Structure:
@@ -89,13 +91,34 @@ When converting optimization results to OCPP SetChargingProfile:
 - Retry SetChargingProfile on failure
 - Store command status in `charging_commands` table (PRD Section 6.1)
 
+## Vehicle-Charger Mapping
+
+When a StartTransaction is received:
+1. Map OCPP `idTag` to `vehicle_id`:
+   - First, try matching `idTag` to `vehicles.id_tag` (if field exists)
+   - Otherwise, match `idTag` to `vehicles.external_id`
+2. Store the associated `charger_id` (from charge point identifier) in all telemetry entries for that transaction
+3. When MeterValues include `maxChargingRate`:
+   - Store in telemetry table with both `vehicle_id` and `charger_id`
+   - **CRITICAL**: Dynamically update `vehicles.max_charge_kw` in database (per PRD Section 8.4)
+   - Update vehicle's effective max_charge_kw for optimization
+   - This ensures data consistency and prevents stale max_charge_kw values
+
+## Vehicle Max Charge Rate Resolution
+
+Priority per PRD Section 8.4:
+1. **OCPP MeterValues** (highest priority): If reported within last 15 minutes, use this value
+2. **Vehicle config** (fallback): Use `max_charge_kw` from vehicles table
+3. **Charger rated_kw** (cap): Never exceed the charger's rated power
+
 ## Integration with Optimization
 
 After optimization completes:
 1. Convert schedule to SetChargingProfile format
-2. Send to each charger via OCPP
-3. Store command in `charging_commands` table
-4. Monitor for acceptance/rejection
+2. Allocate aggregated power to individual chargers (post-optimization allocation per PRD Section 8.3)
+3. Send SetChargingProfile to each charger via OCPP
+4. Store command in `charging_commands` table
+5. Monitor for acceptance/rejection
 
 Reference: PRD Section 5.3 (Data Flow)
 

@@ -1,7 +1,7 @@
 # API Specifications
 
 ## Reference
-This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD.md#7-api-specifications](PRD.md#7-api-specifications).
+This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD_v2.md#7-api-specifications](PRD_v2.md#7-api-specifications).
 
 ## REST API Endpoints
 
@@ -22,10 +22,11 @@ Trigger optimization for a depot.
 {
     "run_id": "uuid",
     "depot_id": "uuid",
-    "status": "completed",
+    "status": "optimal",
     "objective_value": 1234.56,
-    "solve_time_seconds": 12.3,
+    "solve_time_s": 12.3,
     "peak_demand_kw": 450.0,
+    "solver_used": "gurobi",
     "schedule": {
         "bus_1": {
             "charging_power": [0, 0, 80, 80, ...],
@@ -34,6 +35,23 @@ Trigger optimization for a depot.
     }
 }
 ```
+
+**Response Fields:**
+- `solver_used`: Which solver was used ('gurobi' or 'highs'). Tracks fallback events for monitoring.
+
+**Status Values:**
+- `optimal`: Optimal solution found
+- `feasible`: Feasible solution found (may have hit time limit)
+- `degraded`: Solution found with relaxed constraints (some vehicles may not reach target SoC)
+- `infeasible`: No feasible solution found
+- `timeout`: Optimization exceeded time limit
+
+**Solver Reliability:**
+- Primary solver: Gurobi (commercial, high performance)
+- Fallback solver: HiGHS (open-source, automatic fallback if Gurobi fails)
+- The `solver_used` field indicates which solver was used for this optimization
+- Fallback occurs automatically on Gurobi license failure or connection errors
+- See PRD Section 8.2 for detailed solver configuration
 
 **Error Codes:**
 - 400: Invalid request (missing depot_id, etc.)
@@ -56,7 +74,16 @@ Get current depot state.
     },
     "battery_soc": 0.55,
     "current_month_peak_kw": 380.0,
-    "current_price_kwh": 0.15
+    "current_price_kwh": 0.15,
+    "building_load_kw": 45.0,
+    "incoming_vehicles": [
+        {
+            "vehicle_id": "uuid",
+            "external_id": "bus_201",
+            "expected_soc": 0.35,
+            "arrival_time": "2025-12-04T14:30:00Z"
+        }
+    ]
 }
 ```
 
@@ -87,7 +114,9 @@ Send inter-depot handoff message.
 {
     "dest_depot_id": "uuid",
     "expected_soc": 0.35,
-    "arrival_time": "2025-12-04T14:30:00Z"
+    "arrival_time": "2025-12-04T14:30:00Z",
+    "battery_kwh": 324.0,
+    "max_charge_kw": 150.0
 }
 ```
 
@@ -96,6 +125,33 @@ Send inter-depot handoff message.
 {
     "message_id": "uuid",
     "status": "sent"
+}
+```
+
+---
+
+### POST /depots/{depot_id}/handoff/receive
+Receive inter-depot handoff message (called by origin depot).
+
+**Request:**
+```json
+{
+    "message_id": "uuid",
+    "origin_depot_id": "uuid",
+    "vehicle_id": "uuid",
+    "external_id": "bus_201",
+    "expected_soc": 0.35,
+    "arrival_time": "2025-12-04T14:30:00Z",
+    "battery_kwh": 324.0,
+    "max_charge_kw": 150.0
+}
+```
+
+**Response:**
+```json
+{
+    "status": "acknowledged",
+    "acknowledged_at": "2025-12-04T10:00:05Z"
 }
 ```
 
@@ -111,7 +167,9 @@ Health check endpoint.
     "timestamp": "2025-12-04T10:00:00Z",
     "components": {
         "database": "healthy",
-        "ocpp_server": "healthy"
+        "ocpp_server": "healthy",
+        "gurobi_license": "valid",
+        "highs_available": "true"
     }
 }
 ```
@@ -120,7 +178,7 @@ Health check endpoint.
 
 ## WebSocket API (OCPP)
 
-The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{charger_id}`.
+The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{ocpp_id}`.
 
 **Supported Messages:**
 
@@ -128,24 +186,25 @@ The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{charger
 |-----------|---------|---------|
 | CP → CS | BootNotification | Charger registration |
 | CP → CS | StatusNotification | Charger status updates |
-| CP → CS | MeterValues | Energy and SoC readings |
+| CP → CS | MeterValues | Energy, SoC, and max_charge_kw readings |
 | CP → CS | StartTransaction | Charging session start |
 | CP → CS | StopTransaction | Charging session end |
 | CS → CP | SetChargingProfile | Dispatch charging schedule |
 | CS → CP | RemoteStartTransaction | Initiate charging |
 | CS → CP | RemoteStopTransaction | Stop charging |
 
-For detailed OCPP integration specifications, see [PRD.md#9-1-ocpp-integration](PRD.md#9-1-ocpp-integration).
+For detailed OCPP integration specifications, see [PRD_v2.md#9-1-ocpp-integration](PRD_v2.md#9-1-ocpp-integration).
 
 ---
 
 ## Implementation Notes
 
 - All endpoints use FastAPI framework
-- Authentication: JWT tokens (future)
+- Authentication: JWT tokens (1 hour access, 24 hour refresh) - per PRD Section 10.3
+- TLS: Required for all exposed ports in production (PRD Section 10.3)
 - Error responses follow consistent format
 - Request/response logging included
 - OpenAPI schema auto-generated from FastAPI
 
-For complete specifications, see [PRD.md](PRD.md).
+For complete specifications, see [PRD_v2.md](PRD_v2.md).
 

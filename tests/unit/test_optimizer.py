@@ -247,7 +247,9 @@ def test_solution_satisfies_all_constraints(
     # Check charging power bounds
     for vehicle_id, schedule in result['schedule'].items():
         for power in schedule['charging_power']:
-            assert 0.0 <= power <= simple_depot_config.charger_power
+            # Get max charger power from charger_groups (single group assumed)
+            max_charger_power = list(simple_depot_config.charger_groups.keys())[0]
+            assert 0.0 <= power <= max_charger_power
 
     # Check peak demand
     assert result['peak_demand'] >= max(result['grid_power'])
@@ -473,7 +475,7 @@ def test_charger_capacity_constraint(simple_depot_state, simple_depot_config):
     model = build_optimization_model(simple_depot_state, simple_depot_config)
     result = solve_model(model)
 
-    n_chargers = simple_depot_config.n_chargers
+    n_chargers = sum(simple_depot_config.charger_groups.values())
 
     # Count active chargers per timestep
     for t in range(96):
@@ -1134,13 +1136,18 @@ class TestOptimizerEdgeCases:
         n_vehicles = 10
         n_chargers = 3
         
+        vehicle_ids = [f'bus_{i}' for i in range(n_vehicles)]
         config = DepotConfig(
-            vehicle_capacities={f'bus_{i}': 324.0 for i in range(n_vehicles)},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: n_chargers},
             charger_efficiency=0.95,
-            n_chargers=n_chargers,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
+            battery_efficiency=0.92,
+            battery_soc_min=0.2,
+            battery_soc_max=0.8,
             max_site_power=1000.0,
         )
         
@@ -1169,7 +1176,8 @@ class TestOptimizerEdgeCases:
                 1 for vid in result.schedule
                 if result.schedule[vid]['charging_power'][t] > 0.1
             )
-            assert charging_count <= n_chargers
+            total_chargers = sum(config.charger_groups.values())
+            assert charging_count <= total_chargers
 
     def test_all_vehicles_unavailable(self):
         """Test optimizer when all vehicles are unavailable (all on route)."""

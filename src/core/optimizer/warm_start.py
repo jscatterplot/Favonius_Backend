@@ -1,6 +1,6 @@
 """Warm-starting implementation for optimization models.
 
-Reference: Development plan Step 1.2, PRD Section 8.3
+Reference: Development plan Step 1.2, PRD_v2.md Section 8.5
 """
 
 from __future__ import annotations
@@ -135,8 +135,8 @@ def warm_start_model(
                     model.P_grid[t].value = max(0.0, grid_power)
 
     # Initialize peak demand
-    if previous_result.peak_demand is not None:
-        model.P_peak.value = max(0.0, previous_result.peak_demand)
+    if previous_result.peak_demand_kw is not None:
+        model.P_peak.value = max(0.0, previous_result.peak_demand_kw)
 
     logger.info("Warm-start initialization complete")
 

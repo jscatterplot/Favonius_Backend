@@ -44,7 +44,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         priority_charging_manager: Optional[Any] = None,
         external_control_manager: Optional[Any] = None,
         certificate_manager: Optional[CertificateManager] = None,
-        v2x_controller: Optional[Any] = None
+        # v2x_controller removed - out of scope for MVP per PRD Section 1.2
     ):
         """Initialize enhanced charge point with V2G capabilities."""
         super().__init__(station_id, connection)
@@ -59,7 +59,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.priority_charging_manager = priority_charging_manager
         self.external_control_manager = external_control_manager
         self.certificate_manager = certificate_manager
-        self.v2x_controller = v2x_controller
+        # V2X removed - out of scope for MVP
         
         # Station state
         self.station_info: Optional[Dict] = None

@@ -53,7 +53,7 @@ favonius-platform/
 │   │   ├── models.py           # Data classes (DepotState, DepotConfig, etc.)
 │   │   ├── optimizer/          # MILP optimization engine
 │   │   │   ├── milp_model.py   # Pyomo model definition
-│   │   │   ├── solver.py       # Gurobi solver wrapper
+│   │   │   ├── solver.py       # Gurobi solver wrapper with HiGHS fallback
 │   │   │   └── allocator.py    # Post-optimization charger allocation
 │   │   ├── surrogate/          # Energy consumption model
 │   │   └── state/              # State assembler
@@ -64,6 +64,7 @@ favonius-platform/
 │   │   ├── building_load/      # Building load meter/API
 │   │   └── handoff/            # Inter-depot handoff manager
 │   ├── triggers/               # Re-optimization trigger monitor
+│   ├── security/               # Security modules (validators, auth, rate limiting)
 │   ├── api/                    # FastAPI REST endpoints
 │   └── db/                     # Database models & migrations
 ├── tests/
@@ -94,7 +95,8 @@ favonius-platform/
 
 | Component | Package | Purpose |
 |-----------|---------|---------|
-| **Optimization** | `gurobipy` | Gurobi MILP solver |
+| **Optimization** | `gurobipy` | Gurobi MILP solver (primary) |
+| **Optimization** | `highspy` or `appsi_highs` | HiGHS MILP solver (fallback) |
 | **Modeling** | `pyomo` | Algebraic modeling language |
 | **ML/Surrogate** | `scikit-learn`, `gpytorch` | Gaussian Process, MLP |
 | **API** | `fastapi`, `uvicorn` | REST API server |
@@ -109,12 +111,15 @@ favonius-platform/
 # Using uv (recommended)
 uv init favonius-platform
 cd favonius-platform
-uv add pyomo gurobipy scikit-learn gpytorch fastapi uvicorn asyncpg sqlalchemy
-uv add ocpp pandas polars openmeteo-requests httpx
+uv add pyomo gurobipy highspy scikit-learn gpytorch fastapi uvicorn asyncpg sqlalchemy
+uv add ocpp pandas polars openmeteo-requests httpx pyjwt cryptography
 uv add --dev pytest pytest-asyncio pytest-cov ruff mypy
 
-# Verify Gurobi license
+# Verify Gurobi license (primary solver)
 python -c "import gurobipy as gp; print(f'Gurobi {gp.gurobi.version()}')"
+
+# Verify HiGHS availability (fallback solver)
+python -c "import pyomo.environ as pyo; solver = pyo.SolverFactory('appsi_highs'); print('HiGHS available')"
 ```
 
 **Verification:**
@@ -466,6 +471,7 @@ class OptimizationResult:
     objective_value: float
     solve_time_s: float
     status: str  # 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'
+    solver_used: str = 'gurobi'  # 'gurobi' or 'highs' - tracks which solver was used
 ```
 
 **Verification:**
@@ -690,9 +696,10 @@ def solve_model(
     warm_start: bool = True,
     allow_degraded: bool = True,
 ) -> OptimizationResult:
-    """Solve the optimization model using Gurobi.
+    """Solve the optimization model using Gurobi with HiGHS fallback.
 
     See PRD_v2.md Section 8.2 for solver configuration.
+    Implements automatic fallback to HiGHS if Gurobi fails for reliability.
     See PRD_v2.md Section 8.5.1 for infeasibility handling.
 
     Args:
@@ -791,6 +798,7 @@ def solve_model(
             objective_value=pyo.value(model.objective),
             solve_time_s=result.solver.time if hasattr(result.solver, 'time') else 0.0,
             status=status,
+            solver_used=solver_used,  # Track which solver was used for monitoring
         )
     else:
         # Never silently fail - log and return error result
@@ -804,6 +812,7 @@ def solve_model(
             objective_value=float('inf'),
             solve_time_s=result.solver.time if hasattr(result.solver, 'time') else 0.0,
             status=status,
+            solver_used=solver_used or 'unknown',  # Track solver attempt
         )
 
 
@@ -1369,6 +1378,9 @@ class OCPPHandler:
 
         If max_charge_kw is reported, it's stored and takes precedence
         over static config for optimization.
+        
+        Per PRD Section 8.4, this value must be dynamically updated
+        in the vehicles table for consistency.
         """
         # Store telemetry (charger_id tracks which charger reported this)
         await self.db.execute(
@@ -1383,6 +1395,49 @@ class OCPPHandler:
         if vehicle_id and max_charge_kw:
             self._recent_max_charge_kw[str(vehicle_id)] = (max_charge_kw, timestamp)
             logger.debug(f"Vehicle {vehicle_id} max_charge_kw from OCPP: {max_charge_kw}")
+            
+            # CRITICAL: Update vehicles table dynamically (per PRD Section 8.4)
+            # This ensures data consistency and prevents stale max_charge_kw in DB
+            await self._update_vehicle_max_charge_kw(vehicle_id, max_charge_kw, timestamp)
+    
+    async def _update_vehicle_max_charge_kw(
+        self,
+        vehicle_id: UUID,
+        max_charge_kw: float,
+        timestamp: datetime,
+    ) -> None:
+        """Update vehicle's max_charge_kw in database from OCPP MeterValues.
+        
+        This ensures the vehicles table reflects the most recent OCPP-reported
+        value, maintaining data consistency for optimization.
+        
+        Per PRD Section 8.4, OCPP values take precedence over static config.
+        """
+        try:
+            await self.db.execute(
+                """
+                UPDATE vehicles
+                SET max_charge_kw = $1
+                WHERE vehicle_id = $2
+                  AND (
+                    -- Only update if OCPP value is newer than last update
+                    -- or if current value is from config (no OCPP update yet)
+                    max_charge_kw IS NULL
+                    OR max_charge_kw != $1
+                  )
+                """,
+                max_charge_kw, vehicle_id
+            )
+            logger.info(
+                f"Updated vehicle {vehicle_id} max_charge_kw to {max_charge_kw} kW "
+                f"from OCPP MeterValues at {timestamp}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to update vehicle {vehicle_id} max_charge_kw: {e}",
+                exc_info=True
+            )
+            # Don't raise - telemetry is stored, update is best-effort
     
     def get_effective_max_charge_kw(
         self,
@@ -1420,9 +1475,24 @@ class OCPPHandler:
 
 ## PHASE 4.5: SECURITY & INPUT VALIDATION
 
-### Step 4.5.1: Input Validation Middleware
+### Step 4.5.1: Security Folder Structure
 
-Create `src/api/validation.py`:
+Create `src/security/` directory for security-related modules:
+
+```
+src/security/
+├── __init__.py
+├── validators.py      # Input validation (UUIDs, SoC, power limits)
+├── auth.py            # JWT authentication (per PRD Section 10.3)
+├── rate_limiter.py    # Rate limiting (per PRD Section 10.4)
+└── secrets.py         # Secrets management helpers
+```
+
+This centralizes security code for better maintainability and follows reliability engineering principles.
+
+### Step 4.5.2: Input Validation Middleware
+
+Create `src/security/validators.py`:
 
 ```python
 """Input validation for API endpoints.
@@ -1517,9 +1587,9 @@ def sanitize_sql_identifier(value: str) -> str:
     return value
 ```
 
-### Step 4.5.2: Rate Limiting
+### Step 4.5.3: Rate Limiting
 
-Create `src/api/rate_limit.py`:
+Create `src/security/rate_limiter.py`:
 
 ```python
 """Rate limiting for API endpoints.
@@ -1630,7 +1700,135 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 ```
 
-### Step 4.5.3: SQL Injection Prevention
+### Step 4.5.4: Authentication (JWT)
+
+Create `src/security/auth.py`:
+
+```python
+"""JWT authentication for API endpoints.
+
+See PRD_v2.md Section 10.3 for authentication requirements.
+"""
+from __future__ import annotations
+
+import os
+import jwt
+from datetime import datetime, timedelta
+from typing import Optional
+from fastapi import HTTPException, status, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# JWT configuration per PRD Section 10.3
+JWT_ACCESS_TOKEN_EXPIRY = timedelta(hours=1)  # 1 hour access token
+JWT_REFRESH_TOKEN_EXPIRY = timedelta(hours=24)  # 24 hour refresh token
+JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')  # Must be set in production
+JWT_ALGORITHM = 'HS256'
+
+security = HTTPBearer()
+
+
+async def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> dict:
+    """Verify JWT token and return payload.
+    
+    Raises HTTPException if token is invalid or expired.
+    """
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM]
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
+
+# Usage in FastAPI endpoints:
+# @app.get("/depots/{depot_id}/state")
+# async def get_state(depot_id: UUID, token: dict = Depends(verify_token)):
+#     ...
+```
+
+### Step 4.5.5: TLS Configuration
+
+Update `docker-compose.yml` to include TLS for all exposed ports:
+
+```yaml
+services:
+  api:
+    # ... existing config ...
+    volumes:
+      - ./gurobi.lic:/opt/gurobi/gurobi.lic:ro
+      - ./certs:/etc/ssl/certs:ro  # TLS certificates
+    environment:
+      # ... existing env vars ...
+      TLS_CERT_PATH: /etc/ssl/certs/api.crt
+      TLS_KEY_PATH: /etc/ssl/certs/api.key
+      # Require TLS for all connections
+      REQUIRE_TLS: "true"
+```
+
+Add Nginx reverse proxy for TLS termination (recommended for production):
+
+```yaml
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "443:443"  # HTTPS
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/ssl/certs:ro
+    depends_on:
+      - api
+```
+
+### Step 4.5.6: Secrets Management
+
+Create `src/security/secrets.py`:
+
+```python
+"""Secrets management helpers.
+
+Per PRD Section 10.3, use environment variables or Vault (future).
+"""
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+def get_secret(key: str, default: Optional[str] = None) -> str:
+    """Get secret from environment variable.
+    
+    In production, this should integrate with HashiCorp Vault or similar.
+    """
+    value = os.getenv(key, default)
+    if value is None:
+        raise ValueError(f"Required secret {key} not found in environment")
+    return value
+
+
+# Usage:
+# db_password = get_secret('DB_PASSWORD')
+# jwt_secret = get_secret('JWT_SECRET_KEY')
+```
+
+**Verification:**
+- [ ] All secrets use environment variables (no hardcoded passwords)
+- [ ] TLS certificates configured for production
+- [ ] JWT authentication implemented on all API endpoints
+- [ ] Health checks fail on insecure configurations
+
+### Step 4.5.7: SQL Injection Prevention
 
 **Enforcement:** All database queries MUST use parameterized queries. Never interpolate user input into SQL strings.
 
@@ -1696,7 +1894,7 @@ async def insert_telemetry(
     await db.execute(query, timestamp, vehicle_id, charger_id, soc, charging_kw, max_charge_kw)
 ```
 
-### Step 4.5.4: Data Freshness Requirements
+### Step 4.5.8: Data Freshness Requirements
 
 Implement staleness checks per PRD_v2.md Section 10.4:
 
@@ -1985,6 +2183,40 @@ class TestOptimizerBasic:
         result = solve_model(model, time_limit=60)
         
         assert result.solve_time_s < 60
+    
+    def test_gurobi_fallback_to_highs(self, realistic_depot_state, realistic_depot_config):
+        """Test automatic fallback to HiGHS when Gurobi fails.
+        
+        Per PRD Section 8.2, system must gracefully degrade to HiGHS
+        if Gurobi license fails or connection issues occur.
+        """
+        from unittest.mock import patch, MagicMock
+        import pyomo.environ as pyo
+        
+        model = build_optimization_model(realistic_depot_state, realistic_depot_config)
+        
+        # Simulate Gurobi failure (e.g., invalid license)
+        with patch('pyomo.environ.SolverFactory') as mock_factory:
+            # First call (Gurobi) fails
+            mock_gurobi = MagicMock()
+            mock_gurobi.solve.side_effect = Exception("Gurobi license invalid")
+            
+            # Second call (HiGHS) succeeds
+            mock_highs = MagicMock()
+            mock_highs_result = MagicMock()
+            mock_highs_result.solver.termination_condition = pyo.TerminationCondition.optimal
+            mock_highs_result.solver.time = 25.0
+            mock_highs.solve.return_value = mock_highs_result
+            
+            # Mock factory returns Gurobi first, then HiGHS
+            mock_factory.side_effect = [mock_gurobi, mock_highs]
+            
+            # Should fall back to HiGHS automatically
+            result = solve_model(model, time_limit=60)
+            
+            assert result.solver_used == 'highs'
+            assert result.status in ['optimal', 'feasible']
+            assert result.solve_time_s < 60
 
 
 class TestDepartureSoC:
@@ -2426,10 +2658,13 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 ### Milestone 1: Core Optimization Engine
 - [ ] Data models implemented (DepotConfig, DepotState)
 - [ ] MILP model builds with Gurobi
+- [ ] HiGHS fallback solver implemented (automatic on Gurobi failure)
 - [ ] Solver finds optimal/feasible solutions
 - [ ] Solve time < 60s for 20 vehicles
 - [ ] All departure SoC constraints satisfied
 - [ ] Building load integrated in grid power
+- [ ] Warm-starting implemented (> 3x speedup target)
+- [ ] Infeasibility handling with degraded solve (per PRD Section 8.5.1)
 
 ### Milestone 2: Data Infrastructure
 - [ ] TimescaleDB schema deployed
@@ -2440,10 +2675,11 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 
 ### Milestone 3: Triggers & Re-optimization
 - [ ] SoC deviation trigger (>5%)
-- [ ] Price change trigger (>25% OR >$25/MWh)
-- [ ] Return time deviation trigger (>15 min)
-- [ ] Scheduled trigger (hourly 7AM-11PM)
-- [ ] Inter-depot handoff trigger
+- [ ] Price change trigger (>25% OR >$25/MWh) - OR logic per PRD Section 5.1
+- [ ] Return time deviation trigger (>15 min late)
+- [ ] Scheduled trigger (hourly 7AM-11PM) - per PRD Section 5.1
+- [ ] Inter-depot handoff trigger (on message receipt)
+- [ ] Trigger cooldown (5 min per depot) to prevent rapid re-optimization
 
 ### Milestone 4: Inter-Depot Coordination
 - [ ] Handoff message send/receive
@@ -2457,7 +2693,11 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 - [ ] Rate limiting (100/min API, 10/min optimize)
 - [ ] Trigger cooldown (5 min per depot)
 - [ ] Parameterized SQL queries (no interpolation)
-- [ ] Data freshness checks before optimization
+- [ ] Data freshness checks before optimization (all PRD thresholds)
+- [ ] JWT authentication for API endpoints (per PRD Section 10.3)
+- [ ] TLS for all exposed ports (HTTPS for API, WSS for OCPP)
+- [ ] Secrets management (environment variables, no hardcoded secrets)
+- [ ] Security folder structure (src/security/)
 
 ### Milestone 5: Post-Optimization Allocation
 - [ ] Charger allocation algorithm

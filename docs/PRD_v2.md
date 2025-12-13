@@ -593,7 +593,7 @@ CREATE TABLE optimization_runs (
     objective_value DOUBLE PRECISION,
     peak_demand_kw  DOUBLE PRECISION,
     status          VARCHAR(20) DEFAULT 'completed',
-    schedule_json   JSONB NOT NULL  -- Full optimization schedule
+    schedule_json   JSONB NOT NULL  -- Full optimization schedule (includes solver_used metadata)
 );
 
 CREATE TABLE charging_commands (
@@ -767,6 +767,7 @@ class OptimizationResult:
     objective_value: float
     solve_time_s: float
     status: str  # 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'
+    solver_used: str = 'gurobi'  # 'gurobi' or 'highs' - tracks which solver was used for monitoring
     # 'degraded' = solved with relaxed constraints (see Section 8.5.1)
 ```
 
@@ -1163,6 +1164,7 @@ The demand charge rate used in optimization is resolved in this priority order:
 
 ### 8.2 Solver Configuration
 
+**Primary Solver: Gurobi**
 ```python
 # Pyomo + Gurobi configuration
 import pyomo.environ as pyo
@@ -1194,6 +1196,50 @@ solver.options['WarmStart'] = 1
 
 # Note: Gurobi requires valid license. Check license status in health endpoint.
 ```
+
+**Fallback Solver: HiGHS (Open-Source)**
+
+For reliability and fault tolerance, the system MUST support automatic fallback to HiGHS if Gurobi is unavailable (license failure, connection issues, or solver errors). This ensures graceful degradation rather than complete system failure.
+
+```python
+# Fallback solver configuration (HiGHS via appsi_highs)
+fallback_solver = pyo.SolverFactory('appsi_highs')
+
+# Time limit: Same 60 seconds
+fallback_solver.options['time_limit'] = 60
+
+# MIP optimality gap: 1% (same target)
+fallback_solver.options['mip_rel_gap'] = 0.01
+
+# Thread count: adjust based on deployment environment
+fallback_solver.options['threads'] = 4
+
+# Presolve: enabled
+fallback_solver.options['presolve'] = 'on'
+
+# Note: HiGHS is open-source and does not require a license.
+# Performance may be slower than Gurobi, but provides reliable fallback.
+```
+
+**Solver Selection Logic:**
+
+1. **Primary attempt**: Try Gurobi solver
+   - Check license validity before solving
+   - If license invalid or solver unavailable, log warning and fall back
+
+2. **Fallback attempt**: If Gurobi fails, automatically use HiGHS
+   - Log fallback event with reason (license failure, connection error, etc.)
+   - Mark optimization result with `solver_used: 'highs'` in metadata
+   - Continue with same time limit and gap targets
+
+3. **Error handling**: If both solvers fail, return `status: 'error'` with detailed error message
+
+**Implementation Requirements:**
+- Solver selection must be transparent to optimization logic (same interface)
+- Fallback must be automatic (no manual intervention required)
+- All solver failures must be logged for monitoring
+- Health endpoint must report solver availability (Gurobi license status, HiGHS availability)
+- Optimization results must include `solver_used` field for analysis
 
 ### 8.3 Charger Aggregation Strategy
 
@@ -1715,6 +1761,7 @@ Follow the existing patterns in src/api/main.py.
 | 2.0 | 2025-12-12 | Claude + Joris | Reconciled with dev plan; added Gurobi config, building load, inter-depot handoffs, return time trigger, charger-vehicle access, vehicle max_charge_kw from OCPP |
 | 2.1 | 2025-12-12 | Claude | Fixed inconsistencies: corrected OCPP WebSocket URL to use `{ocpp_id}`, clarified TOU pricing hours, fixed battery dynamics formula (removed incorrect efficiency division), updated all document references from PRD.md to PRD_v2.md |
 | 2.2 | 2025-12-13 | Claude | Security & logic hardening: added vehicle count constraint to MILP, fixed grid power balance to use P_batt_effective, clarified incoming vehicle SoC initialization, added comprehensive security requirements (input validation, rate limiting, SQL injection prevention), added database CHECK constraints, added infeasibility handling specification, added data freshness requirements |
+| 2.3 | 2025-12-13 | Claude | Reliability improvements: Added HiGHS fallback solver for graceful degradation when Gurobi fails (license error, connection issues), added solver_used field to OptimizationResult for monitoring, added Gurobi license failure test to integration tests |
 
 ---
 

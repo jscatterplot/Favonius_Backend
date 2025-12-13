@@ -171,9 +171,10 @@ def test_charger_capacity_constraint(realistic_depot):
             if result.schedule[vid]['charging_power'][t] > 0.1
         )
 
-        assert charging_count <= config.n_chargers, (
+        total_chargers = sum(config.charger_groups.values())
+        assert charging_count <= total_chargers, (
             f"Too many vehicles charging at timestep {t}: "
-            f"{charging_count} > {config.n_chargers}"
+            f"{charging_count} > {total_chargers}"
         )
 
 

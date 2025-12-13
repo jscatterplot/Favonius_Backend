@@ -1,6 +1,8 @@
 """Command-line interface for depot simulation.
 
-Reference: Development plan Step 6.1
+Reference: PRD_v2.md Section 11.1 (MVP Acceptance Tests)
+           docs/SIMULATION.md
+           favonius_development_plan_v2.md Step 6.1
 """
 
 import argparse
@@ -48,14 +50,25 @@ def get_depot_config(
         f"bus_{i}": 324.0 for i in range(n_vehicles)
     }
 
+    # Per PRD Section 8.3: Chargers aggregated by rated_kw
+    # Create charger groups: all chargers at 80kW
+    charger_groups = {80.0: n_chargers}
+    
+    # Per PRD Section 6.2: DepotConfig structure
     return DepotConfig(
         vehicle_capacities=vehicle_capacities,
-        charger_power=80.0,
+        vehicle_max_charge_kw={f"bus_{i}": 80.0 for i in range(n_vehicles)},
+        charger_groups=charger_groups,
         charger_efficiency=0.95,
-        n_chargers=n_chargers,
+        charger_vehicle_access={},  # All vehicles can access all chargers (simple case)
         battery_capacity=1000.0,
         battery_power=200.0,
+        battery_efficiency=0.92,  # Per PRD Section 8.1
+        battery_soc_min=0.2,
+        battery_soc_max=0.8,
         max_site_power=1200.0,
+        delta_t=0.25,  # 15 minutes per PRD Section 3.2
+        n_timesteps=96,  # 24 hours
     )
 
 
@@ -105,7 +118,8 @@ async def run_simulation_cmd(
                 if verbose:
                     print(
                         f"Step {step}: Optimization completed "
-                        f"(solve_time={result.solve_time:.2f}s)"
+                        f"(solve_time={result.solve_time_s:.2f}s, "
+                        f"solver={result.solver_used})"
                     )
             except Exception as e:
                 print(f"Optimization error at step {step}: {e}")
@@ -149,16 +163,29 @@ async def benchmark_cmd(
 
     print(f"Benchmarking {fleet_size} vehicles ({n_runs} runs)...")
 
+    # Per PRD Section 8.3: Chargers aggregated by rated_kw
+    n_chargers = max(5, fleet_size // 2)
+    charger_groups = {80.0: n_chargers}
+    
+    # Per PRD Section 6.2: DepotConfig structure
     config = DepotConfig(
         vehicle_capacities={
             f"bus_{i}": 324.0 for i in range(fleet_size)
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={
+            f"bus_{i}": 80.0 for i in range(fleet_size)
+        },
+        charger_groups=charger_groups,
         charger_efficiency=0.95,
-        n_chargers=max(5, fleet_size // 2),
+        charger_vehicle_access={},  # All vehicles can access all chargers
         battery_capacity=1000.0,
         battery_power=200.0,
+        battery_efficiency=0.92,  # Per PRD Section 8.1
+        battery_soc_min=0.2,
+        battery_soc_max=0.8,
         max_site_power=1200.0,
+        delta_t=0.25,  # 15 minutes per PRD Section 3.2
+        n_timesteps=96,  # 24 hours
     )
 
     n_t = config.n_timesteps
@@ -184,13 +211,18 @@ async def benchmark_cmd(
 
     results = []
     for run in range(n_runs):
-        result = optimize(state, config, time_limit=30.0)
+        # Per PRD Section 8.3: Solve time target < 60 seconds
+        from src.core.optimizer.milp_model import build_optimization_model, solve_model
+        model = build_optimization_model(state, config)
+        result = solve_model(model, time_limit=60.0)
+        
         results.append(
             {
                 "run": run + 1,
-                "solve_time": result.solve_time,
+                "solve_time": result.solve_time_s,  # Per PRD: solve_time_s field
                 "objective_value": result.objective_value,
-                "peak_demand": result.peak_demand,
+                "peak_demand": result.peak_demand_kw,  # Per PRD: peak_demand_kw field
+                "solver_used": result.solver_used,  # Per PRD Section 8.2: Track solver
             }
         )
         print(

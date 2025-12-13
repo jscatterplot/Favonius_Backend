@@ -16,6 +16,16 @@ from .exceptions import (
 from .milp_model import build_optimization_model, optimize
 from .solver import solve_model
 from .warm_start import warm_start_model
+from .allocator import allocate_chargers, ChargerAssignment
+
+__all__ = [
+    'build_optimization_model',
+    'optimize',
+    'solve_model',
+    'warm_start_model',
+    'allocate_chargers',
+    'ChargerAssignment',
+]
 
 __all__ = [
     # Functions

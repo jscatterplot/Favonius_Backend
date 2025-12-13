@@ -4,7 +4,7 @@
 
 The control loop is the core orchestration system for depot charging optimization. It automatically runs optimizations, monitors for re-optimization triggers, and dispatches charging commands to chargers via OCPP.
 
-**Reference:** Development Plan Step 5.2, PRD Section 5.2
+**Reference:** Development Plan Step 5.2, PRD_v2.md Section 5.2
 
 ## Architecture
 
@@ -49,7 +49,7 @@ Configuration is loaded from environment variables with defaults:
 | `FAVONIUS_OPTIMIZATION_HORIZON_HOURS` | 24 | Optimization horizon in hours |
 | `FAVONIUS_HOURLY_OPT_START` | 7 | Hourly optimization start hour (0-23) |
 | `FAVONIUS_HOURLY_OPT_END` | 23 | Hourly optimization end hour (0-23) |
-| `FAVONIUS_OPTIMIZATION_TIMEOUT` | 30.0 | Solver timeout in seconds |
+| `FAVONIUS_OPTIMIZATION_TIMEOUT` | 60.0 | Solver timeout in seconds |
 | `FAVONIUS_TRIGGER_COOLDOWN_MIN` | 5 | Cooldown after trigger in minutes |
 | `FAVONIUS_MAX_OPT_FAILURES` | 3 | Max failures before circuit break |
 | `FAVONIUS_DISPATCH_RETRIES` | 3 | OCPP dispatch retry attempts |
@@ -80,9 +80,11 @@ Controllers run hourly optimizations during active hours (default: 7am-11pm):
 
 The TriggerMonitor continuously monitors:
 
-- **SoC Deviation**: Vehicle SoC deviates >5% from expected
-- **Price Changes**: Electricity price changes >25% or >$25/MWh
-- **Return Time Delays**: Vehicle returns >15 minutes late
+- **SoC Deviation**: Vehicle SoC deviates >5% from expected (event-driven)
+- **Price Changes**: Electricity price changes >25% OR >$25/MWh (OR logic, on ingestion)
+- **Return Time Delays**: Vehicle returns >15 minutes late (event-driven)
+- **Inter-depot Handoff**: On message receipt (event-driven)
+- **Scheduled**: Hourly 7AM-11PM (periodic)
 
 When a trigger fires:
 1. Check cooldown period (prevents rapid re-optimization)
@@ -139,10 +141,20 @@ All metrics are prefixed with `favonius_`:
 - `optimization_runs_total`: Counter by depot_id and trigger_reason
 - `optimization_duration_seconds`: Histogram by depot_id
 - `optimization_failures_total`: Counter by depot_id and failure_type
+- `solver_used_total`: Counter by depot_id and solver ('gurobi' or 'highs')
+- `solver_fallback_total`: Counter by depot_id and reason (license_failure, connection_error, etc.)
 - `ocpp_dispatch_success_total`: Counter by depot_id
 - `ocpp_dispatch_failures_total`: Counter by depot_id and error_type
 - `control_loop_uptime_seconds`: Gauge by depot_id
 - `controller_state`: Gauge by depot_id (1=running, 0=stopped)
+
+### Solver Reliability
+
+Per PRD Section 8.2, the system automatically falls back to HiGHS if Gurobi fails:
+- Monitor Gurobi license status via health endpoint
+- Track solver usage in metrics (`solver_used_total`)
+- Log all fallback events with reason
+- Health endpoint reports both Gurobi license status and HiGHS availability
 
 ### Health Checks
 
@@ -246,9 +258,9 @@ Controllers are automatically:
 ## References
 
 - Development Plan Step 5.2: Control Loop Implementation
-- PRD Section 5.2: Component Responsibilities
-- PRD Section 5.3: Data Flow
-- PRD Section 9.1: OCPP Integration
+- PRD_v2.md Section 5.2: Component Responsibilities
+- PRD_v2.md Section 5.3: Data Flow
+- PRD_v2.md Section 9.1: OCPP Integration
 - Code: `src/core/controller.py`
 - Code: `src/core/controller_manager.py`
 - Code: `src/core/controller_config.py`

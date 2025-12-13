@@ -4,7 +4,7 @@
 Simulates multiple OCPP 1.6 charge points connecting to the server
 and responding to commands.
 
-Reference: PRD.md#9-1-ocpp-integration
+Reference: PRD_v2.md#9-1-ocpp-integration
 """
 
 import asyncio

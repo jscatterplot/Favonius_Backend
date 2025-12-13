@@ -1,7 +1,7 @@
 # Optimization Engine Rules
 
 ## Reference
-Primary reference: PRD.md#8-optimization-engine-specifications
+Primary reference: PRD_v2.md#8-optimization-engine-specifications
 
 ## Mathematical Formulation
 
@@ -10,17 +10,17 @@ The optimization minimizes total electricity cost:
 ```
 minimize:
     Σ_t (price[t] × P_grid[t] × Δt)           # Energy cost
-  + demand_rate × P_max_grid                   # Demand charge
+  + demand_charge_rate × P_max_grid           # Demand charge
 ```
 
 Reference: PRD Section 8.1
 
 ### Decision Variables
 - `P_charge[b,t]`: Charging power for vehicle b at time t (kW) - ℝ≥0
-- `SoC[b,t]`: State of charge for vehicle b at time t - [0.1, 1.0]
+- `SoC[b,t]`: State of charge for vehicle b at time t - [0.0, 1.0]
 - `y_charge[b,t]`: Binary indicator if vehicle b is charging at time t - {0,1}
 - `P_batt[t]`: Battery power (+discharge, -charge) - [-P_max, P_max]
-- `SoC_batt[t]`: Battery state of charge - [0.2, 0.8]
+- `SoC_batt[t]`: Battery state of charge - [soc_min, soc_max] (typically [0.2, 0.8])
 - `P_grid[t]`: Grid power draw at time t - ℝ≥0
 - `P_max_grid`: Maximum grid power (demand) - ℝ≥0
 
@@ -28,48 +28,105 @@ Reference: PRD Section 8.1
 
 ### Constraints (MUST BE ENFORCED)
 
-1. **SoC Dynamics:**
+1. **SoC Initialization:**
+   ```
+   For existing depot vehicles:
+   SoC[b, 0] = current_measured_soc[b]   ∀b in depot_vehicles
+   
+   For incoming vehicles (from inter-depot handoff):
+   SoC[b, t_arrive[b]] = expected_soc[b]  (fixed at arrival)
+   ```
+
+2. **SoC Dynamics:**
    ```
    SoC[b,t] = SoC[b,t-1] + (η × P_charge[b,t-1] × Δt) / E_batt[b]
    ```
+   Where η is charging efficiency (0.90-0.95)
 
-2. **Vehicle Availability:**
+3. **SoC Bounds:**
    ```
-   P_charge[b,t] = 0   if available[b,t] = 0
+   0.0 ≤ SoC[b,t] ≤ 1.0   ∀b,t
+   ```
+   Note: Input SoC from telemetry is clamped to [0.0, 1.0] before optimization.
+
+4. **Vehicle Availability:**
+   ```
+   P_charge[b,t] = 0   if available[b,t] = False
    ```
 
-3. **Departure SoC (HARD CONSTRAINT - NEVER RELAX):**
+5. **Departure SoC (HARD CONSTRAINT - NEVER RELAX):**
    ```
    SoC[b, t_depart[b]] ≥ 0.99
    ```
    This is a HARD constraint per PRD Section 8.1. Never allow solutions that violate this.
 
-4. **Charger Linking:**
+6. **Charger Linking (vehicle max charge rate):**
    ```
-   P_charge[b,t] ≤ P_charger × y_charge[b,t]
+   P_charge[b,t] ≤ max_charge_kw[b] × y_charge[b,t]
    ```
+   Where max_charge_kw[b] is resolved per PRD Section 8.4 (OCPP → config → charger cap)
 
-5. **Charger Capacity:**
+7. **Charger Capacity (BOTH constraints required):**
    ```
-   Σ_b y_charge[b,t] ≤ n_chargers
+   Power limit:
+   Σ_b P_charge[b,t] ≤ Σ_g (n_chargers[g] × P_g)   ∀t
+   
+   Vehicle count limit:
+   Σ_b y_charge[b,t] ≤ Σ_g n_chargers[g]   ∀t
    ```
+   Both constraints are required: power limit prevents exceeding total capacity,
+   while count limit prevents more vehicles charging than available chargers.
 
-6. **Grid Power Balance:**
+8. **Grid Power Balance (includes building load - REQUIRED):**
    ```
-   P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt[t]
+   P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt_effective[t]
+   
+   Where P_batt_effective[t] accounts for battery efficiency:
+   - Discharge (P_batt > 0): grid receives P_batt × η_batt
+   - Charge (P_batt < 0): grid provides |P_batt| / η_batt
    ```
+   Building load is REQUIRED per PRD Section 9.4.
 
-7. **Demand Tracking:**
+9. **Site Power Limit:**
    ```
-   P_max_grid ≥ P_grid[t]   ∀t
-   P_max_grid ≥ current_month_peak   (moving limit)
+   P_grid[t] ≤ max_site_power   ∀t
    ```
+   Where max_site_power is sourced from depots.max_grid_kw
 
-8. **Battery Dynamics:**
-   ```
-   SoC_batt[t] = SoC_batt[t-1] + (P_batt[t-1] × Δt) / E_batt_storage
-   0.2 ≤ SoC_batt[t] ≤ 0.8
-   ```
+10. **Demand Tracking:**
+    ```
+    P_max_grid ≥ P_grid[t]   ∀t
+    P_max_grid ≥ current_month_peak   (moving limit)
+    ```
+
+11. **Battery Dynamics:**
+    ```
+    SoC_batt[0] = current_battery_soc   (initial condition)
+    SoC_batt[t] = SoC_batt[t-1] - (P_batt[t-1] × Δt) / E_batt_storage   ∀t > 0
+    soc_min ≤ SoC_batt[t] ≤ soc_max   ∀t
+    
+    Where:
+    - P_batt[t] > 0 means discharging (reducing SoC)
+    - P_batt[t] < 0 means charging (increasing SoC)
+    ```
+
+12. **Incoming Vehicle Availability:**
+    ```
+    For each incoming vehicle i with arrival_time t_arrive:
+    - If t_arrive < horizon_end:
+      - SoC[i, t_arrive] = expected_soc[i]  (fixed at arrival)
+      - available[i, t] = False   ∀t < t_arrive
+      - available[i, t] = True   ∀t ≥ t_arrive
+    ```
+
+Reference: PRD Section 8.1
+
+## Demand Charge Rate Resolution
+
+The demand charge rate used in optimization is resolved in this priority order:
+1. If `prices.demand_kw` is not null (from most recent price row), use that value
+2. Otherwise, use `depots.demand_charge_rate_kw`
+3. The resolved value is stored in `DepotState.demand_charge_rate`
 
 Reference: PRD Section 8.1
 
@@ -88,21 +145,44 @@ model.B = pyo.Set(initialize=vehicle_ids)
 # Parameters
 model.price = pyo.Param(model.T, initialize=prices)
 model.E_batt = pyo.Param(model.B, initialize=capacities)
+model.building_power = pyo.Param(model.T, initialize=building_load)
 
 # Variables
 model.P_charge = pyo.Var(model.B, model.T, domain=pyo.NonNegativeReals)
-model.SoC = pyo.Var(model.B, model.T, bounds=(0.1, 1.0))
+model.SoC = pyo.Var(model.B, model.T, bounds=(0.0, 1.0))
 model.y_charge = pyo.Var(model.B, model.T, domain=pyo.Binary)
 ```
 
-### Solver Configuration
+### Solver Configuration (Gurobi Primary, HiGHS Fallback)
+
+**Primary Solver: Gurobi**
 ```python
-solver = pyo.SolverFactory('appsi_highs')
-solver.options['time_limit'] = 30.0      # seconds (PRD Section 8.3)
-solver.options['mip_rel_gap'] = 0.01     # 1% optimality gap
-solver.options['threads'] = 4            # parallel threads
-solver.options['presolve'] = 'on'        # preprocessing
+solver = pyo.SolverFactory('gurobi')
+solver.options['TimeLimit'] = 60          # seconds (PRD Section 8.2)
+solver.options['MIPGap'] = 0.01           # 1% optimality gap
+solver.options['Threads'] = 4             # parallel threads
+solver.options['Presolve'] = 2             # Aggressive presolve
+solver.options['NumericFocus'] = 3         # Highest numerical accuracy
+solver.options['OutputFlag'] = 1           # Normal output
+solver.options['WarmStart'] = 1            # Use warm-starting
 ```
+
+**Fallback Solver: HiGHS (Automatic on Gurobi Failure)**
+```python
+# Fallback solver configuration (HiGHS via appsi_highs)
+fallback_solver = pyo.SolverFactory('appsi_highs')
+fallback_solver.options['time_limit'] = 60
+fallback_solver.options['mip_rel_gap'] = 0.01  # Same 1% gap target
+fallback_solver.options['threads'] = 4
+fallback_solver.options['presolve'] = 'on'
+```
+
+**Solver Selection Logic (per PRD Section 8.2):**
+1. Try Gurobi first (check license validity)
+2. If Gurobi fails, automatically fall back to HiGHS
+3. Log fallback event with reason
+4. Track solver used in `OptimizationResult.solver_used` field
+5. If both fail, return `status: 'error'`
 
 Reference: PRD Section 8.2
 
@@ -110,23 +190,61 @@ Reference: PRD Section 8.2
 
 | Metric | Target | Test Configuration |
 |--------|--------|-------------------|
-| Solve time | < 30 seconds | 20 vehicles, 96 timesteps |
+| Solve time | < 60 seconds | 20 vehicles, 96 timesteps |
 | Memory | < 2 GB | Same configuration |
 | Optimality gap | < 1% | Required for deployment |
 | Warm-start speedup | > 3x | Use previous solution |
 
-Reference: PRD Section 8.3
+Reference: PRD Section 8.5
 
 ## Warm-Starting
 
 Always use warm-starting from previous solutions when available:
 - Initialize `P_charge[b,t]` from previous schedule
 - Initialize `y_charge[b,t]` based on previous charging activity
-- This provides > 3x speedup per PRD Section 8.3
+- Initialize `SoC[b,t]` from previous solution
+- Initialize `P_batt[t]` and `SoC_batt[t]` from previous battery dispatch
+- This provides > 3x speedup per PRD Section 8.5
+
+## Infeasibility Handling
+
+When optimization cannot satisfy all constraints (PRD Section 8.5.1):
+
+1. **Detection:**
+   - Gurobi returns `TerminationCondition.infeasible`
+   - Log infeasibility with depot_id, trigger_reason, and constraint analysis
+
+2. **Response Strategy:**
+   - Use Gurobi's IIS (Irreducible Inconsistent Subsystem) to identify conflicting vehicles
+   - Relaxed solve: Relax departure SoC from 99% to 90% for affected vehicles only
+   - Re-solve with relaxed constraints
+   - Mark result as `status: 'degraded'`
+
+3. **Never silently fail:**
+   - Always return a schedule (even if degraded)
+   - `OptimizationResult.status` must be one of: 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'
+
+## Charger Aggregation Strategy
+
+To reduce optimization complexity, chargers are aggregated by `rated_kw` before optimization:
+1. **Pre-optimization**: Group chargers by `rated_kw` into charger groups
+2. **Optimization**: Constraint uses total charger capacity per group
+3. **Post-optimization**: Allocate power to individual chargers respecting physical accessibility
+
+Reference: PRD Section 8.3
+
+## Vehicle Max Charge Rate Resolution
+
+Vehicle charging rate limits are resolved in this priority order:
+1. **OCPP MeterValues** (highest priority): If reported within last 15 minutes, use this value
+2. **Vehicle config** (fallback): Use `max_charge_kw` from vehicles table
+3. **Charger rated_kw** (cap): Never exceed the charger's rated power
+
+Reference: PRD Section 8.4
 
 ## Surrogate Model Integration
 
-Energy consumption predictions come from the surrogate model (PRD Section 8.4):
+Energy consumption predictions come from the surrogate model (PRD Section 8.6):
 - Use predicted energy requirements for `energy_requirements` dict
 - R² ≥ 0.85 on validation set required
 - Uncertainty estimates available for robust optimization
@@ -135,8 +253,23 @@ Energy consumption predictions come from the surrogate model (PRD Section 8.4):
 
 Before accepting any optimization solution:
 1. Verify all departure SoC constraints satisfied (≥ 0.99)
-2. Check solve time < 30 seconds
+2. Check solve time < 60 seconds
 3. Verify objective value is reasonable
-4. Log solve time and objective value for monitoring
+4. Log solve time, objective value, and solver used for monitoring
+5. Verify building load included in grid power
+6. Verify battery efficiency handled correctly
+7. Track solver used in OptimizationResult.solver_used field
 
 Reference: PRD Section 11.1 (Acceptance Criteria)
+
+## Solver Reliability
+
+Per PRD Section 8.2, the system MUST support automatic fallback to HiGHS if Gurobi fails:
+- License failure: Check Gurobi license before solving, fall back if invalid
+- Connection errors: Catch solver exceptions and fall back automatically
+- Solver errors: Any Gurobi error triggers HiGHS fallback
+- Logging: All fallback events must be logged with reason
+- Monitoring: Health endpoint must report solver availability
+- Result tracking: OptimizationResult.solver_used field tracks which solver was used
+
+This ensures graceful degradation rather than complete system failure.

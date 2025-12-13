@@ -209,7 +209,9 @@ def test_peak_demand_optimization():
     result = optimize(state, config, time_limit=30.0)
 
     # Calculate unmanaged peak (all vehicles charge simultaneously)
-    unmanaged_peak = min(15, config.n_chargers) * config.charger_power
+    total_chargers = sum(config.charger_groups.values())
+    charger_power = list(config.charger_groups.keys())[0]  # Single group assumed
+    unmanaged_peak = min(15, total_chargers) * charger_power
 
     # Optimized peak should be lower
     assert result.peak_demand < unmanaged_peak, (

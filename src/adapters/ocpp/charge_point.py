@@ -1,6 +1,8 @@
 """OCPP Charge Point management for fleet optimization.
 
-Reference: Development plan Step 3.1, PRD.md#9-1-ocpp-integration
+Reference: Development plan Step 3.1, PRD_v2.md#9-1-ocpp-integration
+Per PRD Section 8.4, max_charge_kw from OCPP MeterValues is extracted
+and dynamically updated in the vehicles table.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ class FleetChargePoint(CP16):
         connection,
         on_status_change: Optional[Callable[[str, int, str], None]] = None,
         on_meter_values: Optional[
-            Callable[[str, int, float, float, datetime], None]
+            Callable[[str, int, float, float, datetime, Optional[float]], None]
         ] = None,
     ):
         """Initialize FleetChargePoint.
@@ -42,7 +44,8 @@ class FleetChargePoint(CP16):
             on_status_change: Optional callback for status changes
                 Signature: (charge_point_id, connector_id, status) -> None
             on_meter_values: Optional callback for meter value updates
-                Signature: (charge_point_id, connector_id, soc, power_kw, timestamp) -> None
+                Signature: (charge_point_id, connector_id, soc, power_kw, timestamp, max_charge_kw) -> None
+                max_charge_kw is optional and may be None if not reported by charger
         """
         super().__init__(id, connection)
         self.on_status_change = on_status_change
@@ -114,6 +117,7 @@ class FleetChargePoint(CP16):
         """
         soc: Optional[float] = None
         power_kw: Optional[float] = None
+        max_charge_kw: Optional[float] = None
         timestamp: Optional[datetime] = None
 
         for mv in meter_value:
@@ -152,16 +156,27 @@ class FleetChargePoint(CP16):
                         power_kw = value
                     else:
                         power_kw = value / 1000.0  # Default assume W
+                elif measurand == 'maxChargingRate' or measurand == 'MaxChargingRate':
+                    # Extract max charge rate from OCPP (per PRD Section 8.4)
+                    # Convert from W to kW if needed
+                    if unit == 'W':
+                        max_charge_kw = value / 1000.0
+                    elif unit == 'kW':
+                        max_charge_kw = value
+                    else:
+                        max_charge_kw = value / 1000.0  # Default assume W
 
         if soc is not None or power_kw is not None:
             logger.debug(
                 f"MeterValues from {self.id}, connector {connector_id}: "
                 f"SoC={soc}, Power={power_kw}kW"
+                + (f", max_charge_kw={max_charge_kw}kW" if max_charge_kw else "")
             )
             if self.on_meter_values and timestamp:
                 try:
+                    # Pass max_charge_kw to callback if available
                     await self.on_meter_values(
-                        self.id, connector_id, soc or 0.0, power_kw or 0.0, timestamp
+                        self.id, connector_id, soc or 0.0, power_kw or 0.0, timestamp, max_charge_kw
                     )
                 except Exception as e:
                     logger.error(f"Error in meter values callback: {e}")

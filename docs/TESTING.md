@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the testing suite for the Favonius Energy V2G System, including test coverage, setup requirements, and known gaps.
+This document describes the testing suite for the Favonius Energy EV Fleet Depot Optimization Platform, including test coverage, setup requirements, and known gaps.
 
 ## Test Structure
 
@@ -23,7 +23,7 @@ This document describes the testing suite for the Favonius Energy V2G System, in
 
 - Core unit tests: optimizer, controller, state assembler, triggers, surrogate model
 - Core integration tests: trigger monitor, state-to-optimizer, control loop, full pipeline
-- Acceptance tests: AT-01 through AT-05 (after fixes)
+- Acceptance tests: AT-01 through AT-07 (after fixes)
 
 ### Test Collection Issues
 
@@ -161,31 +161,33 @@ Configured in `pytest.ini`:
 
 ### Warm-Start Speedup
 
-**Current**: ~1.15x speedup  
-**Target**: 1.2x+ (realistic expectation)
+**Current**: Varies by solver
+**Target**: > 3x speedup (PRD Section 8.5)
 
-**Note**: Warm-start speedup is limited by:
-- HiGHS solver warm-start implementation
-- Problem structure may not benefit significantly
-- Model rebuilding overhead
-
-The test expectation has been adjusted from 2x to 1.2x to reflect realistic performance.
+**Note**: Warm-start speedup with Gurobi:
+- Gurobi supports effective warm-starting via WarmStart option
+- Expected > 3x speedup per PRD Section 8.5
+- Model rebuilding overhead is minimal with proper implementation
 
 ### Solve Time Targets
 
-- **10 vehicles**: < 30 seconds
-- **20 vehicles**: < 30 seconds (PRD requirement)
-- **50 vehicles**: < 60 seconds
+- **10 vehicles**: < 60 seconds
+- **20 vehicles**: < 60 seconds (PRD Section 8.3 requirement)
+- **50 vehicles**: < 60 seconds (may require optimization tuning)
+
+**Note:** Solve time targets apply to both Gurobi (primary) and HiGHS (fallback) solvers. HiGHS may be slower but must still meet the < 60 second requirement per PRD Section 8.2.
 
 ## Acceptance Test Coverage
 
-All PRD acceptance criteria (AT-01 through AT-05) are validated:
+All PRD acceptance criteria (AT-01 through AT-07) are validated:
 
 - **AT-01**: End-to-end optimization (99% SoC at departure)
 - **AT-02**: Demand charge reduction
 - **AT-03**: Price spike re-optimization
 - **AT-04**: SoC deviation handling
-- **AT-05**: Inter-depot handoff
+- **AT-05**: Return time deviation handling
+- **AT-06**: Inter-depot handoff
+- **AT-07**: Building load integration
 
 ## Running Tests
 
@@ -233,9 +235,20 @@ pytest -m slow
 
 ## Test Coverage Goals
 
-- **Optimizer**: ≥ 80% coverage (PRD Section 11.2)
-- **Surrogate Model**: ≥ 85% coverage (PRD Section 11.2)
+- **Optimizer**: ≥ 90% coverage (PRD Section 11.2)
+- **Surrogate Model**: ≥ 90% coverage (PRD Section 11.2)
 - **Overall**: ≥ 80% coverage
+
+## Solver Reliability Tests
+
+Per PRD Section 8.2, the system must support automatic fallback to HiGHS when Gurobi fails:
+
+- **Gurobi license failure test**: Verify automatic fallback to HiGHS
+- **Solver tracking**: Verify `solver_used` field in OptimizationResult
+- **Fallback logging**: Verify fallback events are logged with reason
+- **Health endpoint**: Verify solver availability reporting
+
+Reference: PRD Section 8.2, Integration Test Requirements (PRD Section 11.3)
 
 ## Continuous Integration
 

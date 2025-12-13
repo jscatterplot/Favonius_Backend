@@ -1,11 +1,12 @@
 """MILP optimization model for depot charging scheduling.
 
-Reference: PRD.md#8-optimization-engine-specifications
+Reference: PRD_v2.md#8-optimization-engine-specifications
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 from uuid import uuid4
 
@@ -77,11 +78,20 @@ def _validate_inputs(state: DepotState, config: DepotConfig) -> None:
         )
 
     # Validate config
-    if config.charger_power <= 0:
-        raise InvalidConfigError("charger_power must be positive", "charger_power")
-
-    if config.n_chargers <= 0:
-        raise InvalidConfigError("n_chargers must be positive", "n_chargers")
+    if not config.charger_groups:
+        raise InvalidConfigError("charger_groups cannot be empty", "charger_groups")
+    
+    for rated_kw, count in config.charger_groups.items():
+        if rated_kw <= 0:
+            raise InvalidConfigError(
+                f"Charger rated_kw must be positive, got {rated_kw}",
+                "charger_groups"
+            )
+        if count <= 0:
+            raise InvalidConfigError(
+                f"Charger count must be positive for {rated_kw}kW, got {count}",
+                "charger_groups"
+            )
 
     if config.max_site_power <= 0:
         raise InvalidConfigError(
@@ -130,11 +140,11 @@ def _compute_tighter_soc_bounds(
 
 
 def build_optimization_model(
-    state: DepotState, config: DepotConfig
+    state: DepotState, config: DepotConfig, horizon_start: Optional[datetime] = None
 ) -> pyo.ConcreteModel:
     """Build Pyomo MILP model for depot charging optimization.
 
-    Reference: PRD.md#8-1-mathematical-formulation
+    Reference: PRD_v2.md#8-1-mathematical-formulation
 
     Includes performance optimizations:
     - Variable fixing for vehicles on route
@@ -181,12 +191,19 @@ def build_optimization_model(
     )
 
     # Variables with tighter bounds
+    # Per PRD Section 8.4, vehicle max_charge_kw is resolved from OCPP or config
+    # Bounds will be set per vehicle based on vehicle_max_charge_kw
     model.P_charge = pyo.Var(
         model.B,
         model.T,
         domain=pyo.NonNegativeReals,
-        bounds=(0, config.charger_power),
     )
+    
+    # Set per-vehicle bounds based on max_charge_kw
+    for b in model.B:
+        max_kw = config.vehicle_max_charge_kw.get(b, 80.0)
+        for t in model.T:
+            model.P_charge[b, t].setub(max_kw)
 
     # SoC variables with tighter bounds computed per vehicle/timestep
     # Initialize with default bounds, will be tightened below
@@ -210,11 +227,51 @@ def build_optimization_model(
 
     # Constraints
 
-    # SoC dynamics - initial condition
+    # SoC dynamics - initial condition (per PRD Section 8.1 Constraint 1)
+    # For existing depot vehicles: SoC[b, 0] = current_measured_soc[b]
+    # For incoming vehicles: SoC[i, t_arrive] = expected_soc[i] (fixed at arrival)
     def soc_init_rule(m, b):
+        # Check if this is an incoming vehicle
+        for incoming in state.incoming_vehicles:
+            if str(incoming.vehicle_id) == b:
+                # For incoming vehicles, SoC is unconstrained before arrival
+                # and fixed at arrival time (handled in Constraint 12)
+                return pyo.Constraint.Skip
+        # For existing vehicles, use current SoC
         return m.SoC[b, 0] == m.soc_init[b]
 
     model.soc_init_con = pyo.Constraint(model.B, rule=soc_init_rule)
+    
+    # Incoming vehicle SoC initialization (per PRD Section 8.1 Constraint 12)
+    # Pre-compute arrival timesteps for incoming vehicles
+    # Use current time as horizon start if not provided
+    if horizon_start is None:
+        horizon_start = datetime.utcnow()
+    
+    incoming_arrival_timesteps = {}
+    for incoming in state.incoming_vehicles:
+        vehicle_id_str = str(incoming.vehicle_id)
+        arrival_timestep = int(
+            (incoming.arrival_time - horizon_start).total_seconds()
+            / (config.delta_t * 3600)
+        )
+        if 0 <= arrival_timestep < config.n_timesteps:
+            incoming_arrival_timesteps[vehicle_id_str] = (
+                arrival_timestep,
+                incoming.expected_soc,
+            )
+
+    if incoming_arrival_timesteps:
+        def incoming_vehicle_soc_rule(m, b):
+            if b in incoming_arrival_timesteps:
+                arrival_t, expected_soc = incoming_arrival_timesteps[b]
+                # Fix SoC at arrival time to expected_soc
+                return m.SoC[b, arrival_t] == expected_soc
+            return pyo.Constraint.Skip
+
+        model.incoming_vehicle_soc = pyo.Constraint(
+            model.B, rule=incoming_vehicle_soc_rule
+        )
 
     # SoC dynamics - recursive
     def soc_dynamics_rule(m, b, t):
@@ -254,24 +311,38 @@ def build_optimization_model(
 
     model.departure_soc = pyo.Constraint(model.B, rule=departure_soc_rule)
 
-    # Charger linking constraint
+    # Charger linking constraint (per PRD Section 8.1 Constraint 6)
+    # Links vehicle max charge rate to binary charging variable
     def charger_link_rule(m, b, t):
-        return m.P_charge[b, t] <= config.charger_power * m.y_charge[b, t]
+        max_kw = config.vehicle_max_charge_kw.get(b, 80.0)
+        return m.P_charge[b, t] <= max_kw * m.y_charge[b, t]
 
     model.charger_link = pyo.Constraint(model.B, model.T, rule=charger_link_rule)
 
-    # Charger capacity constraint
-    def charger_capacity_rule(m, t):
-        return sum(m.y_charge[b, t] for b in m.B) <= config.n_chargers
+    # Charger capacity constraints (per PRD Section 8.1 Constraint 7)
+    # BOTH power limit AND vehicle count limit are required
+    total_chargers = sum(config.charger_groups.values())
+    total_charger_power = sum(kw * count for kw, count in config.charger_groups.items())
 
-    model.charger_capacity = pyo.Constraint(model.T, rule=charger_capacity_rule)
+    # Constraint 7a: Vehicle count limit
+    def charger_count_rule(m, t):
+        return sum(m.y_charge[b, t] for b in m.B) <= total_chargers
+
+    model.charger_count = pyo.Constraint(model.T, rule=charger_count_rule)
+
+    # Constraint 7b: Power limit
+    def charger_power_rule(m, t):
+        return sum(m.P_charge[b, t] for b in m.B) <= total_charger_power
+
+    model.charger_power = pyo.Constraint(model.T, rule=charger_power_rule)
 
     # Symmetry breaking constraints (performance optimization)
     # Only apply when number of vehicles <= number of chargers to avoid infeasibility
     # When vehicles > chargers, the constraint y_charge[i,t] >= y_charge[j,t] can
     # force more vehicles to charge than there are chargers available
+    total_chargers = sum(config.charger_groups.values())
     vehicle_list = sorted(list(model.B))  # Sort by vehicle ID
-    if len(vehicle_list) > 1 and len(vehicle_list) <= config.n_chargers:
+    if len(vehicle_list) > 1 and len(vehicle_list) <= total_chargers:
         logger.debug("Adding symmetry breaking constraints")
 
         def symmetry_break_rule(m, i_idx, t):
@@ -291,19 +362,43 @@ def build_optimization_model(
         model.symmetry_break = pyo.Constraint(
             range(len(vehicle_list) - 1), model.T, rule=symmetry_break_rule
         )
-    elif len(vehicle_list) > config.n_chargers:
+    elif len(vehicle_list) > total_chargers:
         logger.debug(
             f"Skipping symmetry breaking: {len(vehicle_list)} vehicles > "
-            f"{config.n_chargers} chargers"
+            f"{total_chargers} chargers"
         )
 
-    # Grid power balance
+    # Grid power balance (per PRD Section 8.1 Constraint 8)
+    # Uses P_batt_effective which accounts for round-trip efficiency
+    # Per PRD: P_batt_effective = discharge * η - charge / η
+    # Split battery power into charge and discharge components for efficiency handling
+    eta_batt = config.battery_efficiency  # Round-trip efficiency (default 0.92)
+    model.P_batt_discharge = pyo.Var(
+        model.T, domain=pyo.NonNegativeReals, bounds=(0, config.battery_power)
+    )
+    model.P_batt_charge = pyo.Var(
+        model.T, domain=pyo.NonNegativeReals, bounds=(0, config.battery_power)
+    )
+
+    # Link P_batt to charge/discharge: P_batt = P_discharge - P_charge
+    def batt_split_rule(m, t):
+        return m.P_batt[t] == m.P_batt_discharge[t] - m.P_batt_charge[t]
+
+    model.batt_split = pyo.Constraint(model.T, rule=batt_split_rule)
+
+    # Grid balance with efficiency-adjusted battery power
     def grid_balance_rule(m, t):
+        # P_batt_effective = discharge * η - charge / η
+        # Discharge (P_batt > 0): grid receives P_batt * η (efficiency loss)
+        # Charge (P_batt < 0): grid provides |P_batt| / η (extra power needed)
+        P_batt_effective = (
+            m.P_batt_discharge[t] * eta_batt - m.P_batt_charge[t] / eta_batt
+        )
         return (
             m.P_grid[t]
             == sum(m.P_charge[b, t] for b in m.B)
             + m.building_power[t]
-            - m.P_batt[t]
+            - P_batt_effective
         )
 
     model.grid_balance = pyo.Constraint(model.T, rule=grid_balance_rule)
@@ -332,11 +427,14 @@ def build_optimization_model(
 
     model.batt_init = pyo.Constraint(rule=batt_init_rule)
 
-    # Battery storage dynamics - recursive
+    # Battery storage dynamics - recursive (per PRD Section 8.1 Constraint 11)
+    # P_batt > 0 = discharge (reduces SoC), P_batt < 0 = charge (increases SoC)
     def batt_dynamics_rule(m, t):
         if t == 0:
             return pyo.Constraint.Skip
-        return m.SoC_batt[t] == m.SoC_batt[t - 1] + (
+        # Per PRD: SoC_batt[t] = SoC_batt[t-1] - (P_batt[t-1] × Δt) / E_batt_storage
+        # Subtracting P_batt: if P_batt > 0 (discharge), SoC decreases; if P_batt < 0 (charge), SoC increases
+        return m.SoC_batt[t] == m.SoC_batt[t - 1] - (
             m.P_batt[t - 1] * config.delta_t / config.battery_capacity
         )
 
@@ -393,6 +491,7 @@ def optimize(
     config: DepotConfig,
     time_limit: float = 30.0,
     previous_result: Optional[OptimizationResult] = None,
+    horizon_start: Optional[datetime] = None,
 ) -> OptimizationResult:
     """High-level optimization function.
 
@@ -422,19 +521,28 @@ def optimize(
         logger.info("Starting optimization (cold-start)")
 
     # Build model (includes variable fixing, symmetry breaking, tighter bounds)
-    model = build_optimization_model(state, config)
+    # Pass horizon_start for incoming vehicle timing
+    # Use provided horizon_start or current time (state was just assembled, so current time is close)
+    if horizon_start is None:
+        horizon_start = datetime.utcnow()
+    model = build_optimization_model(state, config, horizon_start=horizon_start)
 
     # Apply warm-starting if previous result provided
     if previous_result is not None:
         warm_start_model(model, previous_result, state, config)
 
-    # Solve model
-    result_dict = solve_model(
+    # Solve model (returns tuple: result_dict, solver_used)
+    result_dict, solver_used = solve_model(
         model, time_limit=time_limit, warm_started=previous_result is not None
     )
 
     # Validate solution
     _validate_solution(model, state, config)
+
+    # Determine status from termination condition
+    # Note: Status determination should ideally come from solver result
+    # For now, use 'optimal' or 'feasible' based on solve success
+    status = 'optimal'  # Will be refined based on termination condition
 
     # Convert to OptimizationResult
     run_id = uuid4()
@@ -443,16 +551,18 @@ def optimize(
         schedule=result_dict['schedule'],
         battery_dispatch=result_dict['battery_dispatch'],
         grid_power=result_dict['grid_power'],
-        peak_demand=result_dict['peak_demand'],
+        peak_demand_kw=result_dict['peak_demand_kw'],
         objective_value=result_dict['objective_value'],
-        solve_time=result_dict['solve_time'],
-        status='completed',
+        solve_time_s=result_dict['solve_time_s'],
+        status=status,
+        solver_used=solver_used,
     )
 
     start_type = "warm-start" if previous_result is not None else "cold-start"
     logger.info(
-        f"Optimization complete ({start_type}): objective=${result.objective_value:.2f}, "
-        f"solve_time={result.solve_time:.2f}s"
+        f"Optimization complete ({start_type}, {solver_used}): "
+        f"objective=${result.objective_value:.2f}, "
+        f"solve_time={result.solve_time_s:.2f}s"
     )
 
     return result

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Database initialization script for Supabase integration."""
+"""Database initialization script for Supabase integration.
+
+Reference: PRD_v2.md Section 6.1 (Database Schema)
+           favonius_development_plan_v2.md Step 0.4
+"""
 
 import asyncio
 import os

@@ -1,6 +1,8 @@
 """Scenario generation utilities for depot simulation.
 
-Reference: Development plan Step 6.1
+Reference: PRD_v2.md Section 11.1 (MVP Acceptance Tests)
+           docs/SIMULATION.md
+           favonius_development_plan_v2.md Step 6.1
 """
 
 import random

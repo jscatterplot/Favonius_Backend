@@ -3,12 +3,12 @@ You are a senior Python/Julia developer specializing in energy systems optimizat
 ## Project Context
 
 **Project:** Favonius Energy - EV Fleet Depot Optimization Platform
-**Tech Stack:** Python 3.12, Pyomo, HiGHS, FastAPI, TimescaleDB, OCPP 1.6/2.0.1
+**Tech Stack:** Python 3.12, Pyomo, Gurobi, FastAPI, TimescaleDB, OCPP 1.6/2.0.1
 
 ## Single Source of Truth
 
-The PRD.md file is the **authoritative specification** for this project. Always reference it when implementing features:
-- Use `@PRD.md#section-name` to reference specific sections
+The PRD_v2.md file is the **authoritative specification** for this project. Always reference it when implementing features:
+- Use `@PRD_v2.md#section-name` to reference specific sections
 - Check acceptance criteria before marking tasks complete
 - Data models in PRD Section 6 are authoritative - do not deviate without updating the PRD
 
@@ -23,38 +23,63 @@ For detailed patterns and best practices, refer to domain-specific rules in `.cu
 
 These constraints MUST NEVER be relaxed:
 - **Vehicle departure SoC ≥ 99%** - This is a hard constraint in optimization (PRD Section 8.1)
-- **Optimization solve time < 30 seconds** - Required for production (PRD Section 8.3)
+- **Optimization solve time < 60 seconds** - Required for production (PRD Section 8.3)
 - **OCPP 1.6 is primary protocol** - 2.0.1 is future-ready but not required for MVP (PRD Section 9.1)
+- **Building load is REQUIRED** - Must be included in grid power calculation (PRD Section 9.4)
+- **CCS connector only (MVP)** - Only CCS connector supported in MVP (PRD Section 3.2)
 
 ## Code Patterns
 
 - Use dataclasses for data models (see PRD Section 6.2)
 - Use asyncpg for database operations
-- Use Pyomo for optimization modeling (PRD Section 8.2)
-- Follow Stanford CarbonFree paper approach for surrogate models (PRD Section 8.4)
+- Use Pyomo for optimization modeling with Gurobi solver (primary) and HiGHS fallback (PRD Section 8.2)
+- Follow Stanford CarbonFree paper approach for surrogate models (PRD Section 8.6)
 
 ## Implementation Guidelines
 
 ### When implementing optimization:
-- Reference PRD.md#8-optimization-engine-specifications for formulation
-- Use warm-starting from previous solutions (PRD Section 8.3)
-- Log solve time and objective value
+- Reference PRD_v2.md#8-optimization-engine-specifications for formulation
+- Use Gurobi solver (primary) with automatic HiGHS fallback if Gurobi fails (PRD Section 8.2)
+- Use Gurobi solver with specified options (TimeLimit=60, MIPGap=0.01)
+- Implement automatic fallback to HiGHS on Gurobi license failure or connection errors
+- Track solver used in OptimizationResult.solver_used field ('gurobi' or 'highs')
+- Use warm-starting from previous solutions (PRD Section 8.5)
+- Log solve time, objective value, and solver used
 - Ensure all departure SoC constraints are satisfied
+- Vehicle max_charge_kw comes from OCPP or config (see Section 8.4)
+- Include building load in grid power balance (PRD Section 8.1 Constraint 8)
+- Handle battery efficiency in grid power calculation (P_batt_effective)
+- Enforce BOTH power limit AND vehicle count limit for chargers (PRD Section 8.1 Constraint 7)
 
 ### When implementing API endpoints:
-- Reference PRD.md#7-api-specifications for contracts
+- Reference PRD_v2.md#7-api-specifications for contracts
 - Return consistent error formats
 - Include request/response logging
+- Validate all inputs (UUIDs, SoC ranges, power limits) per PRD Section 10.4
+- Enforce rate limiting per PRD Section 10.4
+- Implement JWT authentication per PRD Section 10.3
+- Use TLS for all exposed ports in production (PRD Section 10.3)
 
 ### When working with OCPP:
-- Reference PRD.md#9-1-ocpp-integration for message formats
+- Reference PRD_v2.md#9-1-ocpp-integration for message formats
 - OCPP 1.6 primary, 2.0.1 ready
 - Follow connection flow specified in PRD
+- Extract max_charge_kw from MeterValues when available (PRD Section 8.4)
+- Store charger_id in telemetry for all MeterValues (PRD Section 6.1)
+- Map idTag to vehicle_id for vehicle-charger association (PRD Section 9.1)
 
 ### When working with TimescaleDB:
-- Reference PRD.md#6-data-models for schema
+- Reference PRD_v2.md#6-data-models for schema
 - Use hypertables for time-series data
 - Follow compression and retention policies
+- Include building_load hypertable (PRD Section 6.1)
+
+### When implementing triggers:
+- Price trigger: >25% OR >$25/MWh (OR logic per PRD Section 5.1)
+- SoC deviation trigger: >5%
+- Return time deviation trigger: >15 minutes late
+- Inter-depot handoff trigger: On message receipt
+- Scheduled trigger: Hourly 7AM-11PM
 
 ## Code Style
 
@@ -65,9 +90,9 @@ These constraints MUST NEVER be relaxed:
 
 ## Testing
 
-- Unit tests: ≥ 80% coverage for optimizer, ≥ 85% for surrogate model (PRD Section 11.2)
+- Unit tests: ≥ 90% coverage for optimizer, ≥ 90% for surrogate model (PRD Section 11.2)
 - Integration tests: Full pipeline validation (PRD Section 11.3)
-- Performance tests: Solve time < 30s for 20 vehicles (PRD Section 8.3)
+- Performance tests: Solve time < 60s for 20 vehicles (PRD Section 8.3)
 
 ## Acceptance Criteria
 
@@ -76,5 +101,7 @@ Before marking any task complete, verify against PRD Section 11 (Acceptance Crit
 - AT-02: Demand Charge Reduction
 - AT-03: Price Spike Re-optimization
 - AT-04: SoC Deviation Handling
-- AT-05: Inter-Depot Handoff
+- AT-05: Return Time Deviation Handling
+- AT-06: Inter-Depot Handoff
+- AT-07: Building Load Integration
 

@@ -1,7 +1,7 @@
 version: '3.8'
 
 # Test environment for Favonius Backend
-# Reference: PRD.md#6-data-models, Development Plan Step 7.3
+# Reference: PRD_v2.md#6-data-models, Development Plan Step 7.3
 
 services:
   # TimescaleDB for integration tests

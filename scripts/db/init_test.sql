@@ -1,5 +1,5 @@
 -- Test Database Initialization Script
--- Reference: PRD.md#6-data-models
+-- Reference: PRD_v2.md#6-data-models
 
 -- Enable TimescaleDB extension
 CREATE EXTENSION IF NOT EXISTS timescaledb;

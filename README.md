@@ -1,18 +1,20 @@
 # Favonius Energy - EV Fleet Depot Optimization Platform
 
-An integrated depot energy management platform that coordinates EV charging schedules, stationary batteries, and building loads to reduce electricity costs by 30-50% for commercial fleet operators. The system supports OCPP 1.6/2.0.1 communication with chargers, V2G capabilities, and MILP-based optimization.
+An integrated depot energy management platform that coordinates EV charging schedules, stationary batteries, and building loads to reduce electricity costs by 30-50% for commercial fleet operators. The system supports OCPP 1.6/2.0.1 communication with chargers and MILP-based optimization.
+
+**Reference:** `docs/PRD_v2.md` (Product Requirements Document - single source of truth)
 
 ## Features
 
 ### Core Functionality
-- **OCPP 1.6/2.0.1 Protocol Support**: Primary support for OCPP 1.6 with 2.0.1 ready for smart charging profiles.
-- **Fleet Depot Optimization**: MILP-based optimization engine (Pyomo + HiGHS) for demand charge reduction.
-- **V2G Support**: Vehicle-to-Grid capabilities for bidirectional charging and grid services.
-- **Energy Consumption Surrogate Model**: Gaussian Process model for predicting vehicle energy consumption.
-- **Demand Charge Minimization**: Optimizes charging schedules to reduce peak demand charges (30-50% reduction target).
+- **OCPP 1.6/2.0.1 Protocol Support**: Primary support for OCPP 1.6 with 2.0.1 ready for smart charging profiles (per PRD Section 9.1).
+- **Fleet Depot Optimization**: MILP-based optimization engine (Pyomo + Gurobi primary, HiGHS fallback) for demand charge reduction (per PRD Section 8.2).
+- **Energy Consumption Surrogate Model**: Gaussian Process model for predicting vehicle energy consumption (per PRD Section 8.6).
+- **Demand Charge Minimization**: Optimizes charging schedules to reduce peak demand charges (30-50% reduction target per PRD Section 1.3).
 - **Stationary Battery Dispatch**: Coordinates battery storage for peak shaving.
+- **Building Load Integration**: **REQUIRED** for accurate grid power calculation (per PRD Section 9.4).
 - **CAISO Price Integration**: Real-time and day-ahead market price feeds for TOU arbitrage.
-- **Inter-Depot Vehicle Handoff**: Messaging system for multi-depot fleet coordination.
+- **Inter-Depot Vehicle Handoff**: Messaging system for multi-depot fleet coordination (per PRD Section 5.4).
 - **Observability**: Prometheus metrics and structured JSON logging.
 
 ### Optimization Capabilities
@@ -28,7 +30,7 @@ An integrated depot energy management platform that coordinates EV charging sche
 │                         EXTERNAL INPUTS                             │
 ├─────────┬─────────┬─────────┬─────────┬─────────┬─────────────────┤
 │ Weather │ Market/ │  Fleet  │ Vehicle │ Inter-  │ Building Load   │
-│   API   │ Utility │  Mgmt   │Telemetry│  Depot  │  (optional)     │
+│   API   │ Utility │  Mgmt   │Telemetry│  Depot  │    Meter        │
 └────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────────┬────────┘
      │         │         │         │         │             │
      ▼         ▼         ▼         ▼         ▼             ▼
@@ -49,9 +51,9 @@ An integrated depot energy management platform that coordinates EV charging sche
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                       MILP OPTIMIZER                                │
-│                       (Pyomo + HiGHS)                               │
+│                       (Pyomo + Gurobi / HiGHS fallback)            │
 │  Objective: min(Energy Cost + Demand Charges)                       │
-│  Solve time target: < 30 seconds                                    │
+│  Solve time target: < 60 seconds (per PRD Section 8.3)             │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
@@ -136,7 +138,7 @@ TLS-specific variables (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_VERIFY_CLIENT`) re
 - **TimescaleDB** is the primary state store. Schema creation in `timescale_schema.py` will run automatically in development mode.
 - **Supabase** provides user/org metadata. Populate it with demo data or connect to your project.
 - **Price feeder** requires outbound access to CAISO OASIS. In offline environments you may disable it via `PRICE_FEEDER_ENABLED=false`.
-- **Optimization engine** uses Pyomo + HiGHS for MILP optimization. Julia solver available as alternative via `julia_bridge.py`.
+- **Optimization engine** uses Pyomo + Gurobi (primary) with HiGHS fallback for MILP optimization (per PRD Section 8.2). Gurobi license required for production. Julia solver available as reference implementation in `optimization/mip_solver.jl`.
 
 ## Observability
 
@@ -167,7 +169,7 @@ This project uses Cursor IDE with custom rules for AI-assisted development:
   - `timescale.mdc` - TimescaleDB best practices (PRD Section 6)
 
 **Using Cursor:**
-- Reference PRD sections using `@PRD.md#section-name`
+- Reference PRD sections using `@PRD_v2.md#section-name`
 - AI suggestions automatically follow PRD constraints and patterns
 - Domain-specific rules provide detailed implementation guidance
 

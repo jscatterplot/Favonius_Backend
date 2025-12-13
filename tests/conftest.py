@@ -14,12 +14,12 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 # Optional: Import websocket_handler config if available
+# Note: Supabase removed - PRD specifies TimescaleDB only
 try:
-    from websocket_handler.config import Config, TimescaleConfig, SupabaseConfig
+    from websocket_handler.config import Config, TimescaleConfig
 except ImportError:
     Config = None
     TimescaleConfig = None
-    SupabaseConfig = None
 
 # Core model imports
 try:
@@ -90,17 +90,22 @@ def sample_depot_config():
     if not CORE_MODELS_AVAILABLE:
         pytest.skip("Core models not available")
     
+    vehicle_ids = ['bus_1', 'bus_2', 'bus_3']
     return DepotConfig(
         vehicle_capacities={
             'bus_1': 324.0,
             'bus_2': 324.0,
             'bus_3': 250.0,
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
+        battery_efficiency=0.92,
+        battery_soc_min=0.2,
+        battery_soc_max=0.8,
         max_site_power=800.0,
         delta_t=0.25,
         n_timesteps=96,
@@ -115,11 +120,15 @@ def sample_depot_config_small():
     
     return DepotConfig(
         vehicle_capacities={'bus_1': 324.0},
-        charger_power=80.0,
+        vehicle_max_charge_kw={'bus_1': 80.0},
+        charger_groups={80.0: 1},
         charger_efficiency=0.95,
-        n_chargers=1,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
+        battery_efficiency=0.92,
+        battery_soc_min=0.2,
+        battery_soc_max=0.8,
         max_site_power=400.0,
         delta_t=0.25,
         n_timesteps=48,  # 12 hours
@@ -366,33 +375,11 @@ def mock_timescale_client():
     return client
 
 
-@pytest.fixture
-def mock_supabase_client():
-    """Mock SupabaseClient with common methods."""
-    client = Mock()
-    
-    # User and organization methods
-    client.get_user = AsyncMock()
-    client.create_user = AsyncMock()
-    client.update_user = AsyncMock()
-    client.delete_user = AsyncMock()
-    client.get_organization = AsyncMock()
-    client.create_organization = AsyncMock()
-    
-    # Station and fleet methods
-    client.get_station = AsyncMock()
-    client.create_station = AsyncMock()
-    client.update_station = AsyncMock()
-    client.get_fleet_stations = AsyncMock()
-    
-    # Analytics methods
-    client.get_analytics_data = AsyncMock()
-    client.store_analytics_event = AsyncMock()
-    
-    # Health check method
-    client.health_check = AsyncMock(return_value={"status": "healthy"})
-    
-    return client
+# Supabase removed - PRD specifies TimescaleDB only
+# @pytest.fixture
+# def mock_supabase_client():
+#     """Mock SupabaseClient with common methods."""
+#     ...
 
 
 @pytest.fixture
@@ -424,13 +411,10 @@ def test_config():
             user="test",
             password="test"
         ),
-        supabase=SupabaseConfig(
-            url="https://test.supabase.co",
-            anon_key="test_anon_key",
-            service_key="test_service_key",
-            db_host="test.db.host",
-            db_user="test_user",
-            db_password="test_password"
+        # Supabase removed - PRD specifies TimescaleDB only
+        # supabase=SupabaseConfig(
+        #     url="https://test.supabase.co",
+            # Supabase removed - PRD specifies TimescaleDB only
         )
     )
 
@@ -840,18 +824,32 @@ def depot_config_factory():
     def _create(
         n_vehicles: int = 3,
         n_chargers: int = 5,
-        charger_power: float = 80.0,
+        charger_power: float = 80.0,  # For backward compatibility, converted to charger_groups
         battery_capacity: float = 500.0,
         max_site_power: float = 800.0,
         n_timesteps: int = 96,
+        charger_groups: Optional[dict[float, int]] = None,  # New: explicit charger groups
     ) -> DepotConfig:
+        # Convert legacy charger_power/n_chargers to charger_groups if not provided
+        if charger_groups is None:
+            charger_groups = {charger_power: n_chargers}
+        
+        # Build vehicle capacities and max_charge_kw
+        vehicle_ids = [f'bus_{i:02d}' for i in range(1, n_vehicles + 1)]
+        vehicle_capacities = {vid: 324.0 for vid in vehicle_ids}
+        vehicle_max_charge_kw = {vid: charger_power for vid in vehicle_ids}
+        
         return DepotConfig(
-            vehicle_capacities={f'bus_{i:02d}': 324.0 for i in range(1, n_vehicles + 1)},
-            charger_power=charger_power,
+            vehicle_capacities=vehicle_capacities,
+            vehicle_max_charge_kw=vehicle_max_charge_kw,
+            charger_groups=charger_groups,
             charger_efficiency=0.95,
-            n_chargers=n_chargers,
+            charger_vehicle_access={},  # All vehicles can access all chargers (simple case)
             battery_capacity=battery_capacity,
             battery_power=100.0,
+            battery_efficiency=0.92,
+            battery_soc_min=0.2,
+            battery_soc_max=0.8,
             max_site_power=max_site_power,
             delta_t=0.25,
             n_timesteps=n_timesteps,
