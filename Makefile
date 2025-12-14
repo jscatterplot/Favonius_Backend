@@ -67,6 +67,13 @@ docker-logs:
 docker-restart:
 	docker-compose restart
 
+docker-build:
+	docker-compose build
+
+docker-verify:
+	@echo "Verifying deployment..."
+	@./scripts/deploy/verify_deployment.sh
+
 # Cleanup
 clean:
 	find . -type d -name "__pycache__" -exec rm -r {} + 2>/dev/null || true

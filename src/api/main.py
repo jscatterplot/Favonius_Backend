@@ -1431,6 +1431,74 @@ async def check_ocpp_server_health() -> str:
         return "unknown"
 
 
+def check_gurobi_license() -> str:
+    """Check Gurobi license status.
+    
+    Per PRD Section 8.2: Gurobi requires valid license.
+    Per PRD Section 7.1: Health endpoint should report license status.
+    
+    Returns:
+        "valid", "invalid", "unavailable", or "not_configured"
+    """
+    try:
+        import pyomo.environ as pyo
+        
+        solver = pyo.SolverFactory('gurobi')
+        if solver is None:
+            return "not_configured"
+        
+        # Check if solver is available (includes license check)
+        if solver.available():
+            # Try to create a simple model to verify license works
+            try:
+                model = pyo.ConcreteModel()
+                model.x = pyo.Var(domain=pyo.NonNegativeReals)
+                model.obj = pyo.Objective(expr=model.x)
+                # Quick solve test (should be instant for trivial problem)
+                result = solver.solve(model, tee=False)
+                if result.solver.termination_condition == pyo.TerminationCondition.optimal:
+                    return "valid"
+                else:
+                    return "invalid"
+            except Exception as e:
+                logger.debug(f"Gurobi license test failed: {e}")
+                return "invalid"
+        else:
+            return "unavailable"
+    except ImportError:
+        logger.debug("Gurobi/Pyomo not available")
+        return "not_configured"
+    except Exception as e:
+        logger.debug(f"Gurobi license check error: {e}")
+        return "unavailable"
+
+
+def check_gurobi_license() -> str:
+    """Check Gurobi license status.
+    
+    Per PRD Section 7.1: Health endpoint should report Gurobi license status.
+    Per PRD Section 8.2: Gurobi is primary solver, HiGHS is fallback.
+    
+    Returns:
+        "valid", "invalid", or "unavailable"
+    """
+    try:
+        import pyomo.environ as pyo
+        solver = pyo.SolverFactory('gurobi')
+        if solver is None:
+            return "unavailable"
+        if solver.available():
+            return "valid"
+        else:
+            return "invalid"
+    except ImportError:
+        logger.debug("Gurobi/Pyomo not available for license check")
+        return "unavailable"
+    except Exception as e:
+        logger.debug(f"Gurobi license check error: {e}")
+        return "unavailable"
+
+
 @app.get(
     "/health",
     tags=["health"],
@@ -1439,11 +1507,12 @@ async def check_ocpp_server_health() -> str:
     Check the health status of the API and its components.
     
     **Response:**
-    - `status`: Overall status ("healthy")
+    - `status`: Overall status ("healthy" or "degraded")
     - `timestamp`: Current timestamp (ISO 8601)
     - `components`: Status of individual components
       - `database`: "healthy" or "unavailable"
       - `ocpp_server`: "healthy", "unavailable", or "unknown"
+      - `gurobi_license`: "valid", "invalid", or "unavailable"
     
     Always returns 200 status code with component details.
     
@@ -1453,13 +1522,18 @@ async def check_ocpp_server_health() -> str:
 async def health_check():
     """Health check endpoint.
 
+    Per PRD Section 7.1: Health endpoint reports component status including
+    Gurobi license (per PRD Section 8.2).
+
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
     # Check component health
     db_status = await check_database_health()
     ocpp_status = await check_ocpp_server_health()
+    gurobi_status = check_gurobi_license()
 
     # Overall status is healthy if database is healthy
+    # Gurobi license invalid is degraded but not fatal (HiGHS fallback available)
     overall_status = "healthy" if db_status == "healthy" else "degraded"
 
     return {
@@ -1468,6 +1542,7 @@ async def health_check():
         "components": {
             "database": db_status,
             "ocpp_server": ocpp_status,
+            "gurobi_license": gurobi_status,
         },
     }
 

@@ -1,0 +1,251 @@
+# Favonius Energy API Deployment
+# Main API service: FastAPI REST API + OCPP WebSocket + Optimization Engine
+# Reference: PRD_v2.md Section 7.1, 8.2, 10.3; Development Plan Phase 7 Step 7.2
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: favonius-api
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/name: favonius-api
+    app.kubernetes.io/component: api-server
+    app.kubernetes.io/version: v1.0.0
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: favonius-api
+      app.kubernetes.io/component: api-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: favonius-api
+        app.kubernetes.io/component: api-server
+        app.kubernetes.io/version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: favonius-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: api
+        image: favonius/api:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        - name: websocket
+          containerPort: 9000
+          protocol: TCP
+        env:
+        # Configuration from ConfigMap
+        - name: API_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: API_HOST
+        - name: API_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: API_PORT
+        - name: OCPP_SERVER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: OCPP_SERVER_ENABLED
+        - name: OCPP_SERVER_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: OCPP_SERVER_HOST
+        - name: OCPP_SERVER_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: OCPP_SERVER_PORT
+        - name: OPTIMIZATION_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: OPTIMIZATION_TIMEOUT
+        - name: OPTIMIZATION_MIP_GAP
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: OPTIMIZATION_MIP_GAP
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: LOG_LEVEL
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: ENVIRONMENT
+        - name: DATABASE_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: DATABASE_HOST
+        - name: DATABASE_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: DATABASE_PORT
+        - name: DATABASE_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: DATABASE_NAME
+        - name: DATABASE_USER
+          valueFrom:
+            configMapKeyRef:
+              name: favonius-api-config
+              key: DATABASE_USER
+        
+        # Secrets
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: favonius-api-secrets
+              key: DATABASE_PASSWORD
+        - name: JWT_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: favonius-api-secrets
+              key: JWT_SECRET_KEY
+        - name: GUROBI_LICENSE_FILE
+          value: /opt/gurobi/gurobi.lic
+        
+        # Pod information
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+          successThreshold: 1
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        
+        # Graceful shutdown
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sleep", "10"]
+        
+        terminationGracePeriodSeconds: 30
+        
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+        - name: data
+          mountPath: /app/data
+        # Gurobi license (per PRD Section 8.2)
+        - name: gurobi-license
+          mountPath: /opt/gurobi
+          readOnly: true
+        # TLS certificates (per PRD Section 10.3)
+        - name: tls-certs
+          mountPath: /app/certs
+          readOnly: true
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+      
+      volumes:
+      - name: logs
+        emptyDir:
+          sizeLimit: 1Gi
+      - name: data
+        emptyDir:
+          sizeLimit: 100Mi
+      # Gurobi license from Secret (per PRD Section 8.2)
+      - name: gurobi-license
+        secret:
+          secretName: favonius-api-secrets
+          items:
+          - key: gurobi.lic
+            path: gurobi.lic
+          defaultMode: 0400
+      # TLS certificates (per PRD Section 10.3)
+      - name: tls-certs
+        secret:
+          secretName: favonius-api-tls
+          defaultMode: 0400
+      
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                  - favonius-api
+              topologyKey: kubernetes.io/hostname
+      
+      nodeSelector:
+        kubernetes.io/os: linux
+      
+      tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300

@@ -1,0 +1,94 @@
+# Favonius API Service Definitions
+# Reference: PRD_v2.md Section 7.1, 9.1; Development Plan Phase 7 Step 7.2
+
+# External LoadBalancer service for REST API and OCPP WebSocket
+apiVersion: v1
+kind: Service
+metadata:
+  name: favonius-api-service
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/name: favonius-api
+    app.kubernetes.io/component: service
+  annotations:
+    # AWS Load Balancer Controller annotations
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    # GCP Load Balancer annotations (alternative)
+    # cloud.google.com/load-balancer-type: "External"
+    # cloud.google.com/backend-config: '{"default": {"timeoutSec": 60}}'
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: favonius-api
+    app.kubernetes.io/component: api-server
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+    protocol: TCP
+  - name: websocket
+    port: 9000
+    targetPort: websocket
+    protocol: TCP
+  # Session affinity for WebSocket connections (per PRD Section 9.1)
+  # OCPP connections require persistent connections
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800  # 3 hours
+
+---
+# Internal ClusterIP service for health checks and metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: favonius-api-internal
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/name: favonius-api
+    app.kubernetes.io/component: service-internal
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: favonius-api
+    app.kubernetes.io/component: api-server
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+    protocol: TCP
+  - name: metrics
+    port: 8000
+    targetPort: http
+    protocol: TCP
+
+---
+# Headless service for direct pod communication (optional)
+apiVersion: v1
+kind: Service
+metadata:
+  name: favonius-api-headless
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/name: favonius-api
+    app.kubernetes.io/component: service-headless
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: favonius-api
+    app.kubernetes.io/component: api-server
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+    protocol: TCP
+  - name: websocket
+    port: 9000
+    targetPort: websocket
+    protocol: TCP
