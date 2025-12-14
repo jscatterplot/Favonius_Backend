@@ -135,8 +135,11 @@ class DepotState:
 @dataclass
 class OptimizationResult:
     """Output from optimization.
-    
+
     Reference: PRD_v2.md Section 6.2
+
+    Note: peak_demand and solve_time are aliases for peak_demand_kw and solve_time_s
+    for backwards compatibility with existing tests.
     """
 
     run_id: UUID
@@ -148,4 +151,15 @@ class OptimizationResult:
     solve_time_s: float  # Solve time in seconds
     status: str  # 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'
     solver_used: str = 'gurobi'  # 'gurobi' or 'highs' - tracks which solver was used for monitoring
+
+    # Property aliases for backwards compatibility
+    @property
+    def peak_demand(self) -> float:
+        """Alias for peak_demand_kw."""
+        return self.peak_demand_kw
+
+    @property
+    def solve_time(self) -> float:
+        """Alias for solve_time_s."""
+        return self.solve_time_s
 
