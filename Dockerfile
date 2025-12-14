@@ -1,6 +1,13 @@
-# Multi-stage Docker build for Favonius Energy EV Fleet Depot Optimization Platform
-# Per PRD_v2.md: Python 3.12, Pyomo + Gurobi (primary) with HiGHS fallback
-FROM python:3.12-slim as builder
+# Favonius Energy EV Fleet Depot Optimization Platform
+# Multi-stage Docker build
+#
+# Reference: PRD_v2.md Section 8.2 (Gurobi + HiGHS), Development Plan Phase 7
+#
+# Build: docker build -t favonius-api .
+# Run:   docker run -p 8000:8000 -p 9000:9000 favonius-api
+
+# ============ Builder Stage ============
+FROM python:3.12-slim AS builder
 
 # Set build arguments
 ARG DEBIAN_FRONTEND=noninteractive
@@ -11,26 +18,32 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package installer)
+RUN pip install --no-cache-dir uv
 
 # Create and set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Copy dependency files
+COPY pyproject.toml ./
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+# Create virtual environment and install dependencies using uv
+# Per PRD Section 8.2: Gurobi primary, HiGHS fallback
+RUN uv venv /app/.venv && \
+    . /app/.venv/bin/activate && \
+    uv pip install --no-cache -r pyproject.toml
 
-# Production stage
-FROM python:3.11-slim as runtime
+# ============ Runtime Stage ============
+FROM python:3.12-slim AS runtime
 
 # Set build arguments
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Install runtime dependencies
-# Gurobi requires specific system libraries (per PRD Section 8.2)
+# Per PRD Section 8.2: Gurobi requires specific system libraries
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
@@ -41,42 +54,42 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy Python packages from builder
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+# Copy virtual environment from builder
+COPY --from=builder /app/.venv /app/.venv
 
 # Copy application code
 COPY src/ ./src/
+COPY config/ ./config/
 COPY README.md ./
 
-# Create directories for logs and data
-RUN mkdir -p /app/logs /app/data && \
-    chown -R appuser:appuser /app
+# Create directories for logs, data, and ensure proper permissions
+RUN mkdir -p /app/logs /app/data /opt/gurobi && \
+    chown -R appuser:appuser /app /opt/gurobi
+
+# Set Python environment
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Default environment variables
+ENV API_PORT=8000
+ENV OCPP_SERVER_PORT=9000
+ENV LOG_LEVEL=INFO
+ENV ENVIRONMENT=production
 
 # Switch to non-root user
 USER appuser
 
-# Set Python path
-ENV PYTHONPATH=/app/src
-
-# Environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-
-# Default environment values
-ENV WEBSOCKET_PORT=9000
-ENV METRICS_PORT=8080
-ENV HEALTH_CHECK_PORT=8081
-ENV LOG_LEVEL=INFO
-ENV ENVIRONMENT=production
-
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${HEALTH_CHECK_PORT}/liveness || exit 1
+# Per PRD Section 7.1: /health endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:${API_PORT}/health || exit 1
 
 # Expose ports
-EXPOSE ${WEBSOCKET_PORT} ${METRICS_PORT} ${HEALTH_CHECK_PORT}
+# Per PRD Section 7.1: REST API on 8000, OCPP WebSocket on 9000
+EXPOSE 8000 9000
 
 # Run the application
-# Per PRD_v2.md Section 7.1: FastAPI REST API server
+# Per PRD Section 7.1: FastAPI REST API server with uvicorn
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

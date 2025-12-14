@@ -93,3 +93,15 @@ gurobi.lic
 *.pem
 *.key
 credentials.json
+
+# Docker
+docker-compose.override.yml
+data/
+timescale_data/
+
+# TLS certificates
+certs/
+
+# Application data
+data/
+logs/*.log

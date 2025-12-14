@@ -67,28 +67,70 @@ An integrated depot energy management platform that coordinates EV charging sche
 
 ## Quick Start
 
-### Docker Compose (development)
+### Docker Compose (Recommended)
+
 1. **Clone & configure**
 ```bash
 git clone <repository>
-   cd Favonius_Backend
-   cp .env.example .env  # fill in Supabase/Timescale credentials
+cd Favonius_Backend
+cp .env.example .env  # Configure as needed
 ```
-2. **Launch supporting services** (docker-compose provides TimescaleDB, Prometheus, Grafana, optional tools)
+
+2. **Launch all services**
 ```bash
+# Basic services (TimescaleDB + API)
 docker-compose up -d
+
+# With OCPP simulator for testing
+docker-compose --profile simulation up -d
+
+# With monitoring (Prometheus + Grafana)
+docker-compose --profile monitoring up -d
+
+# All services
+docker-compose --profile simulation --profile monitoring up -d
 ```
-3. **Run the WebSocket handler**
+
+3. **Verify services are running**
 ```bash
-   python -m venv venv
-   source venv/bin/activate  # or venv\Scripts\activate on Windows
-   pip install -r requirements.txt
-   python -m src.websocket_handler.main
-   ```
-4. **Smoke check**
+# API health check
+curl http://localhost:8000/health
+
+# Prometheus metrics
+curl http://localhost:8000/metrics
+
+# View logs
+docker-compose logs -f api
+```
+
+4. **Access services**
+- **REST API**: http://localhost:8000
+- **OCPP WebSocket**: ws://localhost:9000/ocpp
+- **Prometheus** (with monitoring profile): http://localhost:9090
+- **Grafana** (with monitoring profile): http://localhost:3000 (admin/admin123)
+
+### Local Development (without Docker)
+
+1. **Setup Python environment**
 ```bash
-   curl http://localhost:8081/health   # health endpoints
-   curl http://localhost:8080/metrics  # Prometheus scrape
+python -m venv venv
+source venv/bin/activate  # or venv\Scripts\activate on Windows
+pip install -e ".[dev]"
+```
+
+2. **Start TimescaleDB** (requires Docker)
+```bash
+docker-compose up -d timescaledb
+```
+
+3. **Run the API server**
+```bash
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+4. **Verify**
+```bash
+curl http://localhost:8000/health
 ```
 
 ## Configuration

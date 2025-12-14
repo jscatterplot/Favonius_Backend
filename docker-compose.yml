@@ -1,57 +1,92 @@
+# Favonius Energy EV Fleet Depot Optimization Platform
+# Docker Compose Configuration
+#
+# Reference: PRD_v2.md Section 7.1, Development Plan Phase 7
+#
+# Usage:
+#   Development:     docker-compose up -d
+#   With simulator:  docker-compose --profile simulation up -d
+#   Logs:           docker-compose logs -f api
+
 version: '3.8'
 
 services:
-  # Main API service (FastAPI + Optimization Engine)
-  # Per PRD_v2.md Section 7.1: REST API endpoints
+  # TimescaleDB for time-series data storage
+  # Per PRD Section 5.2: TimescaleDB for telemetry with compression
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: favonius-timescaledb
+    environment:
+      POSTGRES_USER: favonius
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-favonius_dev}
+      POSTGRES_DB: favonius
+      TIMESCALEDB_TELEMETRY: off
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U favonius -d favonius"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # Main API service (FastAPI + Optimization Engine + OCPP Server)
+  # Per PRD Section 7.1: REST API endpoints
+  # Per PRD Section 8.2: Gurobi primary, HiGHS fallback
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ev-api
+    container_name: favonius-api
     ports:
       - "8000:8000"   # REST API (HTTPS in production per PRD Section 10.3)
       - "9000:9000"   # OCPP WebSocket (WSS in production per PRD Section 10.3)
-      - "8080:8080"   # Metrics
-      - "8081:8081"   # Health checks
     environment:
       # Database configuration
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@timescaledb:5432/ev_charging
-      
+      DATABASE_URL: postgresql://favonius:${DB_PASSWORD:-favonius_dev}@timescaledb:5432/favonius
+
       # Gurobi license (required for primary solver per PRD Section 8.2)
       GUROBI_LICENSE_FILE: /opt/gurobi/gurobi.lic
-      
+
       # API configuration
       API_HOST: 0.0.0.0
       API_PORT: 8000
-      OCPP_PORT: 9000
-      
+
+      # OCPP configuration (per PRD Section 7.2)
+      OCPP_SERVER_ENABLED: "true"
+      OCPP_SERVER_HOST: 0.0.0.0
+      OCPP_SERVER_PORT: 9000
+
       # Optimization configuration (per PRD Section 8.2)
       OPTIMIZATION_TIMEOUT: 60  # seconds
       OPTIMIZATION_MIP_GAP: 0.01  # 1%
-      
-      # TLS configuration (required for production per PRD Section 10.3)
-      # TLS_CERT_PATH: /app/certs/server.crt
-      # TLS_KEY_PATH: /app/certs/server.key
-      # TLS_VERIFY_CLIENT: false
-      # REQUIRE_TLS: "true"
-      
-      # Monitoring
-      METRICS_PORT: 8080
-      HEALTH_CHECK_PORT: 8081
-      LOG_LEVEL: INFO
+
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+
+      # CORS (configure for production)
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
-      - ./gurobi.lic:/opt/gurobi/gurobi.lic:ro  # Gurobi license file
-      # Uncomment for TLS certificates (required for production)
-      # - ./certs:/app/certs:ro
+      - ./gurobi.lic:/opt/gurobi/gurobi.lic:ro  # Gurobi license file (optional)
+      - ./config:/app/config:ro
     restart: unless-stopped
     depends_on:
       timescaledb:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -65,89 +100,30 @@ services:
           memory: 1G
           cpus: '0.5'
 
-  # OCPP WebSocket handler service (legacy - may be merged with api service)
-  websocket-handler:
+  # OCPP Charger Simulator for testing
+  # Per PRD Section 9.1: OCPP 1.6 primary
+  ocpp_simulator:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: ev-websocket-handler
-    ports:
-      - "9000:9000"   # WebSocket server
-      - "8080:8080"   # Metrics
-      - "8081:8081"   # Health checks
+      dockerfile: Dockerfile.ocpp-simulator
+    container_name: favonius-ocpp-simulator
     environment:
-      # Simplified configuration (Kafka removed)
-      
-      # WebSocket configuration
-      WEBSOCKET_HOST: 0.0.0.0
-      WEBSOCKET_PORT: 9000
-      MAX_CONNECTIONS: 100
-      HEARTBEAT_INTERVAL: 30
-      MESSAGE_TIMEOUT: 60
-      RATE_LIMIT_PER_MINUTE: 100
-      
-      # Monitoring configuration
-      METRICS_PORT: 8080
-      HEALTH_CHECK_PORT: 8081
-      LOG_LEVEL: INFO
-      ENABLE_TELEMETRY: true
-      
-      # Application configuration
-      ENVIRONMENT: development
-      DEBUG: false
-      
-      # TLS configuration (optional)
-      # TLS_CERT_PATH: /app/certs/server.crt
-      # TLS_KEY_PATH: /app/certs/server.key
-      # TLS_VERIFY_CLIENT: false
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-      # Uncomment for TLS certificates
-      # - ./certs:/app/certs:ro
+      OCPP_SERVER_URL: ws://api:9000/ocpp
+      NUM_CHARGERS: ${NUM_CHARGERS:-10}
+      CHARGER_PREFIX: ${CHARGER_PREFIX:-charger_}
+      SIMULATION_MODE: ${SIMULATION_MODE:-responsive}
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/liveness"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: '2'
-        reservations:
-          memory: 1G
-          cpus: '0.5'
+    profiles:
+      - simulation
 
-  # Redis and Kafka removed for simplification
-
-  # TimescaleDB for time series data (optional for local dev)
-  timescaledb:
-    image: timescale/timescaledb:2.13.1-pg15
-    container_name: ev-timescaledb
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: ev_charging
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      TIMESCALEDB_TELEMETRY: off
-    volumes:
-      - timescaledb_data:/var/lib/postgresql/data
-      - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ev_charging"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Prometheus for metrics collection (optional)
+  # Prometheus for metrics collection
+  # Per PRD Section 10.1: Performance monitoring
   prometheus:
     image: prom/prometheus:v2.45.0
-    container_name: ev-prometheus
+    container_name: favonius-prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -156,75 +132,43 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
       - '--storage.tsdb.retention.time=7d'
       - '--web.enable-lifecycle'
     restart: unless-stopped
     depends_on:
       - api
+    profiles:
+      - monitoring
 
-  # Grafana for monitoring dashboards (optional)
+  # Grafana for monitoring dashboards
+  # Per PRD Section 10.1: Monitoring visualization
   grafana:
     image: grafana/grafana:10.0.0
-    container_name: ev-grafana
+    container_name: favonius-grafana
     ports:
       - "3000:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
-      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+      GF_INSTALL_PLUGINS: grafana-clock-panel
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     restart: unless-stopped
     depends_on:
       - prometheus
-
-  # OCPP Simulator for testing (optional)
-  ocpp-simulator:
-    image: ghcr.io/thoughtworks/steve:latest
-    container_name: ev-ocpp-simulator
-    ports:
-      - "8180:8180"
-    environment:
-      STEVE_DB_URL: jdbc:mysql://mysql:3306/stevedb
-      STEVE_DB_USER: steve
-      STEVE_DB_PASSWORD: changeme
-      STEVE_OCPP_SERVER_URL: ws://api:9000/
-    depends_on:
-      - api
-      - mysql
-    restart: unless-stopped
-    profiles: ["testing"]
-
-  # MySQL for OCPP simulator (optional)
-  mysql:
-    image: mysql:8.0
-    container_name: ev-mysql
-    environment:
-      MYSQL_ROOT_PASSWORD: rootpass
-      MYSQL_DATABASE: stevedb
-      MYSQL_USER: steve
-      MYSQL_PASSWORD: changeme
-    volumes:
-      - mysql_data:/var/lib/mysql
-    restart: unless-stopped
-    profiles: ["testing"]
+    profiles:
+      - monitoring
 
 volumes:
-  # Redis and Kafka volumes removed for simplification
-  timescaledb_data:
+  timescale_data:
     driver: local
   prometheus_data:
     driver: local
   grafana_data:
     driver: local
-  mysql_data:
-    driver: local
 
 networks:
   default:
-    name: ev-charging-network
+    name: favonius-network
     driver: bridge
