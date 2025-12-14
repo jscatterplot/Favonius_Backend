@@ -1,18 +1,36 @@
-# OCPP Charger Simulator Dockerfile
-# Reference: Development Plan Step 7.3
+# OCPP Charger Simulator
+# Simulates multiple OCPP 1.6 charge points for testing
+#
+# Reference: PRD_v2.md Section 9.1 (OCPP Integration)
+#            Development Plan Phase 7
 
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies for OCPP simulation
 RUN pip install --no-cache-dir \
     websockets>=12.0 \
     ocpp>=0.27.0 \
     asyncio
 
 # Copy simulator script
-COPY scripts/ocpp_simulator.py ./
+COPY scripts/ocpp_simulator.py ./ocpp_simulator.py
+
+# Environment variables for configuration
+ENV OCPP_SERVER_URL=ws://localhost:9000/ocpp
+ENV NUM_CHARGERS=10
+ENV CHARGER_PREFIX=charger_
+ENV SIMULATION_MODE=responsive
+
+# Health check - just verify the script is valid Python
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD python -c "import ocpp_simulator" || exit 1
 
 # Run simulator
 CMD ["python", "ocpp_simulator.py"]

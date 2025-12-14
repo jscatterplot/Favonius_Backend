@@ -1,12 +1,13 @@
 version: '3.8'
 
 # Test environment for Favonius Backend
-# Reference: PRD_v2.md#6-data-models, Development Plan Step 7.3
+# Reference: PRD_v2.md#6-data-models, Development Plan Phase 7
 
 services:
   # TimescaleDB for integration tests
+  # Uses same schema as production (migrations/001_initial_schema.sql)
   timescaledb:
-    image: timescale/timescaledb:latest-pg15
+    image: timescale/timescaledb:latest-pg16
     container_name: favonius_test_db
     environment:
       POSTGRES_USER: favonius_test
@@ -15,7 +16,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - ./scripts/db/init_test.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./migrations:/docker-entrypoint-initdb.d:ro
       - timescale_test_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U favonius_test -d favonius_test"]
