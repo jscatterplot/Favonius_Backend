@@ -63,7 +63,6 @@ This document is extracted from the Product Requirements Document. For the autho
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   RE-OPTIMIZATION TRIGGERS                          │
-│                   (Checked every 15 minutes)                        │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Trigger                    │ Detection Method │ Threshold           │
 │  ─────────────────────────────────────────────────────────────────  │
@@ -71,7 +70,7 @@ This document is extracted from the Product Requirements Document. For the autho
 │  Vehicle return time        │ Event-driven     │ > 15 minutes late   │
 │  Inter-depot handoff        │ Event-driven     │ On message receipt  │
 │  Price change               │ On ingestion     │ > 25% OR > $25/MWh  │
-│  Scheduled (default)        │ Periodic         │ Hourly 7AM-11PM     │
+│  Scheduled (default)        │ Periodic         │ Hourly 24/7          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

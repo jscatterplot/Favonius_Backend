@@ -243,7 +243,7 @@ Controllers are automatically:
 
 **Solutions**:
 1. Check `/admin/controllers` for controller existence
-2. Verify optimization hours (default: 7am-11pm)
+2. Verify optimization hours (default: 24/7)
 3. Check application logs for errors
 4. Restart application if needed
 
