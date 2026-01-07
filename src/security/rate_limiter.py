@@ -33,6 +33,7 @@ class RateLimiter:
     config: RateLimitConfig = field(default_factory=RateLimitConfig)
     _api_buckets: dict = field(default_factory=lambda: defaultdict(list))
     _optimize_buckets: dict = field(default_factory=lambda: defaultdict(list))
+    _handoff_buckets: dict = field(default_factory=lambda: defaultdict(list))  # depot_pair -> timestamps
     _last_trigger_optimization: dict = field(default_factory=dict)
 
     def _clean_bucket(self, bucket: list, window_seconds: int) -> list:
@@ -99,6 +100,33 @@ class RateLimiter:
     def record_trigger_optimization(self, depot_id: UUID) -> None:
         """Record that a trigger-induced optimization occurred."""
         self._last_trigger_optimization[depot_id] = time.time()
+
+    def check_handoff_limit(self, origin_depot_id: str, dest_depot_id: str) -> bool:
+        """Check if handoff rate limit is within bounds.
+        
+        Per PRD Section 10.4: 50 messages/hour per depot pair.
+        
+        Args:
+            origin_depot_id: Origin depot identifier
+            dest_depot_id: Destination depot identifier
+            
+        Returns:
+            True if request allowed, False if rate limited
+        """
+        # Create depot pair key (sorted to ensure consistent key regardless of order)
+        depot_pair = tuple(sorted([origin_depot_id, dest_depot_id]))
+        bucket = self._clean_bucket(self._handoff_buckets[depot_pair], 3600)  # 1 hour window
+        self._handoff_buckets[depot_pair] = bucket
+        
+        if len(bucket) >= 50:  # 50 messages/hour per depot pair
+            logger.warning(
+                f"Handoff rate limit exceeded for depot pair "
+                f"{origin_depot_id} <-> {dest_depot_id}"
+            )
+            return False
+        
+        self._handoff_buckets[depot_pair].append(time.time())
+        return True
 
 
 # Global rate limiter instance

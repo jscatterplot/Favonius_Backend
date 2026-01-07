@@ -81,7 +81,7 @@ Commercial EV fleet operators face **demand charges** that represent **49-90% of
 
 ### 2.2 The Opportunity
 
-Fleet vehicles are **idle 85-95% of the time**, providing substantial flexibility for charging schedule optimization. Coordinating charging across a depot can:
+Fleet vehicles are idle for prolonged periods, providing substantial flexibility for charging schedule optimization. Coordinating charging across a depot can:
 - Shift charging to low-cost periods (TOU arbitrage)
 - Flatten demand peaks (demand charge reduction)
 - Utilize stationary battery storage for peak shaving
@@ -255,8 +255,8 @@ SO THAT charging can be planned before arrival
 ### 5.1 High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         EXTERNAL INPUTS                             │
+┌───────────────────────────────────────────────────────────────────┐
+│                         EXTERNAL INPUTS                           │
 ├─────────┬─────────┬─────────┬─────────┬─────────┬─────────────────┤
 │ Weather │ Market/ │  Fleet  │ Vehicle │ Inter-  │ Building Load   │
 │   API   │ Utility │  Mgmt   │Telemetry│  Depot  │    Meter        │
@@ -310,15 +310,15 @@ SO THAT charging can be planned before arrival
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   RE-OPTIMIZATION TRIGGERS                          │
-│  Event-driven (SoC/return/handoff) | Periodic (price/scheduled)    │
+│  Event-driven (SoC/return/handoff) | Periodic (price/scheduled)     │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Trigger                    │ Detection Method │ Threshold           │
+│  Trigger                    │ Detection Method │ Threshold          │
 │  ─────────────────────────────────────────────────────────────────  │
-│  Vehicle SoC deviation      │ Event-driven     │ > 5%                │
-│  Vehicle return time        │ Event-driven     │ > 15 minutes late   │
-│  Inter-depot handoff        │ Event-driven     │ On message receipt  │
-│  Price change               │ On ingestion     │ > 25% OR > $25/MWh   │
-│  Scheduled (default)        │ Periodic         │ Hourly 7AM-11PM      │
+│  Vehicle SoC deviation      │ Event-driven     │ > 5%               │
+│  Vehicle return time        │ Event-driven     │ > 15 minutes late  │
+│  Inter-depot handoff        │ Event-driven     │ On message receipt │
+│  Price change               │ On ingestion     │ > 25% OR > $25/MWh │
+│  Scheduled (default)        │ Periodic         │ Hourly 24/7        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -395,7 +395,7 @@ SO THAT charging can be planned before arrival
    Periodic triggers (price, scheduled):
    - Price change: Evaluated on each price ingestion event (every 5 minutes)
      If deviation >25% OR >$25/MWh, trigger immediately (subject to rate limiting)
-   - Scheduled: Evaluated hourly 7AM-11PM
+   - Scheduled: Evaluated hourly 24/7
    - Optimization completes within 60 seconds of trigger
 
 6. INTER-DEPOT COORDINATION (on vehicle departure)
@@ -418,15 +418,15 @@ SO THAT charging can be planned before arrival
        │  {vehicle_id, expected_soc: 0.35,          │
        │   arrival_time, battery_kwh, max_charge_kw}│
        │                                            │
-       │                              2. Depot B    │
-       │                                 stores in  │
-       │                                 pending    │
-       │                                 arrivals   │
+       │                             2. Depot B     │
+       │                                stores in   │
+       │                                pending     │
+       │                                arrivals    │
        │                                            │
-       │                              3. Next       │
-       │                                 optimization│
-       │                                 includes   │
-       │                                 bus_1      │
+       │                             3. Next        │
+       │                                optimization│
+       │                                includes    │
+       │                                bus_1       │
        │                                            │
        │  4. Vehicle arrives                        │
        │◄───────────────────────────────────────────┤
@@ -1326,6 +1326,7 @@ When optimization cannot satisfy all constraints (typically: insufficient time t
    - Relax departure SoC from 99% to 90% for affected vehicles only
    - Re-solve with relaxed constraints
    - Mark result as `status: 'degraded'`
+   - If failing again, relax departure SoC to be expected energy consumption for the next route +20% safety margin
 
 3. **Alert generation:**
    - Create high-priority alert for operations team
@@ -1371,7 +1372,7 @@ When optimization cannot satisfy all constraints (typically: insufficient time t
 | is_school_day | Binary | Calendar |
 
 **Training:**
-- Window: Rolling 30 days
+- Window: Rolling 14 days
 - Validation: Next 7 days
 - Retraining: Weekly
 

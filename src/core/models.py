@@ -32,7 +32,7 @@ class Vehicle:
     vehicle_type: str  # 'bus_large', 'bus_small', 'van'
     battery_kwh: float
     max_charge_kw: float
-    ocpp_id: Optional[str] = None
+    id_tag: Optional[str] = None  # OCPP idTag used in Authorize messages to map sessions to vehicles
 
 
 @dataclass

@@ -684,7 +684,7 @@ class StateAssembler:
             depot_id: Depot identifier
 
         Returns:
-            Tuple of (DepotConfig, vehicle_id_to_ocpp_id mapping)
+            Tuple of (DepotConfig, vehicle_id_to_id_tag mapping)
 
         Raises:
             ValueError: If depot not found or configuration is invalid
@@ -711,7 +711,7 @@ class StateAssembler:
 
         # Query vehicles
         vehicles_query = """
-        SELECT vehicle_id::text, battery_kwh, max_charge_kw, ocpp_id
+        SELECT vehicle_id::text, battery_kwh, max_charge_kw, id_tag
         FROM vehicles
         WHERE depot_id = $1
         """
@@ -726,8 +726,8 @@ class StateAssembler:
         for row in vehicle_rows:
             vid = row['vehicle_id']
             vehicle_capacities[vid] = float(row['battery_kwh'])
-            if row['ocpp_id']:
-                vehicle_to_ocpp[vid] = row['ocpp_id']
+            if row['id_tag']:
+                vehicle_to_ocpp[vid] = row['id_tag']
 
         # Query chargers - aggregate by rated_kw per PRD Section 8.3
         chargers_query = """

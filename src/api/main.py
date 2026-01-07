@@ -26,8 +26,10 @@ from ..core.controller import DepotController
 from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.state.assembler import StateAssembler
+from ..security.auth import verify_token
+from ..security.rate_limiter import rate_limiter
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +243,9 @@ app = FastAPI(
         },
     ],
 )
+
+# Add rate limiting middleware (before logging to catch rate limits early)
+app.add_middleware(RateLimitMiddleware)
 
 # Add logging middleware
 app.add_middleware(LoggingMiddleware)
@@ -550,6 +555,63 @@ async def postgres_error_handler(
     )
 
 
+# ============ Rate Limiting Middleware ============
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware to enforce rate limits per PRD Section 10.4."""
+
+    async def dispatch(self, request: Request, call_next):
+        """Check rate limits before processing request."""
+        # Skip rate limiting for health and metrics endpoints
+        if request.url.path in ["/health", "/metrics"]:
+            return await call_next(request)
+
+        # Extract client identifier (IP address or API key from header)
+        client_id = request.client.host if request.client else "unknown"
+        
+        # Check for API key in header (if available)
+        api_key = request.headers.get("X-API-Key")
+        if api_key:
+            client_id = f"api_key:{api_key}"
+
+        # Apply different rate limits based on endpoint
+        path = request.url.path
+        
+        # POST /optimize: 10 requests/minute
+        if path == "/optimize" and request.method == "POST":
+            if not rate_limiter.check_optimize_limit(client_id):
+                return JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        detail="Rate limit exceeded: Maximum 10 optimization requests per minute",
+                        error_code="RATE_LIMIT_EXCEEDED",
+                        timestamp=datetime.utcnow().isoformat(),
+                    ).model_dump(),
+                )
+        
+        # Inter-depot handoff: 50 messages/hour per depot pair
+        elif "/handoff" in path:
+            # For handoff endpoints, we need to extract depot IDs from the request
+            # This is done after rate limit check for send_handoff and receive_handoff endpoints
+            # For now, apply general API limit, then check handoff limit in endpoint handlers
+            # (handoff limit requires reading request body which is not available in middleware)
+            pass  # Handoff rate limiting handled in endpoint handlers
+        
+        # General API endpoints: 100 requests/minute
+        else:
+            if not rate_limiter.check_api_limit(client_id):
+                return JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        detail="Rate limit exceeded: Maximum 100 requests per minute",
+                        error_code="RATE_LIMIT_EXCEEDED",
+                        timestamp=datetime.utcnow().isoformat(),
+                    ).model_dump(),
+                )
+
+        return await call_next(request)
+
+
 # ============ Logging Middleware ============
 
 class LoggingMiddleware(BaseHTTPMiddleware):
@@ -697,6 +759,8 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
     description="""
     Trigger optimization for a depot to generate charging schedules.
     
+    **Authentication:** Requires JWT token in Authorization header.
+    
     **Request:**
     - `depot_id`: Depot identifier (UUID)
     - `horizon_hours`: Optimization horizon (1-48 hours, default 24)
@@ -712,6 +776,7 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
     
     **Error Codes:**
     - 400: Invalid request (missing depot_id, invalid horizon_hours)
+    - 401: Unauthorized (missing or invalid JWT token)
     - 404: Depot not found
     - 500: Optimization failed (infeasible, timeout)
     - 503: Database not available
@@ -720,12 +785,16 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
     """,
     responses={
         400: {"model": ErrorResponse, "description": "Invalid request"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
         404: {"model": ErrorResponse, "description": "Depot not found"},
         500: {"model": ErrorResponse, "description": "Optimization failed"},
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def run_optimization(request: OptimizationRequest):
+async def run_optimization(
+    request: OptimizationRequest,
+    user: dict = Depends(verify_token)
+):
     """Trigger depot charging optimization.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
@@ -837,6 +906,8 @@ async def run_optimization(request: OptimizationRequest):
     Get current state of a depot including vehicle SoCs, battery state,
     current month peak demand, and current electricity price.
     
+    **Authentication:** Requires JWT token in Authorization header.
+    
     **Response:**
     - `depot_id`: Depot identifier
     - `timestamp`: Current timestamp (ISO 8601)
@@ -846,6 +917,7 @@ async def run_optimization(request: OptimizationRequest):
     - `current_price_kwh`: Current electricity price ($/kWh)
     
     **Error Codes:**
+    - 401: Unauthorized (missing or invalid JWT token)
     - 404: Depot not found
     - 500: Server error
     - 503: Database not available
@@ -853,12 +925,16 @@ async def run_optimization(request: OptimizationRequest):
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
     responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
         404: {"model": ErrorResponse, "description": "Depot not found"},
         500: {"model": ErrorResponse, "description": "Server error"},
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def get_depot_state(depot_id: str):
+async def get_depot_state(
+    depot_id: str,
+    user: dict = Depends(verify_token)
+):
     """Get current depot state.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
@@ -928,6 +1004,8 @@ async def get_depot_state(depot_id: str):
     description="""
     Get the most recent charging schedule for a depot.
     
+    **Authentication:** Requires JWT token in Authorization header.
+    
     **Response:**
     - `depot_id`: Depot identifier
     - `run_id`: Optimization run identifier
@@ -937,6 +1015,7 @@ async def get_depot_state(depot_id: str):
     - `schedule`: Charging schedule per vehicle
     
     **Error Codes:**
+    - 401: Unauthorized (missing or invalid JWT token)
     - 404: No schedule found for depot
     - 500: Server error
     - 503: Database not available
@@ -944,12 +1023,16 @@ async def get_depot_state(depot_id: str):
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
     responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
         404: {"model": ErrorResponse, "description": "No schedule found"},
         500: {"model": ErrorResponse, "description": "Server error"},
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def get_depot_schedule(depot_id: str):
+async def get_depot_schedule(
+    depot_id: str,
+    user: dict = Depends(verify_token)
+):
     """Get current charging schedule.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
@@ -1048,6 +1131,8 @@ async def get_depot_schedule(depot_id: str):
     to another depot. The destination depot will receive notification
     to plan charging for the arriving vehicle.
     
+    **Authentication:** Requires JWT token in Authorization header.
+    
     **Request:**
     - `dest_depot_id`: Destination depot identifier (UUID)
     - `expected_soc`: Expected state of charge at arrival (0.0-1.0)
@@ -1059,6 +1144,7 @@ async def get_depot_schedule(depot_id: str):
     
     **Error Codes:**
     - 400: Invalid request (invalid UUID, invalid SoC)
+    - 401: Unauthorized (missing or invalid JWT token)
     - 500: Server error
     - 503: Database not available
     
@@ -1066,12 +1152,16 @@ async def get_depot_schedule(depot_id: str):
     """,
     responses={
         400: {"model": ErrorResponse, "description": "Invalid request"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
         500: {"model": ErrorResponse, "description": "Server error"},
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
 async def send_handoff(
-    depot_id: str, vehicle_id: str, request: HandoffRequest
+    depot_id: str,
+    vehicle_id: str,
+    request: HandoffRequest,
+    user: dict = Depends(verify_token)
 ):
     """Send inter-depot handoff message.
 
@@ -1084,6 +1174,13 @@ async def send_handoff(
     validate_depot_id(depot_id)
     validate_vehicle_id(vehicle_id)
     validate_depot_id(request.dest_depot_id)
+
+    # Check handoff rate limit per PRD Section 10.4 (50 messages/hour per depot pair)
+    if not rate_limiter.check_handoff_limit(depot_id, request.dest_depot_id):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded: Maximum 50 handoff messages per hour per depot pair"
+        )
 
     try:
         from uuid import uuid4
@@ -1266,6 +1363,10 @@ class HandoffReceiveResponse(BaseModel):
     The destination depot stores the message and incorporates the vehicle
     into the next optimization run.
     
+    **Authentication:** Requires JWT token in Authorization header.
+    Note: In production, this endpoint should also validate inter-depot
+    authentication (mutual TLS or signed JWT per PRD Section 10.3).
+    
     **Request:**
     - `origin_depot_id`: Origin depot identifier (UUID)
     - `vehicle_id`: Vehicle identifier (UUID)
@@ -1282,6 +1383,7 @@ class HandoffReceiveResponse(BaseModel):
     
     **Error Codes:**
     - 400: Invalid request (invalid UUID, invalid SoC)
+    - 401: Unauthorized (missing or invalid JWT token)
     - 500: Server error
     - 503: Database not available
     
@@ -1289,11 +1391,16 @@ class HandoffReceiveResponse(BaseModel):
     """,
     responses={
         400: {"model": ErrorResponse, "description": "Invalid request"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
         500: {"model": ErrorResponse, "description": "Server error"},
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def receive_handoff(depot_id: str, request: HandoffReceiveRequest):
+async def receive_handoff(
+    depot_id: str,
+    request: HandoffReceiveRequest,
+    user: dict = Depends(verify_token)
+):
     """Receive inter-depot handoff message.
 
     Per PRD Section 5.4, the destination depot:
@@ -1316,6 +1423,13 @@ async def receive_handoff(depot_id: str, request: HandoffReceiveRequest):
         raise HTTPException(
             status_code=400,
             detail=f"expected_soc must be between 0.0 and 1.0, got {request.expected_soc}"
+        )
+
+    # Check handoff rate limit per PRD Section 10.4 (50 messages/hour per depot pair)
+    if not rate_limiter.check_handoff_limit(request.origin_depot_id, depot_id):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded: Maximum 50 handoff messages per hour per depot pair"
         )
 
     try:
@@ -1358,6 +1472,33 @@ async def receive_handoff(depot_id: str, request: HandoffReceiveRequest):
                 "external_id": request.external_id,
             }
         )
+
+        # Trigger optimization per PRD Section 5.3 (inter-depot handoff trigger)
+        # Ensure optimization completes within 60 seconds
+        if controller_manager:
+            try:
+                controller = await controller_manager.get_or_create_controller(
+                    depot_id
+                )
+                # Trigger optimization with reason='interdepot_handoff'
+                trigger_reason = f"interdepot_handoff: message_id={message_id}, vehicle_id={request.vehicle_id}"
+                logger.info(
+                    f"Triggering optimization for depot {depot_id} "
+                    f"due to inter-depot handoff"
+                )
+                # Run optimization in background to avoid blocking response
+                asyncio.create_task(controller.run_optimization(trigger_reason))
+            except Exception as e:
+                logger.error(
+                    f"Failed to trigger optimization after handoff: {e}",
+                    exc_info=True,
+                    extra={
+                        "depot_id": depot_id,
+                        "message_id": str(message_id),
+                        "vehicle_id": request.vehicle_id,
+                    }
+                )
+                # Continue - message is stored, optimization can be triggered later
 
         return HandoffReceiveResponse(
             status="acknowledged",
@@ -1582,6 +1723,8 @@ async def metrics():
     description="""
     List all active depot controllers managed by the controller manager.
     
+    **Authentication:** Requires JWT token in Authorization header.
+    
     **Response:**
     - `controllers`: List of depot IDs with active controllers
     - `count`: Number of active controllers
@@ -1590,7 +1733,7 @@ async def metrics():
     """,
     include_in_schema=True,
 )
-async def list_controllers():
+async def list_controllers(user: dict = Depends(verify_token)):
     """List active controllers."""
     if not controller_manager:
         raise HTTPException(
@@ -1612,6 +1755,8 @@ async def list_controllers():
     description="""
     Get health status for a specific depot controller.
     
+    **Authentication:** Requires JWT token in Authorization header.
+    
     **Response:**
     - `depot_id`: Depot identifier
     - `status`: Controller status (healthy, degraded, error)
@@ -1623,7 +1768,10 @@ async def list_controllers():
     Reference: Development plan Step 5.2
     """,
 )
-async def get_controller_health(depot_id: str):
+async def get_controller_health(
+    depot_id: str,
+    user: dict = Depends(verify_token)
+):
     """Get controller health status."""
     if not controller_manager:
         raise HTTPException(

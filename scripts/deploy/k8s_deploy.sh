@@ -142,3 +142,5 @@ echo "  2. Check logs: kubectl logs -n $NAMESPACE -l app.kubernetes.io/name=favo
 echo "  3. Monitor metrics: kubectl port-forward -n $NAMESPACE svc/favonius-api-internal 8000:8000"
 echo ""
 
+
+

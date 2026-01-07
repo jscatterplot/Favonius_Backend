@@ -23,7 +23,8 @@ async def get_vehicle_to_charger_map(
     """Build vehicle-to-charger mapping for a depot.
 
     Maps vehicle_id (as string) to (charge_point_id, connector_id) tuples.
-    Uses vehicle.ocpp_id to match with charger.ocpp_id.
+    Uses charger_vehicle_access table to find which chargers each vehicle can access.
+    For vehicles with multiple accessible chargers, returns the first one found.
 
     Args:
         pool: Database connection pool
@@ -46,15 +47,17 @@ async def get_vehicle_to_charger_map(
         return _mapping_cache[depot_id_str]
 
     query = """
-    SELECT 
+    SELECT DISTINCT ON (v.vehicle_id)
         v.vehicle_id::text as vehicle_id,
         c.ocpp_id as charge_point_id,
         1 as connector_id  -- Default to connector 1
     FROM vehicles v
-    JOIN chargers c ON v.ocpp_id = c.ocpp_id
+    JOIN charger_vehicle_access cva ON v.vehicle_id = cva.vehicle_id
+    JOIN chargers c ON cva.charger_id = c.charger_id
     WHERE v.depot_id = $1::uuid
-      AND v.ocpp_id IS NOT NULL
+      AND cva.is_accessible = TRUE
       AND c.ocpp_id IS NOT NULL
+    ORDER BY v.vehicle_id, c.ocpp_id
     """
 
     mapping: dict[str, tuple[str, int]] = {}
@@ -121,21 +124,31 @@ async def get_vehicle_id_from_ocpp_id(
 ) -> Optional[UUID]:
     """Get vehicle_id from OCPP charge point ID and connector.
 
+    This function finds which vehicle is currently connected to a charger
+    by looking up the charger's ocpp_id. Note: This requires active transaction
+    or telemetry data to determine the actual vehicle connection.
+
     Args:
         pool: Database connection pool
-        ocpp_id: OCPP charge point identifier
+        ocpp_id: OCPP charge point identifier (charger's ocpp_id)
         connector_id: Connector identifier (default 1)
 
     Returns:
         Vehicle UUID or None if not found
+
+    Note:
+        This is a simplified implementation. In production, this should
+        query telemetry or transaction data to find the active vehicle
+        connection rather than using a static mapping.
     """
-    query = """
-    SELECT v.vehicle_id
-    FROM vehicles v
-    JOIN chargers c ON v.ocpp_id = c.ocpp_id
-    WHERE c.ocpp_id = $1
-    LIMIT 1
-    """
+    # For now, return None as this requires active transaction/telemetry lookup
+    # The proper implementation would query telemetry table for recent connections
+    # or use transaction_manager to find active sessions
+    logger.warning(
+        f"get_vehicle_id_from_ocpp_id called for charger {ocpp_id} - "
+        "implementation needs active transaction/telemetry lookup"
+    )
+    return None
 
     try:
         async with pool.acquire() as conn:

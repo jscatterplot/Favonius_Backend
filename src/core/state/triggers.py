@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable, Optional
+from uuid import UUID
 
 import asyncpg
 
@@ -111,6 +112,7 @@ class TriggerMonitor:
         self._running = False
         self._last_trigger_time: Optional[datetime] = None
         self._trigger_cooldown_sec: float = 300.0  # 5 minutes
+        self._last_scheduled_hour: Optional[int] = None  # Track last scheduled trigger hour
 
         # Validate that we have a way to fetch state
         if assembler is None and (pool is None or depot_id is None):
@@ -228,6 +230,28 @@ class TriggerMonitor:
                     logger.warning(reason)
                     return reason
         return None
+
+    def trigger_interdepot_handoff(
+        self, message_id: UUID, vehicle_id: UUID
+    ) -> str:
+        """Create trigger for inter-depot handoff receipt.
+        
+        Per PRD Section 5.3, inter-depot handoff messages trigger
+        re-optimization immediately (event-driven trigger).
+        
+        Args:
+            message_id: Handoff message identifier
+            vehicle_id: Vehicle identifier arriving from another depot
+            
+        Returns:
+            Trigger reason string
+        """
+        reason = (
+            f"interdepot_handoff: message_id={message_id}, "
+            f"vehicle_id={vehicle_id}"
+        )
+        logger.info(f"Inter-depot handoff trigger: {reason}")
+        return reason
 
     async def _get_current_vehicle_socs(self) -> dict[str, float]:
         """Get current vehicle SoCs from database.
@@ -373,6 +397,16 @@ class TriggerMonitor:
 
         while self._running:
             try:
+                now = datetime.utcnow()
+                current_hour = now.hour
+                
+                # Scheduled trigger: hourly 24/7 (once per hour)
+                scheduled_trigger = None
+                if self._last_scheduled_hour is None or self._last_scheduled_hour != current_hour:
+                    scheduled_trigger = "scheduled"
+                    self._last_scheduled_hour = current_hour
+                    logger.info(f"Scheduled trigger fired for hour {current_hour}")
+                
                 # Fetch current state
                 current_socs = await self._get_current_vehicle_socs()
                 current_prices = await self._get_current_prices()
@@ -386,11 +420,14 @@ class TriggerMonitor:
                 )
 
                 # Fire callback if any trigger detected (with cooldown)
-                if soc_trigger or price_trigger or return_trigger:
+                # Scheduled triggers bypass cooldown (they're already rate-limited to once per hour)
+                if scheduled_trigger:
+                    await self.on_trigger(scheduled_trigger)
+                    self._last_trigger_time = now
+                elif soc_trigger or price_trigger or return_trigger:
                     reason = soc_trigger or price_trigger or return_trigger
 
                     # Check cooldown to prevent rapid-fire triggers
-                    now = datetime.utcnow()
                     if (
                         self._last_trigger_time is None
                         or (now - self._last_trigger_time).total_seconds()

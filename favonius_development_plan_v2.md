@@ -56,14 +56,13 @@ favonius-platform/
 │   │   │   ├── solver.py       # Gurobi solver wrapper with HiGHS fallback
 │   │   │   └── allocator.py    # Post-optimization charger allocation
 │   │   ├── surrogate/          # Energy consumption model
-│   │   └── state/              # State assembler
+│   │   └── state/              # State assembler and trigger monitor
 │   ├── adapters/
 │   │   ├── ocpp/               # OCPP server and handlers
 │   │   ├── caiso/              # CAISO price feeds
 │   │   ├── weather/            # Weather API integration
 │   │   ├── building_load/      # Building load meter/API
 │   │   └── handoff/            # Inter-depot handoff manager
-│   ├── triggers/               # Re-optimization trigger monitor
 │   ├── security/               # Security modules (validators, auth, rate limiting)
 │   ├── api/                    # FastAPI REST endpoints
 │   └── db/                     # Database models & migrations
@@ -969,7 +968,7 @@ def allocate_chargers(
 
 ### Step 2.1: Trigger Monitor Implementation
 
-Create `src/triggers/monitor.py`:
+Create `src/core/state/triggers.py`:
 
 ```python
 """Re-optimization trigger monitoring.
@@ -980,7 +979,7 @@ Trigger thresholds:
 - Price change: >25% OR >$25/MWh
 - Return time deviation: >15 minutes
 - Inter-depot handoff: On message receipt
-- Scheduled: Hourly 7AM-11PM
+- Scheduled: Hourly 24/7
 """
 from __future__ import annotations
 
@@ -1175,10 +1174,11 @@ class TriggerMonitor:
             now = datetime.utcnow()
             hour = now.hour
             
-            # Scheduled trigger: hourly 7AM-11PM
-            if 7 <= hour <= 23:
+            # Scheduled trigger: hourly 24/7
+            if not hasattr(self, '_last_scheduled_hour') or self._last_scheduled_hour != hour:
                 trigger = self.create_scheduled_trigger()
                 self.on_trigger(trigger)
+                self._last_scheduled_hour = hour
             
             await asyncio.sleep(self.check_interval)
     
@@ -1192,7 +1192,7 @@ class TriggerMonitor:
 - [ ] SoC deviation triggers at >5%
 - [ ] Price change triggers with OR logic (>25% OR >$25/MWh)
 - [ ] Return time deviation triggers at >15 minutes late
-- [ ] Scheduled trigger fires hourly 7AM-11PM
+- [ ] Scheduled trigger fires hourly 24/7
 
 ---
 
@@ -2677,7 +2677,7 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 - [ ] SoC deviation trigger (>5%)
 - [ ] Price change trigger (>25% OR >$25/MWh) - OR logic per PRD Section 5.1
 - [ ] Return time deviation trigger (>15 min late)
-- [ ] Scheduled trigger (hourly 7AM-11PM) - per PRD Section 5.1
+- [ ] Scheduled trigger (hourly 24/7) - per PRD Section 5.1
 - [ ] Inter-depot handoff trigger (on message receipt)
 - [ ] Trigger cooldown (5 min per depot) to prevent rapid re-optimization
 

@@ -28,7 +28,7 @@ For each depot:
     - Start control loop (background task)
     ↓
 Control Loop (per depot):
-    - Hourly optimization (7am-11pm)
+    - Hourly optimization (24/7)
     - Trigger-based re-optimization
     - OCPP command dispatch
     ↓
@@ -47,7 +47,7 @@ Configuration is loaded from environment variables with defaults:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FAVONIUS_OPTIMIZATION_HORIZON_HOURS` | 24 | Optimization horizon in hours |
-| `FAVONIUS_HOURLY_OPT_START` | 7 | Hourly optimization start hour (0-23) |
+| `FAVONIUS_HOURLY_OPT_START` | 0 | Hourly optimization start hour (0-23) |
 | `FAVONIUS_HOURLY_OPT_END` | 23 | Hourly optimization end hour (0-23) |
 | `FAVONIUS_OPTIMIZATION_TIMEOUT` | 60.0 | Solver timeout in seconds |
 | `FAVONIUS_TRIGGER_COOLDOWN_MIN` | 5 | Cooldown after trigger in minutes |
@@ -68,7 +68,7 @@ Configuration is loaded from environment variables with defaults:
 
 ### Hourly Optimization
 
-Controllers run hourly optimizations during active hours (default: 7am-11pm):
+Controllers run hourly optimizations during active hours (default: 24/7):
 
 1. Assemble current depot state (vehicle SoCs, prices, etc.)
 2. Build and solve optimization model
@@ -84,7 +84,7 @@ The TriggerMonitor continuously monitors:
 - **Price Changes**: Electricity price changes >25% OR >$25/MWh (OR logic, on ingestion)
 - **Return Time Delays**: Vehicle returns >15 minutes late (event-driven)
 - **Inter-depot Handoff**: On message receipt (event-driven)
-- **Scheduled**: Hourly 7AM-11PM (periodic)
+- **Scheduled**: Hourly 24/7 (periodic)
 
 When a trigger fires:
 1. Check cooldown period (prevents rapid re-optimization)

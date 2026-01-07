@@ -348,8 +348,8 @@ class TestVehicle:
         assert vehicle.vehicle_type == 'bus_large'
         assert vehicle.battery_kwh == 324.0
 
-    def test_vehicle_with_ocpp_id(self):
-        """Test Vehicle with OCPP ID."""
+    def test_vehicle_with_id_tag(self):
+        """Test Vehicle with OCPP idTag."""
         vehicle = Vehicle(
             vehicle_id=uuid4(),
             depot_id=uuid4(),
@@ -357,13 +357,13 @@ class TestVehicle:
             vehicle_type='bus_small',
             battery_kwh=200.0,
             max_charge_kw=60.0,
-            ocpp_id='charger_001_connector_1',
+            id_tag='RFID_001',
         )
         
-        assert vehicle.ocpp_id == 'charger_001_connector_1'
+        assert vehicle.id_tag == 'RFID_001'
 
-    def test_vehicle_default_ocpp_id(self):
-        """Test Vehicle without OCPP ID defaults to None."""
+    def test_vehicle_default_id_tag(self):
+        """Test Vehicle without idTag defaults to None."""
         vehicle = Vehicle(
             vehicle_id=uuid4(),
             depot_id=uuid4(),
@@ -373,7 +373,7 @@ class TestVehicle:
             max_charge_kw=50.0,
         )
         
-        assert vehicle.ocpp_id is None
+        assert vehicle.id_tag is None
 
 
 # ============ Charger Tests ============
