@@ -14,7 +14,7 @@ from uuid import UUID
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -243,6 +243,123 @@ app = FastAPI(
         },
     ],
 )
+
+# ============ Rate Limiting Middleware ============
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware to enforce rate limits per PRD Section 10.4."""
+
+    async def dispatch(self, request: Request, call_next):
+        """Check rate limits before processing request."""
+        # Skip rate limiting for health and metrics endpoints
+        if request.url.path in ["/health", "/metrics"]:
+            return await call_next(request)
+
+        # Extract client identifier (IP address or API key from header)
+        client_id = request.client.host if request.client else "unknown"
+        
+        # Check for API key in header (if available)
+        api_key = request.headers.get("X-API-Key")
+        if api_key:
+            client_id = f"api_key:{api_key}"
+
+        # Apply different rate limits based on endpoint
+        path = request.url.path
+        
+        # POST /optimize: 10 requests/minute
+        if path == "/optimize" and request.method == "POST":
+            if not rate_limiter.check_optimize_limit(client_id):
+                return JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        detail="Rate limit exceeded: Maximum 10 optimization requests per minute",
+                        error_code="RATE_LIMIT_EXCEEDED",
+                        timestamp=datetime.utcnow().isoformat(),
+                    ).model_dump(),
+                )
+        
+        # Inter-depot handoff: 50 messages/hour per depot pair
+        elif "/handoff" in path:
+            # For handoff endpoints, we need to extract depot IDs from the request
+            # This is done after rate limit check for send_handoff and receive_handoff endpoints
+            # For now, apply general API limit, then check handoff limit in endpoint handlers
+            # (handoff limit requires reading request body which is not available in middleware)
+            pass  # Handoff rate limiting handled in endpoint handlers
+        
+        # General API endpoints: 100 requests/minute
+        else:
+            if not rate_limiter.check_api_limit(client_id):
+                return JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        detail="Rate limit exceeded: Maximum 100 requests per minute",
+                        error_code="RATE_LIMIT_EXCEEDED",
+                        timestamp=datetime.utcnow().isoformat(),
+                    ).model_dump(),
+                )
+
+        return await call_next(request)
+
+
+# ============ Logging Middleware ============
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware to log all requests and responses."""
+
+    async def dispatch(self, request: Request, call_next):
+        """Process request and log details."""
+        start_time = time.time()
+
+        # Log request
+        logger.info(
+            "Incoming request",
+            extra={
+                "method": request.method,
+                "path": str(request.url.path),
+                "query_params": dict(request.query_params),
+                "client": request.client.host if request.client else None,
+            }
+        )
+
+        # Process request
+        try:
+            response = await call_next(request)
+            process_time = time.time() - start_time
+
+            # Log response (exclude sensitive endpoints)
+            if request.url.path not in ["/metrics", "/health"]:
+                logger.info(
+                    "Request completed",
+                    extra={
+                        "method": request.method,
+                        "path": str(request.url.path),
+                        "status_code": response.status_code,
+                        "process_time": f"{process_time:.3f}s",
+                    }
+                )
+            else:
+                # Log health/metrics with less detail
+                logger.debug(
+                    f"{request.method} {request.url.path} - {response.status_code} "
+                    f"({process_time:.3f}s)"
+                )
+
+            return response
+
+        except Exception as e:
+            process_time = time.time() - start_time
+            logger.error(
+                "Request failed",
+                extra={
+                    "method": request.method,
+                    "path": str(request.url.path),
+                    "error": str(e),
+                    "process_time": f"{process_time:.3f}s",
+                },
+                exc_info=True,
+            )
+            raise
+
 
 # Add rate limiting middleware (before logging to catch rate limits early)
 app.add_middleware(RateLimitMiddleware)
@@ -553,123 +670,6 @@ async def postgres_error_handler(
             timestamp=datetime.utcnow().isoformat(),
         ).model_dump(),
     )
-
-
-# ============ Rate Limiting Middleware ============
-
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Middleware to enforce rate limits per PRD Section 10.4."""
-
-    async def dispatch(self, request: Request, call_next):
-        """Check rate limits before processing request."""
-        # Skip rate limiting for health and metrics endpoints
-        if request.url.path in ["/health", "/metrics"]:
-            return await call_next(request)
-
-        # Extract client identifier (IP address or API key from header)
-        client_id = request.client.host if request.client else "unknown"
-        
-        # Check for API key in header (if available)
-        api_key = request.headers.get("X-API-Key")
-        if api_key:
-            client_id = f"api_key:{api_key}"
-
-        # Apply different rate limits based on endpoint
-        path = request.url.path
-        
-        # POST /optimize: 10 requests/minute
-        if path == "/optimize" and request.method == "POST":
-            if not rate_limiter.check_optimize_limit(client_id):
-                return JSONResponse(
-                    status_code=429,
-                    content=ErrorResponse(
-                        detail="Rate limit exceeded: Maximum 10 optimization requests per minute",
-                        error_code="RATE_LIMIT_EXCEEDED",
-                        timestamp=datetime.utcnow().isoformat(),
-                    ).model_dump(),
-                )
-        
-        # Inter-depot handoff: 50 messages/hour per depot pair
-        elif "/handoff" in path:
-            # For handoff endpoints, we need to extract depot IDs from the request
-            # This is done after rate limit check for send_handoff and receive_handoff endpoints
-            # For now, apply general API limit, then check handoff limit in endpoint handlers
-            # (handoff limit requires reading request body which is not available in middleware)
-            pass  # Handoff rate limiting handled in endpoint handlers
-        
-        # General API endpoints: 100 requests/minute
-        else:
-            if not rate_limiter.check_api_limit(client_id):
-                return JSONResponse(
-                    status_code=429,
-                    content=ErrorResponse(
-                        detail="Rate limit exceeded: Maximum 100 requests per minute",
-                        error_code="RATE_LIMIT_EXCEEDED",
-                        timestamp=datetime.utcnow().isoformat(),
-                    ).model_dump(),
-                )
-
-        return await call_next(request)
-
-
-# ============ Logging Middleware ============
-
-class LoggingMiddleware(BaseHTTPMiddleware):
-    """Middleware to log all requests and responses."""
-
-    async def dispatch(self, request: Request, call_next):
-        """Process request and log details."""
-        start_time = time.time()
-
-        # Log request
-        logger.info(
-            "Incoming request",
-            extra={
-                "method": request.method,
-                "path": str(request.url.path),
-                "query_params": dict(request.query_params),
-                "client": request.client.host if request.client else None,
-            }
-        )
-
-        # Process request
-        try:
-            response = await call_next(request)
-            process_time = time.time() - start_time
-
-            # Log response (exclude sensitive endpoints)
-            if request.url.path not in ["/metrics", "/health"]:
-                logger.info(
-                    "Request completed",
-                    extra={
-                        "method": request.method,
-                        "path": str(request.url.path),
-                        "status_code": response.status_code,
-                        "process_time": f"{process_time:.3f}s",
-                    }
-                )
-            else:
-                # Log health/metrics with less detail
-                logger.debug(
-                    f"{request.method} {request.url.path} - {response.status_code} "
-                    f"({process_time:.3f}s)"
-                )
-
-            return response
-
-        except Exception as e:
-            process_time = time.time() - start_time
-            logger.error(
-                "Request failed",
-                extra={
-                    "method": request.method,
-                    "path": str(request.url.path),
-                    "error": str(e),
-                    "process_time": f"{process_time:.3f}s",
-                },
-                exc_info=True,
-            )
-            raise
 
 
 async def _get_depot_config(depot_id: str) -> DepotConfig:
@@ -1184,7 +1184,6 @@ async def send_handoff(
 
     try:
         from uuid import uuid4
-        import httpx
 
         message_id = uuid4()
         departure_time = datetime.utcnow()
@@ -1609,32 +1608,6 @@ def check_gurobi_license() -> str:
     except ImportError:
         logger.debug("Gurobi/Pyomo not available")
         return "not_configured"
-    except Exception as e:
-        logger.debug(f"Gurobi license check error: {e}")
-        return "unavailable"
-
-
-def check_gurobi_license() -> str:
-    """Check Gurobi license status.
-    
-    Per PRD Section 7.1: Health endpoint should report Gurobi license status.
-    Per PRD Section 8.2: Gurobi is primary solver, HiGHS is fallback.
-    
-    Returns:
-        "valid", "invalid", or "unavailable"
-    """
-    try:
-        import pyomo.environ as pyo
-        solver = pyo.SolverFactory('gurobi')
-        if solver is None:
-            return "unavailable"
-        if solver.available():
-            return "valid"
-        else:
-            return "invalid"
-    except ImportError:
-        logger.debug("Gurobi/Pyomo not available for license check")
-        return "unavailable"
     except Exception as e:
         logger.debug(f"Gurobi license check error: {e}")
         return "unavailable"
