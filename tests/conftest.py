@@ -412,10 +412,6 @@ def test_config():
             password="test"
         ),
         # Supabase removed - PRD specifies TimescaleDB only
-        # supabase=SupabaseConfig(
-        #     url="https://test.supabase.co",
-            # Supabase removed - PRD specifies TimescaleDB only
-        )
     )
 
 

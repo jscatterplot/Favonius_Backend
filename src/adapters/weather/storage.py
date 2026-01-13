@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
 import asyncpg
 
-from .openmeteo import WeatherData
+if TYPE_CHECKING:
+    from .openmeteo import WeatherData
 
 logger = logging.getLogger(__name__)
 
