@@ -69,7 +69,9 @@ dependencies = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     # Weather API
-    "openmeteo-requests>=0.1.0",
+    "openmeteo-requests>=1.2.0",
+    "requests-cache>=1.1.0",
+    "retry-requests>=2.0.0",
     "httpx>=0.25.0",
 ]
 
