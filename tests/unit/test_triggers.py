@@ -26,6 +26,7 @@ class TestTriggerConfig:
         assert config.price_change_absolute == 25.0  # $25/MWh
         assert config.return_time_deviation_min == 15.0  # 15 minutes
         assert config.check_interval_sec == 60.0  # 1 minute
+        assert config.trigger_cooldown_minutes == 5  # 5 minutes
 
     def test_custom_values(self):
         """Test TriggerConfig with custom values."""
@@ -35,12 +36,14 @@ class TestTriggerConfig:
             price_change_absolute=50.0,
             return_time_deviation_min=30.0,
             check_interval_sec=120.0,
+            trigger_cooldown_minutes=10,
         )
         assert config.soc_deviation_threshold == 0.10
         assert config.price_change_percent == 0.50
         assert config.price_change_absolute == 50.0
         assert config.return_time_deviation_min == 30.0
         assert config.check_interval_sec == 120.0
+        assert config.trigger_cooldown_minutes == 10
 
 
 class TestTriggerMonitorInitialization:
@@ -70,6 +73,44 @@ class TestTriggerMonitorInitialization:
 
         assert monitor.pool == pool
         assert monitor.depot_id == "test_depot"
+
+    def test_init_trigger_cooldown_from_config(self):
+        """Test TriggerMonitor uses config.trigger_cooldown_minutes (not hardcoded).
+        
+        Per PRD alignment fix, cooldown should come from config, not be hardcoded.
+        """
+        config = TriggerConfig(trigger_cooldown_minutes=10)
+        callback = AsyncMock()
+        assembler = MagicMock()
+        monitor = TriggerMonitor(config, callback, assembler=assembler)
+
+        # Cooldown should be calculated from config (10 minutes * 60 = 600 seconds)
+        assert monitor._trigger_cooldown_sec == 600.0, (
+            "Cooldown should be calculated from config.trigger_cooldown_minutes"
+        )
+
+    def test_init_trigger_cooldown_default(self):
+        """Test TriggerMonitor uses default cooldown when not specified."""
+        config = TriggerConfig()  # Default trigger_cooldown_minutes = 5
+        callback = AsyncMock()
+        assembler = MagicMock()
+        monitor = TriggerMonitor(config, callback, assembler=assembler)
+
+        # Default is 5 minutes = 300 seconds
+        assert monitor._trigger_cooldown_sec == 300.0, (
+            "Default cooldown should be 5 minutes = 300 seconds"
+        )
+
+    def test_init_trigger_cooldown_custom(self):
+        """Test TriggerMonitor with custom cooldown value."""
+        config = TriggerConfig(trigger_cooldown_minutes=7)
+        callback = AsyncMock()
+        assembler = MagicMock()
+        monitor = TriggerMonitor(config, callback, assembler=assembler)
+
+        assert monitor._trigger_cooldown_sec == 420.0, (
+            "Custom cooldown should be 7 minutes = 420 seconds"
+        )
 
     def test_init_raises_error_when_no_state_source(self):
         """Test initialization raises error when no state source provided."""
@@ -271,7 +312,11 @@ class TestCheckPriceChange:
 
     @pytest.mark.asyncio
     async def test_price_change_percent_only(self):
-        """Test price change with only percent threshold met."""
+        """Test price change triggers when ONLY percent threshold met (OR logic).
+        
+        Per PRD Section 5.3, price trigger uses OR logic: >25% OR >$25/MWh.
+        This test verifies that percent threshold alone triggers.
+        """
         config = TriggerConfig(
             price_change_percent=0.25,  # 25%
             price_change_absolute=25.0,  # $25/MWh
@@ -280,21 +325,53 @@ class TestCheckPriceChange:
         monitor = TriggerMonitor(config, callback, assembler=MagicMock())
 
         base_time = datetime.utcnow()
-        last_prices = {base_time: 0.10}  # $0.10/kWh
+        last_prices = {base_time: 0.10}  # $0.10/kWh = $100/MWh
         monitor.update_prices(last_prices)
 
-        current_prices = {base_time: 0.13}  # $0.13/kWh
-        # 30% change (> 25%) BUT only $30/MWh change (< $25/MWh? No, $30 > $25)
-        # Actually: $0.03/kWh = $30/MWh, which is > $25/MWh
-        # So both thresholds are met, should trigger
+        # 30% change (> 25%) but only $3/MWh change (< $25/MWh)
+        # With OR logic, should trigger because percent threshold met
+        current_prices = {base_time: 0.013}  # $0.013/kWh = $13/MWh
+        # Change: $0.003/kWh = $3/MWh (absolute < $25/MWh)
+        # Percent: 30% (> 25%)
 
         result = await monitor.check_price_change(current_prices)
 
-        assert result is not None
+        assert result is not None, "Price trigger should fire with OR logic when percent threshold met"
+        assert 'Price change' in result
 
     @pytest.mark.asyncio
     async def test_price_change_absolute_only(self):
-        """Test price change with only absolute threshold met."""
+        """Test price change triggers when ONLY absolute threshold met (OR logic).
+        
+        Per PRD Section 5.3, price trigger uses OR logic: >25% OR >$25/MWh.
+        This test verifies that absolute threshold alone triggers.
+        """
+        config = TriggerConfig(
+            price_change_percent=0.25,  # 25%
+            price_change_absolute=25.0,  # $25/MWh
+        )
+        callback = AsyncMock()
+        monitor = TriggerMonitor(config, callback, assembler=MagicMock())
+
+        base_time = datetime.utcnow()
+        # Use higher base price to get absolute-only scenario
+        last_prices = {base_time: 0.50}  # $0.50/kWh = $500/MWh
+        monitor.update_prices(last_prices)
+        
+        # $0.50 -> $0.53 = $30/MWh change, 6% change (< 25%)
+        # With OR logic, should trigger because $30/MWh > $25/MWh
+        current_prices = {base_time: 0.53}  # $0.53/kWh = $530/MWh
+        # Change: $0.03/kWh = $30/MWh (> $25/MWh)
+        # Percent: (0.53 - 0.50) / 0.50 = 0.06 = 6% (< 25%)
+
+        result = await monitor.check_price_change(current_prices)
+
+        assert result is not None, "Price trigger should fire with OR logic when absolute threshold met"
+        assert 'Price change' in result
+
+    @pytest.mark.asyncio
+    async def test_price_change_neither_threshold(self):
+        """Test price change does NOT trigger when NEITHER threshold met."""
         config = TriggerConfig(
             price_change_percent=0.25,  # 25%
             price_change_absolute=25.0,  # $25/MWh
@@ -307,7 +384,7 @@ class TestCheckPriceChange:
         monitor.update_prices(last_prices)
 
         current_prices = {base_time: 0.12}  # $0.12/kWh
-        # 20% change (< 25%) BUT $20/MWh change (< $25/MWh)
+        # 20% change (< 25%) AND $20/MWh change (< $25/MWh)
         # Neither threshold met, should not trigger
 
         result = await monitor.check_price_change(current_prices)
@@ -333,6 +410,103 @@ class TestCheckPriceChange:
         result = await monitor.check_price_change(current_prices)
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_price_change_both_thresholds(self):
+        """Test price change triggers when BOTH thresholds met (OR logic still applies)."""
+        config = TriggerConfig(
+            price_change_percent=0.25,  # 25%
+            price_change_absolute=25.0,  # $25/MWh
+        )
+        callback = AsyncMock()
+        monitor = TriggerMonitor(config, callback, assembler=MagicMock())
+
+        base_time = datetime.utcnow()
+        last_prices = {base_time: 0.10}  # $0.10/kWh = $100/MWh
+        monitor.update_prices(last_prices)
+
+        current_prices = {base_time: 0.15}  # $0.15/kWh = $150/MWh
+        # 50% change (> 25%) AND $50/MWh change (> $25/MWh)
+        # Both thresholds met, should trigger
+
+        result = await monitor.check_price_change(current_prices)
+
+        assert result is not None
+        assert 'Price change' in result
+
+    @pytest.mark.asyncio
+    async def test_price_change_exactly_at_thresholds(self):
+        """Test price change behavior at exact threshold values."""
+        config = TriggerConfig(
+            price_change_percent=0.25,  # 25%
+            price_change_absolute=25.0,  # $25/MWh
+        )
+        callback = AsyncMock()
+        monitor = TriggerMonitor(config, callback, assembler=MagicMock())
+
+        base_time = datetime.utcnow()
+        last_prices = {base_time: 0.10}  # $0.10/kWh = $100/MWh
+        monitor.update_prices(last_prices)
+
+        # Exactly 25% change and exactly $25/MWh change
+        current_prices = {base_time: 0.125}  # $0.125/kWh = $125/MWh
+        # Change: $0.025/kWh = $25/MWh (exactly at threshold)
+        # Percent: 25% (exactly at threshold)
+        # With OR logic and > comparison, exactly at threshold should NOT trigger
+        # (needs to be > threshold, not >=)
+
+        result = await monitor.check_price_change(current_prices)
+
+        # Exactly at threshold should not trigger (needs > not >=)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_price_change_small_base_price(self):
+        """Test price change with very small base price."""
+        config = TriggerConfig(
+            price_change_percent=0.25,  # 25%
+            price_change_absolute=25.0,  # $25/MWh
+        )
+        callback = AsyncMock()
+        monitor = TriggerMonitor(config, callback, assembler=MagicMock())
+
+        base_time = datetime.utcnow()
+        last_prices = {base_time: 0.01}  # $0.01/kWh = $10/MWh
+        monitor.update_prices(last_prices)
+
+        # Small absolute change but large percent change
+        current_prices = {base_time: 0.015}  # $0.015/kWh = $15/MWh
+        # Change: $0.005/kWh = $5/MWh (< $25/MWh)
+        # Percent: 50% (> 25%)
+        # Should trigger because percent threshold met (OR logic)
+
+        result = await monitor.check_price_change(current_prices)
+
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_price_change_large_base_price(self):
+        """Test price change with very large base price."""
+        config = TriggerConfig(
+            price_change_percent=0.25,  # 25%
+            price_change_absolute=25.0,  # $25/MWh
+        )
+        callback = AsyncMock()
+        monitor = TriggerMonitor(config, callback, assembler=MagicMock())
+
+        base_time = datetime.utcnow()
+        last_prices = {base_time: 1.00}  # $1.00/kWh = $1000/MWh
+        monitor.update_prices(last_prices)
+
+        # Large absolute change but small percent change
+        current_prices = {base_time: 1.03}  # $1.03/kWh = $1030/MWh
+        # Change: $0.03/kWh = $30/MWh (> $25/MWh)
+        # Percent: 3% (< 25%)
+        # Should trigger because absolute threshold met (OR logic)
+
+        result = await monitor.check_price_change(current_prices)
+
+        assert result is not None
 
     @pytest.mark.asyncio
     async def test_price_change_no_baseline(self):

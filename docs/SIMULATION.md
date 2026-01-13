@@ -48,9 +48,10 @@ sim = morning_rush_scenario(n_vehicles=10, n_chargers=5)
 # Create depot config
 config = DepotConfig(
     vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
-    charger_power=80.0,
+    vehicle_max_charge_kw={v.vehicle_id: 150.0 for v in sim.vehicles},  # Max charge rate per vehicle
+    charger_groups={80.0: 5},  # 5 chargers at 80kW each
     charger_efficiency=0.95,
-    n_chargers=5,
+    charger_vehicle_access={},  # Empty = all vehicles can access all chargers
     battery_capacity=500.0,
     battery_power=100.0,
     max_site_power=800.0,
@@ -299,9 +300,10 @@ async def main():
     # Create config
     config = DepotConfig(
         vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
-        charger_power=80.0,
+        vehicle_max_charge_kw={v.vehicle_id: 150.0 for v in sim.vehicles},
+        charger_groups={80.0: 5},  # 5 chargers at 80kW each
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},  # Empty = all vehicles can access all chargers
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,

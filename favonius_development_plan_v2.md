@@ -5,14 +5,22 @@
 
 ## Overview
 
-This development plan implements the specifications in `docs/PRD_v2.md` (Version 2.2). The PRD is the **single source of truth** — if any discrepancy exists between this plan and the PRD, the PRD wins.
+This development plan implements the specifications in `docs/PRD_v2.md` (Version 2.5). The PRD is the **single source of truth** — if any discrepancy exists between this plan and the PRD, the PRD wins.
 
 **Key Technical Decisions (from PRD):**
-- Solver: **Gurobi** with <60 second solve time
+- Solver: **Gurobi** with <60 second solve time, **HiGHS fallback** for reliability
 - Price trigger: **OR** logic (>25% OR >$25/MWh)
 - Building load: **Required** (not optional)
 - Connector type: **CCS only** for MVP
 - Vehicle max_charge_kw: From **OCPP MeterValues** or config fallback
+
+**Architecture Decisions (Implemented):**
+- **Integrated System Architecture**: Main API backend is primary optimization service
+- **WebSocket Handler as Telemetry Service**: WebSocket handler receives OCPP messages, stores telemetry, exposes internal API
+- **Backup Heuristic**: WebSocket handler maintains heuristic optimizer for emergency use when main API unavailable > 1 hour
+- **Julia Removed**: Julia MIP solver bridge removed, using Pyomo/Gurobi/HiGHS only
+- **V2G Out of Scope**: V2G functionality removed/commented out per MVP scope
+- **Dual Database**: Supabase for static data, TimescaleDB for time-series data
 
 ---
 
@@ -99,7 +107,8 @@ favonius-platform/
 | **Modeling** | `pyomo` | Algebraic modeling language |
 | **ML/Surrogate** | `scikit-learn`, `gpytorch` | Gaussian Process, MLP |
 | **API** | `fastapi`, `uvicorn` | REST API server |
-| **Database** | `asyncpg`, `sqlalchemy` | PostgreSQL/TimescaleDB |
+| **Database (Static)** | `supabase-py` | Supabase client for static data |
+| **Database (Time-Series)** | `asyncpg`, `sqlalchemy` | TimescaleDB for time-series data |
 | **OCPP** | `ocpp` | OCPP 1.6/2.0.1 support |
 | **Time-series** | `pandas`, `polars` | Data manipulation |
 | **Weather** | `openmeteo-requests` | Weather API client |
@@ -110,7 +119,7 @@ favonius-platform/
 # Using uv (recommended)
 uv init favonius-platform
 cd favonius-platform
-uv add pyomo gurobipy highspy scikit-learn gpytorch fastapi uvicorn asyncpg sqlalchemy
+uv add pyomo gurobipy highspy scikit-learn gpytorch fastapi uvicorn asyncpg sqlalchemy supabase
 uv add ocpp pandas polars openmeteo-requests httpx pyjwt cryptography
 uv add --dev pytest pytest-asyncio pytest-cov ruff mypy
 
@@ -128,11 +137,15 @@ python -c "import pyomo.environ as pyo; solver = pyo.SolverFactory('appsi_highs'
 
 ---
 
-### Step 0.4: Database Setup (TimescaleDB)
+### Step 0.4: Database Setup (Supabase + TimescaleDB)
 
-**Schema:** Copy directly from PRD Section 6.1.
+**Architecture:** The platform uses a dual-database architecture:
+- **Supabase**: Static/reference data (depots, vehicles, chargers, schedules)
+- **TimescaleDB**: Time-series data (telemetry, prices, weather, optimization results)
 
-Create `migrations/001_initial_schema.sql`:
+**Schema:** Split schema per PRD Section 6.1.1 and 6.1.2.
+
+Create `migrations/001_supabase_schema.sql` (for Supabase):
 
 ```sql
 -- Enable TimescaleDB extension
@@ -261,8 +274,9 @@ CREATE TABLE schedules (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_schedules_vehicle_depart ON schedules (vehicle_id, departure_time);
+```
 
-CREATE TABLE optimization_runs (
+Create `migrations/002_timescale_schema.sql` (for TimescaleDB):
     run_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     depot_id        UUID NOT NULL REFERENCES depots(depot_id),
     run_time        TIMESTAMPTZ DEFAULT NOW(),
@@ -308,18 +322,21 @@ CREATE INDEX idx_interdepot_dest_status ON interdepot_messages (dest_depot_id, s
 
 CREATE TABLE trigger_log (
     trigger_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    depot_id        UUID NOT NULL REFERENCES depots(depot_id),
+    depot_id        UUID NOT NULL,  -- References Supabase depots table
     trigger_type    VARCHAR(50) NOT NULL,
     trigger_time    TIMESTAMPTZ DEFAULT NOW(),
     details         JSONB,
     run_id          UUID REFERENCES optimization_runs(run_id)
 );
+SELECT create_hypertable('trigger_log', 'trigger_time');
 ```
 
 **Verification:**
+- [ ] Supabase project created and schema applied
 - [ ] TimescaleDB container running (`docker-compose up -d timescaledb`)
-- [ ] Schema migrations applied
+- [ ] Both schema migrations applied
 - [ ] Sample data inserted for testing
+- [ ] Foreign key relationships verified (TimescaleDB references Supabase UUIDs)
 
 ---
 
@@ -725,20 +742,69 @@ def solve_model(
     if warm_start:
         solver.options['WarmStart'] = 1
 
-    # Solve
-    result = solver.solve(model, tee=False)
-
-    # Determine status
-    term_cond = result.solver.termination_condition
-    if term_cond == pyo.TerminationCondition.optimal:
-        status = 'optimal'
-    elif term_cond in [pyo.TerminationCondition.maxTimeLimit,
-                       pyo.TerminationCondition.feasible]:
-        status = 'feasible'
-    elif term_cond == pyo.TerminationCondition.infeasible:
-        status = 'infeasible'
-    else:
+    # Track which solver was used (for monitoring and fallback detection)
+    solver_used = 'gurobi'
+    result = None
+    term_cond = None
+    status = 'error'
+    
+    # ========== PRIMARY SOLVER: GUROBI (PRD Section 8.2) ==========
+    try:
+        # Check Gurobi availability first
+        if solver is None or not solver.available():
+            raise Exception("Gurobi solver not available")
+        
+        # Solve with Gurobi
+        logger.info("Attempting solve with Gurobi solver")
+        result = solver.solve(model, tee=False)
+        term_cond = result.solver.termination_condition
+        
+        # Determine status from termination condition
+        if term_cond == pyo.TerminationCondition.optimal:
+            status = 'optimal'
+        elif term_cond in [pyo.TerminationCondition.maxTimeLimit,
+                           pyo.TerminationCondition.feasible]:
+            status = 'feasible'
+        elif term_cond == pyo.TerminationCondition.infeasible:
+            status = 'infeasible'
+        else:
+            status = 'error'
+            
+    except Exception as gurobi_error:
+        # Gurobi failed (license error, connection issue, etc.)
+        logger.warning(f"Gurobi solver failed: {gurobi_error}. Falling back to HiGHS.")
+        solver_used = 'highs'
         status = 'error'
+    
+    # ========== FALLBACK TO HiGHS (PRD Section 8.2) ==========
+    # If Gurobi fails, automatically fall back to HiGHS
+    if solver_used == 'highs' or status == 'error':
+        logger.warning("Gurobi solve failed, attempting HiGHS fallback")
+        solver_used = 'highs'
+        
+        try:
+            fallback_solver = pyo.SolverFactory('appsi_highs')
+            fallback_solver.options['time_limit'] = time_limit
+            fallback_solver.options['mip_rel_gap'] = 0.01
+            fallback_solver.options['threads'] = 4
+            fallback_solver.options['presolve'] = 'on'
+            
+            result = fallback_solver.solve(model, tee=False)
+            term_cond = result.solver.termination_condition
+            
+            if term_cond == pyo.TerminationCondition.optimal:
+                status = 'optimal'
+            elif term_cond in [pyo.TerminationCondition.maxTimeLimit,
+                               pyo.TerminationCondition.feasible]:
+                status = 'feasible'
+            elif term_cond == pyo.TerminationCondition.infeasible:
+                status = 'infeasible'
+            else:
+                status = 'error'
+        except Exception as fallback_error:
+            logger.error(f"HiGHS fallback also failed: {fallback_error}")
+            status = 'error'
+            # Both solvers failed - will be handled in error path below
 
     # ========== INFEASIBILITY HANDLING (PRD Section 8.5.1) ==========
     # When optimization cannot satisfy all constraints:
@@ -766,8 +832,16 @@ def solve_model(
                 return pyo.Constraint.Skip  # Remove departure constraints
             model.relaxed_departure = pyo.Constraint(model.B, rule=relaxed_departure_rule)
 
-            # Re-solve with relaxed constraints
-            result = solver.solve(model, tee=False)
+            # Re-solve with relaxed constraints (use same solver that was used initially)
+            if solver_used == 'gurobi':
+                result = solver.solve(model, tee=False)
+            else:
+                # Use HiGHS if that's what we're using
+                fallback_solver = pyo.SolverFactory('appsi_highs')
+                fallback_solver.options['time_limit'] = time_limit
+                fallback_solver.options['mip_rel_gap'] = 0.01
+                result = fallback_solver.solve(model, tee=False)
+            
             term_cond = result.solver.termination_condition
 
             if term_cond in [pyo.TerminationCondition.optimal,
@@ -800,8 +874,12 @@ def solve_model(
             solver_used=solver_used,  # Track which solver was used for monitoring
         )
     else:
-        # Never silently fail - log and return error result
+        # Never silently fail - log and return error result (per PRD Section 8.5.1)
         logger.error(f"Optimization failed with status: {status}")
+        solve_time = 0.0
+        if result is not None and hasattr(result, 'solver') and hasattr(result.solver, 'time'):
+            solve_time = result.solver.time
+        
         return OptimizationResult(
             run_id=uuid4(),
             schedule={},
@@ -809,7 +887,7 @@ def solve_model(
             grid_power=[],
             peak_demand_kw=0.0,
             objective_value=float('inf'),
-            solve_time_s=result.solver.time if hasattr(result.solver, 'time') else 0.0,
+            solve_time_s=solve_time,
             status=status,
             solver_used=solver_used or 'unknown',  # Track solver attempt
         )
@@ -1332,7 +1410,171 @@ class HandoffManager:
 
 ---
 
-## PHASE 4: OCPP INTEGRATION
+## PHASE 4: OCPP INTEGRATION & INTERNAL API
+
+### Architecture Context
+
+**Current State:**
+- WebSocket Handler has OCPP 1.6 server that handles all charger connections
+- WebSocket Handler stores all telemetry to TimescaleDB
+- Main API currently has its own OCPP 1.6 server (`src/adapters/ocpp/server.py`) for direct charger communication (temporary workaround)
+
+**Target Architecture (Phase 4):**
+- WebSocket Handler is the single OCPP 1.6 communication layer (handles OCPP 2+ messages)
+- Main API communicates with WebSocket Handler via internal REST API
+- WebSocket Handler exposes endpoints for:
+  - Querying connected charge points
+  - Getting charge point state (SoC, power, connection status)
+  - Sending SetChargingProfile commands
+  - Health monitoring
+
+**OCPP Version Strategy:**
+- **Primary Protocol**: OCPP 1.6-J (dominant in field, simpler implementation)
+- **OCPP 2+ Compatibility**: OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 protocol format
+  - OCPP 2+ adds additional messages but maintains backward compatibility at connection level
+  - Server handles OCPP 2+ messages by responding in OCPP 1.6 format where applicable
+  - No need for separate OCPP 2+ server since OCPP 1.6 can handle the connection
+
+**Benefits:**
+- Single OCPP communication layer (no duplication)
+- Simpler implementation (one protocol version to maintain)
+- Better separation of concerns (optimization vs. OCPP protocol)
+- Easier to scale OCPP connections independently
+- Centralized telemetry storage
+
+### Step 4.0: Internal API Implementation (WebSocket Handler)
+
+**Objective:** Expose internal REST API for Main API to query charge point state and send commands.
+
+**Create `src/websocket_handler/internal_api.py`:**
+
+```python
+"""Internal REST API for Main API backend communication.
+
+This API is not exposed externally - only accessible from Main API service.
+Provides charge point state queries and command dispatch.
+"""
+from fastapi import FastAPI, HTTPException
+from typing import List, Dict, Optional
+from datetime import datetime
+from uuid import UUID
+
+app = FastAPI(title="WebSocket Handler Internal API")
+
+
+@app.get("/internal/charge-points/connected")
+async def get_connected_charge_points() -> List[str]:
+    """Get list of currently connected charge point IDs."""
+    # Query connection manager for active connections
+    pass
+
+
+@app.get("/internal/charge-points/{charge_point_id}/state")
+async def get_charge_point_state(charge_point_id: str) -> Dict:
+    """Get current state of a charge point.
+    
+    Returns:
+        {
+            "connected": bool,
+            "current_power_kw": float,
+            "soc_percent": float,
+            "status": str,
+            "last_update": datetime
+        }
+    """
+    pass
+
+
+@app.post("/internal/charge-points/{charge_point_id}/set-charging-profile")
+async def set_charging_profile(
+    charge_point_id: str,
+    profile: Dict
+) -> Dict:
+    """Send SetChargingProfile command to charge point.
+    
+    Returns:
+        {"status": "Accepted" | "Rejected", "message": str}
+    """
+    pass
+
+
+@app.get("/internal/health")
+async def health_check() -> Dict:
+    """Health check for internal API."""
+    return {"status": "healthy"}
+```
+
+**Update Main API to use Internal API:**
+
+Create `src/adapters/ocpp/client.py`:
+
+```python
+"""OCPP client for Main API to communicate with WebSocket Handler.
+
+Replaces direct OCPP server usage in Main API.
+"""
+import httpx
+from typing import Optional, Dict, List
+from datetime import datetime
+
+class OCPPClient:
+    """Client for WebSocket Handler internal API."""
+    
+    def __init__(self, base_url: str = "http://websocket-handler:8080"):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(timeout=30.0)
+    
+    async def get_connected_charge_points(self) -> List[str]:
+        """Get list of connected charge points."""
+        response = await self.client.get(f"{self.base_url}/internal/charge-points/connected")
+        response.raise_for_status()
+        return response.json()
+    
+    async def get_charge_point_state(self, charge_point_id: str) -> Dict:
+        """Get charge point state."""
+        response = await self.client.get(
+            f"{self.base_url}/internal/charge-points/{charge_point_id}/state"
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    async def send_charging_profile(
+        self,
+        charge_point_id: str,
+        profile: Dict
+    ) -> Dict:
+        """Send SetChargingProfile command."""
+        response = await self.client.post(
+            f"{self.base_url}/internal/charge-points/{charge_point_id}/set-charging-profile",
+            json=profile
+        )
+        response.raise_for_status()
+        return response.json()
+```
+
+**Update `DepotController` to use OCPP Client:**
+
+```python
+# In src/core/controller.py
+# Replace ocpp_server parameter with ocpp_client
+def __init__(
+    self,
+    pool: asyncpg.Pool,
+    depot_id: str | UUID,
+    config: DepotConfig,
+    ocpp_client: Optional['OCPPClient'] = None,  # Changed from ocpp_server
+    controller_config: Optional[ControllerConfig] = None,
+):
+    # ...
+    self.ocpp_client = ocpp_client  # Changed from ocpp_server
+```
+
+**Verification:**
+- [ ] Internal API endpoints respond correctly
+- [ ] Main API can query charge point state
+- [ ] Main API can send SetChargingProfile commands
+- [ ] All existing tests updated to use ocpp_client
+- [ ] Integration tests pass with new architecture
 
 ### Step 4.1: Vehicle Max Charge Rate from OCPP
 
@@ -2737,6 +2979,8 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 | 2.0 | 2025-12-12 | Claude + Joris | Reconciled with PRD v2; Gurobi config, triggers with OR logic, building load required, inter-depot handoffs, return time trigger, realistic tests |
 | 2.1 | 2025-12-13 | Claude | Aligned with PRD v2.2: Fixed Vehicle.id_tag field, added CHECK constraints to SQL schema, added charger_id to telemetry, added 'degraded' status, added power limit constraint to MILP, updated grid balance for P_batt_effective with efficiency handling, added infeasibility handling to solve_model, added PHASE 4.5 for security (input validation, rate limiting, SQL injection prevention, data freshness) |
 | 2.2 | 2025-12-13 | Claude | Final alignment fixes: Added battery_efficiency to DepotConfig, fixed data freshness thresholds (prices: 24h, building load: 30min), added lat/lon CHECK constraints to telemetry, added charger_id to OCPP handler, updated all PRD.md refs to PRD_v2.md, use config.battery_efficiency in MILP |
+| 2.3 | 2025-01-XX | Claude | Architecture updates: Documented integrated system architecture (Main API primary, WebSocket Handler telemetry-only), added Phase 4 internal API specification, documented backup heuristic approach, removed Julia references (already done), documented V2G removal, updated component responsibilities to reflect service split |
+| 2.4 | 2025-01-XX | Claude | OCPP simplification: Removed dual server architecture, consolidated to single OCPP 1.6 server in WebSocket Handler that handles OCPP 2+ messages, updated Phase 4 architecture context to reflect single server approach |
 
 ---
 

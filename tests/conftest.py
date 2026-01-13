@@ -65,6 +65,10 @@ def mock_asyncpg_pool():
         pool = MagicMock()
     
     conn = AsyncMock()
+    # Ensure fetchrow returns a proper dict-like object, not a coroutine
+    conn.fetchrow = AsyncMock(return_value=None)  # Default: no rows
+    conn.fetch = AsyncMock(return_value=[])
+    conn.execute = AsyncMock(return_value=None)
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
     return pool, conn
@@ -79,6 +83,10 @@ def mock_db_pool():
         pool = MagicMock()
     
     conn = AsyncMock()
+    # Ensure fetchrow returns a proper dict-like object, not a coroutine
+    conn.fetchrow = AsyncMock(return_value=None)  # Default: no rows
+    conn.fetch = AsyncMock(return_value=[])
+    conn.execute = AsyncMock(return_value=None)
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
     return pool, conn
@@ -369,6 +377,9 @@ def mock_timescale_client():
     client.store_charging_schedule = AsyncMock()
     client.store_optimization_decision = AsyncMock()
     
+    # Telemetry methods
+    client.insert_telemetry_batch = AsyncMock()  # Add missing method
+    
     # Health check method
     client.health_check = AsyncMock(return_value={"status": "healthy"})
     
@@ -404,19 +415,23 @@ def mock_connection_manager():
 @pytest.fixture
 def test_config():
     """Create test configuration."""
-    return Config(
-        timescale=TimescaleConfig(
-            service_url="postgres://test:test@localhost:5432/test",
-            host="localhost",
-            user="test",
-            password="test"
-        ),
-        # Supabase removed - PRD specifies TimescaleDB only
-        # supabase=SupabaseConfig(
-        #     url="https://test.supabase.co",
+    # Note: Config requires all fields, but we only need timescale for tests
+    # If Config initialization fails, we'll skip tests that need it
+    try:
+        return Config(
+            timescale=TimescaleConfig(
+                service_url="postgres://test:test@localhost:5432/test",
+                host="localhost",
+                user="test",
+                password="test"
+            ),
             # Supabase removed - PRD specifies TimescaleDB only
+            # Other fields use defaults from Config class
         )
-    )
+    except (ImportError, AttributeError):
+        # If Config or TimescaleConfig not available, return None
+        # Tests using this fixture should handle None case
+        return None
 
 
 @pytest.fixture
@@ -857,6 +872,112 @@ def depot_config_factory():
     return _create
 
 
+# ============ Helper Functions for DepotConfig Migration ============
+
+def get_total_chargers(config: DepotConfig) -> int:
+    """Get total number of chargers from charger_groups.
+    
+    Helper function for migrating from n_chargers property.
+    
+    Args:
+        config: DepotConfig instance
+        
+    Returns:
+        Total number of chargers (sum of all charger group counts)
+    """
+    return sum(config.charger_groups.values())
+
+
+def get_charger_power(config: DepotConfig) -> float:
+    """Get charger power for single-group configs (most tests).
+    
+    Helper function for migrating from charger_power property.
+    For single-group configs, returns the rated_kw.
+    For multi-group configs, raises ValueError.
+    
+    Args:
+        config: DepotConfig instance
+        
+    Returns:
+        Charger power (rated_kw) for single-group configs
+        
+    Raises:
+        ValueError: If config has multiple charger groups
+    """
+    if len(config.charger_groups) == 1:
+        return list(config.charger_groups.keys())[0]
+    raise ValueError(
+        f"Multiple charger groups found: {config.charger_groups}. "
+        "Use charger_groups directly for multi-group configs."
+    )
+
+
+def create_depot_config_legacy(
+    vehicle_capacities: dict[str, float],
+    charger_power: float,
+    n_chargers: int,
+    charger_efficiency: float = 0.95,
+    battery_capacity: float = 500.0,
+    battery_power: float = 100.0,
+    max_site_power: float = 800.0,
+    delta_t: float = 0.25,
+    n_timesteps: int = 96,
+    **kwargs
+) -> DepotConfig:
+    """Create DepotConfig using legacy API (charger_power, n_chargers).
+    
+    This is a helper function for backward compatibility during migration.
+    It converts legacy parameters to the new charger_groups format.
+    
+    Args:
+        vehicle_capacities: Dict mapping vehicle_id to battery capacity (kWh)
+        charger_power: Charger rated power (kW) - converted to charger_groups
+        n_chargers: Number of chargers - converted to charger_groups
+        charger_efficiency: Charger efficiency (default 0.95)
+        battery_capacity: Stationary battery capacity (kWh)
+        battery_power: Stationary battery power (kW)
+        max_site_power: Maximum site power (kW)
+        delta_t: Time step duration (hours)
+        n_timesteps: Number of time steps
+        **kwargs: Additional fields (vehicle_max_charge_kw, charger_vehicle_access, etc.)
+        
+    Returns:
+        DepotConfig instance with charger_groups set appropriately
+    """
+    if not CORE_MODELS_AVAILABLE:
+        raise ImportError("Core models not available")
+    
+    vehicle_ids = list(vehicle_capacities.keys())
+    
+    # Convert legacy charger_power/n_chargers to charger_groups
+    charger_groups = {charger_power: n_chargers}
+    
+    # Set vehicle_max_charge_kw if not provided
+    vehicle_max_charge_kw = kwargs.get(
+        'vehicle_max_charge_kw',
+        {vid: charger_power for vid in vehicle_ids}
+    )
+    
+    # Set charger_vehicle_access if not provided (empty = all accessible)
+    charger_vehicle_access = kwargs.get('charger_vehicle_access', {})
+    
+    return DepotConfig(
+        vehicle_capacities=vehicle_capacities,
+        vehicle_max_charge_kw=vehicle_max_charge_kw,
+        charger_groups=charger_groups,
+        charger_efficiency=charger_efficiency,
+        charger_vehicle_access=charger_vehicle_access,
+        battery_capacity=battery_capacity,
+        battery_power=battery_power,
+        battery_efficiency=kwargs.get('battery_efficiency', 0.92),
+        battery_soc_min=kwargs.get('battery_soc_min', 0.2),
+        battery_soc_max=kwargs.get('battery_soc_max', 0.8),
+        max_site_power=max_site_power,
+        delta_t=delta_t,
+        n_timesteps=n_timesteps,
+    )
+
+
 @pytest.fixture
 def depot_state_factory(depot_config_factory):
     """Factory for creating DepotState with customizable parameters."""
@@ -1110,6 +1231,9 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "database: mark test as requiring real database"
+    )
+    config.addinivalue_line(
+        "markers", "acceptance: PRD acceptance criteria tests (AT-01 through AT-07)"
     )
 
 

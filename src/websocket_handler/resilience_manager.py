@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import structlog
 
-from .error_handler import CircuitBreakerState, CircuitBreakerOpenError
+from .enhanced_error_handler import CircuitBreakerState, CircuitBreakerOpenError
 
 
 class HealthStatus(Enum):

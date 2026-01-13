@@ -14,11 +14,13 @@ from src.core.optimizer import optimize
 @pytest.fixture
 def benchmark_depot_config():
     """20-vehicle depot configuration for benchmarking."""
+    vehicle_ids = [f'bus_{i}' for i in range(20)]
     return DepotConfig(
-        vehicle_capacities={f'bus_{i}': 324.0 for i in range(20)},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 10},
         charger_efficiency=0.95,
-        n_chargers=10,
+        charger_vehicle_access={},
         battery_capacity=1000.0,
         battery_power=200.0,
         max_site_power=1200.0,

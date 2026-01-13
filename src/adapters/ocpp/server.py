@@ -15,6 +15,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from .charge_point import FleetChargePoint
+from .mapping import get_charger_id_from_ocpp_id
 
 logger = logging.getLogger(__name__)
 
@@ -214,21 +215,16 @@ class OCPPServer:
         
         # Look up vehicle_id and charger_id
         try:
-            async with self.pool.acquire() as conn:
-                # Get charger_id
-                charger_row = await conn.fetchrow(
-                    "SELECT charger_id FROM chargers WHERE ocpp_id = $1",
-                    charge_point_id
-                )
-                charger_id = charger_row['charger_id'] if charger_row else None
-                
-                # Get vehicle_id (simplified - should use proper mapping)
-                # TODO: Implement proper vehicle-charger mapping
-                vehicle_id = None  # Will be resolved in store_meter_values
+            # Get charger_id using mapping helper
+            charger_id = await get_charger_id_from_ocpp_id(self.pool, charge_point_id)
+            
+            # Vehicle ID will be resolved in store_meter_values
+            vehicle_id = None
                 
         except Exception as e:
             logger.debug(f"Could not resolve charger/vehicle IDs: {e}")
             charger_id = None
+            vehicle_id = None
         
         # Use centralized telemetry storage function
         await store_meter_values(

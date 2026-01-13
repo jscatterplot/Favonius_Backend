@@ -35,14 +35,16 @@ class TestAT05FullInterDepotHandoff:
     @pytest.fixture
     def depot_a_config(self):
         """Depot A (origin) configuration."""
+        vehicle_ids = ['bus_1', 'bus_2']
         return DepotConfig(
             vehicle_capacities={
                 'bus_1': 324.0,
                 'bus_2': 324.0,
             },
-            charger_power=80.0,
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 3},
             charger_efficiency=0.95,
-            n_chargers=3,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=600.0,
@@ -53,14 +55,16 @@ class TestAT05FullInterDepotHandoff:
     @pytest.fixture
     def depot_b_config(self):
         """Depot B (destination) configuration."""
+        vehicle_ids = ['bus_3', 'bus_4']
         return DepotConfig(
             vehicle_capacities={
                 'bus_3': 324.0,
                 'bus_4': 324.0,
             },
-            charger_power=80.0,
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 3},
             charger_efficiency=0.95,
-            n_chargers=3,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=600.0,
@@ -239,14 +243,20 @@ class TestAT05FullInterDepotHandoff:
     ):
         """AT-05: Verify Depot B's optimization includes bus_1 after handoff."""
         # Modify depot_b_config to include bus_1
+        # Update vehicle_max_charge_kw to include bus_1
+        vehicle_ids = list(depot_b_config.vehicle_capacities.keys()) + ['bus_1']
         config_with_bus_1 = DepotConfig(
             vehicle_capacities={
                 **depot_b_config.vehicle_capacities,
                 'bus_1': 324.0,  # Added from handoff
             },
-            charger_power=depot_b_config.charger_power,
+            vehicle_max_charge_kw={
+                **depot_b_config.vehicle_max_charge_kw,
+                'bus_1': depot_b_config.charger_power,  # Use backward compat property
+            },
+            charger_groups=depot_b_config.charger_groups,
             charger_efficiency=depot_b_config.charger_efficiency,
-            n_chargers=depot_b_config.n_chargers,
+            charger_vehicle_access=depot_b_config.charger_vehicle_access,
             battery_capacity=depot_b_config.battery_capacity,
             battery_power=depot_b_config.battery_power,
             max_site_power=depot_b_config.max_site_power,
@@ -372,17 +382,25 @@ class TestAT05FullInterDepotHandoff:
         
         # Phase 3: Depot B receives handoff and re-optimizes
         # Update Depot B config to include bus_1
+        # Update vehicle_max_charge_kw to include bus_1
+        vehicle_ids = list(depot_b_config.vehicle_capacities.keys()) + ['bus_1']
         depot_b_config_updated = DepotConfig(
             vehicle_capacities={
                 **depot_b_config.vehicle_capacities,
                 'bus_1': 324.0,
             },
-            charger_power=depot_b_config.charger_power,
+            vehicle_max_charge_kw={
+                **depot_b_config.vehicle_max_charge_kw,
+                'bus_1': depot_b_config.charger_power,  # Use backward compat property
+            },
+            charger_groups=depot_b_config.charger_groups,
             charger_efficiency=depot_b_config.charger_efficiency,
-            n_chargers=depot_b_config.n_chargers,
+            charger_vehicle_access=depot_b_config.charger_vehicle_access,
             battery_capacity=depot_b_config.battery_capacity,
             battery_power=depot_b_config.battery_power,
             max_site_power=depot_b_config.max_site_power,
+            delta_t=depot_b_config.delta_t,
+            n_timesteps=depot_b_config.n_timesteps,
         )
         
         # Update state to include bus_1
@@ -514,17 +532,25 @@ class TestAT05FullInterDepotHandoff:
         n_t = depot_b_config.n_timesteps
         arrival_timestep = 32
         
+        # Update vehicle_max_charge_kw to include bus_1
+        vehicle_ids = list(depot_b_config.vehicle_capacities.keys()) + ['bus_1']
         config_with_bus_1 = DepotConfig(
             vehicle_capacities={
                 **depot_b_config.vehicle_capacities,
                 'bus_1': 324.0,
             },
-            charger_power=depot_b_config.charger_power,
+            vehicle_max_charge_kw={
+                **depot_b_config.vehicle_max_charge_kw,
+                'bus_1': depot_b_config.charger_power,  # Use backward compat property
+            },
+            charger_groups=depot_b_config.charger_groups,
             charger_efficiency=depot_b_config.charger_efficiency,
-            n_chargers=depot_b_config.n_chargers,
+            charger_vehicle_access=depot_b_config.charger_vehicle_access,
             battery_capacity=depot_b_config.battery_capacity,
             battery_power=depot_b_config.battery_power,
             max_site_power=depot_b_config.max_site_power,
+            delta_t=depot_b_config.delta_t,
+            n_timesteps=depot_b_config.n_timesteps,
         )
         
         state_with_low_soc = DepotState(
@@ -574,17 +600,25 @@ class TestAT05FullInterDepotHandoff:
         arrival_timestep = 48  # Noon arrival
         departure_timestep = 56  # 2 PM departure (only 2 hours)
         
+        # Update vehicle_max_charge_kw to include bus_1
+        vehicle_ids = list(depot_b_config.vehicle_capacities.keys()) + ['bus_1']
         config_with_bus_1 = DepotConfig(
             vehicle_capacities={
                 **depot_b_config.vehicle_capacities,
                 'bus_1': 324.0,
             },
-            charger_power=depot_b_config.charger_power,
+            vehicle_max_charge_kw={
+                **depot_b_config.vehicle_max_charge_kw,
+                'bus_1': depot_b_config.charger_power,  # Use backward compat property
+            },
+            charger_groups=depot_b_config.charger_groups,
             charger_efficiency=depot_b_config.charger_efficiency,
-            n_chargers=depot_b_config.n_chargers,
+            charger_vehicle_access=depot_b_config.charger_vehicle_access,
             battery_capacity=depot_b_config.battery_capacity,
             battery_power=depot_b_config.battery_power,
             max_site_power=depot_b_config.max_site_power,
+            delta_t=depot_b_config.delta_t,
+            n_timesteps=depot_b_config.n_timesteps,
         )
         
         state_tight_timing = DepotState(

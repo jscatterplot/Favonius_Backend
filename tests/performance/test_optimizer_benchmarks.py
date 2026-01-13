@@ -48,11 +48,13 @@ def create_depot_scenario(
         n_chargers = max(5, n_vehicles // 2)  # 2:1 ratio
         max_site_power = 1200.0
     
+    vehicle_ids = [f'bus_{i}' for i in range(n_vehicles)]
     config = DepotConfig(
-        vehicle_capacities={f'bus_{i}': 324.0 for i in range(n_vehicles)},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: n_chargers},
         charger_efficiency=0.95,
-        n_chargers=n_chargers,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=max_site_power,

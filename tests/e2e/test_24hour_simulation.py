@@ -34,11 +34,13 @@ class Test24HourSimulation:
     @pytest.fixture
     def depot_config(self):
         """Realistic depot configuration for 20-vehicle fleet."""
+        vehicle_ids = [f'bus_{i:02d}' for i in range(1, 21)]
         return DepotConfig(
-            vehicle_capacities={f'bus_{i:02d}': 324.0 for i in range(1, 21)},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 10},  # 2:1 vehicle-to-charger ratio
             charger_efficiency=0.95,
-            n_chargers=10,  # 2:1 vehicle-to-charger ratio
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=1000.0,

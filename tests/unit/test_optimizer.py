@@ -21,11 +21,13 @@ from src.core.optimizer import (
 @pytest.fixture
 def simple_depot_config():
     """Simple depot configuration for testing."""
+    vehicle_ids = ['bus_1', 'bus_2']
     return DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 2},
         charger_efficiency=0.95,
-        n_chargers=2,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -55,11 +57,13 @@ def simple_depot_state(simple_depot_config):
 @pytest.fixture
 def realistic_depot_config():
     """Realistic depot configuration with 20 vehicles."""
+    vehicle_ids = [f'bus_{i}' for i in range(20)]
     return DepotConfig(
-        vehicle_capacities={f'bus_{i}': 324.0 for i in range(20)},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 10},
         charger_efficiency=0.95,
-        n_chargers=10,
+        charger_vehicle_access={},
         battery_capacity=1000.0,
         battery_power=200.0,
         max_site_power=1200.0,
@@ -174,9 +178,10 @@ def test_invalid_config_negative_charger_power(simple_depot_state):
     """Should raise error for negative charger power."""
     config = DepotConfig(
         vehicle_capacities={'bus_1': 324.0},
-        charger_power=-80.0,  # Invalid
+        vehicle_max_charge_kw={'bus_1': 80.0},
+        charger_groups={-80.0: 2},  # Invalid - negative power
         charger_efficiency=0.95,
-        n_chargers=2,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -261,9 +266,10 @@ def test_single_vehicle():
     # Create config with only one vehicle
     config = DepotConfig(
         vehicle_capacities={'bus_1': 324.0},
-        charger_power=80.0,
+        vehicle_max_charge_kw={'bus_1': 80.0},
+        charger_groups={80.0: 1},
         charger_efficiency=0.95,
-        n_chargers=1,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -289,9 +295,10 @@ def test_all_vehicles_unavailable():
     # Create config with only one vehicle
     config = DepotConfig(
         vehicle_capacities={'bus_1': 324.0},
-        charger_power=80.0,
+        vehicle_max_charge_kw={'bus_1': 80.0},
+        charger_groups={80.0: 1},
         charger_efficiency=0.95,
-        n_chargers=1,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -319,9 +326,10 @@ def test_high_initial_soc():
     # Create config with only one vehicle
     config = DepotConfig(
         vehicle_capacities={'bus_1': 324.0},
-        charger_power=80.0,
+        vehicle_max_charge_kw={'bus_1': 80.0},
+        charger_groups={80.0: 1},
         charger_efficiency=0.95,
-        n_chargers=1,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -348,9 +356,10 @@ def test_no_departure_times():
     # Create config with only one vehicle
     config = DepotConfig(
         vehicle_capacities={'bus_1': 324.0},
-        charger_power=80.0,
+        vehicle_max_charge_kw={'bus_1': 80.0},
+        charger_groups={80.0: 1},
         charger_efficiency=0.95,
-        n_chargers=1,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -599,11 +608,13 @@ def test_variable_fixing_reduces_solve_time(simple_depot_config):
 def test_symmetry_breaking_improves_performance():
     """Symmetry breaking should reduce solve time for larger problems."""
     # Create config where vehicles <= chargers (required for symmetry breaking)
+    vehicle_ids = [f'bus_{i}' for i in range(5)]
     config = DepotConfig(
-        vehicle_capacities={f'bus_{i}': 324.0 for i in range(5)},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},  # Same as vehicles, so symmetry breaking applies
         charger_efficiency=0.95,
-        n_chargers=5,  # Same as vehicles, so symmetry breaking applies
+        charger_vehicle_access={},
         battery_capacity=1000.0,
         battery_power=200.0,
         max_site_power=800.0,
@@ -690,11 +701,13 @@ def test_warm_start_with_different_vehicle_sets(simple_depot_config):
     )
     
     # Update config for new vehicle
+    vehicle_ids_3 = ['bus_1', 'bus_2', 'bus_3']
     config2 = DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0, 'bus_3': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids_3},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids_3},
+        charger_groups={80.0: 2},
         charger_efficiency=0.95,
-        n_chargers=2,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -783,9 +796,10 @@ def test_validate_inputs_vehicle_capacities_mismatch(simple_depot_state):
     """Should raise error if vehicle_capacities keys don't match."""
     config = DepotConfig(
         vehicle_capacities={'bus_3': 324.0},  # Wrong key
-        charger_power=80.0,
+        vehicle_max_charge_kw={'bus_3': 80.0},
+        charger_groups={80.0: 2},
         charger_efficiency=0.95,
-        n_chargers=2,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -796,11 +810,13 @@ def test_validate_inputs_vehicle_capacities_mismatch(simple_depot_state):
 
 def test_validate_inputs_invalid_charger_efficiency(simple_depot_state):
     """Should raise error for invalid charger efficiency."""
+    vehicle_ids = ['bus_1', 'bus_2']
     config = DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 2},
         charger_efficiency=1.5,  # Invalid: > 1.0
-        n_chargers=2,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -811,11 +827,13 @@ def test_validate_inputs_invalid_charger_efficiency(simple_depot_state):
 
 def test_validate_inputs_zero_charger_efficiency(simple_depot_state):
     """Should raise error for zero charger efficiency."""
+    vehicle_ids = ['bus_1', 'bus_2']
     config = DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 2},
         charger_efficiency=0.0,  # Invalid: <= 0
-        n_chargers=2,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -988,11 +1006,13 @@ def test_infeasible_model_error():
 def test_symmetry_breaking_with_unavailable_vehicles():
     """Symmetry breaking should handle unavailable vehicles."""
     # Use config where vehicles <= chargers (required for symmetry breaking)
+    vehicle_ids = ['bus_1', 'bus_2', 'bus_3']
     config = DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0, 'bus_3': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 3},  # Same as vehicles, so symmetry breaking applies
         charger_efficiency=0.95,
-        n_chargers=3,  # Same as vehicles, so symmetry breaking applies
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -1041,11 +1061,13 @@ def test_variable_fixing_multiple_vehicles(simple_depot_config):
         building_power=[50.0] * n_t,
     )
     
+    vehicle_ids_3 = ['bus_1', 'bus_2', 'bus_3']
     config = DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0, 'bus_3': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids_3},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids_3},
+        charger_groups={80.0: 2},
         charger_efficiency=0.95,
-        n_chargers=2,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=500.0,
@@ -1068,9 +1090,10 @@ class TestOptimizerEdgeCases:
         n_t = 96
         config = DepotConfig(
             vehicle_capacities={},  # No vehicles
-            charger_power=80.0,
+            vehicle_max_charge_kw={},
+            charger_groups={80.0: 5},
             charger_efficiency=0.95,
-            n_chargers=5,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1102,9 +1125,10 @@ class TestOptimizerEdgeCases:
         n_t = 96
         config = DepotConfig(
             vehicle_capacities={'solo_bus': 324.0},
-            charger_power=80.0,
+            vehicle_max_charge_kw={'solo_bus': 80.0},
+            charger_groups={80.0: 1},
             charger_efficiency=0.95,
-            n_chargers=1,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=300.0,
@@ -1182,11 +1206,13 @@ class TestOptimizerEdgeCases:
     def test_all_vehicles_unavailable(self):
         """Test optimizer when all vehicles are unavailable (all on route)."""
         n_t = 96
+        vehicle_ids = ['bus_1', 'bus_2']
         config = DepotConfig(
-            vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 2},
             charger_efficiency=0.95,
-            n_chargers=2,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1220,11 +1246,13 @@ class TestOptimizerEdgeCases:
     def test_no_departure_times(self):
         """Test optimizer when no departure times are specified."""
         n_t = 96
+        vehicle_ids = ['bus_1', 'bus_2']
         config = DepotConfig(
-            vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 2},
             charger_efficiency=0.95,
-            n_chargers=2,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1256,11 +1284,13 @@ class TestOptimizerEdgeCases:
     def test_zero_prices_throughout_horizon(self):
         """Test optimizer with zero prices throughout horizon."""
         n_t = 96
+        vehicle_ids = ['bus_1', 'bus_2']
         config = DepotConfig(
-            vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 2},
             charger_efficiency=0.95,
-            n_chargers=2,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1292,9 +1322,10 @@ class TestOptimizerEdgeCases:
         n_t = 96
         config = DepotConfig(
             vehicle_capacities={'bus_1': 324.0},
-            charger_power=80.0,
+            vehicle_max_charge_kw={'bus_1': 80.0},
+            charger_groups={80.0: 1},
             charger_efficiency=0.95,
-            n_chargers=1,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1334,11 +1365,13 @@ class TestOptimizerEdgeCases:
     def test_very_high_demand_charge(self):
         """Test optimizer prioritizes demand charge reduction."""
         n_t = 96
+        vehicle_ids = ['bus_1', 'bus_2', 'bus_3']
         config = DepotConfig(
-            vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0, 'bus_3': 324.0},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 3},
             charger_efficiency=0.95,
-            n_chargers=3,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1372,9 +1405,10 @@ class TestOptimizerEdgeCases:
         n_t = 96
         config = DepotConfig(
             vehicle_capacities={'bus_1': 324.0},
-            charger_power=150.0,  # High power charger
+            vehicle_max_charge_kw={'bus_1': 150.0},
+            charger_groups={150.0: 1},  # High power charger
             charger_efficiency=0.95,
-            n_chargers=1,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1403,11 +1437,13 @@ class TestOptimizerEdgeCases:
     def test_zero_demand_charge(self):
         """Test optimizer with zero demand charge."""
         n_t = 96
+        vehicle_ids = ['bus_1', 'bus_2']
         config = DepotConfig(
-            vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 2},
             charger_efficiency=0.95,
-            n_chargers=2,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,
@@ -1471,11 +1507,13 @@ class TestHiGHSFallback:
     @pytest.fixture
     def simple_config(self):
         """Simple depot configuration for fallback testing."""
+        vehicle_ids = ['bus_1', 'bus_2']
         return DepotConfig(
-            vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-            charger_power=80.0,
+            vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 2},
             charger_efficiency=0.95,
-            n_chargers=2,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,

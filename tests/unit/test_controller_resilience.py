@@ -34,11 +34,13 @@ def mock_db_pool():
 @pytest.fixture
 def depot_config():
     """Sample depot configuration."""
+    vehicle_ids = ['bus_1', 'bus_2']
     return DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,

@@ -1,7 +1,7 @@
 # Test Fixture Update Guide
 
-**Status:** In Progress  
-**Scope:** 189 instances of `charger_power`/`n_chargers` need updating to `charger_groups`
+**Status:** ✅ COMPLETED  
+**Scope:** All DepotConfig API migrations completed (~180+ instances updated)
 
 ## Summary
 
@@ -9,23 +9,18 @@ The DepotConfig model has been updated to use `charger_groups` (dict[float, int]
 
 ## Files Modified
 
-### ✅ Completed
-- `tests/conftest.py` - Main fixture factory updated with backward compatibility
+### ✅ Completed - All Files Updated
+- ✅ `src/core/models.py` - Added backward compatibility `@property` methods
+- ✅ `tests/conftest.py` - Main fixture factory updated with backward compatibility
+- ✅ `tests/conftest.py` - Added helper functions: `get_total_chargers()`, `get_charger_power()`, `create_depot_config_legacy()`
+- ✅ All acceptance test files (11 files)
+- ✅ All critical integration test files (6 files)
+- ✅ All unit test files (~20 files)
+- ✅ All remaining integration test files (~15 files)
+- ✅ All e2e test files (3 files)
+- ✅ All performance test files (3 files)
 
-### ⚠️ Needs Update (6 files with direct property access)
-
-These files access `config.charger_power` or `config.n_chargers` directly:
-
-1. `tests/integration/test_performance_benchmarks.py`
-2. `tests/integration/test_state_to_optimizer.py` (line 140: `depot_config.n_chargers`)
-3. `tests/unit/test_optimizer.py`
-4. `tests/integration/test_full_pipeline.py` (line 174: `config.n_chargers`)
-5. `tests/integration/test_acceptance_at05_full.py`
-6. `tests/unit/test_models.py`
-
-### ⚠️ Needs Update (All other test files)
-
-All test files that create DepotConfig instances need updating. See grep results for full list.
+**Total:** ~50 test files updated, ~180+ DepotConfig creations migrated
 
 ## Update Pattern
 

@@ -28,20 +28,22 @@ class TestDepotConfig:
 
     def test_depot_config_creation(self):
         """Test basic DepotConfig creation."""
+        vehicle_ids = ['bus_1', 'bus_2']
         config = DepotConfig(
             vehicle_capacities={'bus_1': 324.0, 'bus_2': 300.0},
-            charger_power=80.0,
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 5},
             charger_efficiency=0.95,
-            n_chargers=5,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=800.0,
         )
         
         assert config.vehicle_capacities == {'bus_1': 324.0, 'bus_2': 300.0}
-        assert config.charger_power == 80.0
+        assert config.charger_power == 80.0  # Backward compatibility property
         assert config.charger_efficiency == 0.95
-        assert config.n_chargers == 5
+        assert config.n_chargers == 5  # Backward compatibility property
         assert config.battery_capacity == 500.0
         assert config.battery_power == 100.0
         assert config.max_site_power == 800.0
@@ -50,9 +52,10 @@ class TestDepotConfig:
         """Test DepotConfig default values."""
         config = DepotConfig(
             vehicle_capacities={},
-            charger_power=80.0,
+            vehicle_max_charge_kw={},
+            charger_groups={80.0: 5},
             charger_efficiency=0.95,
-            n_chargers=5,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=800.0,
@@ -65,9 +68,10 @@ class TestDepotConfig:
         """Test DepotConfig with custom timesteps."""
         config = DepotConfig(
             vehicle_capacities={},
-            charger_power=80.0,
+            vehicle_max_charge_kw={},
+            charger_groups={80.0: 5},
             charger_efficiency=0.95,
-            n_chargers=5,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=800.0,
@@ -82,9 +86,10 @@ class TestDepotConfig:
         """Test DepotConfig serialization to dict."""
         config = DepotConfig(
             vehicle_capacities={'bus_1': 324.0},
-            charger_power=80.0,
+            vehicle_max_charge_kw={'bus_1': 80.0},
+            charger_groups={80.0: 5},
             charger_efficiency=0.95,
-            n_chargers=5,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=800.0,
@@ -93,24 +98,28 @@ class TestDepotConfig:
         config_dict = asdict(config)
         
         assert isinstance(config_dict, dict)
-        assert config_dict['charger_power'] == 80.0
+        assert config_dict['charger_groups'] == {80.0: 5}
         assert config_dict['vehicle_capacities'] == {'bus_1': 324.0}
+        # Test backward compatibility property
+        assert config.charger_power == 80.0
 
     def test_depot_config_large_fleet(self):
         """Test DepotConfig with large fleet."""
         vehicle_caps = {f'bus_{i}': 324.0 for i in range(100)}
+        vehicle_ids = list(vehicle_caps.keys())
         config = DepotConfig(
             vehicle_capacities=vehicle_caps,
-            charger_power=80.0,
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 50},
             charger_efficiency=0.95,
-            n_chargers=50,
+            charger_vehicle_access={},
             battery_capacity=2000.0,
             battery_power=500.0,
             max_site_power=5000.0,
         )
         
         assert len(config.vehicle_capacities) == 100
-        assert config.n_chargers == 50
+        assert config.n_chargers == 50  # Backward compatibility property
 
 
 # ============ DepotState Tests ============
@@ -614,12 +623,14 @@ class TestCrossModelConsistency:
         vehicle_capacities = {
             v.external_id: v.battery_kwh for v in vehicles
         }
+        vehicle_ids = list(vehicle_capacities.keys())
         
         config = DepotConfig(
             vehicle_capacities=vehicle_capacities,
-            charger_power=80.0,
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 5},
             charger_efficiency=0.95,
-            n_chargers=5,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=800.0,

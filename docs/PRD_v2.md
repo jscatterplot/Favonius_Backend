@@ -1,6 +1,6 @@
 # Product Requirements Document
 ## Favonius Energy — EV Fleet Depot Optimization Platform
-### Version 2.2 (MVP) | December 2025
+### Version 2.5 (MVP) | January 2025
 
 ---
 
@@ -48,7 +48,7 @@ Favonius Energy delivers an integrated depot energy management platform that coo
 | EV charging scheduling | Solar generation prediction |
 | Stationary battery dispatch | Advanced price forecasting (RL) |
 | Market price integration (TOU, CAISO) | Customer dashboard |
-| OCPP 1.6/2.0.1 charger control (CCS only) | Mobile app |
+| OCPP 1.6 charger control (handles OCPP 2+ messages, CCS only) | Mobile app |
 | Energy consumption surrogate model | Multi-company deployments |
 | Re-optimization triggers | Grid services participation |
 | Single-depot operation | Full carbon accounting |
@@ -129,7 +129,7 @@ Each depot runs its own optimization independently. Vehicles can move between de
 | **Gaussian Process surrogate** | Provides uncertainty estimates; proven in Stanford research (R² 0.84-0.94) |
 | **Python + Pyomo + Gurobi** | Production-grade solver with excellent performance and constraint handling |
 | **TimescaleDB for telemetry** | Optimized for time-series; compression for long-term storage |
-| **OCPP 1.6 primary, 2.0.1 ready** | 1.6 is dominant in field; 2.0.1 adds smart charging profiles |
+| **OCPP 1.6 primary, handles 2+ messages** | 1.6 is dominant in field; OCPP 2+ chargers can connect but use 1.6 protocol format |
 | **CCS connector only (MVP)** | Simplifies physical constraints; dominant DC fast charging standard |
 | **Building load required** | Enables accurate grid power tracking; sellable feature |
 
@@ -139,9 +139,11 @@ Each depot runs its own optimization independently. Vehicles can move between de
 |-----------------|--------------|-------------------|
 | Solar prediction | Removed from MVP | Add when self-consumption focus needed |
 | Price forecasting | Use market/TOU prices directly | Add RL forecaster for volatile markets |
-| V2G | Unidirectional only | Add when market revenue justifies |
+| V2G | Removed from MVP (out of scope) | Add when market revenue justifies |
 | Multi-depot | Single depot optimization with handoff messaging | Add coordination layer |
 | Connector types | CCS only | Add CHAdeMO, Type2, NACS support |
+| Julia MIP solver | Removed; using Pyomo/Gurobi/HiGHS only | N/A (decision made) |
+| OCPP communication | Single OCPP 1.6 server in WebSocket Handler (handles OCPP 2+ messages) | Main API communicates via internal API (Phase 4) |
 
 ---
 
@@ -254,6 +256,11 @@ SO THAT charging can be planned before arrival
 
 ### 5.1 High-Level Architecture
 
+**Service Architecture:**
+The platform uses a **two-service architecture**:
+- **Main API Backend**: Primary optimization service (MILP, triggers, control)
+- **WebSocket Handler Service**: Telemetry-only service (OCPP communication, data storage)
+
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │                         EXTERNAL INPUTS                           │
@@ -262,55 +269,122 @@ SO THAT charging can be planned before arrival
 │   API   │ Utility │  Mgmt   │Telemetry│  Depot  │    Meter        │
 └────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────────┬────────┘
      │         │         │         │         │             │
+     │         │         │         │         │             │
      ▼         ▼         ▼         ▼         ▼             ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              ENERGY CONSUMPTION SURROGATE MODEL                     │
-│              (Gaussian Process / MLP)                               │
-│              Input: Weather, Route, Bus Size, Calendar              │
-│              Output: E_consumption[kWh]                             │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        STATE ASSEMBLER                              │
+│                    MAIN API BACKEND SERVICE                        │
+│                    (Optimization & Control)                         │
+├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  • Current SoC (vehicles + battery)                                 │
-│  • Price schedule (TOU / CAISO DAM)                                 │
-│  • Vehicle availability windows                                     │
-│  • Charger availability (aggregated by rated_kw)                    │
-│  • Charger-vehicle physical accessibility matrix                    │
-│  • Energy consumption forecasts                                     │
-│  • Building load forecast                                           │
-│  • Demand charge period info                                        │
-│  • Moving peak limit (max grid draw this month)                     │
-│  • Incoming inter-depot vehicles                                    │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       MILP OPTIMIZER                                │
-│                       (Pyomo + Gurobi)                              │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  FastAPI REST API                                            │  │
+│  │  - POST /optimize                                            │  │
+│  │  - GET /depots/{id}/state                                    │  │
+│  │  - POST /depots/{id}/handoff/*                               │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Controller Manager                                          │  │
+│  │  - Manages per-depot controllers                             │  │
+│  │  - Orchestrates optimization cycles                          │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ├──────────────────┬──────────────────┐                  │
+│           ▼                  ▼                  ▼                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+│  │ State        │  │ Trigger      │  │ Handoff      │             │
+│  │ Assembler    │  │ Monitor      │  │ Manager      │             │
+│  └──────────────┘  └──────────────┘  └──────────────┘             │
+│           │                  │                  │                  │
+│           ▼                  │                  │                  │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Optimization Engine                                        │  │
+│  │  - Surrogate Model (Gaussian Process / MLP)                 │  │
+│  │  - MILP Optimizer (Pyomo + Gurobi / HiGHS fallback)         │  │
+│  │  - Charger Allocator                                        │  │
+│  │                                                              │  │
+│  │  Objective: min(Energy Cost + Demand Charges)               │  │
+│  │  Hard Constraint: SoC[b, t_depart] ≥ 99%                    │  │
+│  │  Solve time target: < 60 seconds                            │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Control Dispatcher                                         │  │
+│  │  - OCPP SetChargingProfile (via WebSocket Handler)          │  │
+│  │  - Battery Modbus commands                                   │  │
+│  └─────────────────────────────────────────────────────────────┘  │
 │                                                                     │
-│  Objective: min(Energy Cost + Demand Charges)                       │
-│  Decision Variables: P_charge[b,t], P_batt[t], y_charge[b,t]        │
-│  Hard Constraint: SoC[b, t_depart] ≥ 99%                            │
-│                                                                     │
-│  Solve time target: < 60 seconds                                    │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
+└─────────────────────────────────────────────────────────────────────┘
+     │                    │                    │                    │
+     │ (queries)           │ (queries)          │ (commands)         │
+     │                    │                    │                    │
+     ▼                    ▼                    ▼                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    CONTROL OUTPUT LAYER                             │
-├─────────────────┬─────────────────┬─────────────────────────────────┤
-│ OCPP Commands   │ Battery Modbus  │ Data Logging (TimescaleDB)      │
-│ SetChargingProf │ Charge/Discharge│ Telemetry, Results, Triggers    │
-└─────────────────┴─────────────────┴─────────────────────────────────┘
+│              WEBSOCKET HANDLER SERVICE                              │
+│              (Telemetry & OCPP Communication)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  OCPP 1.6 WebSocket Server                                   │  │
+│  │  - Handles OCPP 2+ messages (backward compatible)            │  │
+│  │  - Receives MeterValues, StatusNotification                  │  │
+│  │  - Sends SetChargingProfile (from Main API)                  │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Telemetry Ingestion                                        │  │
+│  │  - Stores MeterValues to TimescaleDB                        │  │
+│  │  - Updates vehicle max_charge_kw from OCPP                  │  │
+│  │  - Tracks charger_id for all telemetry                      │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Internal API (Planned - Phase 4)                           │  │
+│  │  - Query charge point state                                 │  │
+│  │  - Send SetChargingProfile commands                         │  │
+│  │  - Health monitoring                                        │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Backup Heuristic Optimizer (Emergency Only)                │  │
+│  │  - Activates if Main API unavailable > 1 hour              │  │
+│  │  - Simplified heuristic algorithms                          │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+     │                    │
+     │ (writes)           │ (writes)
+     │                    │
+     ▼                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DUAL DATABASE ARCHITECTURE                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐       │
+│  │  SUPABASE                │  │  TIMESCALEDB              │       │
+│  │  (PostgreSQL)            │  │  (PostgreSQL Extension)   │       │
+│  │                          │  │                          │       │
+│  │  Static/Reference Data:  │  │  Time-Series Data:       │       │
+│  │  • depots                │  │  • telemetry             │       │
+│  │  • vehicles              │  │  • prices                │       │
+│  │  • chargers              │  │  • weather_forecasts     │       │
+│  │  • schedules             │  │  • building_load          │       │
+│  │  • battery_storage       │  │  • optimization_runs     │       │
+│  │  • charger_vehicle_access│  │  • charging_commands     │       │
+│  │                          │  │  • interdepot_messages   │       │
+│  │  Used by: Both services  │  │  • trigger_log           │       │
+│  │                          │  │                          │       │
+│  │                          │  │  Used by: Both services  │       │
+│  └──────────────────────────┘  └──────────────────────────┘       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 
-                                │
-                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   RE-OPTIMIZATION TRIGGERS                          │
-│  Event-driven (SoC/return/handoff) | Periodic (price/scheduled)     │
+│                   (Main API - Trigger Monitor)                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Trigger                    │ Detection Method │ Threshold          │
 │  ─────────────────────────────────────────────────────────────────  │
@@ -319,41 +393,61 @@ SO THAT charging can be planned before arrival
 │  Inter-depot handoff        │ Event-driven     │ On message receipt │
 │  Price change               │ On ingestion     │ > 25% OR > $25/MWh │
 │  Scheduled (default)        │ Periodic         │ Hourly 24/7        │
+│                                                                     │
+│  Cooldown: 5 minutes minimum between triggers                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 5.2 Component Responsibilities
 
-| Component | Responsibility | Technology |
-|-----------|---------------|------------|
-| **Weather Adapter** | Fetch 7-day forecast | Open-Meteo API, httpx |
-| **Price Adapter** | Fetch TOU/CAISO prices | CAISO OASIS, utility APIs |
-| **Building Load Adapter** | Fetch building power consumption | Modbus meter, API, or forecast |
-| **OCPP Server** | Charger communication | ocpp library, WebSocket |
-| **Surrogate Model** | Energy consumption prediction | scikit-learn, gpytorch |
-| **State Assembler** | Aggregate inputs for optimizer | asyncpg, pandas |
-| **MILP Optimizer** | Generate optimal schedules | Pyomo, Gurobi |
-| **Charger Allocator** | Allocate aggregated power to individual chargers | Post-optimization allocation |
-| **Trigger Monitor** | Detect re-optimization conditions | asyncio |
-| **Control Dispatcher** | Send commands to hardware | OCPP, Modbus |
-| **Handoff Manager** | Send/receive inter-depot messages | HTTP/WebSocket |
-| **API Server** | External interface | FastAPI, uvicorn |
-| **Database** | Persistent storage | TimescaleDB (PostgreSQL) |
+**Architecture Overview:**
+The platform uses an integrated architecture with two main services:
+- **Main API Backend**: Primary optimization service running Pyomo/Gurobi optimizer
+- **WebSocket Handler Service**: Telemetry-only service for OCPP communication and data storage
+
+| Component | Responsibility | Technology | Service |
+|-----------|---------------|------------|---------|
+| **Weather Adapter** | Fetch 7-day forecast | Open-Meteo API, httpx | Main API |
+| **Price Adapter** | Fetch TOU/CAISO prices | CAISO OASIS, utility APIs | Main API |
+| **Building Load Adapter** | Fetch building power consumption | Modbus meter, API, or forecast | Main API |
+| **OCPP Server** | Charger communication (OCPP 1.6, handles OCPP 2+ messages) | ocpp library, WebSocket | WebSocket Handler |
+| **Surrogate Model** | Energy consumption prediction | scikit-learn, gpytorch | Main API |
+| **State Assembler** | Aggregate inputs for optimizer | asyncpg, pandas | Main API |
+| **MILP Optimizer** | Generate optimal schedules | Pyomo, Gurobi (primary), HiGHS (fallback) | Main API |
+| **Heuristic Optimizer** | Backup optimization when main API unavailable | Heuristic algorithms | WebSocket Handler (backup only) |
+| **Charger Allocator** | Allocate aggregated power to individual chargers | Post-optimization allocation | Main API |
+| **Trigger Monitor** | Detect re-optimization conditions | asyncio | Main API |
+| **Control Dispatcher** | Send commands to hardware | OCPP, Modbus | Main API (via WebSocket Handler) |
+| **Handoff Manager** | Send/receive inter-depot messages | HTTP/WebSocket | Main API |
+| **API Server** | External interface | FastAPI, uvicorn | Main API |
+| **Internal API** | Charge point state queries for main API | HTTP REST | WebSocket Handler (planned) |
+| **Telemetry Ingestion** | Store OCPP MeterValues to TimescaleDB | asyncpg | WebSocket Handler |
+| **Supabase** | Static/reference data storage | Supabase (PostgreSQL) | Both services |
+| **TimescaleDB** | Time-series data storage | TimescaleDB (PostgreSQL) | WebSocket Handler |
 
 ### 5.3 Data Flow
 
+**Service Architecture:**
+- **Main API Backend**: Runs optimization, manages triggers, dispatches commands
+- **WebSocket Handler**: Receives OCPP messages, stores telemetry, exposes internal API
+- **Communication**: Main API queries WebSocket Handler for charge point state (planned Phase 4)
+
 ```
 1. INGESTION (every 5 minutes)
-   Weather API → weather_forecasts table
-   CAISO API → prices table
-   OCPP MeterValues → telemetry table (includes vehicle max_charge_kw)
-   Fleet Mgmt System → schedules table
-   Building Load Meter/API → building_load table
-   Inter-depot Messages → interdepot_messages table
+   Weather API → Main API → weather_forecasts table (TimescaleDB)
+   CAISO API → Main API → prices table (TimescaleDB)
+   OCPP MeterValues → WebSocket Handler → telemetry table (TimescaleDB, includes vehicle max_charge_kw)
+   Fleet Mgmt System → Main API → schedules table (Supabase)
+   Building Load Meter/API → Main API → building_load table (TimescaleDB)
+   Inter-depot Messages → Main API → interdepot_messages table (TimescaleDB)
 
-2. STATE ASSEMBLY (before each optimization)
-   Query: latest telemetry, prices, schedules, depot config, building load
+2. STATE ASSEMBLY (before each optimization - Main API)
+   Query: latest telemetry from TimescaleDB (currently direct query; Phase 4: via WebSocket Handler internal API)
+   Query: prices, schedules, depot config from Supabase
+   Query: building load from TimescaleDB
    Query: pending inter-depot incoming vehicles (where arrival_time < horizon_end)
+   
+   **Note**: Currently, Main API queries TimescaleDB directly for telemetry. In Phase 4, this will transition to querying via WebSocket Handler internal API for better separation of concerns and centralized telemetry management.
 
    **Data Freshness Requirements:**
    | Data Type | Max Age | Fallback if Stale |
@@ -374,20 +468,21 @@ SO THAT charging can be planned before arrival
    Resolve: demand_charge_rate (prices.demand_kw → depots.demand_charge_rate_kw)
    Output: DepotState object
 
-3. OPTIMIZATION (hourly + triggers)
+3. OPTIMIZATION (hourly + triggers - Main API)
    Input: DepotState, DepotConfig
-   Execute: MILP solve (< 60s)
+   Execute: MILP solve using Pyomo/Gurobi (< 60s)
+   Fallback: If Gurobi fails, automatically use HiGHS solver
    Output: Charging schedule, battery dispatch
 
-4. DISPATCH (immediately after optimization)
+4. DISPATCH (immediately after optimization - Main API)
    Allocate: Aggregated charger power to individual chargers
-   OCPP: SetChargingProfile to each charger
+   OCPP: SetChargingProfile to each charger (via WebSocket Handler - planned Phase 4)
    Modbus: Battery setpoints
-   Database: Store optimization results
+   Database: Store optimization results to TimescaleDB
 
-5. MONITORING
+5. MONITORING (Main API)
    Event-driven triggers (SoC, return time, handoff):
-   - SoC deviation: Detected within 15 seconds of receiving new telemetry
+   - SoC deviation: Detected within 15 seconds of receiving new telemetry (from WebSocket Handler)
    - Return time deviation: Detected within 15 seconds of schedule update
    - Inter-depot handoff: Detected on message receipt
    - Optimization starts within 60 seconds of trigger detection
@@ -398,9 +493,18 @@ SO THAT charging can be planned before arrival
    - Scheduled: Evaluated hourly 24/7
    - Optimization completes within 60 seconds of trigger
 
-6. INTER-DEPOT COORDINATION (on vehicle departure)
+6. INTER-DEPOT COORDINATION (on vehicle departure - Main API)
    Send: Handoff message to destination depot
    Receive: Acknowledge and incorporate into next optimization
+
+7. BACKUP MODE (WebSocket Handler - Emergency Only)
+   **Activation Condition**: Main API unavailable for > 1 hour
+   **Behavior**: WebSocket Handler activates heuristic optimizer
+   - Uses simplified heuristic algorithms (not MILP)
+   - Ensures basic charging continues during main API outage
+   - Logs all actions for post-recovery analysis
+   - Automatically deactivates when main API recovers
+   **Note**: Backup mode is emergency-only and does not meet full optimization requirements
 ```
 
 ### 5.4 Inter-Depot Handoff Flow
@@ -454,10 +558,27 @@ SO THAT charging can be planned before arrival
 
 ## 6. Data Models
 
-### 6.1 Database Schema
+### 6.1 Database Architecture
+
+The platform uses a **dual-database architecture** to optimize for different data access patterns:
+
+- **Supabase (PostgreSQL)**: Stores static/reference data and relational information
+  - Depot configurations, vehicle metadata, charger definitions
+  - User/organization data for authentication
+  - Route schedules (operational but non-time-series)
+  - Provides better relational data management and built-in auth features
+
+- **TimescaleDB (PostgreSQL extension)**: Stores time-series data
+  - Telemetry, prices, weather forecasts, building load
+  - Optimization results, command history, trigger logs
+  - Optimized for time-series queries, compression, and retention policies
+
+**Rationale:** Supabase excels at relational data and user management, while TimescaleDB is purpose-built for time-series analytics and compression.
+
+### 6.1.1 Supabase Schema (Static/Reference Data)
 
 ```sql
--- PostgreSQL + TimescaleDB
+-- Supabase (PostgreSQL) - Static and reference data
 
 -- ============ REFERENCE DATA ============
 
@@ -518,6 +639,9 @@ CREATE TABLE battery_storage (
 );
 
 -- ============ TIME-SERIES DATA ============
+
+-- Note: Vehicle and charger metadata (vehicle_id, charger_id) are foreign keys
+-- that reference Supabase tables, but telemetry itself is stored in TimescaleDB
 
 CREATE TABLE telemetry (
     time            TIMESTAMPTZ NOT NULL,
@@ -581,6 +705,15 @@ CREATE TABLE schedules (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_schedules_vehicle_depart ON schedules (vehicle_id, departure_time);
+```
+
+### 6.1.2 TimescaleDB Schema (Time-Series Data)
+
+```sql
+-- TimescaleDB (PostgreSQL extension) - Time-series data only
+
+-- Enable TimescaleDB extension
+CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 CREATE TABLE optimization_runs (
     run_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -931,7 +1064,13 @@ Health check endpoint.
 
 ### 7.2 WebSocket API (OCPP)
 
-The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{ocpp_id}`.
+**Architecture:**
+The platform implements a single OCPP 1.6 server in the WebSocket Handler service:
+- **OCPP 1.6 Server**: `ws://websocket-handler:9000/{ocpp_id}` - Single OCPP communication layer
+- **OCPP 2+ Compatibility**: OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 protocol format
+  - OCPP 2+ adds additional messages but maintains backward compatibility
+  - Server handles OCPP 2+ messages by responding in OCPP 1.6 format where applicable
+- **Main API**: Communicates with WebSocket Handler via internal REST API (Phase 4)
 
 **Supported Messages:**
 | Direction | Message | Purpose |
@@ -1386,20 +1525,43 @@ When optimization cannot satisfy all constraints (typically: insufficient time t
 
 ### 9.1 OCPP Integration
 
-**Supported Versions:** OCPP 1.6-J (primary), OCPP 2.0.1 (ready)
+**Supported Versions:** OCPP 1.6-J (primary), with ability to handle OCPP 2.0.1/2.1 messages
 
 **Connector Types (MVP):** CCS only
 
+**Architecture:**
+- **WebSocket Handler Service**: Single OCPP 1.6 server that handles all charger connections
+- **OCPP 2+ Compatibility**: OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 protocol (OCPP 2+ adds more messages but is backward compatible at the connection level)
+- **Main API**: Communicates with WebSocket Handler via internal API (Phase 4)
+
 **Connection Flow:**
 ```
-1. Charger connects: ws://platform:9000/{ocpp_id}
+1. Charger connects: ws://websocket-handler:9000/{ocpp_id} (OCPP 1.6 protocol)
+   - OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 message format
+   - OCPP 2+ adds more messages but maintains backward compatibility at connection level
 2. Platform sends: BootNotificationResponse (Accepted, interval=300)
 3. Charger sends: StatusNotification (every 5 min)
 4. Charger sends: MeterValues (every 15 sec when charging)
    - Includes: Energy.Active.Import.Register, SoC, Power.Active.Import
    - May include: maxChargingRate (vehicle limit)
-5. Platform sends: SetChargingProfile (after optimization)
+5. WebSocket Handler: Stores telemetry to TimescaleDB immediately
+6. Main API: Queries charge point state via internal API (planned Phase 4)
+7. Main API: Sends SetChargingProfile via WebSocket Handler (planned Phase 4)
 ```
+
+**Data Storage:**
+- **Vehicle/charger metadata** (from BootNotification, configuration): Stored in Supabase
+- **Telemetry data** (from MeterValues): Stored in TimescaleDB by WebSocket Handler with `charger_id` reference
+- **Vehicle-charger mapping** (from idTag in Authorize): Resolved via Supabase `vehicles.id_tag` field
+
+**Internal API (Planned - Phase 4):**
+The WebSocket Handler will expose an internal REST API for the Main API to:
+- Query connected charge points
+- Get charge point state (SoC, power, connection status)
+- Send SetChargingProfile commands
+- Monitor connection health
+
+This enables the Main API to remain the single source of optimization logic while delegating OCPP communication to the specialized WebSocket Handler service.
 
 **Vehicle-Charger Mapping:**
 When a StartTransaction is received:
@@ -1763,6 +1925,8 @@ Follow the existing patterns in src/api/main.py.
 | 2.1 | 2025-12-12 | Claude | Fixed inconsistencies: corrected OCPP WebSocket URL to use `{ocpp_id}`, clarified TOU pricing hours, fixed battery dynamics formula (removed incorrect efficiency division), updated all document references from PRD.md to PRD_v2.md |
 | 2.2 | 2025-12-13 | Claude | Security & logic hardening: added vehicle count constraint to MILP, fixed grid power balance to use P_batt_effective, clarified incoming vehicle SoC initialization, added comprehensive security requirements (input validation, rate limiting, SQL injection prevention), added database CHECK constraints, added infeasibility handling specification, added data freshness requirements |
 | 2.3 | 2025-12-13 | Claude | Reliability improvements: Added HiGHS fallback solver for graceful degradation when Gurobi fails (license error, connection issues), added solver_used field to OptimizationResult for monitoring, added Gurobi license failure test to integration tests |
+| 2.4 | 2025-01-XX | Claude | Architecture documentation: Updated Section 5.2 to reflect integrated system architecture (Main API primary, WebSocket Handler telemetry-only), updated Section 5.3 data flow to show service responsibilities, added backup mode documentation (Section 5.3), updated Section 9.1 OCPP integration to reflect service split and internal API plan, clarified component responsibilities by service |
+| 2.5 | 2025-01-XX | Claude | OCPP simplification: Removed dual server architecture, consolidated to single OCPP 1.6 server in WebSocket Handler that handles OCPP 2+ messages, updated all OCPP references to reflect single server approach |
 
 ---
 

@@ -105,7 +105,9 @@ class DepotController:
         self.assembler = StateAssembler(pool, self.depot_id, config)
 
         self.trigger_monitor = TriggerMonitor(
-            TriggerConfig(),
+            TriggerConfig(
+                trigger_cooldown_minutes=self.controller_config.trigger_cooldown_minutes
+            ),
             on_trigger=self._handle_trigger,
             assembler=self.assembler,
         )

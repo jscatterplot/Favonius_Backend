@@ -28,7 +28,7 @@ class ComponentType(Enum):
     SECURITY = "Security"
     SMART_CHARGING = "SmartCharging"
     TARIFF_COST = "TariffCost"
-    V2X_CONTROLLER = "V2XController"
+    # V2X_CONTROLLER = "V2XController"  # Removed - out of scope for MVP per PRD Section 1.2
     METER = "Meter"
     NETWORK = "Network"
     FIRMWARE = "Firmware"
@@ -973,147 +973,15 @@ class StandardOCPPVariables:
             }
         ]
     
+    # V2X controller variables removed - out of scope for MVP per PRD Section 1.2
     @staticmethod
     def get_v2x_controller_variables() -> List[Dict[str, Any]]:
-        """Get standardized V2XController variables."""
-        return [
-            {
-                "name": "V2XCapability",
-                "type": VariableType.BOOLEAN.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Whether V2X is supported",
-                "default_value": "false",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxPower",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X power in kW",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMinPower",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Minimum V2X power in kW",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxDischargePower",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X discharge power in kW",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxChargePower",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X charge power in kW",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxEnergy",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X energy in kWh",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMinEnergy",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Minimum V2X energy in kWh",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxDischargeEnergy",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X discharge energy in kWh",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxChargeEnergy",
-                "type": VariableType.DECIMAL.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X charge energy in kWh",
-                "default_value": "0.0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxVoltage",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X voltage in V",
-                "default_value": "0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMinVoltage",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Minimum V2X voltage in V",
-                "default_value": "0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxCurrent",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X current in A",
-                "default_value": "0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMinCurrent",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Minimum V2X current in A",
-                "default_value": "0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxDischargeCurrent",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X discharge current in A",
-                "default_value": "0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxChargeCurrent",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X charge current in A",
-                "default_value": "0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxDischargeVoltage",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X discharge voltage in V",
-                "default_value": "0",
-                "required": False
-            },
-            {
-                "name": "V2XCapabilityMaxChargeVoltage",
-                "type": VariableType.INTEGER.value,
-                "access": VariableAccess.READ_ONLY.value,
-                "description": "Maximum V2X charge voltage in V",
-                "default_value": "0",
-                "required": False
-            }
-        ]
+        """Get standardized V2XController variables.
+        
+        Note: V2X/V2G is out of scope for MVP per PRD Section 1.2.
+        This method is kept for future reference but returns empty list.
+        """
+        return []
 
 
 @dataclass
@@ -1302,8 +1170,7 @@ class DeviceModel:
             # Initialize SmartCharging component
             await self._initialize_smart_charging_component(station_id)
             
-            # Initialize V2XController component
-            await self._initialize_v2x_controller_component(station_id)
+            # V2XController component removed - out of scope for MVP per PRD Section 1.2
             
             # Initialize V2G-specific components
             await self._initialize_v2x_charging_ctrlr_component(station_id)
@@ -1457,17 +1324,10 @@ class DeviceModel:
                 AttributeEnumType.actual, var_def.get("default_value", "")
             )
     
-    async def _initialize_v2x_controller_component(self, station_id: str) -> None:
-        """Initialize V2XController component."""
-        self._add_component(station_id, "V2XController", "")
-        
-        # Add all V2XController variables
-        variables = StandardOCPPVariables.get_v2x_controller_variables()
-        for var_def in variables:
-            await self._set_variable_value(
-                station_id, "V2XController", "", var_def["name"], "",
-                AttributeEnumType.actual, var_def.get("default_value", "")
-            )
+    # V2XController initialization removed - out of scope for MVP per PRD Section 1.2
+    # async def _initialize_v2x_controller_component(self, station_id: str) -> None:
+    #     """Initialize V2XController component."""
+    #     ...
     
     async def _initialize_v2x_charging_ctrlr_component(self, station_id: str) -> None:
         """Initialize V2XChargingCtrlr component."""
