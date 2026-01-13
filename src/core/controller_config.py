@@ -27,7 +27,7 @@ class ControllerConfig:
     optimization_horizon_hours: int = 24
     hourly_optimization_start: int = 7
     hourly_optimization_end: int = 23
-    optimization_timeout: float = 30.0
+    optimization_timeout: float = 60.0  # Changed from 30.0 per PRD Section 8.2
     trigger_cooldown_minutes: int = 5
     max_optimization_failures: int = 3
     dispatch_retry_attempts: int = 3
@@ -42,7 +42,7 @@ class ControllerConfig:
             FAVONIUS_OPTIMIZATION_HORIZON_HOURS: Optimization horizon (default: 24)
             FAVONIUS_HOURLY_OPT_START: Hourly optimization start hour (default: 7)
             FAVONIUS_HOURLY_OPT_END: Hourly optimization end hour (default: 23)
-            FAVONIUS_OPTIMIZATION_TIMEOUT: Solver timeout in seconds (default: 30.0)
+            FAVONIUS_OPTIMIZATION_TIMEOUT: Solver timeout in seconds (default: 60.0)
             FAVONIUS_TRIGGER_COOLDOWN_MIN: Trigger cooldown in minutes (default: 5)
             FAVONIUS_MAX_OPT_FAILURES: Max optimization failures (default: 3)
             FAVONIUS_DISPATCH_RETRIES: Dispatch retry attempts (default: 3)
@@ -63,7 +63,7 @@ class ControllerConfig:
                 os.getenv('FAVONIUS_HOURLY_OPT_END', '23')
             ),
             optimization_timeout=float(
-                os.getenv('FAVONIUS_OPTIMIZATION_TIMEOUT', '30.0')
+                os.getenv('FAVONIUS_OPTIMIZATION_TIMEOUT', '60.0')
             ),
             trigger_cooldown_minutes=int(
                 os.getenv('FAVONIUS_TRIGGER_COOLDOWN_MIN', '5')

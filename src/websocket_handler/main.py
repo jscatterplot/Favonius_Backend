@@ -20,7 +20,6 @@ from .api_server import APIServer
 from .database_schema import create_schema_from_config
 from .timescale_client import TimescaleClient
 from .timescale_schema import create_timescale_schema_from_config
-from .analytics_service import AnalyticsService
 from .price_feeder import PriceFeederService
 from .optimization_engine import OptimizationEngine
 from .resilience_manager import resilience_manager
@@ -47,7 +46,6 @@ class Application:
         
         # TimescaleDB components
         self.timescale_client: Optional[TimescaleClient] = None
-        self.analytics_service: Optional[AnalyticsService] = None
         self.price_feeder: Optional[PriceFeederService] = None
         self.optimization_engine: Optional[OptimizationEngine] = None
         
@@ -242,10 +240,6 @@ class Application:
             await self.timescale_client.connect()
             
             # Telemetry ingestion service removed for simplification
-            
-            # Create analytics service
-            self.analytics_service = AnalyticsService(self.config.timescale)
-            await self.analytics_service.initialize()
 
             # Initialize optimization engine
             if self.config.optimization.enabled:

@@ -26,11 +26,13 @@ def mock_db_pool():
 @pytest.fixture
 def depot_config():
     """Depot configuration for testing."""
+    vehicle_ids = ['bus_1', 'bus_2', 'bus_3']
     return DepotConfig(
         vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0, 'bus_3': 200.0},
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,
@@ -534,51 +536,151 @@ class TestGetCurrentMonthPeak:
 
 
 class TestGetDemandChargeRate:
-    """Test _get_demand_charge_rate method."""
+    """Test _get_demand_charge_rate method.
+    
+    Per PRD Section 8.1, priority is:
+    1. prices.demand_kw (most recent price row)
+    2. depots.demand_charge_rate_kw
+    3. Default $20/kW
+    """
 
     @pytest.mark.asyncio
-    async def test_get_demand_charge_rate_from_db(self, assembler, mock_db_pool):
-        """Test demand charge rate retrieved from database."""
+    async def test_get_demand_charge_rate_from_prices(self, assembler, mock_db_pool):
+        """Test demand charge rate retrieved from prices.demand_kw (Priority 1)."""
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        mock_row = MagicMock()
-        mock_row.__getitem__.side_effect = lambda k: {
+        # First query: prices.demand_kw (should return value)
+        price_row = MagicMock()
+        price_row.__getitem__.side_effect = lambda k: {
+            'demand_kw': 30.0
+        }[k]
+        
+        # Mock two acquire calls (one for prices, one for depots if prices fails)
+        # But prices should succeed, so only one call needed
+        mock_conn.fetchrow.side_effect = [price_row]  # First call returns price row
+
+        rate = await assembler._get_demand_charge_rate()
+
+        assert rate == 30.0, "Should use prices.demand_kw when available"
+        # Should query prices table first
+        assert mock_conn.fetchrow.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_demand_charge_rate_from_depot_config(self, assembler, mock_db_pool):
+        """Test demand charge rate falls back to depot config when prices.demand_kw is NULL (Priority 2)."""
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # First query: prices.demand_kw (returns None)
+        # Second query: depots.demand_charge_rate_kw (returns value)
+        price_row = None  # No price row with demand_kw
+        depot_row = MagicMock()
+        depot_row.__getitem__.side_effect = lambda k: {
             'demand_charge_rate_kw': 25.0
         }[k]
-        mock_conn.fetchrow.return_value = mock_row
+        
+        mock_conn.fetchrow.side_effect = [price_row, depot_row]
 
         rate = await assembler._get_demand_charge_rate()
 
-        assert rate == 25.0
-        mock_conn.fetchrow.assert_called_once()
+        assert rate == 25.0, "Should fall back to depot config when prices.demand_kw is NULL"
+        assert mock_conn.fetchrow.call_count == 2  # Prices query + depot query
 
     @pytest.mark.asyncio
-    async def test_get_demand_charge_rate_fallback(self, assembler, mock_db_pool):
-        """Test demand charge rate falls back to default when depot not found."""
+    async def test_get_demand_charge_rate_default_fallback(self, assembler, mock_db_pool):
+        """Test demand charge rate falls back to default when both are NULL (Priority 3)."""
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
-        mock_conn.fetchrow.return_value = None
+        
+        # Both queries return None
+        mock_conn.fetchrow.side_effect = [None, None]
 
         rate = await assembler._get_demand_charge_rate()
 
-        assert rate == 20.0  # Default fallback
+        assert rate == 20.0, "Should use default $20/kW when both are NULL"
+        assert mock_conn.fetchrow.call_count == 2  # Prices query + depot query
 
     @pytest.mark.asyncio
-    async def test_get_demand_charge_rate_null(self, assembler, mock_db_pool):
-        """Test demand charge rate falls back when rate is NULL."""
+    async def test_get_demand_charge_rate_prices_takes_precedence(self, assembler, mock_db_pool):
+        """Test prices.demand_kw takes precedence over depot config even if depot has value."""
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        mock_row = MagicMock()
-        mock_row.__getitem__.side_effect = lambda k: {
-            'demand_charge_rate_kw': None
+        # Prices query returns value (should use this, not query depot)
+        price_row = MagicMock()
+        price_row.__getitem__.side_effect = lambda k: {
+            'demand_kw': 35.0
         }[k]
-        mock_conn.fetchrow.return_value = mock_row
+        
+        mock_conn.fetchrow.side_effect = [price_row]  # Only prices query should be called
 
         rate = await assembler._get_demand_charge_rate()
 
-        assert rate == 20.0  # Default fallback
+        assert rate == 35.0, "Should use prices.demand_kw even if depot config exists"
+        # Should only query prices, not depot (since prices returned a value)
+        assert mock_conn.fetchrow.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_demand_charge_rate_most_recent_price(self, assembler, mock_db_pool):
+        """Test that most recent price row is used when multiple price rows exist."""
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # Most recent price row should be returned (ORDER BY time DESC LIMIT 1)
+        price_row = MagicMock()
+        price_row.__getitem__.side_effect = lambda k: {
+            'demand_kw': 28.0
+        }[k]
+        
+        mock_conn.fetchrow.return_value = price_row
+
+        rate = await assembler._get_demand_charge_rate()
+
+        assert rate == 28.0
+        # Verify query uses ORDER BY time DESC LIMIT 1
+        call_args = mock_conn.fetchrow.call_args[0][0] if mock_conn.fetchrow.called else None
+        if call_args:
+            assert 'ORDER BY time DESC' in call_args or 'ORDER BY time DESC' in str(mock_conn.fetchrow.call_args)
+
+    @pytest.mark.asyncio
+    async def test_get_demand_charge_rate_prices_null_depot_null(self, assembler, mock_db_pool):
+        """Test fallback when prices.demand_kw is NULL and depot config is NULL."""
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # Prices query returns row but demand_kw is NULL
+        price_row = MagicMock()
+        price_row.__getitem__.side_effect = lambda k: {
+            'demand_kw': None
+        }[k]
+        
+        # Depot query also returns None
+        mock_conn.fetchrow.side_effect = [price_row, None]
+
+        rate = await assembler._get_demand_charge_rate()
+
+        assert rate == 20.0, "Should use default when both are NULL"
+        assert mock_conn.fetchrow.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_demand_charge_rate_prices_no_rows_depot_has_value(self, assembler, mock_db_pool):
+        """Test fallback to depot when no price rows exist."""
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # No price rows, but depot has value
+        depot_row = MagicMock()
+        depot_row.__getitem__.side_effect = lambda k: {
+            'demand_charge_rate_kw': 22.0
+        }[k]
+        
+        mock_conn.fetchrow.side_effect = [None, depot_row]
+
+        rate = await assembler._get_demand_charge_rate()
+
+        assert rate == 22.0, "Should use depot config when no price rows"
+        assert mock_conn.fetchrow.call_count == 2
 
 
 class TestGetBuildingPower:

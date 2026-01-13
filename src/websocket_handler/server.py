@@ -182,19 +182,9 @@ class OCPPWebSocketServer:
         self.priority_charging_manager = PriorityChargingManager(self.timescale_client)
         self.external_control_manager = ExternalControlManager(self.timescale_client)
         self.certificate_manager = CertificateManager(self.timescale_client, self.cache_manager)
-        # Create V2X controller config from app config
-        from websocket_handler.v2x_controller import V2XControllerConfig
-        v2x_config = V2XControllerConfig(
-            enabled=True,
-            supported_modes=["V2G", "V2H", "V2B"],
-            update_interval={"V2G": 60, "V2H": 300, "V2B": 300},
-            power_limits={"max_charge": 150.0, "max_discharge": 150.0},
-            frequency_deadband=0.05,
-            voltage_limits={"min": 360.0, "max": 420.0}
-        )
-        self.v2x_controller = V2XController(v2x_config, self.config)
+        # V2X controller removed - out of scope for MVP per PRD Section 1.2
         
-        self.logger.info("All V2G managers initialized successfully")
+        self.logger.info("All managers initialized successfully")
     
     def set_optimization_engine(self, optimization_engine) -> None:
         """Set optimization engine and wire it to connection manager."""
@@ -270,8 +260,7 @@ class OCPPWebSocketServer:
             der_control_manager=self.der_control_manager,
             priority_charging_manager=self.priority_charging_manager,
             external_control_manager=self.external_control_manager,
-            certificate_manager=self.certificate_manager,
-            v2x_controller=self.v2x_controller
+            certificate_manager=self.certificate_manager
         )
         self.charge_points[station_id] = charge_point
         

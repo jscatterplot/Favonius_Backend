@@ -1437,6 +1437,35 @@ async def receive_handoff(
         message_id = uuid4()
         acknowledged_at = datetime.utcnow()
 
+        # Get actual departure_time from original pending message if it exists
+        # Per PRD Section 5.4, use actual departure_time instead of approximation
+        departure_time = acknowledged_at  # Default fallback
+        async with db_pool.acquire() as conn:
+            original_message = await conn.fetchrow(
+                """
+                SELECT departure_time
+                FROM interdepot_messages
+                WHERE origin_depot_id = $1
+                  AND dest_depot_id = $2
+                  AND vehicle_id = $3
+                  AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                request.origin_depot_id,
+                depot_id,
+                request.vehicle_id,
+            )
+            if original_message and original_message['departure_time']:
+                departure_time = original_message['departure_time']
+                logger.debug(
+                    f"Using actual departure_time {departure_time} from original message"
+                )
+            else:
+                logger.warning(
+                    f"Original message not found, using acknowledged_at as departure_time approximation"
+                )
+
         # Store message in database with status='acknowledged'
         query = """
         INSERT INTO interdepot_messages
@@ -1452,7 +1481,7 @@ async def receive_handoff(
                 request.origin_depot_id,
                 depot_id,
                 request.vehicle_id,
-                acknowledged_at,  # Use acknowledged_at as departure_time approximation
+                departure_time,  # Use actual departure_time from original message
                 request.expected_soc,
                 request.arrival_time,
                 request.battery_kwh,

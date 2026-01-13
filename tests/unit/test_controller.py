@@ -31,11 +31,13 @@ def mock_db_pool():
 @pytest.fixture
 def depot_config():
     """Sample depot configuration."""
+    vehicle_ids = ['bus_1', 'bus_2']
     return DepotConfig(
-        vehicle_capacities={'bus_1': 324.0, 'bus_2': 324.0},
-        charger_power=80.0,
+        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,
@@ -178,6 +180,35 @@ class TestControllerInitialization:
         )
         
         assert controller.trigger_monitor is not None
+
+    def test_controller_passes_cooldown_config_to_trigger_monitor(
+        self, mock_db_pool, depot_config, controller_config
+    ):
+        """Test controller passes trigger_cooldown_minutes from config to TriggerMonitor.
+        
+        Per PRD alignment fix, controller should pass trigger_cooldown_minutes
+        from ControllerConfig to TriggerMonitor, not use hardcoded value.
+        """
+        pool, _ = mock_db_pool
+        depot_id = str(uuid4())
+        
+        # Set custom cooldown in controller config
+        controller_config.trigger_cooldown_minutes = 7
+        
+        controller = DepotController(
+            pool=pool,
+            depot_id=depot_id,
+            config=depot_config,
+            controller_config=controller_config,
+        )
+        
+        # Verify TriggerMonitor uses the cooldown from controller config
+        assert controller.trigger_monitor._trigger_cooldown_sec == 420.0, (
+            "TriggerMonitor should use cooldown from ControllerConfig (7 minutes = 420 seconds)"
+        )
+        assert controller.trigger_monitor.config.trigger_cooldown_minutes == 7, (
+            "TriggerMonitor config should have trigger_cooldown_minutes from ControllerConfig"
+        )
 
 
 # ============ Optimization Retry Logic Tests ============

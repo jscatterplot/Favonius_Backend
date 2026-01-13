@@ -112,6 +112,32 @@ class DepotConfig:
     delta_t: float = 0.25  # hours (15 min)
     n_timesteps: int = 96  # 24 hours
 
+    # Property aliases for backwards compatibility
+    @property
+    def charger_power(self) -> float:
+        """Alias for charger_groups (backward compatibility).
+        
+        Returns the rated_kw of the first charger group.
+        For single-group configs (most common), this matches the old API.
+        For multi-group configs, returns the first group's rated_kw.
+        
+        Note: This property is deprecated. Use charger_groups directly.
+        """
+        if not self.charger_groups:
+            raise ValueError("charger_groups is empty")
+        # Return first charger group's rated_kw
+        return list(self.charger_groups.keys())[0]
+
+    @property
+    def n_chargers(self) -> int:
+        """Alias for charger_groups (backward compatibility).
+        
+        Returns the sum of all charger group counts.
+        
+        Note: This property is deprecated. Use sum(charger_groups.values()) directly.
+        """
+        return sum(self.charger_groups.values())
+
 
 @dataclass
 class DepotState:

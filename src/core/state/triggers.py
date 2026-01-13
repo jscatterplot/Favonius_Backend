@@ -30,6 +30,7 @@ class TriggerConfig:
         price_change_absolute: Price change absolute threshold in $/MWh (default: 25.0)
         return_time_deviation_min: Return time deviation in minutes (default: 15.0)
         check_interval_sec: Monitoring check interval in seconds (default: 60.0)
+        trigger_cooldown_minutes: Cooldown period after trigger in minutes (default: 5)
     """
 
     soc_deviation_threshold: float = 0.05  # 5%
@@ -37,6 +38,7 @@ class TriggerConfig:
     price_change_absolute: float = 25.0  # $25/MWh
     return_time_deviation_min: float = 15.0  # 15 minutes
     check_interval_sec: float = 60.0  # 1 minute
+    trigger_cooldown_minutes: int = 5  # 5 minutes
 
 
 class TriggerMonitor:
@@ -111,7 +113,7 @@ class TriggerMonitor:
         self.expected_return_times: dict[str, datetime] = {}
         self._running = False
         self._last_trigger_time: Optional[datetime] = None
-        self._trigger_cooldown_sec: float = 300.0  # 5 minutes
+        self._trigger_cooldown_sec: float = config.trigger_cooldown_minutes * 60.0
         self._last_scheduled_hour: Optional[int] = None  # Track last scheduled trigger hour
 
         # Validate that we have a way to fetch state
@@ -191,10 +193,10 @@ class TriggerMonitor:
                 # Convert $/kWh to $/MWh for absolute comparison
                 abs_change = abs(current - last) * 1000.0
 
-                # Combined threshold (both must be met per PRD Section 4.2)
+                # OR threshold (either condition triggers per PRD Section 5.3)
                 if (
                     pct_change > self.config.price_change_percent
-                    and abs_change > self.config.price_change_absolute
+                    or abs_change > self.config.price_change_absolute
                 ):
                     reason = (
                         f"Price change: {ts} was ${last:.4f}/kWh, "

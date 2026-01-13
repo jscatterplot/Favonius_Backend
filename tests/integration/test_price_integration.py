@@ -141,9 +141,10 @@ async def test_state_assembler_reads_prices(
     # Create StateAssembler
     config = DepotConfig(
         vehicle_capacities={},
-        charger_power=80.0,
+        vehicle_max_charge_kw={},
+        charger_groups={80.0: 10},
         charger_efficiency=0.95,
-        n_chargers=10,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,

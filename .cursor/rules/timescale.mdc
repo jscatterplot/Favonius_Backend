@@ -106,7 +106,7 @@ SELECT add_compression_policy('telemetry', INTERVAL '7 days');
 Configure retention for very old data:
 ```sql
 -- Drop data older than 1 year
-SELECT add_retention_policy('telemetry', INTERVAL '1 year');
+SELECT add_retention_policy('telemetry', INTERVAL '2 years');
 ```
 
 ## Connection Patterns

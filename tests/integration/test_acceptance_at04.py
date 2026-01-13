@@ -28,15 +28,17 @@ class TestAT04SoCDeviationHandling:
     @pytest.fixture
     def depot_config(self):
         """Depot configuration."""
+        vehicle_ids = ['bus_1', 'bus_2', 'bus_3']
         return DepotConfig(
             vehicle_capacities={
                 'bus_1': 324.0,
                 'bus_2': 324.0,
                 'bus_3': 324.0,
             },
-            charger_power=80.0,
+            vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+            charger_groups={80.0: 2},
             charger_efficiency=0.95,
-            n_chargers=2,
+            charger_vehicle_access={},
             battery_capacity=500.0,
             battery_power=100.0,
             max_site_power=500.0,

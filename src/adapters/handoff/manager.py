@@ -11,7 +11,13 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-import httpx
+# Make httpx import optional to prevent import errors when not installed
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    httpx = None
+    HAS_HTTPX = False
 
 from ...core.models import IncomingVehicle
 
@@ -70,12 +76,26 @@ class HandoffManager:
 
         Args:
             depot_endpoints: Dictionary mapping depot_id to API endpoint URL
+        
+        Raises:
+            ImportError: If httpx is not installed (required for handoff functionality)
         """
+        if not HAS_HTTPX:
+            raise ImportError(
+                "httpx package is required for HandoffManager. "
+                "Install with: pip install httpx"
+            )
         self.depot_endpoints = depot_endpoints
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client."""
+        """Get or create HTTP client.
+        
+        Raises:
+            ImportError: If httpx is not installed
+        """
+        if not HAS_HTTPX:
+            raise ImportError("httpx package is required for HTTP client")
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=30.0)
         return self._client

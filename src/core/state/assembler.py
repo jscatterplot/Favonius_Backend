@@ -469,28 +469,46 @@ class StateAssembler:
         return peak
 
     async def _get_demand_charge_rate(self) -> float:
-        """Get demand charge rate ($/kW) from depot configuration.
-
+        """Get demand charge rate ($/kW) with PRD-compliant priority.
+        
+        Per PRD Section 8.1, priority is:
+        1. prices.demand_kw (most recent price row)
+        2. depots.demand_charge_rate_kw
+        3. Default $20/kW
+        
         Returns:
             Demand charge rate in $/kW
-
-        Note:
-            Falls back to default $20/kW if depot not found or rate is NULL.
         """
-        query = """
+        # Priority 1: Check prices.demand_kw from most recent price row
+        price_query = """
+        SELECT demand_kw
+        FROM prices
+        WHERE depot_id = $1
+          AND demand_kw IS NOT NULL
+        ORDER BY time DESC
+        LIMIT 1
+        """
+        async with self.pool.acquire() as conn:
+            price_row = await conn.fetchrow(price_query, self.depot_id)
+            if price_row and price_row['demand_kw'] is not None:
+                rate = float(price_row['demand_kw'])
+                logger.debug(f"Demand charge rate from prices: ${rate}/kW")
+                return rate
+        
+        # Priority 2: Fall back to depots.demand_charge_rate_kw
+        depot_query = """
         SELECT demand_charge_rate_kw
         FROM depots
         WHERE depot_id = $1
         """
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(query, self.depot_id)
-
-        if row and row['demand_charge_rate_kw'] is not None:
-            rate = float(row['demand_charge_rate_kw'])
-            logger.debug(f"Demand charge rate from DB: ${rate}/kW")
-            return rate
-
-        # Fallback to default if not found
+            row = await conn.fetchrow(depot_query, self.depot_id)
+            if row and row['demand_charge_rate_kw'] is not None:
+                rate = float(row['demand_charge_rate_kw'])
+                logger.debug(f"Demand charge rate from depot config: ${rate}/kW")
+                return rate
+        
+        # Priority 3: Fallback to default
         logger.warning(
             f"Depot {self.depot_id} not found or rate is NULL, using default $20/kW"
         )

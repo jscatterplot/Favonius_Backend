@@ -1,43 +1,81 @@
 # Test Fixture Update Progress
 
 **Date:** 2025-12-13  
-**Status:** In Progress - Critical fixes completed, bulk updates remaining
+**Status:** ✅ COMPLETED - All DepotConfig API migrations finished
 
 ## Completed ✅
 
-### Core Fixtures Updated
+### Phase 1: Backward Compatibility
+- ✅ `src/core/models.py` - Added `@property` methods for `charger_power` and `n_chargers` backward compatibility
+- ✅ `tests/conftest.py` - Added helper functions: `get_total_chargers()`, `get_charger_power()`, `create_depot_config_legacy()`
 - ✅ `tests/conftest.py` - `depot_config_factory` updated with backward compatibility
-- ✅ `tests/conftest.py` - `sample_depot_config` updated
-- ✅ `tests/conftest.py` - `sample_depot_config_small` updated
 
-### Critical Property Access Fixes
-- ✅ `tests/integration/test_state_to_optimizer.py` - Fixed `depot_config.n_chargers` access
-- ✅ `tests/integration/test_full_pipeline.py` - Fixed `config.n_chargers` access (2 places)
-- ✅ `tests/integration/test_performance_benchmarks.py` - Fixed `config.n_chargers` and `config.charger_power` access
-- ✅ `tests/unit/test_optimizer.py` - Fixed `simple_depot_config.charger_power` access
-- ✅ `tests/unit/test_optimizer.py` - Fixed `simple_depot_config.n_chargers` access (2 places)
-- ✅ `tests/unit/test_optimizer.py` - Updated `test_more_vehicles_than_chargers` to use charger_groups
+### Phase 2: High-Priority Test Files
+- ✅ `tests/unit/test_models.py` - All 6 DepotConfig creations updated, property accesses work via backward compat
+- ✅ `tests/integration/test_acceptance_at05_full.py` - All fixtures and property accesses updated
 
-## Remaining Work ⚠️
+### Phase 3: Acceptance Tests
+- ✅ `tests/integration/test_acceptance_at01.py`
+- ✅ `tests/integration/test_acceptance_at02.py`
+- ✅ `tests/integration/test_acceptance_at03.py`
+- ✅ `tests/integration/test_acceptance_at03_full.py`
+- ✅ `tests/integration/test_acceptance_at04.py`
+- ✅ `tests/integration/test_acceptance_at04_full.py`
+- ✅ `tests/integration/test_acceptance_at05_return_time.py`
+- ✅ `tests/integration/test_acceptance_at06.py`
+- ✅ `tests/integration/test_acceptance_at07.py`
 
-### High Priority - Direct Property Access
-1. **`tests/unit/test_models.py`** - Multiple tests assert on `charger_power` and `n_chargers`:
-   - `test_depot_config_basic` (lines 42-44)
-   - `test_depot_config_to_dict` (line 96)
-   - `test_depot_config_large_fleet` (line 113)
-   - Plus tests that create DepotConfig with old pattern (lines 33-39, 51-59, 66-76, 83-91, 102-110)
+### Phase 4: Critical Integration Tests
+- ✅ `tests/integration/test_full_pipeline.py`
+- ✅ `tests/integration/test_performance_benchmarks.py`
+- ✅ `tests/integration/test_state_to_optimizer.py` (16 DepotConfig creations fixed)
+- ✅ `tests/integration/test_control_loop.py`
+- ✅ `tests/integration/test_trigger_monitor.py`
+- ✅ `tests/integration/test_simulation_acceptance.py` (6 DepotConfig creations fixed)
 
-2. **`tests/integration/test_acceptance_at05_full.py`** - Creates configs and copies properties:
-   - `depot_a_config` fixture (lines 38-50) - needs update
-   - `depot_b_config` fixture (lines 52-64) - needs update
-   - Multiple places copy `depot_b_config.charger_power` and `depot_b_config.n_chargers` (lines 247, 249, 380, 382, 522, 524, 582, 584)
+### Phase 5: Remaining Unit Tests
+- ✅ `tests/unit/test_optimizer.py` (25 DepotConfig creations fixed)
+- ✅ `tests/unit/test_controller.py`
+- ✅ `tests/unit/test_state_assembler.py`
+- ✅ `tests/unit/test_controller_resilience.py`
+- ✅ `tests/unit/test_controller_manager.py`
+- ✅ `tests/unit/test_warm_start.py`
+- ✅ `tests/unit/test_api_main.py`
+- ✅ `tests/unit/test_api_edge_cases.py`
 
-### Medium Priority - DepotConfig Creation
-~180 test files create DepotConfig instances using old pattern. These will fail when fixtures are updated. Priority order:
+### Phase 6: Remaining Integration Tests
+- ✅ `tests/integration/test_optimizer_to_ocpp_flow.py`
+- ✅ `tests/integration/test_trigger_to_optimization_flow.py`
+- ✅ `tests/integration/test_data_resolution.py`
+- ✅ `tests/integration/test_service_resilience.py`
+- ✅ `tests/integration/test_optimizer_edge_cases.py`
+- ✅ `tests/integration/test_state_assembly_edge_cases.py`
+- ✅ `tests/integration/test_price_spike_scenarios.py`
+- ✅ `tests/integration/test_demand_charge_rate_resolution.py`
+- ✅ `tests/integration/test_price_trigger_or_logic.py`
+- ✅ `tests/integration/test_api_integration.py`
+- ✅ `tests/integration/test_error_propagation.py`
+- ✅ `tests/integration/test_control_loop_full.py`
+- ✅ `tests/integration/test_phase4_integration.py`
+- ✅ `tests/integration/test_price_integration.py`
 
-1. Acceptance tests (`test_acceptance_*.py`)
-2. Integration tests (`test_*_integration.py`)
-3. Unit tests (`test_*.py`)
+### Phase 7: E2E Tests
+- ✅ `tests/e2e/test_realistic_day_scenarios.py`
+- ✅ `tests/e2e/test_24hour_simulation.py`
+- ✅ `tests/e2e/test_full_stack.py`
+
+### Phase 8: Performance Tests
+- ✅ `tests/performance/test_comprehensive_benchmarks.py` (4 DepotConfig creations fixed)
+- ✅ `tests/performance/test_optimizer_benchmarks.py`
+- ✅ `tests/performance/test_optimizer_performance.py`
+
+## Summary
+
+**Total Files Fixed:** ~50 test files
+**Total DepotConfig Creations Updated:** ~180+ instances
+**Remaining Matches:** 6 (all function parameters in `test_simulation_acceptance.py`, not DepotConfig creations)
+
+All DepotConfig creations have been migrated from `charger_power`/`n_chargers` to `charger_groups` pattern. Backward compatibility properties ensure existing property accesses continue to work.
 
 ## Update Pattern Reference
 

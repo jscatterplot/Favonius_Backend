@@ -27,13 +27,15 @@ async def test_at01_end_to_end_simulation():
     sim = morning_rush_scenario(n_vehicles=10, n_chargers=5, departure_hour=6)
 
     # Create depot config
+    vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
         vehicle_capacities={
             v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,
@@ -80,13 +82,15 @@ async def test_at02_demand_charge_reduction():
     sim = demand_charge_scenario(n_vehicles=15, n_chargers=8)
 
     # Create depot config
+    vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
         vehicle_capacities={
             v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 8},
         charger_efficiency=0.95,
-        n_chargers=8,
+        charger_vehicle_access={},
         battery_capacity=1000.0,
         battery_power=200.0,
         max_site_power=1200.0,
@@ -144,13 +148,15 @@ async def test_at03_price_spike_reoptimization():
     )
 
     # Create depot config
+    vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
         vehicle_capacities={
             v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,
@@ -217,13 +223,15 @@ async def test_at04_soc_deviation_handling():
     )
 
     # Create depot config
+    vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
         vehicle_capacities={
             v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,
@@ -287,13 +295,15 @@ async def test_at05_inter_depot_handoff():
     )
 
     # Create depot config
+    vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
         vehicle_capacities={
             v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 5},
         charger_efficiency=0.95,
-        n_chargers=5,
+        charger_vehicle_access={},
         battery_capacity=500.0,
         battery_power=100.0,
         max_site_power=800.0,
@@ -328,13 +338,15 @@ async def test_unmanaged_vs_optimized_comparison():
     sim = demand_charge_scenario(n_vehicles=15, n_chargers=8)
 
     # Create depot config
+    vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
         vehicle_capacities={
             v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
         },
-        charger_power=80.0,
+        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
+        charger_groups={80.0: 8},
         charger_efficiency=0.95,
-        n_chargers=8,
+        charger_vehicle_access={},
         battery_capacity=1000.0,
         battery_power=200.0,
         max_site_power=1200.0,

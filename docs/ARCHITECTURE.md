@@ -3,6 +3,15 @@
 ## Reference
 This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD_v2.md#5-system-architecture](PRD_v2.md#5-system-architecture).
 
+## Service Architecture Overview
+
+The Favonius platform uses a **two-service architecture** for separation of concerns:
+
+- **Main API Backend**: Primary optimization service that runs MILP optimization, manages triggers, and orchestrates charging schedules
+- **WebSocket Handler Service**: Telemetry-only service that handles OCPP communication and stores time-series data
+
+Both services share access to the dual-database architecture (Supabase for reference data, TimescaleDB for time-series data).
+
 ## High-Level Architecture
 
 ```
@@ -13,56 +22,122 @@ This document is extracted from the Product Requirements Document. For the autho
 │   API   │ Utility │  Mgmt   │Telemetry│  Depot  │    Meter        │
 └────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────────┬────────┘
      │         │         │         │         │             │
+     │         │         │         │         │             │
      ▼         ▼         ▼         ▼         ▼             ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              ENERGY CONSUMPTION SURROGATE MODEL                     │
-│              (Gaussian Process / MLP)                               │
-│              Input: Weather, Route, Bus Size, Calendar              │
-│              Output: E_consumption[kWh]                             │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        STATE ASSEMBLER                              │
+│                    MAIN API BACKEND SERVICE                        │
+│                    (Optimization & Control)                         │
+├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  • Current SoC (vehicles + battery)                                 │
-│  • Price schedule (TOU / CAISO DAM)                                 │
-│  • Vehicle availability windows                                     │
-│  • Charger availability (aggregated by rated_kw)                  │
-│  • Charger-vehicle physical accessibility matrix                    │
-│  • Energy consumption forecasts                                     │
-│  • Building load forecast                                           │
-│  • Demand charge period info                                        │
-│  • Moving peak limit (max grid draw this month)                     │
-│  • Incoming inter-depot vehicles                                    │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       MILP OPTIMIZER                                │
-│                       (Pyomo + Gurobi / HiGHS fallback)            │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  FastAPI REST API                                            │  │
+│  │  - POST /optimize                                            │  │
+│  │  - GET /depots/{id}/state                                    │  │
+│  │  - POST /depots/{id}/handoff/*                               │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Controller Manager                                          │  │
+│  │  - Manages per-depot controllers                             │  │
+│  │  - Orchestrates optimization cycles                          │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ├──────────────────┬──────────────────┐                  │
+│           ▼                  ▼                  ▼                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+│  │ State        │  │ Trigger      │  │ Handoff      │             │
+│  │ Assembler    │  │ Monitor      │  │ Manager      │             │
+│  └──────────────┘  └──────────────┘  └──────────────┘             │
+│           │                  │                  │                  │
+│           ▼                  │                  │                  │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Optimization Engine                                        │  │
+│  │  - Surrogate Model (Gaussian Process / MLP)                 │  │
+│  │  - MILP Optimizer (Pyomo + Gurobi / HiGHS fallback)         │  │
+│  │  - Charger Allocator                                        │  │
+│  │                                                              │  │
+│  │  Objective: min(Energy Cost + Demand Charges)               │  │
+│  │  Hard Constraint: SoC[b, t_depart] ≥ 99%                    │  │
+│  │  Solve time target: < 60 seconds                            │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Control Dispatcher                                         │  │
+│  │  - OCPP SetChargingProfile (via WebSocket Handler)          │  │
+│  │  - Battery Modbus commands                                   │  │
+│  └─────────────────────────────────────────────────────────────┘  │
 │                                                                     │
-│  Objective: min(Energy Cost + Demand Charges)                       │
-│  Decision Variables: P_charge[b,t], P_batt[t], y_charge[b,t]        │
-│  Hard Constraint: SoC[b, t_depart] ≥ 99%                            │
-│                                                                     │
-│  Primary: Gurobi (commercial, high performance)                     │
-│  Fallback: HiGHS (open-source, automatic on Gurobi failure)       │
-│  Solve time target: < 60 seconds                                    │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
+└─────────────────────────────────────────────────────────────────────┘
+     │                    │                    │                    │
+     │ (queries)           │ (queries)          │ (commands)         │
+     │                    │                    │                    │
+     ▼                    ▼                    ▼                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    CONTROL OUTPUT LAYER                             │
-├─────────────────┬─────────────────┬─────────────────────────────────┤
-│ OCPP Commands   │ Battery Modbus  │ Data Logging (TimescaleDB)      │
-│ SetChargingProf │ Charge/Discharge│ Telemetry, Results, Triggers    │
-└─────────────────┴─────────────────┴─────────────────────────────────┘
+│              WEBSOCKET HANDLER SERVICE                              │
+│              (Telemetry & OCPP Communication)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  OCPP 1.6 WebSocket Server                                   │  │
+│  │  - Handles OCPP 2+ messages (backward compatible)            │  │
+│  │  - Receives MeterValues, StatusNotification                  │  │
+│  │  - Sends SetChargingProfile (from Main API)                  │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Telemetry Ingestion                                        │  │
+│  │  - Stores MeterValues to TimescaleDB                        │  │
+│  │  - Updates vehicle max_charge_kw from OCPP                  │  │
+│  │  - Tracks charger_id for all telemetry                      │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Internal API (Planned - Phase 4)                           │  │
+│  │  - Query charge point state                                 │  │
+│  │  - Send SetChargingProfile commands                         │  │
+│  │  - Health monitoring                                        │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Backup Heuristic Optimizer (Emergency Only)                │  │
+│  │  - Activates if Main API unavailable > 1 hour              │  │
+│  │  - Simplified heuristic algorithms                          │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+     │                    │
+     │ (writes)           │ (writes)
+     │                    │
+     ▼                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DUAL DATABASE ARCHITECTURE                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐       │
+│  │  SUPABASE                │  │  TIMESCALEDB              │       │
+│  │  (PostgreSQL)            │  │  (PostgreSQL Extension)   │       │
+│  │                          │  │                          │       │
+│  │  Static/Reference Data:  │  │  Time-Series Data:       │       │
+│  │  • depots                │  │  • telemetry             │       │
+│  │  • vehicles              │  │  • prices                │       │
+│  │  • chargers              │  │  • weather_forecasts     │       │
+│  │  • schedules             │  │  • building_load          │       │
+│  │  • battery_storage       │  │  • optimization_runs     │       │
+│  │  • charger_vehicle_access│  │  • charging_commands      │       │
+│  │                          │  │  • interdepot_messages   │       │
+│  │  Used by: Both services  │  │  • trigger_log            │       │
+│  │                          │  │                          │       │
+│  │                          │  │  Used by: Both services  │       │
+│  └──────────────────────────┘  └──────────────────────────┘       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 
-                                │
-                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   RE-OPTIMIZATION TRIGGERS                          │
+│                   (Main API - Trigger Monitor)                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Trigger                    │ Detection Method │ Threshold           │
 │  ─────────────────────────────────────────────────────────────────  │
@@ -71,64 +146,134 @@ This document is extracted from the Product Requirements Document. For the autho
 │  Inter-depot handoff        │ Event-driven     │ On message receipt  │
 │  Price change               │ On ingestion     │ > 25% OR > $25/MWh  │
 │  Scheduled (default)        │ Periodic         │ Hourly 24/7          │
+│                                                                     │
+│  Cooldown: 5 minutes minimum between triggers                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Component Responsibilities
 
-| Component | Responsibility | Technology |
-|-----------|---------------|------------|
-| **Weather Adapter** | Fetch 7-day forecast | Open-Meteo API, httpx |
-| **Price Adapter** | Fetch TOU/CAISO prices | CAISO OASIS, utility APIs |
-| **Building Load Adapter** | Fetch building power consumption | Modbus meter, API, or forecast |
-| **OCPP Server** | Charger communication | ocpp library, WebSocket |
-| **Surrogate Model** | Energy consumption prediction | scikit-learn, gpytorch |
-| **State Assembler** | Aggregate inputs for optimizer | asyncpg, pandas |
-| **MILP Optimizer** | Generate optimal schedules | Pyomo, Gurobi (primary), HiGHS (fallback) |
-| **Charger Allocator** | Allocate aggregated power to individual chargers | Post-optimization allocation |
-| **Trigger Monitor** | Detect re-optimization conditions | asyncio |
-| **Control Dispatcher** | Send commands to hardware | OCPP, Modbus |
-| **Handoff Manager** | Send/receive inter-depot messages | HTTP/WebSocket |
-| **API Server** | External interface | FastAPI, uvicorn |
-| **Database** | Persistent storage | TimescaleDB (PostgreSQL) |
+| Component | Responsibility | Technology | Service |
+|-----------|---------------|------------|---------|
+| **Weather Adapter** | Fetch 7-day forecast | Open-Meteo API, httpx | Main API |
+| **Price Adapter** | Fetch TOU/CAISO prices | CAISO OASIS, utility APIs | Main API |
+| **Building Load Adapter** | Fetch building power consumption | Modbus meter, API, or forecast | Main API |
+| **Surrogate Model** | Energy consumption prediction | scikit-learn, gpytorch | Main API |
+| **State Assembler** | Aggregate inputs for optimizer | asyncpg, pandas | Main API |
+| **MILP Optimizer** | Generate optimal schedules | Pyomo, Gurobi (primary), HiGHS (fallback) | Main API |
+| **Charger Allocator** | Allocate aggregated power to individual chargers | Post-optimization allocation | Main API |
+| **Trigger Monitor** | Detect re-optimization conditions | asyncio | Main API |
+| **Control Dispatcher** | Send commands to hardware | OCPP (via WebSocket Handler), Modbus | Main API |
+| **Handoff Manager** | Send/receive inter-depot messages | HTTP | Main API |
+| **API Server** | External REST interface | FastAPI, uvicorn | Main API |
+| **OCPP Server** | Charger communication (OCPP 1.6, handles 2+ messages) | ocpp library, WebSocket | WebSocket Handler |
+| **Telemetry Ingestion** | Store OCPP MeterValues to TimescaleDB | asyncpg | WebSocket Handler |
+| **Internal API** | Charge point state queries for Main API | HTTP REST | WebSocket Handler (planned Phase 4) |
+| **Heuristic Optimizer** | Backup optimization when Main API unavailable | Heuristic algorithms | WebSocket Handler (emergency only) |
+| **Supabase** | Static/reference data storage | Supabase (PostgreSQL) | Both services |
+| **TimescaleDB** | Time-series data storage | TimescaleDB (PostgreSQL extension) | Both services |
 
 ## Data Flow
 
 ### 1. INGESTION (every 5 minutes)
-- Weather API → `weather_forecasts` table
-- CAISO API → `prices` table
-- OCPP MeterValues → `telemetry` table (includes vehicle max_charge_kw)
-- Fleet Mgmt System → `schedules` table
-- Building Load Meter/API → `building_load` table
-- Inter-depot Messages → `interdepot_messages` table
 
-### 2. STATE ASSEMBLY (before each optimization)
-- Query: latest telemetry, prices, schedules, depot config, building load
-- Query: pending inter-depot incoming vehicles (where arrival_time < horizon_end)
-- For each incoming vehicle: Add to vehicle_socs with expected_soc, set availability
+**Main API Backend:**
+- Weather API → Main API → `weather_forecasts` table (TimescaleDB)
+- CAISO API → Main API → `prices` table (TimescaleDB)
+- Fleet Mgmt System → Main API → `schedules` table (Supabase)
+- Building Load Meter/API → Main API → `building_load` table (TimescaleDB)
+- Inter-depot Messages → Main API → `interdepot_messages` table (TimescaleDB)
+
+**WebSocket Handler Service:**
+- OCPP MeterValues → WebSocket Handler → `telemetry` table (TimescaleDB)
+  - Includes: Energy, SoC, Power, max_charge_kw (from vehicle)
+  - Stores `charger_id` for all telemetry entries
+  - Updates vehicle `max_charge_kw` dynamically from OCPP
+
+### 2. STATE ASSEMBLY (before each optimization - Main API)
+
+**Data Queries:**
+- Query latest telemetry from TimescaleDB (currently direct query; Phase 4: via WebSocket Handler internal API)
+- Query prices, schedules, depot config from Supabase
+- Query building load from TimescaleDB
+- Query pending inter-depot incoming vehicles (where `arrival_time < horizon_end`)
+
+**Data Processing:**
+- For each incoming vehicle: Add to `vehicle_socs` with `expected_soc`, set availability
 - Compute: vehicle availability windows, energy requirements
 - Compute: charger-vehicle accessibility matrix
-- Aggregate: chargers by rated_kw for optimization
-- Resolve: demand_charge_rate (prices.demand_kw → depots.demand_charge_rate_kw)
-- Output: `DepotState` object
+- Aggregate: chargers by `rated_kw` for optimization
+- Resolve: `demand_charge_rate` (priority: `prices.demand_kw` → `depots.demand_charge_rate_kw`)
 
-### 3. OPTIMIZATION (hourly + triggers)
-- Input: `DepotState`, `DepotConfig`
-- Execute: MILP solve (< 60s)
-- Output: Charging schedule, battery dispatch
+**Output:** `DepotState` object
 
-### 4. DISPATCH (immediately after optimization)
+### 3. OPTIMIZATION (hourly + triggers - Main API)
+
+**Input:** `DepotState`, `DepotConfig`
+
+**Process:**
+- Execute: MILP solve using Pyomo/Gurobi (< 60s)
+- Fallback: If Gurobi fails (license error, connection issue), automatically use HiGHS solver
+- Warm-start: Use previous solution if available (3x speedup)
+
+**Output:** Charging schedule, battery dispatch, `OptimizationResult` with `solver_used` field
+
+### 4. DISPATCH (immediately after optimization - Main API)
+
+**Charger Allocation:**
 - Allocate: Aggregated charger power to individual chargers
-- OCPP: `SetChargingProfile` to each charger
-- Modbus: Battery setpoints
-- Database: Store optimization results
+- Respect: Physical accessibility constraints (`charger_vehicle_access`)
+- Prioritize: Vehicles by departure time and SoC deficit
 
-### 5. MONITORING (continuous)
-- Compare: actual SoC vs. expected SoC
-- Compare: current prices vs. baseline prices
-- Trigger: re-optimization if thresholds exceeded
-- Cooldown: 5-minute minimum between triggers to prevent rapid re-optimization
-- Logging: All trigger events logged with context for analysis
+**Command Dispatch:**
+- OCPP: `SetChargingProfile` to each charger (currently via Main API's OCPP server; Phase 4: via WebSocket Handler)
+- Modbus: Battery setpoints (if battery storage present)
+- Database: Store optimization results to `optimization_runs` table (TimescaleDB)
+
+### 5. MONITORING (continuous - Main API)
+
+**Event-Driven Triggers:**
+- SoC deviation: Detected within 15 seconds of receiving new telemetry
+  - Threshold: > 5% deviation from expected SoC
+- Return time deviation: Detected within 15 seconds of schedule update
+  - Threshold: > 15 minutes late
+- Inter-depot handoff: Detected on message receipt
+  - Triggers immediately when handoff message received
+
+**Periodic Triggers:**
+- Price change: Evaluated on each price ingestion event (every 5 minutes)
+  - Threshold: > 25% OR > $25/MWh (OR logic)
+- Scheduled: Evaluated hourly 24/7 (configurable: default 7 AM - 11 PM)
+
+**Cooldown:** 5-minute minimum between triggers (configurable via `trigger_cooldown_minutes`)
+
+**Logging:** All trigger events logged to `trigger_log` table with context
+
+### 6. INTER-DEPOT COORDINATION (on vehicle departure - Main API)
+
+**Send Handoff:**
+- Origin depot: Creates handoff message with `departure_time`, `expected_soc`, `arrival_time`, `battery_kwh`, `max_charge_kw`
+- Sends HTTP POST to destination depot's `/handoff/receive` endpoint
+- Stores message in `interdepot_messages` with status='pending'
+
+**Receive Handoff:**
+- Destination depot: Validates request, stores message with status='acknowledged'
+- Queries original message to get actual `departure_time` (not approximation)
+- Incorporates vehicle into next optimization cycle
+- Returns acknowledgment with `acknowledged_at` timestamp
+
+### 7. BACKUP MODE (WebSocket Handler - Emergency Only)
+
+**Activation Condition:** Main API unavailable for > 1 hour
+
+**Behavior:**
+- WebSocket Handler activates heuristic optimizer
+- Uses simplified heuristic algorithms (not MILP)
+- Ensures basic charging continues during Main API outage
+- Logs all actions for post-recovery analysis
+- Automatically deactivates when Main API recovers
+
+**Note:** Backup mode is emergency-only and does not meet full optimization requirements
 
 ## Implementation Structure
 
