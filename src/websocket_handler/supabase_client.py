@@ -1,6 +1,7 @@
 """Supabase client for static/reference data access."""
 
 import asyncio
+import random
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import asyncpg
@@ -65,9 +66,28 @@ class SupabaseClient:
         await self.disconnect()
     
     async def reconnect(self) -> None:
-        """Reconnect to Supabase."""
-        await self.disconnect()
-        await self.connect()
+        """Reconnect to Supabase with retry logic and jitter."""
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                await self.disconnect()
+                await self.connect()
+                self.logger.info("Supabase client reconnected successfully")
+                return
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.logger.error(f"Failed to reconnect to Supabase after {max_retries} attempts: {e}")
+                    raise
+                
+                # Calculate delay with exponential backoff
+                delay = base_delay * (2 ** attempt)
+                # Add jitter: 50-100% of base delay to prevent connection storms
+                delay *= (0.5 + random.random() * 0.5)
+                
+                self.logger.warning(f"Supabase reconnection attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s")
+                await asyncio.sleep(delay)
     
     async def health_check(self) -> bool:
         """Check Supabase connection health."""

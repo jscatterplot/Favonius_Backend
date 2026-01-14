@@ -80,9 +80,13 @@ def _create_openmeteo_client(
     # Ensure cache directory exists
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
+    # requests_cache.CachedSession creates cache file at {cache_dir}.sqlite
+    # when given a directory path, so we use a file path explicitly
+    cache_file = f"{cache_dir}.sqlite"
+
     # Setup cached session with SQLite backend
     cache_session = requests_cache.CachedSession(
-        cache_dir,
+        cache_file,
         expire_after=cache_expire_after,
         backend='sqlite',
     )
@@ -433,11 +437,13 @@ class OpenMeteoAdapter:
 
         Useful for testing or when fresh data is needed.
         """
-        cache_path = Path(self.cache_dir)
-        if cache_path.exists():
-            for cache_file in cache_path.glob("*.sqlite"):
-                try:
-                    cache_file.unlink()
-                    logger.info(f"Cleared cache file: {cache_file}")
-                except Exception as e:
-                    logger.warning(f"Failed to clear cache file {cache_file}: {e}")
+        # requests_cache creates cache file at {cache_dir}.sqlite (sibling to directory)
+        cache_file = Path(f"{self.cache_dir}.sqlite")
+        if cache_file.exists():
+            try:
+                cache_file.unlink()
+                logger.info(f"Cleared cache file: {cache_file}")
+            except Exception as e:
+                logger.warning(f"Failed to clear cache file {cache_file}: {e}")
+        else:
+            logger.debug(f"Cache file not found: {cache_file}")

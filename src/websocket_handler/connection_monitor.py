@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import random
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 
@@ -91,6 +92,9 @@ class ConnectionMonitor:
                 
                 if self.connection_failures['timescale'] >= self.max_failures_before_reconnect:
                     self.logger.error("TimescaleDB connection unhealthy, attempting reconnection")
+                    # Add jitter to prevent connection storms after outages
+                    jitter_delay = random.uniform(0, 5.0)
+                    await asyncio.sleep(jitter_delay)
                     await self._reconnect_timescale()
                     
         except Exception as e:
@@ -98,6 +102,9 @@ class ConnectionMonitor:
             self.logger.error(f"TimescaleDB health check error: {e}")
             
             if self.connection_failures['timescale'] >= self.max_failures_before_reconnect:
+                # Add jitter to prevent connection storms after outages
+                jitter_delay = random.uniform(0, 5.0)
+                await asyncio.sleep(jitter_delay)
                 await self._reconnect_timescale()
     
     async def _check_supabase_connection(self, current_time: datetime) -> None:
@@ -114,6 +121,9 @@ class ConnectionMonitor:
                 
                 if self.connection_failures['supabase'] >= self.max_failures_before_reconnect:
                     self.logger.error("Supabase connection unhealthy, attempting reconnection")
+                    # Add jitter to prevent connection storms after outages
+                    jitter_delay = random.uniform(0, 5.0)
+                    await asyncio.sleep(jitter_delay)
                     await self._reconnect_supabase()
                     
         except Exception as e:
@@ -121,6 +131,9 @@ class ConnectionMonitor:
             self.logger.error(f"Supabase health check error: {e}")
             
             if self.connection_failures['supabase'] >= self.max_failures_before_reconnect:
+                # Add jitter to prevent connection storms after outages
+                jitter_delay = random.uniform(0, 5.0)
+                await asyncio.sleep(jitter_delay)
                 await self._reconnect_supabase()
     
     async def _reconnect_timescale(self) -> None:

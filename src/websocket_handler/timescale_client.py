@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import random
 from typing import Dict, Any, List, Optional, Union
 from datetime import datetime, timezone, timedelta
 import asyncpg
@@ -38,7 +39,7 @@ class TimescaleClient:
         await self._connect_with_retry()
     
     async def _connect_with_retry(self, max_retries: int = 3, base_delay: float = 1.0) -> None:
-        """Connect with exponential backoff retry."""
+        """Connect with exponential backoff retry and jitter."""
         for attempt in range(max_retries):
             try:
                 await self._establish_connections()
@@ -54,8 +55,12 @@ class TimescaleClient:
                     self.logger.error(f"Failed to connect to TimescaleDB after {max_retries} attempts: {e}")
                     raise
                 
+                # Calculate delay with exponential backoff
                 delay = base_delay * (2 ** attempt)
-                self.logger.warning(f"TimescaleDB connection attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s")
+                # Add jitter: 50-100% of base delay to prevent connection storms
+                delay *= (0.5 + random.random() * 0.5)
+                
+                self.logger.warning(f"TimescaleDB connection attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s")
                 await asyncio.sleep(delay)
     
     async def _establish_connections(self) -> None:

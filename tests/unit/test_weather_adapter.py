@@ -626,10 +626,10 @@ async def test_get_cached_forecasts_database_error(mock_pool):
 
 def test_clear_cache(tmp_path):
     """Test cache clearing functionality."""
-    # Create a fake cache file
+    # requests_cache creates cache file at {cache_dir}.sqlite (sibling to directory)
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    cache_file = cache_dir / "test.sqlite"
+    cache_file = tmp_path / "cache.sqlite"  # Sibling to directory, not inside
     cache_file.write_text("fake cache data")
 
     with patch('src.adapters.weather.openmeteo._create_openmeteo_client'):
