@@ -26,6 +26,16 @@ from .certificate_manager import CertificateManager
 # V2X removed - out of scope for MVP per PRD Section 1.2
 from .cache_manager import CacheManager
 
+# VDV 463 integration
+try:
+    from adapters.vdv463.handler import VDV463Handler
+    from adapters.vdv463.messages import ValidationMode
+    VDV463_AVAILABLE = True
+except ImportError:
+    VDV463_AVAILABLE = False
+    VDV463Handler = None
+    ValidationMode = None
+
 
 # Prometheus metrics - imported from monitoring module
 from .monitoring import (
@@ -211,7 +221,7 @@ class OCPPWebSocketServer:
         return context
     
     async def _handle_connection(self, websocket: WebSocketServerProtocol, path: str) -> None:
-        """Handle new WebSocket connection."""
+        """Handle new WebSocket connection with path-based protocol routing."""
         connection_id = str(uuid.uuid4())
         client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
         
@@ -222,7 +232,41 @@ class OCPPWebSocketServer:
             ERRORS_TOTAL.labels(operation_type="connection_limit_exceeded").inc()
             return
         
-        # Validate OCPP subprotocol
+        # Parse path for protocol routing
+        path_parts = [p for p in path.strip("/").split("/") if p]
+        protocol = path_parts[0] if path_parts else None
+        
+        # Route VDV 463 connections
+        if protocol == "vdv463" and VDV463_AVAILABLE and self.config.vdv463.enabled:
+            presystem_id = path_parts[1] if len(path_parts) > 1 else f"presystem_{connection_id}"
+            
+            # VDV 463 doesn't require OCPP subprotocol
+            validation_mode = ValidationMode.HARD if self.config.vdv463.validation_mode == "hard" else ValidationMode.SOFT
+            
+            handler = VDV463Handler(
+                presystem_id=presystem_id,
+                websocket=websocket,
+                connection_manager=self.connection_manager,
+                config=self.config,
+                depot_id=self.config.vdv463.default_depot_id,
+                validation_mode=validation_mode,
+            )
+            
+            self.logger.info(
+                f"VDV 463 connection {connection_id} from {client_ip} for presystem {presystem_id}"
+            )
+            
+            try:
+                await handler.run()
+            except websockets.exceptions.ConnectionClosed:
+                self.logger.info(f"VDV 463 connection {connection_id} closed normally")
+            except Exception as e:
+                self.logger.error(f"Error handling VDV 463 connection {connection_id}: {e}")
+                ERRORS_TOTAL.labels(operation_type="connection_error").inc()
+            return
+        
+        # Default to OCPP handling (legacy or /ocpp/{charge_point_id} paths)
+        # Validate OCPP subprotocol for OCPP connections
         if websocket.subprotocol != "ocpp2.1":
             self.logger.warning(f"Invalid subprotocol from {client_ip}: {websocket.subprotocol}")
             await websocket.close(1002, "Invalid subprotocol")
@@ -230,7 +274,9 @@ class OCPPWebSocketServer:
             return
         
         # Extract station ID from path
-        if path.strip("/"):
+        if protocol == "ocpp" and len(path_parts) > 1:
+            station_id = path_parts[1]
+        elif path.strip("/"):
             station_id = path.strip("/")
         else:
             # Use full UUID to avoid collisions
@@ -269,7 +315,7 @@ class OCPPWebSocketServer:
             station_id, connection_id, client_ip, websocket
         )
         
-        self.logger.info(f"New connection {connection_id} from {client_ip} for station {station_id}")
+        self.logger.info(f"New OCPP connection {connection_id} from {client_ip} for station {station_id}")
         
         try:
             # Start the OCPP charge point

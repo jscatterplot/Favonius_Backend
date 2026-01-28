@@ -1,4 +1,25 @@
-<!-- 6a5be03e-5d45-4fbc-8aa0-9397ad37cca3 de3c3b36-f994-4204-ad8a-765fd4b5d741 -->
+---
+name: Comprehensive Testing Execution Plan
+overview: ""
+todos:
+  - id: 75f6ee2a-36a6-4d9b-9d74-50a70632d6db
+    content: Review docs and current test reports to map coverage gaps before writing new tests.
+    status: pending
+  - id: 147a6781-3e2b-4b29-a648-1533444a5406
+    content: Design and implement missing unit/component tests for uncovered managers and error-handling paths.
+    status: pending
+  - id: 163eb299-4cb5-4b63-8a56-ac5641ab836b
+    content: Augment integration/e2e suites with simulator workflows, failure scenarios, and scaling tests.
+    status: pending
+  - id: ffc272ac-b729-47de-b239-d0b73ba18118
+    content: Replay external datasets through ingestion and optimization pipelines to validate outputs.
+    status: pending
+  - id: b9ee9e1d-e5c5-4c1a-9e67-f6a3bbaf4810
+    content: Strengthen load, security, and privacy test coverage plus reporting automation.
+    status: pending
+isProject: false
+---
+
 # Comprehensive Testing Execution Plan
 
 ## Overview
@@ -237,10 +258,10 @@ echo "" >> TESTING_FIXES.md
 
 ### Success Criteria for Phase 1
 
-- [ ] All unit tests passing (or 90%+ with documented exceptions)
-- [ ] Coverage above 80% for critical modules
-- [ ] No import errors or configuration issues
-- [ ] All fixes documented in `TESTING_FIXES.md`
+- All unit tests passing (or 90%+ with documented exceptions)
+- Coverage above 80% for critical modules
+- No import errors or configuration issues
+- All fixes documented in `TESTING_FIXES.md`
 
 **Only proceed to Phase 2 when Phase 1 success criteria met.**
 
@@ -396,12 +417,12 @@ echo "" >> TESTING_FIXES.md
 
 ### Success Criteria for Phase 2
 
-- [ ] All integration tests passing
-- [ ] Data successfully persisting to TimescaleDB
-- [ ] Supabase integration working (if applicable)
-- [ ] No database connection issues
-- [ ] Test isolation maintained (no data leakage)
-- [ ] All fixes documented
+- All integration tests passing
+- Data successfully persisting to TimescaleDB
+- Supabase integration working (if applicable)
+- No database connection issues
+- Test isolation maintained (no data leakage)
+- All fixes documented
 
 **Only proceed to Phase 3 when Phase 2 success criteria met.**
 
@@ -554,13 +575,13 @@ echo "" >> TESTING_FIXES.md
 
 ### Success Criteria for Phase 3
 
-- [ ] All load test scenarios passing
-- [ ] Success rate > 90% under all load conditions
-- [ ] Response time < 1s average, < 2s max
-- [ ] Memory usage < 1GB increase for 200 connections
-- [ ] No connection limit issues
-- [ ] No server crashes or timeouts
-- [ ] Performance metrics documented
+- All load test scenarios passing
+- Success rate > 90% under all load conditions
+- Response time < 1s average, < 2s max
+- Memory usage < 1GB increase for 200 connections
+- No connection limit issues
+- No server crashes or timeouts
+- Performance metrics documented
 
 **Only proceed to Phase 4 when Phase 3 success criteria met.**
 
@@ -735,13 +756,13 @@ echo "" >> TESTING_FIXES.md
 
 ### Success Criteria for Phase 4
 
-- [ ] All security tests passing - NO BYPASSES
-- [ ] All privacy tests passing - GDPR compliant
-- [ ] Certificate validation working correctly
-- [ ] Authentication enforced on all endpoints
-- [ ] Rate limiting preventing abuse
-- [ ] Data encryption working properly
-- [ ] All fixes documented
+- All security tests passing - NO BYPASSES
+- All privacy tests passing - GDPR compliant
+- Certificate validation working correctly
+- Authentication enforced on all endpoints
+- Rate limiting preventing abuse
+- Data encryption working properly
+- All fixes documented
 
 **Only proceed to Phase 5 when Phase 4 success criteria met.**
 
@@ -881,13 +902,13 @@ echo "" >> TESTING_FIXES.md
 
 ### Success Criteria for Phase 5
 
-- [ ] All E2E test scenarios passing
-- [ ] Complete OCPP 2.0.1 protocol coverage
-- [ ] Server runs stably throughout tests
-- [ ] No connection failures or timeouts
-- [ ] Transaction flows work correctly
-- [ ] Simulator integration successful
-- [ ] All fixes documented
+- All E2E test scenarios passing
+- Complete OCPP 2.0.1 protocol coverage
+- Server runs stably throughout tests
+- No connection failures or timeouts
+- Transaction flows work correctly
+- Simulator integration successful
+- All fixes documented
 
 **Only proceed to Phase 6 when Phase 5 success criteria met.**
 
@@ -937,12 +958,12 @@ python tests/enhanced_test_runner.py
 
 ### Success Criteria for Phase 6
 
-- [ ] All test suites passing in orchestrated run
-- [ ] Comprehensive report generated
-- [ ] Overall success rate > 95%
-- [ ] All performance metrics acceptable
-- [ ] No critical issues remaining
-- [ ] Reports saved to `tests/results/reports/`
+- All test suites passing in orchestrated run
+- Comprehensive report generated
+- Overall success rate > 95%
+- All performance metrics acceptable
+- No critical issues remaining
+- Reports saved to `tests/results/reports/`
 
 ## Phase 7: Results Analysis & Documentation
 
@@ -1018,93 +1039,79 @@ cat TESTING_FIXES.md
 
 ### Success Criteria for Phase 7
 
-- [ ] Comprehensive report reviewed
-- [ ] Executive summary created
-- [ ] All fixes documented
-- [ ] Pilot readiness decision made
-- [ ] Next steps identified
+- Comprehensive report reviewed
+- Executive summary created
+- All fixes documented
+- Pilot readiness decision made
+- Next steps identified
 
 ## Pilot Readiness Decision
 
 ### GO Criteria (All must be met)
 
-- [ ] Unit tests: 90%+ passing, 80%+ coverage
-- [ ] Integration tests: 100% passing with real database
-- [ ] Load tests: 90%+ success rate, < 1s response time
-- [ ] Security tests: 100% passing, no bypasses
-- [ ] E2E tests: 100% passing, full OCPP coverage
-- [ ] No critical security vulnerabilities
-- [ ] Database integration working with production instances
-- [ ] All critical fixes applied and documented
+- Unit tests: 90%+ passing, 80%+ coverage
+- Integration tests: 100% passing with real database
+- Load tests: 90%+ success rate, < 1s response time
+- Security tests: 100% passing, no bypasses
+- E2E tests: 100% passing, full OCPP coverage
+- No critical security vulnerabilities
+- Database integration working with production instances
+- All critical fixes applied and documented
 
 ### NO-GO Criteria (Any triggers NO-GO)
 
-- [ ] Critical test failures in OCPP handlers
-- [ ] Security vulnerabilities (authentication bypass, encryption failures)
-- [ ] Database connection failures to production
-- [ ] Load tests < 80% success rate
-- [ ] Memory leaks or severe performance issues
-- [ ] GDPR compliance failures
+- Critical test failures in OCPP handlers
+- Security vulnerabilities (authentication bypass, encryption failures)
+- Database connection failures to production
+- Load tests < 80% success rate
+- Memory leaks or severe performance issues
+- GDPR compliance failures
 
 ## Post-Testing Next Steps
 
 ### If GO for Pilot
 
 1. **Deploy to staging environment**
-   ```bash
+  ```bash
    kubectl apply -f k8s/namespace.yaml
    kubectl apply -f k8s/configmap.yaml
    kubectl apply -f k8s/secret.yaml
    kubectl apply -f k8s/deployment.yaml
    kubectl apply -f k8s/service.yaml
-   ```
-
+  ```
 2. **Run smoke tests in staging**
-   ```bash
+  ```bash
    # Quick validation
    pytest tests/unit/test_simple.py -v
-   ```
-
+  ```
 3. **Set up monitoring**
-
-   - Configure Prometheus metrics endpoint
-   - Set up Grafana dashboards
-   - Configure alerting rules
-
+  - Configure Prometheus metrics endpoint
+  - Set up Grafana dashboards
+  - Configure alerting rules
 4. **Prepare for real dataset acquisition**
-
-   - Follow `DATA_ACQUISITION_GUIDE.md`
-   - Contact dataset providers
-   - Set up data ingestion pipelines
-
+  - Follow `DATA_ACQUISITION_GUIDE.md`
+  - Contact dataset providers
+  - Set up data ingestion pipelines
 5. **Schedule pilot launch**
-
-   - Coordinate with stakeholders
-   - Prepare rollback plan
-   - Set up incident response
+  - Coordinate with stakeholders
+  - Prepare rollback plan
+  - Set up incident response
 
 ### If NO-GO for Pilot
 
 1. **Address critical failures**
-
-   - Fix security vulnerabilities immediately
-   - Resolve database integration issues
-   - Improve performance to meet targets
-
+  - Fix security vulnerabilities immediately
+  - Resolve database integration issues
+  - Improve performance to meet targets
 2. **Re-run affected test suites**
-
-   - Follow phase-specific guidance above
-   - Document new fixes
-
+  - Follow phase-specific guidance above
+  - Document new fixes
 3. **Re-evaluate pilot readiness**
-
-   - Run comprehensive test runner again
-   - Update pilot readiness report
-
+  - Run comprehensive test runner again
+  - Update pilot readiness report
 4. **Set new pilot target date**
-
-   - Based on time needed for fixes
-   - Re-assess with stakeholders
+  - Based on time needed for fixes
+  - Re-assess with stakeholders
 
 ## Estimated Timeline
 
@@ -1124,10 +1131,3 @@ cat TESTING_FIXES.md
 - Day 1: Phases 1-3 (unit, integration, load) + fixes
 - Day 2: Phases 4-7 (security, E2E, comprehensive, analysis) + final fixes
 
-### To-dos
-
-- [ ] Review docs and current test reports to map coverage gaps before writing new tests.
-- [ ] Design and implement missing unit/component tests for uncovered managers and error-handling paths.
-- [ ] Augment integration/e2e suites with simulator workflows, failure scenarios, and scaling tests.
-- [ ] Replay external datasets through ingestion and optimization pipelines to validate outputs.
-- [ ] Strengthen load, security, and privacy test coverage plus reporting automation.

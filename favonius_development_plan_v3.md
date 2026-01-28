@@ -1,11 +1,11 @@
 # Favonius Energy — Product Development Plan
-## EV Fleet Depot Optimization Platform (MVP v2)
+## EV Fleet Depot Optimization Platform (MVP v3)
 
 ---
 
 ## Overview
 
-This development plan implements the specifications in `docs/PRD_v2.md` (Version 2.5). The PRD is the **single source of truth** — if any discrepancy exists between this plan and the PRD, the PRD wins.
+This development plan implements the specifications in `docs/PRD_v2.md` (Version 2.7). The PRD is the **single source of truth** — if any discrepancy exists between this plan and the PRD, the PRD wins.
 
 **Key Technical Decisions (from PRD):**
 - Solver: **Gurobi** with <60 second solve time, **HiGHS fallback** for reliability
@@ -13,14 +13,20 @@ This development plan implements the specifications in `docs/PRD_v2.md` (Version
 - Building load: **Required** (not optional)
 - Connector type: **CCS only** for MVP
 - Vehicle max_charge_kw: From **OCPP MeterValues** or config fallback
+- **OCPP Protocol**: **1.6J only** (chargers MUST be configured for 1.6J subprotocol; 2.0.1 NOT wire-compatible)
+- **VDV 463**: Transit operations integration for BMS/ITCS communication
+- **BACnet/SC**: Building HVAC control via setpoint offset (thermal flywheel optimization)
+- **Preconditioning**: **Soft constraint** (can be curtailed under site power limit)
+- **Battery Efficiency**: Split round-trip model (√η each direction) to prevent free energy loops
 
 **Architecture Decisions (Implemented):**
 - **Integrated System Architecture**: Main API backend is primary optimization service
-- **WebSocket Handler as Telemetry Service**: WebSocket handler receives OCPP messages, stores telemetry, exposes internal API
+- **Unified WebSocket Handler**: Single service handles OCPP 1.6J, VDV 463, and BACnet/SC connections
 - **Backup Heuristic**: WebSocket handler maintains heuristic optimizer for emergency use when main API unavailable > 1 hour
 - **Julia Removed**: Julia MIP solver bridge removed, using Pyomo/Gurobi/HiGHS only
 - **V2G Out of Scope**: V2G functionality removed/commented out per MVP scope
 - **Dual Database**: Supabase for static data, TimescaleDB for time-series data
+- **Dispatch Validation**: Pre-dispatch checks for charger/device status before sending commands
 
 ---
 
@@ -36,7 +42,9 @@ This development plan implements the specifications in `docs/PRD_v2.md` (Version
 3. Set up Git repository with conventional commits
 4. Create `.cursor/rules/` directory with domain-specific rules:
    - `optimization.mdc` — MILP formulation patterns (Gurobi-specific)
-   - `ocpp.mdc` — OCPP 1.6/2.0.1 message formats
+   - `ocpp.mdc` — OCPP 1.6J message formats (1.6J ONLY, 2.0.1 not wire-compatible)
+   - `vdv463.mdc` — VDV 463 transit operations protocol
+   - `bacnet.mdc` — BACnet/SC building control patterns
    - `timescale.mdc` — TimescaleDB best practices
 
 **Verification:**
@@ -58,15 +66,24 @@ favonius-platform/
 │   └── API.md                  # API specifications (OpenAPI)
 ├── src/
 │   ├── core/
-│   │   ├── models.py           # Data classes (DepotState, DepotConfig, etc.)
+│   │   ├── models.py           # Data classes (DepotState, DepotConfig, BuildingZone, etc.)
 │   │   ├── optimizer/          # MILP optimization engine
 │   │   │   ├── milp_model.py   # Pyomo model definition
 │   │   │   ├── solver.py       # Gurobi solver wrapper with HiGHS fallback
-│   │   │   └── allocator.py    # Post-optimization charger allocation
+│   │   │   ├── allocator.py    # Post-optimization charger allocation
+│   │   │   └── dispatcher.py   # Dispatch validation and command execution
 │   │   ├── surrogate/          # Energy consumption model
 │   │   └── state/              # State assembler and trigger monitor
 │   ├── adapters/
-│   │   ├── ocpp/               # OCPP server and handlers
+│   │   ├── ocpp/               # OCPP 1.6J server and handlers
+│   │   ├── vdv463/             # VDV 463 transit operations adapter
+│   │   │   ├── handler.py      # WebSocket handler for BMS/ITCS
+│   │   │   ├── messages.py     # Message parsing and generation
+│   │   │   └── vehicle_resolver.py  # vehicleId → vehicle_id UUID mapping
+│   │   ├── bacnet/             # BACnet/SC building HVAC adapter
+│   │   │   ├── hub.py          # BACnet/SC Hub implementation (bacpypes3)
+│   │   │   ├── zone_mapper.py  # device_id → zone_id mapping
+│   │   │   └── setpoint.py     # Setpoint offset calculation and dispatch
 │   │   ├── caiso/              # CAISO price feeds
 │   │   ├── weather/            # Weather API integration
 │   │   ├── building_load/      # Building load meter/API
@@ -109,7 +126,8 @@ favonius-platform/
 | **API** | `fastapi`, `uvicorn` | REST API server |
 | **Database (Static)** | `supabase-py` | Supabase client for static data |
 | **Database (Time-Series)** | `asyncpg`, `sqlalchemy` | TimescaleDB for time-series data |
-| **OCPP** | `ocpp` | OCPP 1.6/2.0.1 support |
+| **OCPP** | `ocpp` | OCPP 1.6J support (1.6J ONLY for MVP) |
+| **BACnet** | `bacpypes3` | BACnet/SC Hub for building HVAC control |
 | **Time-series** | `pandas`, `polars` | Data manipulation |
 | **Weather** | `openmeteo-requests` | Weather API client |
 | **Testing** | `pytest`, `pytest-asyncio` | Test framework |
@@ -120,7 +138,7 @@ favonius-platform/
 uv init favonius-platform
 cd favonius-platform
 uv add pyomo gurobipy highspy scikit-learn gpytorch fastapi uvicorn asyncpg sqlalchemy supabase
-uv add ocpp pandas polars openmeteo-requests httpx pyjwt cryptography
+uv add ocpp bacpypes3 pandas polars openmeteo-requests httpx pyjwt cryptography
 uv add --dev pytest pytest-asyncio pytest-cov ruff mypy
 
 # Verify Gurobi license (primary solver)
@@ -128,6 +146,9 @@ python -c "import gurobipy as gp; print(f'Gurobi {gp.gurobi.version()}')"
 
 # Verify HiGHS availability (fallback solver)
 python -c "import pyomo.environ as pyo; solver = pyo.SolverFactory('appsi_highs'); print('HiGHS available')"
+
+# Verify BACnet/SC support
+python -c "import bacpypes3; print('BACpypes3 available')"
 ```
 
 **Verification:**
@@ -1415,12 +1436,12 @@ class HandoffManager:
 ### Architecture Context
 
 **Current State:**
-- WebSocket Handler has OCPP 1.6 server that handles all charger connections
+- WebSocket Handler has OCPP 1.6J server that handles all charger connections
 - WebSocket Handler stores all telemetry to TimescaleDB
-- Main API currently has its own OCPP 1.6 server (`src/adapters/ocpp/server.py`) for direct charger communication (temporary workaround)
+- Main API currently has its own OCPP 1.6J server (`src/adapters/ocpp/server.py`) for direct charger communication (temporary workaround)
 
 **Target Architecture (Phase 4):**
-- WebSocket Handler is the single OCPP 1.6 communication layer (handles OCPP 2+ messages)
+- WebSocket Handler is the single OCPP 1.6J communication layer
 - Main API communicates with WebSocket Handler via internal REST API
 - WebSocket Handler exposes endpoints for:
   - Querying connected charge points
@@ -1428,12 +1449,12 @@ class HandoffManager:
   - Sending SetChargingProfile commands
   - Health monitoring
 
-**OCPP Version Strategy:**
-- **Primary Protocol**: OCPP 1.6-J (dominant in field, simpler implementation)
-- **OCPP 2+ Compatibility**: OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 protocol format
-  - OCPP 2+ adds additional messages but maintains backward compatibility at connection level
-  - Server handles OCPP 2+ messages by responding in OCPP 1.6 format where applicable
-  - No need for separate OCPP 2+ server since OCPP 1.6 can handle the connection
+**OCPP Version Strategy (CRITICAL - per PRD v2.7):**
+- **Supported Protocol**: OCPP 1.6J ONLY
+- **OCPP 2.0.1 is NOT wire-compatible** with 1.6J—different JSON schemas, RPC action names, and enum values
+- Chargers supporting OCPP 2.0.1/2.1 **MUST be configured to use OCPP 1.6J subprotocol**
+- A charger attempting a true OCPP 2.0.1 handshake will **fail to connect**
+- Native OCPP 2.0.1 support is planned for **post-MVP**
 
 **Benefits:**
 - Single OCPP communication layer (no duplication)
@@ -2218,7 +2239,976 @@ def check_data_freshness(
 
 ---
 
-## PHASE 5: UNIT TESTS
+## PHASE 5: VDV 463 TRANSIT OPERATIONS INTEGRATION
+
+### Overview
+
+VDV 463 enables communication with transit operations systems (BMS/ITCS) for:
+- Receiving charging requests with arrival/departure schedules
+- Reporting charging status back to operations
+- Managing bus preconditioning (manual and automatic)
+
+**Reference:** `docs/PRD_v2_7_Building_Integration.md` Section 9.6
+
+**VDV 463 Schema Set (from `VDVde/VDV463/schema`):**
+- `MessageStructure.json`
+- `BootNotificationRequest.json` / `BootNotificationResponse.json`
+- `ProvideChargingRequestsRequest.json` / `ProvideChargingRequestsResponse.json`
+- `ProvideChargingInformationRequest.json` / `ProvideChargingInformationResponse.json`
+
+All request and information payloads MUST validate against their `*Request` schemas; all confirmations use empty-object payloads at index 6 per their `*Response` schemas.
+
+### Schema Validation Strategy
+
+VDV 463 JSON schema validation MUST be **configurable**, with:
+
+- **Default (production) mode – Hard fail:**
+  - All inbound and outbound VDV 463 messages (full message array + payload) MUST validate against the official schemas in `VDVde/VDV463/schema` (`MessageStructure.json`, `ProvideChargingRequestsRequest.json`, `ProvideChargingInformationRequest.json`).
+  - Messages that fail validation are **rejected**:
+    - Return a VDV 463 Error message (MessageType `3`) with an `errorCode` such as `SchemaValidationError` and a concise `errorDescription`. The exact error payload shape is a Favonius convention (not defined by the VDV 463 schemas), and upstream systems must treat `errorCode` as an opaque string and be robust to additional fields.
+    - Log the failure with depot_id, presystem_id, action, and validation details for operator diagnostics.
+
+- **Soft/log mode – Non-production / controlled deployments:**
+  - If `vdv463.validation_mode = "soft"` (config flag), accept messages with non-critical deviations, but:
+    - Record validation warnings in logs and metrics.
+    - Mark the affected requests in `vdv463_charging_requests` with a `validation_status` field (e.g., `"warning"`), for later analysis.
+
+**Note:** Confirmations for `ProvideChargingRequests` and `ProvideChargingInformation` use empty-object payloads at index 6 in accordance with the official `*Response.json` schemas. Any acceptance semantics are implicit and captured via logs/metrics rather than additional payload fields.
+
+Implementation notes:
+- Implement validation in `src/adapters/vdv463/messages.py` using a schema-backed layer (jsonschema or Pydantic models generated from the official JSON schemas).
+- The handler (`VDV463Handler`) MUST call this validation layer before applying any business logic and must respect the configured mode (`hard` vs `soft`), supplied via environment variable or depot-level configuration.
+
+### Step 5.1: VDV 463 WebSocket Handler
+
+Create `src/adapters/vdv463/handler.py`:
+
+```python
+"""VDV 463 WebSocket handler for BMS/ITCS communication.
+
+Implements VDV 463 v1.1.0 protocol over WebSocket Secure (WSS).
+See docs/PRD_v2_7_Building_Integration.md Section 9.6 and the official VDV 463 JSON schemas
+in https://github.com/VDVde/VDV463/tree/main/schema for the authoritative specification.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime
+from typing import Optional
+from uuid import UUID
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+logger = logging.getLogger(__name__)
+
+
+class VDV463Handler:
+    """Handles VDV 463 protocol messages from BMS/ITCS systems."""
+    
+    def __init__(self, db_pool, depot_id: UUID):
+        self.db = db_pool
+        self.depot_id = depot_id
+        self.presystem_id: Optional[str] = None
+        self.system_type: Optional[str] = None  # 'BMS' or 'ITCS'
+    
+    async def handle_connection(self, websocket: WebSocket, presystem_id: str):
+        """Handle incoming VDV 463 WebSocket connection."""
+        await websocket.accept()
+        self.presystem_id = presystem_id
+        
+        try:
+            while True:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                await self._process_message(websocket, message)
+        except WebSocketDisconnect:
+            logger.info(f"VDV 463 presystem {presystem_id} disconnected")
+            await self._log_disconnect()
+    
+    async def _process_message(self, websocket: WebSocket, message: list):
+        """Process VDV 463 message based on MessageStructure.json."""
+        # MessageStructure indices:
+        # 0 = MessageType (1=Request, 2=Confirmation, 3=Error)
+        # 1 = Source ("BMS" | "ITCS" | "CMS")
+        # 2 = PresystemId (string)
+        # 3 = Timestamp (date-time)
+        # 4 = MessageId (UUID)
+        # 5 = MessageAction ("BootNotification" | "ProvideChargingRequests" | "ProvideChargingInformation")
+        # 6 = Payload (object)
+        msg_type = message[0]
+        action = message[5]
+
+        # Validate against MessageStructure.json and action-specific schema
+        from src.adapters.vdv463.messages import validate_message
+        try:
+            validate_message(message)
+        except VDV463Error as e:
+            error_response = [
+                3,
+                "CMS",
+                message[2],
+                datetime.utcnow().isoformat(),
+                f"schema-error-{message[4]}",
+                action,
+                {"errorCode": "SchemaValidationError", "errorDescription": e.description},
+            ]
+            await websocket.send_text(json.dumps(error_response))
+            return
+
+        if action == "BootNotification":
+            await self._handle_boot_notification(websocket, message)
+        elif action == "ProvideChargingRequests":
+            await self._handle_charging_requests(websocket, message)
+        else:
+            logger.warning(f"Unknown VDV 463 message action: {action}")
+    
+    async def _handle_boot_notification(self, websocket: WebSocket, message: list):
+        """Handle BootNotification from BMS/ITCS."""
+        payload = message[6]
+        # BootNotificationRequest.json: { "presystem": "BMS" | "ITCS" }
+        self.system_type = payload.get("presystem", "BMS")
+        
+        # Log connection
+        await self.db.execute("""
+            INSERT INTO vdv463_connections (depot_id, presystem_id, system_type, connected_at)
+            VALUES ($1, $2, $3, NOW())
+        """, self.depot_id, self.presystem_id, self.system_type)
+        
+        # Send acceptance response
+        # BootNotificationResponse.json: { "status": "Accepted" | "Rejected" }
+        response = [
+            2,
+            "CMS",
+            self.presystem_id,
+            datetime.utcnow().isoformat(),
+            message[4],
+            "BootNotification",
+            {"status": "Accepted"},
+        ]
+        await websocket.send_text(json.dumps(response))
+    
+    async def _handle_charging_requests(self, websocket: WebSocket, message: list):
+        """Handle ProvideChargingRequests from BMS/ITCS."""
+        payload = message[6]
+        # Per ProvideChargingRequestsRequest.json, payload has 'chargingRequestList'
+        requests = payload.get("chargingRequestList", [])
+        
+        for req in requests:
+            try:
+                await self._process_charging_request(req)
+            except VDV463Error as e:
+                # Send error response per PRD Section 9.6
+                error_response = [
+                    3,
+                    "CMS",
+                    self.presystem_id,
+                    datetime.utcnow().isoformat(),
+                    f"error-{req['chargingRequestId']}",
+                    "ProvideChargingRequests",
+                    {
+                        "errorCode": e.code,
+                        "errorDescription": e.description,
+                        "chargingRequestId": req["chargingRequestId"],
+                    },
+                ]
+                await websocket.send_text(json.dumps(error_response))
+        
+        # Send acknowledgment (ProvideChargingRequestsResponse.json: empty object payload)
+        ack = [
+            2,
+            "CMS",
+            self.presystem_id,
+            datetime.utcnow().isoformat(),
+            message[4],
+            "ProvideChargingRequests",
+            {},
+        ]
+        await websocket.send_text(json.dumps(ack))
+    
+    async def _process_charging_request(self, request: dict):
+        """Process individual charging request and store in database."""
+        from src.adapters.vdv463.vehicle_resolver import resolve_vdv_vehicle_id
+        
+        # Resolve vehicle ID (per PRD v2.7 Section 9.6)
+        vdv_vehicle_id = request['vehicleId']
+        vehicle_uuid = await resolve_vdv_vehicle_id(self.db, self.depot_id, vdv_vehicle_id)
+        
+        # Extract charging data
+        data = request.get('chargingRequestData', {})
+        precond = request.get('manualPreconditioning') or request.get('automaticPreconditioning')
+        precond_type = 'manual' if 'manualPreconditioning' in request else ('automatic' if precond else None)
+        
+        # Store request (captures all relevant AutomaticPreconditioning and ManualPreconditioning fields)
+        await self.db.execute("""
+            INSERT INTO vdv463_charging_requests 
+            (depot_id, charging_request_id, charging_point_id, vehicle_id, priority,
+             charging_instruction, expected_arrival, expected_soc_at_arrival,
+             min_target_soc, max_target_soc, requested_departure,
+             preconditioning_type, preconditioning_start, 
+             ambient_temperature, requested_start_time, requested_finish_time,
+             hvac_aux_power, system_aux_power,
+             presystem_id, message_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16, $17, $18, $19)
+            ON CONFLICT (depot_id, charging_request_id, presystem_id) 
+            DO UPDATE SET charging_instruction = EXCLUDED.charging_instruction,
+                          expected_arrival = EXCLUDED.expected_arrival,
+                          min_target_soc = EXCLUDED.min_target_soc,
+                          max_target_soc = EXCLUDED.max_target_soc,
+                          requested_departure = EXCLUDED.requested_departure,
+                          preconditioning_type = EXCLUDED.preconditioning_type,
+                          preconditioning_start = EXCLUDED.preconditioning_start,
+                          ambient_temperature = EXCLUDED.ambient_temperature,
+                          requested_start_time = EXCLUDED.requested_start_time,
+                          requested_finish_time = EXCLUDED.requested_finish_time,
+                          hvac_aux_power = EXCLUDED.hvac_aux_power,
+                          system_aux_power = EXCLUDED.system_aux_power
+        """, 
+             self.depot_id,
+             request['chargingRequestId'], 
+             request.get('chargingPointId'),
+             vehicle_uuid,
+             request.get('priority', 1),
+             request.get('chargingInstruction', 'Normal'),
+             data.get('expectedArrivalTimeAtChargingPoint'),
+             data.get('expectedSocAtArrival'),
+             data.get('minTargetSoc'),
+             data.get('maxTargetSoc'),
+             data.get('requestedTimeForDeparture'),
+             precond_type,
+             precond.get('hvacPreconditioningStartTime') if precond else None,
+             precond.get('ambientTemperature') if precond else None,
+             precond.get('requestedStartTime') if precond else None,
+             precond.get('requestedFinishTime') if precond else None,
+             precond.get('hvacAuxiliaryConsumerPower') if precond else None,
+             precond.get('systemAuxiliaryConsumerPower') if precond else None,
+             self.presystem_id,
+             request.get('messageId', ''))
+
+
+class VDV463Error(Exception):
+    """VDV 463 protocol error."""
+    def __init__(self, code: str, description: str):
+        self.code = code
+        self.description = description
+        super().__init__(f"{code}: {description}")
+```
+
+### Step 5.2: Vehicle ID Resolution
+
+Create `src/adapters/vdv463/vehicle_resolver.py`:
+
+```python
+"""VDV 463 vehicle ID resolution.
+
+Maps VDV 463 vehicleId strings to internal UUIDs.
+See docs/PRD_v2_7_Building_Integration.md Section 9.6 and the official VDV 463 JSON schemas
+in https://github.com/VDVde/VDV463/tree/main/schema for the authoritative specification.
+"""
+from __future__ import annotations
+
+from uuid import UUID
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+async def resolve_vdv_vehicle_id(db, depot_id: UUID, vdv_vehicle_id: str) -> UUID:
+    """Map VDV 463 vehicleId string to internal vehicle UUID.
+    
+    Resolution path: vdv.vehicleId → vehicles.external_id → vehicles.vehicle_id
+    
+    Args:
+        db: Database connection pool
+        depot_id: Depot UUID for scoping lookup
+        vdv_vehicle_id: VDV 463 vehicleId string (e.g., "bus_101")
+    
+    Returns:
+        Vehicle UUID
+    
+    Raises:
+        VDV463Error: If vehicle not found in depot configuration
+    """
+    from src.adapters.vdv463.handler import VDV463Error
+    
+    result = await db.fetchrow("""
+        SELECT vehicle_id FROM vehicles 
+        WHERE depot_id = $1 AND external_id = $2
+    """, depot_id, vdv_vehicle_id)
+    
+    if result is None:
+        logger.warning(f"VDV 463 vehicle '{vdv_vehicle_id}' not found in depot {depot_id}")
+        raise VDV463Error(
+            code="InvalidVehicleId",
+            description=f"Vehicle '{vdv_vehicle_id}' not found in depot configuration"
+        )
+    
+    logger.debug(f"Resolved VDV 463 vehicle '{vdv_vehicle_id}' to UUID {result['vehicle_id']}")
+    return result['vehicle_id']
+```
+
+### Step 5.3: VDV 463 Database Schema
+
+Add to `migrations/003_vdv463_schema.sql`:
+
+```sql
+-- VDV 463 charging requests (optimization inputs)
+CREATE TABLE vdv463_charging_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    charging_request_id TEXT NOT NULL,
+    charging_point_id UUID REFERENCES chargers(charger_id),
+    vehicle_id UUID REFERENCES vehicles(vehicle_id),
+    priority INTEGER DEFAULT 1,
+    charging_instruction TEXT DEFAULT 'Normal',
+    expected_arrival TIMESTAMPTZ,
+    expected_soc_at_arrival REAL,
+    min_target_soc REAL,
+    max_target_soc REAL,
+    requested_departure TIMESTAMPTZ,
+    preconditioning_type TEXT,              -- 'manual', 'automatic', or NULL
+    preconditioning_start TIMESTAMPTZ,      -- For manual
+    ambient_temperature REAL,               -- For automatic
+    requested_start_time TIMESTAMPTZ,       -- For automatic (requestedStartTime)
+    requested_finish_time TIMESTAMPTZ,      -- For automatic (requestedFinishTime)
+    hvac_aux_power INTEGER,                 -- For manual (hvacAuxiliaryConsumerPower)
+    system_aux_power INTEGER,               -- For manual (systemAuxiliaryConsumerPower)
+    presystem_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    received_at TIMESTAMPTZ DEFAULT NOW(),
+    status TEXT DEFAULT 'active',           -- 'active', 'completed', 'terminated'
+    validation_status TEXT,                 -- NULL | 'ok' | 'warning' | 'error'
+    UNIQUE(depot_id, charging_request_id, presystem_id)
+);
+SELECT create_hypertable('vdv463_charging_requests', 'received_at');
+
+-- VDV 463 connection log
+CREATE TABLE vdv463_connections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    presystem_id TEXT NOT NULL,
+    system_type TEXT NOT NULL,              -- 'BMS' or 'ITCS'
+    connected_at TIMESTAMPTZ DEFAULT NOW(),
+    disconnected_at TIMESTAMPTZ,
+    disconnect_reason TEXT
+);
+```
+
+### Step 5.4: Preconditioning Constraint Integration
+
+Update `src/core/optimizer/milp_model.py` to include preconditioning as a **soft constraint** (per PRD v2.7):
+
+```python
+def add_preconditioning_constraints(model, preconditioning_requests: list):
+    """Add VDV 463 preconditioning as soft constraint.
+    
+    Per PRD v2.7, preconditioning is a SOFT constraint with high penalty (M=1000).
+    This allows curtailment under site power limit while strongly encouraging fulfillment.
+    
+    Priority Hierarchy:
+    1. Site power limit (hard - electrical safety)
+    2. Departure SoC ≥ 99% (hard - operational)
+    3. Preconditioning (soft with M=1000 penalty)
+    4. Energy cost minimization (objective)
+    """
+    M_PRECOND = 1000.0  # Penalty weight $/kW
+    
+    # Slack variable for unfulfilled preconditioning
+    model.precond_slack = pyo.Var(model.T, within=pyo.NonNegativeReals)
+    
+    # Preconditioning load constraint (soft)
+    def precond_load_rule(model, t):
+        required_load = sum(
+            req['power_kw'] for req in preconditioning_requests
+            if req['start_time'] <= t < req['end_time']
+        )
+        return model.P_precond[t] + model.precond_slack[t] >= required_load
+    
+    model.precond_constraint = pyo.Constraint(model.T, rule=precond_load_rule)
+    
+    # Add penalty to objective function
+    model.precond_penalty = pyo.Expression(
+        expr=M_PRECOND * sum(model.precond_slack[t] for t in model.T)
+    )
+    
+    return model
+```
+
+**Verification:**
+- [ ] VDV 463 WebSocket endpoint accepts connections at `/vdv463/{presystem_id}`
+- [ ] BootNotification handled correctly
+- [ ] ProvideChargingRequests stored in database
+- [ ] Vehicle ID resolution works (external_id → UUID)
+- [ ] InvalidVehicleId error returned for unknown vehicles
+- [ ] Preconditioning requests included in optimization
+- [ ] Preconditioning curtailed gracefully under site power limit
+
+---
+
+## PHASE 6: BACNET/SC BUILDING HVAC INTEGRATION
+
+### Overview
+
+BACnet/SC (Secure Connect) enables building HVAC control for thermal flywheel optimization:
+- Pre-cool/heat during low-cost periods
+- Reduce HVAC load during peak charging
+- Coordinate building and EV charging for demand reduction
+
+**Reference:** PRD v2.7 Section 9.7
+
+### Step 6.1: BuildingZone Data Model
+
+Update `src/core/models.py` to add BuildingZone:
+
+```python
+@dataclass
+class BuildingZone:
+    """Building zone configuration for HVAC control.
+    
+    See PRD_v2.md Section 6.2 and 9.7.
+    """
+    zone_id: UUID
+    depot_id: UUID
+    name: str
+    bacnet_device_id: int                     # BACnet device identifier
+    temp_sensor_oid: str                      # BACnet object ID (e.g., "analogInput:1")
+    setpoint_cmd_oid: str                     # BACnet object ID (e.g., "analogValue:1")
+    active_setpoint_oid: Optional[str]        # For reading baseline setpoint (e.g., "analogValue:2")
+    thermal_mass_kwh_c: float                 # Thermal mass (kWh per degree C)
+    current_temp_c: float                     # Current zone temperature
+    min_temp_c: float = 19.0                  # Minimum allowed temperature (safety limit)
+    max_temp_c: float = 24.0                  # Maximum allowed temperature (safety limit)
+    baseline_load_kw: float = 0.0             # Non-HVAC baseline load for this zone
+    max_hvac_power_kw: float = 50.0           # Maximum HVAC power for zone (kW)
+    hvac_cop: float = 3.5                     # HVAC Coefficient of Performance
+    ua_value: float = 0.5                     # Heat transfer coefficient (kW/°C)
+    hvac_response_lag_min: float = 5.0        # HVAC response lag (minutes)
+    hvac_ramp_kw_per_timestep: float = 5.0    # HVAC ramp rate limit (kW per timestep)
+```
+
+### Step 6.2: BACnet/SC Hub Implementation
+
+Create `src/adapters/bacnet/hub.py`:
+
+```python
+"""BACnet/SC Hub for building HVAC control.
+
+Uses bacpypes3 library for BACnet Secure Connect.
+See PRD_v2.md Section 9.7 for specification.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Optional
+from uuid import UUID
+
+from bacpypes3.app import Application
+from bacpypes3.basetypes import PropertyIdentifier
+from bacpypes3.constructeddata import AnyAtomic
+from bacpypes3.pdu import Address
+
+logger = logging.getLogger(__name__)
+
+
+class BACnetSCHub:
+    """BACnet/SC Hub for building HVAC control.
+    
+    Single shared Hub instance per worker (not per-connection).
+    Handles multiple BACnet device connections.
+    """
+    
+    def __init__(self, db_pool, depot_id: UUID):
+        self.db = db_pool
+        self.depot_id = depot_id
+        self.app: Optional[Application] = None
+        self._zone_cache: dict[tuple[int, str], UUID] = {}  # (device_id, oid) → zone_id
+    
+    async def start(self, hub_address: str = "0.0.0.0"):
+        """Start BACnet/SC Hub."""
+        # Initialize bacpypes3 Application
+        self.app = Application()
+        await self.app.startup()
+        logger.info(f"BACnet/SC Hub started for depot {self.depot_id}")
+    
+    async def stop(self):
+        """Stop BACnet/SC Hub."""
+        if self.app:
+            await self.app.shutdown()
+    
+    async def resolve_zone(self, device_id: int, object_id: str) -> UUID:
+        """Map BACnet device and object to zone UUID.
+        
+        Per PRD v2.7, uses building_zones table with unique constraint
+        on (depot_id, bacnet_device_id, temp_sensor_oid).
+        """
+        cache_key = (device_id, object_id)
+        if cache_key in self._zone_cache:
+            return self._zone_cache[cache_key]
+        
+        result = await self.db.fetchrow("""
+            SELECT zone_id FROM building_zones 
+            WHERE depot_id = $1 AND bacnet_device_id = $2 AND temp_sensor_oid = $3
+        """, self.depot_id, device_id, object_id)
+        
+        if result is None:
+            raise BACnetError(
+                code="InvalidObjectId",
+                description=f"No zone mapped to device {device_id} object {object_id}"
+            )
+        
+        zone_id = result['zone_id']
+        self._zone_cache[cache_key] = zone_id
+        return zone_id
+    
+    async def read_zone_temperature(self, zone: 'BuildingZone') -> float:
+        """Read current temperature from BACnet device."""
+        # Parse object identifier (e.g., "analogInput:1")
+        obj_type, obj_instance = zone.temp_sensor_oid.split(':')
+        
+        value = await self.app.read_property(
+            Address(zone.bacnet_device_id),
+            f"{obj_type},{obj_instance}",
+            PropertyIdentifier.presentValue
+        )
+        return float(value)
+    
+    async def read_baseline_setpoint(self, zone: 'BuildingZone') -> Optional[float]:
+        """Read current baseline setpoint from BMS.
+        
+        Used for setpoint offset calculation per PRD v2.7 Constraint 15b.
+        """
+        if not zone.active_setpoint_oid:
+            return None
+        
+        obj_type, obj_instance = zone.active_setpoint_oid.split(':')
+        
+        try:
+            value = await self.app.read_property(
+                Address(zone.bacnet_device_id),
+                f"{obj_type},{obj_instance}",
+                PropertyIdentifier.presentValue
+            )
+            return float(value)
+        except Exception as e:
+            logger.warning(f"Failed to read baseline setpoint for zone {zone.zone_id}: {e}")
+            return None
+    
+    async def write_setpoint_offset(
+        self, 
+        zone: 'BuildingZone', 
+        offset_c: float,
+        baseline_setpoint: float
+    ) -> bool:
+        """Write setpoint offset to BACnet device.
+        
+        Per PRD v2.7 Constraint 15b:
+        - Clamps offset to ensure final setpoint stays within safety bounds
+        - Validates before dispatch
+        
+        Args:
+            zone: Building zone configuration
+            offset_c: Desired temperature offset (°C)
+            baseline_setpoint: Current BMS baseline setpoint (°C)
+        
+        Returns:
+            True if command sent successfully
+        """
+        # Safety clamping per PRD v2.7
+        effective_setpoint = baseline_setpoint + offset_c
+        
+        if effective_setpoint < zone.min_temp_c:
+            offset_c = zone.min_temp_c - baseline_setpoint
+            logger.warning(f"Clamped offset to {offset_c}°C to respect min temp {zone.min_temp_c}°C")
+        elif effective_setpoint > zone.max_temp_c:
+            offset_c = zone.max_temp_c - baseline_setpoint
+            logger.warning(f"Clamped offset to {offset_c}°C to respect max temp {zone.max_temp_c}°C")
+        
+        # Parse object identifier
+        obj_type, obj_instance = zone.setpoint_cmd_oid.split(':')
+        
+        try:
+            await self.app.write_property(
+                Address(zone.bacnet_device_id),
+                f"{obj_type},{obj_instance}",
+                PropertyIdentifier.presentValue,
+                AnyAtomic(offset_c)
+            )
+            
+            # Log command
+            await self.db.execute("""
+                INSERT INTO hvac_telemetry (time, zone_id, setpoint_offset_c)
+                VALUES (NOW(), $1, $2)
+            """, zone.zone_id, offset_c)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write setpoint offset for zone {zone.zone_id}: {e}")
+            return False
+
+
+class BACnetError(Exception):
+    """BACnet protocol error."""
+    def __init__(self, code: str, description: str):
+        self.code = code
+        self.description = description
+        super().__init__(f"{code}: {description}")
+```
+
+### Step 6.3: Setpoint Offset Calculation
+
+Create `src/adapters/bacnet/setpoint.py`:
+
+```python
+"""HVAC setpoint offset calculation.
+
+Implements PRD v2.7 Constraint 15b: Offset = T_optimal - T_baseline
+"""
+from __future__ import annotations
+
+from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def calculate_setpoint_offset(
+    t_optimal: float,
+    t_baseline: float,
+    t_min: float,
+    t_max: float
+) -> float:
+    """Calculate setpoint offset with safety clamping.
+    
+    Per PRD v2.7 Constraint 15b:
+    Offset[z,t] = T_optimal[z,t] - T_baseline_setpoint[z]
+    
+    Args:
+        t_optimal: Optimized zone temperature from solver (°C)
+        t_baseline: BMS current active setpoint (°C)
+        t_min: Zone minimum temperature (°C)
+        t_max: Zone maximum temperature (°C)
+    
+    Returns:
+        Clamped offset value (°C)
+    """
+    offset = t_optimal - t_baseline
+    
+    # Safety clamping
+    effective_setpoint = t_baseline + offset
+    
+    if effective_setpoint < t_min:
+        clamped_offset = t_min - t_baseline
+        logger.info(f"Clamped offset {offset:.2f}°C → {clamped_offset:.2f}°C (min bound)")
+        return clamped_offset
+    elif effective_setpoint > t_max:
+        clamped_offset = t_max - t_baseline
+        logger.info(f"Clamped offset {offset:.2f}°C → {clamped_offset:.2f}°C (max bound)")
+        return clamped_offset
+    
+    return offset
+```
+
+### Step 6.4: BACnet Database Schema
+
+Add to `migrations/004_bacnet_schema.sql`:
+
+```sql
+-- BACnet device connections
+CREATE TABLE bacnet_devices (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    device_id INTEGER NOT NULL,  -- BACnet device identifier
+    device_name VARCHAR(255),
+    connected_at TIMESTAMPTZ DEFAULT NOW(),
+    disconnected_at TIMESTAMPTZ,
+    certificate_cn TEXT,  -- Client certificate Common Name
+    UNIQUE(depot_id, device_id)
+);
+
+-- HVAC telemetry (zone temperatures, HVAC power)
+CREATE TABLE hvac_telemetry (
+    time TIMESTAMPTZ NOT NULL,
+    zone_id UUID NOT NULL REFERENCES building_zones(zone_id),
+    temperature_c DOUBLE PRECISION,
+    hvac_power_kw DOUBLE PRECISION CHECK (hvac_power_kw >= 0),
+    setpoint_offset_c DOUBLE PRECISION,  -- Demand response offset applied
+    PRIMARY KEY (time, zone_id)
+);
+SELECT create_hypertable('hvac_telemetry', 'time');
+
+-- Building zones configuration
+CREATE TABLE building_zones (
+    zone_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    name VARCHAR(255) NOT NULL,
+    bacnet_device_id INTEGER NOT NULL,
+    temp_sensor_oid VARCHAR(100) NOT NULL,  -- e.g., "analogInput:1"
+    setpoint_cmd_oid VARCHAR(100) NOT NULL,  -- e.g., "analogValue:1"
+    active_setpoint_oid VARCHAR(100),        -- e.g., "analogValue:2"
+    thermal_mass_kwh_c DOUBLE PRECISION NOT NULL CHECK (thermal_mass_kwh_c > 0),
+    min_temp_c DOUBLE PRECISION DEFAULT 19.0,
+    max_temp_c DOUBLE PRECISION DEFAULT 24.0,
+    baseline_load_kw DOUBLE PRECISION DEFAULT 0,
+    hvac_cop DOUBLE PRECISION DEFAULT 3.5 CHECK (hvac_cop > 0),
+    ua_value DOUBLE PRECISION DEFAULT 0.5 CHECK (ua_value > 0),
+    max_hvac_power_kw DOUBLE PRECISION DEFAULT 50.0 CHECK (max_hvac_power_kw > 0),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT unique_zone_sensor UNIQUE (depot_id, bacnet_device_id, temp_sensor_oid)
+);
+```
+
+### Step 6.5: HVAC Thermal Dynamics Constraints
+
+Add to `src/core/optimizer/milp_model.py`:
+
+```python
+def add_hvac_constraints(model, zones: list['BuildingZone'], ambient_temp: list[float]):
+    """Add HVAC thermal dynamics constraints.
+    
+    Per PRD v2.7 Section 8.1 Constraints 13-15b.
+    
+    Thermal dynamics model building as "thermal battery":
+    - Pre-cool during cheap periods (charging)
+    - Let temperature drift during peaks (discharging)
+    """
+    for z in zones:
+        zone_idx = z.zone_id
+        
+        # Variables
+        model.T_zone[zone_idx, :] = pyo.Var(model.T, bounds=(z.min_temp_c, z.max_temp_c))
+        model.P_hvac[zone_idx, :] = pyo.Var(model.T, bounds=(0, z.max_hvac_power_kw))
+        
+        # Constraint 13: Thermal dynamics
+        def thermal_dynamics_rule(model, t):
+            if t == 0:
+                return model.T_zone[zone_idx, t] == z.current_temp_c
+            
+            # RC thermal model: T[t] = T[t-1] + (UA*(T_amb - T[t-1]) + COP*P_hvac) * dt / C
+            dt = model.delta_t  # hours
+            T_prev = model.T_zone[zone_idx, t-1]
+            T_amb = ambient_temp[t]
+            
+            heat_transfer = z.ua_value * (T_amb - T_prev)  # kW
+            hvac_effect = z.hvac_cop * model.P_hvac[zone_idx, t-1]  # kW (cooling = negative)
+            
+            dT = (heat_transfer - hvac_effect) * dt / z.thermal_mass_kwh_c
+            return model.T_zone[zone_idx, t] == T_prev + dT
+        
+        model.thermal_dynamics[zone_idx] = pyo.Constraint(model.T, rule=thermal_dynamics_rule)
+        
+        # Constraint 14: HVAC power limits
+        def hvac_power_rule(model, t):
+            return model.P_hvac[zone_idx, t] <= z.max_hvac_power_kw
+        
+        model.hvac_power_limit[zone_idx] = pyo.Constraint(model.T, rule=hvac_power_rule)
+        
+        # Constraint 15: HVAC ramp rate
+        def hvac_ramp_rule(model, t):
+            if t == 0:
+                return pyo.Constraint.Skip
+            return abs(model.P_hvac[zone_idx, t] - model.P_hvac[zone_idx, t-1]) <= z.hvac_ramp_kw_per_timestep
+        
+        model.hvac_ramp[zone_idx] = pyo.Constraint(model.T, rule=hvac_ramp_rule)
+    
+    return model
+```
+
+**Verification:**
+- [ ] BACnet/SC Hub starts and accepts device connections
+- [ ] Zone temperature readings work via BACnet
+- [ ] Baseline setpoint reading works
+- [ ] Setpoint offset calculation correct (T_optimal - T_baseline)
+- [ ] Safety clamping enforced (min/max temp bounds)
+- [ ] Thermal dynamics constraints in optimization
+- [ ] HVAC power included in grid power calculation
+- [ ] Pre-cooling scheduled during low-cost periods
+
+---
+
+## PHASE 6.5: DISPATCH VALIDATION
+
+### Overview
+
+Pre-dispatch validation prevents sending commands to unavailable devices.
+Handles race conditions between state assembly and command dispatch.
+
+**Reference:** PRD v2.7 Section 8.7
+
+### Step 6.5.1: Dispatcher with Validation
+
+Create `src/core/optimizer/dispatcher.py`:
+
+```python
+"""Dispatch validation and command execution.
+
+Implements PRD v2.7 Section 8.7: Pre-dispatch checks.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Optional
+from uuid import UUID
+
+logger = logging.getLogger(__name__)
+
+
+class Dispatcher:
+    """Handles command dispatch with pre-validation."""
+    
+    def __init__(self, db_pool, ocpp_client, bacnet_hub):
+        self.db = db_pool
+        self.ocpp_client = ocpp_client
+        self.bacnet_hub = bacnet_hub
+    
+    async def dispatch_charging_profiles(
+        self,
+        profiles: dict[str, dict],
+        run_id: UUID
+    ) -> dict[str, str]:
+        """Dispatch SetChargingProfile commands with validation.
+        
+        Per PRD v2.7 Section 8.7:
+        - Validate charger status immediately before dispatch
+        - Skip commands to unavailable chargers (Faulted, Unavailable, Reserved)
+        - Log skipped commands, do NOT re-run optimization
+        
+        Returns:
+            Dict of charger_id → status ('dispatched', 'skipped')
+        """
+        results = {}
+        
+        for charger_id, profile in profiles.items():
+            # Pre-dispatch validation
+            is_valid = await self._validate_charger_before_dispatch(charger_id)
+            
+            if not is_valid:
+                results[charger_id] = 'skipped'
+                await self._log_dispatch_skip(charger_id, run_id, 'charger_unavailable')
+                continue
+            
+            # Send command
+            try:
+                response = await self.ocpp_client.send_charging_profile(charger_id, profile)
+                results[charger_id] = 'dispatched' if response.get('status') == 'Accepted' else 'rejected'
+            except Exception as e:
+                logger.error(f"Failed to dispatch to charger {charger_id}: {e}")
+                results[charger_id] = 'error'
+        
+        return results
+    
+    async def dispatch_hvac_setpoints(
+        self,
+        setpoint_offsets: dict[UUID, float],
+        zones: dict[UUID, 'BuildingZone'],
+        run_id: UUID
+    ) -> dict[UUID, str]:
+        """Dispatch HVAC setpoint offset commands with validation.
+        
+        Per PRD v2.7 Section 8.7:
+        - Validate BACnet device connectivity before dispatch
+        - Validate offset won't violate safety bounds
+        - Skip commands to disconnected devices
+        
+        Returns:
+            Dict of zone_id → status ('dispatched', 'skipped')
+        """
+        results = {}
+        
+        for zone_id, offset in setpoint_offsets.items():
+            zone = zones[zone_id]
+            
+            # Pre-dispatch validation
+            is_valid = await self._validate_bacnet_before_dispatch(
+                zone.bacnet_device_id, zone_id, offset, zone
+            )
+            
+            if not is_valid:
+                results[zone_id] = 'skipped'
+                await self._log_dispatch_skip(str(zone_id), run_id, 'device_unavailable')
+                continue
+            
+            # Read baseline setpoint
+            baseline = await self.bacnet_hub.read_baseline_setpoint(zone)
+            if baseline is None:
+                baseline = (zone.min_temp_c + zone.max_temp_c) / 2  # Use midpoint as fallback
+                logger.warning(f"Using fallback baseline setpoint {baseline}°C for zone {zone_id}")
+            
+            # Send command
+            success = await self.bacnet_hub.write_setpoint_offset(zone, offset, baseline)
+            results[zone_id] = 'dispatched' if success else 'error'
+        
+        return results
+    
+    async def _validate_charger_before_dispatch(self, charger_id: str) -> bool:
+        """Check charger status immediately before dispatch.
+        
+        Returns False for Faulted, Unavailable, or Reserved status.
+        """
+        # Query latest status (< 100ms latency target)
+        status = await self.db.fetchval("""
+            SELECT status FROM chargers WHERE charger_id = $1
+        """, charger_id)
+        
+        if status in ('Faulted', 'Unavailable', 'Reserved'):
+            logger.warning(f"Skipping dispatch to charger {charger_id}: status={status}")
+            return False
+        
+        if status == 'Finishing':
+            logger.info(f"Charger {charger_id} finishing session, command may be rejected")
+        
+        return True
+    
+    async def _validate_bacnet_before_dispatch(
+        self,
+        device_id: int,
+        zone_id: UUID,
+        offset: float,
+        zone: 'BuildingZone'
+    ) -> bool:
+        """Check BACnet device connectivity and bounds before dispatch."""
+        # Check device connectivity
+        device = await self.db.fetchrow("""
+            SELECT disconnected_at FROM bacnet_devices 
+            WHERE depot_id = $1 AND device_id = $2
+        """, zone.depot_id, device_id)
+        
+        if device is None or device['disconnected_at'] is not None:
+            logger.warning(f"Skipping dispatch to BACnet device {device_id}: disconnected")
+            return False
+        
+        # Validate bounds (redundant safety check)
+        # Assume baseline = current temp for validation
+        effective = zone.current_temp_c + offset
+        if effective < zone.min_temp_c or effective > zone.max_temp_c:
+            logger.warning(f"Offset {offset}°C may violate bounds for zone {zone_id}")
+            # Don't skip - let clamping handle it
+        
+        return True
+    
+    async def _log_dispatch_skip(self, device_id: str, run_id: UUID, reason: str):
+        """Log skipped dispatch command for audit."""
+        await self.db.execute("""
+            INSERT INTO charging_commands (run_id, charger_id, status, profile_json)
+            VALUES ($1, $2, 'skipped', $3)
+        """, run_id, device_id, {'skip_reason': reason})
+        
+        logger.info(f"Dispatch skipped: device={device_id}, reason={reason}, run_id={run_id}")
+```
+
+**Verification:**
+- [ ] Charger status checked before SetChargingProfile
+- [ ] Commands skipped for Faulted/Unavailable/Reserved chargers
+- [ ] BACnet device connectivity checked before setpoint dispatch
+- [ ] Skipped commands logged with reason
+- [ ] No re-optimization on dispatch failures (use next cycle)
+
+---
+
+## PHASE 7: UNIT TESTS
 
 ### Step 5.1: Realistic Test Fixtures
 
@@ -2698,7 +3688,7 @@ class TestReturnTimeDeviation:
 
 ---
 
-## PHASE 6: INTEGRATION TESTS
+## PHASE 8: INTEGRATION TESTS
 
 ### Step 6.1: Full Pipeline Test
 
@@ -2798,7 +3788,7 @@ class TestAT07BuildingLoadIntegration:
 
 ---
 
-## PHASE 7: DEPLOYMENT
+## PHASE 9: DEPLOYMENT
 
 ### Step 7.1: Docker Configuration
 
@@ -2898,7 +3888,7 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 ## Development Milestones Checklist
 
 ### Milestone 1: Core Optimization Engine
-- [ ] Data models implemented (DepotConfig, DepotState)
+- [ ] Data models implemented (DepotConfig, DepotState, BuildingZone)
 - [ ] MILP model builds with Gurobi
 - [ ] HiGHS fallback solver implemented (automatic on Gurobi failure)
 - [ ] Solver finds optimal/feasible solutions
@@ -2907,10 +3897,11 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 - [ ] Building load integrated in grid power
 - [ ] Warm-starting implemented (> 3x speedup target)
 - [ ] Infeasibility handling with degraded solve (per PRD Section 8.5.1)
+- [ ] Battery efficiency model correct (split √η each direction)
 
 ### Milestone 2: Data Infrastructure
 - [ ] TimescaleDB schema deployed
-- [ ] OCPP adapter functional (including max_charge_kw extraction)
+- [ ] OCPP adapter functional (1.6J ONLY, max_charge_kw extraction)
 - [ ] Price feed adapter functional
 - [ ] Weather adapter functional
 - [ ] Building load adapter functional
@@ -2921,6 +3912,7 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 - [ ] Return time deviation trigger (>15 min late)
 - [ ] Scheduled trigger (hourly 24/7) - per PRD Section 5.1
 - [ ] Inter-depot handoff trigger (on message receipt)
+- [ ] VDV 463 ChargingRequest trigger (on update)
 - [ ] Trigger cooldown (5 min per depot) to prevent rapid re-optimization
 
 ### Milestone 4: Inter-Depot Coordination
@@ -2937,37 +3929,102 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 - [ ] Parameterized SQL queries (no interpolation)
 - [ ] Data freshness checks before optimization (all PRD thresholds)
 - [ ] JWT authentication for API endpoints (per PRD Section 10.3)
-- [ ] TLS for all exposed ports (HTTPS for API, WSS for OCPP)
+- [ ] TLS for all exposed ports (HTTPS for API, WSS for OCPP/VDV463/BACnet)
 - [ ] Secrets management (environment variables, no hardcoded secrets)
 - [ ] Security folder structure (src/security/)
 
-### Milestone 5: Post-Optimization Allocation
+### Milestone 5: VDV 463 Transit Integration
+- [ ] VDV 463 WebSocket handler at `/vdv463/{presystem_id}`
+- [ ] BootNotification handling
+- [ ] ProvideChargingRequests parsing and storage
+- [ ] Vehicle ID resolution (external_id → UUID)
+- [ ] InvalidVehicleId error handling
+- [ ] ProvideChargingInformation export (every 15 sec)
+  - [ ] Outbound payloads conform to `ProvideChargingInformationRequest.json` schema (`depotInfoList` → `ChargingStationInfo` → `ChargingPointInfo` → `ChargingProcessInfo`)
+  - [ ] `processStatus` values use the official `ProcessStatus` enum, including `ChargingRejectedTechnically` for technical rejections
+  - [ ] Broadcast task runs for all active VDV 463 connections, using shared depot state from TimescaleDB
+- [ ] Manual preconditioning support
+- [ ] Automatic preconditioning calculation
+- [ ] Preconditioning as soft constraint (M=1000 penalty)
+- [ ] Preconditioning curtailment under site limit
+- [ ] VDV 463 database schema deployed
+
+**MVP vs Full ProvideChargingInformation Scope:**
+- MVP implements a **minimal but schema-valid subset**:
+  - Populate required `DepotInfo`, `ChargingStationInfo`, and `ChargingPointInfo` fields.
+  - Populate `ChargingProcessInfo` for active processes with correct `processStatus` and basic electrical data.
+  - Populate `VehicleInfo.vehicleId`, `VehicleInfo.tractionBatteryInfo.stateOfCharge`, and `VehicleChargingStatus`.
+- Post-MVP / Phase 5.x tasks:
+  - Map charger, charging point, and vehicle fault information into `ChargingStationFaultInfo`, `ChargingPointFaultInfo`, and `VehicleFaultInfo` when telemetry is available.
+  - Populate `scheduledChargingProcessList` with future charging processes derived from the optimizer.
+
+**Operator-facing error surfacing:**
+- [ ] All VDV 463 protocol errors (`InvalidVehicleId`, `InvalidChargingPointId`, `InvalidTimeWindow`, `DuplicateRequestId`, `SchemaValidationError`, etc.) are:
+  - [ ] Returned as VDV 463 Error messages (MessageType 3) with `errorCode` and `errorDescription` in a Favonius-defined error payload (VDV 463 does not prescribe a concrete JSON schema for MessageType 3)
+  - [ ] Logged with structured fields (depot_id, presystem_id, chargingRequestId, errorCode) suitable for later analytics and UI
+- [ ] Error records are stored in a queryable form (TimescaleDB table or logging sink) to support a future operator diagnostics UI
+
+### Milestone 6: BACnet/SC Building Integration
+- [ ] BACnet/SC Hub implementation (bacpypes3)
+- [ ] Device-to-zone mapping (device_id + oid → zone_id)
+- [ ] Zone temperature reading
+- [ ] Baseline setpoint reading
+- [ ] Setpoint offset calculation (Constraint 15b)
+- [ ] Safety clamping (min/max temp bounds)
+- [ ] Thermal dynamics constraints in MILP
+- [ ] HVAC power in grid power calculation
+- [ ] Pre-cooling optimization working
+- [ ] BACnet database schema deployed
+
+### Milestone 6.5: Dispatch Validation
+- [ ] Pre-dispatch charger status check
+- [ ] Skip dispatch to Faulted/Unavailable/Reserved chargers
+- [ ] Pre-dispatch BACnet connectivity check
+- [ ] Dispatch skip logging for audit
+- [ ] No re-optimization on dispatch failure (eventual consistency)
+
+### Milestone 7: Post-Optimization Allocation
 - [ ] Charger allocation algorithm
 - [ ] Physical accessibility constraints
 - [ ] OCPP SetChargingProfile dispatch
+- [ ] BACnet setpoint offset dispatch
 
-### Milestone 6: Testing
+### Milestone 8: Testing
 - [ ] Unit tests with ≥90% coverage
 - [ ] Realistic fixtures with UUIDs
+- [ ] VDV 463 integration tests (AT-08 through AT-11)
+  - [ ] Use `BootNotification`, `ProvideChargingRequests`, and `ProvideChargingInformation` JSON messages that validate against the official VDV 463 schemas (including empty-object payloads for all *Response messages)
+  - [ ] Verify correct mapping of arrival/departure times, SoC targets, priority, and preconditioning into optimization (per PRD AT-08/AT-09)
+  - [ ] Assert correct error behavior for invalid vehicle/charging point IDs, invalid time windows, and schema violations
+  - [ ] Confirm that `ProvideChargingInformation` reflects optimization results and preconditioning status as described in PRD Section 9.6
+- [ ] BACnet integration tests (AT-14, AT-15)
+- [ ] Solver fallback test (AT-12)
+- [ ] Preconditioning curtailment test (AT-13)
 - [ ] Integration tests pass
 - [ ] Performance benchmarks met
 
-### Milestone 7: Deployment
+### Milestone 9: Deployment
 - [ ] Docker containers built
 - [ ] Docker Compose stack running
 - [ ] Gurobi license configured
 - [ ] Health endpoint operational
+- [ ] VDV 463 endpoint accessible
+- [ ] BACnet/SC Hub running
 
 ---
 
 ## Post-MVP Roadmap
 
 1. **V2G Support**: Add discharge capabilities and grid services
-2. **Multi-depot Coordination**: Central coordinator for fleet-wide optimization
-3. **Advanced Forecasting**: RL-based price prediction if needed
-4. **Additional Connectors**: CHAdeMO, Type2, NACS support
-5. **Customer Dashboard**: Real-time visualization and ROI tracking
-6. **Solar Integration**: Re-add solar predictor for self-consumption
+2. **OCPP 2.0.1 Native Support**: Add native OCPP 2.0.1 protocol support (currently 1.6J only)
+3. **Multi-depot Coordination**: Central coordinator for fleet-wide optimization
+4. **Advanced Forecasting**: RL-based price prediction if needed
+5. **Additional Connectors**: CHAdeMO, Type2, NACS support
+6. **Customer Dashboard**: Real-time visualization and ROI tracking
+7. **Solar Integration**: Re-add solar predictor for self-consumption
+8. **OpenADR Integration**: Demand response revenue streams
+9. **OCPI Integration**: Charge point roaming for public charging
+10. **VDV 261 Full Stack**: Full ISO 15118 Plug & Charge with VDV 261
 
 ---
 
@@ -2981,6 +4038,7 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 | 2.2 | 2025-12-13 | Claude | Final alignment fixes: Added battery_efficiency to DepotConfig, fixed data freshness thresholds (prices: 24h, building load: 30min), added lat/lon CHECK constraints to telemetry, added charger_id to OCPP handler, updated all PRD.md refs to PRD_v2.md, use config.battery_efficiency in MILP |
 | 2.3 | 2025-01-XX | Claude | Architecture updates: Documented integrated system architecture (Main API primary, WebSocket Handler telemetry-only), added Phase 4 internal API specification, documented backup heuristic approach, removed Julia references (already done), documented V2G removal, updated component responsibilities to reflect service split |
 | 2.4 | 2025-01-XX | Claude | OCPP simplification: Removed dual server architecture, consolidated to single OCPP 1.6 server in WebSocket Handler that handles OCPP 2+ messages, updated Phase 4 architecture context to reflect single server approach |
+| 3.0 | 2025-01-19 | Claude + Joris | **Major update aligned with PRD v2.7**: (1) **OCPP 1.6J-only clarification** - corrected that 2.0.1 is NOT wire-compatible, chargers MUST use 1.6J subprotocol; (2) **PHASE 5: VDV 463 Integration** - added complete transit operations integration with WebSocket handler, vehicle ID resolution, preconditioning as soft constraint; (3) **PHASE 6: BACnet/SC Integration** - added building HVAC control with thermal flywheel optimization, setpoint offset calculation (Constraint 15b); (4) **PHASE 6.5: Dispatch Validation** - added pre-dispatch checks for charger/device status; (5) Updated repository structure with new adapter directories; (6) Added bacpypes3 dependency; (7) Added VDV 463 and BACnet database schemas; (8) Updated BuildingZone dataclass with max_hvac_power_kw and active_setpoint_oid; (9) Renumbered phases (Unit Tests → 7, Integration → 8, Deployment → 9); (10) Expanded milestones for new integrations; (11) Updated Post-MVP roadmap |
 
 ---
 

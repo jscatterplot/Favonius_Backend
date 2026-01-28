@@ -7,7 +7,7 @@ You are a senior Python/Julia developer specializing in energy systems optimizat
 
 ## Single Source of Truth
 
-The PRD_v2.md file is the **authoritative specification** for this project. Always reference it when implementing features:
+The `docs/PRD_v2_7_Building_Integration.md` file is the **authoritative specification** for this project (superseding older PRD versions). Always reference it when implementing features:
 - Use `@PRD_v2.md#section-name` to reference specific sections
 - Check acceptance criteria before marking tasks complete
 - Data models in PRD Section 6 are authoritative - do not deviate without updating the PRD
@@ -17,6 +17,7 @@ The PRD_v2.md file is the **authoritative specification** for this project. Alwa
 For detailed patterns and best practices, refer to domain-specific rules in `.cursor/rules/`:
 - `optimization.mdc` - MILP formulation patterns (PRD Section 8)
 - `ocpp.mdc` - OCPP protocol patterns (PRD Section 9.1)
+- `vdv463.mdc` - VDV 463 transit operations protocol patterns (PRD Section 9.6)
 - `timescale.mdc` - TimescaleDB best practices (PRD Section 6)
 
 ## Critical Constraints (HARD REQUIREMENTS)
@@ -67,6 +68,20 @@ These constraints MUST NEVER be relaxed:
 - Extract max_charge_kw from MeterValues when available (PRD Section 8.4)
 - Store charger_id in telemetry for all MeterValues (PRD Section 6.1)
 - Map idTag to vehicle_id for vehicle-charger association (PRD Section 9.1)
+
+### When working with VDV 463:
+- Reference `docs/PRD_v2_7_Building_Integration.md#9.6-vdv-463-transit-operations-integration` for message formats, mappings, and behavior.
+- Treat VDV 463 as the **standard interface** for BMS/ITCS transit operations (CMS role in Favonius).
+- Validate all VDV 463 messages (inbound and outbound) against the official JSON schemas in `https://github.com/VDVde/VDV463/tree/main/schema`:
+  - `MessageStructure.json`
+  - `ProvideChargingRequestsRequest.json`
+  - `ProvideChargingInformationRequest.json`
+- Use a **single unified WebSocket handler service** (shared with OCPP and BACnet/SC) and route by path:
+  - `/ocpp/{charge_point_id}`
+  - `/vdv463/{presystem_id}`
+  - `/bacnet/{device_id}`
+- On validation or semantic errors (e.g., `InvalidVehicleId`, `InvalidChargingPointId`), return a VDV 463 Error message (MessageType 3) and log structured error details for future operator UI/diagnostics.
+- For protocol-specific patterns and examples, see `vdv463.mdc`.
 
 ### When working with TimescaleDB:
 - Reference PRD_v2.md#6-data-models for schema

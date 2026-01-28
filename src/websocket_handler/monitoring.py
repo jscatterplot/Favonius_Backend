@@ -88,6 +88,42 @@ ERRORS_TOTAL = _get_or_create_metric(
     ["error_type", "station_id"]
 )
 
+# VDV 463 specific metrics
+VDV463_MESSAGES_RECEIVED_TOTAL = _get_or_create_metric(
+    Counter,
+    "vdv463_messages_received_total",
+    "Total number of VDV 463 messages received",
+    ["depot_id", "presystem_id", "message_name"]
+)
+
+VDV463_MESSAGES_SENT_TOTAL = _get_or_create_metric(
+    Counter,
+    "vdv463_messages_sent_total",
+    "Total number of VDV 463 messages sent",
+    ["depot_id", "presystem_id", "message_name"]
+)
+
+VDV463_ERRORS_TOTAL = _get_or_create_metric(
+    Counter,
+    "vdv463_errors_total",
+    "Total number of VDV 463 errors",
+    ["depot_id", "presystem_id", "error_code"]
+)
+
+VDV463_VALIDATION_DURATION = _get_or_create_metric(
+    Histogram,
+    "vdv463_validation_duration_seconds",
+    "VDV 463 message validation duration",
+    ["message_action"]
+)
+
+VDV463_VALIDATION_WARNINGS_TOTAL = _get_or_create_metric(
+    Counter,
+    "vdv463_validation_warnings_total",
+    "Total number of VDV 463 validation warnings",
+    ["depot_id", "presystem_id", "message_action"]
+)
+
 # Note: Other metrics are defined in server.py to avoid duplication
 
 # Redis metrics removed for simplification

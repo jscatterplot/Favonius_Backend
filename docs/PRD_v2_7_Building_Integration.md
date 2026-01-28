@@ -1,6 +1,6 @@
 # Product Requirements Document
 ## Favonius Energy — EV Fleet Depot Optimization Platform
-### Version 2.5 (MVP) | January 2025
+### Version 2.7 (MVP) | January 2025
 
 ---
 
@@ -53,7 +53,9 @@ Favonius Energy delivers an integrated depot energy management platform that coo
 | Re-optimization triggers | Grid services participation |
 | Single-depot operation | Full carbon accounting |
 | Inter-depot vehicle handoff messaging | Multi-connector support (CHAdeMO, Type2, NACS) |
-| Building load integration | — |
+| Building load integration | OCPI roaming integration |
+| **VDV 463 transit operations integration** | OpenADR demand response |
+| **VDV 261 bus preconditioning (via VDV 463)** | — |
 
 ### 1.3 Success Metrics
 
@@ -129,9 +131,11 @@ Each depot runs its own optimization independently. Vehicles can move between de
 | **Gaussian Process surrogate** | Provides uncertainty estimates; proven in Stanford research (R² 0.84-0.94) |
 | **Python + Pyomo + Gurobi** | Production-grade solver with excellent performance and constraint handling |
 | **TimescaleDB for telemetry** | Optimized for time-series; compression for long-term storage |
-| **OCPP 1.6 primary, handles 2+ messages** | 1.6 is dominant in field; OCPP 2+ chargers can connect but use 1.6 protocol format |
+| **OCPP 1.6J only (MVP)** | 1.6J is dominant in field; chargers supporting 2.0.1 MUST be configured to use 1.6J subprotocol (not wire-compatible) |
 | **CCS connector only (MVP)** | Simplifies physical constraints; dominant DC fast charging standard |
 | **Building load required** | Enables accurate grid power tracking; sellable feature |
+| **VDV 463 for transit operations** | Standard interface for European transit market; enables ITCS/BMS integration |
+| **VDV 261 preconditioning via VDV 463** | VDV 463 `manualPreconditioning`/`automaticPreconditioning` fields handle preconditioning requests without full VDV 261 ISO 15118 stack |
 
 ### 3.3 MVP Simplifications
 
@@ -143,7 +147,7 @@ Each depot runs its own optimization independently. Vehicles can move between de
 | Multi-depot | Single depot optimization with handoff messaging | Add coordination layer |
 | Connector types | CCS only | Add CHAdeMO, Type2, NACS support |
 | Julia MIP solver | Removed; using Pyomo/Gurobi/HiGHS only | N/A (decision made) |
-| OCPP communication | Single OCPP 1.6 server in WebSocket Handler (handles OCPP 2+ messages) | Main API communicates via internal API (Phase 4) |
+| OCPP communication | Unified WebSocket Handler (Port 9000) handles OCPP 1.6J and VDV 463; chargers MUST use 1.6J subprotocol | Main API communicates via internal API (Phase 4); native OCPP 2.0.1 support |
 
 ---
 
@@ -250,6 +254,38 @@ SO THAT charging can be planned before arrival
 - [ ] Handoff logged for audit trail
 - [ ] Incoming vehicle appears in destination depot state assembly
 
+#### US-07: Transit Operations Integration (VDV 463)
+```
+AS A transit operator using a Depot Management System (BMS) or ITCS
+I WANT Favonius to receive charging requests with schedules and priorities
+SO THAT charging is coordinated with transit operations automatically
+```
+
+**Acceptance Criteria:**
+- [ ] Platform accepts VDV 463 WebSocket connections from upstream systems (BMS/ITCS)
+- [ ] Platform receives `ProvideChargingRequests` messages with vehicle schedules
+- [ ] ChargingRequest data (arrival time, departure time, minTargetSoc, maxTargetSoc, priority, optional preconditioning) is incorporated into optimization
+- [ ] All inbound and outbound VDV 463 messages validate successfully against the official JSON schemas from `VDVde/VDV463`
+- [ ] Platform sends `ProvideChargingInformation` messages with depot status every 15 seconds (cyclic CMS → BMS/ITCS broadcast)
+- [ ] ChargingInformation payloads conform to the `ProvideChargingInformationRequest.json` schema (e.g., `depotInfoList` → `ChargingStationInfo` → `ChargingPointInfo` → `ChargingProcessInfo`)
+- [ ] Platform validates charging point IDs against registered chargers
+
+#### US-08: Bus Preconditioning (VDV 463/261)
+```
+AS A transit operator
+I WANT buses to be preconditioned (heated/cooled) before departure
+SO THAT drivers and passengers have comfortable temperatures from route start
+AND battery range is preserved (energy comes from grid, not battery)
+```
+
+**Acceptance Criteria:**
+- [ ] Platform receives preconditioning requests via VDV 463 `manualPreconditioning` or `automaticPreconditioning` fields
+- [ ] Manual preconditioning: Platform schedules HVAC start at specified `hvacPreconditioningStartTime`
+- [ ] Automatic preconditioning: Platform calculates start time based on `ambientTemperature`, `targetTemperature`, `departureTime`
+- [ ] Preconditioning energy consumption is included in charging schedule optimization
+- [ ] Platform reports preconditioning status in `ProvideChargingInformation` messages
+- [ ] Preconditioning is only initiated while vehicle is connected to charger
+
 ---
 
 ## 5. System Architecture
@@ -259,7 +295,7 @@ SO THAT charging can be planned before arrival
 **Service Architecture:**
 The platform uses a **two-service architecture**:
 - **Main API Backend**: Primary optimization service (MILP, triggers, control)
-- **WebSocket Handler Service**: Telemetry-only service (OCPP communication, data storage)
+- **WebSocket Handler Service**: Unified connectivity service (OCPP, VDV 463, and BACnet/SC WebSocket communication, telemetry ingestion, data storage)
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -323,20 +359,32 @@ The platform uses a **two-service architecture**:
      ▼                    ▼                    ▼                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │              WEBSOCKET HANDLER SERVICE                              │
-│              (Telemetry & OCPP Communication)                       │
+│         (Unified Connectivity: OCPP + VDV 463)                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  OCPP 1.6 WebSocket Server                                   │  │
-│  │  - Handles OCPP 2+ messages (backward compatible)            │  │
-│  │  - Receives MeterValues, StatusNotification                  │  │
-│  │  - Sends SetChargingProfile (from Main API)                  │  │
+│  │  Unified WebSocket Server (Port 9000, WSS)                  │  │
+│  │  - OCPP 1.6: ws://.../ocpp/{charge_point_id}               │  │
+│  │    • Handles OCPP 2+ messages (backward compatible)         │  │
+│  │    • Receives MeterValues, StatusNotification                │  │
+│  │    • Sends SetChargingProfile (from Main API)                │  │
+│  │  - VDV 463: ws://.../vdv463/{presystem_id}                   │  │
+│  │    • Receives ProvideChargingRequests (BMS/ITCS → CMS)       │  │
+│  │    • Sends ProvideChargingInformation (CMS → BMS/ITCS)       │  │
+│  │    • Background broadcast task (every 15 seconds)            │  │
+│  │  - BACnet/SC Hub: ws://.../bacnet/{device_id}                │  │
+│  │    • Receives zone temperature, HVAC power telemetry         │  │
+│  │    • Sends setpoint offset commands (from Main API)          │  │
+│  │    • Thermal flywheel optimization support                   │  │
+│  │  - TLS termination, origin validation, rate limiting        │  │
 │  └─────────────────────────────────────────────────────────────┘  │
 │           │                                                          │
 │           ▼                                                          │
 │  ┌─────────────────────────────────────────────────────────────┐  │
 │  │  Telemetry Ingestion                                        │  │
-│  │  - Stores MeterValues to TimescaleDB                        │  │
+│  │  - Stores OCPP MeterValues to TimescaleDB                   │  │
+│  │  - Stores VDV 463 ChargingRequests to TimescaleDB           │  │
+│  │  - Stores BACnet zone temperatures and HVAC power to TimescaleDB │
 │  │  - Updates vehicle max_charge_kw from OCPP                  │  │
 │  │  - Tracks charger_id for all telemetry                      │  │
 │  └─────────────────────────────────────────────────────────────┘  │
@@ -376,7 +424,50 @@ The platform uses a **two-service architecture**:
 │  │  • charger_vehicle_access│  │  • charging_commands     │       │
 │  │                          │  │  • interdepot_messages   │       │
 │  │  Used by: Both services  │  │  • trigger_log           │       │
+│  │                          │  │  • vdv463_charging_requests │    │
+│  │                          │  │  • vdv463_connections    │       │
+│  │                          │  │  Used by: Both services  │       │
+│  └──────────────────────────┘  └──────────────────────────┘       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│              EXTERNAL CONNECTIONS TO WEBSOCKET HANDLER              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │
+│  │   Chargers   │  │  BMS/ITCS    │  │ Building BMS │            │
+│  │  (OCPP 1.6)  │  │ (VDV 463)    │  │ (BACnet/SC)  │            │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘            │
+│         │                 │                 │                     │
+│         │ wss://.../ocpp/ │ wss://.../vdv463│ wss://.../bacnet/   │
+│         │ {id}            │ /{id}           │ {device_id}        │
+│         │                 │                 │                     │
+│         └─────────────────┴─────────────────┴─────────────────────┘
+│                          │                                          │
+│                          ▼                                          │
+│              WebSocket Handler (Port 9000)                          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DUAL DATABASE ARCHITECTURE                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐       │
+│  │  SUPABASE                │  │  TIMESCALEDB              │       │
+│  │  (PostgreSQL)            │  │  (PostgreSQL Extension)   │       │
 │  │                          │  │                          │       │
+│  │  Static/Reference Data:  │  │  Time-Series Data:       │       │
+│  │  • depots                │  │  • telemetry             │       │
+│  │  • vehicles              │  │  • prices                │       │
+│  │  • chargers              │  │  • weather_forecasts     │       │
+│  │  • schedules             │  │  • building_load          │       │
+│  │  • battery_storage       │  │  • optimization_runs     │       │
+│  │  • charger_vehicle_access│  │  • charging_commands     │       │
+│  │                          │  │  • interdepot_messages   │       │
+│  │  Used by: Both services  │  │  • trigger_log           │       │
+│  │                          │  │  • vdv463_charging_requests │    │
+│  │                          │  │  • vdv463_connections    │       │
 │  │                          │  │  Used by: Both services  │       │
 │  └──────────────────────────┘  └──────────────────────────┘       │
 │                                                                     │
@@ -391,6 +482,7 @@ The platform uses a **two-service architecture**:
 │  Vehicle SoC deviation      │ Event-driven     │ > 5%               │
 │  Vehicle return time        │ Event-driven     │ > 15 minutes late  │
 │  Inter-depot handoff        │ Event-driven     │ On message receipt │
+│  VDV 463 ChargingRequest    │ Event-driven     │ On new/changed req │
 │  Price change               │ On ingestion     │ > 25% OR > $25/MWh │
 │  Scheduled (default)        │ Periodic         │ Hourly 24/7        │
 │                                                                     │
@@ -403,7 +495,7 @@ The platform uses a **two-service architecture**:
 **Architecture Overview:**
 The platform uses an integrated architecture with two main services:
 - **Main API Backend**: Primary optimization service running Pyomo/Gurobi optimizer
-- **WebSocket Handler Service**: Telemetry-only service for OCPP communication and data storage
+- **WebSocket Handler Service**: Unified connectivity service for OCPP and VDV 463 WebSocket communication, telemetry ingestion, and data storage
 
 | Component | Responsibility | Technology | Service |
 |-----------|---------------|------------|---------|
@@ -411,25 +503,28 @@ The platform uses an integrated architecture with two main services:
 | **Price Adapter** | Fetch TOU/CAISO prices | CAISO OASIS, utility APIs | Main API |
 | **Building Load Adapter** | Fetch building power consumption | Modbus meter, API, or forecast | Main API |
 | **OCPP Server** | Charger communication (OCPP 1.6, handles OCPP 2+ messages) | ocpp library, WebSocket | WebSocket Handler |
+| **VDV 463 Server** | Transit system integration (BMS/ITCS communication) | websockets, FastAPI | WebSocket Handler |
+| **VDV 463 Broadcast Task** | Periodic ProvideChargingInformation broadcast (every 15 seconds) | asyncio, background task | WebSocket Handler |
+| **BACnet/SC Hub** | Building HVAC control (BMS communication via BACnet Secure Connect) | bacpypes3, WebSocket | WebSocket Handler |
 | **Surrogate Model** | Energy consumption prediction | scikit-learn, gpytorch | Main API |
-| **State Assembler** | Aggregate inputs for optimizer | asyncpg, pandas | Main API |
+| **State Assembler** | Aggregate inputs for optimizer (including VDV 463 requests) | asyncpg, pandas | Main API |
 | **MILP Optimizer** | Generate optimal schedules | Pyomo, Gurobi (primary), HiGHS (fallback) | Main API |
 | **Heuristic Optimizer** | Backup optimization when main API unavailable | Heuristic algorithms | WebSocket Handler (backup only) |
 | **Charger Allocator** | Allocate aggregated power to individual chargers | Post-optimization allocation | Main API |
-| **Trigger Monitor** | Detect re-optimization conditions | asyncio | Main API |
-| **Control Dispatcher** | Send commands to hardware | OCPP, Modbus | Main API (via WebSocket Handler) |
+| **Trigger Monitor** | Detect re-optimization conditions (including VDV 463 updates) | asyncio | Main API |
+| **Control Dispatcher** | Send commands to hardware | OCPP, Modbus, BACnet/SC | Main API (via WebSocket Handler) |
 | **Handoff Manager** | Send/receive inter-depot messages | HTTP/WebSocket | Main API |
 | **API Server** | External interface | FastAPI, uvicorn | Main API |
 | **Internal API** | Charge point state queries for main API | HTTP REST | WebSocket Handler (planned) |
-| **Telemetry Ingestion** | Store OCPP MeterValues to TimescaleDB | asyncpg | WebSocket Handler |
+| **Telemetry Ingestion** | Store OCPP MeterValues, VDV 463 ChargingRequests, and BACnet HVAC telemetry to TimescaleDB | asyncpg | WebSocket Handler |
 | **Supabase** | Static/reference data storage | Supabase (PostgreSQL) | Both services |
-| **TimescaleDB** | Time-series data storage | TimescaleDB (PostgreSQL) | WebSocket Handler |
+| **TimescaleDB** | Time-series data storage | TimescaleDB (PostgreSQL) | Both services |
 
 ### 5.3 Data Flow
 
 **Service Architecture:**
 - **Main API Backend**: Runs optimization, manages triggers, dispatches commands
-- **WebSocket Handler**: Receives OCPP messages, stores telemetry, exposes internal API
+- **WebSocket Handler**: Unified connectivity service receiving OCPP, VDV 463, and BACnet/SC messages, storing telemetry, broadcasting VDV status, exposing internal API
 - **Communication**: Main API queries WebSocket Handler for charge point state (planned Phase 4)
 
 ```
@@ -437,6 +532,8 @@ The platform uses an integrated architecture with two main services:
    Weather API → Main API → weather_forecasts table (TimescaleDB)
    CAISO API → Main API → prices table (TimescaleDB)
    OCPP MeterValues → WebSocket Handler → telemetry table (TimescaleDB, includes vehicle max_charge_kw)
+   VDV 463 ProvideChargingRequests → WebSocket Handler → vdv463_charging_requests table (TimescaleDB)
+   BACnet/SC zone temperatures, HVAC power → WebSocket Handler → hvac_telemetry table (TimescaleDB)
    Fleet Mgmt System → Main API → schedules table (Supabase)
    Building Load Meter/API → Main API → building_load table (TimescaleDB)
    Inter-depot Messages → Main API → interdepot_messages table (TimescaleDB)
@@ -446,8 +543,10 @@ The platform uses an integrated architecture with two main services:
    Query: prices, schedules, depot config from Supabase
    Query: building load from TimescaleDB
    Query: pending inter-depot incoming vehicles (where arrival_time < horizon_end)
+   Query: active VDV 463 charging requests from vdv463_charging_requests table (TimescaleDB)
+   Query: current zone temperatures and HVAC power from hvac_telemetry table (TimescaleDB)
    
-   **Note**: Currently, Main API queries TimescaleDB directly for telemetry. In Phase 4, this will transition to querying via WebSocket Handler internal API for better separation of concerns and centralized telemetry management.
+   **Note**: Currently, Main API queries TimescaleDB directly for telemetry and VDV 463 requests. In Phase 4, this will transition to querying via WebSocket Handler internal API for better separation of concerns and centralized telemetry management.
 
    **Data Freshness Requirements:**
    | Data Type | Max Age | Fallback if Stale |
@@ -478,13 +577,15 @@ The platform uses an integrated architecture with two main services:
    Allocate: Aggregated charger power to individual chargers
    OCPP: SetChargingProfile to each charger (via WebSocket Handler - planned Phase 4)
    Modbus: Battery setpoints
+   BACnet/SC: HVAC setpoint offset commands to building zones (via WebSocket Handler)
    Database: Store optimization results to TimescaleDB
 
 5. MONITORING (Main API)
-   Event-driven triggers (SoC, return time, handoff):
+   Event-driven triggers (SoC, return time, handoff, VDV 463):
    - SoC deviation: Detected within 15 seconds of receiving new telemetry (from WebSocket Handler)
    - Return time deviation: Detected within 15 seconds of schedule update
    - Inter-depot handoff: Detected on message receipt
+   - VDV 463 ChargingRequest: Detected on new/changed request (from WebSocket Handler → TimescaleDB)
    - Optimization starts within 60 seconds of trigger detection
    
    Periodic triggers (price, scheduled):
@@ -493,11 +594,17 @@ The platform uses an integrated architecture with two main services:
    - Scheduled: Evaluated hourly 24/7
    - Optimization completes within 60 seconds of trigger
 
-6. INTER-DEPOT COORDINATION (on vehicle departure - Main API)
+6. VDV 463 EGRESS (WebSocket Handler - Background Task)
+   Every 15 seconds:
+   - Query: Latest depot status from TimescaleDB (optimization results + telemetry)
+   - Broadcast: ProvideChargingInformation to all connected VDV 463 clients
+   - Format: VDV 463 JSON array with depot status, charging stations, charging processes
+
+7. INTER-DEPOT COORDINATION (on vehicle departure - Main API)
    Send: Handoff message to destination depot
    Receive: Acknowledge and incorporate into next optimization
 
-7. BACKUP MODE (WebSocket Handler - Emergency Only)
+8. BACKUP MODE (WebSocket Handler - Emergency Only)
    **Activation Condition**: Main API unavailable for > 1 hour
    **Behavior**: WebSocket Handler activates heuristic optimizer
    - Uses simplified heuristic algorithms (not MILP)
@@ -875,6 +982,28 @@ class DepotConfig:
 
 
 @dataclass
+class BuildingZone:
+    """Building zone configuration for HVAC control."""
+    zone_id: UUID
+    depot_id: UUID
+    name: str
+    bacnet_device_id: int                     # BACnet device identifier
+    temp_sensor_oid: str                      # BACnet object ID for temperature sensor (e.g., "analogInput:1")
+    setpoint_cmd_oid: str                     # BACnet object ID for setpoint command (e.g., "analogValue:1")
+    active_setpoint_oid: Optional[str]        # BACnet object ID for reading baseline setpoint (e.g., "analogValue:2")
+    thermal_mass_kwh_c: float                 # Thermal mass (kWh per degree C)
+    current_temp_c: float                     # Current zone temperature
+    min_temp_c: float = 19.0                  # Minimum allowed temperature (safety limit)
+    max_temp_c: float = 24.0                  # Maximum allowed temperature (safety limit)
+    baseline_load_kw: float = 0.0             # Non-HVAC baseline load for this zone
+    max_hvac_power_kw: float = 50.0           # Maximum HVAC power for zone (kW)
+    hvac_cop: float = 3.5                     # HVAC Coefficient of Performance
+    ua_value: float = 0.5                     # Heat transfer coefficient (kW/°C) for thermal dynamics
+    hvac_response_lag_min: float = 5.0        # HVAC response lag (minutes)
+    hvac_ramp_kw_per_timestep: float = 5.0    # HVAC ramp rate limit (kW per timestep)
+
+
+@dataclass
 class DepotState:
     """Dynamic state for optimization."""
     vehicle_socs: dict[str, float]            # vehicle_id -> SoC [0,1]
@@ -885,7 +1014,10 @@ class DepotState:
     vehicle_availability: dict[str, list[bool]]  # vehicle_id -> availability per timestep
     energy_requirements: dict[str, float]     # vehicle_id -> kWh needed for next trip
     departure_times: dict[str, int]           # vehicle_id -> timestep index of departure
-    building_power: list[float]               # Building load per timestep (kW)
+    building_power: list[float]               # Building fixed load per timestep (kW, excludes HVAC)
+    zone_temperatures: dict[str, float]       # zone_id -> current temperature (°C)
+    ambient_temperatures: list[float]         # Ambient temperature per timestep (°C)
+    preconditioning_load_kw: list[float]      # Fixed VDV preconditioning load per timestep (kW)
     incoming_vehicles: list[IncomingVehicle] = field(default_factory=list)  # Inter-depot arrivals
 
 
@@ -1062,14 +1194,26 @@ Health check endpoint.
 
 ---
 
-### 7.2 WebSocket API (OCPP)
+### 7.2 WebSocket API (Unified: OCPP + VDV 463)
 
 **Architecture:**
-The platform implements a single OCPP 1.6 server in the WebSocket Handler service:
-- **OCPP 1.6 Server**: `ws://websocket-handler:9000/{ocpp_id}` - Single OCPP communication layer
-- **OCPP 2+ Compatibility**: OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 protocol format
-  - OCPP 2+ adds additional messages but maintains backward compatibility
-  - Server handles OCPP 2+ messages by responding in OCPP 1.6 format where applicable
+The platform implements a unified WebSocket Handler service (Port 9000) that handles both OCPP and VDV 463 protocols:
+
+- **OCPP 1.6J Endpoint**: `wss://chargers.favonius.com:9000/ocpp/{charge_point_id}` (or root path `/{charge_point_id}` for backward compatibility)
+  - Server implements OCPP 1.6J protocol only
+  - Chargers supporting OCPP 2.0.1/2.1 MUST be configured to use OCPP 1.6J subprotocol
+  - OCPP 2.0.1 is NOT wire-compatible with 1.6J—a charger attempting a true 2.0.1 handshake will fail
+  - Native OCPP 2.0.1 support is planned for post-MVP
+
+- **VDV 463 Endpoint**: `wss://transit.favonius.com:9000/vdv463/{presystem_id}`
+  - Receives `ProvideChargingRequests` from BMS/ITCS systems
+  - Sends `ProvideChargingInformation` via background broadcast task (every 15 seconds)
+
+- **BACnet/SC Endpoint**: `wss://building.favonius.com:9000/bacnet/{device_id}`
+  - Receives zone temperature and HVAC power telemetry
+  - Sends setpoint offset commands for HVAC control
+
+- **Security**: TLS termination, origin validation, rate limiting, message size limits (see Section 10.3)
 - **Main API**: Communicates with WebSocket Handler via internal REST API (Phase 4)
 
 **Supported Messages:**
@@ -1132,6 +1276,9 @@ minimize:
 | y_charge[b,t] | {0,1} | Binary: is vehicle b charging at time t |
 | P_batt[t] | [-P_batt_max, P_batt_max] | Battery power (+discharge, -charge) |
 | SoC_batt[t] | [soc_min, soc_max] | Battery state of charge |
+| P_hvac[z,t] | ℝ≥0 | HVAC power for zone z at time t (kW) |
+| T_zone[z,t] | [T_min, T_max] | Zone temperature for zone z at time t (°C) |
+| P_precond[t] | ℝ≥0 | Fixed preconditioning load from VDV (kW) |
 | P_grid[t] | ℝ≥0 | Grid power draw at time t |
 | P_max_grid | ℝ≥0 | Maximum grid power (demand) |
 
@@ -1232,14 +1379,16 @@ The demand charge rate used in optimization is resolved in this priority order:
 
 8. **Grid Power Balance:**
    ```
-   P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt_effective[t]
+   P_grid[t] = Σ_b P_charge[b,t] + P_building_fixed[t] + Σ_z P_hvac[z,t] + P_precond[t] - P_batt_effective[t]
 
    Where:
-   - P_building[t] is the building load at timestep t (kW)
+   - P_building_fixed[t] is the non-HVAC building load at timestep t (kW)
+   - P_hvac[z,t] is the HVAC power for zone z at timestep t (kW)
+   - P_precond[t] is fixed preconditioning load from VDV requests (kW)
    - P_batt_effective[t] is the grid-side battery power (see Constraint 11 for efficiency handling)
 
    For MVP simplification, if efficiency is omitted:
-   P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt[t]
+   P_grid[t] = Σ_b P_charge[b,t] + P_building_fixed[t] + Σ_z P_hvac[z,t] + P_precond[t] - P_batt[t]
    ```
 
 9. **Site Power Limit:**
@@ -1275,20 +1424,31 @@ The demand charge rate used in optimization is resolved in this priority order:
     - P_batt[t] < 0 means charging (increasing SoC)
     - E_batt_storage is the battery capacity (kWh)
 
-    Efficiency Handling:
-    For MVP, round-trip efficiency (η_batt, typically 0.92 from DepotConfig.battery_efficiency)
-    is modeled as a power loss during discharge only:
-    - Grid receives: P_batt × η_batt when P_batt > 0 (discharge)
-    - Grid provides: |P_batt| when P_batt < 0 (charge)
+    Efficiency Handling (Split Round-Trip):
+    Round-trip efficiency (η_batt = 0.92) is split symmetrically:
+    - η_charge = √η_batt ≈ 0.96
+    - η_discharge = √η_batt ≈ 0.96
 
-    This means the grid power balance (Constraint 8) should use:
-    P_grid[t] = Σ_b P_charge[b,t] + P_building[t] - P_batt_effective[t]
+    Grid Power Calculation:
+    When charging (P_batt < 0):
+      P_batt_effective[t] = P_batt[t] / η_charge   (draw more from grid than stored)
 
-    Where P_batt_effective[t] = P_batt[t] × η_batt if P_batt[t] > 0, else P_batt[t]
+    When discharging (P_batt > 0):
+      P_batt_effective[t] = P_batt[t] × η_discharge   (inject less to grid than drained)
 
-    Note: For MVP simplification, implementations may omit efficiency entirely from
-    battery dynamics and note this as a modeling limitation. Future versions will
-    model charge/discharge efficiencies separately for higher accuracy.
+    Combined (for Constraint 8):
+      P_batt_effective[t] = P_batt[t] × η_discharge   if P_batt[t] > 0
+                          = P_batt[t] / η_charge      if P_batt[t] < 0
+
+    Note: This prevents "free energy" loops because SoC dynamics track raw power
+    while grid sees efficiency-adjusted power. The solver cannot profit from
+    round-trip cycling due to cumulative losses.
+
+    MVP Simplification Option:
+    Implementations may apply full round-trip efficiency on discharge only:
+      P_batt_effective[t] = P_batt[t] × η_batt if P_batt[t] > 0, else P_batt[t]
+    This creates ~4% modeling error on charge cycles but simplifies implementation.
+    Document this choice in optimization logs.
     ```
 
 12. **Incoming Vehicle Availability:**
@@ -1300,6 +1460,96 @@ The demand charge rate used in optimization is resolved in this priority order:
       - available[i, t] = True   ∀t ≥ t_arrive
       - Include in departure SoC constraint (Constraint 5) if departure within horizon
     ```
+
+13. **HVAC Thermal Dynamics:**
+    ```
+    For each zone z:
+    T_zone[z, 0] = current_temp[z]   (initial condition)
+
+    T_zone[z, t] = T_zone[z, t-1] + (HeatGain_External[z,t] - Cooling_Power[z,t-1] × COP[z]) × Δt / ThermalMass[z]   ∀t > 0
+
+    Where:
+    - HeatGain_External[z,t] = (T_ambient[t] - T_zone[z,t-1]) × UA[z]
+    - Cooling_Power[z,t] = P_hvac[z,t] (positive = cooling, negative = heating)
+    - COP[z] is the HVAC Coefficient of Performance for zone z
+    - ThermalMass[z] is the thermal mass (kWh/°C) for zone z
+    - UA[z] is the heat transfer coefficient (kW/°C) for zone z
+
+    Temperature bounds:
+    T_min[z] ≤ T_zone[z,t] ≤ T_max[z]   ∀z,t
+
+    Where T_min[z] and T_max[z] are safety limits (typically 19°C - 24°C).
+    ```
+
+14. **HVAC Power Limits:**
+    ```
+    For each zone z:
+    0 ≤ P_hvac[z,t] ≤ P_hvac_max[z]   ∀z,t
+
+    Where P_hvac_max[z] is the maximum HVAC power for zone z (typically 20-50 kW for large zones).
+    ```
+
+15. **HVAC Ramp Rate (Response Lag):**
+    ```
+    For each zone z:
+    |P_hvac[z,t] - P_hvac[z,t-1]| ≤ ramp_rate[z]   ∀z,t > 0
+
+    Where ramp_rate[z] (kW per timestep) captures compressor/VFD response lag and prevents unrealistic instant load shedding.
+    ```
+
+15b. **HVAC Setpoint Offset Calculation (Post-Optimization):**
+    ```
+    After optimization, the setpoint offset command sent to BACnet devices is:
+
+    Offset[z,t] = T_optimal[z,t] - T_baseline_setpoint[z]
+
+    Where:
+    - T_optimal[z,t] is the optimized zone temperature from the solver
+    - T_baseline_setpoint[z] is the BMS's current active setpoint (read from AnalogValue:2)
+    ```
+
+    **Baseline Setpoint Handling:**
+    For MVP, assume T_baseline_setpoint is constant over the optimization horizon
+    (use current reading from BACnet `active_setpoint` object). If the building has
+    scheduled setpoint changes (e.g., night setback), a "Base Setpoint Schedule"
+    input will be required (post-MVP enhancement).
+
+    **Safety Clamping:**
+    Before dispatch, offset commands are clamped to ensure final setpoint remains
+    within zone safety limits:
+    ```
+    Effective_setpoint = T_baseline_setpoint[z] + Offset[z,t]
+    
+    If Effective_setpoint < T_min[z]:
+        Offset[z,t] = T_min[z] - T_baseline_setpoint[z]
+    If Effective_setpoint > T_max[z]:
+        Offset[z,t] = T_max[z] - T_baseline_setpoint[z]
+    ```
+
+16. **VDV Preconditioning Load (Soft Constraint with High Penalty):**
+    ```
+    For manual preconditioning requests:
+    P_precond[t] + P_precond_slack[t] = preconditioning_load_kw[t]   ∀t in [start_time, start_time + duration)
+    P_precond_slack[t] ≥ 0   (slack variable for unfulfilled preconditioning)
+
+    Objective function addition:
+    + M_precond × Σ_t P_precond_slack[t]
+
+    Where M_precond is a high penalty weight (1000 $/kW) that strongly encourages
+    meeting preconditioning requests but allows shedding if site limit would be violated.
+    ```
+
+    **Priority Hierarchy (highest to lowest):**
+    1. Site power limit (Constraint 9) — hard constraint, electrical safety
+    2. Departure SoC ≥ 99% (Constraint 5) — hard constraint, operational requirement
+    3. Preconditioning load — soft constraint with high penalty (M_precond = 1000)
+    4. Energy cost minimization — objective function
+
+    **Infeasibility Handling:**
+    If preconditioning is curtailed due to site limit constraints:
+    - Log warning with affected vehicle IDs and curtailed power (kW)
+    - Report `preconditioningStatus = "Curtailed"` in VDV 463 ChargingInformation
+    - Include curtailment reason in alert for operations team
 
 ### 8.2 Solver Configuration
 
@@ -1519,26 +1769,99 @@ When optimization cannot satisfy all constraints (typically: insufficient time t
 - R² ≥ 0.85 on validation set (applies to whichever model is active: GP or MLP fallback)
 - Uncertainty estimates for robust optimization
 
+### 8.7 Dispatch Validation (Pre-Dispatch Check)
+
+Before sending commands after optimization, the Dispatcher MUST validate device availability to handle race conditions between state assembly and dispatch.
+
+**Motivation:**
+Optimization may run with stale data if critical telemetry (e.g., charger `Faulted` status) arrives between state assembly and dispatch. This check prevents sending commands to unavailable devices.
+
+**Charger Pre-Dispatch Validation:**
+```python
+async def validate_charger_before_dispatch(
+    charger_id: UUID, 
+    command: SetChargingProfile
+) -> bool:
+    """Check charger status immediately before dispatch."""
+    # Query latest status from cache/DB (< 100ms latency)
+    status = await get_charger_status(charger_id)
+    
+    if status in ('Faulted', 'Unavailable', 'Reserved'):
+        log.warning(f"Skipping dispatch to charger {charger_id}: status={status}")
+        return False
+    
+    if status == 'Finishing':
+        log.info(f"Charger {charger_id} finishing session, command may be rejected")
+    
+    return True
+```
+
+**BACnet Pre-Dispatch Validation:**
+```python
+async def validate_bacnet_before_dispatch(
+    device_id: int, 
+    zone_id: UUID,
+    offset_command: float
+) -> bool:
+    """Check BACnet device connectivity before dispatch."""
+    # Check device is still connected
+    device = await get_bacnet_device_status(device_id)
+    
+    if device is None or device.disconnected_at is not None:
+        log.warning(f"Skipping dispatch to BACnet device {device_id}: disconnected")
+        return False
+    
+    # Validate offset won't violate safety bounds (redundant check)
+    zone = await get_zone_config(zone_id)
+    baseline = await get_current_baseline_setpoint(zone_id)
+    effective_setpoint = baseline + offset_command
+    
+    if effective_setpoint < zone.min_temp_c or effective_setpoint > zone.max_temp_c:
+        log.warning(f"Offset {offset_command} would violate bounds for zone {zone_id}")
+        return False
+    
+    return True
+```
+
+**Behavior:**
+- If validation fails, skip command for that device (do NOT retry in same cycle)
+- Log skipped commands with reason for audit trail
+- Do NOT re-run full optimization—use next scheduled cycle
+- Acceptable for MVP (eventual consistency model)
+
+**Logging:**
+```json
+{
+  "event": "dispatch_skipped",
+  "device_type": "charger",
+  "device_id": "charger-uuid",
+  "reason": "status_faulted",
+  "command": "SetChargingProfile",
+  "timestamp": "2026-01-19T10:00:45Z"
+}
+```
+
 ---
 
 ## 9. Integration Requirements
 
 ### 9.1 OCPP Integration
 
-**Supported Versions:** OCPP 1.6-J (primary), with ability to handle OCPP 2.0.1/2.1 messages
+**Supported Versions:** OCPP 1.6-J only (MVP)
 
 **Connector Types (MVP):** CCS only
 
 **Architecture:**
-- **WebSocket Handler Service**: Single OCPP 1.6 server that handles all charger connections
-- **OCPP 2+ Compatibility**: OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 protocol (OCPP 2+ adds more messages but is backward compatible at the connection level)
+- **WebSocket Handler Service**: Single OCPP 1.6J server that handles all charger connections
+- **Protocol Requirement**: Chargers supporting OCPP 2.0.1/2.1 MUST be configured to use OCPP 1.6J subprotocol; OCPP 2.0.1 is NOT wire-compatible with 1.6J
 - **Main API**: Communicates with WebSocket Handler via internal API (Phase 4)
 
 **Connection Flow:**
 ```
-1. Charger connects: ws://websocket-handler:9000/{ocpp_id} (OCPP 1.6 protocol)
-   - OCPP 2.0.1/2.1 chargers can connect; server uses OCPP 1.6 message format
-   - OCPP 2+ adds more messages but maintains backward compatibility at connection level
+1. Charger connects: wss://chargers.favonius.com:9000/ocpp/{charge_point_id}
+   - Server implements OCPP 1.6J only
+   - Chargers MUST be configured to use OCPP 1.6J subprotocol (even if hardware supports 2.0.1)
+   - A charger attempting a true OCPP 2.0.1 handshake will fail to connect
 2. Platform sends: BootNotificationResponse (Accepted, interval=300)
 3. Charger sends: StatusNotification (every 5 min)
 4. Charger sends: MeterValues (every 15 sec when charging)
@@ -1640,6 +1963,476 @@ When a StartTransaction is received:
 2. CSV file upload
 3. Manual entry via admin interface
 
+### 9.6 VDV 463 Transit Operations Integration
+
+**Protocol Version:** VDV 463 v1.1.0 (February 2025)
+
+Favonius validates all VDV 463 messages against the official **VDV463 1.0.0 FINAL JSON schemas** (schema release 12.2024) published in the [`VDVde/VDV463` GitHub repository](https://github.com/VDVde/VDV463).
+
+**Purpose:** VDV 463 enables bidirectional communication between Favonius (acting as Charge Management System - CMS) and upstream transit systems (Depot Management System - BMS or Intermodal Transport Control System - ITCS). This is the standard interface for European transit operators including De Lijn (Belgium), STIB (Brussels), and Nordic transit agencies.
+
+**Architecture:**
+```
+┌─────────────────────────┐     VDV 463 (WSS)      ┌─────────────────────────┐
+│  Upstream System        │◄─────────────────────► │  Favonius Platform      │
+│  (BMS / ITCS)           │                        │  (CMS Role)             │
+│                         │                        │                         │
+│  - Vehicle schedules    │  ChargingRequests ───► │  - Receives schedules   │
+│  - Priorities           │                        │  - Optimizes charging   │
+│  - Preconditioning      │  ◄── ChargingInfo      │  - Reports status       │
+└─────────────────────────┘                        └─────────────────────────┘
+```
+
+Mermaid view of the same interaction:
+
+```mermaid
+sequenceDiagram
+    participant BMS_ITCS as BMS_ITCS
+    participant FavoniusCMS as FavoniusCMS
+    participant Chargers as OCPPChargers
+    participant Building as BuildingLoad
+
+    BMS_ITCS->>FavoniusCMS: VDV463[ProvideChargingRequests]
+    FavoniusCMS->>FavoniusCMS: Map to schedules & constraints
+    FavoniusCMS->>Chargers: OCPP SetChargingProfile
+    FavoniusCMS->>Building: Include building_load in optimization
+    FavoniusCMS-->>BMS_ITCS: VDV463[ProvideChargingInformation]
+```
+
+**Transport Protocol:**
+- WebSocket Secure (WSS) over TLS 1.2+ (required in production)
+- Unified WebSocket Handler service (Port 9000) handles both OCPP and VDV 463
+- Connection URL: `wss://{favonius_host}:9000/vdv463/{presystem_id}`
+  - Recommended SNI endpoint: `wss://transit.favonius.com:9000/vdv463/{presystem_id}` (mTLS required)
+- X.509 certificate authentication (mTLS recommended for transit systems)
+- Username/password authentication (fallback)
+- Origin validation to prevent Cross-Site WebSocket Hijacking (CSWSH)
+
+**Message Structure:**
+All VDV 463 messages are JSON arrays with the following structure:
+```json
+[
+    1,                                      // MessageType: 1=Request, 2=Confirmation, 3=Error
+    "BMS",                                  // Source: "BMS", "ITCS", or "CMS"
+    "Presystem1",                           // PresystemId: Unique upstream system identifier
+    "2026-01-19T09:58:52Z",                 // Timestamp: UTC ISO 8601
+    "96fd700f-7bc9-43f1-9afb-0610abf7f4df", // MessageId: UUID
+    "ProvideChargingRequests",              // MessageAction
+    { /* Payload */ }                       // Message-specific payload
+]
+```
+
+**Message Actions:**
+
+| Action | Direction | Description |
+|--------|-----------|-------------|
+| `BootNotification` | BMS/ITCS → CMS | Initial connection handshake |
+| `ProvideChargingRequests` | BMS/ITCS → CMS | Send/update/delete charging schedules (event-driven) |
+| `ProvideChargingInformation` | CMS → BMS/ITCS | Report depot status (cyclic) |
+
+**Behavioral Notes (per VDV 463 + FAQ):**
+- Upstream systems (BMS/ITCS) send `ProvideChargingRequests` **event-driven**, whenever schedules or priorities change. The standard does not prescribe a fixed resend interval.
+- `ProvideChargingInformation` is sent by the CMS cyclically. VDV 463 does not define a strict interval; **Favonius chooses 15 seconds** (Section 5.3) to keep transit systems closely synchronized.
+- If a `chargingRequestId` disappears from an updated `chargingRequestList` (or a different ID is sent for the same vehicle/charging point), the previous request is treated as **deleted** by Favonius and is marked as `terminated` internally.
+- Confirmation messages (MessageType = 2) only acknowledge **receipt**, not that a request has been processed. The effective outcome is reflected via subsequent `ProvideChargingInformation` messages.
+
+**ChargingRequest Object:**
+```json
+{
+    "chargingPointId": "acaa6611-9b9b-4296-9ba1-102a028f1f99",
+    "vehicleId": "bus_101",
+    "chargingRequestId": "cr-001",
+    "chargingProcessId": "cp-req-001",
+    "priority": 1,
+    "chargingInstruction": "Normal",        // "Normal", "Changed", "Terminate"
+    "chargingRequestData": {
+        "expectedArrivalTimeAtChargingPoint": "2026-01-19T09:30:00Z",
+        "expectedSocAtArrival": 22,          // Percentage (0-100)
+        "minTargetSoc": 50,                  // Percentage (0-100)
+        "maxTargetSoc": 90,                  // Percentage (0-100)
+        "requestedTimeForDeparture": "2026-01-20T05:30:00Z",
+        "adHocCharging": false
+    },
+    "manualPreconditioning": {              // OPTIONAL: Fixed start time
+        "hvacPreconditioningStartTime": "2026-01-20T05:00:00Z",
+        "hvacAuxiliaryConsumerPower": 8000,
+        "systemPreconditioningStartTime": "2026-01-20T04:45:00Z",
+        "systemAuxiliaryConsumerPower": 4000
+    },
+    "automaticPreconditioning": {           // OPTIONAL: Calculated start time
+        "preconditioningRequest": "WarmWaterAndVentilation",
+        "ambientTemperature": -5,           // Celsius
+        "requestedStartTime": "2026-01-20T05:00:00Z",
+        "requestedFinishTime": "2026-01-20T05:30:00Z"
+    }
+}
+```
+
+Schema highlights (from `ProvideChargingRequestsRequest.json`):
+- Required top-level fields in `ChargingRequest`: `vehicleId`, `chargingRequestId`, and `chargingRequestData`.
+- Required fields inside `chargingRequestData`: `minTargetSoc` and `maxTargetSoc`; other fields (arrival/departure times, expected SoC, `adHocCharging`) are optional but strongly recommended for Favonius optimization.
+- Identifiers such as `chargingRequestId`, `chargingPointId`, and `chargingProcessId` are defined as `UniqueIdentifier` (opaque strings). The VDV FAQ recommends using **URIs according to RFC 3986**; Favonius treats them as opaque strings and maps them to internal UUIDs.
+
+**Mapping to Optimization Inputs:**
+
+| VDV 463 Field | Optimization Input | Usage |
+|---------------|-------------------|-------|
+| `chargingRequestData.expectedArrivalTimeAtChargingPoint` | `schedules.return_time` | Start of charging window |
+| `chargingRequestData.requestedTimeForDeparture` | `schedules.departure_time` | Deadline constraint |
+| `chargingRequestData.minTargetSoc` | `departure_soc_target` | Minimum SoC at departure |
+| `chargingRequestData.maxTargetSoc` | `soc_limit` | Maximum SoC (battery protection) |
+| `chargingRequestData.expectedSocAtArrival` | `initial_soc` | Starting SoC for optimization |
+| `priority` | Objective function weight | Higher priority → higher weight |
+| `chargingRequestData.adHocCharging` | `ad_hoc_flag` | Mark unplanned, immediate charging (bypasses long-horizon scheduling where necessary) |
+| `manualPreconditioning.hvacPreconditioningStartTime` | `preconditioning_start` | Fixed HVAC preconditioning start (non-shiftable load) |
+| `automaticPreconditioning.*` | `preconditioning_params` | Preconditioning type + requested window (start/finish) to derive optimal start time |
+
+**Vehicle ID Resolution:**
+
+VDV 463 `vehicleId` strings must be mapped to internal UUIDs before optimization:
+
+```
+vdv.vehicleId → vehicles.external_id → vehicles.vehicle_id (UUID)
+```
+
+**Resolution Logic:**
+```python
+async def resolve_vdv_vehicle_id(depot_id: UUID, vdv_vehicle_id: str) -> UUID:
+    """Map VDV 463 vehicleId string to internal vehicle UUID."""
+    result = await db.fetchrow("""
+        SELECT vehicle_id FROM vehicles 
+        WHERE depot_id = $1 AND external_id = $2
+    """, depot_id, vdv_vehicle_id)
+    
+    if result is None:
+        raise VDV463Error(
+            code="InvalidVehicleId",
+            description=f"Vehicle '{vdv_vehicle_id}' not found in depot configuration"
+        )
+    
+    return result['vehicle_id']
+```
+
+**Error Response (InvalidVehicleId):**
+```json
+[
+    3,
+    "CMS",
+    "Presystem1",
+    "2026-01-19T10:00:00Z",
+    "error-msg-uuid",
+    "ProvideChargingRequests",
+    {
+        "errorCode": "InvalidVehicleId",
+        "errorDescription": "Vehicle 'bus_999' not found in depot configuration",
+        "chargingRequestId": "cr-001"
+    }
+]
+```
+
+Orphaned requests (unknown vehicle IDs) are logged for operator review and do NOT cause connection termination.
+
+**ChargingInformation Object (Outbound):**
+```json
+{
+    "depotInfoList": [
+        {
+            "depotId": "depot-001",
+            "name": "Main Depot",
+            "chargingStationInfoList": [
+                {
+                    "chargingStationId": "cs-001",
+                    "chargingStationStatus": "Available",
+                    "chargingPointInfoList": [
+                        {
+                            "chargingPointId": "cp-001",
+                            "chargingPointStatus": "Occupied",
+                            "presentPower": 50.0,
+                            "vehicleInfo": {
+                                "vehicleId": "bus_101",
+                                "vehicleChargingStatus": "Charging",
+                                "tractionBatteryInfo": {
+                                    "stateOfCharge": 65
+                                },
+                                "preconditioningInfo": {
+                                    "vehiclePreconditioningTime": 30,
+                                    "vehiclePreconditioningEnergy": 8
+                                }
+                            },
+                            "chargingProcessInfo": {
+                                "presystemId": "Presystem1",
+                                "chargingRequestId": "cr-001",
+                                "chargingProcessId": "cp-req-001",
+                                "processStatus": "Charging",
+                                "startTime": "2026-01-20T03:45:00Z",
+                                "electricData": {
+                                    "chargingPower": 50.0
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
+```
+
+Schema highlights (from `ProvideChargingInformationRequest.json`):
+- Top-level payload is a `depotInfoList` array, each `DepotInfo` containing a `depotId`, `name`, and `chargingStationInfoList`.
+- `ChargingStationInfo` and `ChargingPointInfo` describe the current status of stations and points; `presentPower` and `energyMeterReading` allow reconstructing depot-level load.
+- `ChargingProcessInfo.processStatus` uses the `ProcessStatus` enum (e.g., `Preparing`, `Charging`, `ChargingRejectedTechnically`), which Favonius uses to indicate technical rejections and other lifecycle states for each charging process.
+
+**Preconditioning via VDV 463:**
+
+VDV 463 supports preconditioning requests through two mechanisms. For MVP, Favonius implements preconditioning at the charging management level (via OCPP SetChargingProfile to maintain power during preconditioning). Full VDV 261 ISO 15118 vehicle-to-charger preconditioning is out of scope for MVP.
+
+| Mechanism | Description | MVP Support |
+|-----------|-------------|-------------|
+| `manualPreconditioning` | Upstream system specifies exact HVAC start time | ✓ Supported |
+| `automaticPreconditioning` | CMS calculates start time based on temperatures | ✓ Supported |
+| VDV 261 (ISO 15118 VAS) | Direct vehicle preconditioning via charger | Post-MVP |
+
+**Preconditioning Constraints:**
+- Preconditioning can only occur while vehicle is connected and SoC is above safety threshold (20%)
+- Preconditioning power consumption (typically 5-15 kW for bus HVAC) must be included in grid power calculation
+- Estimated preconditioning duration: `(targetTemp - ambientTemp) × 3 minutes` (configurable)
+- Manual preconditioning is a **fixed load**: the HVAC start time is non-shiftable and must be enforced as a hard constraint in optimization
+
+**Data Storage:**
+
+VDV 463 messages are stored in TimescaleDB for audit and replay:
+
+```sql
+-- VDV 463 charging requests (optimization inputs)
+CREATE TABLE vdv463_charging_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    charging_request_id TEXT NOT NULL,
+    charging_point_id UUID REFERENCES chargers(charger_id),
+    vehicle_id UUID REFERENCES vehicles(vehicle_id),
+    priority INTEGER DEFAULT 1,
+    charging_instruction TEXT DEFAULT 'Normal',
+    expected_arrival TIMESTAMPTZ,
+    expected_soc_at_arrival REAL,
+    min_target_soc REAL,
+    max_target_soc REAL,
+    requested_departure TIMESTAMPTZ,
+    preconditioning_type TEXT,              -- 'manual', 'automatic', or NULL
+    preconditioning_start TIMESTAMPTZ,      -- For manual
+    ambient_temperature REAL,               -- For automatic
+    target_temperature REAL,                -- For automatic
+    presystem_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    received_at TIMESTAMPTZ DEFAULT NOW(),
+    status TEXT DEFAULT 'active',           -- 'active', 'completed', 'terminated'
+    UNIQUE(depot_id, charging_request_id, presystem_id)
+);
+SELECT create_hypertable('vdv463_charging_requests', 'received_at');
+
+-- VDV 463 connection log
+CREATE TABLE vdv463_connections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    presystem_id TEXT NOT NULL,
+    system_type TEXT NOT NULL,              -- 'BMS' or 'ITCS'
+    connected_at TIMESTAMPTZ DEFAULT NOW(),
+    disconnected_at TIMESTAMPTZ,
+    disconnect_reason TEXT
+);
+```
+
+**Implementation Requirements:**
+
+1. **Unified WebSocket Server**: VDV 463 WebSocket endpoint in WebSocket Handler service (same port 9000 as OCPP, different path `/vdv463/{presystem_id}`)
+2. **Authentication**: 
+   - Primary: X.509 mutual TLS (mTLS) - reverse proxy (Nginx/AWS ALB) validates client certificate and passes `X-SSL-Client-CN` header
+   - Fallback: Username/password authentication
+   - Origin validation to prevent CSWSH attacks
+3. **Message Validation**: Validate against VDV 463 JSON schema (https://github.com/VDVde/VDV463) with strict Pydantic models
+4. **State Assembly Integration**: Main API queries `vdv463_charging_requests` from TimescaleDB during state assembly
+5. **Outbound Messages**: WebSocket Handler background task sends `ProvideChargingInformation` every 15 seconds to all connected VDV 463 clients
+   - Task queries TimescaleDB for latest depot status (optimization results + telemetry)
+   - Broadcasts to all active VDV 463 connections
+6. **Preconditioning**: Implement preconditioning scheduling with configurable energy consumption model
+   - Manual preconditioning start times are fixed and enforced as non-shiftable load constraints
+
+**Error Handling:**
+
+| Error Code | Description | Response |
+|------------|-------------|----------|
+| `InvalidChargingPointId` | Unknown charging point | Return Error message with details |
+| `InvalidVehicleId` | Unknown vehicle | Return Error message with details |
+| `InvalidTimeWindow` | Arrival after departure | Return Error message with details |
+| `DuplicateRequestId` | Same request ID in message | Return Error message with details |
+
+---
+
+### 9.7 Building HVAC Integration (BACnet/SC)
+
+**Protocol:** BACnet Secure Connect (BACnet/SC, Addendum 135-2016bj / 135-2020)
+
+**Purpose:** Enable building HVAC control to treat the building as a "thermal battery" (thermal flywheel), allowing pre-cooling/heating during low-cost periods to reduce HVAC load during peak charging times. This integration enables coordinated demand management between EV charging and building HVAC systems.
+
+**Architecture:**
+```
+┌─────────────────────────┐     BACnet/SC (WSS)      ┌─────────────────────────┐
+│  Building BMS           │◄─────────────────────► │  Favonius Platform      │
+│  (BACnet/SC Node)       │                        │  (BACnet/SC Hub)        │
+│                         │                        │                         │
+│  - Zone temperatures    │  Telemetry ──────────► │  - Receives zone temps  │
+│  - HVAC power           │                        │  - Optimizes HVAC       │
+│  - Setpoint control     │  ◄── Setpoint Commands  │  - Sends setpoint offsets│
+└─────────────────────────┘                        └─────────────────────────┘
+```
+
+**Transport Protocol:**
+- WebSocket Secure (WSS) over TLS 1.3 (required in production)
+- Unified WebSocket Handler service (Port 9000) acts as BACnet/SC Hub
+- Connection URL: `wss://building.favonius.com:9000/bacnet/{device_id}` (mTLS required)
+- Mutual TLS (mTLS) authentication - BMS must present client certificate signed by Favonius CA
+- Origin validation to prevent Cross-Site WebSocket Hijacking (CSWSH)
+
+**Hub/Node Topology:**
+- **Favonius Platform**: Acts as BACnet/SC Hub, accepting outbound connections from building BMS systems
+- **Building BMS**: Acts as BACnet/SC Node, initiates WSS connection to Favonius
+- **Addressing**: Gateway maps `bacnet_device_id` (e.g., Device 100) to active WebSocket connection
+- **Outbound Connection Model**: BMS connects outbound to cloud, eliminating need for complex firewall rules (similar to EV charger OCPP connections)
+
+**Control Strategy: Global Setpoint Trim**
+
+To avoid complex logic conflicts with local BMS control, Favonius uses a **Global Trim Strategy**:
+
+- **Standard Operation**: BMS runs its internal schedule (e.g., 21°C setpoint)
+- **Optimization Action**: Favonius writes to a specific BACnet object (e.g., `demand_response_offset` AnalogValue)
+  - **Pre-cooling (Cheap Energy)**: Write `-2.0` offset → Effective target becomes 19°C
+  - **Shedding (Peak Demand)**: Write `+2.0` offset → Effective target becomes 23°C
+- **Safety**: Local BMS maintains hard limits (e.g., never go below 18°C) regardless of Favonius commands
+- **Coordination**: BMS adds Favonius offset to its baseline setpoint to compute final target
+
+**Data Requirements:**
+
+For each controlled zone, the system requires:
+
+| BACnet Object | Type | Purpose | Example |
+|---------------|------|---------|---------|
+| Zone Temperature | AnalogInput (Read-Only) | Current zone temperature for validation | `analogInput:1` |
+| Active Setpoint | AnalogValue (Read-Only) | Baseline setpoint tracking | `analogValue:2` |
+| HVAC Power Meter | AnalogInput (Read-Only) | Sub-metered HVAC power (preferred) or derived from VFD speed | `analogInput:3` |
+| Demand Response Offset | AnalogValue (Read/Write) | Optimization control "knob" | `analogValue:1` |
+
+**Thermal Flywheel Optimization:**
+
+The building HVAC system is modeled as a "thermal battery" where:
+- **Charge** = Running HVAC (cooling down / heating up) during low-cost periods
+- **Discharge** = Turning HVAC off (temperature drifts back to ambient) during peak periods
+
+**Optimization Benefits:**
+- Pre-cool buildings during low-cost periods (e.g., 2-4 PM) to reduce HVAC load during peak charging (e.g., 6-8 PM)
+- Shift HVAC load away from high-price periods
+- Reduce peak demand by coordinating HVAC and EV charging schedules
+- Maintain comfort within configured temperature bounds (typically 19-24°C)
+
+**Data Storage:**
+
+BACnet/SC telemetry and commands are stored in TimescaleDB:
+
+```sql
+-- BACnet device connections
+CREATE TABLE bacnet_devices (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    device_id INTEGER NOT NULL,  -- BACnet device identifier
+    device_name VARCHAR(255),
+    connected_at TIMESTAMPTZ DEFAULT NOW(),
+    disconnected_at TIMESTAMPTZ,
+    certificate_cn TEXT,  -- Client certificate Common Name
+    UNIQUE(depot_id, device_id)
+);
+
+-- HVAC telemetry (zone temperatures, HVAC power)
+CREATE TABLE hvac_telemetry (
+    time TIMESTAMPTZ NOT NULL,
+    zone_id UUID NOT NULL REFERENCES building_zones(zone_id),
+    temperature_c DOUBLE PRECISION,
+    hvac_power_kw DOUBLE PRECISION CHECK (hvac_power_kw >= 0),
+    setpoint_offset_c DOUBLE PRECISION,  -- Demand response offset applied
+    PRIMARY KEY (time, zone_id)
+);
+SELECT create_hypertable('hvac_telemetry', 'time');
+
+-- Building zones configuration
+CREATE TABLE building_zones (
+    zone_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    name VARCHAR(255) NOT NULL,
+    bacnet_device_id INTEGER NOT NULL,
+    temp_sensor_oid VARCHAR(100) NOT NULL,  -- e.g., "analogInput:1"
+    setpoint_cmd_oid VARCHAR(100) NOT NULL,  -- e.g., "analogValue:1"
+    active_setpoint_oid VARCHAR(100),        -- e.g., "analogValue:2" (for reading baseline setpoint)
+    thermal_mass_kwh_c DOUBLE PRECISION NOT NULL CHECK (thermal_mass_kwh_c > 0),
+    min_temp_c DOUBLE PRECISION DEFAULT 19.0,
+    max_temp_c DOUBLE PRECISION DEFAULT 24.0,
+    baseline_load_kw DOUBLE PRECISION DEFAULT 0,
+    hvac_cop DOUBLE PRECISION DEFAULT 3.5 CHECK (hvac_cop > 0),
+    ua_value DOUBLE PRECISION DEFAULT 0.5 CHECK (ua_value > 0),
+    max_hvac_power_kw DOUBLE PRECISION DEFAULT 50.0 CHECK (max_hvac_power_kw > 0),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    -- Note: Multiple zones may share the same BACnet device (different object IDs)
+    -- Use UNIQUE on (depot_id, bacnet_device_id, temp_sensor_oid) if 1:1 zone-to-sensor required
+    CONSTRAINT unique_zone_sensor UNIQUE (depot_id, bacnet_device_id, temp_sensor_oid)
+);
+```
+
+**Device-to-Zone Mapping:**
+
+When telemetry arrives from a BACnet device, the WebSocket Handler maps to zone UUID:
+
+```python
+async def resolve_bacnet_zone(depot_id: UUID, device_id: int, object_id: str) -> UUID:
+    """Map BACnet device and object to zone UUID."""
+    result = await db.fetchrow("""
+        SELECT zone_id FROM building_zones 
+        WHERE depot_id = $1 AND bacnet_device_id = $2 AND temp_sensor_oid = $3
+    """, depot_id, device_id, object_id)
+    
+    if result is None:
+        raise BACnetError(
+            code="InvalidObjectId",
+            description=f"No zone mapped to device {device_id} object {object_id}"
+        )
+    
+    return result['zone_id']
+```
+
+**Constraints:**
+- `bacnet_device_id` + `temp_sensor_oid` combination must be unique per depot
+- WebSocket Handler caches device→zone mapping at connection time for performance
+- Multiple zones may exist on the same BACnet device (using different object IDs)
+
+**Implementation Requirements:**
+
+1. **Unified WebSocket Server**: BACnet/SC Hub endpoint in WebSocket Handler service (same port 9000 as OCPP/VDV 463, different path `/bacnet/{device_id}`)
+2. **Authentication**: 
+   - Primary: X.509 mutual TLS (mTLS) - reverse proxy validates client certificate, passes `X-SSL-Client-CN` header
+   - Device ID in URL path must match certificate CN or registered device mapping
+   - Origin validation to prevent CSWSH attacks
+3. **BACnet/SC Protocol**: Use `bacpypes3` library for BACnet/SC Hub implementation
+   - Run a single shared BACnet/SC Hub instance per worker (not per-connection handler)
+   - Validate in a proof-of-concept that the Hub persists across multiple connections within a Uvicorn worker
+4. **State Assembly Integration**: Main API queries `hvac_telemetry` from TimescaleDB during state assembly for current zone temperatures and HVAC power
+5. **Dispatch**: Main API sends setpoint offset commands via WebSocket Handler to BACnet devices after optimization
+6. **Thermal Modeling**: Implement thermal dynamics constraints in optimization (see Section 8.1, Constraint 13)
+
+**Error Handling:**
+
+| Error Code | Description | Response |
+|------------|-------------|----------|
+| `InvalidDeviceId` | Unknown BACnet device | Return Error message with details |
+| `InvalidObjectId` | Unknown BACnet object | Return Error message with details |
+| `WritePermissionDenied` | Object is read-only | Return Error message with details |
+| `TemperatureOutOfBounds` | Setpoint offset would violate safety limits | Reject command, log warning |
+
 ---
 
 ## 10. Non-Functional Requirements
@@ -1667,12 +2460,43 @@ When a StartTransaction is received:
 | Requirement | Implementation |
 |-------------|---------------|
 | API authentication | JWT tokens with expiration (1 hour access, 24 hour refresh) |
-| OCPP authentication | Basic auth + TLS 1.3 (wss:// required in production) |
+| OCPP authentication | Basic auth (ChargePointID + Password) + TLS 1.3 (wss:// required in production) |
+| VDV 463 authentication | Mutual TLS (mTLS) via reverse proxy + X-SSL-Client-CN header validation, username/password fallback |
+| BACnet/SC authentication | Mutual TLS (mTLS) via reverse proxy + X-SSL-Client-CN header validation, device ID mapping |
 | Database access | Role-based, encrypted connections (SSL required) |
 | Secrets management | Environment variables, Vault (future) |
-| Audit logging | All API calls, optimization runs, handoff messages |
-| Transport security | HTTPS required for all API endpoints in production |
+| Audit logging | All API calls, optimization runs, handoff messages, WebSocket connections |
+| Transport security | HTTPS required for all API endpoints in production, WSS required for all WebSocket connections |
 | Inter-depot auth | Mutual TLS or signed JWT for handoff messages |
+
+**WebSocket Security Hardening (Critical Checklist):**
+
+The WebSocket Handler service implements comprehensive security measures per [WebSocket.org Security Guide](https://websocket.org/guides/security/):
+
+| Security Measure | Implementation | Protocol |
+|------------------|----------------|----------|
+| **TLS/SSL Encryption** | WSS (wss://) required in production, TLS 1.2+ minimum, TLS 1.3 preferred | OCPP, VDV 463, BACnet/SC |
+| **Origin Validation** | Validate Origin header against whitelist to prevent Cross-Site WebSocket Hijacking (CSWSH) | OCPP, VDV 463, BACnet/SC |
+| **Authentication** | OCPP: Basic auth during handshake; VDV 463: mTLS (primary) or username/password (fallback); BACnet/SC: mTLS required | OCPP, VDV 463, BACnet/SC |
+| **Message Size Limits** | Maximum message size: 1 MB per message to prevent memory exhaustion DoS | OCPP, VDV 463, BACnet/SC |
+| **Rate Limiting** | Connection-level: 10 connections per IP per minute; Message-level: 100 messages per connection per second | OCPP, VDV 463, BACnet/SC |
+| **Idle Timeout** | Close connections idle > 5 minutes; Heartbeat/ping every 30 seconds to detect stale connections | OCPP, VDV 463, BACnet/SC |
+| **Input Validation** | Strict JSON schema validation (Pydantic models), reject malformed messages immediately | OCPP, VDV 463, BACnet/SC |
+| **Compression Security** | Disable per-message compression to prevent CRIME/BREACH attacks; Use TLS-level compression only | OCPP, VDV 463, BACnet/SC |
+| **Security Headers** | Content-Security-Policy, X-Content-Type-Options, X-Frame-Options configured | OCPP, VDV 463, BACnet/SC |
+| **Logging & Monitoring** | Log all connection attempts, authentication failures, message validation errors, suspicious patterns | OCPP, VDV 463, BACnet/SC |
+| **Connection Timeout** | Maximum connection duration: 24 hours; Force re-authentication after timeout | OCPP, VDV 463, BACnet/SC |
+| **TLS Cipher Suites** | Prefer ECDHE ciphers, disable weak ciphers (RC4, DES, MD5, SHA1) | OCPP, VDV 463, BACnet/SC |
+| **Certificate Pinning** | Optional: Pin server certificates for OCPP chargers in high-security deployments | OCPP |
+| **HSTS** | HTTP Strict Transport Security header enforced on WebSocket upgrade requests | OCPP, VDV 463, BACnet/SC |
+
+**TLS Termination & mTLS Routing (Single-Port Constraint):**
+- TLS handshake occurs before URL routing; mTLS requirements cannot depend on path alone.
+- Use SNI-based routing with **distinct subdomains** on the same port to control mTLS policy:
+  - `chargers.favonius.com:9000` → OCPP (Basic Auth, no client cert required)
+  - `transit.favonius.com:9000` → VDV 463 (mTLS required)
+  - `building.favonius.com:9000` → BACnet/SC (mTLS required)
+- Reverse proxy MUST support `ssl_verify_client optional` or equivalent SNI-based policy to avoid blocking OCPP chargers.
 
 **Input Validation Requirements:**
 
@@ -1702,9 +2526,28 @@ When a StartTransaction is received:
 - ORM/query builder validates field names against schema
 
 **OCPP Security:**
-- Charger ocpp_id validated against registered chargers
-- Unregistered chargers rejected at BootNotification
+- Charger ocpp_id validated against registered chargers in `chargers` table
+- Unregistered chargers rejected at BootNotification with appropriate error
 - SetChargingProfile only sent to chargers in 'Available' or 'Charging' status
+- Origin validation: Reject connections with Origin header not matching expected charger domains
+- Rate limiting: Maximum 5 BootNotification attempts per IP per 15 minutes
+
+**VDV 463 Security:**
+- Presystem ID validated against `vdv463_connections` table or configuration
+- mTLS validation: Reverse proxy (Nginx/AWS ALB) validates client certificate, passes `X-SSL-Client-CN` header
+- Header validation: `presystem_id` in URL path must match `X-SSL-Client-CN` header (for mTLS) or username (for password auth)
+- Message validation: Strict Pydantic model validation against VDV 463 v1.1.0 schema
+- Duplicate request ID detection: Reject `ProvideChargingRequests` with duplicate `chargingRequestId` within active set
+- Rate limiting: Maximum 10 ProvideChargingRequests per connection per minute
+
+**BACnet/SC Security:**
+- Device ID validated against `bacnet_devices` table or configuration
+- mTLS validation: Reverse proxy (Nginx/AWS ALB) validates client certificate, passes `X-SSL-Client-CN` header
+- Header validation: `device_id` in URL path must match `X-SSL-Client-CN` header or registered device mapping
+- Certificate management: BMS client certificates must be signed by Favonius CA (managed in Supabase)
+- Object access control: Validate write permissions before sending setpoint commands
+- Temperature safety: Reject setpoint offsets that would violate configured min/max temperature bounds
+- Rate limiting: Maximum 50 BACnet read/write operations per connection per minute
 
 ### 10.4 Scalability
 
@@ -1791,16 +2634,125 @@ THEN grid power calculation includes building load
 AND peak demand accounts for both charging and building load
 ```
 
+#### AT-08: VDV 463 Charging Request Integration
+```gherkin
+GIVEN an upstream BMS connected via VDV 463
+AND BMS sends ProvideChargingRequests with:
+    - vehicleId = "bus_101"
+    - expectedArrivalTimeAtChargingPoint = "2026-01-19T22:00:00Z"
+    - requestedTimeForDeparture = "2026-01-20T05:30:00Z"
+    - minTargetSoc = 90
+    - priority = 1
+WHEN optimization runs
+THEN bus_101 schedule uses VDV 463 arrival/departure times
+AND bus_101 reaches ≥90% SoC by 5:15 AM
+AND priority 1 vehicles are charged before lower priority vehicles
+AND the ChargingRequest payload validates against `ProvideChargingRequestsRequest.json`
+AND vehicleId and chargingPointId resolve to known internal entities
+```
+
+#### AT-09: VDV 463 Preconditioning (Manual)
+```gherkin
+GIVEN an upstream BMS connected via VDV 463
+AND BMS sends ProvideChargingRequests with:
+    - vehicleId = "bus_101"
+    - manualPreconditioning.hvacPreconditioningStartTime = "2026-01-20T05:00:00Z"
+    - requestedTimeForDeparture = "2026-01-20T05:30:00Z"
+WHEN optimization runs
+THEN preconditioning power (10 kW) is included in schedule from 5:00 AM
+AND bus_101 maintains sufficient SoC to support preconditioning
+AND ProvideChargingInformation reports preconditioningStatus = "Scheduled" before 5:00 AM
+AND ProvideChargingInformation reports preconditioningStatus = "Active" at 5:00 AM
+AND the ProvideChargingInformation payload validates against `ProvideChargingInformationRequest.json`
+```
+
+#### AT-10: VDV 463 Preconditioning (Automatic)
+```gherkin
+GIVEN an upstream BMS connected via VDV 463
+AND BMS sends ProvideChargingRequests with:
+    - vehicleId = "bus_101"
+    - automaticPreconditioning.ambientTemperature = -10
+    - automaticPreconditioning.targetTemperature = 18
+    - automaticPreconditioning.departureTime = "2026-01-20T05:30:00Z"
+WHEN optimization runs
+THEN system calculates preconditioning duration ≈ 84 minutes (28°C × 3 min/°C)
+AND preconditioning is scheduled to start at ~4:06 AM
+AND preconditioning power is included in grid power calculation
+```
+
+#### AT-11: VDV 463 ChargingInformation Export
+```gherkin
+GIVEN an upstream BMS connected via VDV 463
+AND depot has 3 charging stations with 6 charging points
+AND 2 vehicles are currently charging
+WHEN 15 seconds elapse
+THEN system sends ProvideChargingInformation message
+AND message includes all charging point statuses
+AND message includes current SoC and power for charging vehicles
+AND message includes estimatedCompletionTime for active charging processes
+```
+
+#### AT-12: Solver Fallback (Gurobi → HiGHS)
+```gherkin
+GIVEN Gurobi license is invalid or unavailable
+AND optimization is triggered
+WHEN solver selection logic runs
+THEN system automatically falls back to HiGHS solver
+AND optimization completes successfully
+AND OptimizationResult.solver_used = "highs"
+AND solve time < 60 seconds
+AND warning is logged with fallback reason
+```
+
+#### AT-13: Preconditioning Curtailment Under Site Limit
+```gherkin
+GIVEN grid is at 990 kW (near max_site_power of 1000 kW)
+AND VDV 463 manualPreconditioning requests arrive for 5 buses (50 kW total)
+WHEN optimization runs
+THEN preconditioning is partially or fully curtailed to respect site limit
+AND P_grid never exceeds max_site_power (1000 kW)
+AND ProvideChargingInformation reports preconditioningStatus = "Curtailed" for affected buses
+AND alert is generated for operations team
+AND curtailment is logged with affected vehicle IDs and power shortfall
+```
+
+#### AT-14: BACnet/SC Connection
+```gherkin
+GIVEN the WebSocket Handler is running as a BACnet/SC Hub
+WHEN a building BMS connects via WSS with a valid client certificate
+AND the device_id in the URL path matches the certificate CN
+THEN the connection is accepted
+AND the device appears in the `bacnet_devices` table
+AND zone temperature and HVAC power telemetry is received
+```
+
+#### AT-15: Thermal Flywheel Optimization
+```gherkin
+GIVEN a predicted price spike at 18:00
+AND a building with high thermal mass (thermal_mass_kwh_c = 50)
+AND current zone temperature = 21°C
+AND ambient temperature = 25°C
+AND configured temperature bounds: 19°C - 24°C
+WHEN the optimizer runs at 14:00
+THEN it schedules increased HVAC power (P_hvac) from 14:00-16:00 (pre-cooling)
+AND reduces P_hvac to near zero during the 18:00 price spike
+AND zone temperature remains within configured bounds (19°C - 24°C)
+AND setpoint offset commands are dispatched to BACnet devices
+AND grid power calculation includes HVAC load (P_hvac) alongside EV charging
+```
+
 ### 11.2 Unit Test Requirements
 
 | Module | Coverage Target | Critical Paths |
 |--------|-----------------|----------------|
 | Optimizer | ≥ 90% | Constraint satisfaction, objective calculation |
 | Surrogate Model | ≥ 90% | Feature engineering, prediction |
-| State Assembler | ≥ 90% | Data aggregation, availability computation, incoming vehicles |
+| State Assembler | ≥ 90% | Data aggregation, availability computation, incoming vehicles, VDV 463 request integration |
 | OCPP Adapter | ≥ 90% | Message handling, profile dispatch, max_charge_kw extraction |
 | Trigger Monitor | ≥ 90% | All trigger conditions including return time deviation |
 | Handoff Manager | ≥ 90% | Message send/receive, acknowledgment |
+| VDV 463 Adapter | ≥ 90% | Message parsing, request creation/update/termination, ChargingInformation generation, preconditioning scheduling |
+| BACnet/SC Adapter | ≥ 90% | BACnet/SC Hub connection handling, zone temperature/HVAC power reading, setpoint offset writing, thermal model integration |
 
 ### 11.3 Integration Test Requirements
 
@@ -1813,27 +2765,40 @@ AND peak demand accounts for both charging and building load
 | Weather API timeout | Use last known forecast |
 | Building load meter failure | Use forecast model, log warning |
 | Inter-depot handoff | Send → Acknowledge → Include in optimization |
+| VDV 463 connection | Connect → BootNotification → ProvideChargingInformation |
+| VDV 463 charging request | ProvideChargingRequests → Optimization includes schedule |
+| VDV 463 preconditioning | Preconditioning request → Included in power schedule |
+| VDV 463 reconnection | Disconnect → Reconnect → State recovery |
+| BACnet/SC connection | Connect → Device registration → Telemetry reception |
+| BACnet/SC thermal optimization | Price spike → Pre-cooling → Setpoint dispatch |
 
 ---
 
 ## 12. Glossary
 
+- **BMS**: *Betriebshof Management System (Depot Management System)* — Software managing depot operations, vehicle assignments, and schedules.
 - **CAISO**: *California Independent System Operator* — manages California's electricity grid.
 - **CCS**: *Combined Charging System* — DC fast charging standard (MVP-supported connector).
+- **CMS**: *Charge Management System* — System that controls and optimizes charging infrastructure (Favonius's role in VDV 463).
 - **DAM**: *Day-Ahead Market* — electricity market clearing the day before energy delivery.
 - **Demand Charge**: Monthly fee based on peak power draw ($/kW).
 - **Δt**: Optimization timestep (15 minutes = 0.25 hours).
 - **GP**: *Gaussian Process* — probabilistic machine learning model for energy consumption surrogate.
 - **Gurobi**: Commercial MILP solver used for optimization.
 - **Horizon**: Planning window for optimization (24 hours).
+- **ITCS**: *Intermodal Transport Control System* — System for real-time transit operations control.
 - **LMP**: *Locational Marginal Price* — spot electricity price at a grid node.
 - **MILP**: *Mixed-Integer Linear Programming* — optimization with integer and continuous variables.
 - **MPC**: *Model Predictive Control* — rolling horizon optimization approach.
 - **OCPP**: *Open Charge Point Protocol* — standard for EV charger communications.
+- **Preconditioning**: Heating or cooling a vehicle's interior while connected to charger, preserving battery range.
 - **Pyomo**: Python optimization modeling library.
 - **SoC**: *State of Charge* — battery charge level (0.00-1.00).
 - **TOU**: *Time-of-Use* — electricity rate structure varying by time of day.
 - **V2G**: *Vehicle-to-Grid* — bidirectional EV charging (post-MVP).
+- **VDV**: *Verband Deutscher Verkehrsunternehmen* — Association of German Transport Companies, publishes transit IT standards.
+- **VDV 261**: VDV standard for bus preconditioning via ISO 15118 Value Added Services.
+- **VDV 463**: VDV standard for communication between Charge Management Systems and Depot Management/ITCS systems.
 - **Warm-start**: Initializing solver with previous solution for faster convergence.
 
 ---
@@ -1846,37 +2811,63 @@ AND peak demand accounts for both charging and building load
 You are a senior Python developer specializing in energy systems optimization.
 
 Project: Favonius Energy - EV Fleet Depot Optimization Platform
-Tech Stack: Python 3.12, Pyomo, Gurobi, FastAPI, TimescaleDB, OCPP
+Tech Stack: Python 3.12, Pyomo, Gurobi, FastAPI, TimescaleDB, OCPP, VDV 463, BACnet/SC
 
 Key Patterns:
 - Use dataclasses for data models (see src/core/models.py)
 - Use asyncpg for database operations
-- Use Pyomo for optimization modeling with Gurobi solver
+- Use Pyomo for optimization modeling with Gurobi solver (HiGHS fallback)
 - Follow the Stanford CarbonFree paper approach for surrogate models
+- Use FastAPI/Starlette WebSocket for unified WebSocket Handler (OCPP + VDV 463 + BACnet/SC)
 
 Critical Constraints:
 - Vehicle departure SoC ≥ 99% is a HARD constraint (never relax)
 - Optimization solve time MUST be < 60 seconds
-- OCPP 1.6 is primary protocol version
+- OCPP 1.6J is the ONLY supported protocol (chargers MUST use 1.6J subprotocol)
 - CCS is the only supported connector type for MVP
 - Building load is REQUIRED in grid power calculation
+- VDV 463 v1.1.0 is the target protocol version
+- Preconditioning is a SOFT constraint (can be curtailed under site limit)
 
 When implementing optimization:
 - Reference PRD_v2.md#8-optimization-engine-specifications for formulation
 - Use Gurobi solver with specified options (TimeLimit=60, MIPGap=0.01)
+- Fall back to HiGHS if Gurobi unavailable
 - Use warm-starting from previous solutions
 - Log solve time and objective value
 - Vehicle max_charge_kw comes from OCPP or config (see Section 8.4)
+- Include VDV 463 charging requests in state assembly (see Section 9.6)
+- HVAC setpoint offset = T_optimal - T_baseline (see Constraint 15b)
 
 When implementing API endpoints:
 - Reference PRD_v2.md#7-api-specifications for contracts
 - Return consistent error formats
 - Include request/response logging
 
+When implementing VDV 463:
+- Reference PRD_v2.md#9-6-vdv-463-transit-operations-integration
+- Use WSS (WebSocket Secure) for connections
+- Validate messages against VDV 463 JSON schema
+- Send ProvideChargingInformation every 15 seconds
+- Support manualPreconditioning and automaticPreconditioning
+- Map vehicleId string to vehicle_id UUID via external_id lookup
+
+When implementing BACnet/SC:
+- Reference PRD_v2.md#9-7-building-hvac-integration-bacnetsc
+- Use bacpypes3 library for BACnet/SC Hub implementation
+- Map device_id + object_id to zone_id via building_zones table
+- Validate setpoint offsets against min/max temperature bounds before dispatch
+
 When implementing triggers:
 - Price trigger: >25% OR >$25/MWh
 - SoC deviation trigger: >5%
 - Return time deviation trigger: >15 minutes
+- VDV 463 ChargingRequest update: Trigger re-optimization
+
+When implementing dispatch:
+- Validate charger status before sending SetChargingProfile (Section 8.7)
+- Validate BACnet device connectivity before sending setpoint commands
+- Skip commands to unavailable devices, log warning, continue with others
 
 Code Style:
 - Type hints required on all functions
@@ -1927,6 +2918,8 @@ Follow the existing patterns in src/api/main.py.
 | 2.3 | 2025-12-13 | Claude | Reliability improvements: Added HiGHS fallback solver for graceful degradation when Gurobi fails (license error, connection issues), added solver_used field to OptimizationResult for monitoring, added Gurobi license failure test to integration tests |
 | 2.4 | 2025-01-XX | Claude | Architecture documentation: Updated Section 5.2 to reflect integrated system architecture (Main API primary, WebSocket Handler telemetry-only), updated Section 5.3 data flow to show service responsibilities, added backup mode documentation (Section 5.3), updated Section 9.1 OCPP integration to reflect service split and internal API plan, clarified component responsibilities by service |
 | 2.5 | 2025-01-XX | Claude | OCPP simplification: Removed dual server architecture, consolidated to single OCPP 1.6 server in WebSocket Handler that handles OCPP 2+ messages, updated all OCPP references to reflect single server approach |
+| 2.6 | 2025-01-19 | Claude + Joris | **VDV Protocol Integration (MVP):** Added VDV 463 transit operations integration and VDV 261 preconditioning support to MVP scope. Added US-07 (Transit Operations Integration) and US-08 (Bus Preconditioning) user stories. Added Section 9.6 with complete VDV 463 technical specification including message formats, ChargingRequest/ChargingInformation objects, preconditioning mechanisms, and database schema. Added AT-08 through AT-11 acceptance tests. Updated glossary with VDV terms. Preconditioning implemented via VDV 463 manualPreconditioning/automaticPreconditioning fields; full VDV 261 ISO 15118 stack deferred to post-MVP. |
+| 2.7 | 2025-01-19 | Claude + Joris | **Critical Fixes & BACnet Integration:** (1) **OCPP Protocol Correction**: Fixed incorrect claim that OCPP 2.0.1 is wire-compatible with 1.6J—clarified that chargers MUST be configured to use 1.6J subprotocol; (2) **HVAC Setpoint Offset Formula**: Added Constraint 15b with explicit `Offset = T_optimal - T_baseline` calculation and safety clamping; (3) **VDV 463 Vehicle ID Resolution**: Added explicit `vehicleId → external_id → vehicle_id` mapping logic with InvalidVehicleId error handling; (4) **BACnet Device-to-Zone Mapping**: Added device_id + object_id → zone_id resolution with unique constraint; (5) **Preconditioning Soft Constraint**: Changed Constraint 16 from hard to soft constraint with M_precond=1000 penalty to prevent infeasibility under site limit conflicts; (6) **Battery Efficiency Clarification**: Documented split round-trip efficiency model (√η for each direction) to prevent "free energy" loops; (7) **Dispatch Validation**: Added Section 8.7 with pre-dispatch charger/BACnet status checks to handle telemetry race conditions; (8) **Schema Fixes**: Corrected FK references in VDV 463 schema (charger_id, vehicle_id, depot_id); (9) **BuildingZone Dataclass**: Added missing max_hvac_power_kw and active_setpoint_oid fields; (10) **Acceptance Tests**: Added AT-12 (Solver Fallback) and AT-13 (Preconditioning Curtailment). |
 
 ---
 

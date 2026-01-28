@@ -98,6 +98,23 @@ class OptimizationServiceConfig(BaseModel):
     battery_capacity_kwh: float = Field(default=75.0, description="Default battery capacity in kWh")
 
 
+class VDV463Config(BaseModel):
+    """VDV 463 transit operations configuration."""
+    enabled: bool = Field(default=True, description="Enable VDV 463 support")
+    validation_mode: str = Field(
+        default="hard",
+        description="Validation mode: 'hard' (reject invalid) or 'soft' (warn only)"
+    )
+    schema_dir: Optional[str] = Field(
+        default=None,
+        description="Directory containing VDV 463 JSON schemas"
+    )
+    default_depot_id: Optional[str] = Field(
+        default=None,
+        description="Default depot ID for VDV 463 connections"
+    )
+
+
 class Config(BaseModel):
     """Main application configuration."""
     tls: TLSConfig = Field(default_factory=TLSConfig)
@@ -107,6 +124,7 @@ class Config(BaseModel):
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     price_feeder: PriceFeederConfig = Field(default_factory=PriceFeederConfig)
     optimization: OptimizationServiceConfig = Field(default_factory=OptimizationServiceConfig)
+    vdv463: VDV463Config = Field(default_factory=VDV463Config)
     
     # Environment-specific settings
     environment: str = Field(default="development", description="Environment (development/staging/production)")
@@ -203,6 +221,12 @@ class Config(BaseModel):
                 charge_power_kw=float(os.getenv("OPTIMIZATION_CHARGE_POWER_KW", "22.0")),
                 discharge_power_kw=float(os.getenv("OPTIMIZATION_DISCHARGE_POWER_KW", "10.0")),
                 battery_capacity_kwh=float(os.getenv("OPTIMIZATION_BATTERY_CAPACITY_KWH", "75.0")),
+            ),
+            vdv463=VDV463Config(
+                enabled=os.getenv("VDV463_ENABLED", "true").lower() == "true",
+                validation_mode=os.getenv("VDV463_VALIDATION_MODE", "hard"),
+                schema_dir=os.getenv("VDV463_SCHEMA_DIR"),
+                default_depot_id=os.getenv("VDV463_DEFAULT_DEPOT_ID"),
             ),
             environment=os.getenv("ENVIRONMENT", "development"),
             debug=os.getenv("DEBUG", "false").lower() == "true",
