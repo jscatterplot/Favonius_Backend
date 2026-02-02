@@ -166,11 +166,11 @@ spec:
         
         readinessProbe:
           httpGet:
-            path: /health
+            path: /readiness
             port: http
           initialDelaySeconds: 15
           periodSeconds: 10
-          timeoutSeconds: 5
+          timeoutSeconds: 15  # Increased to allow for DB health check (10s timeout)
           failureThreshold: 3
           successThreshold: 1
         

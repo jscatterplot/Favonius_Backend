@@ -34,17 +34,20 @@ class CacheEntry:
 
 class CacheManager:
     """Advanced caching system with multiple strategies."""
-    
+
     def __init__(self, max_size: int = 10000, default_ttl: timedelta = timedelta(minutes=5)):
         """Initialize cache manager."""
         self.max_size = max_size
         self.default_ttl = default_ttl
         self.logger = get_logger(__name__)
-        
+
         # Cache storage
         self._cache: Dict[str, CacheEntry] = {}
         self._access_order: List[str] = []  # For LRU
-        
+
+        # Lock for thread-safe cache operations
+        self._lock = asyncio.Lock()
+
         # Statistics
         self.stats = {
             "hits": 0,
@@ -52,7 +55,7 @@ class CacheManager:
             "evictions": 0,
             "size": 0
         }
-        
+
         # Background cleanup task
         self._cleanup_task: Optional[asyncio.Task] = None
         self._running = False
@@ -75,56 +78,58 @@ class CacheManager:
         self.logger.info("Cache manager stopped")
     
     async def get(self, key: str, default: Any = None) -> Any:
-        """Get value from cache."""
-        if key not in self._cache:
-            self.stats["misses"] += 1
-            return default
-        
-        entry = self._cache[key]
-        
-        # Check TTL
-        if entry.ttl and datetime.now(timezone.utc) - entry.created_at > entry.ttl:
-            await self._evict(key)
-            self.stats["misses"] += 1
-            return default
-        
-        # Update access metadata
-        entry.last_accessed = datetime.now(timezone.utc)
-        entry.access_count += 1
-        
-        # Update LRU order
-        if key in self._access_order:
-            self._access_order.remove(key)
-        self._access_order.append(key)
-        
-        self.stats["hits"] += 1
-        return entry.value
+        """Get value from cache (thread-safe)."""
+        async with self._lock:
+            if key not in self._cache:
+                self.stats["misses"] += 1
+                return default
+
+            entry = self._cache[key]
+
+            # Check TTL
+            if entry.ttl and datetime.now(timezone.utc) - entry.created_at > entry.ttl:
+                await self._evict_unlocked(key)
+                self.stats["misses"] += 1
+                return default
+
+            # Update access metadata
+            entry.last_accessed = datetime.now(timezone.utc)
+            entry.access_count += 1
+
+            # Update LRU order
+            if key in self._access_order:
+                self._access_order.remove(key)
+            self._access_order.append(key)
+
+            self.stats["hits"] += 1
+            return entry.value
     
-    async def set(self, key: str, value: Any, ttl: Optional[timedelta] = None, 
+    async def set(self, key: str, value: Any, ttl: Optional[timedelta] = None,
                   strategy: CacheStrategy = CacheStrategy.TTL) -> None:
-        """Set value in cache."""
-        # Check if we need to evict
-        if len(self._cache) >= self.max_size and key not in self._cache:
-            await self._evict_lru()
-        
-        # Create cache entry
-        entry = CacheEntry(
-            key=key,
-            value=value,
-            created_at=datetime.now(timezone.utc),
-            last_accessed=datetime.now(timezone.utc),
-            ttl=ttl or self.default_ttl,
-            strategy=strategy
-        )
-        
-        self._cache[key] = entry
-        
-        # Update LRU order
-        if key in self._access_order:
-            self._access_order.remove(key)
-        self._access_order.append(key)
-        
-        self.stats["size"] = len(self._cache)
+        """Set value in cache (thread-safe)."""
+        async with self._lock:
+            # Check if we need to evict
+            if len(self._cache) >= self.max_size and key not in self._cache:
+                await self._evict_lru_unlocked()
+
+            # Create cache entry
+            entry = CacheEntry(
+                key=key,
+                value=value,
+                created_at=datetime.now(timezone.utc),
+                last_accessed=datetime.now(timezone.utc),
+                ttl=ttl or self.default_ttl,
+                strategy=strategy
+            )
+
+            self._cache[key] = entry
+
+            # Update LRU order
+            if key in self._access_order:
+                self._access_order.remove(key)
+            self._access_order.append(key)
+
+            self.stats["size"] = len(self._cache)
     
     async def delete(self, key: str) -> bool:
         """Delete key from cache."""
@@ -170,19 +175,29 @@ class CacheManager:
         }
     
     async def _evict(self, key: str) -> None:
-        """Evict key from cache."""
+        """Evict key from cache (acquires lock)."""
+        async with self._lock:
+            await self._evict_unlocked(key)
+
+    async def _evict_unlocked(self, key: str) -> None:
+        """Evict key from cache (must hold lock)."""
         if key in self._cache:
             del self._cache[key]
             if key in self._access_order:
                 self._access_order.remove(key)
             self.stats["evictions"] += 1
             self.stats["size"] = len(self._cache)
-    
+
     async def _evict_lru(self) -> None:
-        """Evict least recently used entry."""
+        """Evict least recently used entry (acquires lock)."""
+        async with self._lock:
+            await self._evict_lru_unlocked()
+
+    async def _evict_lru_unlocked(self) -> None:
+        """Evict least recently used entry (must hold lock)."""
         if self._access_order:
             lru_key = self._access_order[0]
-            await self._evict(lru_key)
+            await self._evict_unlocked(lru_key)
     
     async def _cleanup_loop(self) -> None:
         """Background cleanup loop."""
@@ -196,17 +211,19 @@ class CacheManager:
                 self.logger.error(f"Error in cache cleanup: {e}")
     
     async def _cleanup_expired(self) -> None:
-        """Clean up expired entries."""
+        """Clean up expired entries (thread-safe)."""
         now = datetime.now(timezone.utc)
-        expired_keys = []
-        
-        for key, entry in self._cache.items():
-            if entry.ttl and now - entry.created_at > entry.ttl:
-                expired_keys.append(key)
-        
-        for key in expired_keys:
-            await self._evict(key)
-        
+
+        async with self._lock:
+            expired_keys = []
+
+            for key, entry in self._cache.items():
+                if entry.ttl and now - entry.created_at > entry.ttl:
+                    expired_keys.append(key)
+
+            for key in expired_keys:
+                await self._evict_unlocked(key)
+
         if expired_keys:
             self.logger.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
 

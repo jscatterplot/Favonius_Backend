@@ -17,6 +17,7 @@ from .config import Config
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
 from .connection_manager import ConnectionManager
+from .task_supervisor import TaskSupervisor
 from .device_model import DeviceModel
 from .charging_profile_manager import ChargingProfileManager
 from .transaction_manager import TransactionManager
@@ -102,6 +103,9 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         
         # Initialize privacy manager
         self.privacy_manager = PrivacyManager(timescale_client)
+
+        # Task supervisor for fire-and-forget tasks with error handling
+        self._task_supervisor = TaskSupervisor(f"ocpp:{station_id}", max_concurrent=50)
     
     @on(Action.boot_notification)
     def on_boot_notification(
@@ -126,12 +130,9 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         }
         
         # Store in database and initialize device model concurrently
-        # Use asyncio.create_task but don't store the tasks
-        task1 = asyncio.create_task(self._store_station_info())
-        task2 = asyncio.create_task(self._initialize_complete_device_model())
-        
-        # Fire and forget - don't await or store the tasks
-        # This prevents the BootNotification object from being used as a task identifier
+        # Use task supervisor to track tasks and handle errors
+        self._task_supervisor.create_task(self._store_station_info(), "store_station_info")
+        self._task_supervisor.create_task(self._initialize_complete_device_model(), "init_device_model")
         
         return call_result.BootNotification(
             current_time=datetime.now(timezone.utc).isoformat(),
@@ -157,11 +158,12 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         
         # Update connector state
         self.connector_states[connector_id] = status.value
-        
+
         # Store status in database
-        asyncio.create_task(self._store_connector_status(
-            connector_id, status.value, error_code, timestamp
-        ))
+        self._task_supervisor.create_task(
+            self._store_connector_status(connector_id, status.value, error_code, timestamp),
+            f"store_connector_status:{connector_id}"
+        )
         
         return call_result.StatusNotification()
     
@@ -185,11 +187,14 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             self.active_transactions[connector_id] = transaction_id
         elif event_type == TransactionEventEnumType.ended:
             self.active_transactions.pop(connector_id, None)
-        
+
         # Store transaction in database with V2G extensions
-        asyncio.create_task(self._store_transaction_event_v2g(
-            transaction_id, event_type.value, timestamp, transaction_info, evse_id, connector_id, kwargs
-        ))
+        self._task_supervisor.create_task(
+            self._store_transaction_event_v2g(
+                transaction_id, event_type.value, timestamp, transaction_info, evse_id, connector_id, kwargs
+            ),
+            f"store_transaction:{transaction_id}"
+        )
         
         return call_result.TransactionEvent()
     
@@ -202,9 +207,12 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     ):
         """Handle MeterValues message."""
         self.logger.debug(f"Meter values from {self.id}: EVSE {evse_id}")
-        
+
         # Process meter values
-        asyncio.create_task(self._process_meter_values(evse_id, meter_value))
+        self._task_supervisor.create_task(
+            self._process_meter_values(evse_id, meter_value),
+            f"process_meter_values:{evse_id}"
+        )
         
         return call_result.MeterValues()
     
@@ -213,9 +221,12 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         """Handle Heartbeat message."""
         self.last_heartbeat = time.time()
         self.logger.debug(f"Heartbeat from {self.id}")
-        
+
         # Update connection manager
-        asyncio.create_task(self.connection_manager.update_heartbeat(self.id))
+        self._task_supervisor.create_task(
+            self.connection_manager.update_heartbeat(self.id),
+            "update_heartbeat"
+        )
         
         return call_result.Heartbeat(
             current_time=datetime.now(timezone.utc).isoformat()
@@ -245,9 +256,12 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     def on_data_transfer(self, vendor_id: str, message_id: str, data: Optional[str] = None, **kwargs):
         """Handle DataTransfer message."""
         self.logger.info(f"Data transfer from {self.id}: {vendor_id}.{message_id}")
-        
+
         # Store custom data if needed
-        asyncio.create_task(self._store_data_transfer(vendor_id, message_id, data))
+        self._task_supervisor.create_task(
+            self._store_data_transfer(vendor_id, message_id, data),
+            f"store_data_transfer:{message_id}"
+        )
         
         return call_result.DataTransfer(
             status="Accepted",
@@ -263,9 +277,12 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     ):
         """Handle NotifyEVChargingNeeds message."""
         self.logger.info(f"EV charging needs from {self.id}: EVSE {evse_id}")
-        
+
         # Store EV charging needs
-        asyncio.create_task(self._store_ev_charging_needs(evse_id, charging_needs))
+        self._task_supervisor.create_task(
+            self._store_ev_charging_needs(evse_id, charging_needs),
+            f"store_ev_charging_needs:{evse_id}"
+        )
         
         return call_result.NotifyEVChargingNeeds()
     
@@ -279,9 +296,12 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     ):
         """Handle NotifyEVChargingSchedule message."""
         self.logger.info(f"EV charging schedule from {self.id}: EVSE {evse_id}")
-        
+
         # Store EV charging schedule
-        asyncio.create_task(self._store_ev_charging_schedule(evse_id, time_base, charging_schedule))
+        self._task_supervisor.create_task(
+            self._store_ev_charging_schedule(evse_id, time_base, charging_schedule),
+            f"store_ev_charging_schedule:{evse_id}"
+        )
         
         return call_result.NotifyEVChargingSchedule()
     
@@ -731,7 +751,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"GetVariables from {self.id}")
         
         # Process variables request
-        asyncio.create_task(self._handle_get_variables(get_variable_data))
+        self._task_supervisor.create_task(self._handle_get_variables(get_variable_data), "get_variables")
         
         return call_result.GetVariables(get_variable_result=[])
     
@@ -741,7 +761,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"SetVariables from {self.id}")
         
         # Process variables set request
-        asyncio.create_task(self._handle_set_variables(set_variable_data))
+        self._task_supervisor.create_task(self._handle_set_variables(set_variable_data), "set_variables")
         
         return call_result.SetVariables(set_variable_result=[])
     
@@ -751,7 +771,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"GetBaseReport from {self.id}")
         
         # Process base report request
-        asyncio.create_task(self._handle_get_base_report(request_id, report_base))
+        self._task_supervisor.create_task(self._handle_get_base_report(request_id, report_base), "get_base_report")
         
         return call_result.GetBaseReport()
     
@@ -762,9 +782,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"NotifyReport from {self.id}")
         
         # Process report notification
-        asyncio.create_task(self._handle_notify_report(
-            request_id, generated_at, tbc, seq_no, report_data
-        ))
+        self._task_supervisor.create_task(
+            self._handle_notify_report(request_id, generated_at, tbc, seq_no, report_data),
+            "notify_report"
+        )
         
         return call_result.NotifyReport()
     
@@ -777,10 +798,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"GetChargingProfiles from {self.id}")
         
         # Process charging profiles request
-        asyncio.create_task(self._handle_get_charging_profiles(
-            request_id, evse_id, charging_profile_id, 
-            charging_profile_purpose, stack_level
-        ))
+        self._task_supervisor.create_task(
+            self._handle_get_charging_profiles(request_id, evse_id, charging_profile_id, charging_profile_purpose, stack_level),
+            "get_charging_profiles"
+        )
         
         return call_result.GetChargingProfiles(status="Accepted")
     
@@ -792,9 +813,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"ClearChargingProfile from {self.id}")
         
         # Process clear charging profile request
-        asyncio.create_task(self._handle_clear_charging_profile(
-            charging_profile_id, charging_profile_purpose, stack_level
-        ))
+        self._task_supervisor.create_task(
+            self._handle_clear_charging_profile(charging_profile_id, charging_profile_purpose, stack_level),
+            "clear_charging_profile"
+        )
         
         return call_result.ClearChargingProfile(status="Accepted")
     
@@ -805,9 +827,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"GetCompositeSchedule from {self.id}")
         
         # Process composite schedule request
-        asyncio.create_task(self._handle_get_composite_schedule(
-            request_id, evse_id, duration, charging_rate_unit
-        ))
+        self._task_supervisor.create_task(
+            self._handle_get_composite_schedule(request_id, evse_id, duration, charging_rate_unit),
+            "get_composite_schedule"
+        )
         
         return call_result.GetCompositeSchedule()
     
@@ -817,7 +840,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"SetChargingProfile from {self.id}")
         
         # Process charging profile set request
-        asyncio.create_task(self._handle_set_charging_profile(evse_id, charging_profile))
+        self._task_supervisor.create_task(self._handle_set_charging_profile(evse_id, charging_profile), "set_charging_profile")
         
         return call_result.SetChargingProfile(status="Accepted")
     
@@ -830,9 +853,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"RequestStartTransaction from {self.id}")
         
         # Process start transaction request
-        asyncio.create_task(self._handle_request_start_transaction(
-            evse_id, id_token, remote_start_id, charging_profile, evse_id_token
-        ))
+        self._task_supervisor.create_task(
+            self._handle_request_start_transaction(evse_id, id_token, remote_start_id, charging_profile, evse_id_token),
+            "request_start_transaction"
+        )
         
         return call_result.RequestStartTransaction(status="Accepted")
     
@@ -842,7 +866,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"RequestStopTransaction from {self.id}")
         
         # Process stop transaction request
-        asyncio.create_task(self._handle_request_stop_transaction(transaction_id, reason))
+        self._task_supervisor.create_task(self._handle_request_stop_transaction(transaction_id, reason), "request_stop_transaction")
         
         return call_result.RequestStopTransaction()
     
@@ -852,7 +876,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"Reset from {self.id}: {type}")
         
         # Process reset request
-        asyncio.create_task(self._handle_reset(type, evse_id))
+        self._task_supervisor.create_task(self._handle_reset(type, evse_id), "reset")
         
         return call_result.Reset(status="Accepted")
     
@@ -862,7 +886,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"ChangeAvailability from {self.id}: {operational_status}")
         
         # Process change availability request
-        asyncio.create_task(self._handle_change_availability(operational_status, evse))
+        self._task_supervisor.create_task(self._handle_change_availability(operational_status, evse), "change_availability")
         
         return call_result.ChangeAvailability(status="Accepted")
     
@@ -872,7 +896,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"TriggerMessage from {self.id}: {requested_message}")
         
         # Process trigger message request
-        asyncio.create_task(self._handle_trigger_message(requested_message, evse))
+        self._task_supervisor.create_task(self._handle_trigger_message(requested_message, evse), "trigger_message")
         
         return call_result.TriggerMessage()
     
@@ -882,7 +906,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"UnlockConnector from {self.id}: EVSE {evse_id}, Connector {connector_id}")
         
         # Process unlock connector request
-        asyncio.create_task(self._handle_unlock_connector(evse_id, connector_id))
+        self._task_supervisor.create_task(self._handle_unlock_connector(evse_id, connector_id), "unlock_connector")
         
         return call_result.UnlockConnector()
     
@@ -894,7 +918,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"Get15118EVCertificate from {self.id}: {certificate_type}")
         
         # Process certificate request
-        asyncio.create_task(self._handle_get_15118_ev_certificate(certificate_type, exi_request))
+        self._task_supervisor.create_task(self._handle_get_15118_ev_certificate(certificate_type, exi_request), "get_15118_ev_certificate")
         
         return call_result.Get15118EVCertificate()
     
@@ -905,7 +929,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"CertificateSigned from {self.id}: {certificate_type}")
         
         # Process certificate signed
-        asyncio.create_task(self._handle_certificate_signed(certificate_type, certificate_chain, exi_response))
+        self._task_supervisor.create_task(self._handle_certificate_signed(certificate_type, certificate_chain, exi_response), "certificate_signed")
         
         return call_result.CertificateSigned()
     
@@ -915,7 +939,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"InstallCertificate from {self.id}: {certificate_type}")
         
         # Process certificate installation
-        asyncio.create_task(self._handle_install_certificate(certificate_type, certificate))
+        self._task_supervisor.create_task(self._handle_install_certificate(certificate_type, certificate), "install_certificate")
         
         return call_result.InstallCertificate()
     
@@ -925,7 +949,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"DeleteCertificate from {self.id}")
         
         # Process certificate deletion
-        asyncio.create_task(self._handle_delete_certificate(certificate_hash_data))
+        self._task_supervisor.create_task(self._handle_delete_certificate(certificate_hash_data), "delete_certificate")
         
         return call_result.DeleteCertificate()
     
@@ -935,7 +959,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"GetInstalledCertificateIds from {self.id}")
         
         # Process certificate IDs request
-        asyncio.create_task(self._handle_get_installed_certificate_ids(certificate_type))
+        self._task_supervisor.create_task(self._handle_get_installed_certificate_ids(certificate_type), "get_installed_certificate_ids")
         
         return call_result.GetInstalledCertificateIds()
     
@@ -945,7 +969,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"SignCertificate from {self.id}: {certificate_type}")
         
         # Process certificate signing
-        asyncio.create_task(self._handle_sign_certificate(certificate_type, certificate_signing_request))
+        self._task_supervisor.create_task(self._handle_sign_certificate(certificate_type, certificate_signing_request), "sign_certificate")
         
         return call_result.SignCertificate()
     
@@ -957,9 +981,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"SecurityEventNotification from {self.id}: {event_type}")
         
         # Process security event notification
-        asyncio.create_task(self._handle_security_event_notification(
-            event_type, timestamp, tech_info, additional_info
-        ))
+        self._task_supervisor.create_task(
+            self._handle_security_event_notification(event_type, timestamp, tech_info, additional_info),
+            "security_event_notification"
+        )
         
         return call_result.SecurityEventNotification()
     
@@ -970,7 +995,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"GetLog from {self.id}: {log_type}")
         
         # Process log request
-        asyncio.create_task(self._handle_get_log(log_type, request_id, retry_count, retry_interval))
+        self._task_supervisor.create_task(self._handle_get_log(log_type, request_id, retry_count, retry_interval), "get_log")
         
         return call_result.GetLog()
     
@@ -980,7 +1005,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"LogStatusNotification from {self.id}: {status}")
         
         # Process log status notification
-        asyncio.create_task(self._handle_log_status_notification(status, request_id))
+        self._task_supervisor.create_task(self._handle_log_status_notification(status, request_id), "log_status_notification")
         
         return call_result.LogStatusNotification()
     
@@ -991,7 +1016,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"NotifyEvent from {self.id}: {event_type}")
         
         # Process notify event
-        asyncio.create_task(self._handle_notify_event(event_type, timestamp, tech_info, additional_info))
+        self._task_supervisor.create_task(self._handle_notify_event(event_type, timestamp, tech_info, additional_info), "notify_event")
         
         return call_result.NotifyEvent()
     
@@ -1008,12 +1033,15 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"PublishFirmware from {self.id}: {location}")
         
         # Process publish firmware request
-        asyncio.create_task(self._handle_publish_firmware(
-            location, retrieve_date_time, request_id, retry_interval, retries,
-            retry_back_off_random_range, checksum, checksum_algorithm,
-            signing_certificate, signature, signing_certificate_chain,
-            request_start_time, request_stop_time
-        ))
+        self._task_supervisor.create_task(
+            self._handle_publish_firmware(
+                location, retrieve_date_time, request_id, retry_interval, retries,
+                retry_back_off_random_range, checksum, checksum_algorithm,
+                signing_certificate, signature, signing_certificate_chain,
+                request_start_time, request_stop_time
+            ),
+            "publish_firmware"
+        )
         
         return call_result.PublishFirmware()
     
@@ -1023,7 +1051,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"UnpublishFirmware from {self.id}: {checksum}")
         
         # Process unpublish firmware request
-        asyncio.create_task(self._handle_unpublish_firmware(checksum))
+        self._task_supervisor.create_task(self._handle_unpublish_firmware(checksum), "unpublish_firmware")
         
         return call_result.UnpublishFirmware()
     
@@ -1040,12 +1068,15 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"UpdateFirmware from {self.id}: {location}")
         
         # Process update firmware request
-        asyncio.create_task(self._handle_update_firmware(
-            location, retrieve_date_time, request_id, retry_interval, retries,
-            retry_back_off_random_range, checksum, checksum_algorithm,
-            signing_certificate, signature, signing_certificate_chain,
-            request_start_time, request_stop_time
-        ))
+        self._task_supervisor.create_task(
+            self._handle_update_firmware(
+                location, retrieve_date_time, request_id, retry_interval, retries,
+                retry_back_off_random_range, checksum, checksum_algorithm,
+                signing_certificate, signature, signing_certificate_chain,
+                request_start_time, request_stop_time
+            ),
+            "update_firmware"
+        )
         
         return call_result.UpdateFirmware()
     
@@ -1056,7 +1087,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"FirmwareStatusNotification from {self.id}: {status}")
         
         # Process firmware status notification
-        asyncio.create_task(self._handle_firmware_status_notification(status, request_id, location))
+        self._task_supervisor.create_task(self._handle_firmware_status_notification(status, request_id, location), "firmware_status_notification")
         
         return call_result.FirmwareStatusNotification()
 
@@ -1069,9 +1100,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"GetMonitoringReport from {self.id}: {monitoring_base}")
         
         # Process monitoring report request
-        asyncio.create_task(self._handle_get_monitoring_report(
-            request_id, monitoring_base, monitoring_criterion, component_name, variable_name
-        ))
+        self._task_supervisor.create_task(
+            self._handle_get_monitoring_report(request_id, monitoring_base, monitoring_criterion, component_name, variable_name),
+            "get_monitoring_report"
+        )
         
         return call_result.GetMonitoringReport(status="Accepted")
 
@@ -1082,9 +1114,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"SetVariableMonitoring from {self.id}: {component_name}.{variable_name}")
         
         # Process variable monitoring request
-        asyncio.create_task(self._handle_set_variable_monitoring(
-            component_name, variable_name, monitoring_criterion, threshold
-        ))
+        self._task_supervisor.create_task(
+            self._handle_set_variable_monitoring(component_name, variable_name, monitoring_criterion, threshold),
+            "set_variable_monitoring"
+        )
         
         return call_result.SetVariableMonitoring()
 
@@ -1095,9 +1128,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"ClearVariableMonitoring from {self.id}: {component_name}.{variable_name}")
         
         # Process clear variable monitoring request
-        asyncio.create_task(self._handle_clear_variable_monitoring(
-            component_name, variable_name, monitoring_criterion
-        ))
+        self._task_supervisor.create_task(
+            self._handle_clear_variable_monitoring(component_name, variable_name, monitoring_criterion),
+            "clear_variable_monitoring"
+        )
         
         return call_result.ClearVariableMonitoring()
 
@@ -1110,9 +1144,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"NotifyMonitoringReport from {self.id}: {monitoring_base}")
         
         # Process monitoring report notification
-        asyncio.create_task(self._handle_notify_monitoring_report(
-            request_id, monitoring_base, monitoring_criterion, component_name, variable_name
-        ))
+        self._task_supervisor.create_task(
+            self._handle_notify_monitoring_report(request_id, monitoring_base, monitoring_criterion, component_name, variable_name),
+            "notify_monitoring_report"
+        )
         
         return call_result.NotifyMonitoringReport()
 
@@ -1123,9 +1158,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"SetDisplayMessage from {self.id}: {message_info.id}")
         
         # Process display message request
-        asyncio.create_task(self._handle_set_display_message(
-            message_info, evse_id, connector_id
-        ))
+        self._task_supervisor.create_task(
+            self._handle_set_display_message(message_info, evse_id, connector_id),
+            "set_display_message"
+        )
         
         return call_result.SetDisplayMessage(status="Accepted")
 
@@ -1137,9 +1173,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"ClearDisplayMessage from {self.id}: {message_id}")
         
         # Process clear display message request
-        asyncio.create_task(self._handle_clear_display_message(
-            message_id, evse_id, connector_id
-        ))
+        self._task_supervisor.create_task(
+            self._handle_clear_display_message(message_id, evse_id, connector_id),
+            "clear_display_message"
+        )
         
         return call_result.ClearDisplayMessage()
 
@@ -1152,9 +1189,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.logger.info(f"CustomerInformation from {self.id}: {request_id}")
         
         # Process customer information request
-        asyncio.create_task(self._handle_customer_information(
-            request_id, customer_certificate_id, id_token, customer_identifier
-        ))
+        self._task_supervisor.create_task(
+            self._handle_customer_information(request_id, customer_certificate_id, id_token, customer_identifier),
+            "customer_information"
+        )
         
         return call_result.CustomerInformation(status="Accepted")
 
@@ -1168,14 +1206,16 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                                   setpoint: Optional[float] = None,
                                   setpoint_reactive: Optional[float] = None, **kwargs):
         """Handle UpdateDynamicSchedule request."""
-        asyncio.create_task(self._handle_update_dynamic_schedule(charging_profile_id, limit, 
-                                                          discharging_limit, setpoint, setpoint_reactive))
+        self._task_supervisor.create_task(
+            self._handle_update_dynamic_schedule(charging_profile_id, limit, discharging_limit, setpoint, setpoint_reactive),
+            "update_dynamic_schedule"
+        )
         return call_result.UpdateDynamicSchedule(status="Accepted")
     
     @on(Action.pull_dynamic_schedule_update)
     def on_pull_dynamic_schedule_update(self, charging_profile_id: int, **kwargs):
         """Handle PullDynamicScheduleUpdate request."""
-        asyncio.create_task(self._handle_pull_dynamic_schedule_update(charging_profile_id))
+        self._task_supervisor.create_task(self._handle_pull_dynamic_schedule_update(charging_profile_id), "pull_dynamic_schedule_update")
         return call_result.PullDynamicScheduleUpdate(status="Accepted")
     
     @on(Action.notify_charging_limit)
@@ -1183,57 +1223,57 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                                 evse_id: Optional[int] = None,
                                 charging_limit: Dict = None, **kwargs):
         """Handle NotifyChargingLimit request."""
-        asyncio.create_task(self._handle_notify_charging_limit(charging_schedule, evse_id, charging_limit))
+        self._task_supervisor.create_task(self._handle_notify_charging_limit(charging_schedule, evse_id, charging_limit), "notify_charging_limit")
         return call_result.NotifyChargingLimit(status="Accepted")
     
     @on(Action.cleared_charging_limit)
     def on_cleared_charging_limit(self, charging_limit_source: str,
                                  evse_id: Optional[int] = None, **kwargs):
         """Handle ClearedChargingLimit request."""
-        asyncio.create_task(self._handle_cleared_charging_limit(charging_limit_source, evse_id))
+        self._task_supervisor.create_task(self._handle_cleared_charging_limit(charging_limit_source, evse_id), "cleared_charging_limit")
         return call_result.ClearedChargingLimit(status="Accepted")
     
     @on(Action.use_priority_charging)
     def on_use_priority_charging(self, transaction_id: str, activate: bool, **kwargs):
         """Handle UsePriorityCharging request."""
-        asyncio.create_task(self._handle_use_priority_charging(transaction_id, activate))
+        self._task_supervisor.create_task(self._handle_use_priority_charging(transaction_id, activate), "use_priority_charging")
         return call_result.UsePriorityCharging(status="Accepted")
     
     @on(Action.notify_priority_charging)
     def on_notify_priority_charging(self, transaction_id: str, activated: bool, **kwargs):
         """Handle NotifyPriorityCharging request."""
-        asyncio.create_task(self._handle_notify_priority_charging(transaction_id, activated))
+        self._task_supervisor.create_task(self._handle_notify_priority_charging(transaction_id, activated), "notify_priority_charging")
         return call_result.NotifyPriorityCharging(status="Accepted")
     
     @on(Action.notify_allowed_energy_transfer)
     def on_notify_allowed_energy_transfer(self, allowed_energy_transfer: List[str], **kwargs):
         """Handle NotifyAllowedEnergyTransfer request."""
-        asyncio.create_task(self._handle_notify_allowed_energy_transfer(allowed_energy_transfer))
+        self._task_supervisor.create_task(self._handle_notify_allowed_energy_transfer(allowed_energy_transfer), "notify_allowed_energy_transfer")
         return call_result.NotifyAllowedEnergyTransfer(status="Accepted")
     
     # DER Control message handlers
     @on(Action.set_der_control)
     def on_set_der_control(self, der_control: Dict, **kwargs):
         """Handle SetDERControl request."""
-        asyncio.create_task(self._handle_set_der_control(der_control))
+        self._task_supervisor.create_task(self._handle_set_der_control(der_control), "set_der_control")
         return call_result.SetDERControl(status="Accepted")
     
     @on(Action.get_der_control)
     def on_get_der_control(self, control_id: Optional[int] = None, **kwargs):
         """Handle GetDERControl request."""
-        asyncio.create_task(self._handle_get_der_control(control_id))
+        self._task_supervisor.create_task(self._handle_get_der_control(control_id), "get_der_control")
         return call_result.GetDERControl(status="Accepted")
     
     @on(Action.report_der_control)
     def on_report_der_control(self, der_control: List[Dict], **kwargs):
         """Handle ReportDERControl request."""
-        asyncio.create_task(self._handle_report_der_control(der_control))
+        self._task_supervisor.create_task(self._handle_report_der_control(der_control), "report_der_control")
         return call_result.ReportDERControl(status="Accepted")
     
     @on(Action.clear_der_control)
     def on_clear_der_control(self, control_id: Optional[int] = None, **kwargs):
         """Handle ClearDERControl request."""
-        asyncio.create_task(self._handle_clear_der_control(control_id))
+        self._task_supervisor.create_task(self._handle_clear_der_control(control_id), "clear_der_control")
         return call_result.ClearDERControl(status="Accepted")
     
     @on(Action.notify_der_alarm)
@@ -1241,7 +1281,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                             grid_event_fault: Optional[str] = None,
                             timestamp: str = None, **kwargs):
         """Handle NotifyDERAlarm request."""
-        asyncio.create_task(self._handle_notify_der_alarm(control_type, alarm_ended, grid_event_fault, timestamp))
+        self._task_supervisor.create_task(self._handle_notify_der_alarm(control_type, alarm_ended, grid_event_fault, timestamp), "notify_der_alarm")
         return call_result.NotifyDERAlarm(status="Accepted")
     
     @on(Action.notify_der_start_stop)
@@ -1249,13 +1289,13 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                                  superseded_id: Optional[int] = None,
                                  timestamp: str = None, **kwargs):
         """Handle NotifyDERStartStop request."""
-        asyncio.create_task(self._handle_notify_der_start_stop(control_id, started, superseded_id, timestamp))
+        self._task_supervisor.create_task(self._handle_notify_der_start_stop(control_id, started, superseded_id, timestamp), "notify_der_start_stop")
         return call_result.NotifyDERStartStop(status="Accepted")
     
     @on(Action.afrr_signal)
     def on_afrr_signal(self, signal: float, timestamp: str, **kwargs):
         """Handle AFRRSignal request."""
-        asyncio.create_task(self._handle_afrr_signal(signal, timestamp))
+        self._task_supervisor.create_task(self._handle_afrr_signal(signal, timestamp), "afrr_signal")
         return call_result.AFRRSignal(status="Accepted")
     
     # ===== ASYNC HANDLERS =====

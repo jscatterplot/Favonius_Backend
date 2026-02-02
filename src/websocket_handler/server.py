@@ -74,12 +74,14 @@ class OCPPWebSocketServer:
         # Server state
         self.server: Optional[websockets.WebSocketServer] = None
         self.running = False
+        self._shutting_down = False  # Flag for graceful shutdown
         
         # Connection tracking
         self.connections: Dict[str, WebSocketServerProtocol] = {}
         self.charge_points: Dict[str, EnhancedOCPPChargePoint] = {}  # station_id -> charge_point
         self.station_connections: Dict[str, str] = {}  # station_id -> connection_id
-        self.message_queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        # Bounded message queues to prevent memory exhaustion (maxsize=1000 per station)
+        self.message_queues: Dict[str, asyncio.Queue] = defaultdict(lambda: asyncio.Queue(maxsize=1000))
         
         # Rate limiting - use connection manager's rate limiter
         # self.rate_limits: Dict[str, list] = defaultdict(list)  # Removed - using RateLimiter class

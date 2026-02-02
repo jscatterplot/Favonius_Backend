@@ -80,13 +80,26 @@ class PriceFeederService:
             self.logger.error(f"Manual price fetch failed: {exc}")
 
     async def _run_loop(self) -> None:
-        """Background loop for periodic fetching."""
+        """Background loop for periodic fetching with exponential backoff."""
         await asyncio.sleep(5)  # small delay to allow startup
+        consecutive_failures = 0
+        max_backoff = 300  # 5 minutes max backoff
+
         while self._running:
             try:
                 await self._fetch_and_store_prices()
+                consecutive_failures = 0  # Reset on success
             except Exception as exc:
-                self.logger.error(f"Price feeder loop error: {exc}")
+                consecutive_failures += 1
+                # Exponential backoff: 2^failures seconds, capped at max_backoff
+                backoff = min(2 ** consecutive_failures, max_backoff)
+                self.logger.error(
+                    f"Price feeder loop error (failure {consecutive_failures}): {exc}. "
+                    f"Backing off {backoff}s"
+                )
+                await asyncio.sleep(backoff)
+                continue  # Skip normal sleep, we already waited
+
             await asyncio.sleep(self.config.fetch_interval_seconds)
 
     async def _fetch_and_store_prices(self) -> None:
@@ -113,7 +126,9 @@ class PriceFeederService:
                     if response.status != 200:
                         raise RuntimeError(f"CAISO response code: {response.status}")
                     body = await response.read()
-                    points = self._parse_zip_response(body, node)
+                    # Run blocking ZIP parsing in executor to avoid blocking event loop
+                    loop = asyncio.get_running_loop()
+                    points = await loop.run_in_executor(None, self._parse_zip_response, body, node)
                     all_points.extend(points)
             except Exception as exc:
                 self.logger.error(f"Failed to fetch prices for node {node}: {exc}")

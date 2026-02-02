@@ -155,7 +155,7 @@ class EnhancedConnectionPool:
                 pool_size=self.min_connections,
                 max_overflow=self.max_connections - self.min_connections,
                 pool_timeout=self.connection_timeout,
-                pool_recycle=3600,  # 1 hour
+                pool_recycle=600,  # 10 minutes - faster recovery after DB restarts
                 pool_pre_ping=True,
                 echo=False,
                 connect_args={
@@ -173,32 +173,39 @@ class EnhancedConnectionPool:
         """Execute query with performance monitoring."""
         start_time = time.time()
         self.metrics["total_queries"] += 1
-        
+
         try:
-            async with self.asyncpg_pool.acquire() as conn:
-                # Track connection health
-                conn_id = id(conn)
-                self.connection_health[conn_id] = {
-                    "acquired_at": datetime.now(timezone.utc),
-                    "query_count": self.connection_health.get(conn_id, {}).get("query_count", 0) + 1
-                }
-                
-                # Execute query
-                if args:
-                    rows = await conn.fetch(query, *args)
-                else:
-                    rows = await conn.fetch(query)
-                
-                query_time = (time.time() - start_time) * 1000
-                self.metrics["total_query_time"] += query_time
-                self.metrics["successful_queries"] += 1
-                
-                # Log slow queries
-                if query_time > 1000:  # > 1 second
-                    self.logger.warning(f"Slow query detected: {query_time:.2f}ms - {query[:100]}...")
-                
-                return [dict(row) for row in rows]
-                
+            # Add timeout on connection acquire to prevent indefinite hangs
+            async with asyncio.timeout(self.connection_timeout):
+                async with self.asyncpg_pool.acquire() as conn:
+                    # Track connection health
+                    conn_id = id(conn)
+                    self.connection_health[conn_id] = {
+                        "acquired_at": datetime.now(timezone.utc),
+                        "query_count": self.connection_health.get(conn_id, {}).get("query_count", 0) + 1
+                    }
+
+                    # Execute query
+                    if args:
+                        rows = await conn.fetch(query, *args)
+                    else:
+                        rows = await conn.fetch(query)
+
+                    query_time = (time.time() - start_time) * 1000
+                    self.metrics["total_query_time"] += query_time
+                    self.metrics["successful_queries"] += 1
+
+                    # Log slow queries
+                    if query_time > 1000:  # > 1 second
+                        self.logger.warning(f"Slow query detected: {query_time:.2f}ms - {query[:100]}...")
+
+                    return [dict(row) for row in rows]
+
+        except asyncio.TimeoutError:
+            query_time = (time.time() - start_time) * 1000
+            self.metrics["failed_queries"] += 1
+            self.logger.error(f"Connection acquire timeout after {query_time:.2f}ms for query: {query[:100]}...")
+            raise
         except Exception as e:
             query_time = (time.time() - start_time) * 1000
             self.metrics["failed_queries"] += 1
@@ -208,23 +215,29 @@ class EnhancedConnectionPool:
     async def execute_transaction(self, queries: List[tuple]) -> List[Any]:
         """Execute multiple queries in a transaction."""
         start_time = time.time()
-        
+
         try:
-            async with self.asyncpg_pool.acquire() as conn:
-                async with conn.transaction():
-                    results = []
-                    for query, args in queries:
-                        if args:
-                            result = await conn.fetch(query, *args)
-                        else:
-                            result = await conn.fetch(query)
-                        results.append([dict(row) for row in result])
-                    
-                    transaction_time = (time.time() - start_time) * 1000
-                    self.logger.info(f"Transaction completed in {transaction_time:.2f}ms")
-                    
-                    return results
-                    
+            # Add timeout on connection acquire
+            async with asyncio.timeout(self.connection_timeout):
+                async with self.asyncpg_pool.acquire() as conn:
+                    async with conn.transaction():
+                        results = []
+                        for query, args in queries:
+                            if args:
+                                result = await conn.fetch(query, *args)
+                            else:
+                                result = await conn.fetch(query)
+                            results.append([dict(row) for row in result])
+
+                        transaction_time = (time.time() - start_time) * 1000
+                        self.logger.info(f"Transaction completed in {transaction_time:.2f}ms")
+
+                        return results
+
+        except asyncio.TimeoutError:
+            transaction_time = (time.time() - start_time) * 1000
+            self.logger.error(f"Connection acquire timeout for transaction after {transaction_time:.2f}ms")
+            raise
         except Exception as e:
             transaction_time = (time.time() - start_time) * 1000
             self.logger.error(f"Transaction failed after {transaction_time:.2f}ms: {e}")
@@ -240,31 +253,37 @@ class EnhancedConnectionPool:
         total_rows = len(data)
         
         try:
-            async with self.asyncpg_pool.acquire() as conn:
-                # Get column names from first row
-                columns = list(data[0].keys())
-                columns_str = ', '.join(columns)
-                placeholders = ', '.join([f'${i+1}' for i in range(len(columns))])
-                
-                query = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
-                
-                # Process in batches
-                for i in range(0, total_rows, batch_size):
-                    batch = data[i:i + batch_size]
-                    
-                    # Prepare batch data
-                    batch_values = []
-                    for row in batch:
-                        batch_values.extend([row[col] for col in columns])
-                    
-                    # Execute batch insert
-                    await conn.executemany(query, [tuple(row[col] for col in columns) for row in batch])
-                    
-                    self.logger.debug(f"Inserted batch {i//batch_size + 1}/{(total_rows + batch_size - 1)//batch_size}")
-                
-                batch_time = (time.time() - start_time) * 1000
-                self.logger.info(f"Batch insert completed: {total_rows} rows in {batch_time:.2f}ms")
-                
+            # Add timeout on connection acquire
+            async with asyncio.timeout(self.connection_timeout):
+                async with self.asyncpg_pool.acquire() as conn:
+                    # Get column names from first row
+                    columns = list(data[0].keys())
+                    columns_str = ', '.join(columns)
+                    placeholders = ', '.join([f'${i+1}' for i in range(len(columns))])
+
+                    query = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
+
+                    # Process in batches
+                    for i in range(0, total_rows, batch_size):
+                        batch = data[i:i + batch_size]
+
+                        # Prepare batch data
+                        batch_values = []
+                        for row in batch:
+                            batch_values.extend([row[col] for col in columns])
+
+                        # Execute batch insert
+                        await conn.executemany(query, [tuple(row[col] for col in columns) for row in batch])
+
+                        self.logger.debug(f"Inserted batch {i//batch_size + 1}/{(total_rows + batch_size - 1)//batch_size}")
+
+                    batch_time = (time.time() - start_time) * 1000
+                    self.logger.info(f"Batch insert completed: {total_rows} rows in {batch_time:.2f}ms")
+
+        except asyncio.TimeoutError:
+            batch_time = (time.time() - start_time) * 1000
+            self.logger.error(f"Connection acquire timeout for batch insert after {batch_time:.2f}ms")
+            raise
         except Exception as e:
             batch_time = (time.time() - start_time) * 1000
             self.logger.error(f"Batch insert failed after {batch_time:.2f}ms: {e}")
@@ -301,21 +320,29 @@ class EnhancedConnectionPool:
         """Perform health check on connection pool."""
         try:
             start_time = time.time()
-            
-            async with self.asyncpg_pool.acquire() as conn:
-                # Simple query to test connection
-                await conn.fetchval("SELECT 1")
-                
-                response_time = (time.time() - start_time) * 1000
-                
-                return {
-                    "status": "healthy",
-                    "response_time_ms": response_time,
-                    "pool_size": self.asyncpg_pool.get_size(),
-                    "idle_connections": self.asyncpg_pool.get_idle_size(),
-                    "timestamp": datetime.now(timezone.utc)
-                }
-                
+
+            # Add timeout on connection acquire for health checks
+            async with asyncio.timeout(10):  # 10s timeout for health checks
+                async with self.asyncpg_pool.acquire() as conn:
+                    # Simple query to test connection
+                    await conn.fetchval("SELECT 1")
+
+                    response_time = (time.time() - start_time) * 1000
+
+                    return {
+                        "status": "healthy",
+                        "response_time_ms": response_time,
+                        "pool_size": self.asyncpg_pool.get_size(),
+                        "idle_connections": self.asyncpg_pool.get_idle_size(),
+                        "timestamp": datetime.now(timezone.utc)
+                    }
+
+        except asyncio.TimeoutError:
+            return {
+                "status": "unhealthy",
+                "error": "Connection acquire timeout",
+                "timestamp": datetime.now(timezone.utc)
+            }
         except Exception as e:
             return {
                 "status": "unhealthy",

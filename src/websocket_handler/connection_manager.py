@@ -3,7 +3,7 @@
 import asyncio
 import json
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Set, Tuple
 from websockets import WebSocketServerProtocol
@@ -15,20 +15,24 @@ from .monitoring import get_logger
 
 class RateLimiter:
     """Token bucket rate limiter for WebSocket connections."""
-    
+
     def __init__(self, max_stations: int = 100):
         """
         Initialize rate limiter.
-        
+
         Args:
             max_stations: Expected number of charging stations (default 100)
                          Rate limits will be set to 100x this value
         """
         self.requests_per_minute = max_stations * 100  # 100 requests per station per minute
         self.burst_allowance = max_stations * 10  # Allow burst of 10x normal rate
-        
-        # Track requests per station: {station_id: [(timestamp, count), ...]}
-        self.request_history: Dict[str, list] = defaultdict(list)
+
+        # Track requests per station using deque with maxlen to prevent memory leak
+        # Each station can have at most requests_per_minute entries
+        self._max_history_per_station = self.requests_per_minute
+        self.request_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=self._max_history_per_station)
+        )
         self.cleanup_interval = 60  # seconds
         self.last_cleanup = datetime.now()
     
@@ -292,11 +296,13 @@ class ConnectionManager:
         return await self.rate_limiter.check_rate_limit(station_id)
     
     async def record_message_received(self, station_id: str, message_size: int) -> None:
-        connection_id = self.station_connections.get(station_id)
-        if connection_id and connection_id in self.connection_stats:
-            self.connection_stats[connection_id]["messages_received"] += 1
-            self.connection_stats[connection_id]["bytes_received"] += message_size
-            self.connection_stats[connection_id]["last_activity"] = time.time()
+        """Record message received from station (with lock for thread safety)."""
+        async with self._lock:
+            connection_id = self.station_connections.get(station_id)
+            if connection_id and connection_id in self.connection_stats:
+                self.connection_stats[connection_id]["messages_received"] += 1
+                self.connection_stats[connection_id]["bytes_received"] += message_size
+                self.connection_stats[connection_id]["last_activity"] = time.time()
     
     def get_connection_stats(self) -> Dict[str, Dict]:
         """Get connection statistics."""

@@ -11,7 +11,7 @@ from .monitoring import health_checker, metrics_collector, get_logger
 
 class HealthCheckServer:
     """HTTP server for health checks and status endpoints."""
-    
+
     def __init__(self, port: int = 8081):
         """Initialize health check server."""
         self.port = port
@@ -19,7 +19,8 @@ class HealthCheckServer:
         self.app = web.Application()
         self.runner = None
         self.site = None
-        
+        self._shutting_down = False  # Flag for graceful shutdown
+
         # Setup routes
         self._setup_routes()
     
@@ -75,32 +76,46 @@ class HealthCheckServer:
                 status=500
             )
     
+    def begin_shutdown(self) -> None:
+        """Signal that shutdown has begun - readiness probe will fail."""
+        self._shutting_down = True
+        self.logger.info("Health check server entering shutdown mode")
+
     async def _readiness_check(self, request: web.Request) -> web.Response:
         """Kubernetes readiness probe endpoint."""
         try:
+            # Fail readiness if we're shutting down (stop accepting new traffic)
+            if self._shutting_down:
+                return web.json_response(
+                    {"status": "not_ready", "reason": "shutting_down"},
+                    status=503
+                )
+
             # Check if critical components are ready
             results = await health_checker.run_checks()
-            
-            critical_checks = ["connections"]  # Redis removed
+
+            # Include database in critical checks (not just connections)
+            critical_checks = ["connections", "timescaledb"]
             ready = all(
                 results["checks"].get(check, {}).get("status") == "healthy"
                 for check in critical_checks
+                if check in results["checks"]  # Only check if the check exists
             )
-            
+
             if ready:
                 return web.json_response({"status": "ready"})
             else:
                 return web.json_response(
                     {
-                        "status": "not_ready", 
+                        "status": "not_ready",
                         "checks": {
-                            k: v for k, v in results["checks"].items() 
+                            k: v for k, v in results["checks"].items()
                             if k in critical_checks
                         }
                     },
                     status=503
                 )
-                
+
         except Exception as e:
             return web.json_response(
                 {"status": "error", "error": str(e)},
