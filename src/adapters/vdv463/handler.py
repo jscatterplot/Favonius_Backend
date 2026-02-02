@@ -9,16 +9,21 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any
 from websockets import WebSocketServerProtocol
 import websockets
-import structlog
+
+try:
+    import structlog
+    _HAS_STRUCTLOG = True
+except ImportError:
+    import logging
+    structlog = None  # type: ignore
+    _HAS_STRUCTLOG = False
 
 from .messages import (
     ValidationMode,
     VDVMessageEnvelope,
-    VDVProvideChargingRequests,
-    VDVError,
     parse_message,
     build_error,
     build_provide_charging_requests_response,
@@ -27,13 +32,44 @@ from .messages import (
     DepotInfo,
     ChargingPointInfo,
     VDV463ValidationError,
+    parse_charging_request_item,
 )
 from .vehicle_resolver import VehicleResolver
+from .charging_point_resolver import ChargingPointResolver
+from . import repository as vdv_repo
+from .depot_state import get_depot_charging_info
 
 
-def get_logger(name: str) -> structlog.BoundLogger:
-    """Get a structured logger instance."""
-    return structlog.get_logger(name)
+def _stdlib_log_adapter(logger_instance: Any) -> Any:
+    """Wrap stdlib logger to accept structlog-style keyword args."""
+
+    def _log(level: str, msg: str, *args: Any, **kwargs: Any) -> None:
+        if kwargs:
+            extra = " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+            msg = f"{msg} {extra}" if msg else extra
+        getattr(logger_instance, level)(msg, *args)
+
+    class Adapter:
+        def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+            _log("warning", msg, *args, **kwargs)
+
+        def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+            _log("info", msg, *args, **kwargs)
+
+        def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+            _log("error", msg, *args, **kwargs)
+
+        def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+            _log("debug", msg, *args, **kwargs)
+
+    return Adapter()
+
+
+def get_logger(name: str) -> Any:
+    """Get a structured logger instance (structlog if available, else stdlib logging)."""
+    if _HAS_STRUCTLOG:
+        return structlog.get_logger(name)
+    return _stdlib_log_adapter(logging.getLogger(name))
 
 
 logger = get_logger(__name__)
@@ -51,9 +87,11 @@ class VDV463Handler:
         depot_id: Optional[str] = None,
         validation_mode: ValidationMode = ValidationMode.HARD,
         vehicle_resolver: Optional[VehicleResolver] = None,
+        charging_point_resolver: Optional[ChargingPointResolver] = None,
+        db_pool: Any = None,
     ):
         """Initialize VDV 463 handler.
-        
+
         Args:
             presystem_id: Presystem identifier from WebSocket path
             websocket: WebSocket connection
@@ -62,6 +100,8 @@ class VDV463Handler:
             depot_id: Optional depot ID (defaults to config default)
             validation_mode: Validation mode (HARD or SOFT)
             vehicle_resolver: Optional vehicle resolver (creates default if None)
+            charging_point_resolver: Optional charging point resolver (creates default if None)
+            db_pool: asyncpg Pool for persistence (optional; if None, no DB writes)
         """
         self.presystem_id = presystem_id
         self.websocket = websocket
@@ -69,15 +109,17 @@ class VDV463Handler:
         self.config = config
         self.depot_id = depot_id or getattr(config, "default_depot_id", None)
         self.validation_mode = validation_mode
-        self.vehicle_resolver = vehicle_resolver or VehicleResolver()
+        self.db_pool = db_pool
+        self.vehicle_resolver = vehicle_resolver or VehicleResolver(db_pool)
+        self.charging_point_resolver = charging_point_resolver or ChargingPointResolver(db_pool)
         self.logger = get_logger(__name__)
-        
+
         # Connection state
         self.connection_id: Optional[str] = None
         self.running = False
         self._charging_info_task: Optional[asyncio.Task] = None
-        
-        # In-memory storage for Sprint 1 (Sprint 2 will use database)
+
+        # In-memory fallback when db_pool is None (testing)
         self.charging_requests: Dict[str, ChargingRequest] = {}
     
     async def run(self) -> None:
@@ -142,6 +184,34 @@ class VDV463Handler:
     async def _handle_message(self, raw_message: str) -> None:
         """Handle incoming WebSocket message."""
         try:
+            # Message size limit (PRD: 1 MB)
+            max_size = getattr(getattr(self.config, "websocket", None), "max_message_size", 1048576)
+            msg_bytes = len(raw_message.encode("utf-8"))
+            if msg_bytes > max_size:
+                error_msg = [
+                    3,
+                    "CMS",
+                    self.presystem_id,
+                    datetime.utcnow().isoformat() + "Z",
+                    "error-message-too-large",
+                    "ProvideChargingRequests",
+                    {
+                        "errorCode": "MessageTooLarge",
+                        "errorDescription": f"Message size {msg_bytes} exceeds limit {max_size} bytes",
+                    },
+                ]
+                await self.websocket.send(json.dumps(error_msg))
+                self._record_error("MessageTooLarge")
+                if self.db_pool and self.depot_id:
+                    await vdv_repo.log_vdv463_error(
+                        self.db_pool,
+                        self.depot_id,
+                        self.presystem_id,
+                        "MessageTooLarge",
+                        f"Message size {msg_bytes} exceeds limit {max_size} bytes",
+                    )
+                return
+
             # Check rate limiting
             allowed, reason = await self.connection_manager.check_message_rate_limit(
                 self.presystem_id
@@ -163,8 +233,16 @@ class VDV463Handler:
                     await self.websocket.send(json.dumps(error_msg))
                 except Exception:
                     pass  # Can't send error if we can't parse message
+                if self.db_pool and self.depot_id:
+                    await vdv_repo.log_vdv463_error(
+                        self.db_pool,
+                        self.depot_id,
+                        self.presystem_id,
+                        "RateLimitExceeded",
+                        reason or "Rate limit exceeded",
+                    )
                 return
-            
+
             # Record message received
             await self.connection_manager.record_message_received(
                 self.presystem_id,
@@ -174,13 +252,22 @@ class VDV463Handler:
             # Parse and validate message
             try:
                 envelope = parse_message(raw_message, self.validation_mode)
-            except VDV463ValidationError as e:
+                except VDV463ValidationError as e:
                 self.logger.error(
                     "Message validation failed",
                     presystem_id=self.presystem_id,
                     error_code=e.error_code,
                     error=str(e),
                 )
+                self._record_error(e.error_code)
+                if self.db_pool and self.depot_id:
+                    await vdv_repo.log_vdv463_error(
+                        self.db_pool,
+                        self.depot_id,
+                        self.presystem_id,
+                        e.error_code,
+                        str(e),
+                    )
                 # Try to build error response
                 try:
                     # Parse in soft mode to get envelope structure
@@ -233,6 +320,14 @@ class VDV463Handler:
                 error=str(e),
             )
             self._record_error("InvalidJSON")
+            if self.db_pool and self.depot_id:
+                await vdv_repo.log_vdv463_error(
+                    self.db_pool,
+                    self.depot_id,
+                    self.presystem_id,
+                    "InvalidJSON",
+                    str(e),
+                )
         except Exception as e:
             self.logger.error(
                 "Unexpected error handling message",
@@ -262,71 +357,208 @@ class VDV463Handler:
                 f"Action not supported: {action}",
             )
             await self.websocket.send(json.dumps(error_msg))
-    
+            self._record_error("UnsupportedAction")
+            if self.db_pool and self.depot_id:
+                await vdv_repo.log_vdv463_error(
+                    self.db_pool,
+                    self.depot_id,
+                    self.presystem_id,
+                    "UnsupportedAction",
+                    f"Action not supported: {action}",
+                )
+
     async def _handle_provide_charging_requests(
         self, envelope: VDVMessageEnvelope
     ) -> None:
-        """Handle ProvideChargingRequests message."""
+        """Handle ProvideChargingRequests message: validate, resolve IDs, persist, terminate absent."""
         payload = envelope.payload
         charging_request_list = payload.get("chargingRequestList", [])
-        
-        parsed_requests = []
-        
+
+        # DuplicateRequestId: same chargingRequestId twice in one message
+        seen_ids: set = set()
+        for req_data in charging_request_list:
+            crid = req_data.get("chargingRequestId")
+            if crid and crid in seen_ids:
+                error_msg = build_error(
+                    envelope,
+                    "DuplicateRequestId",
+                    f"Duplicate chargingRequestId in message: {crid}",
+                    {"chargingRequestId": crid},
+                )
+                await self.websocket.send(json.dumps(error_msg))
+                self._record_error("DuplicateRequestId")
+                if self.db_pool and self.depot_id:
+                    await vdv_repo.log_vdv463_error(
+                        self.db_pool,
+                        self.depot_id,
+                        self.presystem_id,
+                        "DuplicateRequestId",
+                        f"Duplicate chargingRequestId: {crid}",
+                        crid,
+                    )
+                return
+            if crid:
+                seen_ids.add(crid)
+
+        processed_ids: list = []
         for req_data in charging_request_list:
             try:
-                # Parse charging request
-                charging_request = ChargingRequest(
-                    vehicle_external_id=req_data["vehicleId"],
-                    charging_point_id=req_data.get("chargingPointId"),
-                    arrival_time=req_data["arrivalTime"],
-                    departure_time=req_data["departureTime"],
-                    min_target_soc=req_data.get("minTargetSoc", 0.0),
-                    max_target_soc=req_data.get("maxTargetSoc", 1.0),
-                    priority=req_data.get("chargingPriority"),
-                    manual_preconditioning=req_data.get("manualPreconditioning"),
-                    automatic_preconditioning=req_data.get("automaticPreconditioning"),
-                    validation_status=envelope.validation_status,
+                # Parse from chargingRequestData (official VDV 463 structure)
+                charging_request = parse_charging_request_item(
+                    req_data,
+                    validation_status=envelope.validation_status or "ok",
                 )
-                
-                # Resolve vehicle ID (Sprint 1: may return None)
-                vehicle_id = await self.vehicle_resolver.resolve_vehicle_id(
-                    charging_request.vehicle_external_id,
-                    self.depot_id,
-                )
-                
-                # Store request (Sprint 1: in-memory; Sprint 2: database)
-                request_key = f"{charging_request.vehicle_external_id}_{charging_request.arrival_time}"
-                self.charging_requests[request_key] = charging_request
-                
-                parsed_requests.append(charging_request)
-                
-                self.logger.info(
-                    "Processed charging request",
-                    presystem_id=self.presystem_id,
-                    vehicle_external_id=charging_request.vehicle_external_id,
-                    vehicle_id=vehicle_id,
-                    arrival_time=charging_request.arrival_time,
-                    departure_time=charging_request.departure_time,
-                )
-            
-            except KeyError as e:
+            except (KeyError, TypeError) as e:
                 self.logger.error(
-                    "Missing required field in charging request",
-                    presystem_id=self.presystem_id,
-                    missing_field=str(e),
-                    request_data=req_data,
-                )
-                # Continue processing other requests
-                continue
-            except Exception as e:
-                self.logger.error(
-                    "Error processing charging request",
+                    "Missing or invalid field in charging request",
                     presystem_id=self.presystem_id,
                     error=str(e),
-                    error_type=type(e).__name__,
+                    request_data=req_data,
                 )
                 continue
-        
+
+            # InvalidTimeWindow: arrival >= departure
+            if charging_request.arrival_time and charging_request.departure_time:
+                if charging_request.arrival_time >= charging_request.departure_time:
+                    error_msg = build_error(
+                        envelope,
+                        "InvalidTimeWindow",
+                        "expectedArrivalTimeAtChargingPoint must be before requestedTimeForDeparture",
+                        {"chargingRequestId": charging_request.charging_request_id},
+                    )
+                    await self.websocket.send(json.dumps(error_msg))
+                    self._record_error("InvalidTimeWindow")
+                    if self.db_pool and self.depot_id:
+                        await vdv_repo.log_vdv463_error(
+                            self.db_pool,
+                            self.depot_id,
+                            self.presystem_id,
+                            "InvalidTimeWindow",
+                            "Arrival >= departure",
+                            charging_request.charging_request_id,
+                        )
+                    continue
+
+            # Resolve vehicle ID (required for persistence)
+            vehicle_id = await self.vehicle_resolver.resolve_vehicle_id(
+                charging_request.vehicle_external_id,
+                self.depot_id,
+            )
+            if not vehicle_id:
+                error_msg = build_error(
+                    envelope,
+                    "InvalidVehicleId",
+                    f"Vehicle '{charging_request.vehicle_external_id}' not found in depot configuration",
+                    {"chargingRequestId": charging_request.charging_request_id},
+                )
+                await self.websocket.send(json.dumps(error_msg))
+                self._record_error("InvalidVehicleId")
+                if self.db_pool and self.depot_id:
+                    await vdv_repo.log_vdv463_error(
+                        self.db_pool,
+                        self.depot_id,
+                        self.presystem_id,
+                        "InvalidVehicleId",
+                        f"Vehicle not found: {charging_request.vehicle_external_id}",
+                        charging_request.charging_request_id,
+                    )
+                continue
+
+            # Resolve charging point ID if provided
+            charging_point_uuid = None
+            if charging_request.charging_point_id and self.depot_id:
+                charging_point_uuid = await self.charging_point_resolver.resolve_charging_point_id(
+                    charging_request.charging_point_id,
+                    self.depot_id,
+                )
+                if not charging_point_uuid:
+                    error_msg = build_error(
+                        envelope,
+                        "InvalidChargingPointId",
+                        f"Charging point '{charging_request.charging_point_id}' not found in depot",
+                        {"chargingRequestId": charging_request.charging_request_id},
+                    )
+                    await self.websocket.send(json.dumps(error_msg))
+                    self._record_error("InvalidChargingPointId")
+                    if self.db_pool and self.depot_id:
+                        await vdv_repo.log_vdv463_error(
+                            self.db_pool,
+                            self.depot_id,
+                            self.presystem_id,
+                            "InvalidChargingPointId",
+                            f"Charging point not found: {charging_request.charging_point_id}",
+                            charging_request.charging_request_id,
+                        )
+                    continue
+
+            if self.db_pool and self.depot_id:
+                try:
+                    if charging_request.charging_instruction == "Terminate":
+                        await vdv_repo.set_charging_request_terminated(
+                            self.db_pool,
+                            self.depot_id,
+                            self.presystem_id,
+                            charging_request.charging_request_id,
+                        )
+                    else:
+                        await vdv_repo.upsert_charging_request(
+                            self.db_pool,
+                            self.depot_id,
+                            self.presystem_id,
+                            charging_request,
+                            vehicle_id,
+                            charging_point_uuid,
+                            envelope.message_id or "",
+                        )
+                    processed_ids.append(charging_request.charging_request_id)
+                except Exception as e:
+                    self.logger.error(
+                        "Failed to persist charging request",
+                        presystem_id=self.presystem_id,
+                        charging_request_id=charging_request.charging_request_id,
+                        error=str(e),
+                    )
+                    self._record_error("PersistenceError")
+                    if self.db_pool and self.depot_id:
+                        await vdv_repo.log_vdv463_error(
+                            self.db_pool,
+                            self.depot_id,
+                            self.presystem_id,
+                            "PersistenceError",
+                            str(e),
+                            charging_request.charging_request_id,
+                        )
+                    continue
+            else:
+                request_key = f"{charging_request.charging_request_id}_{charging_request.vehicle_external_id}"
+                self.charging_requests[request_key] = charging_request
+                processed_ids.append(charging_request.charging_request_id)
+
+            self.logger.info(
+                "Processed charging request",
+                presystem_id=self.presystem_id,
+                vehicle_external_id=charging_request.vehicle_external_id,
+                vehicle_id=vehicle_id,
+                charging_request_id=charging_request.charging_request_id,
+            )
+
+        # Terminate requests that disappeared from this message (per PRD)
+        if self.db_pool and self.depot_id:
+            try:
+                await vdv_repo.terminate_requests_not_in_list(
+                    self.db_pool,
+                    self.depot_id,
+                    self.presystem_id,
+                    processed_ids,
+                )
+                await vdv_repo.update_depot_vdv463_timestamp(self.db_pool, self.depot_id)
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to terminate absent requests or update depot timestamp",
+                    presystem_id=self.presystem_id,
+                    error=str(e),
+                )
+
         # Send response
         response = build_provide_charging_requests_response(envelope)
         await self.websocket.send(json.dumps(response))
@@ -341,8 +573,22 @@ class VDV463Handler:
             presystem_id=self.presystem_id,
             source=envelope.source,
         )
-        
-        # Send boot notification response
+        # Log connection for operator diagnostics (per dev plan Phase 5)
+        if self.db_pool and self.depot_id:
+            try:
+                await vdv_repo.log_vdv463_connection(
+                    self.db_pool,
+                    self.depot_id,
+                    self.presystem_id,
+                    envelope.source or "BMS",
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to log VDV 463 connection",
+                    presystem_id=self.presystem_id,
+                    error=str(e),
+                )
+        # Send boot notification response (schema: only "status" per BootNotificationResponse.json)
         response = [
             2,  # Confirmation
             "CMS",
@@ -350,10 +596,7 @@ class VDV463Handler:
             datetime.utcnow().isoformat() + "Z",
             f"boot-response-{envelope.message_id}",
             "BootNotification",
-            {
-                "status": "Accepted",
-                "currentTime": datetime.utcnow().isoformat() + "Z",
-            },
+            {"status": "Accepted"},
         ]
         await self.websocket.send(json.dumps(response))
         self._record_message_sent("BootNotification")
@@ -385,28 +628,43 @@ class VDV463Handler:
         while self.running:
             try:
                 await asyncio.sleep(15)  # 15-second interval per US-07
-                
+
                 if not self.running:
                     break
-                
-                # Build depot information (Sprint 1: placeholder data)
-                # Sprint 2: Query real depot/charger state
-                depot_info = DepotInfo(
-                    depot_id=self.depot_id or "default_depot",
-                    charging_stations=[
-                        ChargingPointInfo(
-                            charging_point_id=f"cp_{i}",
-                            status="Available",
-                            current_power_kw=0.0,
+
+                # Build depot information from DB when available (Sprint 2)
+                if self.db_pool and self.depot_id:
+                    depot_info_list = await get_depot_charging_info(
+                        self.db_pool,
+                        self.depot_id,
+                    )
+                else:
+                    depot_info_list = [
+                        DepotInfo(
+                            depot_id=self.depot_id or "default_depot",
+                            charging_stations=[
+                                ChargingPointInfo(
+                                    charging_point_id=f"cp_{i}",
+                                    charging_point_status="Available",
+                                    current_power_kw=0.0,
+                                )
+                                for i in range(5)
+                            ],
                         )
-                        for i in range(5)  # Placeholder: 5 charging points
-                    ],
-                )
-                
+                    ]
+
+                if not depot_info_list:
+                    depot_info_list = [
+                        DepotInfo(
+                            depot_id=self.depot_id or "default_depot",
+                            charging_stations=[],
+                        )
+                    ]
+
                 # Build and send message
                 message = build_provide_charging_information_message(
                     self.presystem_id,
-                    [depot_info],
+                    depot_info_list,
                 )
                 
                 await self.websocket.send(json.dumps(message))
@@ -481,6 +739,20 @@ class VDV463Handler:
         """Cleanup handler resources."""
         self.running = False
         
+        # Mark VDV 463 connection as disconnected (per dev plan Phase 5)
+        if self.db_pool and self.depot_id:
+            try:
+                await vdv_repo.update_vdv463_connection_disconnect(
+                    self.db_pool,
+                    self.depot_id,
+                    self.presystem_id,
+                )
+            except Exception as e:
+                self.logger.debug(
+                    "Failed to update VDV 463 connection disconnect",
+                    presystem_id=self.presystem_id,
+                    error=str(e),
+                )
         # Cancel periodic task
         if self._charging_info_task:
             self._charging_info_task.cancel()

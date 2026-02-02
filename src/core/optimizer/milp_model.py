@@ -302,14 +302,30 @@ def build_optimization_model(
             model.P_charge[b, 0].fix(0.0)
             model.y_charge[b, 0].fix(0)
 
-    # Departure SoC requirement (HARD CONSTRAINT)
-    def departure_soc_rule(m, b):
+    # Departure SoC requirement (HARD): per-vehicle min/max from VDV 463 or default 0.99 / 1.0
+    soc_min_default = 0.99
+    soc_max_default = 1.0
+    vehicle_departure_soc_min = getattr(state, "vehicle_departure_soc_min", None) or {}
+    vehicle_departure_soc_max = getattr(state, "vehicle_departure_soc_max", None) or {}
+
+    def departure_soc_min_rule(m, b):
         t_depart = state.departure_times.get(b)
         if t_depart is not None and t_depart < config.n_timesteps:
-            return m.SoC[b, t_depart] >= 0.99  # 99% at departure
+            soc_min = vehicle_departure_soc_min.get(b, soc_min_default)
+            return m.SoC[b, t_depart] >= soc_min
         return pyo.Constraint.Skip
 
-    model.departure_soc = pyo.Constraint(model.B, rule=departure_soc_rule)
+    model.departure_soc_min = pyo.Constraint(model.B, rule=departure_soc_min_rule)
+
+    def departure_soc_max_rule(m, b):
+        t_depart = state.departure_times.get(b)
+        if t_depart is not None and t_depart < config.n_timesteps:
+            soc_max = vehicle_departure_soc_max.get(b, soc_max_default)
+            if soc_max < 1.0:  # Only add if binding (battery protection)
+                return m.SoC[b, t_depart] <= soc_max
+        return pyo.Constraint.Skip
+
+    model.departure_soc_max = pyo.Constraint(model.B, rule=departure_soc_max_rule)
 
     # Charger linking constraint (per PRD Section 8.1 Constraint 6)
     # Links vehicle max charge rate to binary charging variable
@@ -386,11 +402,35 @@ def build_optimization_model(
 
     model.batt_split = pyo.Constraint(model.T, rule=batt_split_rule)
 
-    # Grid balance with efficiency-adjusted battery power
+    # VDV 463 preconditioning (soft constraint): P_precond + slack >= required
+    preconditioning_requests = getattr(state, "preconditioning_requests", None) or []
+    required_precond_list = [0.0] * config.n_timesteps
+    if horizon_start is None:
+        horizon_start = datetime.utcnow()
+    for req in preconditioning_requests:
+        start_time = req.get("start_time")
+        end_time = req.get("end_time")
+        power_kw = float(req.get("power_kw") or 0)
+        if start_time is None or end_time is None:
+            continue
+        if hasattr(start_time, "timestamp") and hasattr(horizon_start, "timestamp"):
+            t_start = int((start_time - horizon_start).total_seconds() / (config.delta_t * 3600))
+            t_end = int((end_time - horizon_start).total_seconds() / (config.delta_t * 3600))
+            for t in range(max(0, t_start), min(config.n_timesteps, t_end)):
+                required_precond_list[t] += power_kw
+    model.required_precond = pyo.Param(model.T, initialize=lambda m, t: required_precond_list[t])
+    model.P_precond = pyo.Var(model.T, domain=pyo.NonNegativeReals)
+    model.precond_slack = pyo.Var(model.T, domain=pyo.NonNegativeReals)
+    M_PRECOND = 1000.0  # $/kW penalty for unfulfilled preconditioning (per PRD)
+
+    def precond_rule(m, t):
+        return m.P_precond[t] + m.precond_slack[t] >= m.required_precond[t]
+
+    model.precond_constraint = pyo.Constraint(model.T, rule=precond_rule)
+
+    # Grid balance with efficiency-adjusted battery power and preconditioning load
     def grid_balance_rule(m, t):
         # P_batt_effective = discharge * η - charge / η
-        # Discharge (P_batt > 0): grid receives P_batt * η (efficiency loss)
-        # Charge (P_batt < 0): grid provides |P_batt| / η (extra power needed)
         P_batt_effective = (
             m.P_batt_discharge[t] * eta_batt - m.P_batt_charge[t] / eta_batt
         )
@@ -398,6 +438,7 @@ def build_optimization_model(
             m.P_grid[t]
             == sum(m.P_charge[b, t] for b in m.B)
             + m.building_power[t]
+            + m.P_precond[t]
             - P_batt_effective
         )
 
@@ -440,13 +481,14 @@ def build_optimization_model(
 
     model.batt_dynamics = pyo.Constraint(model.T, rule=batt_dynamics_rule)
 
-    # Objective: minimize energy cost + demand charges
+    # Objective: minimize energy cost + demand charges + preconditioning shortfall penalty
     def objective_rule(m):
         energy_cost = sum(
             m.price[t] * m.P_grid[t] * config.delta_t for t in m.T
         )
         demand_cost = state.demand_charge_rate * m.P_peak
-        return energy_cost + demand_cost
+        precond_penalty = M_PRECOND * sum(m.precond_slack[t] for t in m.T)
+        return energy_cost + demand_cost + precond_penalty
 
     model.objective = pyo.Objective(rule=objective_rule, sense=pyo.minimize)
 
@@ -471,14 +513,16 @@ def _validate_solution(
     Raises:
         ConstraintViolationError: If hard constraints are violated
     """
-    # Validate departure SoC constraints (HARD)
+    # Validate departure SoC constraints (HARD): per-vehicle min from state or 0.99
+    vehicle_departure_soc_min = getattr(state, "vehicle_departure_soc_min", None) or {}
     for b in model.B:
         t_depart = state.departure_times.get(b)
         if t_depart is not None and t_depart < config.n_timesteps:
+            soc_min = vehicle_departure_soc_min.get(b, 0.99)
             soc_at_departure = pyo.value(model.SoC[b, t_depart])
-            if soc_at_departure < 0.99:
+            if soc_at_departure < soc_min:
                 raise ConstraintViolationError(
-                    f"Vehicle {b} SoC at departure ({soc_at_departure:.3f}) < 0.99",
+                    f"Vehicle {b} SoC at departure ({soc_at_departure:.3f}) < {soc_min}",
                     "departure_soc",
                     vehicle_id=b,
                 )

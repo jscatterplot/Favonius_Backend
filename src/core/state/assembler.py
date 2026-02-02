@@ -136,8 +136,12 @@ class StateAssembler:
         # Fetch prices
         prices = await self._get_prices(now, horizon_end, n_steps)
 
-        # Fetch schedules and compute availability
+        # Fetch schedules and VDV 463 charging requests; merge (VDV 463 overrides for same vehicle)
         schedules = await self._get_schedules(now, horizon_end)
+        vdv463_requests = await self._get_vdv463_charging_requests(now, horizon_end)
+        schedules, vehicle_departure_soc_min, vehicle_departure_soc_max, vehicle_priorities, preconditioning_requests = (
+            self._merge_vdv463_into_schedules(schedules, vdv463_requests, now)
+        )
         availability = self._compute_availability(schedules, now, n_steps)
         departure_times = self._compute_departure_times(schedules, now)
         energy_requirements = self._compute_energy_requirements(schedules)
@@ -189,6 +193,10 @@ class StateAssembler:
             departure_times=departure_times,
             building_power=building_power,
             incoming_vehicles=incoming_vehicles,
+            vehicle_departure_soc_min=vehicle_departure_soc_min,
+            vehicle_departure_soc_max=vehicle_departure_soc_max,
+            vehicle_priorities=vehicle_priorities,
+            preconditioning_requests=preconditioning_requests,
         )
 
         assembly_time = time.time() - start_time
@@ -330,6 +338,144 @@ class StateAssembler:
         )
         return prices[:n_steps]
 
+    async def _get_vdv463_charging_requests(
+        self, start: datetime, end: datetime
+    ) -> list[dict]:
+        """Get active VDV 463 charging requests whose window overlaps [start, end].
+
+        Returns list of dicts with: vehicle_id (str), expected_arrival, requested_departure,
+        min_target_soc, max_target_soc, priority, preconditioning_type, preconditioning_start,
+        ambient_temperature, requested_start_time, requested_finish_time, hvac_aux_power,
+        system_aux_power, charging_point_id.
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT vehicle_id::text, expected_arrival, requested_departure,
+                           min_target_soc, max_target_soc, priority,
+                           preconditioning_type, preconditioning_start,
+                           ambient_temperature, requested_start_time, requested_finish_time,
+                           hvac_aux_power, system_aux_power, charging_point_id
+                    FROM vdv463_charging_requests
+                    WHERE depot_id = $1::uuid AND status = 'active'
+                      AND requested_departure >= $2 AND expected_arrival <= $3
+                    ORDER BY expected_arrival
+                    """,
+                    self.depot_id,
+                    start,
+                    end,
+                )
+            return [dict(row) for row in rows]
+        except asyncpg.PostgresError as e:
+            if "vdv463_charging_requests" in str(e) and "does not exist" in str(e).lower():
+                logger.debug(
+                    f"VDV 463 table not present, skipping: {e}",
+                    extra={"depot_id": self.depot_id},
+                )
+                return []
+            logger.error(
+                f"Database error fetching VDV 463 requests for depot {self.depot_id}: {e}"
+            )
+            raise
+
+    def _merge_vdv463_into_schedules(
+        self,
+        schedules: list[dict],
+        vdv463_requests: list[dict],
+        horizon_start: datetime,
+    ) -> tuple[
+        list[dict],
+        dict[str, float],
+        dict[str, float],
+        dict[str, int],
+        list[dict],
+    ]:
+        """Merge VDV 463 requests into schedule list; build SoC/priority/preconditioning dicts.
+
+        VDV 463 is authoritative for vehicles that have an active request; their schedule
+        entry uses expected_arrival as return_time and requested_departure as departure_time.
+        Returns (merged_schedules, vehicle_departure_soc_min, vehicle_departure_soc_max,
+        vehicle_priorities, preconditioning_requests).
+        """
+        vehicle_departure_soc_min: dict[str, float] = {}
+        vehicle_departure_soc_max: dict[str, float] = {}
+        vehicle_priorities: dict[str, int] = {}
+        preconditioning_requests: list[dict] = []
+        vdv_vehicle_ids = {r["vehicle_id"] for r in vdv463_requests}
+
+        # Schedule dicts: vehicle_id, return_time, departure_time, estimated_energy_kwh
+        schedule_by_vehicle: dict[str, dict] = {}
+        for s in schedules:
+            vid = s["vehicle_id"]
+            schedule_by_vehicle[vid] = {
+                "vehicle_id": vid,
+                "return_time": s["return_time"],
+                "departure_time": s["departure_time"],
+                "estimated_energy_kwh": s.get("estimated_energy_kwh") or 100.0,
+            }
+
+        for r in vdv463_requests:
+            vid = r["vehicle_id"]
+            ret = r.get("expected_arrival")
+            dep = r.get("requested_departure")
+            if ret is None or dep is None:
+                continue
+            # Normalize SoC to 0-1 if stored as 0-100
+            min_soc = r.get("min_target_soc")
+            max_soc = r.get("max_target_soc")
+            if min_soc is not None:
+                vehicle_departure_soc_min[vid] = min_soc if min_soc <= 1 else min_soc / 100.0
+            if max_soc is not None:
+                vehicle_departure_soc_max[vid] = max_soc if max_soc <= 1 else max_soc / 100.0
+            if r.get("priority") is not None:
+                vehicle_priorities[vid] = int(r["priority"])
+
+            schedule_by_vehicle[vid] = {
+                "vehicle_id": vid,
+                "return_time": ret,
+                "departure_time": dep,
+                "estimated_energy_kwh": 100.0,
+            }
+
+            # Preconditioning: build list of {vehicle_id, start_time, end_time, power_kw}
+            precond_type = r.get("preconditioning_type")
+            if precond_type == "manual" and r.get("preconditioning_start") and r.get("hvac_aux_power") is not None:
+                start_ts = r["preconditioning_start"]
+                end_ts = dep
+                power_kw = (r["hvac_aux_power"] or 0) / 1000.0
+                preconditioning_requests.append({
+                    "vehicle_id": vid,
+                    "start_time": start_ts,
+                    "end_time": end_ts,
+                    "power_kw": power_kw,
+                })
+            elif precond_type == "automatic" and r.get("requested_finish_time") and r.get("ambient_temperature") is not None:
+                # Duration ~ (targetTemp - ambientTemp) * 3 min/°C; target default 18°C (AT-10)
+                ambient = float(r["ambient_temperature"])
+                target = 18.0
+                duration_min = max(0, (target - ambient) * 3.0)
+                finish_ts = r["requested_finish_time"]
+                if hasattr(finish_ts, "timestamp"):
+                    start_ts = finish_ts - timedelta(minutes=duration_min)
+                else:
+                    start_ts = finish_ts
+                preconditioning_requests.append({
+                    "vehicle_id": vid,
+                    "start_time": start_ts,
+                    "end_time": finish_ts,
+                    "power_kw": 10.0,
+                })
+
+        merged = list(schedule_by_vehicle.values())
+        return (
+            merged,
+            vehicle_departure_soc_min,
+            vehicle_departure_soc_max,
+            vehicle_priorities,
+            preconditioning_requests,
+        )
+
     async def _get_schedules(
         self, start: datetime, end: datetime
     ) -> list[dict]:
@@ -391,7 +537,8 @@ class StateAssembler:
         for sched in schedules:
             vid = sched['vehicle_id']
             if vid not in availability:
-                continue
+                # VDV 463-only vehicle: add to availability
+                availability[vid] = [True] * n_steps
 
             dep = sched['departure_time']
             ret = sched['return_time']

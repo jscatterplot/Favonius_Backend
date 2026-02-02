@@ -243,6 +243,7 @@ class OCPPWebSocketServer:
             # VDV 463 doesn't require OCPP subprotocol
             validation_mode = ValidationMode.HARD if self.config.vdv463.validation_mode == "hard" else ValidationMode.SOFT
             
+            db_pool = self.timescale_client.pg_pool if self.timescale_client else None
             handler = VDV463Handler(
                 presystem_id=presystem_id,
                 websocket=websocket,
@@ -250,6 +251,7 @@ class OCPPWebSocketServer:
                 config=self.config,
                 depot_id=self.config.vdv463.default_depot_id,
                 validation_mode=validation_mode,
+                db_pool=db_pool,
             )
             
             self.logger.info(

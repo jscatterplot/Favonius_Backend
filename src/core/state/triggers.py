@@ -115,6 +115,7 @@ class TriggerMonitor:
         self._last_trigger_time: Optional[datetime] = None
         self._trigger_cooldown_sec: float = config.trigger_cooldown_minutes * 60.0
         self._last_scheduled_hour: Optional[int] = None  # Track last scheduled trigger hour
+        self._last_vdv463_update_at: Optional[datetime] = None  # VDV 463 charging request change trigger
 
         # Validate that we have a way to fetch state
         if assembler is None and (pool is None or depot_id is None):
@@ -388,6 +389,43 @@ class TriggerMonitor:
             logger.error(f"Unexpected error fetching return times: {e}", exc_info=True)
             return {}
 
+    async def check_vdv463_charging_request_change(self) -> Optional[str]:
+        """Check if VDV 463 charging requests were updated since last check.
+
+        Reads vdv463_depot_updates.last_update_at for this depot; if it changed,
+        returns 'vdv463_charging_request_change' to fire re-optimization.
+        """
+        if not self.pool or not self.depot_id:
+            return None
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT last_update_at FROM vdv463_depot_updates
+                    WHERE depot_id = $1::uuid
+                    """,
+                    self.depot_id,
+                )
+            if row is None:
+                return None
+            last_update = row["last_update_at"]
+            if (
+                self._last_vdv463_update_at is not None
+                and last_update > self._last_vdv463_update_at
+            ):
+                self._last_vdv463_update_at = last_update
+                return "vdv463_charging_request_change"
+            self._last_vdv463_update_at = last_update
+            return None
+        except asyncpg.PostgresError as e:
+            if "vdv463_depot_updates" in str(e) and "does not exist" in str(e).lower():
+                return None
+            logger.warning(f"Error checking VDV 463 update: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error checking VDV 463 update: {e}")
+            return None
+
     async def run(self) -> None:
         """Main monitoring loop.
 
@@ -420,14 +458,20 @@ class TriggerMonitor:
                 return_trigger = await self.check_return_time_deviation(
                     actual_returns
                 )
+                vdv463_trigger = await self.check_vdv463_charging_request_change()
 
                 # Fire callback if any trigger detected (with cooldown)
                 # Scheduled triggers bypass cooldown (they're already rate-limited to once per hour)
                 if scheduled_trigger:
                     await self.on_trigger(scheduled_trigger)
                     self._last_trigger_time = now
-                elif soc_trigger or price_trigger or return_trigger:
-                    reason = soc_trigger or price_trigger or return_trigger
+                elif soc_trigger or price_trigger or return_trigger or vdv463_trigger:
+                    reason = (
+                        soc_trigger
+                        or price_trigger
+                        or return_trigger
+                        or vdv463_trigger
+                    )
 
                     # Check cooldown to prevent rapid-fire triggers
                     if (
@@ -444,6 +488,8 @@ class TriggerMonitor:
                                     else 'price_change'
                                     if price_trigger
                                     else 'return_delay'
+                                    if return_trigger
+                                    else 'vdv463_charging_request_change'
                                 ),
                                 'depot_id': self.depot_id,
                             },

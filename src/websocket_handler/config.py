@@ -24,7 +24,7 @@ class WebSocketConfig(BaseModel):
     max_connections: int = Field(default=100, description="Maximum concurrent connections (simplified)")
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
     message_timeout: int = Field(default=60, description="Message timeout in seconds")
-    max_message_size: int = Field(default=65536, description="Maximum message size in bytes")
+    max_message_size: int = Field(default=1048576, description="Maximum message size in bytes (PRD: 1 MB)")
     rate_limit_per_minute: int = Field(default=100, description="Rate limit per connection per minute")
 
 
@@ -102,8 +102,8 @@ class VDV463Config(BaseModel):
     """VDV 463 transit operations configuration."""
     enabled: bool = Field(default=True, description="Enable VDV 463 support")
     validation_mode: str = Field(
-        default="hard",
-        description="Validation mode: 'hard' (reject invalid) or 'soft' (warn only)"
+        default="soft",
+        description="Validation mode: 'soft' (warn only, default) or 'hard' (reject invalid)"
     )
     schema_dir: Optional[str] = Field(
         default=None,
@@ -167,7 +167,7 @@ class Config(BaseModel):
                 max_connections=int(os.getenv("MAX_CONNECTIONS", "100")),
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
-                max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "65536")),
+                max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "1048576")),
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
             ),
             timescale=TimescaleConfig(
@@ -224,7 +224,7 @@ class Config(BaseModel):
             ),
             vdv463=VDV463Config(
                 enabled=os.getenv("VDV463_ENABLED", "true").lower() == "true",
-                validation_mode=os.getenv("VDV463_VALIDATION_MODE", "hard"),
+                validation_mode=os.getenv("VDV463_VALIDATION_MODE", "soft"),
                 schema_dir=os.getenv("VDV463_SCHEMA_DIR"),
                 default_depot_id=os.getenv("VDV463_DEFAULT_DEPOT_ID"),
             ),

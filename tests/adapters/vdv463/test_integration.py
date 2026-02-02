@@ -27,19 +27,25 @@ class TestIntegration:
                 "chargingRequestList": [
                     {
                         "vehicleId": "bus_101",
+                        "chargingRequestId": "cr-001",
                         "chargingPointId": "cp_001",
-                        "arrivalTime": "2025-01-28T10:00:00Z",
-                        "departureTime": "2025-01-28T14:00:00Z",
-                        "minTargetSoc": 0.2,
-                        "maxTargetSoc": 0.95,
+                        "chargingRequestData": {
+                            "expectedArrivalTimeAtChargingPoint": "2025-01-28T10:00:00Z",
+                            "requestedTimeForDeparture": "2025-01-28T14:00:00Z",
+                            "minTargetSoc": 20,
+                            "maxTargetSoc": 95,
+                        },
                         "chargingPriority": 1,
                     },
                     {
                         "vehicleId": "bus_102",
-                        "arrivalTime": "2025-01-28T11:00:00Z",
-                        "departureTime": "2025-01-28T15:00:00Z",
-                        "minTargetSoc": 0.3,
-                        "maxTargetSoc": 0.98,
+                        "chargingRequestId": "cr-002",
+                        "chargingRequestData": {
+                            "expectedArrivalTimeAtChargingPoint": "2025-01-28T11:00:00Z",
+                            "requestedTimeForDeparture": "2025-01-28T15:00:00Z",
+                            "minTargetSoc": 30,
+                            "maxTargetSoc": 98,
+                        },
                     },
                 ]
             },
@@ -79,8 +85,8 @@ class TestIntegration:
             {
                 "chargingRequestList": [
                     {
-                        # Missing vehicleId, arrivalTime, departureTime
-                        "minTargetSoc": 0.2,
+                        # Missing vehicleId, chargingRequestId, chargingRequestData
+                        "chargingRequestData": {"minTargetSoc": 20, "maxTargetSoc": 95},
                     }
                 ]
             },

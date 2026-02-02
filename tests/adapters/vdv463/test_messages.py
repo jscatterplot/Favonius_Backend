@@ -6,9 +6,9 @@ from datetime import datetime
 from adapters.vdv463.messages import (
     ValidationMode,
     VDVMessageEnvelope,
-    VDVProvideChargingRequests,
     ChargingRequest,
     parse_message,
+    parse_charging_request_item,
     build_error,
     build_provide_charging_requests_response,
     build_provide_charging_information_message,
@@ -22,7 +22,7 @@ class TestParseMessage:
     """Test message parsing."""
     
     def test_parse_valid_provide_charging_requests(self):
-        """Test parsing valid ProvideChargingRequests message."""
+        """Test parsing valid ProvideChargingRequests message (chargingRequestData structure)."""
         message = [
             1,  # Request
             "BMS",
@@ -34,18 +34,22 @@ class TestParseMessage:
                 "chargingRequestList": [
                     {
                         "vehicleId": "bus_101",
-                        "arrivalTime": "2025-01-28T10:00:00Z",
-                        "departureTime": "2025-01-28T14:00:00Z",
-                        "minTargetSoc": 0.2,
-                        "maxTargetSoc": 0.95,
+                        "chargingRequestId": "cr-001",
+                        "chargingRequestData": {
+                            "expectedArrivalTimeAtChargingPoint": "2025-01-28T10:00:00Z",
+                            "requestedTimeForDeparture": "2025-01-28T14:00:00Z",
+                            "minTargetSoc": 20,
+                            "maxTargetSoc": 95,
+                            "expectedSocAtArrival": 25,
+                        },
                         "chargingPriority": 1,
                     }
                 ]
             },
         ]
-        
+
         envelope = parse_message(json.dumps(message), ValidationMode.HARD)
-        
+
         assert envelope.message_type == 1
         assert envelope.source == "BMS"
         assert envelope.presystem_id == "presystem_001"
@@ -181,10 +185,11 @@ class TestBuildResponse:
 
 class TestChargingRequest:
     """Test ChargingRequest dataclass."""
-    
+
     def test_charging_request_creation(self):
         """Test creating ChargingRequest."""
         request = ChargingRequest(
+            charging_request_id="cr-001",
             vehicle_external_id="bus_101",
             charging_point_id="cp_001",
             arrival_time="2025-01-28T10:00:00Z",
@@ -193,8 +198,37 @@ class TestChargingRequest:
             max_target_soc=0.95,
             priority=1,
         )
-        
+
+        assert request.charging_request_id == "cr-001"
         assert request.vehicle_external_id == "bus_101"
         assert request.min_target_soc == 0.2
         assert request.max_target_soc == 0.95
         assert request.priority == 1
+
+    def test_parse_charging_request_item_charging_request_data(self):
+        """Test parse_charging_request_item with official chargingRequestData structure."""
+        req_data = {
+            "vehicleId": "bus_101",
+            "chargingRequestId": "cr-001",
+            "chargingPointId": "cp-uuid",
+            "chargingRequestData": {
+                "expectedArrivalTimeAtChargingPoint": "2026-01-19T22:00:00Z",
+                "requestedTimeForDeparture": "2026-01-20T05:30:00Z",
+                "minTargetSoc": 90,
+                "maxTargetSoc": 100,
+                "expectedSocAtArrival": 22,
+            },
+            "priority": 1,
+            "chargingInstruction": "Normal",
+        }
+        req = parse_charging_request_item(req_data, "ok")
+        assert req.charging_request_id == "cr-001"
+        assert req.vehicle_external_id == "bus_101"
+        assert req.arrival_time == "2026-01-19T22:00:00Z"
+        assert req.departure_time == "2026-01-20T05:30:00Z"
+        # SoC 0-100 normalized to 0-1
+        assert req.min_target_soc == 0.9
+        assert req.max_target_soc == 1.0
+        assert req.expected_soc_at_arrival == 0.22
+        assert req.priority == 1
+        assert req.charging_instruction == "Normal"

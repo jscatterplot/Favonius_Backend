@@ -142,9 +142,10 @@ class DepotConfig:
 @dataclass
 class DepotState:
     """Dynamic state for optimization.
-    
+
     Reference: PRD_v2.md Section 6.2
     Assembled from database queries before each optimization run.
+    VDV 463 (Sprint 2): vehicle_departure_soc_min/max, vehicle_priorities, preconditioning_requests.
     """
     vehicle_socs: dict[str, float]  # vehicle_id -> SoC [0,1]
     battery_soc: float  # Stationary battery SoC [0,1]
@@ -156,6 +157,12 @@ class DepotState:
     departure_times: dict[str, int]  # vehicle_id -> timestep index of departure
     building_power: list[float]  # Building load per timestep (kW) - REQUIRED
     incoming_vehicles: list[IncomingVehicle] = field(default_factory=list)  # Inter-depot arrivals
+    # VDV 463: per-vehicle SoC targets and priority (defaults used when absent)
+    vehicle_departure_soc_min: dict[str, float] = field(default_factory=dict)  # vehicle_id -> min SoC at departure (default 0.99)
+    vehicle_departure_soc_max: dict[str, float] = field(default_factory=dict)  # vehicle_id -> max SoC at departure (default 1.0)
+    vehicle_priorities: dict[str, int] = field(default_factory=dict)  # vehicle_id -> priority (higher = more important)
+    # Preconditioning: list of {vehicle_id, start_time, end_time, power_kw} (manual or automatic)
+    preconditioning_requests: list[dict] = field(default_factory=list)
 
 
 @dataclass
