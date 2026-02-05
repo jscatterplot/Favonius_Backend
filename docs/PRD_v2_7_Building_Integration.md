@@ -1125,6 +1125,38 @@ Get current charging schedule.
 
 ---
 
+#### GET /depots/{depot_id}/alerts
+Get active charger faults and last optimization outcome for ops visibility (no dashboard required; consumers may poll or integrate into external monitoring).
+
+**Response:**
+```json
+{
+    "depot_id": "uuid",
+    "timestamp": "2025-12-04T10:00:00Z",
+    "charger_faults": [
+        {
+            "charger_id": "uuid",
+            "ocpp_id": "CP001",
+            "connector_id": 1,
+            "fault_code": "PowerMeterFailure",
+            "timestamp": "2025-12-04T09:55:00Z"
+        }
+    ],
+    "last_optimization": {
+        "run_id": "uuid",
+        "status": "optimal",
+        "solver_used": "gurobi",
+        "solve_time_s": 12.3,
+        "timestamp": "2025-12-04T09:00:00Z"
+    }
+}
+```
+
+- `charger_faults`: Active faults from OCPP StatusNotification (fault codes per OCPP 1.6). Cleared when charger sends status without fault.
+- `last_optimization.status`: `optimal`, `infeasible`, `timeout`, or `error`. Enables ops to see if schedule is valid without calling POST /optimize.
+
+---
+
 #### POST /depots/{depot_id}/vehicles/{vehicle_id}/handoff
 Send inter-depot handoff message.
 
@@ -1220,13 +1252,28 @@ The platform implements a unified WebSocket Handler service (Port 9000) that han
 | Direction | Message | Purpose |
 |-----------|---------|---------|
 | CP → CS | BootNotification | Charger registration |
-| CP → CS | StatusNotification | Charger status updates |
+| CP → CS | Heartbeat | Connection keep-alive |
+| CP → CS | StatusNotification | Charger/connector status and fault updates |
+| CP → CS | Authorize | Authorize idTag before session |
 | CP → CS | MeterValues | Energy, SoC, and max_charge_kw readings |
 | CP → CS | StartTransaction | Charging session start |
 | CP → CS | StopTransaction | Charging session end |
 | CS → CP | SetChargingProfile | Dispatch charging schedule |
 | CS → CP | RemoteStartTransaction | Initiate charging |
 | CS → CP | RemoteStopTransaction | Stop charging |
+
+**Additional CS-initiated operations (MVP):** The following OCPP 1.6 operations are supported for remote control, configuration, and maintenance. Chargers may support a subset; unsupported requests receive Rejected.
+| CS → CP | Purpose |
+|---------|---------|
+| Reset | Soft or hard reset of the charge point |
+| UnlockConnector | Unlock connector (e.g. after session end) |
+| ChangeAvailability | Set connector/charge point to Available or Unavailable |
+| TriggerMessage | Request charger to send BootNotification, StatusNotification, MeterValues, etc. |
+| GetVariables | Read device configuration (OCPP 2.0.1 style; supported for compatibility) |
+| SetVariables | Write device configuration (OCPP 2.0.1 style; supported for compatibility) |
+| UpdateFirmware | Initiate firmware update (URL provided by platform) |
+
+Faults and warnings from StatusNotification (e.g. connector fault, power failure) must be logged and exposed via the alerts API (Section 7.1) for ops visibility.
 
 **MeterValues Processing:**
 When MeterValues include vehicle max charge rate (from smart charging capable chargers), this value is:
@@ -2558,6 +2605,20 @@ The WebSocket Handler service implements comprehensive security measures per [We
 | Telemetry ingestion | 100 msg/sec | 10,000 msg/sec |
 | Optimization parallelism | Serial | Per-depot parallel |
 
+### 10.5 Observability
+
+Metrics and API-exposed state required for MVP operations (no dedicated dashboard; integrate via API or external monitoring):
+
+| Metric / API | Requirement |
+|--------------|--------------|
+| Charger connectivity | Count of connected vs registered chargers; expose via GET /depots/{id}/state or internal metrics |
+| Session success rate | Track StartTransaction/StopTransaction success; log and expose via metrics |
+| Optimization runs | Log and expose: success/fail, solver_used (gurobi/highs), solve_time_s; include in GET /depots/{id}/alerts |
+| Charger faults | OCPP StatusNotification fault codes stored and exposed via GET /depots/{id}/alerts (Section 7.1) |
+| Logs | Structured logging for OCPP messages, optimization triggers, dispatch outcomes; support debugging mixed 1.6/2.0.1 sites when added |
+
+Implementation: Prometheus-compatible metrics (or equivalent) for charger connectivity, optimization success rate, and solver usage; GET /depots/{depot_id}/alerts returns active faults and last optimization outcome.
+
 ---
 
 ## 11. Acceptance Criteria
@@ -2741,6 +2802,18 @@ AND setpoint offset commands are dispatched to BACnet devices
 AND grid power calculation includes HVAC load (P_hvac) alongside EV charging
 ```
 
+#### AT-16: Alerts and Observability
+```gherkin
+GIVEN a depot with at least one charger
+WHEN GET /depots/{depot_id}/alerts is called
+THEN the response includes last_optimization (run_id, status, solver_used, solve_time_s, timestamp)
+AND charger_faults lists any active OCPP StatusNotification fault codes for that depot's chargers
+
+GIVEN a charger sends StatusNotification with status "Faulted" and faultCode "PowerMeterFailure"
+WHEN GET /depots/{depot_id}/alerts is called before the fault is cleared
+THEN charger_faults contains an entry for that charger/connector with fault_code "PowerMeterFailure"
+```
+
 ### 11.2 Unit Test Requirements
 
 | Module | Coverage Target | Critical Paths |
@@ -2771,6 +2844,7 @@ AND grid power calculation includes HVAC load (P_hvac) alongside EV charging
 | VDV 463 reconnection | Disconnect → Reconnect → State recovery |
 | BACnet/SC connection | Connect → Device registration → Telemetry reception |
 | BACnet/SC thermal optimization | Price spike → Pre-cooling → Setpoint dispatch |
+| Alerts API | GET /depots/{id}/alerts returns last_optimization and active charger_faults |
 
 ---
 
@@ -2920,6 +2994,7 @@ Follow the existing patterns in src/api/main.py.
 | 2.5 | 2025-01-XX | Claude | OCPP simplification: Removed dual server architecture, consolidated to single OCPP 1.6 server in WebSocket Handler that handles OCPP 2+ messages, updated all OCPP references to reflect single server approach |
 | 2.6 | 2025-01-19 | Claude + Joris | **VDV Protocol Integration (MVP):** Added VDV 463 transit operations integration and VDV 261 preconditioning support to MVP scope. Added US-07 (Transit Operations Integration) and US-08 (Bus Preconditioning) user stories. Added Section 9.6 with complete VDV 463 technical specification including message formats, ChargingRequest/ChargingInformation objects, preconditioning mechanisms, and database schema. Added AT-08 through AT-11 acceptance tests. Updated glossary with VDV terms. Preconditioning implemented via VDV 463 manualPreconditioning/automaticPreconditioning fields; full VDV 261 ISO 15118 stack deferred to post-MVP. |
 | 2.7 | 2025-01-19 | Claude + Joris | **Critical Fixes & BACnet Integration:** (1) **OCPP Protocol Correction**: Fixed incorrect claim that OCPP 2.0.1 is wire-compatible with 1.6J—clarified that chargers MUST be configured to use 1.6J subprotocol; (2) **HVAC Setpoint Offset Formula**: Added Constraint 15b with explicit `Offset = T_optimal - T_baseline` calculation and safety clamping; (3) **VDV 463 Vehicle ID Resolution**: Added explicit `vehicleId → external_id → vehicle_id` mapping logic with InvalidVehicleId error handling; (4) **BACnet Device-to-Zone Mapping**: Added device_id + object_id → zone_id resolution with unique constraint; (5) **Preconditioning Soft Constraint**: Changed Constraint 16 from hard to soft constraint with M_precond=1000 penalty to prevent infeasibility under site limit conflicts; (6) **Battery Efficiency Clarification**: Documented split round-trip efficiency model (√η for each direction) to prevent "free energy" loops; (7) **Dispatch Validation**: Added Section 8.7 with pre-dispatch charger/BACnet status checks to handle telemetry race conditions; (8) **Schema Fixes**: Corrected FK references in VDV 463 schema (charger_id, vehicle_id, depot_id); (9) **BuildingZone Dataclass**: Added missing max_hvac_power_kw and active_setpoint_oid fields; (10) **Acceptance Tests**: Added AT-12 (Solver Fallback) and AT-13 (Preconditioning Curtailment). |
+| 2.8 | 2025-02-04 | Claude + Joris | **MVP checklist alignment:** (1) **OCPP §7.2**: Added Heartbeat, Authorize to supported messages; added CS-initiated operations (Reset, UnlockConnector, ChangeAvailability, TriggerMessage, GetVariables, SetVariables, UpdateFirmware) and requirement to expose faults via alerts API; (2) **§7.1**: New GET /depots/{id}/alerts (charger_faults, last_optimization); (3) **§10.5**: New Observability (metrics for connectivity, session success, optimization runs, solver_used; faults via alerts API); (4) **AT-16**: Alerts and Observability acceptance test; (5) Integration test row for Alerts API. |
 
 ---
 

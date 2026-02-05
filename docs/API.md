@@ -106,6 +106,40 @@ Get current charging schedule.
 
 ---
 
+### GET /depots/{depot_id}/alerts
+Get active charger faults and last optimization outcome for ops visibility (PRD §7.1, §10.5, AT-16).
+
+**Response:**
+```json
+{
+    "depot_id": "uuid",
+    "timestamp": "2025-12-04T10:00:00Z",
+    "charger_faults": [
+        {
+            "charger_id": "uuid",
+            "ocpp_id": "CP001",
+            "connector_id": 1,
+            "fault_code": "PowerMeterFailure",
+            "timestamp": "2025-12-04T09:55:00Z"
+        }
+    ],
+    "last_optimization": {
+        "run_id": "uuid",
+        "status": "optimal",
+        "solver_used": "gurobi",
+        "solve_time_s": 12.3,
+        "timestamp": "2025-12-04T09:00:00Z"
+    }
+}
+```
+
+- `charger_faults`: Active faults from OCPP StatusNotification (fault codes per OCPP 1.6). Cleared when charger sends status without fault.
+- `last_optimization`: Most recent run; `status` is `optimal`, `feasible`, `degraded`, `infeasible`, `timeout`, or `error`. Omitted if no run exists for the depot.
+
+**Error Codes:** 400 (invalid depot_id), 404 (depot not found), 500 (server error).
+
+---
+
 ### POST /depots/{depot_id}/vehicles/{vehicle_id}/handoff
 Send inter-depot handoff message.
 
@@ -192,6 +226,20 @@ The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{ocpp_id
 | CS → CP | SetChargingProfile | Dispatch charging schedule |
 | CS → CP | RemoteStartTransaction | Initiate charging |
 | CS → CP | RemoteStopTransaction | Stop charging |
+
+**Additional CS-initiated operations (MVP, PRD §7.2):** The following OCPP 1.6/2.0.1 operations are supported for remote control and maintenance. Chargers may support a subset; unsupported requests may return Rejected.
+
+| CS → CP | Purpose |
+|---------|---------|
+| Reset | Soft or hard reset of the charge point |
+| UnlockConnector | Unlock connector (e.g. after session end) |
+| ChangeAvailability | Set connector/charge point to Available or Unavailable |
+| TriggerMessage | Request charger to send BootNotification, StatusNotification, MeterValues, etc. |
+| GetVariables | Read device configuration (OCPP 2.0.1 style) |
+| SetVariables | Write device configuration (OCPP 2.0.1 style) |
+| UpdateFirmware | Initiate firmware update (URL provided by platform) |
+
+Faults from StatusNotification are exposed via GET /depots/{id}/alerts.
 
 For detailed OCPP integration specifications, see [PRD_v2.md#9-1-ocpp-integration](PRD_v2.md#9-1-ocpp-integration).
 

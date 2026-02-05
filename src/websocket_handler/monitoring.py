@@ -50,8 +50,15 @@ def _get_or_create_metric(metric_class, name, *args, **kwargs):
 
 WEBSOCKET_CONNECTIONS = _get_or_create_metric(
     Gauge,
-    "websocket_connections_active", 
+    "websocket_connections_active",
     "Number of active WebSocket connections"
+)
+
+# PRD §10.5 Observability: charger connectivity for ops
+CHARGER_CONNECTIONS_ACTIVE = _get_or_create_metric(
+    Gauge,
+    "favonius_charger_connections_active",
+    "Number of connected OCPP charge points (stations)",
 )
 
 MESSAGES_RECEIVED_TOTAL = _get_or_create_metric(

@@ -1734,6 +1734,25 @@ class OCPPHandler:
 - [ ] Recent OCPP values used in optimization
 - [ ] Fallback to config when OCPP stale
 
+### Step 4.2: Supported OCPP Operations (CSMS-initiated)
+
+**Objective:** Align implementation with PRD §7.2 supported operations. The WebSocket Handler already implements these; verify and document.
+
+**Per PRD §7.2, the following CS-initiated OCPP 1.6 operations are in scope for MVP:**
+- Reset, UnlockConnector, ChangeAvailability
+- TriggerMessage (request BootNotification, StatusNotification, MeterValues, etc.)
+- GetVariables, SetVariables (OCPP 2.0.1 style; supported for compatibility)
+- UpdateFirmware
+
+**Actions:**
+1. Verify in `src/websocket_handler/ocpp_handler.py` (or equivalent) that Reset, UnlockConnector, ChangeAvailability, TriggerMessage, GetVariables, SetVariables, UpdateFirmware are implemented and return Accepted/Rejected as appropriate.
+2. Ensure StatusNotification fault codes are logged and stored so GET /depots/{id}/alerts can expose them (see Step 4.5.9).
+3. Document in API.md or PRD that unsupported requests receive Rejected.
+
+**Verification:**
+- [ ] All listed CS-initiated operations handled
+- [ ] Fault codes from StatusNotification persisted for alerts API
+
 ---
 
 ## PHASE 4.5: SECURITY & INPUT VALIDATION
@@ -2236,6 +2255,22 @@ def check_data_freshness(
 - [ ] Trigger cooldown prevents rapid re-optimization
 - [ ] All SQL queries use parameterized statements
 - [ ] Data freshness checked before optimization
+
+### Step 4.5.9: Observability and Alerts API
+
+**Objective:** Implement PRD §10.5 Observability and §7.1 GET /depots/{depot_id}/alerts for ops visibility without a dedicated dashboard.
+
+**Actions:**
+1. **Alerts API:** Implement GET /depots/{depot_id}/alerts in Main API:
+   - Return `charger_faults`: active OCPP StatusNotification fault codes for the depot's chargers (query from WebSocket Handler or TimescaleDB if fault state is persisted).
+   - Return `last_optimization`: run_id, status (optimal/infeasible/timeout/error), solver_used, solve_time_s, timestamp from last optimization run (from optimization_runs or equivalent).
+2. **Persistence:** Ensure StatusNotification fault state is stored (e.g. charger status table or telemetry/events) so alerts can list active faults; clear when charger sends status without fault.
+3. **Metrics (optional but recommended):** Expose Prometheus-compatible metrics for: charger connectivity count, optimization success/failure count, solver_used. See `src/monitoring/metrics.py`; add gauges/counters per PRD §10.5.
+
+**Verification:**
+- [ ] GET /depots/{id}/alerts returns last_optimization and charger_faults
+- [ ] AT-16 (Alerts and Observability) passes
+- [ ] Metrics for connectivity and optimization runs available (if Prometheus is used)
 
 ---
 
@@ -3932,6 +3967,9 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 - [ ] TLS for all exposed ports (HTTPS for API, WSS for OCPP/VDV463/BACnet)
 - [ ] Secrets management (environment variables, no hardcoded secrets)
 - [ ] Security folder structure (src/security/)
+- [ ] Supported OCPP operations (Reset, UnlockConnector, ChangeAvailability, TriggerMessage, GetVariables, SetVariables, UpdateFirmware) verified per PRD §7.2 (Step 4.2)
+- [ ] GET /depots/{id}/alerts implemented: last_optimization, charger_faults (PRD §7.1, §10.5; Step 4.5.9)
+- [ ] Observability: metrics for charger connectivity, optimization success/fail, solver_used (PRD §10.5)
 
 ### Milestone 5: VDV 463 Transit Integration
 - [ ] VDV 463 WebSocket handler at `/vdv463/{presystem_id}`
@@ -4039,6 +4077,7 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 | 2.3 | 2025-01-XX | Claude | Architecture updates: Documented integrated system architecture (Main API primary, WebSocket Handler telemetry-only), added Phase 4 internal API specification, documented backup heuristic approach, removed Julia references (already done), documented V2G removal, updated component responsibilities to reflect service split |
 | 2.4 | 2025-01-XX | Claude | OCPP simplification: Removed dual server architecture, consolidated to single OCPP 1.6 server in WebSocket Handler that handles OCPP 2+ messages, updated Phase 4 architecture context to reflect single server approach |
 | 3.0 | 2025-01-19 | Claude + Joris | **Major update aligned with PRD v2.7**: (1) **OCPP 1.6J-only clarification** - corrected that 2.0.1 is NOT wire-compatible, chargers MUST use 1.6J subprotocol; (2) **PHASE 5: VDV 463 Integration** - added complete transit operations integration with WebSocket handler, vehicle ID resolution, preconditioning as soft constraint; (3) **PHASE 6: BACnet/SC Integration** - added building HVAC control with thermal flywheel optimization, setpoint offset calculation (Constraint 15b); (4) **PHASE 6.5: Dispatch Validation** - added pre-dispatch checks for charger/device status; (5) Updated repository structure with new adapter directories; (6) Added bacpypes3 dependency; (7) Added VDV 463 and BACnet database schemas; (8) Updated BuildingZone dataclass with max_hvac_power_kw and active_setpoint_oid; (9) Renumbered phases (Unit Tests → 7, Integration → 8, Deployment → 9); (10) Expanded milestones for new integrations; (11) Updated Post-MVP roadmap |
+| 3.1 | 2025-02-04 | Claude + Joris | **MVP checklist (PRD v2.8):** (1) **Step 4.2**: Supported OCPP operations (Reset, UnlockConnector, ChangeAvailability, TriggerMessage, GetVariables, SetVariables, UpdateFirmware)—verify and document; (2) **Step 4.5.9**: Observability and Alerts API—GET /depots/{id}/alerts, metrics per PRD §10.5; (3) Milestone 4.5: added checklist items for OCPP ops, alerts API, observability. |
 
 ---
 

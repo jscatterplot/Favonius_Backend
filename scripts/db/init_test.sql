@@ -114,6 +114,17 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_vehicle ON telemetry(vehicle_id, time D
 CREATE INDEX IF NOT EXISTS idx_prices_node ON prices(node_id, time DESC);
 CREATE INDEX IF NOT EXISTS idx_opt_runs_depot ON optimization_runs(depot_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_commands_run ON charging_commands(run_id);
+
+-- Connector status (OCPP StatusNotification) for GET /depots/{id}/alerts
+CREATE TABLE IF NOT EXISTS connector_status (
+    station_id   VARCHAR(255) NOT NULL,
+    connector_id  INTEGER NOT NULL,
+    status       VARCHAR(50) NOT NULL,
+    error_code   VARCHAR(100),
+    timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_connector_status_latest ON connector_status (station_id, connector_id, timestamp DESC);
+
 CREATE INDEX IF NOT EXISTS idx_interdepot_dest ON interdepot_messages(destination_depot_id, status);
 
 -- Insert test depot

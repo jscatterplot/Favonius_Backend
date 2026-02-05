@@ -472,6 +472,44 @@ class DepotStateResponse(BaseModel):
     )
 
 
+class ChargerFaultItem(BaseModel):
+    """Single charger fault from OCPP StatusNotification (PRD §7.1)."""
+
+    charger_id: str = Field(..., description="Charger UUID")
+    ocpp_id: str = Field(..., description="OCPP charge point ID")
+    connector_id: int = Field(..., description="Connector index")
+    fault_code: str = Field(..., description="OCPP 1.6 fault code")
+    timestamp: str = Field(..., description="Fault timestamp (ISO 8601)")
+
+
+class LastOptimizationItem(BaseModel):
+    """Last optimization run summary (PRD §7.1)."""
+
+    run_id: str = Field(..., description="Optimization run UUID")
+    status: str = Field(
+        ...,
+        description="optimal | feasible | degraded | infeasible | timeout | error"
+    )
+    solver_used: str = Field(..., description="gurobi | highs")
+    solve_time_s: Optional[float] = Field(None, description="Solve time in seconds")
+    timestamp: str = Field(..., description="Run timestamp (ISO 8601)")
+
+
+class AlertsResponse(BaseModel):
+    """Alerts and last optimization (PRD §7.1 GET /depots/{id}/alerts)."""
+
+    depot_id: str = Field(..., description="Depot identifier (UUID)")
+    timestamp: str = Field(..., description="Response timestamp (ISO 8601)")
+    charger_faults: list[ChargerFaultItem] = Field(
+        default_factory=list,
+        description="Active OCPP StatusNotification faults for depot chargers",
+    )
+    last_optimization: Optional[LastOptimizationItem] = Field(
+        None,
+        description="Most recent optimization run for this depot",
+    )
+
+
 class ScheduleResponse(BaseModel):
     """Schedule response.
 
@@ -1117,6 +1155,139 @@ async def get_depot_schedule(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to get schedule: {str(e)}"
+        )
+
+
+@app.get(
+    "/depots/{depot_id}/alerts",
+    response_model=AlertsResponse,
+    tags=["depots"],
+    summary="Get depot alerts and last optimization",
+    description="""
+    Get active charger faults and last optimization outcome for ops visibility (PRD §7.1, §10.5).
+
+    **Authentication:** Requires JWT token in Authorization header.
+
+    **Response:**
+    - `charger_faults`: Active OCPP StatusNotification fault codes for depot chargers
+    - `last_optimization`: Last run (run_id, status, solver_used, solve_time_s, timestamp)
+
+    **Error Codes:**
+    - 400: Invalid depot_id
+    - 404: Depot not found
+    - 500: Server error
+    Reference: PRD_v2_7_Building_Integration.md §7.1, AT-16
+    """,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid depot_id"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        500: {"model": ErrorResponse, "description": "Server error"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_alerts(
+    depot_id: str,
+    user: dict = Depends(verify_token)
+):
+    """GET /depots/{depot_id}/alerts — charger faults and last optimization (PRD §7.1)."""
+    if not db_pool:
+        raise DatabaseError("Database not available")
+
+    validate_depot_id(depot_id)
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Check depot exists (e.g. via depots or chargers)
+            depot_check = await conn.fetchval(
+                "SELECT 1 FROM depots WHERE depot_id = $1",
+                depot_id,
+            )
+            if not depot_check:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Depot {depot_id} not found"
+                )
+
+            # Last optimization
+            last_row = await conn.fetchrow(
+                """
+                SELECT run_id, run_time, status, solver_used, solve_time_s
+                FROM optimization_runs
+                WHERE depot_id = $1
+                ORDER BY run_time DESC
+                LIMIT 1
+                """,
+                depot_id,
+            )
+            last_optimization: Optional[LastOptimizationItem] = None
+            if last_row:
+                ts = last_row["run_time"]
+                ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+                last_optimization = LastOptimizationItem(
+                    run_id=str(last_row["run_id"]),
+                    status=last_row["status"] or "unknown",
+                    solver_used=last_row["solver_used"] or "gurobi",
+                    solve_time_s=last_row["solve_time_s"],
+                    timestamp=ts_str,
+                )
+
+            # Active charger faults: latest status per connector, join chargers for depot
+            faults_query = """
+            WITH latest AS (
+                SELECT DISTINCT ON (station_id, connector_id)
+                    station_id, connector_id, status, error_code, timestamp
+                FROM connector_status
+                ORDER BY station_id, connector_id, timestamp DESC
+            )
+            SELECT c.charger_id, c.ocpp_id, l.connector_id,
+                   COALESCE(l.error_code, 'Unknown') AS fault_code, l.timestamp
+            FROM latest l
+            JOIN chargers c ON c.ocpp_id = l.station_id AND c.depot_id = $1
+            WHERE l.status = 'Faulted'
+            """
+            fault_rows = await conn.fetch(faults_query, depot_id)
+
+        charger_faults = [
+            ChargerFaultItem(
+                charger_id=str(r["charger_id"]),
+                ocpp_id=r["ocpp_id"],
+                connector_id=r["connector_id"],
+                fault_code=r["fault_code"],
+                timestamp=(
+                    r["timestamp"].isoformat()
+                    if isinstance(r["timestamp"], datetime)
+                    else str(r["timestamp"])
+                ),
+            )
+            for r in fault_rows
+        ]
+
+        now = datetime.utcnow()
+        return AlertsResponse(
+            depot_id=depot_id,
+            timestamp=now.isoformat() + "Z",
+            charger_faults=charger_faults,
+            last_optimization=last_optimization,
+        )
+
+    except HTTPException:
+        raise
+    except asyncpg.PostgresError as e:
+        logger.error(
+            f"Database error getting alerts: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(e)}")
+    except Exception as e:
+        logger.error(
+            f"Failed to get alerts: {e}",
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get alerts: {str(e)}"
         )
 
 

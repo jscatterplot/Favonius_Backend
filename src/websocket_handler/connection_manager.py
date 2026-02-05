@@ -10,7 +10,7 @@ from websockets import WebSocketServerProtocol
 
 from .config import Config
 # Redis removed for simplification
-from .monitoring import get_logger
+from .monitoring import get_logger, CHARGER_CONNECTIONS_ACTIVE
 
 
 class RateLimiter:
@@ -145,7 +145,13 @@ class ConnectionManager:
                 }
                 
                 # Redis registration removed for simplification
-                
+
+                # PRD §10.5: observability metric for charger connectivity
+                try:
+                    CHARGER_CONNECTIONS_ACTIVE.set(len(self.station_connections))
+                except Exception:
+                    pass
+
                 self.logger.info(f"Registered connection {connection_id} for station {station_id} from {client_ip}")
                 
             except Exception as e:
@@ -168,7 +174,13 @@ class ConnectionManager:
             self.station_connections.pop(station_id, None)
             self.last_heartbeats.pop(station_id, None)
             stats = self.connection_stats.pop(connection_id, None)
-            
+
+            # PRD §10.5: observability metric for charger connectivity
+            try:
+                CHARGER_CONNECTIONS_ACTIVE.set(len(self.station_connections))
+            except Exception:
+                pass
+
             # Redis unregistration removed for simplification
             
             # Log connection statistics

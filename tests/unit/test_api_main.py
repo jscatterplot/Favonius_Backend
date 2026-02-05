@@ -18,6 +18,7 @@ from src.api.main import (
     OptimizationResponse,
     DepotStateResponse,
     ScheduleResponse,
+    AlertsResponse,
     HandoffRequest,
     HandoffResponse,
     validate_uuid,
@@ -275,6 +276,122 @@ class TestDepotScheduleEndpoint:
             response = client.get(f"/depots/{depot_id}/schedule")
 
         assert response.status_code == http_status.HTTP_404_NOT_FOUND
+
+
+class TestDepotAlertsEndpoint:
+    """Test GET /depots/{depot_id}/alerts (PRD §7.1, AT-16)."""
+
+    @patch('src.api.main.db_pool')
+    @patch('src.api.main.verify_token')
+    def test_get_alerts_success_with_last_optimization(
+        self, mock_verify, mock_pool, client, mock_db_pool
+    ):
+        """Alerts returns last_optimization and charger_faults."""
+        mock_verify.return_value = {"sub": "test"}
+        pool, conn = mock_db_pool
+        depot_id = str(uuid4())
+        run_id = uuid4()
+        now = datetime.utcnow()
+
+        conn.fetchval = AsyncMock(return_value=1)
+        conn.fetchrow = AsyncMock(return_value={
+            'run_id': run_id,
+            'run_time': now,
+            'status': 'optimal',
+            'solver_used': 'gurobi',
+            'solve_time_s': 12.3,
+        })
+        conn.fetch = AsyncMock(return_value=[])
+
+        with patch('src.api.main.db_pool', pool):
+            response = client.get(
+                f"/depots/{depot_id}/alerts",
+                headers={"Authorization": "Bearer test"},
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert data["depot_id"] == depot_id
+        assert "timestamp" in data
+        assert data["charger_faults"] == []
+        assert data["last_optimization"] is not None
+        assert data["last_optimization"]["run_id"] == str(run_id)
+        assert data["last_optimization"]["status"] == "optimal"
+        assert data["last_optimization"]["solver_used"] == "gurobi"
+        assert data["last_optimization"]["solve_time_s"] == 12.3
+
+    @patch('src.api.main.db_pool')
+    @patch('src.api.main.verify_token')
+    def test_get_alerts_includes_charger_faults(
+        self, mock_verify, mock_pool, client, mock_db_pool
+    ):
+        """When connector_status has Faulted, charger_faults list is populated."""
+        mock_verify.return_value = {"sub": "test"}
+        pool, conn = mock_db_pool
+        depot_id = str(uuid4())
+        charger_id = uuid4()
+        now = datetime.utcnow()
+
+        conn.fetchval = AsyncMock(return_value=1)
+        conn.fetchrow = AsyncMock(return_value={
+            'run_id': uuid4(),
+            'run_time': now,
+            'status': 'optimal',
+            'solver_used': 'gurobi',
+            'solve_time_s': 5.0,
+        })
+        conn.fetch = AsyncMock(return_value=[
+            {
+                'charger_id': charger_id,
+                'ocpp_id': 'CP001',
+                'connector_id': 1,
+                'fault_code': 'PowerMeterFailure',
+                'timestamp': now,
+            }
+        ])
+
+        with patch('src.api.main.db_pool', pool):
+            response = client.get(
+                f"/depots/{depot_id}/alerts",
+                headers={"Authorization": "Bearer test"},
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert len(data["charger_faults"]) == 1
+        assert data["charger_faults"][0]["ocpp_id"] == "CP001"
+        assert data["charger_faults"][0]["fault_code"] == "PowerMeterFailure"
+        assert data["charger_faults"][0]["connector_id"] == 1
+
+    @patch('src.api.main.db_pool')
+    @patch('src.api.main.verify_token')
+    def test_get_alerts_depot_not_found(self, mock_verify, mock_pool, client, mock_db_pool):
+        """Alerts returns 404 when depot does not exist."""
+        mock_verify.return_value = {"sub": "test"}
+        pool, conn = mock_db_pool
+        depot_id = str(uuid4())
+        conn.fetchval = AsyncMock(return_value=None)
+
+        with patch('src.api.main.db_pool', pool):
+            response = client.get(
+                f"/depots/{depot_id}/alerts",
+                headers={"Authorization": "Bearer test"},
+            )
+
+        assert response.status_code == http_status.HTTP_404_NOT_FOUND
+
+    @patch('src.api.main.verify_token')
+    def test_get_alerts_invalid_depot_id(self, mock_verify, client):
+        """Alerts returns 400 or 422 for invalid depot_id."""
+        mock_verify.return_value = {"sub": "test"}
+        response = client.get(
+            "/depots/not-a-uuid/alerts",
+            headers={"Authorization": "Bearer test"},
+        )
+        assert response.status_code in (
+            http_status.HTTP_400_BAD_REQUEST,
+            http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
 
 
 class TestHandoffEndpoint:
