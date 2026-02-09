@@ -13,6 +13,7 @@ from typing import Callable, Optional
 
 from ocpp.v16 import ChargePoint as CP16
 from ocpp.v16 import call, call_result
+from ocpp.v16.enums import AuthorizationStatus, RegistrationStatus
 from ocpp.routing import on
 
 logger = logging.getLogger(__name__)
@@ -70,10 +71,10 @@ class FleetChargePoint(CP16):
         logger.info(
             f"BootNotification from {self.id}: {charge_point_vendor} {charge_point_model}"
         )
-        return call_result.BootNotificationPayload(
+        return call_result.BootNotification(
             current_time=datetime.utcnow().isoformat(),
             interval=300,  # 5 minutes heartbeat per PRD Section 9.1
-            status='Accepted',
+            status=RegistrationStatus.accepted,
         )
 
     @on('StatusNotification')
@@ -99,7 +100,7 @@ class FleetChargePoint(CP16):
                 await self.on_status_change(self.id, connector_id, status)
             except Exception as e:
                 logger.error(f"Error in status change callback: {e}")
-        return call_result.StatusNotificationPayload()
+        return call_result.StatusNotification()
 
     @on('MeterValues')
     async def on_meter_values(self, connector_id: int, meter_value: list, **kwargs):
@@ -181,7 +182,7 @@ class FleetChargePoint(CP16):
                 except Exception as e:
                     logger.error(f"Error in meter values callback: {e}")
 
-        return call_result.MeterValuesPayload()
+        return call_result.MeterValues()
 
     @on('StartTransaction')
     async def on_start_transaction(
@@ -206,9 +207,9 @@ class FleetChargePoint(CP16):
             f"StartTransaction from {self.id}, connector {connector_id}, "
             f"transaction_id={self.current_transaction_id}"
         )
-        return call_result.StartTransactionPayload(
+        return call_result.StartTransaction(
             transaction_id=self.current_transaction_id,
-            id_tag_info={'status': 'Accepted'},
+            id_tag_info={'status': AuthorizationStatus.accepted},
         )
 
     @on('StopTransaction')
@@ -237,7 +238,9 @@ class FleetChargePoint(CP16):
         )
         if self.current_transaction_id == transaction_id:
             self.current_transaction_id = None
-        return call_result.StopTransactionPayload(id_tag_info={'status': 'Accepted'})
+        return call_result.StopTransaction(
+            id_tag_info={'status': AuthorizationStatus.accepted}
+        )
 
     async def set_charging_profile(
         self,

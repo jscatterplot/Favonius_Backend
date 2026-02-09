@@ -111,7 +111,7 @@ class OCPPWebSocketServer:
                 self.config.websocket.host,
                 self.config.websocket.port,
                 ssl=ssl_context,
-                subprotocols=["ocpp2.1"],
+                subprotocols=["ocpp1.6", "ocpp2.1"],
                 max_size=self.config.websocket.max_message_size,
                 ping_interval=self.config.websocket.heartbeat_interval,
                 ping_timeout=10,

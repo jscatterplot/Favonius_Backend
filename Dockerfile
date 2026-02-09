@@ -57,9 +57,11 @@ WORKDIR /app
 # Copy virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
 
-# Copy application code
+# Copy application code and migrations (for pre-deploy runner)
 COPY src/ ./src/
 COPY config/ ./config/
+COPY migrations/ ./migrations/
+COPY scripts/ ./scripts/
 COPY README.md ./
 
 # Create directories for logs, data, and ensure proper permissions
@@ -81,15 +83,13 @@ ENV ENVIRONMENT=production
 # Switch to non-root user
 USER appuser
 
-# Health check
-# Per PRD Section 7.1: /health endpoint
+# Health check (use PORT at runtime when set, e.g. Railway)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:${API_PORT}/health || exit 1
+    CMD ["sh", "-c", "curl -f http://localhost:${PORT:-8000}/health || exit 1"]
 
 # Expose ports
-# Per PRD Section 7.1: REST API on 8000, OCPP WebSocket on 9000
+# Per PRD Section 7.1: REST API, OCPP WebSocket (same port when OCPP_USE_SAME_PORT=true)
 EXPOSE 8000 9000
 
-# Run the application
-# Per PRD Section 7.1: FastAPI REST API server with uvicorn
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the application. PORT is set by Railway at runtime (e.g. 8080); default 8000 for local.
+CMD ["sh", "-c", "exec uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

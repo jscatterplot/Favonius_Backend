@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import asyncpg
 import websockets
 from websockets.server import WebSocketServerProtocol
 
+from .asgi_adapter import StarletteOCPPAdapter
 from .charge_point import FleetChargePoint
 from .mapping import get_charger_id_from_ocpp_id
 
@@ -103,6 +104,28 @@ class OCPPServer:
             if charge_point_id in self.charge_points:
                 del self.charge_points[charge_point_id]
             logger.info(f"Cleaned up connection for charge point: {charge_point_id}")
+
+    async def handle_websocket(self, websocket: Any, charge_point_id: str) -> None:
+        """Handle one OCPP WebSocket connection from ASGI (e.g. FastAPI route).
+
+        Use when OCPP_USE_SAME_PORT=true so OCPP is served on the same port as REST.
+        websocket: Starlette/FastAPI WebSocket.
+        """
+        adapter = StarletteOCPPAdapter(websocket)
+        cp = FleetChargePoint(
+            id=charge_point_id,
+            connection=adapter,
+            on_status_change=self._handle_status_change,
+            on_meter_values=self._handle_meter_values,
+        )
+        self.charge_points[charge_point_id] = cp
+        try:
+            await cp.start()
+        except (ConnectionError, Exception) as e:
+            logger.info(f"OCPP connection closed for {charge_point_id}: {e}")
+        finally:
+            self.charge_points.pop(charge_point_id, None)
+            logger.info(f"Cleaned up OCPP connection for charge point: {charge_point_id}")
 
     async def _handle_status_change(
         self, charge_point_id: str, connector_id: int, status: str
@@ -238,16 +261,6 @@ class OCPPServer:
             max_charge_kw=max_charge_kw,
             charger_id=charger_id,
         )
-        is_plugged = power_kw > 0.1  # Consider plugged if charging
-
-        try:
-            async with self.pool.acquire() as conn:
-                await conn.execute(
-                    query, timestamp, vehicle_id, soc, power_kw, is_plugged
-                )
-        except Exception as e:
-            logger.error(f"Database error storing meter values: {e}")
-            raise
 
     async def _store_status_update(
         self,

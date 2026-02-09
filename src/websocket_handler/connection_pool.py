@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from enum import Enum
 import asyncpg
+import ssl
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool, StaticPool
 from sqlalchemy.engine import Engine
@@ -103,13 +104,29 @@ class EnhancedConnectionPool:
             else:  # HYBRID
                 pool_size = min(self.min_connections * 2, self.max_connections)
             
+            sslmode = getattr(self.config, 'sslmode', 'require')
+            ssl_context: Optional[ssl.SSLContext | bool] = None
+            if sslmode in ("disable", "false", "0"):
+                ssl_context = False
+            elif sslmode in ("require", "prefer", "verify-ca", "verify-full"):
+                ssl_context = ssl.create_default_context()
+                # Timescale Cloud uses standard PostgreSQL certs; hostname verification may be required
+                if sslmode in ("verify-ca", "verify-full"):
+                    ssl_context.check_hostname = True
+                    ssl_context.verify_mode = ssl.CERT_REQUIRED
+                else:
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_REQUIRED
+            else:
+                ssl_context = True
+
             self.asyncpg_pool = await asyncpg.create_pool(
                 host=self.config.host,
                 port=self.config.port,
                 database=self.config.database,
                 user=self.config.user,
                 password=self.config.password,
-                ssl=getattr(self.config, 'sslmode', 'require'),
+                ssl=ssl_context,
                 min_size=self.min_connections,
                 max_size=self.max_connections,
                 command_timeout=self.statement_timeout,

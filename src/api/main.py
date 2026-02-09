@@ -14,7 +14,7 @@ from uuid import UUID
 
 import asyncpg
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -141,29 +141,31 @@ async def lifespan(app: FastAPI):
 
     # Initialize OCPP server (if enabled)
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
+    ocpp_use_same_port = os.getenv("OCPP_USE_SAME_PORT", "false").lower() == "true"
     if ocpp_enabled and db_pool:
         try:
             from ..adapters.ocpp.server import OCPPServer
-            
+
             ocpp_host = os.getenv("OCPP_SERVER_HOST", "0.0.0.0")
             ocpp_port = int(os.getenv("OCPP_SERVER_PORT", "9000"))
-            
+
             ocpp_server = OCPPServer(
                 host=ocpp_host,
                 port=ocpp_port,
                 pool=db_pool,
             )
-            
-            # Start OCPP server in background
-            # Note: OCPPServer.start() runs forever, so we start it as a background task
-            async def run_ocpp_server():
-                try:
-                    await ocpp_server.start()
-                except Exception as e:
-                    logger.error(f"OCPP server error: {e}", exc_info=True)
-            
-            ocpp_task = asyncio.create_task(run_ocpp_server())
-            logger.info(f"OCPP server starting on {ocpp_host}:{ocpp_port}")
+
+            if ocpp_use_same_port:
+                logger.info("OCPP served on same port as REST (path /ocpp/{charge_point_id})")
+            else:
+                async def run_ocpp_server():
+                    try:
+                        await ocpp_server.start()
+                    except Exception as e:
+                        logger.error(f"OCPP server error: {e}", exc_info=True)
+
+                asyncio.create_task(run_ocpp_server())
+                logger.info(f"OCPP server starting on {ocpp_host}:{ocpp_port}")
         except Exception as e:
             logger.error(f"Failed to start OCPP server: {e}", exc_info=True)
             ocpp_server = None
@@ -786,6 +788,28 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
             status_code=500,
             detail=f"Failed to load depot configuration: {str(e)}"
     )
+
+
+@app.websocket("/ocpp/{charge_point_id}")
+async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
+    """OCPP 1.6 WebSocket endpoint (same port as REST when OCPP_USE_SAME_PORT=true)."""
+    if not charge_point_id or not charge_point_id.strip():
+        await websocket.close(code=4000)
+        return
+    if ocpp_server is None:
+        await websocket.close(code=1011)
+        return
+    await websocket.accept(subprotocol="ocpp1.6")
+    try:
+        await ocpp_server.handle_websocket(websocket, charge_point_id.strip())
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"OCPP WebSocket error for {charge_point_id}: {e}", exc_info=True)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
 @app.post(

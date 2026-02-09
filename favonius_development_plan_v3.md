@@ -4042,12 +4042,17 @@ CMD ["uv", "run", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", 
 - [ ] Performance benchmarks met
 
 ### Milestone 9: Deployment
-- [ ] Docker containers built
-- [ ] Docker Compose stack running
-- [ ] Gurobi license configured
-- [ ] Health endpoint operational
-- [ ] VDV 463 endpoint accessible
-- [ ] BACnet/SC Hub running
+
+**Trial deployment:** Railway with two services (Main API + WebSocket Handler). Kubernetes-based deployment has been removed for the trial; it can be reintroduced later if needed.
+
+- [ ] Railway project created with two services (API, WebSocket Handler) from same repo
+- [ ] External TimescaleDB provider configured (`DATABASE_URL` / Timescale env vars)
+- [ ] API service: `railway.json` build/start/pre-deploy/health; secrets set (`DATABASE_URL`, `JWT_SECRET_KEY`)
+- [ ] WebSocket Handler service: start command and env (Timescale, Supabase, `WEBSOCKET_PORT`/`PORT`); no HTTP healthcheck or lightweight `/health` added
+- [ ] Docker / Docker Compose usable for local dev
+- [ ] Gurobi license configured (or HiGHS fallback)
+- [ ] API health endpoint operational; WSS to WebSocket Handler verified (e.g. `wss://<ws-domain>/ocpp/{charge_point_id}`, subprotocol `ocpp1.6`)
+- [ ] VDV 463 and BACnet/SC endpoints accessible via WebSocket Handler
 
 ---
 

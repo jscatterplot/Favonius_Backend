@@ -162,7 +162,7 @@ class Config(BaseModel):
                 verify_client=os.getenv("TLS_VERIFY_CLIENT", "false").lower() == "true",
             ),
             websocket=WebSocketConfig(
-                port=int(os.getenv("WEBSOCKET_PORT", "9000")),
+                port=int(os.getenv("WEBSOCKET_PORT") or os.getenv("PORT", "9000")),
                 host=os.getenv("WEBSOCKET_HOST", "0.0.0.0"),
                 max_connections=int(os.getenv("MAX_CONNECTIONS", "100")),
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),

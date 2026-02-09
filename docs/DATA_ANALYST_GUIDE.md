@@ -151,6 +151,7 @@ pytest tests/integration/test_acceptance_at01.py -v
 - `building_load` - Building power consumption
 - `optimization_runs` - Optimization results storage
 - `interdepot_messages` - Inter-depot handoff messages
+  - WebSocket Handler writes telemetry into this unified `telemetry` table for trial deployments.
 
 ## Next Steps
 

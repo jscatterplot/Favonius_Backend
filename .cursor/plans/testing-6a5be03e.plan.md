@@ -1072,13 +1072,7 @@ cat TESTING_FIXES.md
 ### If GO for Pilot
 
 1. **Deploy to staging environment**
-  ```bash
-   kubectl apply -f k8s/namespace.yaml
-   kubectl apply -f k8s/configmap.yaml
-   kubectl apply -f k8s/secret.yaml
-   kubectl apply -f k8s/deployment.yaml
-   kubectl apply -f k8s/service.yaml
-  ```
+   - Kubernetes deployment has been removed for the trial. Use **Railway** (two services: API + WebSocket Handler) per `docs/DEPLOYMENT.md`.
 2. **Run smoke tests in staging**
   ```bash
    # Quick validation

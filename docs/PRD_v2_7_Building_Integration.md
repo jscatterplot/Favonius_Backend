@@ -520,6 +520,8 @@ The platform uses an integrated architecture with two main services:
 | **Supabase** | Static/reference data storage | Supabase (PostgreSQL) | Both services |
 | **TimescaleDB** | Time-series data storage | TimescaleDB (PostgreSQL) | Both services |
 
+**Trial deployment (Railway):** For trial deployment the platform is deployed on [Railway](https://railway.com) with two services from the same repository: (1) **Main API Backend** (FastAPI, optimization, REST); (2) **WebSocket Handler Service** (OCPP, VDV 463, BACnet/SC, telemetry to TimescaleDB). Time-series data uses an **external TimescaleDB provider** (connection string set via `DATABASE_URL` / Timescale env vars); no database service runs on Railway. Trial constraints: one public port per Railway service (API: HTTP + `/health`; WebSocket Handler: WSS on single port); TLS/WSS is terminated by Railway at the edge; OCPP subprotocol for trial MUST be **OCPP 1.6J** (`ocpp1.6`) where chargers connect to the WebSocket Handler. Kubernetes-based deployment has been removed for the trial; it can be reintroduced later if needed.
+
 ### 5.3 Data Flow
 
 **Service Architecture:**

@@ -143,50 +143,122 @@ class TimescaleClient:
     
     # Telemetry Data Operations
     async def insert_telemetry_batch(self, telemetry_data: List[Dict[str, Any]]) -> None:
-        """Insert batch of telemetry data."""
+        """Insert batch of telemetry data into main telemetry table.
+
+        Aligns WebSocket Handler telemetry writes with the main API schema.
+        Requires telemetry table and vehicle_id resolution.
+        """
         if not telemetry_data:
             return
         
         try:
             async with self.pg_pool.acquire() as conn:
-                # Prepare data for bulk insert
-                values = []
+                inserted = 0
                 for data in telemetry_data:
-                    values.append((
-                        data['time'],
-                        data['station_id'],
-                        data['evse_id'],
-                        data['connector_id'],
-                        data.get('session_id'),
-                        data.get('power_kw'),
-                        data.get('energy_kwh'),
-                        data.get('voltage_v'),
-                        data.get('current_a'),
-                        data.get('frequency_hz'),
-                        data.get('soc_percent'),
-                        data.get('temperature_c'),
-                        data.get('grid_frequency_mhz'),
-                        data.get('reactive_power_kvar'),
-                        data.get('power_factor')
-                    ))
-                
-                # Bulk insert using COPY
-                await conn.copy_records_to_table(
-                    'telemetry_data',
-                    records=values,
-                    columns=[
-                        'time', 'station_id', 'evse_id', 'connector_id', 'session_id',
-                        'power_kw', 'energy_kwh', 'voltage_v', 'current_a', 'frequency_hz',
-                        'soc_percent', 'temperature_c', 'grid_frequency_mhz',
-                        'reactive_power_kvar', 'power_factor'
-                    ]
-                )
-                
-                self.logger.debug(f"Inserted {len(telemetry_data)} telemetry records")
+                    vehicle_id = data.get("vehicle_id")
+                    session_id = data.get("session_id")
+                    station_id = data.get("station_id")
+                    connector_id = data.get("connector_id", 1)
+
+                    if not vehicle_id:
+                        vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
+                    if not vehicle_id:
+                        vehicle_id = await self._resolve_vehicle_id_from_id_token(conn, station_id, connector_id)
+
+                    if not vehicle_id:
+                        self.logger.debug(
+                            f"Skipping telemetry: no vehicle_id for station_id={station_id}, "
+                            f"connector_id={connector_id}, session_id={session_id}"
+                        )
+                        continue
+
+                    charger_id = await self._resolve_charger_id(conn, station_id)
+
+                    soc_percent = data.get("soc_percent")
+                    soc = (soc_percent / 100.0) if soc_percent is not None else None
+                    charging_kw = data.get("power_kw")
+                    is_plugged = charging_kw is not None and charging_kw > 0.1
+                    max_charge_kw = data.get("max_charge_power_kw")
+
+                    await conn.execute(
+                        """
+                        INSERT INTO telemetry (
+                            time, vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
+                        )
+                        VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7)
+                        ON CONFLICT (time, vehicle_id) DO NOTHING
+                        """,
+                        data["time"],
+                        str(vehicle_id),
+                        str(charger_id) if charger_id else None,
+                        soc,
+                        charging_kw,
+                        is_plugged,
+                        max_charge_kw
+                    )
+                    inserted += 1
+
+                if inserted:
+                    self.logger.debug(f"Inserted {inserted} telemetry records into telemetry")
                 
         except Exception as e:
             self.logger.error(f"Failed to insert telemetry batch: {e}")
             raise
+
+    async def _resolve_vehicle_id_from_session(
+        self, conn: asyncpg.Connection, session_id: Optional[str]
+    ) -> Optional[str]:
+        if not session_id:
+            return None
+        row = await conn.fetchrow(
+            "SELECT vehicle_id FROM charging_sessions WHERE session_id = $1 LIMIT 1",
+            session_id
+        )
+        return row["vehicle_id"] if row and row["vehicle_id"] else None
+
+    async def _resolve_vehicle_id_from_id_token(
+        self, conn: asyncpg.Connection, station_id: Optional[str], connector_id: int
+    ) -> Optional[str]:
+        if not station_id:
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT id_token
+            FROM transaction_events_v2g
+            WHERE station_id = $1 AND connector_id = $2
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            station_id,
+            connector_id
+        )
+        if not row or not row["id_token"]:
+            return None
+        id_token = row["id_token"]
+        if isinstance(id_token, str):
+            try:
+                id_token = json.loads(id_token)
+            except json.JSONDecodeError:
+                id_token = {}
+        token_value = id_token.get("idToken") or id_token.get("id_token")
+        if not token_value:
+            return None
+        vehicle_row = await conn.fetchrow(
+            "SELECT vehicle_id FROM vehicles WHERE id_tag = $1 LIMIT 1",
+            token_value
+        )
+        return vehicle_row["vehicle_id"] if vehicle_row else None
+
+    async def _resolve_charger_id(
+        self, conn: asyncpg.Connection, station_id: Optional[str]
+    ) -> Optional[str]:
+        if not station_id:
+            return None
+        row = await conn.fetchrow(
+            "SELECT charger_id FROM chargers WHERE ocpp_id = $1 LIMIT 1",
+            station_id
+        )
+        return row["charger_id"] if row else None
 
     # Electricity Prices
     async def store_electricity_prices(self, price_points: List[Dict[str, Any]]) -> None:

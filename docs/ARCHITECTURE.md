@@ -93,6 +93,8 @@ Both services share access to the dual-database architecture (Supabase for refer
 │  │  - Updates vehicle max_charge_kw from OCPP                  │  │
 │  │  - Tracks charger_id for all telemetry                      │  │
 │  └─────────────────────────────────────────────────────────────┘  │
+│  │  Note: Telemetry is stored in the unified `telemetry` table │  │
+│  │  (no separate `telemetry_data` table for trial deployments) │  │
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────────┐  │
 │  │  Internal API (Planned - Phase 4)                           │  │

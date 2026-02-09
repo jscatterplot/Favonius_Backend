@@ -78,7 +78,7 @@ async def store_meter_values(
     query = """
     INSERT INTO telemetry (time, vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw)
     VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7)
-    ON CONFLICT DO NOTHING
+    ON CONFLICT (time, vehicle_id) DO NOTHING
     """
 
     is_plugged = power_kw > 0.1  # Consider plugged if charging

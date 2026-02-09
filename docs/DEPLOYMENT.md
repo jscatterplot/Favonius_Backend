@@ -1,428 +1,123 @@
-# Favonius Energy Platform - Kubernetes Deployment Guide
+# Favonius Energy Platform - Deployment Guide
 
 ## Overview
 
-This guide covers deploying the Favonius Energy EV Fleet Depot Optimization Platform to Kubernetes. The deployment includes:
+This guide covers **trial deployment on Railway** with two services: **Main API Backend** (REST + optimization) and **WebSocket Handler** (OCPP, VDV 463, BACnet/SC). Time-series data uses an **external TimescaleDB provider** (no database service on Railway required).
 
-- Main API service (FastAPI REST API + OCPP WebSocket + Optimization Engine)
-- TimescaleDB database (or managed service)
-- Ingress with TLS termination
-- Horizontal Pod Autoscaling
-- Monitoring and health checks
+Kubernetes-based deployment has been removed for the trial and can be reintroduced later if needed.
 
-**Reference:** PRD_v2.md Section 10.3 (Security), Section 10.1 (Performance), Development Plan Phase 7 Step 7.2
+**Reference:** PRD Section 5.2 (Architecture), Section 10 (Non-Functional Requirements)
 
-## Prerequisites
+## Railway Deployment
 
-### Required Tools
+Deploy **two services** from this repo on [Railway](https://railway.com): **Main API** (REST + optimization) and **WebSocket Handler** (OCPP, VDV 463, BACnet/SC). Use an **external TimescaleDB provider** for time-series data; do not use the default Railway PostgreSQL (app requires TimescaleDB).
 
-- `kubectl` (v1.24+) configured with cluster access
-- Kubernetes cluster (v1.24+)
-- `helm` (optional, for cert-manager installation)
+### Project layout (two services)
 
-### Required Components
+| Service | Role | Start command |
+|---------|------|----------------|
+| **API** | FastAPI REST, optimization, `/health` | `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT` |
+| **WebSocket Handler** | OCPP, VDV 463, BACnet/SC, telemetry to TimescaleDB | `python -m src.websocket_handler.main` |
 
-1. **Ingress Controller**: Nginx Ingress Controller or similar
-2. **Cert-Manager**: For automatic TLS certificate management (recommended)
-3. **Storage Class**: For TimescaleDB persistent volumes
-4. **Metrics Server**: For HPA to function
+Both services use the same repo and same Dockerfile. Configure each service in the Railway dashboard (root directory, Dockerfile build). API service can use `railway.json` for config-as-code; WebSocket Handler is configured via dashboard (start command, variables, no healthcheck path).
 
-### Optional Components
+### Database: external TimescaleDB
 
-- Prometheus Operator (for advanced monitoring)
-- External Secrets Operator (for secrets management)
-- VPA (Vertical Pod Autoscaler) controller
+- Set **API service** `DATABASE_URL` to your external TimescaleDB connection string (e.g. Timescale Cloud). Mark as **Secret**.
+- Set **WebSocket Handler** Timescale env vars from the same provider: `TIMESCALE_SERVICE_URL` or `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE` (see table below). Mark credentials as **Secret**.
 
-## Deployment Steps
+### API service: variables and secrets
 
-### 1. Install Cert-Manager (Recommended)
+| Variable | Required | Secret? | Description |
+|----------|----------|---------|-------------|
+| `DATABASE_URL` | Yes | Yes | External TimescaleDB URL |
+| `JWT_SECRET_KEY` | Yes | Yes | e.g. `openssl rand -hex 32` |
+| `OCPP_SERVER_ENABLED` | No | No | `false` when using separate WebSocket Handler |
+| `OCPP_USE_SAME_PORT` | No | No | `false` (OCPP is on WebSocket Handler service) |
+| `CORS_ORIGINS` | Recommended | No | Production frontend origin(s) |
+| `ENVIRONMENT` | No | No | `production` |
+| `OPTIMIZATION_TIMEOUT` | No | No | Default 60 |
+| `OPTIMIZATION_MIP_GAP` | No | No | Default 0.01 |
+| `GUROBI_LIC_CONTENT` | If using Gurobi | Yes | License file contents; write to `/opt/gurobi/gurobi.lic` via entrypoint if needed |
 
-Cert-manager automatically manages TLS certificates from Let's Encrypt:
+### WebSocket Handler service: variables and secrets
 
-```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
-```
+| Variable | Required | Secret? | Description |
+|----------|----------|---------|-------------|
+| `WEBSOCKET_PORT` | No | No | Optional: set to `$PORT` or leave unset; app uses Railway's `PORT` when set |
+| `TIMESCALE_SERVICE_URL` or `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`/`PGSSLMODE` | Yes | Yes for credentials | Same TimescaleDB as API |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY` | Yes | Yes for keys | Supabase project |
+| `SUPABASE_DB_HOST`, `SUPABASE_DB_PORT`, `SUPABASE_DB_NAME`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD` | Yes | Yes for password | Supabase DB connection |
+| `USE_KUBERNETES_SECRETS` | No | No | `false` |
+| `FALLBACK_TO_ENV` | No | No | `true` |
+| `ENVIRONMENT` | No | No | `production` |
 
-Wait for cert-manager to be ready:
+Healthcheck: do **not** set an HTTP healthcheck path for the WebSocket Handler (it is a pure WebSocket server). Optionally add a lightweight HTTP `/health` on the same port later for Railway readiness.
 
-```bash
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
-```
+### WebSocket URL for hardware
 
-### 2. Create ClusterIssuer for Let's Encrypt
+- **OCPP**: `wss://<ws-service-public-domain>/ocpp/{charge_point_id}` — use subprotocol **`ocpp1.6`** (PRD: OCPP 1.6J only).
+- **VDV 463**: `wss://<ws-service-public-domain>/vdv463/{presystem_id}`
+- **BACnet/SC**: `wss://<ws-service-public-domain>/bacnet/{device_id}`
 
-Create `k8s/cluster-issuer.yaml`:
+Generate a public domain for the WebSocket Handler service (Settings → Networking → Generate domain). Railway terminates TLS (WSS).
 
-```yaml
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-prod
-spec:
-  acme:
-    server: https://acme-v02.api.letsencrypt.org/directory
-    email: your-email@example.com  # Replace with your email
-    privateKeySecretRef:
-      name: letsencrypt-prod
-    solvers:
-    - http01:
-        ingress:
-          class: nginx
-```
+### Migrations
 
-Apply:
+API service only: migrations run automatically before each deploy when `railway.json` includes `"preDeployCommand": "python scripts/run_migrations.py"`. Ensure `DATABASE_URL` is set before the first deploy. Migrations live in `migrations/` and are applied in filename order.
 
-```bash
-kubectl apply -f k8s/cluster-issuer.yaml
-```
+### API health check
 
-### 3. Configure Secrets
+Configure in Railway (or rely on `railway.json`): path `/health`, timeout 60 s. The API listens on `$PORT`.
 
-**IMPORTANT:** Replace placeholder values in `k8s/secret.yaml` with actual secrets:
+### Config as code (API only)
 
-```bash
-# Generate JWT secret
-JWT_SECRET=$(openssl rand -hex 32)
+`railway.json` in the repo root applies to the **API** service:
 
-# Update secret.yaml with:
-# - DATABASE_PASSWORD: Your database password
-# - JWT_SECRET_KEY: Generated JWT secret
-# - gurobi.lic: Your Gurobi license file content
-```
+- Build from `Dockerfile`
+- Start: `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT`
+- Pre-deploy: `python scripts/run_migrations.py`
+- Health: path `/health`, timeout 60 s
 
-For production, use external secrets manager:
-- AWS Secrets Manager
-- Google Cloud Secret Manager
-- HashiCorp Vault
-- External Secrets Operator
+### Trial deployment checklist
 
-### 4. Update Configuration
+1. Create a Railway project; add **two** services from the same GitHub repo (same root, same Dockerfile).
+2. **API service:** Set `DATABASE_URL`, `JWT_SECRET_KEY` (secrets); set `OCPP_SERVER_ENABLED=false`, `OCPP_USE_SAME_PORT=false`, `CORS_ORIGINS`, `ENVIRONMENT=production`. Generate public domain.
+3. **WebSocket Handler service:** Set `WEBSOCKET_PORT=$PORT` and all Timescale + Supabase env vars (secrets where appropriate). Set `USE_KUBERNETES_SECRETS=false`, `FALLBACK_TO_ENV=true`. Generate public domain. Do not set healthcheck path.
+4. Deploy API first so pre-deploy migrations run against your external TimescaleDB.
+5. Deploy WebSocket Handler.
+6. Validate: `curl https://<api-domain>/health` returns 200.
+7. Validate: connect to `wss://<ws-domain>/ocpp/{charge_point_id}` with subprotocol `ocpp1.6` and verify handshake/session.
+8. Confirm TimescaleDB tables exist and telemetry writes (e.g. from OCPP MeterValues) succeed.
 
-Edit `k8s/configmap.yaml` and `k8s/api-ingress.yaml` to set your domain names:
+### Updated advice (Railway docs + MCP)
 
-```yaml
-# In api-ingress.yaml, replace:
-- host: api.yourdomain.com  # Your API domain
-- host: ocpp.yourdomain.com  # Your OCPP WebSocket domain
-- host: monitoring.yourdomain.com  # Your monitoring domain
-```
+**Railway MCP:** The Railway MCP tools depend on the [Railway CLI](https://docs.railway.com/guides/cli) being installed and authenticated (`railway login`). If the CLI is not available in the environment (e.g. Cursor’s backend), `check-railway-status`, `list-projects`, `list-services`, and `list-variables` will fail with “railway: command not found”. To use the MCP against your project: install the CLI, run `railway login`, and in this repo run `railway link` to link the project; then the MCP can list services/variables and help with deploys from a session where the CLI is on PATH.
 
-### 5. Deploy Namespace
+**Database options:**
 
-```bash
-kubectl apply -f k8s/namespace.yaml
-```
+- **External TimescaleDB (recommended if you already have one):** Set `DATABASE_URL` on the API service to your provider’s connection string (e.g. Timescale Cloud). Mark as **Secret** in Railway. No DB service needed on Railway; time-series stays in TimescaleDB from day one.
+- **Railway TimescaleDB:** Use the [TimescaleDB + PostGIS template](https://railway.com/template/timescaledb-postgis) (not default PostgreSQL). Set `DATABASE_URL` = `${{TimescaleDB.DATABASE_URL}}` (use the actual service name). For external references you must use the service name: `${{ServiceName.DATABASE_URL}}`; a bare `${{DATABASE_URL}}` is empty.
 
-### 6. Deploy ConfigMap and Secrets
+**Secrets to set (mark as Secret in Railway UI):**
 
-```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml
-```
+| Variable | Required | Secret? | Notes |
+|----------|----------|---------|--------|
+| `DATABASE_URL` | Yes | Yes | Full URL from your TimescaleDB provider or `${{TimescaleDB.DATABASE_URL}}` |
+| `JWT_SECRET_KEY` | Yes | Yes | e.g. `openssl rand -hex 32` |
+| `GUROBI_LIC_CONTENT` | If using Gurobi | Yes | Raw contents of `gurobi.lic`; app/entrypoint must write to `/opt/gurobi/gurobi.lic` |
 
-### 7. Deploy TimescaleDB (Optional)
+**Recommended (non-secret):** For two-service trial: API uses `OCPP_USE_SAME_PORT=false`, `OCPP_SERVER_ENABLED=false`; set `CORS_ORIGINS`, `ENVIRONMENT=production`. Optional: `HANDOFF_DEST_DEPOT_ENDPOINT`, `DEFAULT_DEPOT_ENDPOINT` for inter-depot handoff.
 
-**For Production:** Use managed TimescaleDB service (AWS RDS, Google Cloud SQL) instead.
+**GitHub deploy:** In Service Settings, set the branch that triggers deploys. To wait for GitHub Actions before deploying, enable **Wait for CI** (requires a workflow that runs on push); failed workflows cause the deploy to be skipped.
 
-For self-hosted deployment:
+**Healthchecks (from Railway docs):** Railway calls the health path until HTTP 200. Requests come from hostname `healthcheck.railway.app`; if your app restricts by host, allow that host. Default timeout is **300 seconds**; `railway.json` overrides to 60s. The app must listen on the injected `PORT`. To override timeout in the dashboard use variable `RAILWAY_HEALTHCHECK_TIMEOUT_SEC`. Healthchecks run only at deploy time (not continuous monitoring).
 
-```bash
-kubectl apply -f k8s/timescaledb-deployment.yaml
-```
+**Config as code:** Settings in `railway.json` override the dashboard for each deployment; the dashboard is not updated. Deployment details in the Railway UI show which values came from the config file.
 
-Wait for database to be ready:
-
-```bash
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=timescaledb -n ev-charging --timeout=300s
-```
-
-### 8. Deploy RBAC
-
-```bash
-kubectl apply -f k8s/rbac.yaml
-```
-
-### 9. Deploy API Service
-
-```bash
-kubectl apply -f k8s/api-deployment.yaml
-kubectl apply -f k8s/api-service.yaml
-```
-
-### 10. Deploy Ingress
-
-```bash
-kubectl apply -f k8s/api-ingress.yaml
-```
-
-### 11. Deploy Autoscaling and PDB
-
-```bash
-kubectl apply -f k8s/autoscaling.yaml
-kubectl apply -f k8s/pdb.yaml
-```
-
-### 12. Verify Deployment
-
-Check pod status:
-
-```bash
-kubectl get pods -n ev-charging
-```
-
-Expected output:
-
-```
-NAME                              READY   STATUS    RESTARTS   AGE
-favonius-api-xxxxxxxxxx-xxxxx     1/1     Running   0          2m
-timescaledb-0                     1/1     Running   0          5m
-```
-
-Check services:
-
-```bash
-kubectl get svc -n ev-charging
-```
-
-Check ingress:
-
-```bash
-kubectl get ingress -n ev-charging
-```
-
-### 13. Test Health Endpoint
-
-```bash
-# Get ingress IP
-INGRESS_IP=$(kubectl get ingress favonius-api-ingress -n ev-charging -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-
-# Test health endpoint (replace with your domain)
-curl https://api.yourdomain.com/health
-```
-
-Expected response:
-
-```json
-{
-  "status": "healthy",
-  "timestamp": "2025-12-04T10:00:00Z",
-  "components": {
-    "database": "healthy",
-    "ocpp_server": "healthy",
-    "gurobi_license": "valid"
-  }
-}
-```
-
-## Configuration
-
-### Environment Variables
-
-Key configuration is managed via ConfigMap (`k8s/configmap.yaml`):
-
-- `API_HOST`, `API_PORT`: REST API server settings
-- `OCPP_SERVER_*`: OCPP WebSocket server settings
-- `OPTIMIZATION_TIMEOUT`: Solver timeout (60s per PRD Section 8.2)
-- `OPTIMIZATION_MIP_GAP`: Optimality gap (0.01 = 1% per PRD Section 8.2)
-- `DATABASE_*`: Database connection settings (non-sensitive)
-
-### Resource Limits
-
-Per PRD Section 8.2 and 10.1:
-
-- **API Pods**: 4GB memory, 2 CPU (limits)
-- **TimescaleDB**: 2GB memory, 1 CPU (limits)
-
-### Scaling
-
-HPA configuration (per PRD Section 10.4):
-
-- **Min replicas**: 2 (high availability)
-- **Max replicas**: 10
-- **CPU target**: 70%
-- **Memory target**: 80%
-
-## Security
-
-### TLS/SSL
-
-Per PRD Section 10.3:
-
-- **HTTPS required** for all API endpoints
-- **WSS required** for OCPP in production
-- **TLS 1.3** support configured in ingress
-
-Cert-manager automatically manages certificates from Let's Encrypt.
-
-### Authentication
-
-- **JWT tokens** for API authentication (per PRD Section 10.3)
-- **Basic auth** for monitoring endpoints (optional)
-- **OCPP authentication**: Basic auth + TLS 1.3 (per PRD Section 9.1)
-
-### Secrets Management
-
-**Never commit actual secrets to repository.**
-
-For production, use:
-- External Secrets Operator
-- Cloud provider secrets manager
-- HashiCorp Vault
-
-## Monitoring
-
-### Health Checks
-
-- **Liveness probe**: `/health` endpoint, 30s interval
-- **Readiness probe**: `/health` endpoint, 10s interval
-- **Health check response time**: < 500ms (per PRD Section 10.1)
-
-### Metrics
-
-Prometheus scraping configured via annotations:
-
-```yaml
-prometheus.io/scrape: "true"
-prometheus.io/port: "8000"
-prometheus.io/path: "/metrics"
-```
-
-### Logging
-
-Logs are written to `/app/logs` (emptyDir volume, 1GB limit).
-
-For production, consider:
-- Centralized logging (ELK, Loki, CloudWatch)
-- Log aggregation and analysis
-
-## Troubleshooting
-
-### Pods Not Starting
-
-Check pod logs:
-
-```bash
-kubectl logs -n ev-charging <pod-name>
-```
-
-Common issues:
-
-1. **Database connection failure**: Verify `DATABASE_PASSWORD` in secrets
-2. **Gurobi license error**: Verify `gurobi.lic` in secrets
-3. **Image pull error**: Verify image name and registry access
-
-### Health Check Failures
-
-Check health endpoint directly:
-
-```bash
-kubectl exec -n ev-charging <pod-name> -- curl http://localhost:8000/health
-```
-
-### Ingress Not Working
-
-1. Verify ingress controller is installed
-2. Check ingress status: `kubectl describe ingress -n ev-charging`
-3. Verify DNS points to ingress IP
-4. Check TLS certificate: `kubectl get certificate -n ev-charging`
-
-### Autoscaling Not Working
-
-1. Verify metrics server is installed: `kubectl top nodes`
-2. Check HPA status: `kubectl describe hpa -n ev-charging`
-3. Verify resource requests/limits are set in deployment
-
-### Database Connection Issues
-
-1. Verify TimescaleDB pod is running: `kubectl get pods -n ev-charging -l app.kubernetes.io/name=timescaledb`
-2. Check database logs: `kubectl logs -n ev-charging timescaledb-0`
-3. Test connection: `kubectl exec -n ev-charging <api-pod> -- psql -h timescaledb-service -U favonius -d favonius`
-
-## Production Considerations
-
-### High Availability
-
-- **Min replicas**: 2 (ensures availability during updates)
-- **Pod Disruption Budget**: Min 1 available pod
-- **Pod Anti-Affinity**: Spread pods across nodes
-
-### Database
-
-**Recommended:** Use managed TimescaleDB service:
-
-- AWS RDS for PostgreSQL with TimescaleDB extension
-- Google Cloud SQL for PostgreSQL with TimescaleDB extension
-- Azure Database for PostgreSQL with TimescaleDB extension
-
-Benefits:
-- Automated backups
-- High availability
-- Managed updates
-- Monitoring and alerting
-
-### Backup and Recovery
-
-1. **Database backups**: Configure automated backups for TimescaleDB
-2. **Configuration backups**: Version control all Kubernetes manifests
-3. **Secrets backup**: Store in external secrets manager with backup
-
-### Performance Tuning
-
-Per PRD Section 10.1:
-
-- **API response time**: < 500ms (99th percentile)
-- **Optimization latency**: < 60 seconds (95th percentile)
-- **Database query time**: < 100ms (average)
-
-Monitor and adjust:
-- Resource limits
-- HPA thresholds
-- Database connection pool size
-- Optimization solver settings
-
-## Updating Deployment
-
-### Rolling Updates
-
-Deployment uses `RollingUpdate` strategy:
-
-```bash
-# Update image
-kubectl set image deployment/favonius-api api=favonius/api:v1.1.0 -n ev-charging
-
-# Or update entire deployment
-kubectl apply -f k8s/api-deployment.yaml
-```
-
-### Configuration Updates
-
-```bash
-# Update ConfigMap
-kubectl apply -f k8s/configmap.yaml
-kubectl rollout restart deployment/favonius-api -n ev-charging
-```
-
-### Secret Updates
-
-```bash
-# Update Secret (use external secrets manager in production)
-kubectl apply -f k8s/secret.yaml
-kubectl rollout restart deployment/favonius-api -n ev-charging
-```
-
-## Cleanup
-
-To remove all resources:
-
-```bash
-kubectl delete -f k8s/
-```
-
-**Warning:** This will delete all data. Backup first!
+**WebSockets:** With two services, OCPP/VDV/BACnet connect to the **WebSocket Handler** service domain: `wss://<ws-service-domain>/ocpp/{charge_point_id}` (subprotocol `ocpp1.6`). Railway terminates TLS (WSS).
 
 ## Additional Resources
 
-- [PRD_v2.md](../docs/PRD_v2.md) - Product Requirements Document
-- [Development Plan](../favonius_development_plan_v2.md) - Development Plan
-- [Kubernetes Documentation](https://kubernetes.io/docs/)
-- [Cert-Manager Documentation](https://cert-manager.io/docs/)
+- [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md) - Product Requirements Document
+- [favonius_development_plan_v3.md](../favonius_development_plan_v3.md) - Development Plan
