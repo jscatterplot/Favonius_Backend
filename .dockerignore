@@ -1,0 +1,80 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tests (not needed in runtime image)
+tests/
+
+# Docs and large markdown (keep README.md which Dockerfile copies)
+docs/
+PILOT_READINESS_REPORT.md
+TESTING_FIXES.md
+TESTING.md
+TEST_COVERAGE_REPORT.md
+favonius_development_plan_v3.md
+
+# IDE / editor / Cursor
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Local environments
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+
+# Local data and logs
+logs/
+data/
+timescale_data/
+
+# Docker-compose and auxiliary Dockerfiles
+docker-compose.yml
+docker-compose.test.yml
+docker-compose.override.yml
+Dockerfile.test
+Dockerfile.ocpp-simulator
+
+# Build / dist artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# Optimization experiments (not used by runtime image)
+optimization/
+
+# Misc tooling / dev-only files
+pytest.ini
+test_runner.py
+tests/results/
+Makefile
+.pre-commit-config.yaml
+.cursorrules
+scripts/db/init_test.sql
+
+# Monitoring config (not needed in API container)
+monitoring/
+

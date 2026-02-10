@@ -63,6 +63,7 @@ COPY config/ ./config/
 COPY migrations/ ./migrations/
 COPY scripts/ ./scripts/
 COPY README.md ./
+COPY schemas/ ./schemas/
 
 # Create directories for logs, data, and ensure proper permissions
 RUN mkdir -p /app/logs /app/data /opt/gurobi && \
