@@ -28,7 +28,11 @@ CREATE TABLE IF NOT EXISTS vdv463_charging_requests (
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'completed', 'terminated')),
     validation_status TEXT,                 -- NULL | 'ok' | 'warning' | 'error'
-    UNIQUE(depot_id, charging_request_id, presystem_id)
+    -- TimescaleDB requires that all UNIQUE constraints and PRIMARY KEYs on a
+    -- hypertable include the partitioning column ('received_at' here).
+    -- Include 'received_at' to keep the constraint valid while still enforcing
+    -- uniqueness per (depot, request, presystem, timestamp).
+    UNIQUE(depot_id, charging_request_id, presystem_id, received_at)
 );
 
 CREATE INDEX IF NOT EXISTS idx_vdv463_charging_requests_depot_received
