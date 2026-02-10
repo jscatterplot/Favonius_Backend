@@ -2,9 +2,8 @@
 -- Per favonius_development_plan_v3.md Phase 5 Step 5.3 and PRD Section 9.6
 -- Requires: 001_initial_schema.sql (depots, vehicles, chargers)
 
--- VDV 463 charging requests (optimization inputs from BMS/ITCS)
 CREATE TABLE IF NOT EXISTS vdv463_charging_requests (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID DEFAULT gen_random_uuid(),
     depot_id UUID NOT NULL REFERENCES depots(depot_id),
     charging_request_id TEXT NOT NULL,
     presystem_id TEXT NOT NULL,
@@ -30,8 +29,9 @@ CREATE TABLE IF NOT EXISTS vdv463_charging_requests (
     validation_status TEXT,                 -- NULL | 'ok' | 'warning' | 'error'
     -- TimescaleDB requires that all UNIQUE constraints and PRIMARY KEYs on a
     -- hypertable include the partitioning column ('received_at' here).
-    -- Include 'received_at' to keep the constraint valid while still enforcing
-    -- uniqueness per (depot, request, presystem, timestamp).
+    -- Use a composite primary key and unique constraint that both include
+    -- 'received_at' to satisfy this requirement.
+    PRIMARY KEY (id, received_at),
     UNIQUE(depot_id, charging_request_id, presystem_id, received_at)
 );
 
