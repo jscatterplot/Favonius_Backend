@@ -8,9 +8,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 
 from ocpp.routing import on
-from ocpp.v21 import ChargePoint as OCPPChargePoint, call_result
-from ocpp.v21.enums import Action, ConnectorStatusEnumType, TransactionEventEnumType
-from ocpp.v21.datatypes import ChargingStationType, StatusInfoType, IdTokenType
+from ocpp.v201 import ChargePoint as OCPPChargePoint, call_result
+from ocpp.v201.enums import Action, ConnectorStatusEnumType, TransactionEventEnumType
+
+# Optional OCPP extension actions (may be missing in ocpp package)
+def _opt_action(name: str):
+    return getattr(Action, name, None)
+from ocpp.v201.datatypes import ChargingStationType, StatusInfoType, IdTokenType
 from ocpp.exceptions import OCPPError, NotImplementedError, NotSupportedError
 
 from .config import Config
@@ -308,7 +312,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     async def send_charging_profile(self, evse_id: int, charging_profile: Dict) -> bool:
         """Send SetChargingProfile command to charger."""
         try:
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             
             request = call.SetChargingProfile(
                 evse_id=evse_id,
@@ -331,7 +335,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     async def send_der_control(self, der_control: Dict) -> bool:
         """Send SetDERControl command for V2G operations."""
         try:
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             
             request = call.SetDERControl(
                 der_control=der_control
@@ -354,7 +358,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     async def clear_der_control(self) -> bool:
         """Clear DER control for V2G operations."""
         try:
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             
             request = call.ClearDERControl()
             
@@ -912,7 +916,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     
     # ===== ISO 15118 CERTIFICATE HANDLERS =====
     
-    @on(Action.get15118_ev_certificate)
+    @on(Action.get_15118_ev_certificate)
     def on_get_15118_ev_certificate(self, certificate_type: str, exi_request: Optional[str] = None, **kwargs):
         """Handle Get15118EVCertificate message."""
         self.logger.info(f"Get15118EVCertificate from {self.id}: {certificate_type}")
@@ -1198,26 +1202,34 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
 
     # Note: delete_customer_information is not supported in OCPP 2.1
     
-    # V2G-specific message handlers
-    @on(Action.update_dynamic_schedule)
-    def on_update_dynamic_schedule(self, charging_profile_id: int, 
-                                  limit: Optional[float] = None,
-                                  discharging_limit: Optional[float] = None,
-                                  setpoint: Optional[float] = None,
-                                  setpoint_reactive: Optional[float] = None, **kwargs):
-        """Handle UpdateDynamicSchedule request."""
-        self._task_supervisor.create_task(
-            self._handle_update_dynamic_schedule(charging_profile_id, limit, discharging_limit, setpoint, setpoint_reactive),
-            "update_dynamic_schedule"
-        )
-        return call_result.UpdateDynamicSchedule(status="Accepted")
-    
-    @on(Action.pull_dynamic_schedule_update)
-    def on_pull_dynamic_schedule_update(self, charging_profile_id: int, **kwargs):
-        """Handle PullDynamicScheduleUpdate request."""
-        self._task_supervisor.create_task(self._handle_pull_dynamic_schedule_update(charging_profile_id), "pull_dynamic_schedule_update")
-        return call_result.PullDynamicScheduleUpdate(status="Accepted")
-    
+    # V2G-specific message handlers (optional actions may be missing in ocpp package)
+    _act_uds = _opt_action("update_dynamic_schedule")
+    if _act_uds is not None:
+        @on(_act_uds)
+        def on_update_dynamic_schedule(self, charging_profile_id: int,
+                                      limit: Optional[float] = None,
+                                      discharging_limit: Optional[float] = None,
+                                      setpoint: Optional[float] = None,
+                                      setpoint_reactive: Optional[float] = None, **kwargs):
+            self._task_supervisor.create_task(
+                self._handle_update_dynamic_schedule(charging_profile_id, limit, discharging_limit, setpoint, setpoint_reactive),
+                "update_dynamic_schedule"
+            )
+            return call_result.UpdateDynamicSchedule(status="Accepted")
+    else:
+        def on_update_dynamic_schedule(self, charging_profile_id: int, limit=None, discharging_limit=None, setpoint=None, setpoint_reactive=None, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_pds = _opt_action("pull_dynamic_schedule_update")
+    if _act_pds is not None:
+        @on(_act_pds)
+        def on_pull_dynamic_schedule_update(self, charging_profile_id: int, **kwargs):
+            self._task_supervisor.create_task(self._handle_pull_dynamic_schedule_update(charging_profile_id), "pull_dynamic_schedule_update")
+            return call_result.PullDynamicScheduleUpdate(status="Accepted")
+    else:
+        def on_pull_dynamic_schedule_update(self, charging_profile_id: int, **kwargs):
+            return {"status": "Accepted"}
+
     @on(Action.notify_charging_limit)
     def on_notify_charging_limit(self, charging_schedule: Optional[List] = None,
                                 evse_id: Optional[int] = None,
@@ -1233,70 +1245,106 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self._task_supervisor.create_task(self._handle_cleared_charging_limit(charging_limit_source, evse_id), "cleared_charging_limit")
         return call_result.ClearedChargingLimit(status="Accepted")
     
-    @on(Action.use_priority_charging)
-    def on_use_priority_charging(self, transaction_id: str, activate: bool, **kwargs):
-        """Handle UsePriorityCharging request."""
-        self._task_supervisor.create_task(self._handle_use_priority_charging(transaction_id, activate), "use_priority_charging")
-        return call_result.UsePriorityCharging(status="Accepted")
-    
-    @on(Action.notify_priority_charging)
-    def on_notify_priority_charging(self, transaction_id: str, activated: bool, **kwargs):
-        """Handle NotifyPriorityCharging request."""
-        self._task_supervisor.create_task(self._handle_notify_priority_charging(transaction_id, activated), "notify_priority_charging")
-        return call_result.NotifyPriorityCharging(status="Accepted")
-    
-    @on(Action.notify_allowed_energy_transfer)
-    def on_notify_allowed_energy_transfer(self, allowed_energy_transfer: List[str], **kwargs):
-        """Handle NotifyAllowedEnergyTransfer request."""
-        self._task_supervisor.create_task(self._handle_notify_allowed_energy_transfer(allowed_energy_transfer), "notify_allowed_energy_transfer")
-        return call_result.NotifyAllowedEnergyTransfer(status="Accepted")
-    
-    # DER Control message handlers
-    @on(Action.set_der_control)
-    def on_set_der_control(self, der_control: Dict, **kwargs):
-        """Handle SetDERControl request."""
-        self._task_supervisor.create_task(self._handle_set_der_control(der_control), "set_der_control")
-        return call_result.SetDERControl(status="Accepted")
-    
-    @on(Action.get_der_control)
-    def on_get_der_control(self, control_id: Optional[int] = None, **kwargs):
-        """Handle GetDERControl request."""
-        self._task_supervisor.create_task(self._handle_get_der_control(control_id), "get_der_control")
-        return call_result.GetDERControl(status="Accepted")
-    
-    @on(Action.report_der_control)
-    def on_report_der_control(self, der_control: List[Dict], **kwargs):
-        """Handle ReportDERControl request."""
-        self._task_supervisor.create_task(self._handle_report_der_control(der_control), "report_der_control")
-        return call_result.ReportDERControl(status="Accepted")
-    
-    @on(Action.clear_der_control)
-    def on_clear_der_control(self, control_id: Optional[int] = None, **kwargs):
-        """Handle ClearDERControl request."""
-        self._task_supervisor.create_task(self._handle_clear_der_control(control_id), "clear_der_control")
-        return call_result.ClearDERControl(status="Accepted")
-    
-    @on(Action.notify_der_alarm)
-    def on_notify_der_alarm(self, control_type: str, alarm_ended: bool,
-                            grid_event_fault: Optional[str] = None,
-                            timestamp: str = None, **kwargs):
-        """Handle NotifyDERAlarm request."""
-        self._task_supervisor.create_task(self._handle_notify_der_alarm(control_type, alarm_ended, grid_event_fault, timestamp), "notify_der_alarm")
-        return call_result.NotifyDERAlarm(status="Accepted")
-    
-    @on(Action.notify_der_start_stop)
-    def on_notify_der_start_stop(self, control_id: int, started: bool,
-                                 superseded_id: Optional[int] = None,
-                                 timestamp: str = None, **kwargs):
-        """Handle NotifyDERStartStop request."""
-        self._task_supervisor.create_task(self._handle_notify_der_start_stop(control_id, started, superseded_id, timestamp), "notify_der_start_stop")
-        return call_result.NotifyDERStartStop(status="Accepted")
-    
-    @on(Action.afrr_signal)
-    def on_afrr_signal(self, signal: float, timestamp: str, **kwargs):
-        """Handle AFRRSignal request."""
-        self._task_supervisor.create_task(self._handle_afrr_signal(signal, timestamp), "afrr_signal")
-        return call_result.AFRRSignal(status="Accepted")
+    _act_upc = _opt_action("use_priority_charging")
+    if _act_upc is not None:
+        @on(_act_upc)
+        def on_use_priority_charging(self, transaction_id: str, activate: bool, **kwargs):
+            self._task_supervisor.create_task(self._handle_use_priority_charging(transaction_id, activate), "use_priority_charging")
+            return call_result.UsePriorityCharging(status="Accepted")
+    else:
+        def on_use_priority_charging(self, transaction_id: str, activate: bool, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_npc = _opt_action("notify_priority_charging")
+    if _act_npc is not None:
+        @on(_act_npc)
+        def on_notify_priority_charging(self, transaction_id: str, activated: bool, **kwargs):
+            self._task_supervisor.create_task(self._handle_notify_priority_charging(transaction_id, activated), "notify_priority_charging")
+            return call_result.NotifyPriorityCharging(status="Accepted")
+    else:
+        def on_notify_priority_charging(self, transaction_id: str, activated: bool, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_naet = _opt_action("notify_allowed_energy_transfer")
+    if _act_naet is not None:
+        @on(_act_naet)
+        def on_notify_allowed_energy_transfer(self, allowed_energy_transfer: List[str], **kwargs):
+            self._task_supervisor.create_task(self._handle_notify_allowed_energy_transfer(allowed_energy_transfer), "notify_allowed_energy_transfer")
+            return call_result.NotifyAllowedEnergyTransfer(status="Accepted")
+    else:
+        def on_notify_allowed_energy_transfer(self, allowed_energy_transfer: List[str], **kwargs):
+            return {"status": "Accepted"}
+
+    # DER Control message handlers (optional)
+    _act_sdc = _opt_action("set_der_control")
+    if _act_sdc is not None:
+        @on(_act_sdc)
+        def on_set_der_control(self, der_control: Dict, **kwargs):
+            self._task_supervisor.create_task(self._handle_set_der_control(der_control), "set_der_control")
+            return call_result.SetDERControl(status="Accepted")
+    else:
+        def on_set_der_control(self, der_control: Dict, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_gdc = _opt_action("get_der_control")
+    if _act_gdc is not None:
+        @on(_act_gdc)
+        def on_get_der_control(self, control_id: Optional[int] = None, **kwargs):
+            self._task_supervisor.create_task(self._handle_get_der_control(control_id), "get_der_control")
+            return call_result.GetDERControl(status="Accepted")
+    else:
+        def on_get_der_control(self, control_id: Optional[int] = None, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_rdc = _opt_action("report_der_control")
+    if _act_rdc is not None:
+        @on(_act_rdc)
+        def on_report_der_control(self, der_control: List[Dict], **kwargs):
+            self._task_supervisor.create_task(self._handle_report_der_control(der_control), "report_der_control")
+            return call_result.ReportDERControl(status="Accepted")
+    else:
+        def on_report_der_control(self, der_control: List[Dict], **kwargs):
+            return {"status": "Accepted"}
+
+    _act_cdc = _opt_action("clear_der_control")
+    if _act_cdc is not None:
+        @on(_act_cdc)
+        def on_clear_der_control(self, control_id: Optional[int] = None, **kwargs):
+            self._task_supervisor.create_task(self._handle_clear_der_control(control_id), "clear_der_control")
+            return call_result.ClearDERControl(status="Accepted")
+    else:
+        def on_clear_der_control(self, control_id: Optional[int] = None, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_nda = _opt_action("notify_der_alarm")
+    if _act_nda is not None:
+        @on(_act_nda)
+        def on_notify_der_alarm(self, control_type: str, alarm_ended: bool, grid_event_fault: Optional[str] = None, timestamp: str = None, **kwargs):
+            self._task_supervisor.create_task(self._handle_notify_der_alarm(control_type, alarm_ended, grid_event_fault, timestamp), "notify_der_alarm")
+            return call_result.NotifyDERAlarm(status="Accepted")
+    else:
+        def on_notify_der_alarm(self, control_type: str, alarm_ended: bool, grid_event_fault=None, timestamp=None, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_ndss = _opt_action("notify_der_start_stop")
+    if _act_ndss is not None:
+        @on(_act_ndss)
+        def on_notify_der_start_stop(self, control_id: int, started: bool, superseded_id: Optional[int] = None, timestamp: str = None, **kwargs):
+            self._task_supervisor.create_task(self._handle_notify_der_start_stop(control_id, started, superseded_id, timestamp), "notify_der_start_stop")
+            return call_result.NotifyDERStartStop(status="Accepted")
+    else:
+        def on_notify_der_start_stop(self, control_id: int, started: bool, superseded_id=None, timestamp=None, **kwargs):
+            return {"status": "Accepted"}
+
+    _act_afrr = _opt_action("afrr_signal")
+    if _act_afrr is not None:
+        @on(_act_afrr)
+        def on_afrr_signal(self, signal: float, timestamp: str, **kwargs):
+            self._task_supervisor.create_task(self._handle_afrr_signal(signal, timestamp), "afrr_signal")
+            return call_result.AFRRSignal(status="Accepted")
+    else:
+        def on_afrr_signal(self, signal: float, timestamp: str, **kwargs):
+            return {"status": "Accepted"}
     
     # ===== ASYNC HANDLERS =====
     
@@ -1306,7 +1354,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             results = await self.device_model.get_variables(self.id, get_variable_data)
             
             # Send GetVariablesResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.GetVariablesResponse(
                 get_variable_result=results
             )
@@ -1321,7 +1369,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             results = await self.device_model.set_variables(self.id, set_variable_data)
             
             # Send SetVariablesResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.SetVariablesResponse(
                 set_variable_result=results
             )
@@ -1336,7 +1384,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             report_data = await self.device_model.get_base_report(self.id, report_base)
             
             # Send GetBaseReportResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.GetBaseReportResponse(
                 status="Accepted",
                 status_info={"reason_code": "NoError"}
@@ -1369,7 +1417,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send GetChargingProfilesResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.GetChargingProfilesResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1389,7 +1437,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send ClearChargingProfileResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.ClearChargingProfileResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1408,7 +1456,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send GetCompositeScheduleResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.GetCompositeScheduleResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo"),
@@ -1440,7 +1488,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send SetChargingProfileResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.SetChargingProfileResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1470,7 +1518,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send RequestStartTransactionResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.RequestStartTransactionResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo"),
@@ -1490,7 +1538,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send RequestStopTransactionResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.RequestStopTransactionResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo"),
@@ -1513,7 +1561,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             })
             
             # Send ResetResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.ResetResponse(
                 status="Accepted",
                 status_info={"reason_code": "NoError"}
@@ -1537,7 +1585,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             })
             
             # Send ChangeAvailabilityResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.ChangeAvailabilityResponse(
                 status="Accepted",
                 status_info={"reason_code": "NoError"}
@@ -1561,7 +1609,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             })
             
             # Send TriggerMessageResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.TriggerMessageResponse(
                 status="Accepted",
                 status_info={"reason_code": "NoError"}
@@ -1583,7 +1631,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             })
             
             # Send UnlockConnectorResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.UnlockConnectorResponse(
                 status="Accepted",
                 status_info={"reason_code": "NoError"}
@@ -1608,7 +1656,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             result = await self.certificate_manager.get_15118_ev_certificate(self.id, cert_type, exi_request)
             
             # Send Get15118EVCertificateResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.Get15118EVCertificateResponse(
                 status=result["status"],
                 exi_response=result.get("exiResponse"),
@@ -1626,7 +1674,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             result = await self.certificate_manager.certificate_signed(self.id, cert_type, certificate_chain, exi_response)
             
             # Send CertificateSignedResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.CertificateSignedResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1643,7 +1691,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             result = await self.certificate_manager.install_certificate(self.id, cert_type, certificate)
             
             # Send InstallCertificateResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.InstallCertificateResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1659,7 +1707,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             result = await self.certificate_manager.delete_certificate(self.id, certificate_hash_data)
             
             # Send DeleteCertificateResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.DeleteCertificateResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1676,7 +1724,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             result = await self.certificate_manager.get_installed_certificate_ids(self.id, cert_type)
             
             # Send GetInstalledCertificateIdsResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.GetInstalledCertificateIdsResponse(
                 status=result["status"],
                 certificate_hash_data=result.get("certificateHashData", []),
@@ -1694,7 +1742,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             result = await self.certificate_manager.sign_certificate(self.id, cert_type, certificate_signing_request)
             
             # Send SignCertificateResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.SignCertificateResponse(
                 status=result["status"],
                 certificate=result.get("certificate"),
@@ -1715,7 +1763,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send SecurityEventNotificationResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.SecurityEventNotificationResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1742,7 +1790,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send GetLogResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.GetLogResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1790,7 +1838,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send PublishFirmwareResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.PublishFirmwareResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1806,7 +1854,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             result = await self.firmware_manager.unpublish_firmware(self.id, checksum)
             
             # Send UnpublishFirmwareResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.UnpublishFirmwareResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1833,7 +1881,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send UpdateFirmwareResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.UpdateFirmwareResponse(
                 status=result["status"],
                 status_info=result.get("statusInfo")
@@ -1866,7 +1914,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send GetMonitoringReportResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.GetMonitoringReportResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo"),
@@ -1886,7 +1934,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send SetVariableMonitoringResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.SetVariableMonitoringResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -1905,7 +1953,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send ClearVariableMonitoringResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.ClearVariableMonitoringResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -1938,7 +1986,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send SetDisplayMessageResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.SetDisplayMessageResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -1958,7 +2006,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send ClearDisplayMessageResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.ClearDisplayMessageResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -1979,7 +2027,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send CustomerInformationResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.CustomerInformationResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo"),
@@ -2001,7 +2049,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send DeleteCustomerInformationResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.DeleteCustomerInformationResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -2034,7 +2082,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                 self.logger.warning("Charging profile manager not available")
             
             # Send UpdateDynamicScheduleResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.UpdateDynamicScheduleResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -2055,7 +2103,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send PullDynamicScheduleUpdateResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.PullDynamicScheduleUpdateResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo"),
@@ -2080,7 +2128,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send NotifyChargingLimitResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.NotifyChargingLimitResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -2103,7 +2151,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send ClearedChargingLimitResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.ClearedChargingLimitResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -2129,7 +2177,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                 self.logger.warning("Priority charging manager not available")
             
             # Send UsePriorityChargingResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.UsePriorityChargingResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")
@@ -2151,7 +2199,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
             
             # Send NotifyPriorityChargingResponse
-            from ocpp.v21 import call
+            from ocpp.v201 import call
             request = call.NotifyPriorityChargingResponse(
                 status=result["status"],
                 statusInfo=result.get("statusInfo")

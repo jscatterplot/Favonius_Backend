@@ -7,19 +7,20 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
 import asyncpg
 
-from .prices import CAISOPrice
+if TYPE_CHECKING:
+    from .prices import CAISOPrice
 
 logger = logging.getLogger(__name__)
 
 
 async def store_prices(
     pool: asyncpg.Pool,
-    prices: list[CAISOPrice],
+    prices: list["CAISOPrice"],
     depot_id: str | UUID,
     source: str = 'caiso_dam',
     demand_charge_per_kw: Optional[float] = None,

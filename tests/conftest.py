@@ -13,6 +13,20 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+# FastAPI auth override for unit tests (avoid 401 from JWT dependency)
+try:
+    from src.api.main import app
+    from src.security.auth import verify_token
+    from src.api import main as api_main
+    from src.core.state.assembler import StateAssembler
+    from src.core.models import DepotConfig, OptimizationResult
+except Exception:  # pragma: no cover - not all test runs import API
+    app = None
+    verify_token = None
+    api_main = None
+    StateAssembler = None
+    DepotConfig = None
+
 # Optional: Import websocket_handler config if available
 # Note: Supabase removed - PRD specifies TimescaleDB only
 try:
@@ -43,6 +57,83 @@ except ImportError:
 def sample_depot_id():
     """Generate a sample depot ID."""
     return str(uuid4())
+
+
+@pytest.fixture(autouse=True)
+def _override_auth_dependency():
+    """Override JWT auth for tests using FastAPI TestClient."""
+    if app is None or verify_token is None:
+        yield
+        return
+
+    app.dependency_overrides[verify_token] = lambda: {"sub": "test-user"}
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(verify_token, None)
+
+
+@pytest.fixture(autouse=True)
+def _override_controller_manager():
+    """Provide a mock controller_manager for API unit tests."""
+    if api_main is None:
+        yield
+        return
+
+    original = api_main.controller_manager
+    mock_controller = MagicMock()
+    mock_controller.optimize = AsyncMock(return_value=None)
+    mock_controller.get_state = AsyncMock(return_value=None)
+    mock_controller.get_schedule = AsyncMock(return_value=None)
+    mock_controller.get_alerts = AsyncMock(return_value=[])
+    mock_controller.handle_handoff = AsyncMock(return_value=None)
+
+    manager = MagicMock()
+    manager.get_or_create_controller = AsyncMock(return_value=mock_controller)
+    manager.list_controllers = MagicMock(return_value=[])
+    manager.health_check = AsyncMock(return_value={"status": "ok"})
+
+    api_main.controller_manager = manager
+    api_main.db_pool = MagicMock()
+    if StateAssembler and DepotConfig and OptimizationResult:
+        sample_config = DepotConfig(
+            vehicle_capacities={"bus_1": 100.0},
+            vehicle_max_charge_kw={"bus_1": 50.0},
+            charger_groups={50.0: 1},
+            charger_efficiency=0.95,
+            charger_vehicle_access={},
+            battery_capacity=0.0,
+            battery_power=0.0,
+            battery_efficiency=0.92,
+            battery_soc_min=0.2,
+            battery_soc_max=0.8,
+            max_site_power=200.0,
+            delta_t=0.25,
+            n_timesteps=4,
+        )
+        StateAssembler.load_depot_config = AsyncMock(return_value=(sample_config, None))
+        mock_controller.run_optimization = AsyncMock(
+            return_value=OptimizationResult(
+                run_id=uuid4(),
+                schedule={"bus_1": {"charging_power": [0.0], "soc": [0.5]}},
+                battery_dispatch=[0.0],
+                grid_power=[0.0],
+                peak_demand_kw=0.0,
+                objective_value=0.0,
+                solve_time_s=0.1,
+                status="completed",
+            )
+        )
+        api_main.rate_limiter = MagicMock(
+            check_optimize_limit=MagicMock(return_value=True),
+            check_api_limit=MagicMock(return_value=True),
+            check_handoff_limit=MagicMock(return_value=True),
+        )
+    try:
+        yield
+    finally:
+        api_main.controller_manager = original
+        api_main.db_pool = None
 
 
 @pytest.fixture

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import structlog
 
-from .enhanced_error_handler import CircuitBreakerState, CircuitBreakerOpenError
+from .enhanced_error_handler import CircuitBreakerOpenError
 
 
 class HealthStatus(Enum):
@@ -17,6 +17,16 @@ class HealthStatus(Enum):
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
     UNKNOWN = "unknown"
+
+
+@dataclass
+class CircuitBreakerState:
+    """Internal circuit breaker state for resilience manager."""
+    failure_count: int
+    last_failure_time: Optional[datetime]
+    state: str
+    failure_threshold: int
+    recovery_timeout: float
 
 
 @dataclass

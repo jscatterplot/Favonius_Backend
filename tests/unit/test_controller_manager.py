@@ -706,7 +706,7 @@ class TestControllerConfig:
         assert config.optimization_horizon_hours == 24
         assert config.hourly_optimization_start == 7
         assert config.hourly_optimization_end == 23
-        assert config.optimization_timeout == 30.0
+        assert config.optimization_timeout == 60.0
         assert config.trigger_cooldown_minutes == 5
         assert config.max_optimization_failures == 3
         assert config.dispatch_retry_attempts == 3

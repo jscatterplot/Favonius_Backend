@@ -109,6 +109,10 @@ These constraints MUST NEVER be relaxed:
 - Integration tests: Full pipeline validation (PRD Section 11.3)
 - Performance tests: Solve time < 60s for 20 vehicles (PRD Section 8.3)
 
+## Cursor Behavior
+
+- Do not create or edit Notion pages or reports from Cursor.
+
 ## Acceptance Criteria
 
 Before marking any task complete, verify against PRD Section 11 (Acceptance Criteria):

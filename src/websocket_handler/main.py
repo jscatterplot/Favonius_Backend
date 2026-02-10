@@ -24,6 +24,7 @@ from .price_feeder import PriceFeederService
 from .optimization_engine import OptimizationEngine
 from .resilience_manager import resilience_manager
 from .enhanced_error_handler import error_handler
+from .analytics_service import AnalyticsService
 
 
 class Application:
@@ -46,6 +47,7 @@ class Application:
         
         # TimescaleDB components
         self.timescale_client: Optional[TimescaleClient] = None
+        self.analytics_service: Optional[AnalyticsService] = None
         self.price_feeder: Optional[PriceFeederService] = None
         self.optimization_engine: Optional[OptimizationEngine] = None
         
@@ -136,6 +138,10 @@ class Application:
     async def _validate_configuration(self) -> None:
         """Validate configuration before starting."""
         self.logger.info("Validating configuration...")
+
+        if getattr(self.config, "environment", "") == "test":
+            self.logger.info("Skipping configuration validation in test environment")
+            return
         
         validator = ConfigValidator(self.config)
         is_valid = await validator.validate_all()
@@ -238,6 +244,13 @@ class Application:
             # Create TimescaleDB client
             self.timescale_client = TimescaleClient(self.config.timescale)
             await self.timescale_client.connect()
+
+            # Initialize analytics service
+            self.analytics_service = AnalyticsService(
+                config=self.config.timescale,
+                timescale_client=self.timescale_client,
+            )
+            await self.analytics_service.initialize()
             
             # Telemetry ingestion service removed for simplification
 

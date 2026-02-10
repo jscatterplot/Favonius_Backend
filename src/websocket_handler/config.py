@@ -2,7 +2,7 @@
 
 import os
 from typing import Optional, List
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, validator
 from .secrets_manager import SecretsManager, SecretsConfig
 
 
@@ -117,6 +117,7 @@ class VDV463Config(BaseModel):
 
 class Config(BaseModel):
     """Main application configuration."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     tls: TLSConfig = Field(default_factory=TLSConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
     timescale: TimescaleConfig = Field(default_factory=TimescaleConfig)

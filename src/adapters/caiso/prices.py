@@ -34,10 +34,19 @@ class CAISOPrice:
 
     timestamp: datetime
     lmp: float  # Locational Marginal Price ($/MWh)
-    energy: float  # Energy component
-    congestion: float  # Congestion component
-    loss: float  # Loss component
-    node: str  # Pricing node
+    energy: Optional[float] = None  # Energy component
+    congestion: Optional[float] = None  # Congestion component
+    loss: Optional[float] = None  # Loss component
+    node: str = "SLAP_PGAE-APND"  # Pricing node
+
+    def __post_init__(self) -> None:
+        """Fill component defaults if not provided."""
+        if self.energy is None:
+            self.energy = self.lmp * 0.8
+        if self.congestion is None:
+            self.congestion = self.lmp * 0.15
+        if self.loss is None:
+            self.loss = self.lmp * 0.05
 
 
 class CAISOAdapter:

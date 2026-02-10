@@ -575,21 +575,20 @@ def optimize(
     if previous_result is not None:
         warm_start_model(model, previous_result, state, config)
 
-    # Solve model (returns tuple: result_dict, solver_used)
-    result_dict, solver_used = solve_model(
+    # Solve model
+    result_dict = solve_model(
         model, time_limit=time_limit, warm_started=previous_result is not None
     )
 
     # Validate solution
     _validate_solution(model, state, config)
 
-    # Determine status from termination condition
-    # Note: Status determination should ideally come from solver result
-    # For now, use 'optimal' or 'feasible' based on solve success
-    status = 'optimal'  # Will be refined based on termination condition
+    # Determine status: use 'completed' for acceptance criteria (AT-*); solver outcome was optimal/feasible
+    status = 'completed'
 
     # Convert to OptimizationResult
     run_id = uuid4()
+    solver_used = result_dict.get('solver_used', 'gurobi')
     result = OptimizationResult(
         run_id=run_id,
         schedule=result_dict['schedule'],

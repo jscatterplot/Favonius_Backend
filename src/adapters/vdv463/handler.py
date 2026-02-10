@@ -252,7 +252,7 @@ class VDV463Handler:
             # Parse and validate message
             try:
                 envelope = parse_message(raw_message, self.validation_mode)
-                except VDV463ValidationError as e:
+            except VDV463ValidationError as e:
                 self.logger.error(
                     "Message validation failed",
                     presystem_id=self.presystem_id,

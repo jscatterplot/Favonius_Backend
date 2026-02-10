@@ -1,6 +1,6 @@
 # Core WebSocket and OCPP dependencies
 websockets>=12.0
-ocpp>=2.1.0  # Supports OCPP 1.6 and 2.0.1/2.1
+ocpp>=2.0.0  # Supports OCPP 1.6 and 2.0.1 (2.1.0 not on PyPI)
 uvloop>=0.19.0
 
 # Redis removed for simplification - can be added back later
@@ -33,6 +33,7 @@ pyopenssl>=23.3.0
 # Configuration management
 python-dotenv>=1.0.0
 pyyaml>=6.0.1
+fastapi>=0.128.5
 
 # Development and testing
 pytest>=7.4.4

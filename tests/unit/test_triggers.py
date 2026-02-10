@@ -836,6 +836,7 @@ class TestTriggerMonitorMonitoringLoop:
         
         monitor.expected_socs = {'bus_1': 0.60}
         monitor._last_trigger_time = datetime.utcnow()  # Just triggered
+        monitor._last_scheduled_hour = datetime.utcnow().hour
 
         # Run for one iteration
         monitor._running = True

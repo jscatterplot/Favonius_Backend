@@ -537,8 +537,8 @@ class StateAssembler:
         for sched in schedules:
             vid = sched['vehicle_id']
             if vid not in availability:
-                # VDV 463-only vehicle: add to availability
-                availability[vid] = [True] * n_steps
+                # Ignore unknown vehicles not in depot config
+                continue
 
             dep = sched['departure_time']
             ret = sched['return_time']

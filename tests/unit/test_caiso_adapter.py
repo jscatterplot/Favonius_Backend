@@ -27,8 +27,8 @@ from src.adapters.caiso import (
 def mock_pool():
     """Mock asyncpg connection pool."""
     pool = MagicMock(spec=asyncpg.Pool)
-    conn = AsyncMock(spec=asyncpg.Connection)
-    pool.acquire = AsyncMock(return_value=conn)
+    conn = AsyncMock()
+    pool.acquire = MagicMock(return_value=conn)
     conn.__aenter__ = AsyncMock(return_value=conn)
     conn.__aexit__ = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
@@ -183,7 +183,7 @@ async def test_get_prices_for_depot_with_cache(
     """Test getting prices with cache hit."""
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0)
-    end = datetime(2025, 12, 4, 24, 0, 0)
+    end = datetime(2025, 12, 5, 0, 0, 0)
 
     # Mock cached prices
     cached_rows = [
@@ -211,7 +211,7 @@ async def test_get_prices_for_depot_no_cache(caiso_adapter, mock_pool):
     """Test getting prices without cache (fresh fetch)."""
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0)
-    end = datetime(2025, 12, 4, 24, 0, 0)
+    end = datetime(2025, 12, 5, 0, 0, 0)
 
     # Mock no cached prices
     mock_pool.acquire.return_value.fetch = AsyncMock(return_value=[])
@@ -273,7 +273,7 @@ async def test_get_cached_prices(mock_pool):
     """Test get_cached_prices function."""
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0)
-    end = datetime(2025, 12, 4, 24, 0, 0)
+    end = datetime(2025, 12, 5, 0, 0, 0)
 
     cached_rows = [
         {
@@ -297,7 +297,7 @@ async def test_get_cached_prices_empty(mock_pool):
     """Test get_cached_prices with no cached data."""
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0)
-    end = datetime(2025, 12, 4, 24, 0, 0)
+    end = datetime(2025, 12, 5, 0, 0, 0)
 
     mock_pool.acquire.return_value.fetch = AsyncMock(return_value=[])
 
@@ -359,7 +359,7 @@ async def test_get_cached_prices_database_error(mock_pool):
     """Test get_cached_prices handles database errors."""
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0)
-    end = datetime(2025, 12, 4, 24, 0, 0)
+    end = datetime(2025, 12, 5, 0, 0, 0)
 
     mock_pool.acquire.return_value.fetch = AsyncMock(
         side_effect=asyncpg.PostgresError("Database error")
@@ -407,5 +407,5 @@ async def test_store_prices_conversion(mock_pool):
 
     # Verify conversion: 250.0 $/MWh -> 0.25 $/kWh
     call_args = mock_pool.acquire.return_value.execute.call_args[0]
-    assert call_args[2] == 0.25  # energy_kwh
+    assert call_args[3] == 0.25  # energy_kwh
 

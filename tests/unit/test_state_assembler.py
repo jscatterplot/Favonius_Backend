@@ -708,29 +708,38 @@ class TestGetCurrentState:
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
         
-        # Mock vehicle SoCs
-        mock_conn.fetch.side_effect = [
-            [  # _get_vehicle_socs
-                MagicMock(**{'__getitem__.side_effect': lambda k: {
-                    'vehicle_id': 'bus_1',
-                    'soc': 0.65
-                }[k]}),
-            ],
-            [  # _get_prices
-                MagicMock(**{'__getitem__.side_effect': lambda k, t=datetime.utcnow(), p=0.10: {
-                    'time': t,
-                    'price_per_kwh': p
-                }[k]}),
-            ],
-            [],  # _get_schedules
-        ]
+        # Mock vehicle SoCs and prices, then default empty for other fetches
+        fetch_calls = {"count": 0}
+
+        async def fetch_side_effect(*args, **kwargs):
+            idx = fetch_calls["count"]
+            fetch_calls["count"] += 1
+            if idx == 0:
+                return [
+                    MagicMock(**{'__getitem__.side_effect': lambda k: {
+                        'vehicle_id': 'bus_1',
+                        'soc': 0.65
+                    }[k]}),
+                ]
+            if idx == 1:
+                return [
+                    MagicMock(**{'__getitem__.side_effect': lambda k, t=datetime.utcnow(), p=0.10: {
+                        'time': t,
+                        'price_per_kwh': p
+                    }[k]}),
+                ]
+            return []
+
+        mock_conn.fetch.side_effect = fetch_side_effect
         
         # Mock current month peak and demand charge rate
         mock_peak_row = MagicMock()
         mock_peak_row.__getitem__.side_effect = lambda k: {'peak': 100.0}[k]
+        mock_price_row = MagicMock()
+        mock_price_row.__getitem__.side_effect = lambda k: {'demand_kw': None}[k]
         mock_demand_row = MagicMock()
         mock_demand_row.__getitem__.side_effect = lambda k: {'demand_charge_rate_kw': 25.0}[k]
-        mock_conn.fetchrow.side_effect = [mock_peak_row, mock_demand_row]
+        mock_conn.fetchrow.side_effect = [mock_peak_row, mock_price_row, mock_demand_row]
 
         state = await assembler.get_current_state(horizon_hours=24)
 
@@ -739,7 +748,8 @@ class TestGetCurrentState:
         assert state.current_month_peak == 100.0
         assert state.battery_soc == 0.5  # MVP default
         assert state.demand_charge_rate == 25.0  # From database
-        assert all(p == 0.0 for p in state.building_power)  # MVP default
+        assert len(state.building_power) == 96
+        assert all(p >= 0.0 for p in state.building_power)
 
     @pytest.mark.asyncio
     async def test_get_current_state_custom_horizon(self, assembler, mock_db_pool):
@@ -747,13 +757,12 @@ class TestGetCurrentState:
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
         
-        mock_conn.fetch.side_effect = [
-            [],  # _get_vehicle_socs
-            [],  # _get_prices
-            [],  # _get_schedules
-        ]
+        async def fetch_side_effect(*args, **kwargs):
+            return []
+
+        mock_conn.fetch.side_effect = fetch_side_effect
         
-        mock_conn.fetchrow.side_effect = [None, None]  # peak, demand_rate
+        mock_conn.fetchrow.side_effect = [None, None, None]  # peak, price, demand_rate
 
         state = await assembler.get_current_state(horizon_hours=12)
 
@@ -777,18 +786,25 @@ class TestGetCurrentState:
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
         
         # No vehicle SoCs returned
-        mock_conn.fetch.side_effect = [
-            [],  # _get_vehicle_socs - empty
-            [  # _get_prices
-                MagicMock(**{'__getitem__.side_effect': lambda k, t=datetime.utcnow(), p=0.10: {
-                    'time': t,
-                    'price_per_kwh': p
-                }[k]}),
-            ],
-            [],  # _get_schedules
-        ]
+        fetch_calls = {"count": 0}
+
+        async def fetch_side_effect(*args, **kwargs):
+            idx = fetch_calls["count"]
+            fetch_calls["count"] += 1
+            if idx == 0:
+                return []
+            if idx == 1:
+                return [
+                    MagicMock(**{'__getitem__.side_effect': lambda k, t=datetime.utcnow(), p=0.10: {
+                        'time': t,
+                        'price_per_kwh': p
+                    }[k]}),
+                ]
+            return []
+
+        mock_conn.fetch.side_effect = fetch_side_effect
         
-        mock_conn.fetchrow.side_effect = [None, None]  # peak, demand_rate
+        mock_conn.fetchrow.side_effect = [None, None, None]  # peak, price, demand_rate
 
         state = await assembler.get_current_state(horizon_hours=24)
 

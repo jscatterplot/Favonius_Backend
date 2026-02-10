@@ -112,10 +112,12 @@ class ControllerManager:
         self._running = False
 
         # Stop all controllers
-        stop_tasks = []
+        stop_tasks: list[asyncio.Task] = []
         for depot_id, controller in self.controllers.items():
             stop_tasks.append(
-                self._stop_controller_async(depot_id, controller)
+                asyncio.create_task(
+                    self._stop_controller_async(depot_id, controller)
+                )
             )
 
         # Wait for all to stop (with timeout)
@@ -233,6 +235,7 @@ class ControllerManager:
             task = self._controller_tasks[depot_id_str]
             if not task.done():
                 task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             del self._controller_tasks[depot_id_str]
 
         del self.controllers[depot_id_str]

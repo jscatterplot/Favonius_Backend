@@ -212,7 +212,7 @@ class EnhancedTestRunner:
         
         try:
             # Start test server
-            server = WebSocketServer(self.config)
+            server = OCPPWebSocketServer(self.config)
             await server.start()
             
             try:
@@ -260,7 +260,7 @@ class EnhancedTestRunner:
         
         try:
             # Start test server
-            server = WebSocketServer(self.config)
+            server = OCPPWebSocketServer(self.config)
             await server.start()
             
             try:
@@ -319,7 +319,7 @@ class EnhancedTestRunner:
         
         try:
             # Start test server
-            server = WebSocketServer(self.config)
+            server = OCPPWebSocketServer(self.config)
             await server.start()
             
             try:
@@ -597,9 +597,11 @@ class EnhancedTestRunner:
 
 async def main():
     """Main function to run comprehensive test suite."""
-    
-    # Create configuration
-    config = Config()
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+    # Create configuration from environment
+    config = Config.from_env()
     
     # Create test runner
     test_runner = EnhancedTestRunner(config)

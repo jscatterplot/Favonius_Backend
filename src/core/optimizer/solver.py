@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def solve_model(
     model: pyo.ConcreteModel, time_limit: float = 60.0, warm_started: bool = False
-) -> tuple[dict, str]:
+) -> dict:
     """Solve the optimization model and return results.
 
     Implements Gurobi primary with automatic HiGHS fallback per PRD Section 8.2.
@@ -34,15 +34,15 @@ def solve_model(
         warm_started: Whether model has been warm-started
 
     Returns:
-        Tuple of (result_dict, solver_used) where:
-        - result_dict contains:
+        result_dict containing:
             - schedule: dict[vehicle_id, {charging_power: list, soc: list}]
             - battery_dispatch: list of battery power per timestep
             - grid_power: list of grid power per timestep
             - peak_demand_kw: peak demand value (kW)
             - objective_value: objective function value
             - solve_time_s: solve time in seconds
-        - solver_used: 'gurobi' or 'highs' indicating which solver was used
+            - solve_time: solve time in seconds (legacy alias)
+            - solver_used: 'gurobi' or 'highs' indicating which solver was used
 
     Raises:
         SolverError: If both solvers fail
@@ -153,9 +153,12 @@ def solve_model(
         'battery_dispatch': battery_dispatch,
         'grid_power': grid_power,
         'peak_demand_kw': peak_demand_kw,
+        'peak_demand': peak_demand_kw,
         'objective_value': objective_value,
         'solve_time_s': solve_time_s,
+        'solve_time': solve_time_s,
+        'solver_used': solver_used,
     }
     
-    return result_dict, solver_used
+    return result_dict
 

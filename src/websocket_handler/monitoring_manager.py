@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 
-from ocpp.v21.enums import GenericDeviceModelStatusEnumType, GenericStatusEnumType
-from ocpp.v21.datatypes import StatusInfoType, MonitoringDataType, ComponentType, VariableType
+from ocpp.v201.enums import GenericDeviceModelStatusEnumType, GenericStatusEnumType
+from ocpp.v201.datatypes import StatusInfoType, MonitoringDataType, ComponentType, VariableType
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient

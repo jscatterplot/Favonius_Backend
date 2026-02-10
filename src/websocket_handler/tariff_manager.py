@@ -7,8 +7,8 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 from decimal import Decimal
 
-from ocpp.v21.enums import GenericStatusEnumType
-from ocpp.v21.datatypes import StatusInfoType, CostType, SalesTariffType, SalesTariffEntryType, TariffType, TariffEnergyType, TariffTimeType, TariffFixedType
+from ocpp.v201.enums import GenericStatusEnumType
+from ocpp.v201.datatypes import StatusInfoType, CostType, SalesTariffType, SalesTariffEntryType
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient

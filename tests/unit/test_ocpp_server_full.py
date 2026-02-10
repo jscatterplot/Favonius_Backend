@@ -396,8 +396,8 @@ class TestFleetChargePointHandlers:
         await charge_point.on_meter_values(connector_id=1, meter_value=meter_value)
         
         # Callback should be called with SoC converted to 0-1 scale
-        charge_point.on_meter_values.assert_called_once()
-        args = charge_point.on_meter_values.call_args[0]
+        charge_point.on_meter_values_callback.assert_called_once()
+        args = charge_point.on_meter_values_callback.call_args[0]
         assert args[2] == 0.75  # SoC
 
     @pytest.mark.asyncio
@@ -413,7 +413,7 @@ class TestFleetChargePointHandlers:
         
         await charge_point.on_meter_values(connector_id=1, meter_value=meter_value)
         
-        args = charge_point.on_meter_values.call_args[0]
+        args = charge_point.on_meter_values_callback.call_args[0]
         assert args[3] == 50.0  # Power in kW
 
     @pytest.mark.asyncio
@@ -429,7 +429,7 @@ class TestFleetChargePointHandlers:
         
         await charge_point.on_meter_values(connector_id=1, meter_value=meter_value)
         
-        args = charge_point.on_meter_values.call_args[0]
+        args = charge_point.on_meter_values_callback.call_args[0]
         assert args[3] == 50.0  # Power in kW
 
     @pytest.mark.asyncio
@@ -459,7 +459,7 @@ class TestFleetChargePointHandlers:
         
         await charge_point.on_meter_values(connector_id=1, meter_value=meter_value)
         
-        charge_point.on_meter_values.assert_called_once()
+        charge_point.on_meter_values_callback.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_start_transaction(self, charge_point):
@@ -735,7 +735,8 @@ class TestDatabaseStorage:
         server, _, mock_conn = server_with_pool
         ts = datetime.now(timezone.utc)
         
-        await server._store_meter_values('charger_001', 1, 0.75, 50.0, ts)
+        with patch('src.adapters.ocpp.telemetry.get_vehicle_id_from_ocpp_id', return_value='bus_1'):
+            await server._store_meter_values('charger_001', 1, 0.75, 50.0, ts)
         
         mock_conn.execute.assert_called_once()
 
@@ -746,8 +747,9 @@ class TestDatabaseStorage:
         mock_conn.execute.side_effect = Exception("DB error")
         ts = datetime.now(timezone.utc)
         
-        with pytest.raises(Exception, match="DB error"):
-            await server._store_meter_values('charger_001', 1, 0.75, 50.0, ts)
+        with patch('src.adapters.ocpp.telemetry.get_vehicle_id_from_ocpp_id', return_value='bus_1'):
+            with pytest.raises(Exception, match="DB error"):
+                await server._store_meter_values('charger_001', 1, 0.75, 50.0, ts)
 
     @pytest.mark.asyncio
     async def test_store_meter_values_no_pool(self):
@@ -770,7 +772,7 @@ class TestEdgeCases:
         cp = FleetChargePoint(id='test', connection=mock_ws)
         
         assert cp.on_status_change is None
-        assert cp.on_meter_values is None
+        assert cp.on_meter_values_callback is None
 
     @pytest.mark.asyncio
     async def test_meter_values_no_timestamp(self):
@@ -790,7 +792,7 @@ class TestEdgeCases:
         
         # Should not raise, but callback not called without timestamp
         await cp.on_meter_values(connector_id=1, meter_value=meter_value)
-        cp.on_meter_values.assert_not_called()
+        cp.on_meter_values_callback.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_meter_values_multiple_samples(self):

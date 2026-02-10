@@ -66,7 +66,10 @@ class ControllerConfig:
                 os.getenv('FAVONIUS_OPTIMIZATION_TIMEOUT', '60.0')
             ),
             trigger_cooldown_minutes=int(
-                os.getenv('FAVONIUS_TRIGGER_COOLDOWN_MIN', '5')
+                os.getenv(
+                    'FAVONIUS_TRIGGER_COOLDOWN_MINUTES',
+                    os.getenv('FAVONIUS_TRIGGER_COOLDOWN_MIN', '5')
+                )
             ),
             max_optimization_failures=int(
                 os.getenv('FAVONIUS_MAX_OPT_FAILURES', '3')

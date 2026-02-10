@@ -71,7 +71,7 @@ def test_fleet_charge_point_initialization(mock_websocket, sample_charge_point_i
     assert cp.id == sample_charge_point_id
     assert cp.current_transaction_id is None
     assert cp.on_status_change is None
-    assert cp.on_meter_values is None
+    assert cp.on_meter_values_callback is None
 
 
 @pytest.mark.asyncio
@@ -80,7 +80,7 @@ async def test_boot_notification_handler(mock_websocket, sample_charge_point_id)
     cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
     response = await cp.on_boot_notification('Vendor', 'Model')
 
-    assert isinstance(response, call_result.BootNotificationPayload)
+    assert isinstance(response, call_result.BootNotification)
     assert response.status == 'Accepted'
     assert response.interval == 300
 
@@ -101,7 +101,7 @@ async def test_status_notification_handler(mock_websocket, sample_charge_point_i
     )
     response = await cp.on_status_notification(1, 'NoError', 'Available')
 
-    assert isinstance(response, call_result.StatusNotificationPayload)
+    assert isinstance(response, call_result.StatusNotification)
     assert callback_called
     assert callback_data == (sample_charge_point_id, 1, 'Available')
 
@@ -112,7 +112,7 @@ async def test_meter_values_handler(mock_websocket, sample_charge_point_id):
     callback_called = False
     callback_data = None
 
-    async def meter_callback(cp_id, conn_id, soc, power, timestamp):
+    async def meter_callback(cp_id, conn_id, soc, power, timestamp, max_charge_kw=None):
         nonlocal callback_called, callback_data
         callback_called = True
         callback_data = (cp_id, conn_id, soc, power, timestamp)
@@ -133,7 +133,7 @@ async def test_meter_values_handler(mock_websocket, sample_charge_point_id):
 
     response = await cp.on_meter_values(1, meter_value)
 
-    assert isinstance(response, call_result.MeterValuesPayload)
+    assert isinstance(response, call_result.MeterValues)
     assert callback_called
     assert callback_data[0] == sample_charge_point_id
     assert callback_data[1] == 1
@@ -280,9 +280,9 @@ async def test_meter_values_storage():
     """Test meter values storage in database."""
     mock_pool = MagicMock()
     mock_conn = AsyncMock()
-    mock_pool.acquire = AsyncMock()
-    mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
-    mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
+    mock_pool.acquire = MagicMock(return_value=mock_conn)
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=None)
 
     timestamp = datetime.utcnow()
     await store_meter_values(

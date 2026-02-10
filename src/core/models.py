@@ -171,8 +171,7 @@ class OptimizationResult:
 
     Reference: PRD_v2.md Section 6.2
 
-    Note: peak_demand and solve_time are aliases for peak_demand_kw and solve_time_s
-    for backwards compatibility with existing tests.
+    Constructor accepts peak_demand_kw/solve_time_s or legacy peak_demand/solve_time.
     """
 
     run_id: UUID
@@ -183,16 +182,40 @@ class OptimizationResult:
     objective_value: float
     solve_time_s: float  # Solve time in seconds
     status: str  # 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'
-    solver_used: str = 'gurobi'  # 'gurobi' or 'highs' - tracks which solver was used for monitoring
+    solver_used: str = 'gurobi'  # 'gurobi' or 'highs'
 
-    # Property aliases for backwards compatibility
+    def __init__(
+        self,
+        run_id: UUID,
+        schedule: dict[str, dict],
+        battery_dispatch: list[float],
+        grid_power: list[float],
+        peak_demand_kw: Optional[float] = None,
+        peak_demand: Optional[float] = None,
+        objective_value: float = 0.0,
+        solve_time_s: Optional[float] = None,
+        solve_time: Optional[float] = None,
+        status: str = "optimal",
+        solver_used: str = "gurobi",
+        **kwargs: object,
+    ) -> None:
+        pkw = peak_demand_kw if peak_demand_kw is not None else (peak_demand if peak_demand is not None else 0.0)
+        sts = solve_time_s if solve_time_s is not None else (solve_time if solve_time is not None else 0.0)
+        self.run_id = run_id
+        self.schedule = schedule
+        self.battery_dispatch = battery_dispatch
+        self.grid_power = grid_power
+        self.peak_demand_kw = pkw
+        self.objective_value = objective_value
+        self.solve_time_s = sts
+        self.status = status
+        self.solver_used = solver_used
+
     @property
     def peak_demand(self) -> float:
-        """Alias for peak_demand_kw."""
         return self.peak_demand_kw
 
     @property
     def solve_time(self) -> float:
-        """Alias for solve_time_s."""
         return self.solve_time_s
 

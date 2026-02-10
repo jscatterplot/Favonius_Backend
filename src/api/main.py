@@ -53,7 +53,10 @@ def validate_uuid(value: str, field_name: str = "id") -> str:
         HTTPException 400: If value is not a valid UUID
     """
     try:
-        UUID(value)
+        parsed = UUID(value)
+        # Enforce canonical hyphenated lowercase format
+        if str(parsed) != value:
+            raise ValueError("Non-canonical UUID format")
         return value
     except ValueError:
         raise HTTPException(

@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Any, Set
 import json
 
-from ocpp.v21.enums import AttributeEnumType
+from ocpp.v201.enums import AttributeEnumType
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient

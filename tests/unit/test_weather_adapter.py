@@ -14,9 +14,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+import pytest
+
+pytest.importorskip("openmeteo_requests")
+
 import asyncpg
 import numpy as np
-import pytest
 
 from src.adapters.weather import (
     OpenMeteoAdapter,

@@ -187,7 +187,7 @@ class TestDERControlManager:
         response = await der_control_manager.clear_der_control(station_id, control_id)
         
         assert response is not None
-        assert response["status"] == "Accepted"  # The actual implementation accepts clearing non-existent controls
+        assert response["status"] == "Rejected"
     
     @pytest.mark.timeout(10)
     def test_der_control_manager_without_client(self):

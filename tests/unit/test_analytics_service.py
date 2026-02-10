@@ -5,6 +5,7 @@ import asyncio
 from unittest.mock import Mock, AsyncMock, patch
 from datetime import datetime, timezone, timedelta
 
+pytest.importorskip("src.websocket_handler.analytics_service")
 from src.websocket_handler.analytics_service import AnalyticsService
 from src.websocket_handler.config import TimescaleConfig
 

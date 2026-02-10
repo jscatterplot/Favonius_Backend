@@ -54,7 +54,7 @@ class TestWebSocketConfig:
         assert config.max_connections == 100
         assert config.heartbeat_interval == 30
         assert config.message_timeout == 60
-        assert config.max_message_size == 65536
+        assert config.max_message_size == 1048576
         assert config.rate_limit_per_minute == 100
 
     def test_websocket_config_custom_values(self):
@@ -441,7 +441,18 @@ class TestConfig:
         assert config.environment == "staging"
         assert config.debug is True
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, {
+        "TIMESCALE_SERVICE_URL": "postgres://test:test@localhost:5432/test",
+        "PGHOST": "localhost",
+        "PGUSER": "test",
+        "PGPASSWORD": "test",
+        "SUPABASE_URL": "https://example.supabase.co",
+        "SUPABASE_ANON_KEY": "anon",
+        "SUPABASE_SERVICE_KEY": "service",
+        "SUPABASE_DB_HOST": "db.host",
+        "SUPABASE_DB_USER": "user",
+        "SUPABASE_DB_PASSWORD": "pass",
+    }, clear=True)
     def test_config_from_env_defaults(self):
         """Test config creation from environment with defaults."""
         config = Config.from_env()

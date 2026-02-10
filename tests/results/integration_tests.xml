@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="5" failures="0" skipped="0" tests="5" time="1.387" timestamp="2026-02-09T18:15:39.454166+02:00" hostname="Mac"><testcase classname="" name="tests.integration.test_cross_module_integration" time="0.000"><error message="collection failure">ImportError while importing test module '/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/tests/integration/test_cross_module_integration.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/importlib/__init__.py:127: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/integration/test_cross_module_integration.py:19: in &lt;module&gt;
+    from src.websocket_handler.v2x_controller import V2XController, V2XSetpoint, V2XOperationMode
+E   ModuleNotFoundError: No module named 'src.websocket_handler.v2x_controller'</error></testcase><testcase classname="" name="tests.integration.test_handoff_departure_time" time="0.000"><error message="collection failure">ImportError while importing test module '/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/tests/integration/test_handoff_departure_time.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/importlib/__init__.py:127: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/integration/test_handoff_departure_time.py:20: in &lt;module&gt;
+    from src.core.models import HandoffReceiveRequest
+E   ImportError: cannot import name 'HandoffReceiveRequest' from 'src.core.models' (/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/src/core/models.py)</error></testcase><testcase classname="" name="tests.integration.test_price_integration" time="0.000"><error message="collection failure">ImportError while importing test module '/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/tests/integration/test_price_integration.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/importlib/__init__.py:127: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/integration/test_price_integration.py:13: in &lt;module&gt;
+    from src.adapters.caiso import (
+E   ImportError: cannot import name 'PriceIngestionService' from 'src.adapters.caiso' (/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/src/adapters/caiso/__init__.py)</error></testcase><testcase classname="" name="tests.integration.test_simulation_acceptance" time="0.000"><error message="collection failure">ImportError while importing test module '/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/tests/integration/test_simulation_acceptance.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/importlib/__init__.py:127: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/integration/test_simulation_acceptance.py:11: in &lt;module&gt;
+    from src.core.optimizer.exceptions import InfeasibleModelError, RuntimeError
+E   ImportError: cannot import name 'RuntimeError' from 'src.core.optimizer.exceptions' (/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/src/core/optimizer/exceptions.py)</error></testcase><testcase classname="" name="tests.integration.test_weather_integration" time="0.000"><error message="collection failure">ImportError while importing test module '/Users/joris/Desktop/FavoniusEnergy/Favonius_Backend/tests/integration/test_weather_integration.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/importlib/__init__.py:127: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/integration/test_weather_integration.py:13: in &lt;module&gt;
+    from src.adapters.weather import (
+src/adapters/weather/__init__.py:3: in &lt;module&gt;
+    from .ingestion import WeatherIngestionService
+src/adapters/weather/ingestion.py:16: in &lt;module&gt;
+    from .openmeteo import OpenMeteoAdapter
+src/adapters/weather/openmeteo.py:23: in &lt;module&gt;
+    import openmeteo_requests
+E   ModuleNotFoundError: No module named 'openmeteo_requests'</error></testcase></testsuite></testsuites>

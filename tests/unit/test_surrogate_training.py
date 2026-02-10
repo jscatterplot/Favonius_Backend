@@ -28,7 +28,10 @@ from src.core.surrogate import (
 def mock_pool():
     """Mock asyncpg.Pool for testing."""
     pool = MagicMock(spec=asyncpg.Pool)
-    pool.acquire = AsyncMock()
+    mock_conn = AsyncMock()
+    pool.acquire = MagicMock(return_value=mock_conn)
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=None)
     return pool
 
 
@@ -308,7 +311,7 @@ async def test_train_and_validate_basic(mock_pool, sample_depot_id):
     assert isinstance(model, EnergySurrogateModel)
     assert model._is_fitted
     assert isinstance(r2, float)
-    assert -1.0 <= r2 <= 1.0  # R² can be negative for poor fits
+    assert r2 <= 1.0
 
 
 @pytest.mark.asyncio

@@ -485,9 +485,8 @@ class TestConcurrentOptimization:
         
         optimization_starts = []
         
-        async def slow_optimization(*args, **kwargs):
+        def slow_optimization(*args, **kwargs):
             optimization_starts.append(datetime.utcnow())
-            await asyncio.sleep(0.1)
             return sample_optimization_result
         
         controller.assembler.get_current_state = AsyncMock(return_value=sample_depot_state)
@@ -522,9 +521,8 @@ class TestConcurrentOptimization:
         
         optimization_count = [0]
         
-        async def count_optimization(*args, **kwargs):
+        def count_optimization(*args, **kwargs):
             optimization_count[0] += 1
-            await asyncio.sleep(0.05)  # Simulate work
             return sample_optimization_result
         
         with patch('src.core.controller.optimize', side_effect=count_optimization):
@@ -667,8 +665,19 @@ class TestDispatchRetryLogic:
             new_callable=AsyncMock
         ) as mock_load:
             mock_load.return_value = (depot_config, {'bus_1': 'charger_1'})
+            single_result = OptimizationResult(
+                run_id=sample_optimization_result.run_id,
+                schedule={"bus_1": sample_optimization_result.schedule["bus_1"]},
+                battery_dispatch=sample_optimization_result.battery_dispatch,
+                grid_power=sample_optimization_result.grid_power,
+                peak_demand_kw=sample_optimization_result.peak_demand_kw,
+                objective_value=sample_optimization_result.objective_value,
+                solve_time_s=sample_optimization_result.solve_time_s,
+                status=sample_optimization_result.status,
+                solver_used=sample_optimization_result.solver_used,
+            )
             
-            await controller._dispatch_commands(sample_optimization_result)
+            await controller._dispatch_commands(single_result)
         
         # Should have retried
         assert mock_cp.set_charging_profile.call_count == 3
@@ -705,8 +714,19 @@ class TestDispatchRetryLogic:
             new_callable=AsyncMock
         ) as mock_load:
             mock_load.return_value = (depot_config, {'bus_1': 'charger_1'})
+            single_result = OptimizationResult(
+                run_id=sample_optimization_result.run_id,
+                schedule={"bus_1": sample_optimization_result.schedule["bus_1"]},
+                battery_dispatch=sample_optimization_result.battery_dispatch,
+                grid_power=sample_optimization_result.grid_power,
+                peak_demand_kw=sample_optimization_result.peak_demand_kw,
+                objective_value=sample_optimization_result.objective_value,
+                solve_time_s=sample_optimization_result.solve_time_s,
+                status=sample_optimization_result.status,
+                solver_used=sample_optimization_result.solver_used,
+            )
             
-            await controller._dispatch_commands(sample_optimization_result)
+            await controller._dispatch_commands(single_result)
         
         assert mock_cp.set_charging_profile.call_count == 2
 

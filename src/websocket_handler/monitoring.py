@@ -301,12 +301,12 @@ class PerformanceTimer:
     
     def __enter__(self):
         """Start timing."""
-        self.start_time = time.time()
+        self.start_time = time.perf_counter()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Stop timing and record."""
-        self.duration = time.time() - self.start_time
+        self.duration = max(time.perf_counter() - self.start_time, 1e-6)
         
         # Call custom callback if provided
         if self.callback:

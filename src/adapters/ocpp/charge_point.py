@@ -49,8 +49,10 @@ class FleetChargePoint(CP16):
                 max_charge_kw is optional and may be None if not reported by charger
         """
         super().__init__(id, connection)
+        self.on_status_change_callback = on_status_change
+        self.on_meter_values_callback = on_meter_values
+        # Backward-compatible attribute name (no method name conflict)
         self.on_status_change = on_status_change
-        self.on_meter_values = on_meter_values
         self.current_transaction_id: Optional[int] = None
         logger.info(f"Initialized FleetChargePoint: {id}")
 
@@ -95,9 +97,9 @@ class FleetChargePoint(CP16):
         logger.debug(
             f"StatusNotification from {self.id}, connector {connector_id}: {status}"
         )
-        if self.on_status_change:
+        if self.on_status_change_callback:
             try:
-                await self.on_status_change(self.id, connector_id, status)
+                await self.on_status_change_callback(self.id, connector_id, status)
             except Exception as e:
                 logger.error(f"Error in status change callback: {e}")
         return call_result.StatusNotification()
@@ -173,10 +175,10 @@ class FleetChargePoint(CP16):
                 f"SoC={soc}, Power={power_kw}kW"
                 + (f", max_charge_kw={max_charge_kw}kW" if max_charge_kw else "")
             )
-            if self.on_meter_values and timestamp:
+            if self.on_meter_values_callback and timestamp:
                 try:
                     # Pass max_charge_kw to callback if available
-                    await self.on_meter_values(
+                    await self.on_meter_values_callback(
                         self.id, connector_id, soc or 0.0, power_kw or 0.0, timestamp, max_charge_kw
                     )
                 except Exception as e:
@@ -263,7 +265,7 @@ class FleetChargePoint(CP16):
 
         for attempt in range(max_retries):
             try:
-                payload = call.SetChargingProfilePayload(
+                payload = call.SetChargingProfile(
                     connector_id=connector_id,
                     cs_charging_profiles={
                         'charging_profile_id': 1,
@@ -319,7 +321,7 @@ class FleetChargePoint(CP16):
             True if accepted, False otherwise
         """
         try:
-            payload = call.RemoteStartTransactionPayload(
+            payload = call.RemoteStartTransaction(
                 connector_id=connector_id,
                 id_tag=id_tag,
             )
@@ -344,7 +346,7 @@ class FleetChargePoint(CP16):
             True if accepted, False otherwise
         """
         try:
-            payload = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+            payload = call.RemoteStopTransaction(transaction_id=transaction_id)
             response = await self.call(payload)
             accepted = response.status == 'Accepted'
             logger.info(

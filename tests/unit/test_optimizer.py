@@ -127,9 +127,9 @@ def test_model_has_all_constraints(simple_depot_state, simple_depot_config):
         'soc_init_con',
         'soc_dynamics',
         'availability_con',
-        'departure_soc',
+        'departure_soc_min',
         'charger_link',
-        'charger_capacity',
+        'charger_power',
         'grid_balance',
         'site_power_limit',
         'peak_tracking',
@@ -1543,9 +1543,10 @@ class TestHiGHSFallback:
         from src.core.optimizer.solver import solve_model
 
         model = build_optimization_model(simple_state, simple_config)
-        result_dict, solver_used = solve_model(model, time_limit=60.0)
+        result_dict = solve_model(model, time_limit=60.0)
 
         # solver_used should be either 'gurobi' or 'highs'
+        solver_used = result_dict.get("solver_used")
         assert solver_used in ('gurobi', 'highs'), f"Unexpected solver: {solver_used}"
 
         # Result should be valid regardless of solver
