@@ -13,6 +13,7 @@ import os
 import ssl
 import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # Repo root: script lives in scripts/
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -46,22 +47,45 @@ async def run_migrations() -> int:
         print("No migration files found under migrations/", file=sys.stderr)
         return 1
 
-    # Build SSL context when sslmode is present in the URL.
-    # asyncpg needs an explicit ssl.SSLContext for cloud-hosted databases.
-    ssl_context: ssl.SSLContext | bool | None = None
-    if "sslmode=" in database_url:
-        ssl_context = ssl.create_default_context()
-        # Timescale Cloud / most managed DBs use valid certs, but if the
-        # provider uses self-signed certs, fall back to unverified context.
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        # Strip sslmode param so asyncpg doesn't choke on it
-        import re
-        database_url = re.sub(r"[?&]sslmode=[^&]*", "", database_url)
-        # Fix URL if stripping left a trailing '?' or '&'
-        database_url = database_url.rstrip("?&")
+    # Build SSL configuration when sslmode is present in the URL.
+    # asyncpg needs an explicit ssl.SSLContext or bool for cloud-hosted databases.
+    ssl_config: ssl.SSLContext | bool | None = None
+    parsed = urlparse(database_url)
+    query_params = parse_qsl(parsed.query, keep_blank_values=True)
 
-    conn = await asyncpg.connect(database_url, ssl=ssl_context)
+    sslmode: str | None = None
+    filtered_query: list[tuple[str, str]] = []
+    for key, value in query_params:
+        if key.lower() == "sslmode":
+            sslmode = value
+        else:
+            filtered_query.append((key, value))
+
+    if sslmode:
+        mode = sslmode.lower()
+        if mode == "disable":
+            # Explicitly requested no SSL.
+            ssl_config = False
+        else:
+            # For all non-disable modes we establish an SSL context.
+            # libpq-style negotiation modes like "allow" and "prefer" cannot be
+            # expressed directly in asyncpg, so we treat them as "require" from
+            # the client's perspective.
+            ctx = ssl.create_default_context()
+            if mode in {"require", "allow", "prefer"}:
+                # Timescale Cloud / most managed DBs use valid certs, but if the
+                # provider uses self-signed certs, fall back to unverified context.
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            # For verify-ca / verify-full we keep default verification behaviour.
+            ssl_config = ctx
+
+        # Strip sslmode param so asyncpg doesn't choke on it while keeping the URL valid.
+        new_query = urlencode(filtered_query, doseq=True)
+        parsed = parsed._replace(query=new_query)
+        database_url = urlunparse(parsed)
+
+    conn = await asyncpg.connect(database_url, ssl=ssl_config)
     try:
         for path in files:
             sql = path.read_text()
