@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import ssl
 import sys
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # Repo root: script lives in scripts/
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -50,16 +50,12 @@ async def run_migrations() -> int:
     # Build SSL configuration when sslmode is present in the URL.
     # asyncpg needs an explicit ssl.SSLContext or bool for cloud-hosted databases.
     ssl_config: ssl.SSLContext | bool | None = None
-    parsed = urlparse(database_url)
-    query_params = parse_qsl(parsed.query, keep_blank_values=True)
 
-    sslmode: str | None = None
-    filtered_query: list[tuple[str, str]] = []
-    for key, value in query_params:
-        if key.lower() == "sslmode":
-            sslmode = value
-        else:
-            filtered_query.append((key, value))
+    # Extract sslmode from the query string without full URL round-trip.
+    # Using urlparse/urlunparse can mangle passwords containing special
+    # characters (%, +, @, etc.), causing authentication failures.
+    sslmode_match = re.search(r"[?&]sslmode=([^&#]*)", database_url)
+    sslmode: str | None = sslmode_match.group(1) if sslmode_match else None
 
     if sslmode:
         mode = sslmode.lower()
@@ -80,10 +76,14 @@ async def run_migrations() -> int:
             # For verify-ca / verify-full we keep default verification behaviour.
             ssl_config = ctx
 
-        # Strip sslmode param so asyncpg doesn't choke on it while keeping the URL valid.
-        new_query = urlencode(filtered_query, doseq=True)
-        parsed = parsed._replace(query=new_query)
-        database_url = urlunparse(parsed)
+        # Strip sslmode param from the URL so asyncpg doesn't choke on it.
+        # Operate directly on the string to avoid password mangling.
+        # Case 1: sslmode is the first (or only) query param — ?sslmode=val(&...)
+        database_url = re.sub(r"\?sslmode=[^&#]*&?", "?", database_url)
+        # Case 2: sslmode appears after another param — &sslmode=val
+        database_url = re.sub(r"&sslmode=[^&#]*", "", database_url)
+        # Clean up trailing '?' if no query params remain.
+        database_url = database_url.rstrip("?")
 
     conn = await asyncpg.connect(database_url, ssl=ssl_config)
     try:
