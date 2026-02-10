@@ -1,4 +1,4 @@
-"""Price ingestion service for CAISO price updates.
+"""Price ingestion service for CAISO and ENTSO-E price updates.
 
 Reference: Development plan Step 3.2, PRD.md#9-3-price-data
 """
@@ -13,6 +13,7 @@ from typing import Optional
 import asyncpg
 
 from .prices import CAISOAdapter
+from ..entsoe import ENTSOEAdapter, is_european_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +21,18 @@ logger = logging.getLogger(__name__)
 class PriceIngestionService:
     """Background service for fetching and storing price data.
 
-    Fetches day-ahead prices daily (10:00 AM PT per PRD) and stores
-    them in the database for all configured depots.
+    Fetches day-ahead prices daily and stores them in the database
+    for all configured depots. Routes European depots to ENTSO-E
+    Transparency Platform and US depots to CAISO.
 
-    Reference: PRD Section 9.3 (CAISO updates daily at 10:00 AM PT)
+    Reference: PRD Section 9.3
     """
 
     def __init__(
         self,
         pool: asyncpg.Pool,
         adapter: Optional[CAISOAdapter] = None,
+        entsoe_adapter: Optional[ENTSOEAdapter] = None,
         ingestion_hour: int = 10,  # 10:00 AM PT
         ingestion_minute: int = 0,
     ):
@@ -38,67 +41,128 @@ class PriceIngestionService:
         Args:
             pool: Database connection pool
             adapter: CAISO adapter instance (creates new if None)
+            entsoe_adapter: ENTSO-E adapter instance (creates new if None)
             ingestion_hour: Hour of day to run ingestion (default 10 = 10 AM)
             ingestion_minute: Minute of hour to run ingestion (default 0)
         """
         self.pool = pool
         self.adapter = adapter or CAISOAdapter(pool=pool)
+        self.entsoe_adapter = entsoe_adapter or ENTSOEAdapter(pool=pool)
         self.ingestion_hour = ingestion_hour
         self.ingestion_minute = ingestion_minute
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
     async def fetch_and_store_prices_for_depot(
-        self, depot_id: str, node: Optional[str] = None
+        self,
+        depot_id: str,
+        node: Optional[str] = None,
+        depot_timezone: Optional[str] = None,
     ) -> int:
         """Fetch and store prices for a single depot.
 
+        Routes to ENTSO-E for European depots (detected by timezone)
+        or to CAISO for US depots.
+
         Args:
             depot_id: Depot identifier
-            node: Pricing node (defaults to adapter default)
+            node: Pricing node for CAISO (defaults to adapter default)
+            depot_timezone: Depot IANA timezone for region detection
 
         Returns:
             Number of prices stored
         """
         try:
-            # Fetch prices for next 48 hours (2 days ahead)
             now = datetime.utcnow()
             end_date = now + timedelta(hours=48)
 
-            prices = await self.adapter.get_prices_for_depot(
-                depot_id=depot_id,
-                start_date=now,
-                end_date=end_date,
-                node=node,
-                use_cache=False,  # Force fresh fetch
-                source='caiso_dam',
-            )
-
-            if prices:
-                stored = await self.adapter.store_prices_to_db(
-                    prices, depot_id, source='caiso_dam'
+            if depot_timezone and is_european_timezone(depot_timezone):
+                return await self._fetch_entsoe_prices(
+                    depot_id, now, end_date, depot_timezone
                 )
-                logger.info(
-                    f"Stored {stored} prices for depot {depot_id} "
-                    f"(node: {node or self.adapter.default_node})"
-                )
-                return stored
             else:
-                logger.warning(f"No prices fetched for depot {depot_id}")
-                return 0
+                return await self._fetch_caiso_prices(
+                    depot_id, now, end_date, node
+                )
 
         except Exception as e:
             logger.error(f"Error fetching prices for depot {depot_id}: {e}")
             raise
 
+    async def _fetch_caiso_prices(
+        self,
+        depot_id: str,
+        start_date: datetime,
+        end_date: datetime,
+        node: Optional[str] = None,
+    ) -> int:
+        """Fetch and store CAISO prices for a US depot."""
+        prices = await self.adapter.get_prices_for_depot(
+            depot_id=depot_id,
+            start_date=start_date,
+            end_date=end_date,
+            node=node,
+            use_cache=False,
+            source='caiso_dam',
+        )
+
+        if prices:
+            stored = await self.adapter.store_prices_to_db(
+                prices, depot_id, source='caiso_dam'
+            )
+            logger.info(
+                f"Stored {stored} CAISO prices for depot {depot_id} "
+                f"(node: {node or self.adapter.default_node})"
+            )
+            return stored
+        else:
+            logger.warning(f"No CAISO prices fetched for depot {depot_id}")
+            return 0
+
+    async def _fetch_entsoe_prices(
+        self,
+        depot_id: str,
+        start_date: datetime,
+        end_date: datetime,
+        depot_timezone: str,
+    ) -> int:
+        """Fetch and store ENTSO-E prices for a European depot."""
+        prices = await self.entsoe_adapter.get_prices_for_depot(
+            depot_id=depot_id,
+            start_date=start_date,
+            end_date=end_date,
+            depot_timezone=depot_timezone,
+            use_cache=False,
+            source='entsoe_dam',
+        )
+
+        if prices:
+            stored = await self.entsoe_adapter.store_prices_to_db(
+                prices, depot_id, source='entsoe_dam'
+            )
+            logger.info(
+                f"Stored {stored} ENTSO-E prices for depot {depot_id} "
+                f"(timezone: {depot_timezone})"
+            )
+            return stored
+        else:
+            logger.warning(
+                f"No ENTSO-E prices fetched for depot {depot_id} "
+                f"(timezone: {depot_timezone})"
+            )
+            return 0
+
     async def fetch_prices_for_all_depots(self) -> dict[str, int]:
         """Fetch and store prices for all configured depots.
+
+        Routes each depot to the appropriate pricing source based on
+        its timezone (European depots -> ENTSO-E, others -> CAISO).
 
         Returns:
             Dictionary mapping depot_id to number of prices stored
         """
         query = """
-        SELECT depot_id, utility_id
+        SELECT depot_id, utility_id, timezone
         FROM depots
         ORDER BY depot_id
         """
@@ -113,16 +177,23 @@ class PriceIngestionService:
                 logger.warning("No depots found in database")
                 return results
 
-            logger.info(f"Fetching prices for {len(rows)} depots")
+            eu_count = sum(
+                1 for r in rows
+                if r['timezone'] and is_european_timezone(r['timezone'])
+            )
+            logger.info(
+                f"Fetching prices for {len(rows)} depots "
+                f"({eu_count} European, {len(rows) - eu_count} non-European)"
+            )
 
             for row in rows:
                 depot_id = str(row['depot_id'])
-                # For now, use default node. In future, could map utility_id to node
+                depot_timezone = row.get('timezone')
                 node = None
 
                 try:
                     stored_count = await self.fetch_and_store_prices_for_depot(
-                        depot_id, node
+                        depot_id, node, depot_timezone=depot_timezone
                     )
                     results[depot_id] = stored_count
                 except Exception as e:
@@ -197,6 +268,7 @@ class PriceIngestionService:
                 pass
 
         await self.adapter.close()
+        await self.entsoe_adapter.close()
         logger.info("Price ingestion service stopped")
 
     async def run_once(self) -> dict[str, int]:

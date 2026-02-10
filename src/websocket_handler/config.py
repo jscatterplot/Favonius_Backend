@@ -73,14 +73,18 @@ class MonitoringConfig(BaseModel):
 
 class PriceFeederConfig(BaseModel):
     """Price feeder configuration."""
-    enabled: bool = Field(default=True, description="Enable CAISO price feeder")
+    enabled: bool = Field(default=True, description="Enable price feeder")
     base_url: str = Field(
         default="https://oasis.caiso.com/oasisapi/SingleZip",
         description="CAISO OASIS API base URL"
     )
     nodes: List[str] = Field(
         default_factory=lambda: ["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"],
-        description="Pricing nodes to monitor"
+        description="CAISO pricing nodes to monitor"
+    )
+    entsoe_zones: List[str] = Field(
+        default_factory=list,
+        description="ENTSO-E bidding zone EIC codes for European depots (e.g., '10Y1001A1001A82H' for DE-LU)"
     )
     fetch_interval_seconds: int = Field(default=900, description="Price refresh interval in seconds")
     lookahead_hours: int = Field(default=24, description="Forecast horizon in hours")
@@ -210,6 +214,7 @@ class Config(BaseModel):
                 enabled=os.getenv("PRICE_FEEDER_ENABLED", "true").lower() == "true",
                 base_url=os.getenv("PRICE_FEEDER_BASE_URL", "https://oasis.caiso.com/oasisapi/SingleZip"),
                 nodes=[node.strip() for node in os.getenv("PRICE_FEEDER_NODES", "TH_SP15_GEN-APND,TH_NP15_GEN-APND").split(",") if node.strip()],
+                entsoe_zones=[z.strip() for z in os.getenv("PRICE_FEEDER_ENTSOE_ZONES", "").split(",") if z.strip()],
                 fetch_interval_seconds=int(os.getenv("PRICE_FEEDER_FETCH_INTERVAL", "900")),
                 lookahead_hours=int(os.getenv("PRICE_FEEDER_LOOKAHEAD_HOURS", "24")),
             ),
