@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run TimescaleDB migrations in order. For Railway pre-deploy or local.
 
-Reads DATABASE_URL from env. Runs migrations/001_*.sql, 003_*.sql, 004_*.sql, etc.
+Reads TIMESCALE_SERVICE_URL (preferred) or DATABASE_URL from env.
+Runs migrations/001_*.sql, 003_*.sql, 004_*.sql, etc.
 Exits 0 on success, 1 on failure.
 """
 
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import ssl
 import sys
 from pathlib import Path
 
@@ -25,9 +27,12 @@ def _read_migrations_dir() -> list[Path]:
 
 
 async def run_migrations() -> int:
-    database_url = os.getenv("DATABASE_URL")
+    database_url = os.getenv("TIMESCALE_SERVICE_URL") or os.getenv("DATABASE_URL")
     if not database_url:
-        print("DATABASE_URL is not set", file=sys.stderr)
+        print(
+            "TIMESCALE_SERVICE_URL or DATABASE_URL must be set",
+            file=sys.stderr,
+        )
         return 1
 
     try:
@@ -41,7 +46,22 @@ async def run_migrations() -> int:
         print("No migration files found under migrations/", file=sys.stderr)
         return 1
 
-    conn = await asyncpg.connect(database_url)
+    # Build SSL context when sslmode is present in the URL.
+    # asyncpg needs an explicit ssl.SSLContext for cloud-hosted databases.
+    ssl_context: ssl.SSLContext | bool | None = None
+    if "sslmode=" in database_url:
+        ssl_context = ssl.create_default_context()
+        # Timescale Cloud / most managed DBs use valid certs, but if the
+        # provider uses self-signed certs, fall back to unverified context.
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        # Strip sslmode param so asyncpg doesn't choke on it
+        import re
+        database_url = re.sub(r"[?&]sslmode=[^&]*", "", database_url)
+        # Fix URL if stripping left a trailing '?' or '&'
+        database_url = database_url.rstrip("?&")
+
+    conn = await asyncpg.connect(database_url, ssl=ssl_context)
     try:
         for path in files:
             sql = path.read_text()
@@ -59,7 +79,8 @@ async def run_migrations() -> int:
     finally:
         await conn.close()
 
-    print("Migrations completed successfully.")
+    url_source = "TIMESCALE_SERVICE_URL" if os.getenv("TIMESCALE_SERVICE_URL") else "DATABASE_URL"
+    print(f"Migrations completed successfully (via {url_source}).")
     return 0
 
 
