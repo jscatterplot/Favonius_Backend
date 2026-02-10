@@ -282,12 +282,13 @@ class TriggerMonitor:
             return {}
 
         query = """
-        SELECT DISTINCT ON (vehicle_id) 
-            vehicle_id::text, soc
+        SELECT DISTINCT ON (t.vehicle_id)
+            t.vehicle_id::text AS vehicle_id,
+            t.soc
         FROM telemetry t
         JOIN vehicles v ON t.vehicle_id = v.vehicle_id
         WHERE v.depot_id = $1
-        ORDER BY vehicle_id, time DESC
+        ORDER BY t.vehicle_id, t.time DESC
         """
         try:
             async with self.pool.acquire() as conn:
