@@ -105,3 +105,14 @@ certs/
 # Application data
 data/
 logs/*.log
+
+# OS & IDE files
+.DS_Store
+
+# Test coverage
+.coverage
+
+# Environment variables
+.env
+.env.local
+.env.*.local
