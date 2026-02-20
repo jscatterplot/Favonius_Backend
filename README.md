@@ -84,6 +84,9 @@ docker-compose up -d
 # With OCPP simulator for testing
 docker-compose --profile simulation up -d
 
+# EVerest SIL smoke test (backend <-> charger)
+./scripts/everest/run_backend_everest_smoke.sh
+
 # With monitoring (Prometheus + Grafana)
 docker-compose --profile monitoring up -d
 
