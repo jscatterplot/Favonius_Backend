@@ -1,4 +1,4 @@
-.PHONY: help install install-dev test lint format type-check clean docker-up docker-down docker-logs
+.PHONY: help install install-dev test lint format type-check clean docker-up docker-down docker-logs everest-up everest-down test-everest
 
 # Default target
 help:
@@ -14,6 +14,9 @@ help:
 	@echo "  make docker-up     - Start docker-compose services"
 	@echo "  make docker-down   - Stop docker-compose services"
 	@echo "  make docker-logs   - View docker-compose logs"
+	@echo "  make everest-up    - Start EVerest smoke-test stack"
+	@echo "  make everest-down  - Stop EVerest smoke-test stack"
+	@echo "  make test-everest  - Run backend↔EVerest smoke test"
 	@echo "  make clean         - Clean build artifacts and caches"
 
 # Installation
@@ -73,6 +76,15 @@ docker-build:
 docker-verify:
 	@echo "Verifying deployment..."
 	@./scripts/deploy/verify_deployment.sh
+
+everest-up:
+	docker compose -f docker-compose.everest.yml up -d --build
+
+everest-down:
+	docker compose -f docker-compose.everest.yml down -v --remove-orphans
+
+test-everest:
+	./scripts/everest/run_backend_everest_smoke.sh
 
 # Cleanup
 clean:

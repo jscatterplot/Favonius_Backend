@@ -1,0 +1,104 @@
+version: "3.8"
+
+# EVerest-backed OCPP smoke-test stack.
+# Based on EVerest demo images and run-sil startup flow:
+# - https://github.com/EVerest/everest-demo
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: favonius_everest_db
+    environment:
+      POSTGRES_USER: favonius
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-favonius_dev}
+      POSTGRES_DB: favonius
+      TIMESCALEDB_TELEMETRY: "off"
+    ports:
+      - "15432:5432"
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+      - timescale_everest_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U favonius -d favonius"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: favonius_everest_api
+    environment:
+      DATABASE_URL: postgresql://favonius:${DB_PASSWORD:-favonius_dev}@timescaledb:5432/favonius
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      PRICE_FEEDER_ENABLED: "false"
+      OCPP_SERVER_ENABLED: "true"
+      OCPP_SERVER_HOST: 0.0.0.0
+      OCPP_SERVER_PORT: 9000
+      OCPP_USE_SAME_PORT: "false"
+    ports:
+      - "18000:8000"
+      - "19000:9000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  everest-mqtt:
+    image: ghcr.io/everest/everest-demo/mqtt-server:${EVEREST_TAG:-2025.10.0-single-phase}
+    container_name: favonius_everest_mqtt
+    logging:
+      driver: none
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+
+  everest-manager:
+    image: ghcr.io/everest/everest-demo/manager:${EVEREST_TAG:-2025.10.0-single-phase}
+    container_name: favonius_everest_manager
+    depends_on:
+      everest-mqtt:
+        condition: service_started
+      api:
+        condition: service_healthy
+    environment:
+      MQTT_SERVER_ADDRESS: everest-mqtt
+      EVEREST_CHARGE_POINT_ID: ${EVEREST_CHARGE_POINT_ID:-charger_01}
+      EVEREST_CSMS_URI: ${EVEREST_CSMS_URI:-api:9000/charger_01}
+    entrypoint: >
+      sh -c "
+        CONFIG=/ext/source/config/config-docker.json;
+        CP_ID=\"$${EVEREST_CHARGE_POINT_ID:-charger_01}\";
+        CSMS_URI=\"$${EVEREST_CSMS_URI:-api:9000/charger_01}\";
+        sed -i \"s|\\\"ChargePointId\\\": \\\"cp001\\\"|\\\"ChargePointId\\\": \\\"$${CP_ID}\\\"|\" \"$${CONFIG}\";
+        sed -i \"s|\\\"ChargeBoxSerialNumber\\\": \\\"cp001\\\"|\\\"ChargeBoxSerialNumber\\\": \\\"$${CP_ID}\\\"|\" \"$${CONFIG}\";
+        sed -i \"s|steve:8180/steve/websocket/CentralSystemService/cp001|$${CSMS_URI}|\" \"$${CONFIG}\";
+        exec sh /ext/build/run-scripts/run-sil.sh
+      "
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+
+  everest-nodered:
+    image: ghcr.io/everest/everest-demo/nodered:${EVEREST_TAG:-2025.10.0-single-phase}
+    container_name: favonius_everest_nodered
+    depends_on:
+      everest-mqtt:
+        condition: service_started
+    environment:
+      MQTT_SERVER_ADDRESS: everest-mqtt
+      FLOWS: /config/config-sil-flow.json
+    ports:
+      - "1880:1880"
+    profiles:
+      - everest-ui
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+
+volumes:
+  timescale_everest_data:
+

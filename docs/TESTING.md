@@ -88,6 +88,22 @@ For complete test coverage including database and OCPP tests:
    pip install httpx structlog cryptography sqlalchemy
    ```
 
+### EVerest Docker Smoke Test (closed-loop OCPP)
+
+Use EVerest SIL to validate backend communication with a standards-grade simulated charger:
+
+```bash
+./scripts/everest/run_backend_everest_smoke.sh
+```
+
+Optional pytest wrapper (explicit opt-in only):
+
+```bash
+RUN_EVEREST_DOCKER_TEST=1 pytest tests/integration/test_everest_docker_smoke.py -v
+```
+
+Reference: `docs/EVEREST_TESTING.md`
+
 ## Test Markers
 
 Configured in `pytest.ini`:
