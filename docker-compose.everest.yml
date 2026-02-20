@@ -3,6 +3,8 @@ version: "3.8"
 # EVerest-backed OCPP smoke-test stack.
 # Based on EVerest demo images and run-sil startup flow:
 # - https://github.com/EVerest/everest-demo
+# Note: upstream demo compose enables IPv6 custom networks by default; this stack
+# intentionally uses Docker's default bridge for broader local compatibility.
 
 services:
   timescaledb:

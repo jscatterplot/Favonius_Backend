@@ -86,4 +86,21 @@ UI endpoint:
 - This smoke test targets charge point ID `charger_01` so it matches seeded charger data from
   `migrations/001_initial_schema.sql`.
 - EVerest demo images are x86-oriented; on Apple Silicon (M1/M2) support may be limited.
+- Upstream `everest-demo` compose files enable IPv6 networks by default. This smoke harness uses
+  Docker's default bridge network for simpler local compatibility; for strict parity with upstream
+  networking, use an IPv6-enabled compose network.
+
+## Official references used for this harness
+
+- EVerest manual (nightly): <https://everest.github.io/nightly/>
+- OCPP 1.6 tutorial (`CentralSystemURI` + OCPP config model):
+  <https://everest.github.io/nightly/tutorials/how_to_ocpp/index.html>
+- EVerest in Software / SIL tutorials:
+  <https://everest.github.io/nightly/tutorials/run_sil/index.html>
+- LF Energy project page (project context and scope):
+  <https://lfenergy.org/projects/everest/>
+- EVerest GitHub org:
+  <https://github.com/EVerest>
+- EVerest demo repository (images, compose templates, scripts):
+  <https://github.com/EVerest/everest-demo>
 
