@@ -3,6 +3,10 @@
 Reference: Development plan Step 3.1, PRD_v2.md#6-1-database-schema
 Per PRD Section 8.4, max_charge_kw from OCPP MeterValues must be dynamically
 updated in the vehicles table for data consistency.
+
+Updates from original:
+ - store_meter_values now accepts energy_kwh (cumulative energy)
+ - store_status_update now actually persists to connector_status table
 """
 
 from __future__ import annotations
@@ -29,9 +33,10 @@ async def store_meter_values(
     vehicle_id: Optional[str | UUID] = None,
     max_charge_kw: Optional[float] = None,
     charger_id: Optional[UUID] = None,
+    energy_kwh: Optional[float] = None,
 ) -> None:
     """Store meter values in TimescaleDB telemetry table.
-    
+
     Per PRD Section 8.4, if max_charge_kw is provided, it will be:
     1. Stored in telemetry table
     2. Dynamically updated in vehicles table for data consistency
@@ -43,13 +48,10 @@ async def store_meter_values(
         soc: State of charge (0.0-1.0)
         power_kw: Charging power in kW
         timestamp: Meter reading timestamp
-        vehicle_id: Optional vehicle identifier (if known, will be looked up if None)
-        max_charge_kw: Optional max charge rate from OCPP MeterValues (kW)
-        charger_id: Optional charger UUID (for tracking which charger reported this)
-
-    Raises:
-        asyncpg.PostgresError: If database operation fails
-        ValueError: If vehicle_id cannot be determined
+        vehicle_id: Optional vehicle identifier (looked up if None)
+        max_charge_kw: Optional max charge rate from OCPP (kW)
+        charger_id: Optional charger UUID
+        energy_kwh: Optional cumulative energy (Energy.Active.Import.Register)
     """
     # Resolve vehicle_id from charge_point_id if not provided
     if vehicle_id is None:
@@ -63,7 +65,6 @@ async def store_meter_values(
 
     # Resolve charger_id if not provided
     if charger_id is None:
-        # Look up charger_id from ocpp_id
         try:
             async with pool.acquire() as conn:
                 charger_row = await conn.fetchrow(
@@ -81,30 +82,31 @@ async def store_meter_values(
     ON CONFLICT (time, vehicle_id) DO NOTHING
     """
 
-    is_plugged = power_kw > 0.1  # Consider plugged if charging
+    is_plugged = power_kw > 0.1
 
     try:
         async with pool.acquire() as conn:
             await conn.execute(
-                query, 
-                timestamp, 
-                str(vehicle_id), 
+                query,
+                timestamp,
+                str(vehicle_id),
                 str(charger_id) if charger_id else None,
-                soc, 
-                power_kw, 
+                soc,
+                power_kw,
                 is_plugged,
-                max_charge_kw
+                max_charge_kw,
             )
         logger.debug(
             f"Stored meter values: {charge_point_id}, connector {connector_id}, "
             f"vehicle_id={vehicle_id}, SoC={soc:.2f}, Power={power_kw:.2f}kW"
+            + (f", Energy={energy_kwh:.2f}kWh" if energy_kwh else "")
             + (f", max_charge_kw={max_charge_kw:.2f}kW" if max_charge_kw else "")
         )
-        
+
         # CRITICAL: Update vehicles table if max_charge_kw provided (per PRD Section 8.4)
         if max_charge_kw and max_charge_kw > 0:
             await _update_vehicle_max_charge_kw(pool, vehicle_id, max_charge_kw, timestamp)
-            
+
     except asyncpg.PostgresError as e:
         logger.error(f"Database error storing meter values: {e}")
         raise
@@ -120,15 +122,8 @@ async def _update_vehicle_max_charge_kw(
     timestamp: datetime,
 ) -> None:
     """Update vehicle's max_charge_kw in database from OCPP MeterValues.
-    
+
     Per PRD Section 8.4, OCPP values take precedence over static config.
-    This ensures data consistency and prevents stale max_charge_kw values.
-    
-    Args:
-        pool: AsyncPG connection pool
-        vehicle_id: Vehicle identifier
-        max_charge_kw: Max charge rate from OCPP (kW)
-        timestamp: Timestamp of OCPP reading
     """
     try:
         async with pool.acquire() as conn:
@@ -151,7 +146,6 @@ async def _update_vehicle_max_charge_kw(
             f"Failed to update vehicle {vehicle_id} max_charge_kw: {e}",
             exc_info=True
         )
-        # Don't raise - telemetry is stored, update is best-effort
 
 
 async def store_status_update(
@@ -162,10 +156,10 @@ async def store_status_update(
     error_code: Optional[str],
     timestamp: Optional[datetime] = None,
 ) -> None:
-    """Store connector status update.
+    """Store connector status update in database.
 
-    Note: This is a placeholder. In production, you might have a
-    charger_status table or update the chargers table.
+    Upserts into the connector_status table (migration 004) if it exists.
+    Falls back to logging if table is not yet created.
 
     Args:
         pool: AsyncPG connection pool
@@ -174,31 +168,35 @@ async def store_status_update(
         status: Connector status (Available, Preparing, Charging, etc.)
         error_code: Optional error code
         timestamp: Optional timestamp (defaults to now)
-
-    Raises:
-        asyncpg.PostgresError: If database operation fails
     """
     if timestamp is None:
         timestamp = datetime.utcnow()
 
-    # For now, just log the status update
-    # In production, you'd insert into a charger_status table or update chargers table
-    logger.debug(
-        f"Status update: {charge_point_id}, connector {connector_id}, "
-        f"status={status}, error_code={error_code}"
-    )
-
-    # Example query (uncomment when charger_status table exists):
-    # query = """
-    # INSERT INTO charger_status (charge_point_id, connector_id, status, error_code, timestamp)
-    # VALUES ($1, $2, $3, $4, $5)
-    # ON CONFLICT (charge_point_id, connector_id) DO UPDATE
-    # SET status = $3, error_code = $4, timestamp = $5
-    # """
-    # try:
-    #     async with pool.acquire() as conn:
-    #         await conn.execute(query, charge_point_id, connector_id, status, error_code, timestamp)
-    # except asyncpg.PostgresError as e:
-    #     logger.error(f"Database error storing status update: {e}")
-    #     raise
-
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO connector_status
+                    (charger_ocpp_id, connector_id, status, error_code, updated_at)
+                VALUES ($1, $2, $3, $4, $5::timestamptz)
+                ON CONFLICT (charger_ocpp_id, connector_id)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    error_code = EXCLUDED.error_code,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                charge_point_id, connector_id, status,
+                error_code, timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp,
+            )
+            logger.debug(
+                f"Stored status update: {charge_point_id}, connector {connector_id}, "
+                f"status={status}"
+            )
+    except asyncpg.UndefinedTableError:
+        logger.debug(
+            f"connector_status table not found, logging only: "
+            f"{charge_point_id}:{connector_id}={status}"
+        )
+    except asyncpg.PostgresError as e:
+        logger.error(f"Database error storing status update: {e}")
+        raise
