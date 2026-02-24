@@ -176,34 +176,45 @@ class SimulatedChargePoint(CP):
 
 
 async def run_charger(charger_id: str, server_url: str, response_delay: float = 0.0):
-    """Run a single simulated charger."""
-    async with websockets.connect(
-        f"{server_url}/{charger_id}",
-        subprotocols=["ocpp1.6"],
-    ) as ws:
-        cp = SimulatedChargePoint(charger_id, ws, response_delay)
-        
-        # Start message handler
-        handler_task = asyncio.create_task(cp.start())
-        
-        # Send boot notification
-        if not await cp.send_boot_notification():
-            logger.error(f"[{charger_id}] Boot rejected")
-            return
-        
-        # Send initial status
-        await cp.send_status_notification(ChargePointStatus.available)
-        
-        # Main loop: send periodic meter values and simulate charging
+    """Run a single simulated charger with reconnect logic."""
+    backoff = 2.0
+    max_backoff = 60.0
+
+    while True:
         try:
-            while True:
-                await asyncio.sleep(60)  # Every minute
-                await cp.send_meter_values()
-                await cp.simulate_charging()
+            async with websockets.connect(
+                f"{server_url}/{charger_id}",
+                subprotocols=["ocpp1.6"],
+            ) as ws:
+                backoff = 2.0  # Reset on successful connection
+                cp = SimulatedChargePoint(charger_id, ws, response_delay)
+
+                handler_task = asyncio.create_task(cp.start())
+
+                if not await cp.send_boot_notification():
+                    logger.error(f"[{charger_id}] Boot rejected")
+                    handler_task.cancel()
+                    return
+
+                await cp.send_status_notification(ChargePointStatus.available)
+
+                try:
+                    while True:
+                        await asyncio.sleep(60)  # Every minute
+                        await cp.send_meter_values()
+                        await cp.simulate_charging()
+                except asyncio.CancelledError:
+                    logger.info(f"[{charger_id}] Shutting down")
+                    raise
+                finally:
+                    handler_task.cancel()
+
         except asyncio.CancelledError:
-            logger.info(f"[{charger_id}] Shutting down")
-        finally:
-            handler_task.cancel()
+            return
+        except Exception as e:
+            logger.warning(f"[{charger_id}] Connection error: {e}. Retrying in {backoff:.0f}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
 
 
 async def main():
@@ -226,7 +237,7 @@ async def main():
     # Start all chargers
     tasks = []
     for i in range(1, num_chargers + 1):
-        charger_id = f"{charger_prefix}{i}"
+        charger_id = f"{charger_prefix}{i:02d}"
         task = asyncio.create_task(run_charger(charger_id, server_url, response_delay))
         tasks.append(task)
         await asyncio.sleep(0.5)  # Stagger connections
