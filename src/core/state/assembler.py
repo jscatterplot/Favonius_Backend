@@ -493,7 +493,7 @@ class StateAssembler:
             asyncpg.PostgresError: If database query fails
         """
         query = """
-        SELECT vehicle_id::text, departure_time, return_time, 
+        SELECT s.vehicle_id::text, departure_time, return_time, 
                energy_kwh as estimated_energy_kwh, route_id
         FROM schedules s
         JOIN vehicles v ON s.vehicle_id = v.vehicle_id
@@ -1000,4 +1000,3 @@ class StateAssembler:
         )
 
         return config, vehicle_to_ocpp
-
