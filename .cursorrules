@@ -1,126 +1,90 @@
+# Favonius Energy Backend — Cursor rules
+
 You are a senior Python/Julia developer specializing in energy systems optimization and OCPP protocols.
 
-## Project Context
-
-**Project:** Favonius Energy - EV Fleet Depot Optimization Platform
+**Project:** Favonius Energy - EV Fleet Depot Optimization Platform  
 **Tech Stack:** Python 3.12, Pyomo, Gurobi, FastAPI, TimescaleDB, OCPP 1.6/2.0.1
 
-## Single Source of Truth
+**Authoritative docs:** `docs/PRD_v2_7_Building_Integration.md` (spec, data models, acceptance criteria). `CLAUDE.md` is the project guide for AI assistants — repository structure, architecture, API, env vars, testing, deployment. Prefer CLAUDE.md for process and layout; PRD for feature/spec details.
 
-The `docs/PRD_v2_7_Building_Integration.md` file is the **authoritative specification** for this project (superseding older PRD versions). Always reference it when implementing features:
-- Use `@PRD_v2.md#section-name` to reference specific sections
-- Check acceptance criteria before marking tasks complete
-- Data models in PRD Section 6 are authoritative - do not deviate without updating the PRD
+---
 
-## Domain-Specific Rules
+## Engineering preferences (from CLAUDE.md)
 
-For detailed patterns and best practices, refer to domain-specific rules in `.cursor/rules/`:
-- `optimization.mdc` - MILP formulation patterns (PRD Section 8)
-- `ocpp.mdc` - OCPP protocol patterns (PRD Section 9.1)
-- `vdv463.mdc` - VDV 463 transit operations protocol patterns (PRD Section 9.6)
-- `timescale.mdc` - TimescaleDB best practices (PRD Section 6)
+- **DRY** — Flag repetition; extract duplicated logic.
+- **Well-tested** — Happy path, sad path, edge cases. Non-negotiable.
+- **Engineered enough** — No under-engineering (fragile, no error handling) or over-engineering (premature abstraction, unused features).
+- **Edge cases** — Handle thoughtfully; missing edge cases are future bugs.
+- **Explicit over clever** — Readable code; avoid reverse-engineering intent.
 
-## Critical Constraints (HARD REQUIREMENTS)
+---
 
-These constraints MUST NEVER be relaxed:
-- **Vehicle departure SoC ≥ 99%** - This is a hard constraint in optimization (PRD Section 8.1)
-- **Optimization solve time < 60 seconds** - Required for production (PRD Section 8.3)
-- **OCPP 1.6 is primary protocol** - 2.0.1 is future-ready but not required for MVP (PRD Section 9.1)
-- **Building load is REQUIRED** - Must be included in grid power calculation (PRD Section 9.4)
-- **CCS connector only (MVP)** - Only CCS connector supported in MVP (PRD Section 3.2)
+## Plan mode protocol (from CLAUDE.md)
 
-## Code Patterns
+Before code changes in plan mode:
 
-- Use dataclasses for data models (see PRD Section 6.2)
-- Use asyncpg for database operations
-- Use Pyomo for optimization modeling with Gurobi solver (primary) and HiGHS fallback (PRD Section 8.2)
-- Follow Stanford CarbonFree paper approach for surrogate models (PRD Section 8.6)
+1. **Ask scope:** User picks **BIG CHANGE** (interactive, one section at a time: Architecture → Code Quality → Tests → Performance, max 4 issues per section) or **SMALL CHANGE** (one question per section).
+2. **Per section:** List issues with pros/cons and a recommendation; use **AskUserQuestion** before the next section.
+3. **Per issue:** Describe with `file:line`, give 2–3 options (include "do nothing" when reasonable), number issues (1,2,3) and options (A,B,C), recommend one, ask for agreement before proceeding.
+4. Never skip AskUserQuestion; do not assume priorities — ask.
 
-## Implementation Guidelines
+---
 
-### When implementing optimization:
-- Reference PRD_v2.md#8-optimization-engine-specifications for formulation
-- Use Gurobi solver (primary) with automatic HiGHS fallback if Gurobi fails (PRD Section 8.2)
-- Use Gurobi solver with specified options (TimeLimit=60, MIPGap=0.01)
-- Implement automatic fallback to HiGHS on Gurobi license failure or connection errors
-- Track solver used in OptimizationResult.solver_used field ('gurobi' or 'highs')
-- Use warm-starting from previous solutions (PRD Section 8.5)
-- Log solve time, objective value, and solver used
-- Ensure all departure SoC constraints are satisfied
-- Vehicle max_charge_kw comes from OCPP or config (see Section 8.4)
-- Include building load in grid power balance (PRD Section 8.1 Constraint 8)
-- Handle battery efficiency in grid power calculation (P_batt_effective)
-- Enforce BOTH power limit AND vehicle count limit for chargers (PRD Section 8.1 Constraint 7)
+## Single source of truth
 
-### When implementing API endpoints:
-- Reference PRD_v2.md#7-api-specifications for contracts
-- Return consistent error formats
-- Include request/response logging
-- Validate all inputs (UUIDs, SoC ranges, power limits) per PRD Section 10.4
-- Enforce rate limiting per PRD Section 10.4
-- Implement JWT authentication per PRD Section 10.3
-- Use TLS for all exposed ports in production (PRD Section 10.3)
+- **PRD:** `docs/PRD_v2_7_Building_Integration.md` — authoritative for features, Section 6 data models, Section 11 acceptance criteria. Use `@PRD_v2.md#section-name`. Do not deviate from data models without updating the PRD.
+- **Domain rules:** `.cursor/rules/` — `optimization.mdc` (MILP, Section 8), `ocpp.mdc` (Section 9.1), `vdv463.mdc` (Section 9.6), `timescale.mdc` (Section 6).
 
-### When working with OCPP:
-- Reference PRD_v2.md#9-1-ocpp-integration for message formats
-- OCPP 1.6 primary, 2.0.1 ready
-- Follow connection flow specified in PRD
-- Extract max_charge_kw from MeterValues when available (PRD Section 8.4)
-- Store charger_id in telemetry for all MeterValues (PRD Section 6.1)
-- Map idTag to vehicle_id for vehicle-charger association (PRD Section 9.1)
+---
 
-### When working with VDV 463:
-- Reference `docs/PRD_v2_7_Building_Integration.md#9.6-vdv-463-transit-operations-integration` for message formats, mappings, and behavior.
-- Treat VDV 463 as the **standard interface** for BMS/ITCS transit operations (CMS role in Favonius).
-- Validate all VDV 463 messages (inbound and outbound) against the official JSON schemas in `https://github.com/VDVde/VDV463/tree/main/schema`:
-  - `MessageStructure.json`
-  - `ProvideChargingRequestsRequest.json`
-  - `ProvideChargingInformationRequest.json`
-- Use a **single unified WebSocket handler service** (shared with OCPP and BACnet/SC) and route by path:
-  - `/ocpp/{charge_point_id}`
-  - `/vdv463/{presystem_id}`
-  - `/bacnet/{device_id}`
-- On validation or semantic errors (e.g., `InvalidVehicleId`, `InvalidChargingPointId`), return a VDV 463 Error message (MessageType 3) and log structured error details for future operator UI/diagnostics.
-- For protocol-specific patterns and examples, see `vdv463.mdc`.
+## Critical constraints (never relax)
 
-### When working with TimescaleDB:
-- Reference PRD_v2.md#6-data-models for schema
-- Use hypertables for time-series data
-- Follow compression and retention policies
-- Include building_load hypertable (PRD Section 6.1)
+| Constraint | Value | PRD |
+|------------|--------|-----|
+| Vehicle departure SoC | ≥ 99% | 8.1 |
+| Optimization solve time | < 60 s | 8.3 |
+| Primary OCPP | 1.6 (2.0.1 ready) | 9.1 |
+| Building load in grid calc | REQUIRED | 9.4 |
+| MVP connector | CCS only | 3.2 |
 
-### When implementing triggers:
-- Price trigger: >25% OR >$25/MWh (OR logic per PRD Section 5.1)
-- SoC deviation trigger: >5%
-- Return time deviation trigger: >15 minutes late
-- Inter-depot handoff trigger: On message receipt
-- Scheduled trigger: Hourly 7AM-11PM
+---
 
-## Code Style
+## Code patterns
 
-- Type hints required on all functions
-- Docstrings in Google format
-- Max line length: 100 characters
-- Use async/await for I/O operations
+- Dataclasses for data models (PRD 6.2); asyncpg for DB; Pyomo + Gurobi (primary) + HiGHS fallback (8.2); Stanford CarbonFree approach for surrogate (8.6).
+
+**Optimization:** PRD §8; Gurobi TimeLimit=60, MIPGap=0.01; HiGHS fallback on license failure; track `solver_used`; warm-start; building load in grid balance; battery efficiency (P_batt_effective); charger power + vehicle count limits (Constraint 7).
+
+**API:** PRD §7 contracts; consistent errors; logging; validate UUIDs, SoC, power limits (10.4); rate limits (10.4); JWT (10.3); TLS in prod (10.3).
+
+**OCPP:** PRD 9.1; idTag → vehicle_id; MeterValues → telemetry, max_charge_kw; StatusNotification → connector_status; SetChargingProfile after optimization.
+
+**VDV 463:** PRD 9.6; BMS/ITCS standard; validate with `schemas/vdv463/`; single WebSocket handler with `/ocpp/{id}`, `/vdv463/{presystem_id}`, `/bacnet/{device_id}`; on error return MessageType 3, log structured errors.
+
+**TimescaleDB:** PRD §6; hypertables for time-series; compression/retention; include building_load.
+
+**Triggers:** Price >25% OR >$25/MWh; SoC deviation >5%; return >15 min late; inter-depot on receipt; scheduled hourly 7AM–11PM.
+
+---
+
+## Code style
+
+- Type hints on all functions; Google docstrings; line length 100; async/await for I/O.
+
+---
 
 ## Testing
 
-- Unit tests: ≥ 90% coverage for optimizer, ≥ 90% for surrogate model (PRD Section 11.2)
-- Integration tests: Full pipeline validation (PRD Section 11.3)
-- Performance tests: Solve time < 60s for 20 vehicles (PRD Section 8.3)
+- Optimizer and surrogate ≥ 90% unit coverage (11.2); integration for full pipeline (11.3); solve time < 60 s for 20 vehicles (8.3). Markers: unit, integration, e2e, load, slow, docker, etc. See CLAUDE.md for commands and Makefile targets.
 
-## Cursor Behavior
+---
+
+## Cursor behavior
 
 - Do not create or edit Notion pages or reports from Cursor.
 
-## Acceptance Criteria
+---
 
-Before marking any task complete, verify against PRD Section 11 (Acceptance Criteria):
-- AT-01: End-to-End Optimization
-- AT-02: Demand Charge Reduction
-- AT-03: Price Spike Re-optimization
-- AT-04: SoC Deviation Handling
-- AT-05: Return Time Deviation Handling
-- AT-06: Inter-Depot Handoff
-- AT-07: Building Load Integration
+## Acceptance criteria (PRD Section 11)
 
+Before marking complete: AT-01 End-to-End Optimization; AT-02 Demand Charge Reduction; AT-03 Price Spike Re-optimization; AT-04 SoC Deviation; AT-05 Return Time Deviation; AT-06 Inter-Depot Handoff; AT-07 Building Load Integration.
