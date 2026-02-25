@@ -1,7 +1,8 @@
 # Favonius Energy EV Fleet Depot Optimization Platform
 # Multi-stage Docker build
 #
-# Reference: PRD_v2.md Section 8.2 (Gurobi + HiGHS), Development Plan Phase 7
+# Reference: PRD_v2_7_Building_Integration.md Section 8.2 (Gurobi + HiGHS),
+#            favonius_development_plan_v3.md (Phase-aligned production deployment)
 #
 # Build: docker build -t favonius-api .
 # Run:   docker run -p 8000:8000 -p 9000:9000 favonius-api
@@ -27,14 +28,15 @@ RUN pip install --no-cache-dir uv
 # Create and set working directory
 WORKDIR /app
 
-# Copy dependency files
+# Copy dependency manifest
 COPY pyproject.toml ./
 
-# Create virtual environment and install dependencies using uv
-# Per PRD Section 8.2: Gurobi primary, HiGHS fallback
+# Create virtual environment and install runtime dependencies from pyproject
+# This keeps Docker installs aligned with the project dependency source of truth.
 RUN uv venv /app/.venv && \
     . /app/.venv/bin/activate && \
-    uv pip install --no-cache -r pyproject.toml
+    python -c "import tomllib, pathlib; print('\n'.join(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']))" > /tmp/requirements.runtime.txt && \
+    uv pip install --no-cache-dir -r /tmp/requirements.runtime.txt
 
 # ============ Runtime Stage ============
 FROM python:3.12-slim AS runtime
