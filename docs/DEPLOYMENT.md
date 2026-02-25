@@ -70,14 +70,14 @@ API service only: migrations run automatically before each deploy when `railway.
 
 Configure in Railway (or rely on `railway.json`): path `/health`, timeout 60 s. The API listens on `$PORT`.
 
-### Config as code (API only)
+### Config as code with two services from one repo
 
-`railway.json` in the repo root applies to the **API** service:
+When API and simulator/WebSocket services are deployed from the **same repo**, avoid service-specific commands in root `railway.json` (they can override dashboard settings on every deploy).
 
-- Build from `Dockerfile`
-- Start: `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT`
-- Pre-deploy: `python scripts/run_migrations.py`
-- Health: path `/health`, timeout 60 s
+- Keep `railway.json` minimal (schema only), **or** disable config-as-code on one service.
+- Set each service's Dockerfile, start command, pre-deploy command, and healthcheck in the Railway dashboard.
+- API should run: `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT` with `/health`.
+- Simulator/WebSocket service should run its own command and should not inherit API migration/health settings.
 
 ### Trial deployment checklist
 
