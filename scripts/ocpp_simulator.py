@@ -24,6 +24,7 @@ from ocpp.v16.enums import (
     ChargingProfileStatus,
     RemoteStartStopStatus,
 )
+from ocpp.routing import on
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ class SimulatedChargePoint(CP):
         await self.call(request)
         logger.debug(f"[{self.id}] MeterValues sent: SoC={self.current_soc:.2f}, Power={self.current_power}")
 
-    @CP.on(Action.set_charging_profile)
+    @on(Action.set_charging_profile)
     async def on_set_charging_profile(self, connector_id, cs_charging_profiles):
         """Handle SetChargingProfile from server."""
         if self.response_delay > 0:
@@ -109,7 +110,7 @@ class SimulatedChargePoint(CP):
             status=ChargingProfileStatus.accepted
         )
 
-    @CP.on(Action.remote_start_transaction)
+    @on(Action.remote_start_transaction)
     async def on_remote_start(self, id_tag, connector_id=1, charging_profile=None):
         """Handle RemoteStartTransaction from server."""
         if self.response_delay > 0:
@@ -130,7 +131,7 @@ class SimulatedChargePoint(CP):
             status=RemoteStartStopStatus.accepted
         )
 
-    @CP.on(Action.remote_stop_transaction)
+    @on(Action.remote_stop_transaction)
     async def on_remote_stop(self, transaction_id):
         """Handle RemoteStopTransaction from server."""
         if self.response_delay > 0:
