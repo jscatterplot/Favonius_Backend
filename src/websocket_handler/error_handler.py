@@ -4,26 +4,37 @@ from typing import Optional
 
 from .enhanced_error_handler import (
     CircuitBreakerConfig,
-    CircuitBreakerOpenError,
-    CircuitBreakerState,
+    EnhancedCircuitBreaker,
+    EnhancedRetryManager,
+)
+from .enhanced_error_handler import ErrorHandler as _EnhancedErrorHandler
+from .enhanced_error_handler import (
     RetryConfig,
 )
-from .enhanced_error_handler import EnhancedCircuitBreaker
-from .enhanced_error_handler import EnhancedRetryManager
-from .enhanced_error_handler import ErrorHandler as _EnhancedErrorHandler
 
 
 class CircuitBreaker:
     """Backward-compat wrapper: CircuitBreaker(name, failure_threshold=..., recovery_timeout=...)."""
 
-    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 60.0, _impl=None, **kwargs):
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 60.0,
+        _impl=None,
+        **kwargs,
+    ):
         if _impl is not None:
             self._impl = _impl
         else:
             config = CircuitBreakerConfig(
                 failure_threshold=failure_threshold,
                 recovery_timeout=recovery_timeout,
-                **{k: v for k, v in kwargs.items() if k in ("half_open_max_calls", "expected_exceptions")},
+                **{
+                    k: v
+                    for k, v in kwargs.items()
+                    if k in ("half_open_max_calls", "expected_exceptions")
+                },
             )
             self._impl = EnhancedCircuitBreaker(name, config)
 
@@ -55,6 +66,7 @@ class CircuitBreaker:
     def last_failure_time(self, value):
         if isinstance(value, (int, float)):
             from datetime import datetime, timezone
+
             value = datetime.fromtimestamp(value, tz=timezone.utc)
         self._impl.last_failure_time = value
 
@@ -107,7 +119,9 @@ class _RetryManagerCompat:
 class RetryManager:
     """Backward-compat retry manager wrapper."""
 
-    def __init__(self, timescale_client: Optional[object] = None, config: Optional[RetryConfig] = None):
+    def __init__(
+        self, timescale_client: Optional[object] = None, config: Optional[RetryConfig] = None
+    ):
         self._client = timescale_client
         self._impl = EnhancedRetryManager(config)
 

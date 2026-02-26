@@ -2,12 +2,12 @@
 
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Any, Dict, List, Optional
 
-from ocpp.v201.enums import GenericDeviceModelStatusEnumType, GenericStatusEnumType
-from ocpp.v201.datatypes import StatusInfoType, MonitoringDataType, ComponentType, VariableType
+from ocpp.v201.datatypes import ComponentType, MonitoringDataType, StatusInfoType, VariableType
+from ocpp.v201.enums import GenericDeviceModelStatusEnumType
 
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
@@ -15,6 +15,7 @@ from .timescale_client import TimescaleClient
 
 class MonitoringCriterion(Enum):
     """Monitoring criteria types."""
+
     THRESHOLD_MONITORING = "ThresholdMonitoring"
     DELTA_MONITORING = "DeltaMonitoring"
     PERIODIC_MONITORING = "PeriodicMonitoring"
@@ -22,6 +23,7 @@ class MonitoringCriterion(Enum):
 
 class AlertSeverity(Enum):
     """Alert severity levels."""
+
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -37,10 +39,15 @@ class MonitoringManager:
         self.logger = get_logger(__name__)
         self.monitoring_tasks: Dict[str, asyncio.Task] = {}  # station_id -> monitoring_task
 
-    async def get_monitoring_report(self, station_id: str, request_id: int,
-                                  monitoring_base: str, monitoring_criterion: Optional[str] = None,
-                                  component_name: Optional[str] = None,
-                                  variable_name: Optional[str] = None) -> Dict[str, Any]:
+    async def get_monitoring_report(
+        self,
+        station_id: str,
+        request_id: int,
+        monitoring_base: str,
+        monitoring_criterion: Optional[str] = None,
+        component_name: Optional[str] = None,
+        variable_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Handle GetMonitoringReport request."""
         self.logger.info(f"GetMonitoringReport for {station_id}, request_id: {request_id}")
 
@@ -53,43 +60,51 @@ class MonitoringManager:
                 "monitoring_criterion": monitoring_criterion,
                 "component_name": component_name,
                 "variable_name": variable_name,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
             }
             await self.timescale_client.store_monitoring_report(report_data)
 
             # Get monitoring data based on criteria
             monitoring_data = await self._get_monitoring_data(
-                station_id, monitoring_base, monitoring_criterion,
-                component_name, variable_name
+                station_id, monitoring_base, monitoring_criterion, component_name, variable_name
             )
 
             return {
                 "status": GenericDeviceModelStatusEnumType.accepted,
-                "monitoringData": monitoring_data
+                "monitoringData": monitoring_data,
             }
 
         except Exception as e:
             self.logger.error(f"Error getting monitoring report: {e}")
             return {
                 "status": GenericDeviceModelStatusEnumType.rejected,
-                "statusInfo": StatusInfoType(reason_code="InternalError", additional_info=str(e))
+                "statusInfo": StatusInfoType(reason_code="InternalError", additional_info=str(e)),
             }
 
-    async def set_variable_monitoring(self, station_id: str, component_name: str,
-                                    variable_name: str, monitoring_criterion: str,
-                                    threshold: Optional[float] = None) -> Dict[str, Any]:
+    async def set_variable_monitoring(
+        self,
+        station_id: str,
+        component_name: str,
+        variable_name: str,
+        monitoring_criterion: str,
+        threshold: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Set variable monitoring configuration."""
-        self.logger.info(f"SetVariableMonitoring for {station_id}: {component_name}.{variable_name}")
+        self.logger.info(
+            f"SetVariableMonitoring for {station_id}: {component_name}.{variable_name}"
+        )
 
         try:
             # Validate monitoring criterion
             try:
-                criterion = MonitoringCriterion(monitoring_criterion)
+                MonitoringCriterion(monitoring_criterion)
             except ValueError:
                 return {
                     "status": GenericDeviceModelStatusEnumType.rejected,
-                    "statusInfo": StatusInfoType(reason_code="InvalidCriterion", 
-                                               additional_info=f"Unknown monitoring criterion: {monitoring_criterion}")
+                    "statusInfo": StatusInfoType(
+                        reason_code="InvalidCriterion",
+                        additional_info=f"Unknown monitoring criterion: {monitoring_criterion}",
+                    ),
                 }
 
             # Store monitoring configuration
@@ -100,7 +115,7 @@ class MonitoringManager:
                 "monitoring_criterion": monitoring_criterion,
                 "threshold": threshold,
                 "enabled": True,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
             }
             await self.timescale_client.store_variable_monitoring(monitoring_data)
 
@@ -113,13 +128,16 @@ class MonitoringManager:
             self.logger.error(f"Error setting variable monitoring: {e}")
             return {
                 "status": GenericDeviceModelStatusEnumType.rejected,
-                "statusInfo": StatusInfoType(reason_code="InternalError", additional_info=str(e))
+                "statusInfo": StatusInfoType(reason_code="InternalError", additional_info=str(e)),
             }
 
-    async def clear_variable_monitoring(self, station_id: str, component_name: str,
-                                      variable_name: str, monitoring_criterion: str) -> Dict[str, Any]:
+    async def clear_variable_monitoring(
+        self, station_id: str, component_name: str, variable_name: str, monitoring_criterion: str
+    ) -> Dict[str, Any]:
         """Clear variable monitoring configuration."""
-        self.logger.info(f"ClearVariableMonitoring for {station_id}: {component_name}.{variable_name}")
+        self.logger.info(
+            f"ClearVariableMonitoring for {station_id}: {component_name}.{variable_name}"
+        )
 
         try:
             # Disable monitoring configuration
@@ -129,7 +147,7 @@ class MonitoringManager:
                 "variable_name": variable_name,
                 "monitoring_criterion": monitoring_criterion,
                 "enabled": False,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
             }
             await self.timescale_client.store_variable_monitoring(monitoring_data)
 
@@ -139,13 +157,18 @@ class MonitoringManager:
             self.logger.error(f"Error clearing variable monitoring: {e}")
             return {
                 "status": GenericDeviceModelStatusEnumType.rejected,
-                "statusInfo": StatusInfoType(reason_code="InternalError", additional_info=str(e))
+                "statusInfo": StatusInfoType(reason_code="InternalError", additional_info=str(e)),
             }
 
-    async def notify_monitoring_report(self, station_id: str, request_id: int,
-                                     monitoring_base: str, monitoring_criterion: Optional[str] = None,
-                                     component_name: Optional[str] = None,
-                                     variable_name: Optional[str] = None) -> None:
+    async def notify_monitoring_report(
+        self,
+        station_id: str,
+        request_id: int,
+        monitoring_base: str,
+        monitoring_criterion: Optional[str] = None,
+        component_name: Optional[str] = None,
+        variable_name: Optional[str] = None,
+    ) -> None:
         """Handle NotifyMonitoringReport notification."""
         self.logger.info(f"NotifyMonitoringReport from {station_id}, request_id: {request_id}")
 
@@ -158,18 +181,25 @@ class MonitoringManager:
                 "monitoring_criterion": monitoring_criterion,
                 "component_name": component_name,
                 "variable_name": variable_name,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
             }
             await self.timescale_client.store_notified_monitoring_report(report_data)
 
         except Exception as e:
             self.logger.error(f"Error storing notified monitoring report: {e}")
 
-    async def create_alert_rule(self, station_id: str, component_name: str, variable_name: str,
-                              monitoring_criterion: str, threshold: float, severity: str = "medium") -> str:
+    async def create_alert_rule(
+        self,
+        station_id: str,
+        component_name: str,
+        variable_name: str,
+        monitoring_criterion: str,
+        threshold: float,
+        severity: str = "medium",
+    ) -> str:
         """Create an alert rule."""
         rule_id = str(uuid.uuid4())
-        
+
         rule_data = {
             "rule_id": rule_id,
             "station_id": station_id,
@@ -179,20 +209,29 @@ class MonitoringManager:
             "threshold": threshold,
             "severity": severity,
             "enabled": True,
-            "created_at": datetime.now(timezone.utc)
+            "created_at": datetime.now(timezone.utc),
         }
-        
+
         await self.timescale_client.store_alert_rule(rule_data)
-        self.logger.info(f"Created alert rule {rule_id} for {station_id}: {component_name}.{variable_name}")
-        
+        self.logger.info(
+            f"Created alert rule {rule_id} for {station_id}: {component_name}.{variable_name}"
+        )
+
         return rule_id
 
-    async def trigger_alert(self, station_id: str, rule_id: str, component_name: str,
-                          variable_name: str, current_value: float, threshold: float,
-                          severity: str) -> str:
+    async def trigger_alert(
+        self,
+        station_id: str,
+        rule_id: str,
+        component_name: str,
+        variable_name: str,
+        current_value: float,
+        threshold: float,
+        severity: str,
+    ) -> str:
         """Trigger an alert."""
         alert_id = str(uuid.uuid4())
-        
+
         alert_data = {
             "alert_id": alert_id,
             "station_id": station_id,
@@ -203,18 +242,24 @@ class MonitoringManager:
             "threshold": threshold,
             "severity": severity,
             "status": "active",
-            "triggered_at": datetime.now(timezone.utc)
+            "triggered_at": datetime.now(timezone.utc),
         }
-        
+
         await self.timescale_client.store_alert(alert_data)
-        self.logger.warning(f"Triggered alert {alert_id} for {station_id}: {component_name}.{variable_name} = {current_value}")
-        
+        self.logger.warning(
+            f"Triggered alert {alert_id} for {station_id}: {component_name}.{variable_name} = {current_value}"
+        )
+
         return alert_id
 
-    async def _get_monitoring_data(self, station_id: str, monitoring_base: str,
-                                 monitoring_criterion: Optional[str],
-                                 component_name: Optional[str],
-                                 variable_name: Optional[str]) -> List[MonitoringDataType]:
+    async def _get_monitoring_data(
+        self,
+        station_id: str,
+        monitoring_base: str,
+        monitoring_criterion: Optional[str],
+        component_name: Optional[str],
+        variable_name: Optional[str],
+    ) -> List[MonitoringDataType]:
         """Get monitoring data based on criteria."""
         monitoring_data = []
 
@@ -225,20 +270,24 @@ class MonitoringManager:
                     station_id, component_name, variable_name
                 )
                 for var in variables:
-                    monitoring_data.append(MonitoringDataType(
-                        component=ComponentType(name=var["component_name"]),
-                        variable=VariableType(name=var["variable_name"]),
-                        variable_monitoring=[]
-                    ))
+                    monitoring_data.append(
+                        MonitoringDataType(
+                            component=ComponentType(name=var["component_name"]),
+                            variable=VariableType(name=var["variable_name"]),
+                            variable_monitoring=[],
+                        )
+                    )
             else:
                 # Get all configuration data
                 variables = await self.timescale_client.get_all_device_variables(station_id)
                 for var in variables:
-                    monitoring_data.append(MonitoringDataType(
-                        component=ComponentType(name=var["component_name"]),
-                        variable=VariableType(name=var["variable_name"]),
-                        variable_monitoring=[]
-                    ))
+                    monitoring_data.append(
+                        MonitoringDataType(
+                            component=ComponentType(name=var["component_name"]),
+                            variable=VariableType(name=var["variable_name"]),
+                            variable_monitoring=[],
+                        )
+                    )
 
         elif monitoring_base == "Operational":
             # Get operational data (meter values, status, etc.)
@@ -260,8 +309,9 @@ class MonitoringManager:
 
         return monitoring_data
 
-    async def _get_operational_data(self, station_id: str, component_name: str,
-                                  variable_name: str) -> List[MonitoringDataType]:
+    async def _get_operational_data(
+        self, station_id: str, component_name: str, variable_name: str
+    ) -> List[MonitoringDataType]:
         """Get operational data for specific component/variable."""
         # This would typically query meter values, status data, etc.
         # For now, return empty list
@@ -301,10 +351,10 @@ class MonitoringManager:
         try:
             # Get alert rules for station
             rules = await self.timescale_client.get_alert_rules(station_id)
-            
+
             for rule in rules:
                 await self._check_rule(station_id, rule)
-                
+
         except Exception as e:
             self.logger.error(f"Error checking monitoring rules for {station_id}: {e}")
 
@@ -322,24 +372,26 @@ class MonitoringManager:
             variables = await self.timescale_client.get_device_variables(
                 station_id, component_name, variable_name
             )
-            
+
             if not variables:
                 return
 
             current_value = float(variables[0]["actual_value"])
-            
+
             # Check if alert should be triggered
             should_trigger = False
-            
+
             if monitoring_criterion == "ThresholdMonitoring":
                 if current_value > threshold:
                     should_trigger = True
             elif monitoring_criterion == "DeltaMonitoring":
                 # Get previous value (simplified - would need proper delta calculation)
                 previous_data = await self.timescale_client.get_periodic_monitoring_data(
-                    station_id, component_name, variable_name,
+                    station_id,
+                    component_name,
+                    variable_name,
                     datetime.now(timezone.utc) - timedelta(minutes=5),
-                    datetime.now(timezone.utc)
+                    datetime.now(timezone.utc),
                 )
                 if previous_data:
                     previous_value = float(previous_data[0]["value"])
@@ -354,11 +406,16 @@ class MonitoringManager:
                     alert["rule_id"] == rule_id and alert["status"] == "active"
                     for alert in active_alerts
                 )
-                
+
                 if not existing_alert:
                     await self.trigger_alert(
-                        station_id, rule_id, component_name, variable_name,
-                        current_value, threshold, severity
+                        station_id,
+                        rule_id,
+                        component_name,
+                        variable_name,
+                        current_value,
+                        threshold,
+                        severity,
                     )
 
         except Exception as e:

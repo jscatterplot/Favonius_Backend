@@ -5,12 +5,11 @@ Coverage target: ≥ 90%
 """
 
 import asyncio
-
-import pytest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
+import pytest
 
 from src.core.state.triggers import TriggerConfig, TriggerMonitor
 
@@ -76,7 +75,7 @@ class TestTriggerMonitorInitialization:
 
     def test_init_trigger_cooldown_from_config(self):
         """Test TriggerMonitor uses config.trigger_cooldown_minutes (not hardcoded).
-        
+
         Per PRD alignment fix, cooldown should come from config, not be hardcoded.
         """
         config = TriggerConfig(trigger_cooldown_minutes=10)
@@ -85,9 +84,9 @@ class TestTriggerMonitorInitialization:
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         # Cooldown should be calculated from config (10 minutes * 60 = 600 seconds)
-        assert monitor._trigger_cooldown_sec == 600.0, (
-            "Cooldown should be calculated from config.trigger_cooldown_minutes"
-        )
+        assert (
+            monitor._trigger_cooldown_sec == 600.0
+        ), "Cooldown should be calculated from config.trigger_cooldown_minutes"
 
     def test_init_trigger_cooldown_default(self):
         """Test TriggerMonitor uses default cooldown when not specified."""
@@ -97,9 +96,9 @@ class TestTriggerMonitorInitialization:
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         # Default is 5 minutes = 300 seconds
-        assert monitor._trigger_cooldown_sec == 300.0, (
-            "Default cooldown should be 5 minutes = 300 seconds"
-        )
+        assert (
+            monitor._trigger_cooldown_sec == 300.0
+        ), "Default cooldown should be 5 minutes = 300 seconds"
 
     def test_init_trigger_cooldown_custom(self):
         """Test TriggerMonitor with custom cooldown value."""
@@ -108,9 +107,9 @@ class TestTriggerMonitorInitialization:
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
-        assert monitor._trigger_cooldown_sec == 420.0, (
-            "Custom cooldown should be 7 minutes = 420 seconds"
-        )
+        assert (
+            monitor._trigger_cooldown_sec == 420.0
+        ), "Custom cooldown should be 7 minutes = 420 seconds"
 
     def test_init_raises_error_when_no_state_source(self):
         """Test initialization raises error when no state source provided."""
@@ -139,10 +138,10 @@ class TestUpdateExpectedState:
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
-        expected_socs = {'bus_1': 0.60, 'bus_2': 0.70}
+        expected_socs = {"bus_1": 0.60, "bus_2": 0.70}
         expected_return_times = {
-            'bus_1': datetime.utcnow() + timedelta(hours=2),
-            'bus_2': datetime.utcnow() + timedelta(hours=4),
+            "bus_1": datetime.utcnow() + timedelta(hours=2),
+            "bus_2": datetime.utcnow() + timedelta(hours=4),
         }
 
         monitor.update_expected_state(expected_socs, expected_return_times)
@@ -207,15 +206,15 @@ class TestCheckSocDeviation:
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
-        monitor.update_expected_state({'bus_1': 0.60}, {})
+        monitor.update_expected_state({"bus_1": 0.60}, {})
 
-        current_socs = {'bus_1': 0.52}  # 8% deviation
+        current_socs = {"bus_1": 0.52}  # 8% deviation
 
         result = await monitor.check_soc_deviation(current_socs)
 
         assert result is not None
-        assert 'bus_1' in result
-        assert 'deviation' in result.lower()
+        assert "bus_1" in result
+        assert "deviation" in result.lower()
 
     @pytest.mark.asyncio
     async def test_soc_deviation_below_threshold(self):
@@ -225,9 +224,9 @@ class TestCheckSocDeviation:
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
-        monitor.update_expected_state({'bus_1': 0.60}, {})
+        monitor.update_expected_state({"bus_1": 0.60}, {})
 
-        current_socs = {'bus_1': 0.58}  # 2% deviation (below threshold)
+        current_socs = {"bus_1": 0.58}  # 2% deviation (below threshold)
 
         result = await monitor.check_soc_deviation(current_socs)
 
@@ -240,9 +239,9 @@ class TestCheckSocDeviation:
         callback = AsyncMock()
         monitor = TriggerMonitor(config, callback, assembler=MagicMock())
 
-        monitor.update_expected_state({'bus_1': 0.60}, {})
+        monitor.update_expected_state({"bus_1": 0.60}, {})
 
-        current_socs = {'bus_1': 0.55}  # Exactly 5% deviation
+        current_socs = {"bus_1": 0.55}  # Exactly 5% deviation
 
         result = await monitor.check_soc_deviation(current_socs)
 
@@ -256,7 +255,7 @@ class TestCheckSocDeviation:
         callback = AsyncMock()
         monitor = TriggerMonitor(config, callback, assembler=MagicMock())
 
-        current_socs = {'bus_1': 0.50}
+        current_socs = {"bus_1": 0.50}
 
         result = await monitor.check_soc_deviation(current_socs)
 
@@ -269,20 +268,18 @@ class TestCheckSocDeviation:
         callback = AsyncMock()
         monitor = TriggerMonitor(config, callback, assembler=MagicMock())
 
-        monitor.update_expected_state(
-            {'bus_1': 0.60, 'bus_2': 0.70, 'bus_3': 0.80}, {}
-        )
+        monitor.update_expected_state({"bus_1": 0.60, "bus_2": 0.70, "bus_3": 0.80}, {})
 
         current_socs = {
-            'bus_1': 0.58,  # No deviation
-            'bus_2': 0.62,  # 8% deviation - should trigger
-            'bus_3': 0.79,  # No deviation
+            "bus_1": 0.58,  # No deviation
+            "bus_2": 0.62,  # 8% deviation - should trigger
+            "bus_3": 0.79,  # No deviation
         }
 
         result = await monitor.check_soc_deviation(current_socs)
 
         assert result is not None
-        assert 'bus_2' in result
+        assert "bus_2" in result
 
 
 class TestCheckPriceChange:
@@ -308,12 +305,12 @@ class TestCheckPriceChange:
         result = await monitor.check_price_change(current_prices)
 
         assert result is not None
-        assert 'Price change' in result
+        assert "Price change" in result
 
     @pytest.mark.asyncio
     async def test_price_change_percent_only(self):
         """Test price change triggers when ONLY percent threshold met (OR logic).
-        
+
         Per PRD Section 5.3, price trigger uses OR logic: >25% OR >$25/MWh.
         This test verifies that percent threshold alone triggers.
         """
@@ -336,13 +333,15 @@ class TestCheckPriceChange:
 
         result = await monitor.check_price_change(current_prices)
 
-        assert result is not None, "Price trigger should fire with OR logic when percent threshold met"
-        assert 'Price change' in result
+        assert (
+            result is not None
+        ), "Price trigger should fire with OR logic when percent threshold met"
+        assert "Price change" in result
 
     @pytest.mark.asyncio
     async def test_price_change_absolute_only(self):
         """Test price change triggers when ONLY absolute threshold met (OR logic).
-        
+
         Per PRD Section 5.3, price trigger uses OR logic: >25% OR >$25/MWh.
         This test verifies that absolute threshold alone triggers.
         """
@@ -357,7 +356,7 @@ class TestCheckPriceChange:
         # Use higher base price to get absolute-only scenario
         last_prices = {base_time: 0.50}  # $0.50/kWh = $500/MWh
         monitor.update_prices(last_prices)
-        
+
         # $0.50 -> $0.53 = $30/MWh change, 6% change (< 25%)
         # With OR logic, should trigger because $30/MWh > $25/MWh
         current_prices = {base_time: 0.53}  # $0.53/kWh = $530/MWh
@@ -366,8 +365,10 @@ class TestCheckPriceChange:
 
         result = await monitor.check_price_change(current_prices)
 
-        assert result is not None, "Price trigger should fire with OR logic when absolute threshold met"
-        assert 'Price change' in result
+        assert (
+            result is not None
+        ), "Price trigger should fire with OR logic when absolute threshold met"
+        assert "Price change" in result
 
     @pytest.mark.asyncio
     async def test_price_change_neither_threshold(self):
@@ -432,7 +433,7 @@ class TestCheckPriceChange:
         result = await monitor.check_price_change(current_prices)
 
         assert result is not None
-        assert 'Price change' in result
+        assert "Price change" in result
 
     @pytest.mark.asyncio
     async def test_price_change_exactly_at_thresholds(self):
@@ -564,7 +565,7 @@ class TestCheckPriceChange:
         result = await monitor.check_price_change(current_prices)
 
         assert result is not None
-        assert str(base_time + timedelta(hours=1)) in result or 'Price change' in result
+        assert str(base_time + timedelta(hours=1)) in result or "Price change" in result
 
 
 class TestCheckReturnTimeDeviation:
@@ -579,17 +580,15 @@ class TestCheckReturnTimeDeviation:
 
         base_time = datetime.utcnow()
         expected_return = base_time + timedelta(hours=2)
-        monitor.update_expected_state({}, {'bus_1': expected_return})
+        monitor.update_expected_state({}, {"bus_1": expected_return})
 
-        actual_return_times = {
-            'bus_1': expected_return + timedelta(minutes=20)  # 20 min delay
-        }
+        actual_return_times = {"bus_1": expected_return + timedelta(minutes=20)}  # 20 min delay
 
         result = await monitor.check_return_time_deviation(actual_return_times)
 
         assert result is not None
-        assert 'bus_1' in result
-        assert 'Return delay' in result or 'delay' in result.lower()
+        assert "bus_1" in result
+        assert "Return delay" in result or "delay" in result.lower()
 
     @pytest.mark.asyncio
     async def test_return_time_deviation_below_threshold(self):
@@ -600,11 +599,9 @@ class TestCheckReturnTimeDeviation:
 
         base_time = datetime.utcnow()
         expected_return = base_time + timedelta(hours=2)
-        monitor.update_expected_state({}, {'bus_1': expected_return})
+        monitor.update_expected_state({}, {"bus_1": expected_return})
 
-        actual_return_times = {
-            'bus_1': expected_return + timedelta(minutes=10)  # 10 min delay
-        }
+        actual_return_times = {"bus_1": expected_return + timedelta(minutes=10)}  # 10 min delay
 
         result = await monitor.check_return_time_deviation(actual_return_times)
 
@@ -619,11 +616,9 @@ class TestCheckReturnTimeDeviation:
 
         base_time = datetime.utcnow()
         expected_return = base_time + timedelta(hours=2)
-        monitor.update_expected_state({}, {'bus_1': expected_return})
+        monitor.update_expected_state({}, {"bus_1": expected_return})
 
-        actual_return_times = {
-            'bus_1': expected_return + timedelta(minutes=15)  # Exactly 15 min
-        }
+        actual_return_times = {"bus_1": expected_return + timedelta(minutes=15)}  # Exactly 15 min
 
         result = await monitor.check_return_time_deviation(actual_return_times)
 
@@ -640,11 +635,9 @@ class TestCheckReturnTimeDeviation:
 
         base_time = datetime.utcnow()
         expected_return = base_time + timedelta(hours=2)
-        monitor.update_expected_state({}, {'bus_1': expected_return})
+        monitor.update_expected_state({}, {"bus_1": expected_return})
 
-        actual_return_times = {
-            'bus_1': expected_return - timedelta(minutes=10)  # 10 min early
-        }
+        actual_return_times = {"bus_1": expected_return - timedelta(minutes=10)}  # 10 min early
 
         result = await monitor.check_return_time_deviation(actual_return_times)
 
@@ -658,7 +651,7 @@ class TestCheckReturnTimeDeviation:
         monitor = TriggerMonitor(config, callback, assembler=MagicMock())
 
         base_time = datetime.utcnow()
-        actual_return_times = {'bus_1': base_time}
+        actual_return_times = {"bus_1": base_time}
 
         result = await monitor.check_return_time_deviation(actual_return_times)
 
@@ -675,20 +668,20 @@ class TestCheckReturnTimeDeviation:
         monitor.update_expected_state(
             {},
             {
-                'bus_1': base_time + timedelta(hours=2),
-                'bus_2': base_time + timedelta(hours=4),
-            }
+                "bus_1": base_time + timedelta(hours=2),
+                "bus_2": base_time + timedelta(hours=4),
+            },
         )
 
         actual_return_times = {
-            'bus_1': base_time + timedelta(hours=2, minutes=10),  # No delay
-            'bus_2': base_time + timedelta(hours=4, minutes=20),  # 20 min delay
+            "bus_1": base_time + timedelta(hours=2, minutes=10),  # No delay
+            "bus_2": base_time + timedelta(hours=4, minutes=20),  # 20 min delay
         }
 
         result = await monitor.check_return_time_deviation(actual_return_times)
 
         assert result is not None
-        assert 'bus_2' in result
+        assert "bus_2" in result
 
 
 class TestStateFetching:
@@ -700,12 +693,12 @@ class TestStateFetching:
         config = TriggerConfig()
         callback = AsyncMock()
         assembler = MagicMock()
-        assembler._get_vehicle_socs = AsyncMock(return_value={'bus_1': 0.65})
+        assembler._get_vehicle_socs = AsyncMock(return_value={"bus_1": 0.65})
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         socs = await monitor._get_current_vehicle_socs()
 
-        assert socs == {'bus_1': 0.65}
+        assert socs == {"bus_1": 0.65}
         assembler._get_vehicle_socs.assert_called_once()
 
     @pytest.mark.asyncio
@@ -717,16 +710,13 @@ class TestStateFetching:
         mock_conn = AsyncMock()
         pool.acquire.return_value.__aenter__.return_value = mock_conn
         mock_row = MagicMock()
-        mock_row.__getitem__.side_effect = lambda k: {
-            'vehicle_id': 'bus_1',
-            'soc': 0.65
-        }[k]
+        mock_row.__getitem__.side_effect = lambda k: {"vehicle_id": "bus_1", "soc": 0.65}[k]
         mock_conn.fetch.return_value = [mock_row]
 
         monitor = TriggerMonitor(config, callback, pool=pool, depot_id="test")
         socs = await monitor._get_current_vehicle_socs()
 
-        assert socs == {'bus_1': 0.65}
+        assert socs == {"bus_1": 0.65}
 
     @pytest.mark.asyncio
     async def test_get_current_prices_with_assembler(self):
@@ -737,7 +727,7 @@ class TestStateFetching:
         assembler.config = MagicMock()
         assembler.config.delta_t = 0.25
         assembler.get_current_state = AsyncMock()
-        
+
         # Mock DepotState
         mock_state = MagicMock()
         mock_state.prices = [0.10, 0.15, 0.20] * 8  # 24 prices
@@ -757,20 +747,20 @@ class TestStateFetching:
         pool = MagicMock(spec=asyncpg.Pool)
         mock_conn = AsyncMock()
         pool.acquire.return_value.__aenter__.return_value = mock_conn
-        
+
         base_time = datetime.utcnow()
         mock_row = MagicMock()
         mock_row.__getitem__.side_effect = lambda k: {
-            'vehicle_id': 'bus_1',
-            'return_time': base_time
+            "vehicle_id": "bus_1",
+            "return_time": base_time,
         }[k]
         mock_conn.fetch.return_value = [mock_row]
 
         monitor = TriggerMonitor(config, callback, pool=pool, depot_id="test")
         returns = await monitor._get_actual_return_times()
 
-        assert 'bus_1' in returns
-        assert returns['bus_1'] == base_time
+        assert "bus_1" in returns
+        assert returns["bus_1"] == base_time
 
 
 class TestTriggerMonitorMonitoringLoop:
@@ -782,12 +772,10 @@ class TestTriggerMonitorMonitoringLoop:
         config = TriggerConfig()
         callback = AsyncMock()
         assembler = MagicMock()
-        
+
         # Mock state fetching
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        monitor._get_current_vehicle_socs = AsyncMock(
-            return_value={'bus_1': 0.50}  # Current SoC
-        )
+        monitor._get_current_vehicle_socs = AsyncMock(return_value={"bus_1": 0.50})  # Current SoC
         monitor._get_current_prices = AsyncMock(return_value={})
         monitor._get_actual_return_times = AsyncMock(return_value={})
         monitor.check_soc_deviation = AsyncMock(
@@ -795,16 +783,16 @@ class TestTriggerMonitorMonitoringLoop:
         )
         monitor.check_price_change = AsyncMock(return_value=None)
         monitor.check_return_time_deviation = AsyncMock(return_value=None)
-        
+
         # Set expected state
-        monitor.expected_socs = {'bus_1': 0.60}
+        monitor.expected_socs = {"bus_1": 0.60}
 
         # Run for one iteration
         monitor._running = True
         task = asyncio.create_task(monitor.run())
         await asyncio.sleep(0.1)  # Let it run briefly
         monitor.stop()
-        
+
         try:
             await asyncio.wait_for(task, timeout=0.5)
         except asyncio.TimeoutError:
@@ -823,18 +811,16 @@ class TestTriggerMonitorMonitoringLoop:
         config = TriggerConfig()
         callback = AsyncMock()
         assembler = MagicMock()
-        
+
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        monitor._get_current_vehicle_socs = AsyncMock(return_value={'bus_1': 0.50})
+        monitor._get_current_vehicle_socs = AsyncMock(return_value={"bus_1": 0.50})
         monitor._get_current_prices = AsyncMock(return_value={})
         monitor._get_actual_return_times = AsyncMock(return_value={})
-        monitor.check_soc_deviation = AsyncMock(
-            return_value="SoC deviation detected"
-        )
+        monitor.check_soc_deviation = AsyncMock(return_value="SoC deviation detected")
         monitor.check_price_change = AsyncMock(return_value=None)
         monitor.check_return_time_deviation = AsyncMock(return_value=None)
-        
-        monitor.expected_socs = {'bus_1': 0.60}
+
+        monitor.expected_socs = {"bus_1": 0.60}
         monitor._last_trigger_time = datetime.utcnow()  # Just triggered
         monitor._last_scheduled_hour = datetime.utcnow().hour
 
@@ -843,7 +829,7 @@ class TestTriggerMonitorMonitoringLoop:
         task = asyncio.create_task(monitor.run())
         await asyncio.sleep(0.1)
         monitor.stop()
-        
+
         try:
             await asyncio.wait_for(task, timeout=0.5)
         except asyncio.TimeoutError:
@@ -862,11 +848,9 @@ class TestTriggerMonitorMonitoringLoop:
         config = TriggerConfig()
         callback = AsyncMock()
         assembler = MagicMock()
-        
+
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        monitor._get_current_vehicle_socs = AsyncMock(
-            side_effect=Exception("Database error")
-        )
+        monitor._get_current_vehicle_socs = AsyncMock(side_effect=Exception("Database error"))
         monitor._get_current_prices = AsyncMock(return_value={})
         monitor._get_actual_return_times = AsyncMock(return_value={})
 
@@ -875,7 +859,7 @@ class TestTriggerMonitorMonitoringLoop:
         task = asyncio.create_task(monitor.run())
         await asyncio.sleep(0.1)
         monitor.stop()
-        
+
         try:
             await asyncio.wait_for(task, timeout=0.5)
         except asyncio.TimeoutError:
@@ -903,17 +887,18 @@ class TestTriggerMonitorLifecycle:
 
         # Start monitoring in background
         import asyncio
+
         task = asyncio.create_task(monitor.run())
-        
+
         # Wait a bit
         await asyncio.sleep(0.15)
-        
+
         # Stop monitoring
         monitor.stop()
-        
+
         # Wait for task to complete
         await asyncio.sleep(0.1)
-        
+
         # Task should be done
         assert task.done()
         assert monitor._running is False
@@ -958,9 +943,7 @@ class TestTriggerMonitorEdgeCases:
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         # Make assembler method raise exception
-        assembler._get_vehicle_socs = AsyncMock(
-            side_effect=Exception("Assembler error")
-        )
+        assembler._get_vehicle_socs = AsyncMock(side_effect=Exception("Assembler error"))
 
         # Should handle gracefully
         socs = await monitor._get_current_vehicle_socs()
@@ -977,14 +960,14 @@ class TestTriggerMonitorEdgeCases:
         # Set very short cooldown for testing
         monitor._trigger_cooldown_sec = 0.1
 
-        monitor.update_expected_state({'bus_1': 0.60}, {})
-        assembler._get_vehicle_socs = AsyncMock(return_value={'bus_1': 0.50})
+        monitor.update_expected_state({"bus_1": 0.60}, {})
+        assembler._get_vehicle_socs = AsyncMock(return_value={"bus_1": 0.50})
         assembler._get_current_prices = AsyncMock(return_value={})
         assembler._get_actual_return_times = AsyncMock(return_value={})
 
         # First trigger
         monitor._last_trigger_time = None
-        trigger1 = await monitor.check_soc_deviation({'bus_1': 0.50})
+        trigger1 = await monitor.check_soc_deviation({"bus_1": 0.50})
         assert trigger1 is not None
 
         # Simulate trigger
@@ -994,7 +977,7 @@ class TestTriggerMonitorEdgeCases:
         await asyncio.sleep(0.15)
 
         # Second trigger after cooldown should work
-        trigger2 = await monitor.check_soc_deviation({'bus_1': 0.48})
+        trigger2 = await monitor.check_soc_deviation({"bus_1": 0.48})
         assert trigger2 is not None
 
     @pytest.mark.asyncio
@@ -1006,11 +989,11 @@ class TestTriggerMonitorEdgeCases:
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         # Set up multiple triggers
-        monitor.update_expected_state({'bus_1': 0.60}, {})
+        monitor.update_expected_state({"bus_1": 0.60}, {})
         base_time = datetime.utcnow()
         monitor.update_prices({base_time: 0.10})
 
-        assembler._get_vehicle_socs = AsyncMock(return_value={'bus_1': 0.50})
+        assembler._get_vehicle_socs = AsyncMock(return_value={"bus_1": 0.50})
         assembler.get_current_state = AsyncMock()
         mock_state = MagicMock()
         mock_state.prices = [0.20] * 24  # Price spike
@@ -1020,10 +1003,8 @@ class TestTriggerMonitorEdgeCases:
         assembler._get_actual_return_times = AsyncMock(return_value={})
 
         # Both SoC and price triggers should fire
-        soc_trigger = await monitor.check_soc_deviation({'bus_1': 0.50})
-        price_trigger = await monitor.check_price_change({
-            base_time: 0.20
-        })
+        soc_trigger = await monitor.check_soc_deviation({"bus_1": 0.50})
+        price_trigger = await monitor.check_price_change({base_time: 0.20})
 
         assert soc_trigger is not None
         assert price_trigger is not None
@@ -1033,6 +1014,7 @@ class TestTriggerMonitorEdgeCases:
 
 
 # ============ Advanced Trigger Scenarios ============
+
 
 class TestAdvancedTriggerScenarios:
     """Tests for advanced trigger scenarios."""
@@ -1049,23 +1031,23 @@ class TestAdvancedTriggerScenarios:
         callback = AsyncMock()
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        
+
         base_time = datetime.utcnow()
-        
+
         # Set up for all three triggers to potentially fire
         monitor.update_expected_state(
-            {'bus_1': 0.60},  # Will deviate
-            {'bus_1': base_time + timedelta(hours=2)}  # Will be late
+            {"bus_1": 0.60},  # Will deviate
+            {"bus_1": base_time + timedelta(hours=2)},  # Will be late
         )
         monitor.update_prices({base_time: 0.10})  # Will spike
-        
+
         # Mock all conditions to trigger
-        soc_result = await monitor.check_soc_deviation({'bus_1': 0.45})  # 15% deviation
+        soc_result = await monitor.check_soc_deviation({"bus_1": 0.45})  # 15% deviation
         price_result = await monitor.check_price_change({base_time: 0.20})  # 100% increase
-        return_result = await monitor.check_return_time_deviation({
-            'bus_1': base_time + timedelta(hours=2, minutes=30)  # 30 min late
-        })
-        
+        return_result = await monitor.check_return_time_deviation(
+            {"bus_1": base_time + timedelta(hours=2, minutes=30)}  # 30 min late
+        )
+
         # All should trigger
         assert soc_result is not None
         assert price_result is not None
@@ -1078,18 +1060,18 @@ class TestAdvancedTriggerScenarios:
         callback = AsyncMock()
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        
-        monitor.update_expected_state({'bus_1': 0.60}, {})
-        
+
+        monitor.update_expected_state({"bus_1": 0.60}, {})
+
         # Rapid SoC changes that oscillate around threshold
         soc_values = [0.56, 0.54, 0.56, 0.53, 0.55]
-        
+
         trigger_count = 0
         for soc in soc_values:
-            result = await monitor.check_soc_deviation({'bus_1': soc})
+            result = await monitor.check_soc_deviation({"bus_1": soc})
             if result is not None:
                 trigger_count += 1
-        
+
         # Should trigger on significant deviations
         assert trigger_count > 0
 
@@ -1101,16 +1083,16 @@ class TestAdvancedTriggerScenarios:
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
         monitor._trigger_cooldown_sec = 0.5  # 500ms cooldown
-        
-        monitor.update_expected_state({'bus_1': 0.60}, {})
-        
+
+        monitor.update_expected_state({"bus_1": 0.60}, {})
+
         # First trigger
-        result1 = await monitor.check_soc_deviation({'bus_1': 0.50})
+        result1 = await monitor.check_soc_deviation({"bus_1": 0.50})
         assert result1 is not None
         monitor._last_trigger_time = datetime.utcnow()
-        
+
         # Immediate second check - should still trigger (check returns condition, not fires callback)
-        result2 = await monitor.check_soc_deviation({'bus_1': 0.49})
+        await monitor.check_soc_deviation({"bus_1": 0.49})
         # The check_soc_deviation method checks condition, not cooldown
         # Cooldown is handled in run() loop or callback
 
@@ -1121,19 +1103,19 @@ class TestAdvancedTriggerScenarios:
         callback = AsyncMock()
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        
+
         # Set initial expected state
-        monitor.update_expected_state({'bus_1': 0.60}, {})
-        
+        monitor.update_expected_state({"bus_1": 0.60}, {})
+
         # First check - deviates
-        result1 = await monitor.check_soc_deviation({'bus_1': 0.50})
+        result1 = await monitor.check_soc_deviation({"bus_1": 0.50})
         assert result1 is not None
-        
+
         # Reset expected state to current
-        monitor.update_expected_state({'bus_1': 0.50}, {})
-        
+        monitor.update_expected_state({"bus_1": 0.50}, {})
+
         # Same actual - no deviation now
-        result2 = await monitor.check_soc_deviation({'bus_1': 0.50})
+        result2 = await monitor.check_soc_deviation({"bus_1": 0.50})
         assert result2 is None
 
     @pytest.mark.asyncio
@@ -1146,14 +1128,14 @@ class TestAdvancedTriggerScenarios:
         callback = AsyncMock()
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        
+
         base_time = datetime.utcnow()
-        
+
         # Test with very small base price - 100% increase AND > $5/MWh
         monitor.update_prices({base_time: 0.01})  # 1 cent = $10/MWh
         result = await monitor.check_price_change({base_time: 0.02})  # 100% increase, +$10/MWh
         assert result is not None
-        
+
         # Test with zero base price
         monitor.update_prices({base_time: 0.0})
         result_zero = await monitor.check_price_change({base_time: 0.10})
@@ -1167,15 +1149,13 @@ class TestAdvancedTriggerScenarios:
         callback = AsyncMock()
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        
+
         # No expected return times set
         monitor.update_expected_state({}, {})  # Empty return times
-        
+
         base_time = datetime.utcnow()
-        result = await monitor.check_return_time_deviation({
-            'bus_1': base_time
-        })
-        
+        result = await monitor.check_return_time_deviation({"bus_1": base_time})
+
         # Should not trigger with no expected times
         assert result is None
 
@@ -1186,26 +1166,29 @@ class TestAdvancedTriggerScenarios:
         callback = AsyncMock()
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        
+
         # Set expected for multiple vehicles
-        monitor.update_expected_state({
-            'bus_1': 0.60,
-            'bus_2': 0.70,
-            'bus_3': 0.80,
-        }, {})
-        
+        monitor.update_expected_state(
+            {
+                "bus_1": 0.60,
+                "bus_2": 0.70,
+                "bus_3": 0.80,
+            },
+            {},
+        )
+
         # Check with varying deviations
         actual_socs = {
-            'bus_1': 0.50,  # 10% deviation - triggers
-            'bus_2': 0.68,  # 2% deviation - no trigger
-            'bus_3': 0.60,  # 20% deviation - triggers
+            "bus_1": 0.50,  # 10% deviation - triggers
+            "bus_2": 0.68,  # 2% deviation - no trigger
+            "bus_3": 0.60,  # 20% deviation - triggers
         }
-        
+
         result = await monitor.check_soc_deviation(actual_socs)
-        
+
         # Should trigger for buses with > 5% deviation
         assert result is not None
-        assert 'bus_1' in result or 'bus_3' in result
+        assert "bus_1" in result or "bus_3" in result
 
     @pytest.mark.asyncio
     async def test_trigger_config_validation(self):
@@ -1220,13 +1203,13 @@ class TestAdvancedTriggerScenarios:
         assert config.soc_deviation_threshold == 0.05
         assert config.price_change_percent == 0.20
         assert config.return_time_deviation_min == 15.0
-        
+
         # Edge case: zero threshold (disabled trigger)
-        config_zero = TriggerConfig(soc_deviation_threshold=0.0)
+        TriggerConfig(soc_deviation_threshold=0.0)
         # Should be allowed but effectively always triggers
-        
+
         # Edge case: very high threshold
-        config_high = TriggerConfig(soc_deviation_threshold=1.0)
+        TriggerConfig(soc_deviation_threshold=1.0)
         # Should be allowed but rarely triggers
 
     @pytest.mark.asyncio
@@ -1236,30 +1219,24 @@ class TestAdvancedTriggerScenarios:
         callback = AsyncMock()
         assembler = MagicMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
-        
+
         base_time = datetime.utcnow()
         expected_return = base_time + timedelta(hours=2)
-        
-        monitor.update_expected_state(
-            {},
-            {'bus_1': expected_return}
-        )
-        
-        # Exactly on time - no trigger
-        result_ontime = await monitor.check_return_time_deviation({
-            'bus_1': expected_return
-        })
-        assert result_ontime is None
-        
-        # Just under threshold - no trigger
-        result_under = await monitor.check_return_time_deviation({
-            'bus_1': expected_return + timedelta(minutes=14)
-        })
-        assert result_under is None
-        
-        # Just over threshold - should trigger
-        result_over = await monitor.check_return_time_deviation({
-            'bus_1': expected_return + timedelta(minutes=16)
-        })
-        assert result_over is not None
 
+        monitor.update_expected_state({}, {"bus_1": expected_return})
+
+        # Exactly on time - no trigger
+        result_ontime = await monitor.check_return_time_deviation({"bus_1": expected_return})
+        assert result_ontime is None
+
+        # Just under threshold - no trigger
+        result_under = await monitor.check_return_time_deviation(
+            {"bus_1": expected_return + timedelta(minutes=14)}
+        )
+        assert result_under is None
+
+        # Just over threshold - should trigger
+        result_over = await monitor.check_return_time_deviation(
+            {"bus_1": expected_return + timedelta(minutes=16)}
+        )
+        assert result_over is not None

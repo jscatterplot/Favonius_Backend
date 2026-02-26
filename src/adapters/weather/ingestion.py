@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 
@@ -46,9 +45,7 @@ class WeatherIngestionService:
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
-    async def fetch_and_store_forecasts_for_depot(
-        self, depot_id: str | UUID
-    ) -> int:
+    async def fetch_and_store_forecasts_for_depot(self, depot_id: str | UUID) -> int:
         """Fetch and store weather forecasts for a single depot.
 
         Args:
@@ -69,18 +66,14 @@ class WeatherIngestionService:
             )
 
             if forecasts:
-                logger.info(
-                    f"Stored {len(forecasts)} weather forecasts for depot {depot_id}"
-                )
+                logger.info(f"Stored {len(forecasts)} weather forecasts for depot {depot_id}")
                 return len(forecasts)
             else:
                 logger.warning(f"No forecasts fetched for depot {depot_id}")
                 return 0
 
         except Exception as e:
-            logger.error(
-                f"Error fetching weather forecasts for depot {depot_id}: {e}"
-            )
+            logger.error(f"Error fetching weather forecasts for depot {depot_id}: {e}")
             raise
         finally:
             if adapter:
@@ -113,17 +106,13 @@ class WeatherIngestionService:
             logger.info(f"Fetching weather forecasts for {len(rows)} depots")
 
             for row in rows:
-                depot_id = str(row['depot_id'])
+                depot_id = str(row["depot_id"])
 
                 try:
-                    stored_count = await self.fetch_and_store_forecasts_for_depot(
-                        depot_id
-                    )
+                    stored_count = await self.fetch_and_store_forecasts_for_depot(depot_id)
                     results[depot_id] = stored_count
                 except Exception as e:
-                    logger.error(
-                        f"Failed to fetch forecasts for depot {depot_id}: {e}"
-                    )
+                    logger.error(f"Failed to fetch forecasts for depot {depot_id}: {e}")
                     results[depot_id] = 0
 
             total_stored = sum(results.values())
@@ -195,4 +184,3 @@ class WeatherIngestionService:
             Dictionary mapping depot_id to number of forecasts stored
         """
         return await self.fetch_forecasts_for_all_depots()
-

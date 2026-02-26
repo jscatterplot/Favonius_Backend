@@ -1,26 +1,28 @@
 """Tests for VDV 463 message parsing and validation."""
 
 import json
-import pytest
 from datetime import datetime
+
+import pytest
+
 from adapters.vdv463.messages import (
-    ValidationMode,
-    VDVMessageEnvelope,
-    ChargingRequest,
-    parse_message,
-    parse_charging_request_item,
-    build_error,
-    build_provide_charging_requests_response,
-    build_provide_charging_information_message,
-    VDV463ValidationError,
-    DepotInfo,
     ChargingPointInfo,
+    ChargingRequest,
+    DepotInfo,
+    ValidationMode,
+    VDV463ValidationError,
+    VDVMessageEnvelope,
+    build_error,
+    build_provide_charging_information_message,
+    build_provide_charging_requests_response,
+    parse_charging_request_item,
+    parse_message,
 )
 
 
 class TestParseMessage:
     """Test message parsing."""
-    
+
     def test_parse_valid_provide_charging_requests(self):
         """Test parsing valid ProvideChargingRequests message (chargingRequestData structure)."""
         message = [
@@ -55,23 +57,26 @@ class TestParseMessage:
         assert envelope.presystem_id == "presystem_001"
         assert envelope.message_action == "ProvideChargingRequests"
         assert envelope.validation_status == "ok"
-    
+
     def test_parse_invalid_json(self):
         """Test parsing invalid JSON."""
         with pytest.raises(VDV463ValidationError) as exc_info:
             parse_message("invalid json", ValidationMode.HARD)
-        
+
         assert exc_info.value.error_code == "InvalidJSON"
-    
+
     def test_parse_invalid_structure(self):
         """Test parsing invalid message structure."""
         message = [1, "BMS"]  # Too short
-        
+
         with pytest.raises(VDV463ValidationError) as exc_info:
             parse_message(json.dumps(message), ValidationMode.HARD)
-        
-        assert "InvalidMessageStructure" in exc_info.value.error_code or "SchemaValidationError" in exc_info.value.error_code
-    
+
+        assert (
+            "InvalidMessageStructure" in exc_info.value.error_code
+            or "SchemaValidationError" in exc_info.value.error_code
+        )
+
     def test_parse_soft_mode_with_warnings(self):
         """Test parsing in SOFT mode with validation warnings."""
         message = [
@@ -90,16 +95,16 @@ class TestParseMessage:
                 ]
             },
         ]
-        
+
         envelope = parse_message(json.dumps(message), ValidationMode.SOFT)
-        
+
         assert envelope.validation_status == "warning"
         assert len(envelope.validation_warnings) > 0
 
 
 class TestBuildError:
     """Test error message building."""
-    
+
     def test_build_error_message(self):
         """Test building VDV 463 error message."""
         envelope = VDVMessageEnvelope(
@@ -110,14 +115,14 @@ class TestBuildError:
             message_id="msg-123",
             message_action="ProvideChargingRequests",
         )
-        
+
         error_msg = build_error(
             envelope,
             "SchemaValidationError",
             "Invalid payload structure",
             {"field": "chargingRequestList"},
         )
-        
+
         assert error_msg[0] == 3  # Error type
         assert error_msg[1] == "CMS"
         assert error_msg[2] == "presystem_001"
@@ -128,7 +133,7 @@ class TestBuildError:
 
 class TestBuildResponse:
     """Test response message building."""
-    
+
     def test_build_provide_charging_requests_response(self):
         """Test building ProvideChargingRequestsResponse."""
         envelope = VDVMessageEnvelope(
@@ -139,15 +144,15 @@ class TestBuildResponse:
             message_id="msg-123",
             message_action="ProvideChargingRequests",
         )
-        
+
         response = build_provide_charging_requests_response(envelope)
-        
+
         assert response[0] == 2  # Confirmation
         assert response[1] == "CMS"
         assert response[2] == "presystem_001"
         assert response[5] == "ProvideChargingRequests"
         assert response[6] == {}  # Empty payload per spec
-    
+
     def test_build_provide_charging_information(self):
         """Test building ProvideChargingInformation message."""
         depot_info = DepotInfo(
@@ -166,17 +171,17 @@ class TestBuildResponse:
                 ),
             ],
         )
-        
+
         message = build_provide_charging_information_message(
             "presystem_001",
             [depot_info],
         )
-        
+
         assert message[0] == 1  # Request (CMS → BMS/ITCS)
         assert message[1] == "CMS"
         assert message[2] == "presystem_001"
         assert message[5] == "ProvideChargingInformation"
-        
+
         payload = message[6]
         assert "depotInfoList" in payload
         assert len(payload["depotInfoList"]) == 1

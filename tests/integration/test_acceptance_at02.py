@@ -23,7 +23,7 @@ class TestAT02DemandChargeReduction:
     @pytest.fixture
     def depot_config(self):
         """Depot configuration for demand charge test."""
-        vehicle_ids = [f'bus_{i}' for i in range(8)]
+        vehicle_ids = [f"bus_{i}" for i in range(8)]
         return DepotConfig(
             vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
             vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -44,10 +44,8 @@ class TestAT02DemandChargeReduction:
         prices = [0.12] * n_t
 
         # Vehicles start at moderate SoC
-        vehicle_socs = {f'bus_{i}': 0.4 for i in range(8)}
-        vehicle_availability = {
-            f'bus_{i}': [True] * n_t for i in range(8)
-        }
+        vehicle_socs = {f"bus_{i}": 0.4 for i in range(8)}
+        vehicle_availability = {f"bus_{i}": [True] * n_t for i in range(8)}
 
         return DepotState(
             vehicle_socs=vehicle_socs,
@@ -56,14 +54,12 @@ class TestAT02DemandChargeReduction:
             demand_charge_rate=20.0,  # $20/kW
             current_month_peak=200.0,  # Current month peak: 200 kW
             vehicle_availability=vehicle_availability,
-            energy_requirements={f'bus_{i}': 180.0 for i in range(8)},
-            departure_times={f'bus_{i}': 48 + i * 6 for i in range(8)},  # Staggered
+            energy_requirements={f"bus_{i}": 180.0 for i in range(8)},
+            departure_times={f"bus_{i}": 48 + i * 6 for i in range(8)},  # Staggered
             building_power=[50.0] * n_t,  # Lower building load
         )
 
-    def test_at02_demand_charge_reduction(
-        self, unmanaged_state, depot_config
-    ):
+    def test_at02_demand_charge_reduction(self, unmanaged_state, depot_config):
         """AT-02: Verify demand charge reduction."""
         # Calculate unmanaged peak (all vehicles charge at max simultaneously)
         # 6 chargers * 80 kW = 480 kW + 50 kW building = 530 kW max
@@ -75,16 +71,16 @@ class TestAT02DemandChargeReduction:
         # Verify optimized peak is reduced (should spread charging over time)
         # With staggered departures, optimizer can spread charging to reduce peak
         optimized_peak = result.peak_demand
-        
+
         # Peak should be less than unmanaged (optimization benefit)
-        assert optimized_peak < unmanaged_peak, (
-            f"Optimized peak {optimized_peak:.2f} kW >= unmanaged {unmanaged_peak:.2f} kW"
-        )
+        assert (
+            optimized_peak < unmanaged_peak
+        ), f"Optimized peak {optimized_peak:.2f} kW >= unmanaged {unmanaged_peak:.2f} kW"
 
         # Peak should be within site limits
-        assert optimized_peak <= depot_config.max_site_power, (
-            f"Optimized peak {optimized_peak:.2f} kW exceeds max site power"
-        )
+        assert (
+            optimized_peak <= depot_config.max_site_power
+        ), f"Optimized peak {optimized_peak:.2f} kW exceeds max site power"
 
         # Calculate demand charge savings
         # Unmanaged: 530 kW * $20/kW = $10,600/month
@@ -99,12 +95,13 @@ class TestAT02DemandChargeReduction:
             f"Unmanaged: ${unmanaged_demand_charge:.2f}, "
             f"Optimized: ${optimized_demand_charge:.2f}"
         )
-        
+
         # Print actual savings for visibility
-        print(f"Demand charge savings: ${savings:.2f}/month "
-              f"(peak reduced from {unmanaged_peak:.1f} to {optimized_peak:.1f} kW)")
+        print(
+            f"Demand charge savings: ${savings:.2f}/month "
+            f"(peak reduced from {unmanaged_peak:.1f} to {optimized_peak:.1f} kW)"
+        )
 
         # Verify optimization completed successfully
-        assert result.status == 'completed'
+        assert result.status == "completed"
         assert result.solve_time < 30.0
-

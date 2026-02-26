@@ -61,11 +61,8 @@ class InvalidConfigError(OptimizationError):
 class ConstraintViolationError(OptimizationError):
     """Raised when solution violates hard constraints."""
 
-    def __init__(
-        self, message: str, constraint_name: str, vehicle_id: Optional[str] = None
-    ):
+    def __init__(self, message: str, constraint_name: str, vehicle_id: Optional[str] = None):
         super().__init__(message)
         self.message = message
         self.constraint_name = constraint_name
         self.vehicle_id = vehicle_id
-

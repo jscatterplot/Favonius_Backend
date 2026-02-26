@@ -12,12 +12,9 @@ AND charging schedule is dispatched to chargers
 """
 
 import pytest
-from datetime import datetime, timedelta
-from uuid import uuid4
 
 from src.core.models import DepotConfig, DepotState
 from src.core.optimizer import optimize
-from src.core.state.assembler import StateAssembler
 
 
 @pytest.mark.integration
@@ -28,7 +25,7 @@ class TestAT01EndToEndOptimization:
     @pytest.fixture
     def depot_config(self):
         """10 vehicles, 5 chargers depot configuration."""
-        vehicle_ids = [f'bus_{i}' for i in range(10)]
+        vehicle_ids = [f"bus_{i}" for i in range(10)]
         return DepotConfig(
             vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
             vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -64,14 +61,14 @@ class TestAT01EndToEndOptimization:
         vehicle_socs = {}
         for i in range(10):
             if i < 3:  # Departing vehicles - need priority charging
-                vehicle_socs[f'bus_{i}'] = 0.50
+                vehicle_socs[f"bus_{i}"] = 0.50
             else:  # Non-departing - can wait
-                vehicle_socs[f'bus_{i}'] = 0.60
+                vehicle_socs[f"bus_{i}"] = 0.60
 
         departure_times = {
-            'bus_0': 32,  # 6:00 AM
-            'bus_1': 32,  # 6:00 AM
-            'bus_2': 32,  # 6:00 AM
+            "bus_0": 32,  # 6:00 AM
+            "bus_1": 32,  # 6:00 AM
+            "bus_2": 32,  # 6:00 AM
         }
 
         # All vehicles available until departure
@@ -82,7 +79,7 @@ class TestAT01EndToEndOptimization:
                 # Unavailable after departure
                 for t in range(32, n_t):
                     availability[t] = False
-            vehicle_availability[f'bus_{i}'] = availability
+            vehicle_availability[f"bus_{i}"] = availability
 
         return DepotState(
             vehicle_socs=vehicle_socs,
@@ -91,37 +88,33 @@ class TestAT01EndToEndOptimization:
             demand_charge_rate=20.0,
             current_month_peak=200.0,
             vehicle_availability=vehicle_availability,
-            energy_requirements={f'bus_{i}': 150.0 for i in range(10)},
+            energy_requirements={f"bus_{i}": 150.0 for i in range(10)},
             departure_times=departure_times,
             building_power=[50.0] * n_t,
         )
 
-    def test_at01_end_to_end_optimization(
-        self, depot_state, depot_config
-    ):
+    def test_at01_end_to_end_optimization(self, depot_state, depot_config):
         """AT-01: Verify end-to-end optimization works correctly."""
         # Run optimization
         result = optimize(depot_state, depot_config, time_limit=30.0)
 
         # Verify solve time < 30 seconds
-        assert result.solve_time < 30.0, (
-            f"Solve time {result.solve_time:.2f}s exceeds 30s limit"
-        )
+        assert result.solve_time < 30.0, f"Solve time {result.solve_time:.2f}s exceeds 30s limit"
 
         # Verify all 3 departing vehicles reach ≥99% SoC at departure
         # Departure at timestep 32 (6:00 AM, 8 hours from 10 PM start)
         departure_timestep = 32
 
-        for vehicle_id in ['bus_0', 'bus_1', 'bus_2']:
+        for vehicle_id in ["bus_0", "bus_1", "bus_2"]:
             schedule = result.schedule.get(vehicle_id)
             assert schedule is not None, f"No schedule for {vehicle_id}"
 
-            soc_at_departure = schedule['soc'][departure_timestep]
+            soc_at_departure = schedule["soc"][departure_timestep]
 
             # Allow small numerical tolerance (0.98 instead of exact 0.99)
-            assert soc_at_departure >= 0.98, (
-                f"{vehicle_id} SoC at departure ({soc_at_departure:.3f}) < 0.98"
-            )
+            assert (
+                soc_at_departure >= 0.98
+            ), f"{vehicle_id} SoC at departure ({soc_at_departure:.3f}) < 0.98"
 
         # Verify schedule structure
         assert len(result.schedule) == 10, "Schedule should include all vehicles"
@@ -130,10 +123,9 @@ class TestAT01EndToEndOptimization:
 
         # Verify charging schedule can be dispatched
         # (This would be tested with actual OCPP server in full integration test)
-        for vehicle_id in ['bus_0', 'bus_1', 'bus_2']:
+        for vehicle_id in ["bus_0", "bus_1", "bus_2"]:
             schedule = result.schedule[vehicle_id]
-            assert 'charging_power' in schedule, f"Missing charging_power for {vehicle_id}"
-            assert len(schedule['charging_power']) == depot_config.n_timesteps
-            assert 'soc' in schedule, f"Missing soc for {vehicle_id}"
-            assert len(schedule['soc']) == depot_config.n_timesteps
-
+            assert "charging_power" in schedule, f"Missing charging_power for {vehicle_id}"
+            assert len(schedule["charging_power"]) == depot_config.n_timesteps
+            assert "soc" in schedule, f"Missing soc for {vehicle_id}"
+            assert len(schedule["soc"]) == depot_config.n_timesteps

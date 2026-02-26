@@ -3,17 +3,15 @@
 Reference: Development plan Step 5.2, PRD.md#11-3-integration-tests
 """
 
-import pytest
-import asyncio
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import asyncpg
+import pytest
 
 from src.core.controller import DepotController
-from src.core.controller_manager import ControllerManager
 from src.core.controller_config import ControllerConfig
+from src.core.controller_manager import ControllerManager
 from src.core.models import DepotConfig, OptimizationResult
 from src.core.state.assembler import StateAssembler
 
@@ -31,7 +29,7 @@ def mock_db_pool():
 @pytest.fixture
 def sample_depot_config():
     """Sample depot configuration."""
-    vehicle_ids = ['bus_1', 'bus_2']
+    vehicle_ids = ["bus_1", "bus_2"]
     return DepotConfig(
         vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -50,13 +48,13 @@ def sample_optimization_result():
     return OptimizationResult(
         run_id=uuid4(),
         schedule={
-            'bus_1': {
-                'charging_power': [0, 0, 80, 80] * 24,
-                'soc': [0.3, 0.3, 0.35, 0.40] * 24,
+            "bus_1": {
+                "charging_power": [0, 0, 80, 80] * 24,
+                "soc": [0.3, 0.3, 0.35, 0.40] * 24,
             },
-            'bus_2': {
-                'charging_power': [80, 80, 0, 0] * 24,
-                'soc': [0.5, 0.55, 0.55, 0.55] * 24,
+            "bus_2": {
+                "charging_power": [80, 80, 0, 0] * 24,
+                "soc": [0.5, 0.55, 0.55, 0.55] * 24,
             },
         },
         battery_dispatch=[0.0] * 96,
@@ -64,7 +62,7 @@ def sample_optimization_result():
         peak_demand=450.0,
         objective_value=1234.56,
         solve_time=12.3,
-        status='completed',
+        status="completed",
     )
 
 
@@ -107,8 +105,7 @@ class TestDepotController:
 
     @pytest.mark.asyncio
     async def test_run_optimization_success(
-        self, mock_db_pool, sample_depot_config, sample_optimization_result,
-        controller_config
+        self, mock_db_pool, sample_depot_config, sample_optimization_result, controller_config
     ):
         """Test successful optimization run."""
         pool, conn = mock_db_pool
@@ -122,23 +119,24 @@ class TestDepotController:
 
         # Mock state assembly
         with patch.object(
-            controller.assembler, 'get_current_state', new_callable=AsyncMock
+            controller.assembler, "get_current_state", new_callable=AsyncMock
         ) as mock_state:
             from src.core.models import DepotState
+
             mock_state.return_value = DepotState(
-                vehicle_socs={'bus_1': 0.45, 'bus_2': 0.82},
+                vehicle_socs={"bus_1": 0.45, "bus_2": 0.82},
                 battery_soc=0.55,
                 prices=[0.10, 0.15, 0.12] * 32,
                 demand_charge_rate=20.0,
                 current_month_peak=380.0,
-                vehicle_availability={'bus_1': [True] * 96, 'bus_2': [True] * 96},
-                energy_requirements={'bus_1': 200.0, 'bus_2': 150.0},
-                departure_times={'bus_1': 48, 'bus_2': 60},
+                vehicle_availability={"bus_1": [True] * 96, "bus_2": [True] * 96},
+                energy_requirements={"bus_1": 200.0, "bus_2": 150.0},
+                departure_times={"bus_1": 48, "bus_2": 60},
                 building_power=[50.0] * 96,
             )
 
             # Mock optimization
-            with patch('src.core.controller.optimize') as mock_optimize:
+            with patch("src.core.controller.optimize") as mock_optimize:
                 mock_optimize.return_value = sample_optimization_result
 
                 # Mock database storage
@@ -153,8 +151,7 @@ class TestDepotController:
 
     @pytest.mark.asyncio
     async def test_run_optimization_with_retry(
-        self, mock_db_pool, sample_depot_config, sample_optimization_result,
-        controller_config
+        self, mock_db_pool, sample_depot_config, sample_optimization_result, controller_config
     ):
         """Test optimization with retry on failure."""
         pool, conn = mock_db_pool
@@ -168,23 +165,24 @@ class TestDepotController:
 
         # Mock state assembly
         with patch.object(
-            controller.assembler, 'get_current_state', new_callable=AsyncMock
+            controller.assembler, "get_current_state", new_callable=AsyncMock
         ) as mock_state:
             from src.core.models import DepotState
+
             mock_state.return_value = DepotState(
-                vehicle_socs={'bus_1': 0.45},
+                vehicle_socs={"bus_1": 0.45},
                 battery_soc=0.55,
                 prices=[0.10] * 96,
                 demand_charge_rate=20.0,
                 current_month_peak=380.0,
-                vehicle_availability={'bus_1': [True] * 96},
-                energy_requirements={'bus_1': 200.0},
-                departure_times={'bus_1': 48},
+                vehicle_availability={"bus_1": [True] * 96},
+                energy_requirements={"bus_1": 200.0},
+                departure_times={"bus_1": 48},
                 building_power=[50.0] * 96,
             )
 
             # Mock optimization - fail first time, succeed second
-            with patch('src.core.controller.optimize') as mock_optimize:
+            with patch("src.core.controller.optimize") as mock_optimize:
                 mock_optimize.side_effect = [
                     Exception("Timeout"),
                     sample_optimization_result,
@@ -198,9 +196,7 @@ class TestDepotController:
                 assert mock_optimize.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_circuit_breaker(
-        self, mock_db_pool, sample_depot_config, controller_config
-    ):
+    async def test_circuit_breaker(self, mock_db_pool, sample_depot_config, controller_config):
         """Test circuit breaker opens after max failures."""
         pool, conn = mock_db_pool
 
@@ -213,23 +209,24 @@ class TestDepotController:
 
         # Mock state assembly
         with patch.object(
-            controller.assembler, 'get_current_state', new_callable=AsyncMock
+            controller.assembler, "get_current_state", new_callable=AsyncMock
         ) as mock_state:
             from src.core.models import DepotState
+
             mock_state.return_value = DepotState(
-                vehicle_socs={'bus_1': 0.45},
+                vehicle_socs={"bus_1": 0.45},
                 battery_soc=0.55,
                 prices=[0.10] * 96,
                 demand_charge_rate=20.0,
                 current_month_peak=380.0,
-                vehicle_availability={'bus_1': [True] * 96},
-                energy_requirements={'bus_1': 200.0},
-                departure_times={'bus_1': 48},
+                vehicle_availability={"bus_1": [True] * 96},
+                energy_requirements={"bus_1": 200.0},
+                departure_times={"bus_1": 48},
                 building_power=[50.0] * 96,
             )
 
             # Mock optimization to always fail
-            with patch('src.core.controller.optimize') as mock_optimize:
+            with patch("src.core.controller.optimize") as mock_optimize:
                 mock_optimize.side_effect = Exception("Optimization failed")
 
                 # Trigger multiple failures
@@ -241,12 +238,12 @@ class TestDepotController:
 
                 # Circuit breaker should be open
                 assert controller._circuit_breaker_open
-                assert controller._optimization_failures >= controller_config.max_optimization_failures
+                assert (
+                    controller._optimization_failures >= controller_config.max_optimization_failures
+                )
 
     @pytest.mark.asyncio
-    async def test_trigger_cooldown(
-        self, mock_db_pool, sample_depot_config, controller_config
-    ):
+    async def test_trigger_cooldown(self, mock_db_pool, sample_depot_config, controller_config):
         """Test trigger cooldown prevents rapid re-optimization."""
         pool, _ = mock_db_pool
 
@@ -259,32 +256,34 @@ class TestDepotController:
 
         # Mock optimization to succeed
         with patch.object(
-            controller.assembler, 'get_current_state', new_callable=AsyncMock
+            controller.assembler, "get_current_state", new_callable=AsyncMock
         ) as mock_state:
             from src.core.models import DepotState
+
             mock_state.return_value = DepotState(
-                vehicle_socs={'bus_1': 0.45},
+                vehicle_socs={"bus_1": 0.45},
                 battery_soc=0.55,
                 prices=[0.10] * 96,
                 demand_charge_rate=20.0,
                 current_month_peak=380.0,
-                vehicle_availability={'bus_1': [True] * 96},
-                energy_requirements={'bus_1': 200.0},
-                departure_times={'bus_1': 48},
+                vehicle_availability={"bus_1": [True] * 96},
+                energy_requirements={"bus_1": 200.0},
+                departure_times={"bus_1": 48},
                 building_power=[50.0] * 96,
             )
 
-            with patch('src.core.controller.optimize') as mock_optimize:
+            with patch("src.core.controller.optimize") as mock_optimize:
                 from src.core.models import OptimizationResult
+
                 mock_optimize.return_value = OptimizationResult(
                     run_id=uuid4(),
-                    schedule={'bus_1': {'charging_power': [80] * 96, 'soc': [0.5] * 96}},
+                    schedule={"bus_1": {"charging_power": [80] * 96, "soc": [0.5] * 96}},
                     battery_dispatch=[0.0] * 96,
                     grid_power=[100.0] * 96,
                     peak_demand=450.0,
                     objective_value=1234.56,
                     solve_time=12.3,
-                    status='completed',
+                    status="completed",
                 )
 
                 # First trigger should work
@@ -297,9 +296,7 @@ class TestDepotController:
                 assert mock_optimize.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_graceful_shutdown(
-        self, mock_db_pool, sample_depot_config, controller_config
-    ):
+    async def test_graceful_shutdown(self, mock_db_pool, sample_depot_config, controller_config):
         """Test graceful shutdown waits for operations."""
         pool, _ = mock_db_pool
 
@@ -337,18 +334,14 @@ class TestControllerManager:
         assert len(manager.controllers) == 0
 
     @pytest.mark.asyncio
-    async def test_add_controller(
-        self, mock_db_pool, sample_depot_config, controller_config
-    ):
+    async def test_add_controller(self, mock_db_pool, sample_depot_config, controller_config):
         """Test adding a controller."""
         pool, conn = mock_db_pool
 
         depot_id = str(uuid4())
 
         # Mock database query for depot config
-        with patch.object(
-            StateAssembler, 'load_depot_config', new_callable=AsyncMock
-        ) as mock_load:
+        with patch.object(StateAssembler, "load_depot_config", new_callable=AsyncMock) as mock_load:
             mock_load.return_value = (sample_depot_config, {})
 
             manager = ControllerManager(
@@ -370,9 +363,7 @@ class TestControllerManager:
 
         depot_id = str(uuid4())
 
-        with patch.object(
-            StateAssembler, 'load_depot_config', new_callable=AsyncMock
-        ) as mock_load:
+        with patch.object(StateAssembler, "load_depot_config", new_callable=AsyncMock) as mock_load:
             mock_load.return_value = (sample_depot_config, {})
 
             manager = ControllerManager(
@@ -400,18 +391,16 @@ class TestControllerManager:
         depot_id2 = str(uuid4())
 
         async def mock_fetch(query, *args):
-            if 'SELECT depot_id' in query:
+            if "SELECT depot_id" in query:
                 return [
-                    {'depot_id': depot_id1},
-                    {'depot_id': depot_id2},
+                    {"depot_id": depot_id1},
+                    {"depot_id": depot_id2},
                 ]
             return []
 
         conn.fetch = AsyncMock(side_effect=mock_fetch)
 
-        with patch.object(
-            StateAssembler, 'load_depot_config', new_callable=AsyncMock
-        ) as mock_load:
+        with patch.object(StateAssembler, "load_depot_config", new_callable=AsyncMock) as mock_load:
             mock_load.return_value = (sample_depot_config, {})
 
             manager = ControllerManager(
@@ -427,9 +416,7 @@ class TestControllerManager:
             assert depot_id2 in manager.controllers
 
     @pytest.mark.asyncio
-    async def test_stop_all_controllers(
-        self, mock_db_pool, sample_depot_config, controller_config
-    ):
+    async def test_stop_all_controllers(self, mock_db_pool, sample_depot_config, controller_config):
         """Test stopping all controllers."""
         pool, conn = mock_db_pool
 
@@ -437,15 +424,13 @@ class TestControllerManager:
 
         # Mock depot query for start_all_controllers
         async def mock_fetch(query, *args):
-            if 'SELECT depot_id' in query:
-                return [{'depot_id': depot_id}]
+            if "SELECT depot_id" in query:
+                return [{"depot_id": depot_id}]
             return []
 
         conn.fetch = AsyncMock(side_effect=mock_fetch)
 
-        with patch.object(
-            StateAssembler, 'load_depot_config', new_callable=AsyncMock
-        ) as mock_load:
+        with patch.object(StateAssembler, "load_depot_config", new_callable=AsyncMock) as mock_load:
             mock_load.return_value = (sample_depot_config, {})
 
             manager = ControllerManager(
@@ -463,17 +448,13 @@ class TestControllerManager:
             assert len(manager.controllers) == 0
 
     @pytest.mark.asyncio
-    async def test_health_check(
-        self, mock_db_pool, sample_depot_config, controller_config
-    ):
+    async def test_health_check(self, mock_db_pool, sample_depot_config, controller_config):
         """Test health check."""
         pool, _ = mock_db_pool
 
         depot_id = str(uuid4())
 
-        with patch.object(
-            StateAssembler, 'load_depot_config', new_callable=AsyncMock
-        ) as mock_load:
+        with patch.object(StateAssembler, "load_depot_config", new_callable=AsyncMock) as mock_load:
             mock_load.return_value = (sample_depot_config, {})
 
             manager = ControllerManager(
@@ -486,8 +467,8 @@ class TestControllerManager:
             health = await manager.health_check()
 
             assert depot_id in health
-            assert 'status' in health[depot_id]
-            assert 'running' in health[depot_id]
+            assert "status" in health[depot_id]
+            assert "running" in health[depot_id]
 
 
 class TestControlLoopIntegration:
@@ -504,15 +485,13 @@ class TestControlLoopIntegration:
 
         # Mock depot query
         async def mock_fetch(query, *args):
-            if 'SELECT depot_id' in query:
-                return [{'depot_id': depot_id}]
+            if "SELECT depot_id" in query:
+                return [{"depot_id": depot_id}]
             return []
 
         conn.fetch = AsyncMock(side_effect=mock_fetch)
 
-        with patch.object(
-            StateAssembler, 'load_depot_config', new_callable=AsyncMock
-        ) as mock_load:
+        with patch.object(StateAssembler, "load_depot_config", new_callable=AsyncMock) as mock_load:
             mock_load.return_value = (sample_depot_config, {})
 
             manager = ControllerManager(
@@ -532,4 +511,3 @@ class TestControlLoopIntegration:
 
             assert len(manager.controllers) == 0
             assert manager._running is False
-

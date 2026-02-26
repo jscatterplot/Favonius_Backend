@@ -12,8 +12,8 @@ from typing import Optional
 
 import asyncpg
 
-from .prices import CAISOAdapter
 from ..entsoe import ENTSOEAdapter, is_european_timezone
+from .prices import CAISOAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +77,9 @@ class PriceIngestionService:
             end_date = now + timedelta(hours=48)
 
             if depot_timezone and is_european_timezone(depot_timezone):
-                return await self._fetch_entsoe_prices(
-                    depot_id, now, end_date, depot_timezone
-                )
+                return await self._fetch_entsoe_prices(depot_id, now, end_date, depot_timezone)
             else:
-                return await self._fetch_caiso_prices(
-                    depot_id, now, end_date, node
-                )
+                return await self._fetch_caiso_prices(depot_id, now, end_date, node)
 
         except Exception as e:
             logger.error(f"Error fetching prices for depot {depot_id}: {e}")
@@ -103,13 +99,11 @@ class PriceIngestionService:
             end_date=end_date,
             node=node,
             use_cache=False,
-            source='caiso_dam',
+            source="caiso_dam",
         )
 
         if prices:
-            stored = await self.adapter.store_prices_to_db(
-                prices, depot_id, source='caiso_dam'
-            )
+            stored = await self.adapter.store_prices_to_db(prices, depot_id, source="caiso_dam")
             logger.info(
                 f"Stored {stored} CAISO prices for depot {depot_id} "
                 f"(node: {node or self.adapter.default_node})"
@@ -133,12 +127,12 @@ class PriceIngestionService:
             end_date=end_date,
             depot_timezone=depot_timezone,
             use_cache=False,
-            source='entsoe_dam',
+            source="entsoe_dam",
         )
 
         if prices:
             stored = await self.entsoe_adapter.store_prices_to_db(
-                prices, depot_id, source='entsoe_dam'
+                prices, depot_id, source="entsoe_dam"
             )
             logger.info(
                 f"Stored {stored} ENTSO-E prices for depot {depot_id} "
@@ -147,8 +141,7 @@ class PriceIngestionService:
             return stored
         else:
             logger.warning(
-                f"No ENTSO-E prices fetched for depot {depot_id} "
-                f"(timezone: {depot_timezone})"
+                f"No ENTSO-E prices fetched for depot {depot_id} " f"(timezone: {depot_timezone})"
             )
             return 0
 
@@ -177,18 +170,15 @@ class PriceIngestionService:
                 logger.warning("No depots found in database")
                 return results
 
-            eu_count = sum(
-                1 for r in rows
-                if r['timezone'] and is_european_timezone(r['timezone'])
-            )
+            eu_count = sum(1 for r in rows if r["timezone"] and is_european_timezone(r["timezone"]))
             logger.info(
                 f"Fetching prices for {len(rows)} depots "
                 f"({eu_count} European, {len(rows) - eu_count} non-European)"
             )
 
             for row in rows:
-                depot_id = str(row['depot_id'])
-                depot_timezone = row.get('timezone')
+                depot_id = str(row["depot_id"])
+                depot_timezone = row.get("timezone")
                 node = None
 
                 try:
@@ -197,9 +187,7 @@ class PriceIngestionService:
                     )
                     results[depot_id] = stored_count
                 except Exception as e:
-                    logger.error(
-                        f"Failed to fetch prices for depot {depot_id}: {e}"
-                    )
+                    logger.error(f"Failed to fetch prices for depot {depot_id}: {e}")
                     results[depot_id] = 0
 
             total_stored = sum(results.values())
@@ -224,7 +212,7 @@ class PriceIngestionService:
         while self._running:
             try:
                 # Calculate next run time (10:00 AM PT)
-                now = datetime.utcnow()
+                datetime.utcnow()
                 # For MVP, run immediately on start, then daily
                 # In production, would calculate next 10 AM PT time
 
@@ -278,4 +266,3 @@ class PriceIngestionService:
             Dictionary mapping depot_id to number of prices stored
         """
         return await self.fetch_prices_for_all_depots()
-

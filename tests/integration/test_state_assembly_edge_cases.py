@@ -8,16 +8,15 @@ Tests:
 Reference: PRD_v2.md#5-2-state-assembly
 """
 
-import pytest
-import pytest_asyncio
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import asyncpg
+import pytest
+import pytest_asyncio
 
-from src.core.state.assembler import StateAssembler
 from src.core.models import DepotConfig
+from src.core.state.assembler import StateAssembler
 
 
 @pytest.mark.integration
@@ -31,8 +30,8 @@ class TestStateAssemblyEdgeCases:
         import os
 
         db_url = os.getenv(
-            'TEST_DATABASE_URL',
-            'postgresql://postgres:postgres@localhost:5432/favonius_test',
+            "TEST_DATABASE_URL",
+            "postgresql://postgres:postgres@localhost:5432/favonius_test",
         )
 
         try:
@@ -57,10 +56,10 @@ class TestStateAssemblyEdgeCases:
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
                 depot_id,
-                'Test Depot',
+                "Test Depot",
                 34.0522,
                 -118.2437,
-                'America/Los_Angeles',
+                "America/Los_Angeles",
                 1000.0,
                 20.0,
             )
@@ -68,16 +67,19 @@ class TestStateAssemblyEdgeCases:
         yield depot_id
 
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM telemetry WHERE vehicle_id IN (SELECT vehicle_id FROM vehicles WHERE depot_id = $1)', depot_id)
-            await conn.execute('DELETE FROM vehicles WHERE depot_id = $1', depot_id)
-            await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+            await conn.execute(
+                "DELETE FROM telemetry WHERE vehicle_id IN (SELECT vehicle_id FROM vehicles WHERE depot_id = $1)",
+                depot_id,
+            )
+            await conn.execute("DELETE FROM vehicles WHERE depot_id = $1", depot_id)
+            await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
     @pytest.fixture
     def depot_config(self):
         """Depot configuration."""
         return DepotConfig(
-            vehicle_capacities={'bus_1': 324.0},
-            vehicle_max_charge_kw={'bus_1': 80.0},
+            vehicle_capacities={"bus_1": 324.0},
+            vehicle_max_charge_kw={"bus_1": 80.0},
             charger_groups={80.0: 2},
             charger_efficiency=0.95,
             charger_vehicle_access={},
@@ -90,7 +92,7 @@ class TestStateAssemblyEdgeCases:
     async def test_missing_telemetry_use_last_known(self, test_db_pool, depot_id, depot_config):
         """Test missing telemetry (use last known + warning)."""
         vehicle_id = uuid4()
-        
+
         # Create vehicle
         async with test_db_pool.acquire() as conn:
             await conn.execute(
@@ -102,10 +104,10 @@ class TestStateAssemblyEdgeCases:
                 """,
                 vehicle_id,
                 depot_id,
-                'bus',
+                "bus",
                 324.0,
             )
-            
+
             # Insert old telemetry (20 minutes ago - stale)
             await conn.execute(
                 """
@@ -119,32 +121,32 @@ class TestStateAssemblyEdgeCases:
                 0.5,  # Last known SoC
                 0.0,
             )
-        
+
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get vehicle SoCs (should use last known if no fresh telemetry)
         socs = await assembler._get_vehicle_socs()
-        
+
         # Should use last known SoC (0.5) with warning
         if str(vehicle_id) in socs:
             assert socs[str(vehicle_id)] == 0.5
-        
+
         # Cleanup
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM telemetry WHERE vehicle_id = $1', vehicle_id)
-            await conn.execute('DELETE FROM vehicles WHERE vehicle_id = $1', vehicle_id)
+            await conn.execute("DELETE FROM telemetry WHERE vehicle_id = $1", vehicle_id)
+            await conn.execute("DELETE FROM vehicles WHERE vehicle_id = $1", vehicle_id)
 
     @pytest.mark.asyncio
     async def test_missing_prices_use_cached_tou(self, test_db_pool, depot_id, depot_config):
         """Test missing prices (use cached TOU)."""
         # No price rows in database
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get prices (should use cached TOU if no prices in database)
         # In real code, StateAssembler._get_prices() would use cached TOU
         # For test, we verify the fallback mechanism exists
         prices = await assembler._get_prices()
-        
+
         # Should have prices (either from database or cached TOU)
         assert prices is not None
         assert len(prices) > 0
@@ -154,25 +156,27 @@ class TestStateAssemblyEdgeCases:
         """Test missing weather (use last forecast)."""
         # No weather rows in database
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get weather (should use last forecast if no weather in database)
         # In real code, StateAssembler._get_weather() would use last forecast
         # For test, we verify the fallback mechanism exists
-        weather = await assembler._get_weather()
-        
+        await assembler._get_weather()
+
         # Weather is optional, so None is acceptable
         # But if present, should be valid
 
     @pytest.mark.asyncio
-    async def test_missing_building_load_use_forecast_model(self, test_db_pool, depot_id, depot_config):
+    async def test_missing_building_load_use_forecast_model(
+        self, test_db_pool, depot_id, depot_config
+    ):
         """Test missing building load (use forecast model)."""
         # No building load rows in database
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get building load (should use forecast model if no building load in database)
         # In real code, StateAssembler._get_building_power() would use forecast model
         building_power = await assembler._get_building_power()
-        
+
         # Should have building power (either from database or forecast model)
         assert building_power is not None
         assert len(building_power) > 0
@@ -180,14 +184,14 @@ class TestStateAssemblyEdgeCases:
     @pytest.mark.asyncio
     async def test_missing_schedules_fail_with_error(self, test_db_pool, depot_id, depot_config):
         """Test missing schedules (fail with error).
-        
+
         Per PRD, schedules are required - missing schedules should fail.
         """
         # Schedules are required for optimization
         # In real code, missing schedules would raise an error
         # For test, we verify the validation exists
-        assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+        StateAssembler(test_db_pool, depot_id, depot_config)
+
         # State assembly should validate schedules exist
         # (Tested in state validation tests)
 
@@ -195,7 +199,7 @@ class TestStateAssemblyEdgeCases:
     async def test_invalid_soc_values_clamp(self, test_db_pool, depot_id, depot_config):
         """Test invalid SoC values (clamp to [0.0, 1.0])."""
         vehicle_id = uuid4()
-        
+
         # Create vehicle with invalid SoC (> 1.0)
         async with test_db_pool.acquire() as conn:
             await conn.execute(
@@ -207,10 +211,10 @@ class TestStateAssemblyEdgeCases:
                 """,
                 vehicle_id,
                 depot_id,
-                'bus',
+                "bus",
                 324.0,
             )
-            
+
             # Insert telemetry with invalid SoC
             await conn.execute(
                 """
@@ -224,21 +228,21 @@ class TestStateAssemblyEdgeCases:
                 1.5,  # Invalid: > 1.0
                 0.0,
             )
-        
+
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get vehicle SoCs (should clamp invalid values)
         socs = await assembler._get_vehicle_socs()
-        
+
         if str(vehicle_id) in socs:
             soc = socs[str(vehicle_id)]
             # Should be clamped to [0.0, 1.0]
             assert 0.0 <= soc <= 1.0, f"SoC {soc} should be clamped to [0.0, 1.0]"
-        
+
         # Cleanup
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM telemetry WHERE vehicle_id = $1', vehicle_id)
-            await conn.execute('DELETE FROM vehicles WHERE vehicle_id = $1', vehicle_id)
+            await conn.execute("DELETE FROM telemetry WHERE vehicle_id = $1", vehicle_id)
+            await conn.execute("DELETE FROM vehicles WHERE vehicle_id = $1", vehicle_id)
 
     @pytest.mark.asyncio
     async def test_invalid_price_values(self, test_db_pool, depot_id, depot_config):
@@ -255,26 +259,26 @@ class TestStateAssemblyEdgeCases:
                 depot_id,
                 datetime.utcnow(),
                 -0.10,  # Invalid: negative price
-                'utility_tou',
+                "utility_tou",
             )
-        
+
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get prices (should handle invalid values)
         prices = await assembler._get_prices()
-        
+
         # Prices should be valid (non-negative)
         assert all(p >= 0 for p in prices), "Prices should be non-negative"
-        
+
         # Cleanup
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM prices WHERE depot_id = $1', depot_id)
+            await conn.execute("DELETE FROM prices WHERE depot_id = $1", depot_id)
 
     @pytest.mark.asyncio
     async def test_invalid_timestamps(self, test_db_pool, depot_id, depot_config):
         """Test invalid timestamps (future, too old)."""
         vehicle_id = uuid4()
-        
+
         # Create vehicle
         async with test_db_pool.acquire() as conn:
             await conn.execute(
@@ -286,10 +290,10 @@ class TestStateAssemblyEdgeCases:
                 """,
                 vehicle_id,
                 depot_id,
-                'bus',
+                "bus",
                 324.0,
             )
-            
+
             # Insert telemetry with future timestamp
             await conn.execute(
                 """
@@ -303,33 +307,33 @@ class TestStateAssemblyEdgeCases:
                 0.5,
                 0.0,
             )
-        
+
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get vehicle SoCs (should handle future timestamps)
         # In real code, would filter out future timestamps or use most recent valid
-        socs = await assembler._get_vehicle_socs()
-        
+        await assembler._get_vehicle_socs()
+
         # Should handle gracefully (may skip future timestamps)
-        
+
         # Cleanup
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM telemetry WHERE vehicle_id = $1', vehicle_id)
-            await conn.execute('DELETE FROM vehicles WHERE vehicle_id = $1', vehicle_id)
+            await conn.execute("DELETE FROM telemetry WHERE vehicle_id = $1", vehicle_id)
+            await conn.execute("DELETE FROM vehicles WHERE vehicle_id = $1", vehicle_id)
 
     @pytest.mark.asyncio
     async def test_invalid_uuids_format_validation(self):
         """Test invalid UUIDs (format validation)."""
         # Invalid UUID format should be rejected
         invalid_uuid = "not-a-uuid"
-        
+
         # UUID validation should catch this
         # (Tested in security/validators tests)
         from src.security.validators import validate_depot_id, validate_vehicle_id
-        
+
         with pytest.raises(ValueError):
             validate_depot_id(invalid_uuid)
-        
+
         with pytest.raises(ValueError):
             validate_vehicle_id(invalid_uuid)
 
@@ -342,7 +346,7 @@ class TestStateAssemblyEdgeCases:
         origin_depot_id = uuid4()
         vehicle_id = uuid4()
         arrival_time = datetime.utcnow() + timedelta(hours=2)
-        
+
         async with test_db_pool.acquire() as conn:
             await conn.execute(
                 """
@@ -362,29 +366,26 @@ class TestStateAssemblyEdgeCases:
                 arrival_time,
                 324.0,
                 150.0,
-                'acknowledged',
+                "acknowledged",
             )
-        
+
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # Get incoming vehicles
         now = datetime.utcnow()
         horizon_end = now + timedelta(hours=24)
         incoming_vehicles = await assembler._get_incoming_vehicles(now, horizon_end)
-        
+
         assert len(incoming_vehicles) == 1
         incoming = incoming_vehicles[0]
         assert str(incoming.vehicle_id) == str(vehicle_id)
         assert incoming.expected_soc == 0.35
         assert incoming.battery_kwh == 324.0
         assert incoming.max_charge_kw == 150.0
-        
+
         # Cleanup
         async with test_db_pool.acquire() as conn:
-            await conn.execute(
-                'DELETE FROM interdepot_messages WHERE dest_depot_id = $1',
-                depot_id
-            )
+            await conn.execute("DELETE FROM interdepot_messages WHERE dest_depot_id = $1", depot_id)
 
     @pytest.mark.asyncio
     async def test_incoming_vehicle_availability_windows(
@@ -396,9 +397,7 @@ class TestStateAssemblyEdgeCases:
         pass
 
     @pytest.mark.asyncio
-    async def test_incoming_vehicle_soc_initialization(
-        self, test_db_pool, depot_id, depot_config
-    ):
+    async def test_incoming_vehicle_soc_initialization(self, test_db_pool, depot_id, depot_config):
         """Test incoming vehicle SoC initialization."""
         # Incoming vehicle SoC should be initialized to expected_soc at arrival
         # (Tested in test_data_resolution.py)

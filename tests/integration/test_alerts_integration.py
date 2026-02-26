@@ -1,13 +1,15 @@
 """Integration tests for GET /depots/{depot_id}/alerts (PRD §7.1, AT-16)."""
 
-import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
+
 import asyncpg
+import pytest
 
 try:
     from fastapi.testclient import TestClient
+
     HAS_HTTPX = True
 except ImportError:
     TestClient = None
@@ -40,8 +42,8 @@ def mock_db_pool():
 class TestAlertsAT16:
     """AT-16: Alerts and Observability acceptance tests."""
 
-    @patch('src.api.main.db_pool')
-    @patch('src.api.main.verify_token')
+    @patch("src.api.main.db_pool")
+    @patch("src.api.main.verify_token")
     def test_alerts_returns_last_optimization_and_charger_faults(
         self, mock_verify, mock_pool, client, mock_db_pool, depot_id
     ):
@@ -52,16 +54,18 @@ class TestAlertsAT16:
         now = datetime.utcnow()
 
         conn.fetchval = AsyncMock(return_value=1)
-        conn.fetchrow = AsyncMock(return_value={
-            'run_id': run_id,
-            'run_time': now,
-            'status': 'optimal',
-            'solver_used': 'gurobi',
-            'solve_time_s': 8.5,
-        })
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "run_id": run_id,
+                "run_time": now,
+                "status": "optimal",
+                "solver_used": "gurobi",
+                "solve_time_s": 8.5,
+            }
+        )
         conn.fetch = AsyncMock(return_value=[])
 
-        with patch('src.api.main.db_pool', pool):
+        with patch("src.api.main.db_pool", pool):
             response = client.get(
                 f"/depots/{depot_id}/alerts",
                 headers={"Authorization": "Bearer test"},
@@ -80,8 +84,8 @@ class TestAlertsAT16:
         assert "timestamp" in data
         assert data["depot_id"] == depot_id
 
-    @patch('src.api.main.db_pool')
-    @patch('src.api.main.verify_token')
+    @patch("src.api.main.db_pool")
+    @patch("src.api.main.verify_token")
     def test_alerts_charger_faults_when_status_faulted(
         self, mock_verify, mock_pool, client, mock_db_pool, depot_id
     ):
@@ -93,24 +97,28 @@ class TestAlertsAT16:
         now = datetime.utcnow()
 
         conn.fetchval = AsyncMock(return_value=1)
-        conn.fetchrow = AsyncMock(return_value={
-            'run_id': run_id,
-            'run_time': now,
-            'status': 'optimal',
-            'solver_used': 'gurobi',
-            'solve_time_s': 10.0,
-        })
-        conn.fetch = AsyncMock(return_value=[
-            {
-                'charger_id': charger_id,
-                'ocpp_id': 'CP001',
-                'connector_id': 1,
-                'fault_code': 'PowerMeterFailure',
-                'timestamp': now,
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "run_id": run_id,
+                "run_time": now,
+                "status": "optimal",
+                "solver_used": "gurobi",
+                "solve_time_s": 10.0,
             }
-        ])
+        )
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "charger_id": charger_id,
+                    "ocpp_id": "CP001",
+                    "connector_id": 1,
+                    "fault_code": "PowerMeterFailure",
+                    "timestamp": now,
+                }
+            ]
+        )
 
-        with patch('src.api.main.db_pool', pool):
+        with patch("src.api.main.db_pool", pool):
             response = client.get(
                 f"/depots/{depot_id}/alerts",
                 headers={"Authorization": "Bearer test"},

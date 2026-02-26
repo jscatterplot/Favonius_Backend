@@ -8,10 +8,11 @@ THEN preconditioning power is included in schedule from start time
 AND ProvideChargingInformation can report preconditioning status (Scheduled/Active).
 """
 
-import pytest
 from datetime import datetime, timedelta
 
-from src.core.models import DepotState, DepotConfig
+import pytest
+
+from src.core.models import DepotConfig, DepotState
 from src.core.optimizer.milp_model import build_optimization_model
 
 

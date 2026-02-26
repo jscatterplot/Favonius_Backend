@@ -8,9 +8,7 @@ Tests the official openmeteo-requests library integration with:
 - Automatic retry mechanism (retry-requests)
 """
 
-import asyncio
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -30,7 +28,6 @@ from src.adapters.weather import (
     get_latest_forecast,
     store_weather_forecasts,
 )
-
 
 # ============ Fixtures ============
 
@@ -84,6 +81,7 @@ def sample_weather_data():
 @pytest.fixture
 def mock_flatbuffers_response():
     """Mock Open-Meteo FlatBuffers response structure."""
+
     # Create mock variable objects that return numpy arrays
     def create_mock_variable(values):
         var = MagicMock()
@@ -118,7 +116,7 @@ def mock_flatbuffers_response():
 @pytest.fixture
 def weather_adapter(mock_pool, tmp_path):
     """OpenMeteo adapter instance with mocked pool."""
-    with patch('src.adapters.weather.openmeteo._create_openmeteo_client') as mock_create:
+    with patch("src.adapters.weather.openmeteo._create_openmeteo_client") as mock_create:
         mock_client = MagicMock()
         mock_create.return_value = mock_client
         adapter = OpenMeteoAdapter(
@@ -226,7 +224,7 @@ async def test_get_forecast_max_days(weather_adapter, mock_flatbuffers_response)
 
     # Verify days parameter was limited to 16
     call_args = weather_adapter._client.weather_api.call_args
-    assert call_args[1]['params']['forecast_days'] == 16
+    assert call_args[1]["params"]["forecast_days"] == 16
 
 
 @pytest.mark.asyncio
@@ -237,19 +235,20 @@ async def test_get_forecast_uses_list_format(weather_adapter, mock_flatbuffers_r
     await weather_adapter.get_forecast(days=7)
 
     call_args = weather_adapter._client.weather_api.call_args
-    params = call_args[1]['params']
+    params = call_args[1]["params"]
 
     # Verify 'daily' parameter is a list
-    assert isinstance(params['daily'], list)
-    assert "temperature_2m_max" in params['daily']
-    assert "temperature_2m_min" in params['daily']
-    assert "precipitation_sum" in params['daily']
-    assert "shortwave_radiation_sum" in params['daily']
+    assert isinstance(params["daily"], list)
+    assert "temperature_2m_max" in params["daily"]
+    assert "temperature_2m_min" in params["daily"]
+    assert "precipitation_sum" in params["daily"]
+    assert "shortwave_radiation_sum" in params["daily"]
 
 
 @pytest.mark.asyncio
 async def test_get_forecast_nan_handling(weather_adapter):
     """Test that NaN values are replaced with defaults."""
+
     # Create response with NaN values
     def create_mock_variable(values):
         var = MagicMock()
@@ -292,9 +291,7 @@ async def test_get_forecast_nan_handling(weather_adapter):
 async def test_store_forecasts_to_db(weather_adapter, sample_weather_data, mock_pool):
     """Test storing forecasts to database."""
     depot_id = uuid4()
-    stored_count = await weather_adapter.store_forecasts_to_db(
-        sample_weather_data[:5], depot_id
-    )
+    stored_count = await weather_adapter.store_forecasts_to_db(sample_weather_data[:5], depot_id)
 
     assert stored_count == 5
     assert mock_pool._mock_conn.execute.call_count == 5
@@ -303,7 +300,7 @@ async def test_store_forecasts_to_db(weather_adapter, sample_weather_data, mock_
 @pytest.mark.asyncio
 async def test_store_forecasts_to_db_no_pool(sample_weather_data, tmp_path):
     """Test storing forecasts without pool raises error."""
-    with patch('src.adapters.weather.openmeteo._create_openmeteo_client'):
+    with patch("src.adapters.weather.openmeteo._create_openmeteo_client"):
         adapter = OpenMeteoAdapter(
             latitude=37.7749,
             longitude=-122.4194,
@@ -316,21 +313,19 @@ async def test_store_forecasts_to_db_no_pool(sample_weather_data, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_get_forecasts_for_depot_with_cache(
-    weather_adapter, sample_weather_data, mock_pool
-):
+async def test_get_forecasts_for_depot_with_cache(weather_adapter, sample_weather_data, mock_pool):
     """Test getting forecasts with cache hit."""
     depot_id = uuid4()
 
     # Mock cached forecasts
     cached_rows = [
         {
-            'time': w.timestamp,
-            'temp_f': w.temperature_f,
-            'temp_max_f': w.temperature_max_f,
-            'temp_min_f': w.temperature_min_f,
-            'precip_in': w.precipitation_inches,
-            'solar_rad': convert_solar_radiation_wm2_to_calcm2(w.solar_radiation),
+            "time": w.timestamp,
+            "temp_f": w.temperature_f,
+            "temp_max_f": w.temperature_max_f,
+            "temp_min_f": w.temperature_min_f,
+            "precip_in": w.precipitation_inches,
+            "solar_rad": convert_solar_radiation_wm2_to_calcm2(w.solar_radiation),
         }
         for w in sample_weather_data[:5]
     ]
@@ -338,12 +333,10 @@ async def test_get_forecasts_for_depot_with_cache(
 
     # Mock depot location
     mock_pool._mock_conn.fetchrow = AsyncMock(
-        return_value={'latitude': 37.7749, 'longitude': -122.4194}
+        return_value={"latitude": 37.7749, "longitude": -122.4194}
     )
 
-    forecasts = await weather_adapter.get_forecasts_for_depot(
-        depot_id, days=7, use_cache=True
-    )
+    forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=7, use_cache=True)
 
     assert len(forecasts) == 5
     # Verify forecasts were converted from cache
@@ -360,14 +353,12 @@ async def test_get_forecasts_for_depot_no_cache(
     # Mock no cached forecasts
     mock_pool._mock_conn.fetch = AsyncMock(return_value=[])
     mock_pool._mock_conn.fetchrow = AsyncMock(
-        return_value={'latitude': 37.7749, 'longitude': -122.4194}
+        return_value={"latitude": 37.7749, "longitude": -122.4194}
     )
 
     weather_adapter._client.weather_api.return_value = [mock_flatbuffers_response]
 
-    forecasts = await weather_adapter.get_forecasts_for_depot(
-        depot_id, days=7, use_cache=False
-    )
+    forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=7, use_cache=False)
 
     assert len(forecasts) == 3
     # Verify forecasts were stored
@@ -395,15 +386,15 @@ def test_create_openmeteo_client(tmp_path):
     """Test that client is created with caching and retry."""
     from src.adapters.weather.openmeteo import _create_openmeteo_client
 
-    with patch('src.adapters.weather.openmeteo.requests_cache.CachedSession') as mock_cache:
-        with patch('src.adapters.weather.openmeteo.retry') as mock_retry:
-            with patch('src.adapters.weather.openmeteo.openmeteo_requests.Client') as mock_client:
+    with patch("src.adapters.weather.openmeteo.requests_cache.CachedSession") as mock_cache:
+        with patch("src.adapters.weather.openmeteo.retry") as mock_retry:
+            with patch("src.adapters.weather.openmeteo.openmeteo_requests.Client") as mock_client:
                 mock_cache_session = MagicMock()
                 mock_cache.return_value = mock_cache_session
                 mock_retry_session = MagicMock()
                 mock_retry.return_value = mock_retry_session
 
-                client = _create_openmeteo_client(
+                _create_openmeteo_client(
                     cache_dir=str(tmp_path),
                     cache_expire_after=3600,
                     retries=5,
@@ -414,8 +405,8 @@ def test_create_openmeteo_client(tmp_path):
                 mock_cache.assert_called_once()
                 cache_call = mock_cache.call_args
                 assert cache_call[0][0] == str(tmp_path)
-                assert cache_call[1]['expire_after'] == 3600
-                assert cache_call[1]['backend'] == 'sqlite'
+                assert cache_call[1]["expire_after"] == 3600
+                assert cache_call[1]["backend"] == "sqlite"
 
                 # Verify retry was configured
                 mock_retry.assert_called_once_with(
@@ -433,9 +424,9 @@ def test_adapter_initialization_creates_cache_dir(tmp_path):
     cache_dir = tmp_path / "new_cache_dir"
     assert not cache_dir.exists()
 
-    with patch('src.adapters.weather.openmeteo.openmeteo_requests.Client'):
-        with patch('src.adapters.weather.openmeteo.requests_cache.CachedSession'):
-            with patch('src.adapters.weather.openmeteo.retry'):
+    with patch("src.adapters.weather.openmeteo.openmeteo_requests.Client"):
+        with patch("src.adapters.weather.openmeteo.requests_cache.CachedSession"):
+            with patch("src.adapters.weather.openmeteo.retry"):
                 OpenMeteoAdapter(
                     latitude=37.7749,
                     longitude=-122.4194,
@@ -452,9 +443,7 @@ def test_adapter_initialization_creates_cache_dir(tmp_path):
 async def test_store_weather_forecasts(mock_pool, sample_weather_data):
     """Test store_weather_forecasts function."""
     depot_id = uuid4()
-    stored_count = await store_weather_forecasts(
-        mock_pool, sample_weather_data[:7], depot_id
-    )
+    stored_count = await store_weather_forecasts(mock_pool, sample_weather_data[:7], depot_id)
 
     assert stored_count == 7
     # Verify execute was called for each forecast
@@ -490,12 +479,12 @@ async def test_get_cached_forecasts(mock_pool):
 
     cached_rows = [
         {
-            'time': datetime(2025, 12, 4, 0, 0, 0, tzinfo=timezone.utc) + timedelta(days=d),
-            'temp_f': 70.0 + d,
-            'temp_max_f': 75.0 + d,
-            'temp_min_f': 65.0 + d,
-            'precip_in': 0.1 * d,
-            'solar_rad': 1000.0 + d * 10,
+            "time": datetime(2025, 12, 4, 0, 0, 0, tzinfo=timezone.utc) + timedelta(days=d),
+            "temp_f": 70.0 + d,
+            "temp_max_f": 75.0 + d,
+            "temp_min_f": 65.0 + d,
+            "precip_in": 0.1 * d,
+            "solar_rad": 1000.0 + d * 10,
         }
         for d in range(7)
     ]
@@ -504,7 +493,7 @@ async def test_get_cached_forecasts(mock_pool):
     forecasts = await get_cached_forecasts(mock_pool, depot_id, start, end)
 
     assert len(forecasts) == 7
-    assert all(f['temp_f'] > 0 for f in forecasts)
+    assert all(f["temp_f"] > 0 for f in forecasts)
 
 
 @pytest.mark.asyncio
@@ -527,20 +516,20 @@ async def test_get_latest_forecast(mock_pool):
     depot_id = uuid4()
 
     latest_row = {
-        'time': datetime(2025, 12, 4, 12, 0, 0, tzinfo=timezone.utc),
-        'temp_f': 70.0,
-        'temp_max_f': 75.0,
-        'temp_min_f': 65.0,
-        'precip_in': 0.1,
-        'solar_rad': 1000.0,
+        "time": datetime(2025, 12, 4, 12, 0, 0, tzinfo=timezone.utc),
+        "temp_f": 70.0,
+        "temp_max_f": 75.0,
+        "temp_min_f": 65.0,
+        "precip_in": 0.1,
+        "solar_rad": 1000.0,
     }
     mock_pool._mock_conn.fetchrow = AsyncMock(return_value=latest_row)
 
     forecast = await get_latest_forecast(mock_pool, depot_id)
 
     assert forecast is not None
-    assert forecast['temp_f'] == 70.0
-    assert forecast['time'] == datetime(2025, 12, 4, 12, 0, 0, tzinfo=timezone.utc)
+    assert forecast["temp_f"] == 70.0
+    assert forecast["time"] == datetime(2025, 12, 4, 12, 0, 0, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -560,7 +549,7 @@ async def test_get_depot_location(mock_pool):
     """Test get_depot_location function."""
     depot_id = uuid4()
 
-    location_row = {'latitude': 37.7749, 'longitude': -122.4194}
+    location_row = {"latitude": 37.7749, "longitude": -122.4194}
     mock_pool._mock_conn.fetchrow = AsyncMock(return_value=location_row)
 
     location = await get_depot_location(mock_pool, depot_id)
@@ -585,7 +574,7 @@ async def test_get_depot_location_missing_coords(mock_pool):
     """Test get_depot_location when coordinates are null."""
     depot_id = uuid4()
 
-    location_row = {'latitude': None, 'longitude': None}
+    location_row = {"latitude": None, "longitude": None}
     mock_pool._mock_conn.fetchrow = AsyncMock(return_value=location_row)
 
     location = await get_depot_location(mock_pool, depot_id)
@@ -601,9 +590,7 @@ async def test_store_weather_forecasts_database_error(mock_pool, sample_weather_
     """Test store_weather_forecasts handles database errors."""
     depot_id = uuid4()
 
-    mock_pool._mock_conn.execute = AsyncMock(
-        side_effect=asyncpg.PostgresError("Database error")
-    )
+    mock_pool._mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("Database error"))
 
     with pytest.raises(asyncpg.PostgresError):
         await store_weather_forecasts(mock_pool, sample_weather_data[:5], depot_id)
@@ -616,9 +603,7 @@ async def test_get_cached_forecasts_database_error(mock_pool):
     start = datetime(2025, 12, 4, 0, 0, 0, tzinfo=timezone.utc)
     end = datetime(2025, 12, 11, 0, 0, 0, tzinfo=timezone.utc)
 
-    mock_pool._mock_conn.fetch = AsyncMock(
-        side_effect=asyncpg.PostgresError("Database error")
-    )
+    mock_pool._mock_conn.fetch = AsyncMock(side_effect=asyncpg.PostgresError("Database error"))
 
     with pytest.raises(asyncpg.PostgresError):
         await get_cached_forecasts(mock_pool, depot_id, start, end)
@@ -635,7 +620,7 @@ def test_clear_cache(tmp_path):
     cache_file = tmp_path / "cache.sqlite"  # Sibling to directory, not inside
     cache_file.write_text("fake cache data")
 
-    with patch('src.adapters.weather.openmeteo._create_openmeteo_client'):
+    with patch("src.adapters.weather.openmeteo._create_openmeteo_client"):
         adapter = OpenMeteoAdapter(
             latitude=37.7749,
             longitude=-122.4194,
@@ -667,13 +652,11 @@ async def test_full_forecast_workflow(weather_adapter, mock_pool, mock_flatbuffe
     weather_adapter._client.weather_api.return_value = [mock_flatbuffers_response]
     mock_pool._mock_conn.fetch = AsyncMock(return_value=[])
     mock_pool._mock_conn.fetchrow = AsyncMock(
-        return_value={'latitude': 37.7749, 'longitude': -122.4194}
+        return_value={"latitude": 37.7749, "longitude": -122.4194}
     )
 
     # First call: should fetch from API
-    forecasts = await weather_adapter.get_forecasts_for_depot(
-        depot_id, days=3, use_cache=False
-    )
+    forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=3, use_cache=False)
 
     assert len(forecasts) == 3
     assert weather_adapter._client.weather_api.called
@@ -687,12 +670,12 @@ async def test_full_forecast_workflow(weather_adapter, mock_pool, mock_flatbuffe
     # Setup cache return
     cached_rows = [
         {
-            'time': f.timestamp,
-            'temp_f': f.temperature_f,
-            'temp_max_f': f.temperature_max_f,
-            'temp_min_f': f.temperature_min_f,
-            'precip_in': f.precipitation_inches,
-            'solar_rad': convert_solar_radiation_wm2_to_calcm2(f.solar_radiation),
+            "time": f.timestamp,
+            "temp_f": f.temperature_f,
+            "temp_max_f": f.temperature_max_f,
+            "temp_min_f": f.temperature_min_f,
+            "precip_in": f.precipitation_inches,
+            "solar_rad": convert_solar_radiation_wm2_to_calcm2(f.solar_radiation),
         }
         for f in forecasts
     ]

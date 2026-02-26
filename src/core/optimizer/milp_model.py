@@ -20,7 +20,7 @@ from .exceptions import (
 )
 
 if TYPE_CHECKING:
-    from pyomo.core import ConcreteModel
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -80,33 +80,25 @@ def _validate_inputs(state: DepotState, config: DepotConfig) -> None:
     # Validate config
     if not config.charger_groups:
         raise InvalidConfigError("charger_groups cannot be empty", "charger_groups")
-    
+
     for rated_kw, count in config.charger_groups.items():
         if rated_kw <= 0:
             raise InvalidConfigError(
-                f"Charger rated_kw must be positive, got {rated_kw}",
-                "charger_groups"
+                f"Charger rated_kw must be positive, got {rated_kw}", "charger_groups"
             )
         if count <= 0:
             raise InvalidConfigError(
-                f"Charger count must be positive for {rated_kw}kW, got {count}",
-                "charger_groups"
+                f"Charger count must be positive for {rated_kw}kW, got {count}", "charger_groups"
             )
 
     if config.max_site_power <= 0:
-        raise InvalidConfigError(
-            "max_site_power must be positive", "max_site_power"
-        )
+        raise InvalidConfigError("max_site_power must be positive", "max_site_power")
 
     if not (0 < config.charger_efficiency <= 1.0):
-        raise InvalidConfigError(
-            "charger_efficiency must be in (0, 1]", "charger_efficiency"
-        )
+        raise InvalidConfigError("charger_efficiency must be in (0, 1]", "charger_efficiency")
 
     if config.battery_capacity <= 0:
-        raise InvalidConfigError(
-            "battery_capacity must be positive", "battery_capacity"
-        )
+        raise InvalidConfigError("battery_capacity must be positive", "battery_capacity")
 
     if config.battery_power <= 0:
         raise InvalidConfigError("battery_power must be positive", "battery_power")
@@ -172,23 +164,15 @@ def build_optimization_model(
     model.B = pyo.Set(initialize=list(state.vehicle_socs.keys()))
 
     # Parameters
-    model.price = pyo.Param(
-        model.T, initialize=lambda m, t: state.prices[t]
-    )
-    model.E_batt = pyo.Param(
-        model.B, initialize=lambda m, b: config.vehicle_capacities[b]
-    )
-    model.soc_init = pyo.Param(
-        model.B, initialize=lambda m, b: state.vehicle_socs[b]
-    )
+    model.price = pyo.Param(model.T, initialize=lambda m, t: state.prices[t])
+    model.E_batt = pyo.Param(model.B, initialize=lambda m, b: config.vehicle_capacities[b])
+    model.soc_init = pyo.Param(model.B, initialize=lambda m, b: state.vehicle_socs[b])
     model.available = pyo.Param(
         model.B,
         model.T,
         initialize=lambda m, b, t: 1 if state.vehicle_availability[b][t] else 0,
     )
-    model.building_power = pyo.Param(
-        model.T, initialize=lambda m, t: state.building_power[t]
-    )
+    model.building_power = pyo.Param(model.T, initialize=lambda m, t: state.building_power[t])
 
     # Variables with tighter bounds
     # Per PRD Section 8.4, vehicle max_charge_kw is resolved from OCPP or config
@@ -198,7 +182,7 @@ def build_optimization_model(
         model.T,
         domain=pyo.NonNegativeReals,
     )
-    
+
     # Set per-vehicle bounds based on max_charge_kw
     for b in model.B:
         max_kw = config.vehicle_max_charge_kw.get(b, 80.0)
@@ -213,9 +197,7 @@ def build_optimization_model(
     model.P_peak = pyo.Var(domain=pyo.NonNegativeReals)
 
     # Battery storage variables
-    model.P_batt = pyo.Var(
-        model.T, bounds=(-config.battery_power, config.battery_power)
-    )
+    model.P_batt = pyo.Var(model.T, bounds=(-config.battery_power, config.battery_power))
     model.SoC_batt = pyo.Var(model.T, bounds=(0.2, 0.8))
 
     # Apply tighter SoC bounds
@@ -241,19 +223,18 @@ def build_optimization_model(
         return m.SoC[b, 0] == m.soc_init[b]
 
     model.soc_init_con = pyo.Constraint(model.B, rule=soc_init_rule)
-    
+
     # Incoming vehicle SoC initialization (per PRD Section 8.1 Constraint 12)
     # Pre-compute arrival timesteps for incoming vehicles
     # Use current time as horizon start if not provided
     if horizon_start is None:
         horizon_start = datetime.utcnow()
-    
+
     incoming_arrival_timesteps = {}
     for incoming in state.incoming_vehicles:
         vehicle_id_str = str(incoming.vehicle_id)
         arrival_timestep = int(
-            (incoming.arrival_time - horizon_start).total_seconds()
-            / (config.delta_t * 3600)
+            (incoming.arrival_time - horizon_start).total_seconds() / (config.delta_t * 3600)
         )
         if 0 <= arrival_timestep < config.n_timesteps:
             incoming_arrival_timesteps[vehicle_id_str] = (
@@ -262,6 +243,7 @@ def build_optimization_model(
             )
 
     if incoming_arrival_timesteps:
+
         def incoming_vehicle_soc_rule(m, b):
             if b in incoming_arrival_timesteps:
                 arrival_t, expected_soc = incoming_arrival_timesteps[b]
@@ -269,9 +251,7 @@ def build_optimization_model(
                 return m.SoC[b, arrival_t] == expected_soc
             return pyo.Constraint.Skip
 
-        model.incoming_vehicle_soc = pyo.Constraint(
-            model.B, rule=incoming_vehicle_soc_rule
-        )
+        model.incoming_vehicle_soc = pyo.Constraint(model.B, rule=incoming_vehicle_soc_rule)
 
     # SoC dynamics - recursive
     def soc_dynamics_rule(m, b, t):
@@ -293,9 +273,7 @@ def build_optimization_model(
     model.availability_con = pyo.Constraint(model.B, model.T, rule=availability_rule)
 
     # Variable fixing for vehicles on route at t=0 (performance optimization)
-    vehicles_on_route = [
-        b for b in model.B if not state.vehicle_availability[b][0]
-    ]
+    vehicles_on_route = [b for b in model.B if not state.vehicle_availability[b][0]]
     if vehicles_on_route:
         logger.debug(f"Fixing variables for {len(vehicles_on_route)} vehicles on route")
         for b in vehicles_on_route:
@@ -431,9 +409,7 @@ def build_optimization_model(
     # Grid balance with efficiency-adjusted battery power and preconditioning load
     def grid_balance_rule(m, t):
         # P_batt_effective = discharge * η - charge / η
-        P_batt_effective = (
-            m.P_batt_discharge[t] * eta_batt - m.P_batt_charge[t] / eta_batt
-        )
+        P_batt_effective = m.P_batt_discharge[t] * eta_batt - m.P_batt_charge[t] / eta_batt
         return (
             m.P_grid[t]
             == sum(m.P_charge[b, t] for b in m.B)
@@ -483,9 +459,7 @@ def build_optimization_model(
 
     # Objective: minimize energy cost + demand charges + preconditioning shortfall penalty
     def objective_rule(m):
-        energy_cost = sum(
-            m.price[t] * m.P_grid[t] * config.delta_t for t in m.T
-        )
+        energy_cost = sum(m.price[t] * m.P_grid[t] * config.delta_t for t in m.T)
         demand_cost = state.demand_charge_rate * m.P_peak
         precond_penalty = M_PRECOND * sum(m.precond_slack[t] for t in m.T)
         return energy_cost + demand_cost + precond_penalty
@@ -500,9 +474,7 @@ def build_optimization_model(
     return model
 
 
-def _validate_solution(
-    model: pyo.ConcreteModel, state: DepotState, config: DepotConfig
-) -> None:
+def _validate_solution(model: pyo.ConcreteModel, state: DepotState, config: DepotConfig) -> None:
     """Validate solution satisfies all constraints, especially departure SoC.
 
     Args:
@@ -584,19 +556,19 @@ def optimize(
     _validate_solution(model, state, config)
 
     # Determine status: use 'completed' for acceptance criteria (AT-*); solver outcome was optimal/feasible
-    status = 'completed'
+    status = "completed"
 
     # Convert to OptimizationResult
     run_id = uuid4()
-    solver_used = result_dict.get('solver_used', 'gurobi')
+    solver_used = result_dict.get("solver_used", "gurobi")
     result = OptimizationResult(
         run_id=run_id,
-        schedule=result_dict['schedule'],
-        battery_dispatch=result_dict['battery_dispatch'],
-        grid_power=result_dict['grid_power'],
-        peak_demand_kw=result_dict['peak_demand_kw'],
-        objective_value=result_dict['objective_value'],
-        solve_time_s=result_dict['solve_time_s'],
+        schedule=result_dict["schedule"],
+        battery_dispatch=result_dict["battery_dispatch"],
+        grid_power=result_dict["grid_power"],
+        peak_demand_kw=result_dict["peak_demand_kw"],
+        objective_value=result_dict["objective_value"],
+        solve_time_s=result_dict["solve_time_s"],
         status=status,
         solver_used=solver_used,
     )
@@ -609,4 +581,3 @@ def optimize(
     )
 
     return result
-

@@ -6,13 +6,15 @@ Per PRD Section 9.6: vehicles.external_id -> vehicles.vehicle_id.
 
 from __future__ import annotations
 
-from typing import Optional, Any
+from typing import Any, Optional
 
 try:
     import structlog
+
     _HAS_STRUCTLOG = True
 except ImportError:
     import logging
+
     structlog = None  # type: ignore
     _HAS_STRUCTLOG = False
 

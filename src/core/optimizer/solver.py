@@ -15,7 +15,7 @@ from .exceptions import (
 )
 
 if TYPE_CHECKING:
-    from pyomo.core import ConcreteModel
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -53,50 +53,52 @@ def solve_model(
     logger.info(f"Solving model ({start_type}) with time limit {time_limit}s")
 
     # Primary solver: Gurobi (per PRD Section 8.2)
-    solver_used = 'gurobi'
+    solver_used = "gurobi"
     try:
-        solver = pyo.SolverFactory('gurobi')
+        solver = pyo.SolverFactory("gurobi")
         if solver is None or not solver.available():
             raise SolverError("Gurobi solver not available", "license_check")
-        
+
         # Configure Gurobi per PRD Section 8.2
-        solver.options['TimeLimit'] = time_limit
-        solver.options['MIPGap'] = 0.01  # 1% optimality gap
-        solver.options['Threads'] = 4
-        solver.options['Presolve'] = 2  # Aggressive presolve
-        solver.options['NumericFocus'] = 3  # Highest numerical accuracy
-        solver.options['OutputFlag'] = 1
-        
+        solver.options["TimeLimit"] = time_limit
+        solver.options["MIPGap"] = 0.01  # 1% optimality gap
+        solver.options["Threads"] = 4
+        solver.options["Presolve"] = 2  # Aggressive presolve
+        solver.options["NumericFocus"] = 3  # Highest numerical accuracy
+        solver.options["OutputFlag"] = 1
+
         if warm_started:
-            solver.options['WarmStart'] = 1
-        
+            solver.options["WarmStart"] = 1
+
         logger.info("Attempting solve with Gurobi solver")
         result = solver.solve(model, tee=False)
-        
+
     except Exception as e:
         # Fallback to HiGHS if Gurobi fails
         logger.warning(f"Gurobi solver failed: {e}. Falling back to HiGHS.")
-        solver_used = 'highs'
-        
+        solver_used = "highs"
+
         try:
-            fallback_solver = pyo.SolverFactory('appsi_highs')
+            fallback_solver = pyo.SolverFactory("appsi_highs")
             if fallback_solver is None or not fallback_solver.available():
                 raise SolverError("HiGHS solver not available", "solver_unavailable")
-            
+
             # Configure HiGHS per PRD Section 8.2
-            fallback_solver.options['time_limit'] = time_limit
-            fallback_solver.options['mip_rel_gap'] = 0.01  # Same 1% gap target
-            fallback_solver.options['threads'] = 4
-            fallback_solver.options['presolve'] = 'on'
-            
+            fallback_solver.options["time_limit"] = time_limit
+            fallback_solver.options["mip_rel_gap"] = 0.01  # Same 1% gap target
+            fallback_solver.options["threads"] = 4
+            fallback_solver.options["presolve"] = "on"
+
             logger.info("Attempting solve with HiGHS fallback solver")
             result = fallback_solver.solve(model, tee=False)
-            
+
         except Exception as fallback_error:
-            logger.error(f"Both Gurobi and HiGHS solvers failed. Gurobi: {e}, HiGHS: {fallback_error}")
+            logger.error(
+                f"Both Gurobi and HiGHS solvers failed. Gurobi: {e}, HiGHS: {fallback_error}"
+            )
             raise SolverError(
                 f"Both solvers failed. Gurobi: {str(e)}, HiGHS: {str(fallback_error)}",
-                "solver_failure"
+                "solver_failure",
             )
 
     # Check termination condition
@@ -127,15 +129,13 @@ def solve_model(
         )
 
     # Extract solution
-    solve_time_s = getattr(result.solver, 'time', 0.0)
+    solve_time_s = getattr(result.solver, "time", 0.0)
 
     schedule = {}
     for b in model.B:
         schedule[str(b)] = {
-            'charging_power': [
-                pyo.value(model.P_charge[b, t]) for t in model.T
-            ],
-            'soc': [pyo.value(model.SoC[b, t]) for t in model.T],
+            "charging_power": [pyo.value(model.P_charge[b, t]) for t in model.T],
+            "soc": [pyo.value(model.SoC[b, t]) for t in model.T],
         }
 
     battery_dispatch = [pyo.value(model.P_batt[t]) for t in model.T]
@@ -149,16 +149,15 @@ def solve_model(
     )
 
     result_dict = {
-        'schedule': schedule,
-        'battery_dispatch': battery_dispatch,
-        'grid_power': grid_power,
-        'peak_demand_kw': peak_demand_kw,
-        'peak_demand': peak_demand_kw,
-        'objective_value': objective_value,
-        'solve_time_s': solve_time_s,
-        'solve_time': solve_time_s,
-        'solver_used': solver_used,
+        "schedule": schedule,
+        "battery_dispatch": battery_dispatch,
+        "grid_power": grid_power,
+        "peak_demand_kw": peak_demand_kw,
+        "peak_demand": peak_demand_kw,
+        "objective_value": objective_value,
+        "solve_time_s": solve_time_s,
+        "solve_time": solve_time_s,
+        "solver_used": solver_used,
     }
-    
-    return result_dict
 
+    return result_dict

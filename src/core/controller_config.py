@@ -5,7 +5,6 @@ Reference: Development plan Step 5.2
 
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -35,7 +34,7 @@ class ControllerConfig:
     shutdown_timeout_seconds: float = 30.0
 
     @classmethod
-    def from_env(cls) -> 'ControllerConfig':
+    def from_env(cls) -> "ControllerConfig":
         """Load configuration from environment variables.
 
         Environment variables:
@@ -53,36 +52,20 @@ class ControllerConfig:
             ControllerConfig instance with values from environment or defaults
         """
         return cls(
-            optimization_horizon_hours=int(
-                os.getenv('FAVONIUS_OPTIMIZATION_HORIZON_HOURS', '24')
-            ),
-            hourly_optimization_start=int(
-                os.getenv('FAVONIUS_HOURLY_OPT_START', '7')
-            ),
-            hourly_optimization_end=int(
-                os.getenv('FAVONIUS_HOURLY_OPT_END', '23')
-            ),
-            optimization_timeout=float(
-                os.getenv('FAVONIUS_OPTIMIZATION_TIMEOUT', '60.0')
-            ),
+            optimization_horizon_hours=int(os.getenv("FAVONIUS_OPTIMIZATION_HORIZON_HOURS", "24")),
+            hourly_optimization_start=int(os.getenv("FAVONIUS_HOURLY_OPT_START", "7")),
+            hourly_optimization_end=int(os.getenv("FAVONIUS_HOURLY_OPT_END", "23")),
+            optimization_timeout=float(os.getenv("FAVONIUS_OPTIMIZATION_TIMEOUT", "60.0")),
             trigger_cooldown_minutes=int(
                 os.getenv(
-                    'FAVONIUS_TRIGGER_COOLDOWN_MINUTES',
-                    os.getenv('FAVONIUS_TRIGGER_COOLDOWN_MIN', '5')
+                    "FAVONIUS_TRIGGER_COOLDOWN_MINUTES",
+                    os.getenv("FAVONIUS_TRIGGER_COOLDOWN_MIN", "5"),
                 )
             ),
-            max_optimization_failures=int(
-                os.getenv('FAVONIUS_MAX_OPT_FAILURES', '3')
-            ),
-            dispatch_retry_attempts=int(
-                os.getenv('FAVONIUS_DISPATCH_RETRIES', '3')
-            ),
-            dispatch_retry_delay_seconds=float(
-                os.getenv('FAVONIUS_DISPATCH_RETRY_DELAY', '2.0')
-            ),
-            shutdown_timeout_seconds=float(
-                os.getenv('FAVONIUS_SHUTDOWN_TIMEOUT', '30.0')
-            ),
+            max_optimization_failures=int(os.getenv("FAVONIUS_MAX_OPT_FAILURES", "3")),
+            dispatch_retry_attempts=int(os.getenv("FAVONIUS_DISPATCH_RETRIES", "3")),
+            dispatch_retry_delay_seconds=float(os.getenv("FAVONIUS_DISPATCH_RETRY_DELAY", "2.0")),
+            shutdown_timeout_seconds=float(os.getenv("FAVONIUS_SHUTDOWN_TIMEOUT", "30.0")),
         )
 
     def validate(self) -> None:
@@ -131,4 +114,3 @@ class ControllerConfig:
                 f"dispatch_retry_attempts must be non-negative, "
                 f"got: {self.dispatch_retry_attempts}"
             )
-

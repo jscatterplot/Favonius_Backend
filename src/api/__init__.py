@@ -1,2 +1,1 @@
 """FastAPI REST API endpoints."""
-

@@ -22,7 +22,7 @@ async def store_prices(
     pool: asyncpg.Pool,
     prices: list["CAISOPrice"],
     depot_id: str | UUID,
-    source: str = 'caiso_dam',
+    source: str = "caiso_dam",
     demand_charge_per_kw: Optional[float] = None,
 ) -> int:
     """Store CAISO prices to database.
@@ -76,10 +76,7 @@ async def store_prices(
                 )
                 stored_count += 1
 
-        logger.info(
-            f"Stored {stored_count} prices for depot {depot_id_str} "
-            f"(source: {source})"
-        )
+        logger.info(f"Stored {stored_count} prices for depot {depot_id_str} " f"(source: {source})")
         return stored_count
 
     except asyncpg.PostgresError as e:
@@ -134,9 +131,7 @@ async def get_cached_prices(
         raise
 
 
-async def get_latest_price(
-    pool: asyncpg.Pool, depot_id: str | UUID
-) -> Optional[dict]:
+async def get_latest_price(pool: asyncpg.Pool, depot_id: str | UUID) -> Optional[dict]:
     """Get the most recent price for a depot.
 
     Args:
@@ -167,4 +162,3 @@ async def get_latest_price(
     except asyncpg.PostgresError as e:
         logger.error(f"Database error getting latest price: {e}")
         raise
-

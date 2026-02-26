@@ -32,7 +32,9 @@ class Vehicle:
     vehicle_type: str  # 'bus_large', 'bus_small', 'van'
     battery_kwh: float
     max_charge_kw: float
-    id_tag: Optional[str] = None  # OCPP idTag used in Authorize messages to map sessions to vehicles
+    id_tag: Optional[str] = (
+        None  # OCPP idTag used in Authorize messages to map sessions to vehicles
+    )
 
 
 @dataclass
@@ -44,7 +46,7 @@ class Charger:
     ocpp_id: str
     rated_kw: float
     efficiency: float = 0.95
-    status: str = 'Available'
+    status: str = "Available"
 
 
 @dataclass
@@ -78,9 +80,10 @@ class Schedule:
 @dataclass
 class IncomingVehicle:
     """Vehicle arriving from another depot via handoff.
-    
+
     Reference: PRD_v2.md Section 6.2
     """
+
     vehicle_id: UUID
     external_id: str
     expected_soc: float
@@ -93,11 +96,12 @@ class IncomingVehicle:
 @dataclass
 class DepotConfig:
     """Static configuration for optimization.
-    
+
     Reference: PRD_v2.md Section 6.2
     Chargers are aggregated by rated_kw for optimization to reduce variable count.
     After optimization, power is allocated back to individual chargers.
     """
+
     vehicle_capacities: dict[str, float]  # vehicle_id -> kWh
     vehicle_max_charge_kw: dict[str, float]  # vehicle_id -> max charge rate (kW)
     charger_groups: dict[float, int]  # rated_kw -> count of chargers with that rating
@@ -116,11 +120,11 @@ class DepotConfig:
     @property
     def charger_power(self) -> float:
         """Alias for charger_groups (backward compatibility).
-        
+
         Returns the rated_kw of the first charger group.
         For single-group configs (most common), this matches the old API.
         For multi-group configs, returns the first group's rated_kw.
-        
+
         Note: This property is deprecated. Use charger_groups directly.
         """
         if not self.charger_groups:
@@ -131,9 +135,9 @@ class DepotConfig:
     @property
     def n_chargers(self) -> int:
         """Alias for charger_groups (backward compatibility).
-        
+
         Returns the sum of all charger group counts.
-        
+
         Note: This property is deprecated. Use sum(charger_groups.values()) directly.
         """
         return sum(self.charger_groups.values())
@@ -147,6 +151,7 @@ class DepotState:
     Assembled from database queries before each optimization run.
     VDV 463 (Sprint 2): vehicle_departure_soc_min/max, vehicle_priorities, preconditioning_requests.
     """
+
     vehicle_socs: dict[str, float]  # vehicle_id -> SoC [0,1]
     battery_soc: float  # Stationary battery SoC [0,1]
     prices: list[float]  # $/kWh per timestep
@@ -158,9 +163,15 @@ class DepotState:
     building_power: list[float]  # Building load per timestep (kW) - REQUIRED
     incoming_vehicles: list[IncomingVehicle] = field(default_factory=list)  # Inter-depot arrivals
     # VDV 463: per-vehicle SoC targets and priority (defaults used when absent)
-    vehicle_departure_soc_min: dict[str, float] = field(default_factory=dict)  # vehicle_id -> min SoC at departure (default 0.99)
-    vehicle_departure_soc_max: dict[str, float] = field(default_factory=dict)  # vehicle_id -> max SoC at departure (default 1.0)
-    vehicle_priorities: dict[str, int] = field(default_factory=dict)  # vehicle_id -> priority (higher = more important)
+    vehicle_departure_soc_min: dict[str, float] = field(
+        default_factory=dict
+    )  # vehicle_id -> min SoC at departure (default 0.99)
+    vehicle_departure_soc_max: dict[str, float] = field(
+        default_factory=dict
+    )  # vehicle_id -> max SoC at departure (default 1.0)
+    vehicle_priorities: dict[str, int] = field(
+        default_factory=dict
+    )  # vehicle_id -> priority (higher = more important)
     # Preconditioning: list of {vehicle_id, start_time, end_time, power_kw} (manual or automatic)
     preconditioning_requests: list[dict] = field(default_factory=list)
 
@@ -182,7 +193,7 @@ class OptimizationResult:
     objective_value: float
     solve_time_s: float  # Solve time in seconds
     status: str  # 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout'
-    solver_used: str = 'gurobi'  # 'gurobi' or 'highs'
+    solver_used: str = "gurobi"  # 'gurobi' or 'highs'
 
     def __init__(
         self,
@@ -199,8 +210,16 @@ class OptimizationResult:
         solver_used: str = "gurobi",
         **kwargs: object,
     ) -> None:
-        pkw = peak_demand_kw if peak_demand_kw is not None else (peak_demand if peak_demand is not None else 0.0)
-        sts = solve_time_s if solve_time_s is not None else (solve_time if solve_time is not None else 0.0)
+        pkw = (
+            peak_demand_kw
+            if peak_demand_kw is not None
+            else (peak_demand if peak_demand is not None else 0.0)
+        )
+        sts = (
+            solve_time_s
+            if solve_time_s is not None
+            else (solve_time if solve_time is not None else 0.0)
+        )
         self.run_id = run_id
         self.schedule = schedule
         self.battery_dispatch = battery_dispatch
@@ -218,4 +237,3 @@ class OptimizationResult:
     @property
     def solve_time(self) -> float:
         return self.solve_time_s
-

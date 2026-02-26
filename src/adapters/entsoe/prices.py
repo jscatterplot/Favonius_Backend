@@ -19,7 +19,7 @@ from uuid import UUID
 import asyncpg
 import httpx
 
-from .mappings import get_bidding_zone, is_european_timezone
+from .mappings import get_bidding_zone
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +110,7 @@ class ENTSOEAdapter:
             ValueError: If no bidding zone can be determined
             httpx.HTTPStatusError: On API errors
         """
-        zone = bidding_zone or (
-            get_bidding_zone(depot_timezone) if depot_timezone else None
-        )
+        zone = bidding_zone or (get_bidding_zone(depot_timezone) if depot_timezone else None)
         if not zone:
             raise ValueError(
                 f"Cannot determine bidding zone. Provide bidding_zone or a "
@@ -133,7 +131,9 @@ class ENTSOEAdapter:
 
         logger.debug(
             "Fetching ENTSO-E prices for zone %s from %s to %s",
-            zone, start_date, end_date,
+            zone,
+            start_date,
+            end_date,
         )
 
         response = await self.client.get(self.BASE_URL, params=params)
@@ -145,16 +145,18 @@ class ENTSOEAdapter:
         if response.status_code != 200:
             logger.error(
                 "ENTSO-E API error: HTTP %d - %s",
-                response.status_code, response.text[:500],
+                response.status_code,
+                response.text[:500],
             )
-            raise RuntimeError(
-                f"ENTSO-E API returned HTTP {response.status_code}"
-            )
+            raise RuntimeError(f"ENTSO-E API returned HTTP {response.status_code}")
 
         prices = _parse_price_document(response.text, zone)
         logger.info(
             "Fetched %d price points for zone %s (%s to %s)",
-            len(prices), zone, start_date, end_date,
+            len(prices),
+            zone,
+            start_date,
+            end_date,
         )
         return prices
 
@@ -175,7 +177,8 @@ class ENTSOEAdapter:
         now = datetime.now(timezone.utc)
         try:
             prices = await self.get_day_ahead_prices(
-                now, now + timedelta(hours=1),
+                now,
+                now + timedelta(hours=1),
                 bidding_zone=bidding_zone,
                 depot_timezone=depot_timezone,
             )
@@ -238,7 +241,9 @@ class ENTSOEAdapter:
 
             logger.info(
                 "Stored %d ENTSO-E prices for depot %s (source: %s)",
-                stored_count, depot_id_str, source,
+                stored_count,
+                depot_id_str,
+                source,
             )
             return stored_count
 
@@ -273,9 +278,7 @@ class ENTSOEAdapter:
         Returns:
             List of ENTSOEPrice objects
         """
-        zone = bidding_zone or (
-            get_bidding_zone(depot_timezone) if depot_timezone else None
-        )
+        zone = bidding_zone or (get_bidding_zone(depot_timezone) if depot_timezone else None)
 
         if use_cache and self.pool:
             try:
@@ -288,7 +291,8 @@ class ENTSOEAdapter:
                 logger.warning("Error getting cached ENTSO-E prices: %s", e)
 
         prices = await self.get_day_ahead_prices(
-            start_date, end_date,
+            start_date,
+            end_date,
             bidding_zone=zone,
             depot_timezone=depot_timezone,
         )
@@ -342,7 +346,8 @@ class ENTSOEAdapter:
 
         logger.debug(
             "Using %d cached ENTSO-E prices for depot %s",
-            len(prices), depot_id_str,
+            len(prices),
+            depot_id_str,
         )
         return prices
 

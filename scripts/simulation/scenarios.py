@@ -35,9 +35,7 @@ def morning_rush_scenario(
     """
     if start_time is None:
         # Start at midnight so departure_hour is straightforward
-        start_time = datetime.utcnow().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        start_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
     sim = DepotSimulator(
         n_vehicles=n_vehicles,
@@ -92,9 +90,7 @@ def price_spike_scenario(
         Configured DepotSimulator instance
     """
     if start_time is None:
-        start_time = datetime.utcnow().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        start_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
     sim = DepotSimulator(
         n_vehicles=n_vehicles,
@@ -134,9 +130,7 @@ def soc_deviation_scenario(
         Configured DepotSimulator instance
     """
     if start_time is None:
-        start_time = datetime.utcnow().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        start_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
     sim = DepotSimulator(
         n_vehicles=n_vehicles,
@@ -149,11 +143,7 @@ def soc_deviation_scenario(
         v.current_soc = random.uniform(0.6, 0.8)
 
     # Set one vehicle to have lower SoC (deviation)
-    target_vehicle = (
-        deviation_vehicle
-        if deviation_vehicle
-        else sim.vehicles[0].vehicle_id
-    )
+    target_vehicle = deviation_vehicle if deviation_vehicle else sim.vehicles[0].vehicle_id
     for v in sim.vehicles:
         if v.vehicle_id == target_vehicle:
             v.current_soc = max(0.1, v.current_soc - deviation_amount)
@@ -181,9 +171,7 @@ def demand_charge_scenario(
         Configured DepotSimulator instance
     """
     if start_time is None:
-        start_time = datetime.utcnow().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        start_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
     sim = DepotSimulator(
         n_vehicles=n_vehicles,
@@ -233,9 +221,7 @@ def inter_depot_scenario(
         Configured DepotSimulator instance
     """
     if start_time is None:
-        start_time = datetime.utcnow().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        start_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
     sim = DepotSimulator(
         n_vehicles=n_vehicles,
@@ -279,9 +265,7 @@ def realistic_depot_scenario(
         Configured DepotSimulator instance
     """
     if start_time is None:
-        start_time = datetime.utcnow().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        start_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
     sim = DepotSimulator(
         n_vehicles=n_vehicles,
@@ -314,9 +298,7 @@ def realistic_depot_scenario(
             vehicle_id = sim.vehicles[route_count].vehicle_id
             departure_hour = random.randint(pattern_start, pattern_end - 1)
             departure_time = start_time + timedelta(hours=departure_hour)
-            return_time = departure_time + timedelta(
-                hours=random.uniform(6, 10)
-            )
+            return_time = departure_time + timedelta(hours=random.uniform(6, 10))
             energy_kwh = random.uniform(150, 300)
 
             sim.add_route(
@@ -328,4 +310,3 @@ def realistic_depot_scenario(
             route_count += 1
 
     return sim
-

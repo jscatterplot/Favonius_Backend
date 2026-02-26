@@ -67,9 +67,9 @@ async def get_vehicle_to_charger_map(
             rows = await conn.fetch(query, depot_id_str)
 
         for row in rows:
-            vehicle_id = row['vehicle_id']
-            charge_point_id = row['charge_point_id']
-            connector_id = row['connector_id']
+            vehicle_id = row["vehicle_id"]
+            charge_point_id = row["charge_point_id"]
+            connector_id = row["connector_id"]
             mapping[vehicle_id] = (charge_point_id, connector_id)
 
         logger.info(
@@ -91,9 +91,7 @@ async def get_vehicle_to_charger_map(
         raise
 
 
-async def get_charger_id_from_ocpp_id(
-    pool: asyncpg.Pool, ocpp_id: str
-) -> Optional[UUID]:
+async def get_charger_id_from_ocpp_id(pool: asyncpg.Pool, ocpp_id: str) -> Optional[UUID]:
     """Get charger_id from OCPP charge point ID.
 
     Args:
@@ -113,7 +111,7 @@ async def get_charger_id_from_ocpp_id(
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(query, ocpp_id)
-        return row['charger_id'] if row else None
+        return row["charger_id"] if row else None
     except asyncpg.PostgresError as e:
         logger.error(f"Database error getting charger_id: {e}")
         raise
@@ -150,14 +148,6 @@ async def get_vehicle_id_from_ocpp_id(
     )
     return None
 
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(query, ocpp_id)
-        return row['vehicle_id'] if row else None
-    except asyncpg.PostgresError as e:
-        logger.error(f"Database error getting vehicle_id: {e}")
-        raise
-
 
 def clear_mapping_cache(depot_id: Optional[str | UUID] = None) -> None:
     """Clear the vehicle-to-charger mapping cache.
@@ -174,4 +164,3 @@ def clear_mapping_cache(depot_id: Optional[str | UUID] = None) -> None:
         if depot_id_str in _mapping_cache:
             del _mapping_cache[depot_id_str]
             logger.debug(f"Cleared mapping cache for depot {depot_id_str}")
-

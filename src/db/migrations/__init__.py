@@ -1,2 +1,1 @@
 """Database migration scripts."""
-

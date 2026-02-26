@@ -26,7 +26,6 @@ import requests_cache
 from retry_requests import retry
 
 from .storage import (
-    convert_solar_radiation_wm2_to_calcm2,
     get_cached_forecasts,
     get_depot_location,
     store_weather_forecasts,
@@ -88,7 +87,7 @@ def _create_openmeteo_client(
     cache_session = requests_cache.CachedSession(
         cache_file,
         expire_after=cache_expire_after,
-        backend='sqlite',
+        backend="sqlite",
     )
 
     # Add retry mechanism with exponential backoff
@@ -240,9 +239,7 @@ class OpenMeteoAdapter:
         daily_variables = list(daily.Variables())
 
         if len(daily_variables) < 4:
-            logger.warning(
-                f"Expected 4 daily variables, got {len(daily_variables)}"
-            )
+            logger.warning(f"Expected 4 daily variables, got {len(daily_variables)}")
             return []
 
         temp_max = daily_variables[self.DAILY_TEMP_MAX_INDEX].ValuesAsNumpy()
@@ -279,9 +276,7 @@ class OpenMeteoAdapter:
                 )
             )
 
-        logger.info(
-            f"Fetched {len(results)} days of weather forecast using FlatBuffers"
-        )
+        logger.info(f"Fetched {len(results)} days of weather forecast using FlatBuffers")
         return results
 
     async def get_forecast(self, days: int = 7) -> list[WeatherData]:
@@ -303,9 +298,7 @@ class OpenMeteoAdapter:
         # Run sync client in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         try:
-            results = await loop.run_in_executor(
-                None, self._fetch_forecast_sync, days
-            )
+            results = await loop.run_in_executor(None, self._fetch_forecast_sync, days)
             return results
         except Exception as e:
             logger.error(f"Error fetching weather forecast: {e}")
@@ -327,9 +320,7 @@ class OpenMeteoAdapter:
             RuntimeError: If database pool not configured
         """
         if not self.pool:
-            raise RuntimeError(
-                "Database pool not configured for OpenMeteoAdapter"
-            )
+            raise RuntimeError("Database pool not configured for OpenMeteoAdapter")
 
         return await store_weather_forecasts(self.pool, forecasts, depot_id)
 
@@ -356,59 +347,46 @@ class OpenMeteoAdapter:
             RuntimeError: If database pool not configured or depot location not found
         """
         if not self.pool:
-            raise RuntimeError(
-                "Database pool not configured for OpenMeteoAdapter"
-            )
+            raise RuntimeError("Database pool not configured for OpenMeteoAdapter")
 
         # Get depot location if not already set
         if self.latitude is None or self.longitude is None:
             location = await get_depot_location(self.pool, depot_id)
             if location is None:
-                raise RuntimeError(
-                    f"Could not find location for depot {depot_id}"
-                )
+                raise RuntimeError(f"Could not find location for depot {depot_id}")
             self.latitude, self.longitude = location
             logger.info(
-                f"Loaded location for depot {depot_id}: "
-                f"({self.latitude}, {self.longitude})"
+                f"Loaded location for depot {depot_id}: " f"({self.latitude}, {self.longitude})"
             )
 
         # Calculate time window
-        now = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        now = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         end_time = now + timedelta(days=days)
 
         # Try to get cached forecasts first
         if use_cache:
             try:
-                cached = await get_cached_forecasts(
-                    self.pool, depot_id, now, end_time
-                )
+                cached = await get_cached_forecasts(self.pool, depot_id, now, end_time)
                 if cached:
                     # Convert cached forecasts back to WeatherData objects
                     forecasts = []
                     for row in cached:
                         # Convert solar_rad from cal/cm² back to W/m² for WeatherData
-                        solar_wm2 = row['solar_rad'] / 2.064
+                        solar_wm2 = row["solar_rad"] / 2.064
                         forecasts.append(
                             WeatherData(
-                                timestamp=row['time'],
-                                temperature_f=row['temp_f'],
-                                temperature_max_f=row['temp_max_f'],
-                                temperature_min_f=row['temp_min_f'],
-                                precipitation_inches=row['precip_in'],
+                                timestamp=row["time"],
+                                temperature_f=row["temp_f"],
+                                temperature_max_f=row["temp_max_f"],
+                                temperature_min_f=row["temp_min_f"],
+                                precipitation_inches=row["precip_in"],
                                 solar_radiation=solar_wm2,
                             )
                         )
-                    logger.debug(
-                        f"Using {len(forecasts)} cached forecasts for depot {depot_id}"
-                    )
+                    logger.debug(f"Using {len(forecasts)} cached forecasts for depot {depot_id}")
                     return forecasts
             except Exception as e:
-                logger.warning(
-                    f"Error getting cached forecasts: {e}, fetching new"
-                )
+                logger.warning(f"Error getting cached forecasts: {e}, fetching new")
 
         # Fetch new forecasts
         forecasts = await self.get_forecast(days=days)

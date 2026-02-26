@@ -7,27 +7,27 @@ variable must be set to the Supabase project's JWT secret
 This ensures the frontend's Supabase session token is accepted
 directly — no separate login endpoint needed on Service A.
 """
+
 from __future__ import annotations
 
 import os
-import jwt
 from typing import Optional
-from fastapi import HTTPException, status, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # The Supabase JWT secret — same secret that signs all Supabase access tokens.
 # Set this env var to: Supabase Dashboard → Settings → API → JWT Secret
-JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 
 # Supabase uses HS256 by default
-JWT_ALGORITHM = os.getenv('JWT_ALGORITHM', 'HS256')
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 security = HTTPBearer()
 
 
-async def verify_token(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-) -> dict:
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """Verify a Supabase JWT token and return the decoded payload.
 
     The payload contains:

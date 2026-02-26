@@ -1,10 +1,11 @@
 """Configuration management for OCPP WebSocket handler."""
 
 import os
-from typing import Optional, List
-from pydantic import BaseModel, ConfigDict, Field, validator
-from .secrets_manager import SecretsManager, SecretsConfig
+from typing import List, Optional
 
+from pydantic import BaseModel, ConfigDict, Field, validator
+
+from .secrets_manager import SecretsConfig, SecretsManager
 
 def _parse_int_env(primary_name: str, fallback_name: Optional[str] = None, default: int = 0) -> int:
     """Parse integer env vars safely, tolerating unresolved templates like '$PORT'."""
@@ -44,6 +45,7 @@ def _parse_int_value(raw_value: Optional[str], default: int) -> int:
 
 class TLSConfig(BaseModel):
     """TLS configuration."""
+
     cert_path: Optional[str] = Field(default=None, description="TLS certificate path")
     key_path: Optional[str] = Field(default=None, description="TLS private key path")
     ca_path: Optional[str] = Field(default=None, description="CA certificate path")
@@ -52,17 +54,25 @@ class TLSConfig(BaseModel):
 
 class WebSocketConfig(BaseModel):
     """WebSocket server configuration."""
+
     port: int = Field(default=9000, description="WebSocket server port")
     host: str = Field(default="0.0.0.0", description="WebSocket server host")
-    max_connections: int = Field(default=100, description="Maximum concurrent connections (simplified)")
+    max_connections: int = Field(
+        default=100, description="Maximum concurrent connections (simplified)"
+    )
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
     message_timeout: int = Field(default=60, description="Message timeout in seconds")
-    max_message_size: int = Field(default=1048576, description="Maximum message size in bytes (PRD: 1 MB)")
-    rate_limit_per_minute: int = Field(default=100, description="Rate limit per connection per minute")
+    max_message_size: int = Field(
+        default=1048576, description="Maximum message size in bytes (PRD: 1 MB)"
+    )
+    rate_limit_per_minute: int = Field(
+        default=100, description="Rate limit per connection per minute"
+    )
 
 
 class TimescaleConfig(BaseModel):
     """TimescaleDB configuration."""
+
     service_url: str = Field(description="TimescaleDB service URL")
     host: str = Field(description="Database host")
     port: int = Field(default=5432, description="Database port")
@@ -81,6 +91,7 @@ class TimescaleConfig(BaseModel):
 
 class SupabaseConfig(BaseModel):
     """Supabase configuration."""
+
     url: str = Field(description="Supabase project URL")
     anon_key: str = Field(description="Supabase anonymous key")
     service_key: str = Field(description="Supabase service role key")
@@ -96,6 +107,7 @@ class SupabaseConfig(BaseModel):
 
 class MonitoringConfig(BaseModel):
     """Monitoring and observability configuration."""
+
     metrics_port: int = Field(default=8080, description="Prometheus metrics port")
     log_level: str = Field(default="INFO", description="Log level")
     enable_telemetry: bool = Field(default=True, description="Enable telemetry collection")
@@ -106,54 +118,61 @@ class MonitoringConfig(BaseModel):
 
 class PriceFeederConfig(BaseModel):
     """Price feeder configuration."""
+
     enabled: bool = Field(default=True, description="Enable price feeder")
     base_url: str = Field(
-        default="https://oasis.caiso.com/oasisapi/SingleZip",
-        description="CAISO OASIS API base URL"
+        default="https://oasis.caiso.com/oasisapi/SingleZip", description="CAISO OASIS API base URL"
     )
     nodes: List[str] = Field(
         default_factory=lambda: ["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"],
-        description="CAISO pricing nodes to monitor"
+        description="CAISO pricing nodes to monitor",
     )
     entsoe_zones: List[str] = Field(
         default_factory=list,
-        description="ENTSO-E bidding zone EIC codes for European depots (e.g., '10Y1001A1001A82H' for DE-LU)"
+        description="ENTSO-E bidding zone EIC codes for European depots (e.g., '10Y1001A1001A82H' for DE-LU)",
     )
-    fetch_interval_seconds: int = Field(default=900, description="Price refresh interval in seconds")
+    fetch_interval_seconds: int = Field(
+        default=900, description="Price refresh interval in seconds"
+    )
     lookahead_hours: int = Field(default=24, description="Forecast horizon in hours")
 
 
 class OptimizationServiceConfig(BaseModel):
     """Optimization engine configuration."""
+
     enabled: bool = Field(default=True, description="Enable optimization service")
     horizon_hours: int = Field(default=4, description="Optimization horizon in hours")
     timestep_minutes: int = Field(default=60, description="Optimization timestep in minutes")
-    soc_minimum: float = Field(default=0.2, description="Minimum allowed state of charge (fraction)")
+    soc_minimum: float = Field(
+        default=0.2, description="Minimum allowed state of charge (fraction)"
+    )
     soc_target: float = Field(default=0.8, description="Target state of charge before departure")
     charge_power_kw: float = Field(default=22.0, description="Default charge power limit in kW")
-    discharge_power_kw: float = Field(default=10.0, description="Default discharge power limit in kW")
+    discharge_power_kw: float = Field(
+        default=10.0, description="Default discharge power limit in kW"
+    )
     battery_capacity_kwh: float = Field(default=75.0, description="Default battery capacity in kWh")
 
 
 class VDV463Config(BaseModel):
     """VDV 463 transit operations configuration."""
+
     enabled: bool = Field(default=True, description="Enable VDV 463 support")
     validation_mode: str = Field(
         default="soft",
-        description="Validation mode: 'soft' (warn only, default) or 'hard' (reject invalid)"
+        description="Validation mode: 'soft' (warn only, default) or 'hard' (reject invalid)",
     )
     schema_dir: Optional[str] = Field(
-        default=None,
-        description="Directory containing VDV 463 JSON schemas"
+        default=None, description="Directory containing VDV 463 JSON schemas"
     )
     default_depot_id: Optional[str] = Field(
-        default=None,
-        description="Default depot ID for VDV 463 connections"
+        default=None, description="Default depot ID for VDV 463 connections"
     )
 
 
 class Config(BaseModel):
     """Main application configuration."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
     tls: TLSConfig = Field(default_factory=TLSConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
@@ -163,23 +182,25 @@ class Config(BaseModel):
     price_feeder: PriceFeederConfig = Field(default_factory=PriceFeederConfig)
     optimization: OptimizationServiceConfig = Field(default_factory=OptimizationServiceConfig)
     vdv463: VDV463Config = Field(default_factory=VDV463Config)
-    
+
     # Environment-specific settings
-    environment: str = Field(default="development", description="Environment (development/staging/production)")
+    environment: str = Field(
+        default="development", description="Environment (development/staging/production)"
+    )
     debug: bool = Field(default=False, description="Debug mode")
-    
+
     # Secrets management
     secrets_manager: Optional[SecretsManager] = None
-    
-    @validator('timescale', 'supabase', pre=True, always=True)
+
+    @validator("timescale", "supabase", pre=True, always=True)
     def validate_credentials(cls, v, values):
         """Validate that required credentials are present."""
-        if hasattr(v, 'password') and not v.password:
+        if hasattr(v, "password") and not v.password:
             raise ValueError("Database password is required")
-        if hasattr(v, 'service_key') and not v.service_key:
+        if hasattr(v, "service_key") and not v.service_key:
             raise ValueError("Supabase service key is required")
         return v
-    
+
     @classmethod
     def from_env(cls) -> "Config":
         """Create configuration from environment variables."""
@@ -188,10 +209,10 @@ class Config(BaseModel):
             secrets_file=os.getenv("SECRETS_FILE"),
             encryption_key=os.getenv("SECRETS_ENCRYPTION_KEY"),
             use_kubernetes_secrets=os.getenv("USE_KUBERNETES_SECRETS", "true").lower() == "true",
-            fallback_to_env=os.getenv("FALLBACK_TO_ENV", "true").lower() == "true"
+            fallback_to_env=os.getenv("FALLBACK_TO_ENV", "true").lower() == "true",
         )
         secrets_manager = SecretsManager(secrets_config)
-        
+
         return cls(
             tls=TLSConfig(
                 cert_path=os.getenv("TLS_CERT_PATH"),
@@ -209,20 +230,37 @@ class Config(BaseModel):
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
             ),
             timescale=TimescaleConfig(
-                service_url=secrets_manager.get_secret("TIMESCALE_SERVICE_URL") or os.getenv("TIMESCALE_SERVICE_URL"),
+                service_url=secrets_manager.get_secret("TIMESCALE_SERVICE_URL")
+                or os.getenv("TIMESCALE_SERVICE_URL"),
                 host=secrets_manager.get_secret("PGHOST") or os.getenv("PGHOST"),
                 port=_parse_int_value(secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT"), 5432),
                 database=secrets_manager.get_secret("PGDATABASE") or os.getenv("PGDATABASE", "tsdb"),
                 user=secrets_manager.get_secret("PGUSER") or os.getenv("PGUSER"),
                 password=secrets_manager.get_secret("PGPASSWORD") or os.getenv("PGPASSWORD"),
-                sslmode=secrets_manager.get_secret("PGSSLMODE") or os.getenv("PGSSLMODE", "require"),
-                max_connections=int(secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS") or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")),
-                pool_size=int(secrets_manager.get_secret("TIMESCALE_POOL_SIZE") or os.getenv("TIMESCALE_POOL_SIZE", "20")),
-                statement_timeout=int(secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT") or os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")),
-                idle_timeout=int(secrets_manager.get_secret("TIMESCALE_IDLE_TIMEOUT") or os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")),
-                chunk_time_interval=secrets_manager.get_secret("TIMESCALE_CHUNK_INTERVAL") or os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
-                compression_after=secrets_manager.get_secret("TIMESCALE_COMPRESSION_AFTER") or os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
-                retention_period=secrets_manager.get_secret("TIMESCALE_RETENTION_PERIOD") or os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
+                sslmode=secrets_manager.get_secret("PGSSLMODE")
+                or os.getenv("PGSSLMODE", "require"),
+                max_connections=int(
+                    secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS")
+                    or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")
+                ),
+                pool_size=int(
+                    secrets_manager.get_secret("TIMESCALE_POOL_SIZE")
+                    or os.getenv("TIMESCALE_POOL_SIZE", "20")
+                ),
+                statement_timeout=int(
+                    secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT")
+                    or os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")
+                ),
+                idle_timeout=int(
+                    secrets_manager.get_secret("TIMESCALE_IDLE_TIMEOUT")
+                    or os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")
+                ),
+                chunk_time_interval=secrets_manager.get_secret("TIMESCALE_CHUNK_INTERVAL")
+                or os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
+                compression_after=secrets_manager.get_secret("TIMESCALE_COMPRESSION_AFTER")
+                or os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
+                retention_period=secrets_manager.get_secret("TIMESCALE_RETENTION_PERIOD")
+                or os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
             ),
             supabase=SupabaseConfig(
                 url=secrets_manager.get_secret("SUPABASE_URL") or os.getenv("SUPABASE_URL"),
@@ -245,9 +283,21 @@ class Config(BaseModel):
             ),
             price_feeder=PriceFeederConfig(
                 enabled=os.getenv("PRICE_FEEDER_ENABLED", "true").lower() == "true",
-                base_url=os.getenv("PRICE_FEEDER_BASE_URL", "https://oasis.caiso.com/oasisapi/SingleZip"),
-                nodes=[node.strip() for node in os.getenv("PRICE_FEEDER_NODES", "TH_SP15_GEN-APND,TH_NP15_GEN-APND").split(",") if node.strip()],
-                entsoe_zones=[z.strip() for z in os.getenv("PRICE_FEEDER_ENTSOE_ZONES", "").split(",") if z.strip()],
+                base_url=os.getenv(
+                    "PRICE_FEEDER_BASE_URL", "https://oasis.caiso.com/oasisapi/SingleZip"
+                ),
+                nodes=[
+                    node.strip()
+                    for node in os.getenv(
+                        "PRICE_FEEDER_NODES", "TH_SP15_GEN-APND,TH_NP15_GEN-APND"
+                    ).split(",")
+                    if node.strip()
+                ],
+                entsoe_zones=[
+                    z.strip()
+                    for z in os.getenv("PRICE_FEEDER_ENTSOE_ZONES", "").split(",")
+                    if z.strip()
+                ],
                 fetch_interval_seconds=int(os.getenv("PRICE_FEEDER_FETCH_INTERVAL", "900")),
                 lookahead_hours=int(os.getenv("PRICE_FEEDER_LOOKAHEAD_HOURS", "24")),
             ),

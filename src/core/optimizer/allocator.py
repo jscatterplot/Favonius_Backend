@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Optional
-from uuid import UUID
 
 from ..models import DepotConfig, OptimizationResult
 
@@ -32,7 +31,9 @@ def allocate_chargers(
     result: OptimizationResult,
     config: DepotConfig,
     charger_ids_by_rating: dict[float, list[str]],  # rated_kw -> list of charger_ids
-    vehicle_priorities: Optional[dict[str, float]] = None,  # vehicle_id -> priority (lower = higher priority)
+    vehicle_priorities: Optional[
+        dict[str, float]
+    ] = None,  # vehicle_id -> priority (lower = higher priority)
 ) -> list[ChargerAssignment]:
     """Allocate optimized power to individual chargers.
 
@@ -68,7 +69,7 @@ def allocate_chargers(
         vehicle_priorities = {}
         for vid, schedule_data in result.schedule.items():
             # Find first timestep where vehicle charges
-            charging_power = schedule_data.get('charging_power', [])
+            charging_power = schedule_data.get("charging_power", [])
             first_charge_t = next(
                 (t for t, power in enumerate(charging_power) if power > 0.1),
                 n_timesteps,
@@ -78,16 +79,16 @@ def allocate_chargers(
     for t in range(n_timesteps):
         # Get vehicles that need charging this timestep
         charging_vehicles = [
-            (vid, result.schedule[vid]['charging_power'][t])
+            (vid, result.schedule[vid]["charging_power"][t])
             for vid in result.schedule
-            if result.schedule[vid]['charging_power'][t] > 0.1
+            if result.schedule[vid]["charging_power"][t] > 0.1
         ]
 
         if not charging_vehicles:
             continue
 
         # Sort by priority (lower priority value = higher priority)
-        charging_vehicles.sort(key=lambda x: vehicle_priorities.get(x[0], float('inf')))
+        charging_vehicles.sort(key=lambda x: vehicle_priorities.get(x[0], float("inf")))
 
         # Track which chargers are used this timestep
         used_chargers: set[str] = set()
@@ -102,9 +103,7 @@ def allocate_chargers(
 
             # Try to allocate to accessible chargers
             # Sort charger groups by power rating (higher first for better matching)
-            sorted_groups = sorted(
-                charger_ids_by_rating.items(), key=lambda x: x[0], reverse=True
-            )
+            sorted_groups = sorted(charger_ids_by_rating.items(), key=lambda x: x[0], reverse=True)
 
             for rated_kw, charger_ids in sorted_groups:
                 if remaining_power <= 0:
@@ -117,13 +116,8 @@ def allocate_chargers(
                         continue
 
                     # Check physical accessibility
-                    accessible_vehicles = config.charger_vehicle_access.get(
-                        charger_id, set()
-                    )
-                    if (
-                        accessible_vehicles
-                        and vehicle_id not in accessible_vehicles
-                    ):
+                    accessible_vehicles = config.charger_vehicle_access.get(charger_id, set())
+                    if accessible_vehicles and vehicle_id not in accessible_vehicles:
                         continue
 
                     accessible_chargers.append(charger_id)
@@ -162,7 +156,5 @@ def allocate_chargers(
                     "constraint violation or missing charger accessibility."
                 )
 
-    logger.info(
-        f"Allocated {len(assignments)} charger assignments across {n_timesteps} timesteps"
-    )
+    logger.info(f"Allocated {len(assignments)} charger assignments across {n_timesteps} timesteps")
     return assignments

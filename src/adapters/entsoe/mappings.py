@@ -10,40 +10,40 @@ from __future__ import annotations
 
 # Country code (ISO 3166-1 alpha-2) -> EIC area code
 COUNTRY_TO_BIDDING_ZONE: dict[str, str] = {
-    "AL": "10YAL-KESH-----5",       # Albania
-    "AT": "10YAT-APG------L",       # Austria
-    "BE": "10YBE----------2",       # Belgium
-    "BA": "10YBA-JPCC-----D",       # Bosnia & Herzegovina
-    "BG": "10YCA-BULGARIA-R",       # Bulgaria
-    "HR": "10YHR-HEP------M",       # Croatia
-    "CZ": "10YCZ-CEPS-----N",       # Czech Republic
-    "DK": "10YDK-1--------W",       # Denmark (West - default)
-    "EE": "10Y1001A1001A39I",       # Estonia
-    "FI": "10YFI-1--------U",       # Finland
-    "FR": "10YFR-RTE------C",       # France
-    "DE": "10Y1001A1001A82H",       # Germany/Luxembourg
-    "GB": "10YGB----------A",       # Great Britain
-    "GR": "10YGR-HTSO-----Y",       # Greece
-    "HU": "10YHU-MAVIR----U",       # Hungary
-    "IE": "10Y1001A1001A59C",       # Ireland (SEM)
-    "IT": "10Y1001A1001A73I",       # Italy (North - default)
-    "LV": "10YLV-1001A00074",       # Latvia
-    "LT": "10YLT-1001A0008Q",       # Lithuania
-    "LU": "10YLU-CEGEDEL-NQ",       # Luxembourg
-    "MT": "10Y1001A1001A93C",       # Malta
-    "ME": "10YCS-CG-TSO---S",       # Montenegro
-    "NL": "10YNL----------L",       # Netherlands
-    "MK": "10YMK-MEPSO----8",       # North Macedonia
-    "NO": "10YNO-1--------2",       # Norway (South-East - default)
-    "PL": "10YPL-AREA-----S",       # Poland
-    "PT": "10YPT-REN------W",       # Portugal
-    "RO": "10YRO-TEL------P",       # Romania
-    "RS": "10YCS-SERBIATSOV",       # Serbia
-    "SK": "10YSK-SEPS-----K",       # Slovakia
-    "SI": "10YSI-ELES-----O",       # Slovenia
-    "ES": "10YES-REE------0",       # Spain
-    "SE": "10Y1001A1001A46L",       # Sweden (Stockholm - default)
-    "CH": "10YCH-SWISSGRIDZ",       # Switzerland
+    "AL": "10YAL-KESH-----5",  # Albania
+    "AT": "10YAT-APG------L",  # Austria
+    "BE": "10YBE----------2",  # Belgium
+    "BA": "10YBA-JPCC-----D",  # Bosnia & Herzegovina
+    "BG": "10YCA-BULGARIA-R",  # Bulgaria
+    "HR": "10YHR-HEP------M",  # Croatia
+    "CZ": "10YCZ-CEPS-----N",  # Czech Republic
+    "DK": "10YDK-1--------W",  # Denmark (West - default)
+    "EE": "10Y1001A1001A39I",  # Estonia
+    "FI": "10YFI-1--------U",  # Finland
+    "FR": "10YFR-RTE------C",  # France
+    "DE": "10Y1001A1001A82H",  # Germany/Luxembourg
+    "GB": "10YGB----------A",  # Great Britain
+    "GR": "10YGR-HTSO-----Y",  # Greece
+    "HU": "10YHU-MAVIR----U",  # Hungary
+    "IE": "10Y1001A1001A59C",  # Ireland (SEM)
+    "IT": "10Y1001A1001A73I",  # Italy (North - default)
+    "LV": "10YLV-1001A00074",  # Latvia
+    "LT": "10YLT-1001A0008Q",  # Lithuania
+    "LU": "10YLU-CEGEDEL-NQ",  # Luxembourg
+    "MT": "10Y1001A1001A93C",  # Malta
+    "ME": "10YCS-CG-TSO---S",  # Montenegro
+    "NL": "10YNL----------L",  # Netherlands
+    "MK": "10YMK-MEPSO----8",  # North Macedonia
+    "NO": "10YNO-1--------2",  # Norway (South-East - default)
+    "PL": "10YPL-AREA-----S",  # Poland
+    "PT": "10YPT-REN------W",  # Portugal
+    "RO": "10YRO-TEL------P",  # Romania
+    "RS": "10YCS-SERBIATSOV",  # Serbia
+    "SK": "10YSK-SEPS-----K",  # Slovakia
+    "SI": "10YSI-ELES-----O",  # Slovenia
+    "ES": "10YES-REE------0",  # Spain
+    "SE": "10Y1001A1001A46L",  # Sweden (Stockholm - default)
+    "CH": "10YCH-SWISSGRIDZ",  # Switzerland
 }
 
 # Map IANA timezones to country codes for automatic region detection
@@ -92,8 +92,6 @@ TIMEZONE_TO_COUNTRY: dict[str, str] = {
     "Europe/Marseille": "FR",
     "Europe/Lyon": "FR",
     "Europe/Barcelona": "ES",
-    "Europe/Lisbon": "PT",
-    "Europe/Helsinki": "FI",
 }
 
 # Direct timezone -> EIC code mapping (for convenience)

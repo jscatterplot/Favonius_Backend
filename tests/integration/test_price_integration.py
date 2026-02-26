@@ -3,7 +3,6 @@
 Reference: Development plan Step 3.2, PRD.md#11-3-integration-test-requirements
 """
 
-import asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -14,10 +13,9 @@ from src.adapters.caiso import (
     CAISOAdapter,
     PriceIngestionService,
     get_cached_prices,
-    store_prices,
 )
-from src.core.state.assembler import StateAssembler
 from src.core.models import DepotConfig
+from src.core.state.assembler import StateAssembler
 
 
 @pytest.fixture
@@ -27,8 +25,8 @@ async def test_db_pool():
     import os
 
     db_url = os.getenv(
-        'TEST_DATABASE_URL',
-        'postgresql://postgres:postgres@localhost:5432/favonius_test',
+        "TEST_DATABASE_URL",
+        "postgresql://postgres:postgres@localhost:5432/favonius_test",
     )
 
     pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
@@ -53,10 +51,10 @@ async def test_depot_id(test_db_pool):
             ON CONFLICT (depot_id) DO NOTHING
             """,
             depot_id,
-            'Test Depot',
+            "Test Depot",
             37.7749,
             -122.4194,
-            'America/Los_Angeles',
+            "America/Los_Angeles",
             1000.0,
             20.0,
         )
@@ -65,8 +63,8 @@ async def test_depot_id(test_db_pool):
 
     # Cleanup
     async with test_db_pool.acquire() as conn:
-        await conn.execute('DELETE FROM prices WHERE depot_id = $1', depot_id)
-        await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+        await conn.execute("DELETE FROM prices WHERE depot_id = $1", depot_id)
+        await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
 
 @pytest.mark.asyncio
@@ -83,9 +81,7 @@ async def test_caiso_to_database_flow(test_db_pool, test_depot_id):
     assert len(prices) == 24
 
     # Store prices
-    stored_count = await adapter.store_prices_to_db(
-        prices, test_depot_id, source='caiso_dam'
-    )
+    stored_count = await adapter.store_prices_to_db(prices, test_depot_id, source="caiso_dam")
 
     assert stored_count == 24
 
@@ -93,8 +89,8 @@ async def test_caiso_to_database_flow(test_db_pool, test_depot_id):
     cached = await get_cached_prices(test_db_pool, test_depot_id, start, end)
 
     assert len(cached) == 24
-    assert all(p['source'] == 'caiso_dam' for p in cached)
-    assert all(p['energy_kwh'] > 0 for p in cached)
+    assert all(p["source"] == "caiso_dam" for p in cached)
+    assert all(p["energy_kwh"] > 0 for p in cached)
 
 
 @pytest.mark.asyncio
@@ -106,19 +102,13 @@ async def test_price_caching(test_db_pool, test_depot_id):
     end = start + timedelta(hours=12)
 
     # First fetch: should store to database
-    prices1 = await adapter.get_prices_for_depot(
-        test_depot_id, start, end, use_cache=False
-    )
+    prices1 = await adapter.get_prices_for_depot(test_depot_id, start, end, use_cache=False)
 
     assert len(prices1) == 12
 
     # Second fetch with cache: should use cached data
-    with pytest.mock.patch.object(
-        adapter, 'get_day_ahead_prices'
-    ) as mock_fetch:
-        prices2 = await adapter.get_prices_for_depot(
-            test_depot_id, start, end, use_cache=True
-        )
+    with pytest.mock.patch.object(adapter, "get_day_ahead_prices"):
+        prices2 = await adapter.get_prices_for_depot(test_depot_id, start, end, use_cache=True)
 
         # Should not call get_day_ahead_prices if cache hit
         # (In practice, it might still be called, but we verify cache is used)
@@ -126,9 +116,7 @@ async def test_price_caching(test_db_pool, test_depot_id):
 
 
 @pytest.mark.asyncio
-async def test_state_assembler_reads_prices(
-    test_db_pool, test_depot_id
-):
+async def test_state_assembler_reads_prices(test_db_pool, test_depot_id):
     """Test StateAssembler can read prices from database."""
     # Store prices first
     adapter = CAISOAdapter(pool=test_db_pool)
@@ -136,7 +124,7 @@ async def test_state_assembler_reads_prices(
     end = start + timedelta(hours=24)
 
     prices = await adapter.get_day_ahead_prices(start, end)
-    await adapter.store_prices_to_db(prices, test_depot_id, source='caiso_dam')
+    await adapter.store_prices_to_db(prices, test_depot_id, source="caiso_dam")
 
     # Create StateAssembler
     config = DepotConfig(
@@ -193,10 +181,10 @@ async def test_price_ingestion_all_depots(test_db_pool):
                 ON CONFLICT (depot_id) DO NOTHING
                 """,
                 depot_id,
-                f'Test Depot {depot_id}',
+                f"Test Depot {depot_id}",
                 37.7749,
                 -122.4194,
-                'America/Los_Angeles',
+                "America/Los_Angeles",
                 1000.0,
                 20.0,
             )
@@ -217,8 +205,8 @@ async def test_price_ingestion_all_depots(test_db_pool):
         # Cleanup
         async with test_db_pool.acquire() as conn:
             for depot_id in depot_ids:
-                await conn.execute('DELETE FROM prices WHERE depot_id = $1', depot_id)
-                await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+                await conn.execute("DELETE FROM prices WHERE depot_id = $1", depot_id)
+                await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
 
 @pytest.mark.asyncio
@@ -229,7 +217,7 @@ async def test_fallback_to_cached_prices(test_db_pool, test_depot_id):
     # Store some cached prices first
     start = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
     prices = await adapter.get_day_ahead_prices(start, start + timedelta(hours=6))
-    await adapter.store_prices_to_db(prices, test_depot_id, source='caiso_dam')
+    await adapter.store_prices_to_db(prices, test_depot_id, source="caiso_dam")
 
     # Simulate API failure by mocking get_day_ahead_prices to raise
     original_method = adapter.get_day_ahead_prices
@@ -259,21 +247,15 @@ async def test_price_storage_upsert(test_db_pool, test_depot_id):
     prices1 = await adapter.get_day_ahead_prices(start, start + timedelta(hours=1))
 
     # Store first time
-    count1 = await adapter.store_prices_to_db(
-        prices1, test_depot_id, source='caiso_dam'
-    )
+    count1 = await adapter.store_prices_to_db(prices1, test_depot_id, source="caiso_dam")
     assert count1 == 1
 
     # Store again (should upsert, not duplicate)
-    count2 = await adapter.store_prices_to_db(
-        prices1, test_depot_id, source='caiso_dam'
-    )
+    count2 = await adapter.store_prices_to_db(prices1, test_depot_id, source="caiso_dam")
     assert count2 == 1
 
     # Verify only one row per time+depot
-    cached = await get_cached_prices(
-        test_db_pool, test_depot_id, start, start + timedelta(hours=1)
-    )
+    cached = await get_cached_prices(test_db_pool, test_depot_id, start, start + timedelta(hours=1))
     assert len(cached) == 1
 
 
@@ -288,14 +270,11 @@ async def test_price_conversion_mwh_to_kwh(test_db_pool, test_depot_id):
     # Peak price should be 250.0 $/MWh = 0.25 $/kWh
     peak_price = prices[0]
     if peak_price.lmp == 250.0:
-        await adapter.store_prices_to_db(
-            [peak_price], test_depot_id, source='caiso_dam'
-        )
+        await adapter.store_prices_to_db([peak_price], test_depot_id, source="caiso_dam")
 
         cached = await get_cached_prices(
             test_db_pool, test_depot_id, start, start + timedelta(hours=1)
         )
 
         assert len(cached) == 1
-        assert cached[0]['energy_kwh'] == 0.25  # 250.0 / 1000.0
-
+        assert cached[0]["energy_kwh"] == 0.25  # 250.0 / 1000.0

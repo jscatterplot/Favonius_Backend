@@ -3,7 +3,6 @@
 Tests the ENTSO-E Transparency Platform adapter for European electricity pricing.
 """
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -14,11 +13,9 @@ import pytest
 from src.adapters.entsoe import ENTSOEAdapter, ENTSOEPrice, get_bidding_zone, is_european_timezone
 from src.adapters.entsoe.mappings import (
     COUNTRY_TO_BIDDING_ZONE,
-    TIMEZONE_TO_BIDDING_ZONE,
     get_bidding_zone_for_country,
 )
 from src.adapters.entsoe.prices import _format_entsoe_time, _parse_price_document, _parse_utc_time
-
 
 # ============ Fixtures ============
 
@@ -171,9 +168,32 @@ def test_get_bidding_zone_for_country():
 def test_all_major_countries_mapped():
     """Test that all major European countries have mappings."""
     major_countries = [
-        "DE", "FR", "NL", "BE", "AT", "ES", "PT", "IT", "GB",
-        "PL", "CZ", "SK", "HU", "RO", "BG", "GR", "FI", "SE",
-        "NO", "DK", "EE", "LV", "LT", "CH", "SI", "HR",
+        "DE",
+        "FR",
+        "NL",
+        "BE",
+        "AT",
+        "ES",
+        "PT",
+        "IT",
+        "GB",
+        "PL",
+        "CZ",
+        "SK",
+        "HU",
+        "RO",
+        "BG",
+        "GR",
+        "FI",
+        "SE",
+        "NO",
+        "DK",
+        "EE",
+        "LV",
+        "LT",
+        "CH",
+        "SI",
+        "HR",
     ]
     for cc in major_countries:
         assert cc in COUNTRY_TO_BIDDING_ZONE, f"Missing country: {cc}"
@@ -329,7 +349,9 @@ async def test_get_day_ahead_prices_with_zone(entsoe_adapter, sample_xml_hourly)
     mock_response.status_code = 200
     mock_response.text = sample_xml_hourly
 
-    with patch.object(entsoe_adapter.client, "get", new_callable=AsyncMock, return_value=mock_response):
+    with patch.object(
+        entsoe_adapter.client, "get", new_callable=AsyncMock, return_value=mock_response
+    ):
         prices = await entsoe_adapter.get_day_ahead_prices(
             start_date=datetime(2026, 2, 9, 23, 0, tzinfo=timezone.utc),
             end_date=datetime(2026, 2, 10, 23, 0, tzinfo=timezone.utc),
@@ -347,7 +369,9 @@ async def test_get_day_ahead_prices_with_timezone(entsoe_adapter, sample_xml_hou
     mock_response.status_code = 200
     mock_response.text = sample_xml_hourly
 
-    with patch.object(entsoe_adapter.client, "get", new_callable=AsyncMock, return_value=mock_response):
+    with patch.object(
+        entsoe_adapter.client, "get", new_callable=AsyncMock, return_value=mock_response
+    ):
         prices = await entsoe_adapter.get_day_ahead_prices(
             start_date=datetime(2026, 2, 9, 23, 0, tzinfo=timezone.utc),
             end_date=datetime(2026, 2, 10, 23, 0, tzinfo=timezone.utc),
@@ -385,7 +409,9 @@ async def test_get_day_ahead_prices_rate_limit(entsoe_adapter):
     mock_response = MagicMock()
     mock_response.status_code = 429
 
-    with patch.object(entsoe_adapter.client, "get", new_callable=AsyncMock, return_value=mock_response):
+    with patch.object(
+        entsoe_adapter.client, "get", new_callable=AsyncMock, return_value=mock_response
+    ):
         with pytest.raises(RuntimeError, match="rate limit"):
             await entsoe_adapter.get_day_ahead_prices(
                 start_date=datetime(2026, 2, 9, 23, 0, tzinfo=timezone.utc),

@@ -16,12 +16,11 @@ from .training import (
 )
 
 __all__ = [
-    'PredictionInput',
-    'compute_degree_days',
-    'EnergySurrogateModel',
-    'fetch_training_data',
-    'is_school_day',
-    'save_trained_model',
-    'train_and_validate',
+    "PredictionInput",
+    "compute_degree_days",
+    "EnergySurrogateModel",
+    "fetch_training_data",
+    "is_school_day",
+    "save_trained_model",
+    "train_and_validate",
 ]
-

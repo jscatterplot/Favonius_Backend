@@ -68,11 +68,10 @@ async def store_meter_values(
         try:
             async with pool.acquire() as conn:
                 charger_row = await conn.fetchrow(
-                    "SELECT charger_id FROM chargers WHERE ocpp_id = $1",
-                    charge_point_id
+                    "SELECT charger_id FROM chargers WHERE ocpp_id = $1", charge_point_id
                 )
                 if charger_row:
-                    charger_id = charger_row['charger_id']
+                    charger_id = charger_row["charger_id"]
         except Exception as e:
             logger.debug(f"Could not resolve charger_id for {charge_point_id}: {e}")
 
@@ -135,17 +134,14 @@ async def _update_vehicle_max_charge_kw(
                   AND (max_charge_kw IS NULL OR max_charge_kw != $1)
                 """,
                 max_charge_kw,
-                str(vehicle_id)
+                str(vehicle_id),
             )
             logger.info(
                 f"Updated vehicle {vehicle_id} max_charge_kw to {max_charge_kw} kW "
                 f"from OCPP MeterValues at {timestamp}"
             )
     except Exception as e:
-        logger.error(
-            f"Failed to update vehicle {vehicle_id} max_charge_kw: {e}",
-            exc_info=True
-        )
+        logger.error(f"Failed to update vehicle {vehicle_id} max_charge_kw: {e}", exc_info=True)
 
 
 async def store_status_update(
@@ -185,8 +181,11 @@ async def store_status_update(
                     error_code = EXCLUDED.error_code,
                     updated_at = EXCLUDED.updated_at
                 """,
-                charge_point_id, connector_id, status,
-                error_code, timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp,
+                charge_point_id,
+                connector_id,
+                status,
+                error_code,
+                timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp,
             )
             logger.debug(
                 f"Stored status update: {charge_point_id}, connector {connector_id}, "

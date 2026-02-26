@@ -206,9 +206,7 @@ class DepotSimulator:
         delta_t = timedelta(hours=self.delta_t_hours)
 
         # Initialize all vehicles as available
-        availability = {
-            v.vehicle_id: [True] * n_timesteps for v in self.vehicles
-        }
+        availability = {v.vehicle_id: [True] * n_timesteps for v in self.vehicles}
 
         # Mark vehicles as unavailable during routes
         for route in self.routes:
@@ -300,21 +298,15 @@ class DepotSimulator:
                                 route.return_time - route.departure_time
                             ).total_seconds() / 3600.0
                             if route_duration_hours > 0:
-                                route_energy_rate = (
-                                    route.energy_kwh / route_duration_hours
-                                )
+                                route_energy_rate = route.energy_kwh / route_duration_hours
                             break
 
                 # Default to random if no route found
                 if route_energy_rate == 0.0:
-                    route_energy_rate = random.uniform(10, 30) / (
-                        dt_minutes / 60
-                    )
+                    route_energy_rate = random.uniform(10, 30) / (dt_minutes / 60)
 
                 energy_used = route_energy_rate * (dt_minutes / 60)
-                v.current_soc = max(
-                    0.1, v.current_soc - energy_used / v.battery_capacity_kwh
-                )
+                v.current_soc = max(0.1, v.current_soc - energy_used / v.battery_capacity_kwh)
 
         # Update battery storage based on dispatch (if set)
         if hasattr(self, "_battery_dispatch") and self._battery_dispatch:
@@ -329,8 +321,7 @@ class DepotSimulator:
                     energy_discharged = dispatch_kw * (dt_minutes / 60)
                     self.battery.current_soc = max(
                         self.battery.soc_min,
-                        self.battery.current_soc
-                        - energy_discharged / self.battery.capacity_kwh,
+                        self.battery.current_soc - energy_discharged / self.battery.capacity_kwh,
                     )
                 elif dispatch_kw < 0:  # Charging
                     energy_charged = abs(dispatch_kw) * (dt_minutes / 60)
@@ -338,8 +329,7 @@ class DepotSimulator:
                     energy_stored = energy_charged * self.battery.efficiency
                     self.battery.current_soc = min(
                         self.battery.soc_max,
-                        self.battery.current_soc
-                        + energy_stored / self.battery.capacity_kwh,
+                        self.battery.current_soc + energy_stored / self.battery.capacity_kwh,
                     )
 
     def apply_battery_dispatch(
@@ -353,17 +343,14 @@ class DepotSimulator:
             start_time: Start time for dispatch schedule (default: current time)
         """
         self._battery_dispatch = dispatch
-        self._battery_dispatch_start = (
-            start_time if start_time else self.time
-        )
+        self._battery_dispatch_start = start_time if start_time else self.time
 
-    def update_metrics(self, result: "OptimizationResult") -> None:
+    def update_metrics(self, result: "OptimizationResult") -> None:  # noqa: F821
         """Update metrics from optimization result.
 
         Args:
             result: OptimizationResult to extract metrics from
         """
-        from src.core.models import OptimizationResult
 
         # Update solve time metrics
         self.metrics.optimization_count += 1
@@ -376,10 +363,7 @@ class DepotSimulator:
         n_timesteps = min(len(prices), len(result.grid_power))
         delta_t = self.delta_t_hours
 
-        energy_cost = sum(
-            prices[t] * result.grid_power[t] * delta_t
-            for t in range(n_timesteps)
-        )
+        energy_cost = sum(prices[t] * result.grid_power[t] * delta_t for t in range(n_timesteps))
         self.metrics.total_energy_cost += energy_cost
 
         # Update peak demand
@@ -409,9 +393,7 @@ class DepotSimulator:
         """
         return self.metrics
 
-    def get_cost_savings(
-        self, unmanaged_cost: float
-    ) -> dict[str, float]:
+    def get_cost_savings(self, unmanaged_cost: float) -> dict[str, float]:
         """Calculate cost savings vs. unmanaged baseline.
 
         Args:
@@ -420,13 +402,9 @@ class DepotSimulator:
         Returns:
             Dictionary with savings metrics
         """
-        total_cost = (
-            self.metrics.total_energy_cost + self.metrics.total_demand_cost
-        )
+        total_cost = self.metrics.total_energy_cost + self.metrics.total_demand_cost
         savings = unmanaged_cost - total_cost
-        savings_percent = (
-            (savings / unmanaged_cost * 100) if unmanaged_cost > 0 else 0.0
-        )
+        savings_percent = (savings / unmanaged_cost * 100) if unmanaged_cost > 0 else 0.0
 
         return {
             "unmanaged_cost": unmanaged_cost,
@@ -441,28 +419,14 @@ class DepotSimulator:
         print("SIMULATION SUMMARY")
         print("=" * 60)
         print(f"Optimizations run: {self.metrics.optimization_count}")
-        print(
-            f"Average solve time: {self.metrics.avg_solve_time:.2f} seconds"
-        )
+        print(f"Average solve time: {self.metrics.avg_solve_time:.2f} seconds")
         print(f"Peak demand: {self.metrics.peak_demand_kw:.2f} kW")
-        print(
-            f"Total energy cost: ${self.metrics.total_energy_cost:.2f}"
-        )
-        print(
-            f"Total demand cost: ${self.metrics.total_demand_cost:.2f}"
-        )
-        total_cost = (
-            self.metrics.total_energy_cost
-            + self.metrics.total_demand_cost
-        )
+        print(f"Total energy cost: ${self.metrics.total_energy_cost:.2f}")
+        print(f"Total demand cost: ${self.metrics.total_demand_cost:.2f}")
+        total_cost = self.metrics.total_energy_cost + self.metrics.total_demand_cost
         print(f"Total cost: ${total_cost:.2f}")
-        print(
-            f"Vehicles ready at departure: "
-            f"{self.metrics.vehicles_ready_at_departure}"
-        )
-        print(
-            f"Vehicles not ready: {self.metrics.vehicles_not_ready}"
-        )
+        print(f"Vehicles ready at departure: " f"{self.metrics.vehicles_ready_at_departure}")
+        print(f"Vehicles not ready: {self.metrics.vehicles_not_ready}")
         print("=" * 60)
 
     def export_metrics(self, filepath: str, format: str = "json") -> None:
@@ -472,8 +436,8 @@ class DepotSimulator:
             filepath: Path to output file
             format: Output format ('json' or 'csv')
         """
-        import json
         import csv
+        import json
         from pathlib import Path
 
         path = Path(filepath)
@@ -485,13 +449,8 @@ class DepotSimulator:
                 "peak_demand_kw": self.metrics.peak_demand_kw,
                 "total_energy_cost": self.metrics.total_energy_cost,
                 "total_demand_cost": self.metrics.total_demand_cost,
-                "total_cost": (
-                    self.metrics.total_energy_cost
-                    + self.metrics.total_demand_cost
-                ),
-                "vehicles_ready_at_departure": (
-                    self.metrics.vehicles_ready_at_departure
-                ),
+                "total_cost": (self.metrics.total_energy_cost + self.metrics.total_demand_cost),
+                "vehicles_ready_at_departure": (self.metrics.vehicles_ready_at_departure),
                 "vehicles_not_ready": self.metrics.vehicles_not_ready,
             }
             with open(path, "w") as f:
@@ -500,26 +459,15 @@ class DepotSimulator:
             with open(path, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["Metric", "Value"])
-                writer.writerow(
-                    ["optimization_count", self.metrics.optimization_count]
-                )
-                writer.writerow(
-                    ["avg_solve_time", self.metrics.avg_solve_time]
-                )
-                writer.writerow(
-                    ["peak_demand_kw", self.metrics.peak_demand_kw]
-                )
-                writer.writerow(
-                    ["total_energy_cost", self.metrics.total_energy_cost]
-                )
-                writer.writerow(
-                    ["total_demand_cost", self.metrics.total_demand_cost]
-                )
+                writer.writerow(["optimization_count", self.metrics.optimization_count])
+                writer.writerow(["avg_solve_time", self.metrics.avg_solve_time])
+                writer.writerow(["peak_demand_kw", self.metrics.peak_demand_kw])
+                writer.writerow(["total_energy_cost", self.metrics.total_energy_cost])
+                writer.writerow(["total_demand_cost", self.metrics.total_demand_cost])
                 writer.writerow(
                     [
                         "total_cost",
-                        self.metrics.total_energy_cost
-                        + self.metrics.total_demand_cost,
+                        self.metrics.total_energy_cost + self.metrics.total_demand_cost,
                     ]
                 )
                 writer.writerow(
@@ -528,9 +476,7 @@ class DepotSimulator:
                         self.metrics.vehicles_ready_at_departure,
                     ]
                 )
-                writer.writerow(
-                    ["vehicles_not_ready", self.metrics.vehicles_not_ready]
-                )
+                writer.writerow(["vehicles_not_ready", self.metrics.vehicles_not_ready])
 
     def get_state(self) -> dict:
         """Get current simulation state.
@@ -546,9 +492,9 @@ class DepotSimulator:
                     "soc": v.current_soc,
                     "is_charging": v.is_charging,
                     "is_on_route": v.is_on_route,
-            "battery_capacity_kwh": v.battery_capacity_kwh,
+                    "battery_capacity_kwh": v.battery_capacity_kwh,
                 }
-            for v in self.vehicles
+                for v in self.vehicles
             ],
             "battery": {
                 "soc": self.battery.current_soc,
@@ -564,12 +510,10 @@ class DepotSimulator:
                 with 'charging_power' list
         """
         for vid, sched in schedule.items():
-            v = next(
-                (v for v in self.vehicles if v.vehicle_id == vid), None
-            )
-            if v and sched.get('charging_power'):
+            v = next((v for v in self.vehicles if v.vehicle_id == vid), None)
+            if v and sched.get("charging_power"):
                 # Set charging based on first timestep
-                if sched['charging_power'][0] > 0:
+                if sched["charging_power"][0] > 0:
                     v.is_charging = True
                 else:
                     v.is_charging = False
@@ -634,18 +578,14 @@ class DepotSimulator:
         """Clear all injected price spikes."""
         self.price_spikes.clear()
 
-    def set_vehicle_on_route(
-        self, vehicle_id: str, is_on_route: bool
-    ) -> None:
+    def set_vehicle_on_route(self, vehicle_id: str, is_on_route: bool) -> None:
         """Set vehicle route status.
 
         Args:
             vehicle_id: Vehicle identifier
             is_on_route: Whether vehicle is on route
         """
-        v = next(
-            (v for v in self.vehicles if v.vehicle_id == vehicle_id), None
-        )
+        v = next((v for v in self.vehicles if v.vehicle_id == vehicle_id), None)
         if v:
             v.is_on_route = is_on_route
             # Can't charge while on route
@@ -663,7 +603,7 @@ class SimulationOptimizer:
     def __init__(
         self,
         simulator: "DepotSimulator",
-        config: "DepotConfig",
+        config: "DepotConfig",  # noqa: F821
     ):
         """Initialize simulation optimizer.
 
@@ -673,9 +613,9 @@ class SimulationOptimizer:
         """
         self.simulator = simulator
         self.config = config
-        self.last_result: Optional["OptimizationResult"] = None
+        self.last_result: Optional["OptimizationResult"] = None  # noqa: F821
 
-    def _assemble_state(self, horizon_hours: int = 24) -> "DepotState":
+    def _assemble_state(self, horizon_hours: int = 24) -> "DepotState":  # noqa: F821
         """Convert simulator state to DepotState.
 
         Args:
@@ -687,9 +627,7 @@ class SimulationOptimizer:
         from src.core.models import DepotState
 
         # Get vehicle SoCs
-        vehicle_socs = {
-            v.vehicle_id: v.current_soc for v in self.simulator.vehicles
-        }
+        vehicle_socs = {v.vehicle_id: v.current_soc for v in self.simulator.vehicles}
 
         # Get battery SoC
         battery_soc = self.simulator.battery.current_soc
@@ -742,7 +680,7 @@ class SimulationOptimizer:
 
     async def optimize(
         self, horizon_hours: int = 24, time_limit: float = 30.0
-    ) -> "OptimizationResult":
+    ) -> "OptimizationResult":  # noqa: F821
         """Run optimization for current simulator state.
 
         Args:
@@ -753,7 +691,6 @@ class SimulationOptimizer:
             OptimizationResult
         """
         from src.core.optimizer import optimize
-        from src.core.models import OptimizationResult
 
         # Assemble state
         state = self._assemble_state(horizon_hours)
@@ -769,7 +706,7 @@ class SimulationOptimizer:
         self.last_result = result
         return result
 
-    def apply_result(self, result: "OptimizationResult") -> None:
+    def apply_result(self, result: "OptimizationResult") -> None:  # noqa: F821
         """Apply optimization result to simulator.
 
         Args:
@@ -787,9 +724,7 @@ class SimulationOptimizer:
         self.simulator.update_metrics(result)
 
 
-async def run_simulation(
-    optimizer_func: Optional[callable] = None, steps: int = 96
-) -> None:
+async def run_simulation(optimizer_func: Optional[callable] = None, steps: int = 96) -> None:
     """Run simulation with optimization.
 
     Args:
@@ -811,7 +746,7 @@ async def run_simulation(
                 schedule = await optimizer_func(sim)
                 if schedule:
                     sim.apply_schedule(schedule)
-                    print(f"  Applied optimization schedule")
+                    print("  Applied optimization schedule")
             except Exception as e:
                 print(f"  Optimization error: {e}")
 
@@ -820,18 +755,12 @@ async def run_simulation(
 
         # Print state
         state = sim.get_state()
-        avg_soc = sum(v['soc'] for v in state['vehicles']) / len(
-            state['vehicles']
-        )
-        charging_count = sum(1 for v in state['vehicles'] if v['is_charging'])
-        print(
-            f"  Avg SoC: {avg_soc:.2f}, "
-            f"Charging: {charging_count}/{sim.n_chargers}"
-        )
+        avg_soc = sum(v["soc"] for v in state["vehicles"]) / len(state["vehicles"])
+        charging_count = sum(1 for v in state["vehicles"] if v["is_charging"])
+        print(f"  Avg SoC: {avg_soc:.2f}, " f"Charging: {charging_count}/{sim.n_chargers}")
 
     print(f"\nSimulation complete: {sim.time}")
 
 
 if __name__ == "__main__":
     asyncio.run(run_simulation())
-

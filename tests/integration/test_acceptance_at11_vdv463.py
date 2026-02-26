@@ -9,23 +9,23 @@ AND message includes charging point statuses, SoC and power for charging vehicle
 AND payload validates against ProvideChargingInformationRequest schema (or SOFT validation).
 """
 
-import pytest
 import os
-import json
+
+import pytest
 
 # Ensure SOFT default for tests that may run without full schema
 os.environ.setdefault("VDV463_VALIDATION_MODE", "soft")
 
 from src.adapters.vdv463.messages import (
-    DepotInfo,
-    ChargingStationInfo,
     ChargingPointInfo,
-    VehicleInfo,
     ChargingProcessInfo,
+    ChargingStationInfo,
+    DepotInfo,
     PreconditioningInfo,
+    ValidationMode,
+    VehicleInfo,
     build_provide_charging_information_message,
     get_schema_registry,
-    ValidationMode,
 )
 
 
@@ -104,7 +104,9 @@ class TestAT11VDV463ChargingInformationExport:
                     charging_station_id="depot-001",
                     charging_station_status="Available",
                     charging_point_info_list=[
-                        ChargingPointInfo(charging_point_id="cp-1", charging_point_status="Available"),
+                        ChargingPointInfo(
+                            charging_point_id="cp-1", charging_point_status="Available"
+                        ),
                     ],
                 )
             ],

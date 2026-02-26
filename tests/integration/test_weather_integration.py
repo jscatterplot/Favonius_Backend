@@ -3,7 +3,6 @@
 Reference: Development plan Step 3.3, PRD.md#11-3-integration-test-requirements
 """
 
-import asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -25,8 +24,8 @@ async def test_db_pool():
     import os
 
     db_url = os.getenv(
-        'TEST_DATABASE_URL',
-        'postgresql://postgres:postgres@localhost:5432/favonius_test',
+        "TEST_DATABASE_URL",
+        "postgresql://postgres:postgres@localhost:5432/favonius_test",
     )
 
     pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
@@ -51,10 +50,10 @@ async def test_depot_id(test_db_pool):
             ON CONFLICT (depot_id) DO NOTHING
             """,
             depot_id,
-            'Test Depot',
+            "Test Depot",
             37.7749,  # San Francisco
             -122.4194,
-            'America/Los_Angeles',
+            "America/Los_Angeles",
             1000.0,
             20.0,
         )
@@ -63,35 +62,30 @@ async def test_depot_id(test_db_pool):
 
     # Cleanup
     async with test_db_pool.acquire() as conn:
-        await conn.execute(
-            'DELETE FROM weather_forecasts WHERE depot_id = $1', depot_id
-        )
-        await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+        await conn.execute("DELETE FROM weather_forecasts WHERE depot_id = $1", depot_id)
+        await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
 
 @pytest.mark.asyncio
 async def test_weather_to_database_flow(test_db_pool, test_depot_id):
     """Test weather adapter → database storage flow."""
-    adapter = OpenMeteoAdapter(
-        latitude=37.7749, longitude=-122.4194, pool=test_db_pool
-    )
+    adapter = OpenMeteoAdapter(latitude=37.7749, longitude=-122.4194, pool=test_db_pool)
 
     # Mock API response since we don't want to hit real API in tests
     mock_response = {
-        'daily': {
-            'time': [
-                (datetime.utcnow() + timedelta(days=d)).strftime('%Y-%m-%d')
-                for d in range(7)
+        "daily": {
+            "time": [
+                (datetime.utcnow() + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(7)
             ],
-            'temperature_2m_max': [75.0] * 7,
-            'temperature_2m_min': [65.0] * 7,
-            'precipitation_sum': [0.1] * 7,
-            'shortwave_radiation_sum': [500.0] * 7,
+            "temperature_2m_max": [75.0] * 7,
+            "temperature_2m_min": [65.0] * 7,
+            "precipitation_sum": [0.1] * 7,
+            "shortwave_radiation_sum": [500.0] * 7,
         },
-        'hourly': {'time': [], 'temperature_2m': []},
+        "hourly": {"time": [], "temperature_2m": []},
     }
 
-    with pytest.mock.patch.object(adapter.client, 'get') as mock_get:
+    with pytest.mock.patch.object(adapter.client, "get") as mock_get:
         mock_http_response = pytest.mock.MagicMock()
         mock_http_response.json.return_value = mock_response
         mock_http_response.raise_for_status = pytest.mock.MagicMock()
@@ -103,9 +97,7 @@ async def test_weather_to_database_flow(test_db_pool, test_depot_id):
         assert len(forecasts) == 7
 
         # Store forecasts
-        stored_count = await adapter.store_forecasts_to_db(
-            forecasts, test_depot_id
-        )
+        stored_count = await adapter.store_forecasts_to_db(forecasts, test_depot_id)
 
         assert stored_count == 7
 
@@ -115,19 +107,17 @@ async def test_weather_to_database_flow(test_db_pool, test_depot_id):
         cached = await get_cached_forecasts(test_db_pool, test_depot_id, start, end)
 
         assert len(cached) == 7
-        assert all(f['temp_f'] > 0 for f in cached)
-        assert all(f['solar_rad'] > 0 for f in cached)  # Should be converted
+        assert all(f["temp_f"] > 0 for f in cached)
+        assert all(f["solar_rad"] > 0 for f in cached)  # Should be converted
 
 
 @pytest.mark.asyncio
 async def test_weather_caching(test_db_pool, test_depot_id):
     """Test weather caching mechanism."""
-    adapter = OpenMeteoAdapter(
-        latitude=37.7749, longitude=-122.4194, pool=test_db_pool
-    )
+    adapter = OpenMeteoAdapter(latitude=37.7749, longitude=-122.4194, pool=test_db_pool)
 
     start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=7)
+    start + timedelta(days=7)
 
     # Create sample weather data
     from src.adapters.weather import WeatherData
@@ -148,7 +138,7 @@ async def test_weather_caching(test_db_pool, test_depot_id):
     await store_weather_forecasts(test_db_pool, forecasts, test_depot_id)
 
     # Second fetch with cache: should use cached data
-    with pytest.mock.patch.object(adapter, 'get_forecast') as mock_fetch:
+    with pytest.mock.patch.object(adapter, "get_forecast"):
         cached_forecasts = await adapter.get_forecasts_for_depot(
             test_depot_id, days=7, use_cache=True
         )
@@ -193,8 +183,8 @@ async def test_surrogate_model_reads_weather(test_db_pool, test_depot_id):
             """,
             vehicle_id,
             test_depot_id,
-            'test_vehicle_1',
-            'bus_large',
+            "test_vehicle_1",
+            "bus_large",
             324.0,
             80.0,
         )
@@ -213,7 +203,7 @@ async def test_surrogate_model_reads_weather(test_db_pool, test_depot_id):
             """,
             schedule_id,
             vehicle_id,
-            'route_101',
+            "route_101",
             departure_time,
             departure_time + timedelta(hours=8),
             200.0,
@@ -221,9 +211,7 @@ async def test_surrogate_model_reads_weather(test_db_pool, test_depot_id):
 
     try:
         # Fetch training data (should join with weather_forecasts)
-        inputs, energies = await fetch_training_data(
-            test_db_pool, test_depot_id, lookback_days=30
-        )
+        inputs, energies = await fetch_training_data(test_db_pool, test_depot_id, lookback_days=30)
 
         # Should have at least one training sample
         if inputs:
@@ -235,34 +223,31 @@ async def test_surrogate_model_reads_weather(test_db_pool, test_depot_id):
     finally:
         # Cleanup
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM schedules WHERE vehicle_id = $1', vehicle_id)
-            await conn.execute('DELETE FROM vehicles WHERE vehicle_id = $1', vehicle_id)
+            await conn.execute("DELETE FROM schedules WHERE vehicle_id = $1", vehicle_id)
+            await conn.execute("DELETE FROM vehicles WHERE vehicle_id = $1", vehicle_id)
 
 
 @pytest.mark.asyncio
 async def test_weather_ingestion_service(test_db_pool, test_depot_id):
     """Test WeatherIngestionService."""
-    adapter = OpenMeteoAdapter(
-        latitude=37.7749, longitude=-122.4194, pool=test_db_pool
-    )
+    adapter = OpenMeteoAdapter(latitude=37.7749, longitude=-122.4194, pool=test_db_pool)
     service = WeatherIngestionService(test_db_pool, adapter=adapter)
 
     # Mock API response
     mock_response = {
-        'daily': {
-            'time': [
-                (datetime.utcnow() + timedelta(days=d)).strftime('%Y-%m-%d')
-                for d in range(7)
+        "daily": {
+            "time": [
+                (datetime.utcnow() + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(7)
             ],
-            'temperature_2m_max': [75.0] * 7,
-            'temperature_2m_min': [65.0] * 7,
-            'precipitation_sum': [0.1] * 7,
-            'shortwave_radiation_sum': [500.0] * 7,
+            "temperature_2m_max": [75.0] * 7,
+            "temperature_2m_min": [65.0] * 7,
+            "precipitation_sum": [0.1] * 7,
+            "shortwave_radiation_sum": [500.0] * 7,
         },
-        'hourly': {'time': [], 'temperature_2m': []},
+        "hourly": {"time": [], "temperature_2m": []},
     }
 
-    with pytest.mock.patch.object(adapter.client, 'get') as mock_get:
+    with pytest.mock.patch.object(adapter.client, "get") as mock_get:
         mock_http_response = pytest.mock.MagicMock()
         mock_http_response.json.return_value = mock_response
         mock_http_response.raise_for_status = pytest.mock.MagicMock()
@@ -294,10 +279,10 @@ async def test_weather_ingestion_all_depots(test_db_pool):
                 ON CONFLICT (depot_id) DO NOTHING
                 """,
                 depot_id,
-                f'Test Depot {depot_id}',
+                f"Test Depot {depot_id}",
                 37.7749,
                 -122.4194,
-                'America/Los_Angeles',
+                "America/Los_Angeles",
                 1000.0,
                 20.0,
             )
@@ -306,29 +291,26 @@ async def test_weather_ingestion_all_depots(test_db_pool):
         service = WeatherIngestionService(test_db_pool)
 
         # Mock API response for all depots
-        mock_response = {
-            'daily': {
-                'time': [
-                    (datetime.utcnow() + timedelta(days=d)).strftime('%Y-%m-%d')
-                    for d in range(7)
+        {
+            "daily": {
+                "time": [
+                    (datetime.utcnow() + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(7)
                 ],
-                'temperature_2m_max': [75.0] * 7,
-                'temperature_2m_min': [65.0] * 7,
-                'precipitation_sum': [0.1] * 7,
-                'shortwave_radiation_sum': [500.0] * 7,
+                "temperature_2m_max": [75.0] * 7,
+                "temperature_2m_min": [65.0] * 7,
+                "precipitation_sum": [0.1] * 7,
+                "shortwave_radiation_sum": [500.0] * 7,
             },
-            'hourly': {'time': [], 'temperature_2m': []},
+            "hourly": {"time": [], "temperature_2m": []},
         }
 
         # Patch the adapter creation to use mocked API
         with pytest.mock.patch(
-            'src.adapters.weather.ingestion.OpenMeteoAdapter'
+            "src.adapters.weather.ingestion.OpenMeteoAdapter"
         ) as mock_adapter_class:
             mock_adapter = pytest.mock.MagicMock()
             mock_adapter.get_forecasts_for_depot = pytest.mock.AsyncMock(
-                return_value=[
-                    pytest.mock.MagicMock() for _ in range(7)
-                ]  # Mock WeatherData objects
+                return_value=[pytest.mock.MagicMock() for _ in range(7)]  # Mock WeatherData objects
             )
             mock_adapter.close = pytest.mock.AsyncMock()
             mock_adapter_class.return_value = mock_adapter
@@ -345,10 +327,8 @@ async def test_weather_ingestion_all_depots(test_db_pool):
         # Cleanup
         async with test_db_pool.acquire() as conn:
             for depot_id in depot_ids:
-                await conn.execute(
-                    'DELETE FROM weather_forecasts WHERE depot_id = $1', depot_id
-                )
-                await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+                await conn.execute("DELETE FROM weather_forecasts WHERE depot_id = $1", depot_id)
+                await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
 
 @pytest.mark.asyncio
@@ -371,9 +351,7 @@ async def test_fallback_to_cached_forecasts(test_db_pool, test_depot_id):
     ]
     await store_weather_forecasts(test_db_pool, forecasts, test_depot_id)
 
-    adapter = OpenMeteoAdapter(
-        latitude=37.7749, longitude=-122.4194, pool=test_db_pool
-    )
+    adapter = OpenMeteoAdapter(latitude=37.7749, longitude=-122.4194, pool=test_db_pool)
 
     # Simulate API failure by mocking get_forecast to raise
     original_method = adapter.get_forecast
@@ -399,9 +377,7 @@ async def test_weather_storage_upsert(test_db_pool, test_depot_id):
     """Test that weather storage handles upserts correctly."""
     from src.adapters.weather import WeatherData
 
-    adapter = OpenMeteoAdapter(
-        latitude=37.7749, longitude=-122.4194, pool=test_db_pool
-    )
+    adapter = OpenMeteoAdapter(latitude=37.7749, longitude=-122.4194, pool=test_db_pool)
 
     base_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     forecast1 = WeatherData(
@@ -435,7 +411,7 @@ async def test_weather_storage_upsert(test_db_pool, test_depot_id):
     )
     assert len(cached) == 1
     # Verify updated value was stored
-    assert cached[0]['temp_f'] == 72.0
+    assert cached[0]["temp_f"] == 72.0
 
 
 @pytest.mark.asyncio
@@ -443,9 +419,7 @@ async def test_solar_radiation_conversion_storage(test_db_pool, test_depot_id):
     """Test that solar radiation is correctly converted when storing."""
     from src.adapters.weather import WeatherData
 
-    adapter = OpenMeteoAdapter(
-        latitude=37.7749, longitude=-122.4194, pool=test_db_pool
-    )
+    adapter = OpenMeteoAdapter(latitude=37.7749, longitude=-122.4194, pool=test_db_pool)
 
     base_time = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     # Solar radiation in W/m² (from API)
@@ -466,5 +440,4 @@ async def test_solar_radiation_conversion_storage(test_db_pool, test_depot_id):
     )
 
     assert len(cached) == 1
-    assert cached[0]['solar_rad'] == pytest.approx(1032.0, rel=0.01)  # 500 * 2.064
-
+    assert cached[0]["solar_rad"] == pytest.approx(1032.0, rel=0.01)  # 500 * 2.064

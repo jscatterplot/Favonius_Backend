@@ -14,6 +14,7 @@ from uuid import UUID
 # Make httpx import optional to prevent import errors when not installed
 try:
     import httpx
+
     HAS_HTTPX = True
 except ImportError:
     httpx = None
@@ -76,21 +77,20 @@ class HandoffManager:
 
         Args:
             depot_endpoints: Dictionary mapping depot_id to API endpoint URL
-        
+
         Raises:
             ImportError: If httpx is not installed (required for handoff functionality)
         """
         if not HAS_HTTPX:
             raise ImportError(
-                "httpx package is required for HandoffManager. "
-                "Install with: pip install httpx"
+                "httpx package is required for HandoffManager. " "Install with: pip install httpx"
             )
         self.depot_endpoints = depot_endpoints
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client.
-        
+
         Raises:
             ImportError: If httpx is not installed
         """
@@ -156,15 +156,12 @@ class HandoffManager:
                 f"Handoff sent: vehicle {external_id} to depot {dest_depot_id}, "
                 f"acknowledged at {ack_data.get('acknowledged_at')}"
             )
-            return UUID(ack_data.get('message_id'))
+            return UUID(ack_data.get("message_id"))
         except httpx.RequestError as e:
             logger.error(f"Failed to send handoff to {dest_depot_id}: {e}")
             return None
         except Exception as e:
-            logger.error(
-                f"Unexpected error sending handoff: {e}",
-                exc_info=True
-            )
+            logger.error(f"Unexpected error sending handoff: {e}", exc_info=True)
             return None
 
     def create_incoming_vehicle(

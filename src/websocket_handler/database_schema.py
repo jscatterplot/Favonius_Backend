@@ -1,10 +1,9 @@
 """Database schema creation and migration scripts for Supabase."""
 
-import asyncio
-import os
-from typing import List, Dict, Any
+import json
+from typing import Any, Dict
+
 import asyncpg
-from datetime import datetime, timezone
 
 from .config import SupabaseConfig
 from .monitoring import get_logger
@@ -12,12 +11,12 @@ from .monitoring import get_logger
 
 class DatabaseSchema:
     """Database schema management for Supabase."""
-    
+
     def __init__(self, config: SupabaseConfig):
         """Initialize database schema manager."""
         self.config = config
         self.logger = get_logger(__name__)
-    
+
     async def create_schema(self) -> None:
         """Create all database tables and functions."""
         try:
@@ -27,37 +26,37 @@ class DatabaseSchema:
                 port=self.config.db_port,
                 database=self.config.db_name,
                 user=self.config.db_user,
-                password=self.config.db_password
+                password=self.config.db_password,
             )
-            
+
             try:
                 # Create tables
                 await self._create_tables(conn)
-                
+
                 # Create indexes
                 await self._create_indexes(conn)
-                
+
                 # Create functions
                 await self._create_functions(conn)
-                
+
                 # Create views
                 await self._create_views(conn)
-                
+
                 # Setup RLS policies
                 await self._setup_rls_policies(conn)
-                
+
                 self.logger.info("Database schema created successfully")
-                
+
             finally:
                 await conn.close()
-                
+
         except Exception as e:
             self.logger.error(f"Failed to create database schema: {e}")
             raise
-    
+
     async def _create_tables(self, conn: asyncpg.Connection) -> None:
         """Create all database tables."""
-        
+
         # Organizations table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS organizations (
@@ -72,7 +71,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # User organizations junction table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_organizations (
@@ -83,7 +82,7 @@ class DatabaseSchema:
                 PRIMARY KEY (user_id, organization_id)
             );
         """)
-        
+
         # Sites table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sites (
@@ -101,7 +100,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Vehicles table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicles (
@@ -122,7 +121,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Charging stations table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_stations (
@@ -144,7 +143,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Charging schedules configuration
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_schedules_config (
@@ -158,7 +157,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Vehicle schedules
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicle_schedules (
@@ -174,7 +173,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Charging sessions summary (synced from TimescaleDB)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_sessions_summary (
@@ -195,7 +194,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Active charging sessions (real-time state)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_sessions_active (
@@ -214,7 +213,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Vehicle real-time state
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicle_realtime_state (
@@ -230,7 +229,7 @@ class DatabaseSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # API usage tracking
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS api_usage (
@@ -243,73 +242,73 @@ class DatabaseSchema:
                 timestamp TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         self.logger.info("All tables created successfully")
-    
+
     async def _create_indexes(self, conn: asyncpg.Connection) -> None:
         """Create database indexes for performance."""
-        
+
         # Spatial index for sites
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sites_location 
             ON sites USING GIST(location);
         """)
-        
+
         # Organization indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vehicles_org 
             ON vehicles(organization_id, status);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_stations_site 
             ON charging_stations(site_id, status);
         """)
-        
+
         await conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_stations_ocpp_id 
             ON charging_stations(station_id);
         """)
-        
+
         # Schedule indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vehicle_schedules 
             ON vehicle_schedules(vehicle_id, days_of_week);
         """)
-        
+
         # Session indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sessions_org_time 
             ON charging_sessions_summary(organization_id, start_time);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_active_sessions_org 
             ON charging_sessions_active(organization_id, status);
         """)
-        
+
         # Real-time state indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vehicle_state_org 
             ON vehicle_realtime_state(organization_id, last_seen);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vehicle_state_location 
             ON vehicle_realtime_state USING GIST(location);
         """)
-        
+
         # API usage indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_api_usage_org_time 
             ON api_usage(organization_id, timestamp);
         """)
-        
+
         self.logger.info("All indexes created successfully")
-    
+
     async def _create_functions(self, conn: asyncpg.Connection) -> None:
         """Create database functions."""
-        
+
         # Function to calculate cost savings
         await conn.execute("""
             CREATE OR REPLACE FUNCTION calculate_savings(
@@ -347,7 +346,7 @@ class DatabaseSchema:
             END;
             $$ LANGUAGE plpgsql SECURITY DEFINER;
         """)
-        
+
         # Function to update timestamps
         await conn.execute("""
             CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -358,15 +357,20 @@ class DatabaseSchema:
             END;
             $$ LANGUAGE plpgsql;
         """)
-        
+
         # Create triggers for updated_at
         tables = [
-            'organizations', 'sites', 'vehicles', 'charging_stations',
-            'charging_schedules_config', 'vehicle_schedules',
-            'charging_sessions_summary', 'charging_sessions_active',
-            'vehicle_realtime_state'
+            "organizations",
+            "sites",
+            "vehicles",
+            "charging_stations",
+            "charging_schedules_config",
+            "vehicle_schedules",
+            "charging_sessions_summary",
+            "charging_sessions_active",
+            "vehicle_realtime_state",
         ]
-        
+
         for table in tables:
             await conn.execute(f"""
                 DROP TRIGGER IF EXISTS update_{table}_updated_at ON {table};
@@ -375,12 +379,12 @@ class DatabaseSchema:
                     FOR EACH ROW
                     EXECUTE FUNCTION update_updated_at_column();
             """)
-        
+
         self.logger.info("All functions and triggers created successfully")
-    
+
     async def _create_views(self, conn: asyncpg.Connection) -> None:
         """Create database views."""
-        
+
         # Daily energy summary view
         await conn.execute("""
             CREATE OR REPLACE VIEW daily_energy_summary AS
@@ -398,7 +402,7 @@ class DatabaseSchema:
             LEFT JOIN charging_sessions_summary s ON o.id = s.organization_id
             GROUP BY o.id, o.name, DATE(s.start_time);
         """)
-        
+
         # Fleet overview view
         await conn.execute("""
             CREATE OR REPLACE VIEW fleet_overview AS
@@ -417,29 +421,36 @@ class DatabaseSchema:
             LEFT JOIN charging_sessions_active csa ON o.id = csa.organization_id
             GROUP BY o.id, o.name;
         """)
-        
+
         # Grant access to views
         await conn.execute("""
             GRANT SELECT ON daily_energy_summary TO authenticated;
             GRANT SELECT ON fleet_overview TO authenticated;
         """)
-        
+
         self.logger.info("All views created successfully")
-    
+
     async def _setup_rls_policies(self, conn: asyncpg.Connection) -> None:
         """Setup Row Level Security policies."""
-        
+
         # Enable RLS on all tables
         tables = [
-            'organizations', 'user_organizations', 'sites', 'vehicles',
-            'charging_stations', 'charging_schedules_config', 'vehicle_schedules',
-            'charging_sessions_summary', 'charging_sessions_active',
-            'vehicle_realtime_state', 'api_usage'
+            "organizations",
+            "user_organizations",
+            "sites",
+            "vehicles",
+            "charging_stations",
+            "charging_schedules_config",
+            "vehicle_schedules",
+            "charging_sessions_summary",
+            "charging_sessions_active",
+            "vehicle_realtime_state",
+            "api_usage",
         ]
-        
+
         for table in tables:
             await conn.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;")
-        
+
         # Organizations policies
         await conn.execute("""
             DROP POLICY IF EXISTS "Users can view their organization" ON organizations;
@@ -450,7 +461,7 @@ class DatabaseSchema:
                     WHERE user_id = auth.uid()
                 ));
         """)
-        
+
         # User organizations policies
         await conn.execute("""
             DROP POLICY IF EXISTS "Users can view their memberships" ON user_organizations;
@@ -458,7 +469,7 @@ class DatabaseSchema:
                 ON user_organizations FOR SELECT
                 USING (user_id = auth.uid());
         """)
-        
+
         # Sites policies
         await conn.execute("""
             DROP POLICY IF EXISTS "Organization members can view sites" ON sites;
@@ -469,7 +480,7 @@ class DatabaseSchema:
                     WHERE user_id = auth.uid()
                 ));
         """)
-        
+
         # Vehicles policies
         await conn.execute("""
             DROP POLICY IF EXISTS "Organization members can view vehicles" ON vehicles;
@@ -480,7 +491,7 @@ class DatabaseSchema:
                     WHERE user_id = auth.uid()
                 ));
         """)
-        
+
         await conn.execute("""
             DROP POLICY IF EXISTS "Admins can manage vehicles" ON vehicles;
             CREATE POLICY "Admins can manage vehicles"
@@ -490,7 +501,7 @@ class DatabaseSchema:
                     WHERE user_id = auth.uid() AND role IN ('owner', 'admin')
                 ));
         """)
-        
+
         # Charging stations policies
         await conn.execute("""
             DROP POLICY IF EXISTS "Organization members can view stations" ON charging_stations;
@@ -502,7 +513,7 @@ class DatabaseSchema:
                     WHERE uo.user_id = auth.uid()
                 ));
         """)
-        
+
         # Session policies
         await conn.execute("""
             DROP POLICY IF EXISTS "Organization members can view sessions" ON charging_sessions_summary;
@@ -513,7 +524,7 @@ class DatabaseSchema:
                     WHERE user_id = auth.uid()
                 ));
         """)
-        
+
         await conn.execute("""
             DROP POLICY IF EXISTS "Organization members can view active sessions" ON charging_sessions_active;
             CREATE POLICY "Organization members can view active sessions"
@@ -523,7 +534,7 @@ class DatabaseSchema:
                     WHERE user_id = auth.uid()
                 ));
         """)
-        
+
         # Vehicle state policies
         await conn.execute("""
             DROP POLICY IF EXISTS "Organization members can view vehicle state" ON vehicle_realtime_state;
@@ -534,9 +545,9 @@ class DatabaseSchema:
                     WHERE user_id = auth.uid()
                 ));
         """)
-        
+
         self.logger.info("All RLS policies created successfully")
-    
+
     async def migrate_data(self, migration_data: Dict[str, Any]) -> None:
         """Migrate data from external sources."""
         try:
@@ -545,14 +556,15 @@ class DatabaseSchema:
                 port=self.config.db_port,
                 database=self.config.db_name,
                 user=self.config.db_user,
-                password=self.config.db_password
+                password=self.config.db_password,
             )
-            
+
             try:
                 # Migrate organizations
-                if 'organizations' in migration_data:
-                    for org in migration_data['organizations']:
-                        await conn.execute("""
+                if "organizations" in migration_data:
+                    for org in migration_data["organizations"]:
+                        await conn.execute(
+                            """
                             INSERT INTO organizations (id, name, type, billing_address, primary_contact, subscription_tier)
                             VALUES ($1, $2, $3, $4, $5, $6)
                             ON CONFLICT (id) DO UPDATE SET
@@ -562,15 +574,20 @@ class DatabaseSchema:
                                 primary_contact = EXCLUDED.primary_contact,
                                 subscription_tier = EXCLUDED.subscription_tier,
                                 updated_at = NOW();
-                        """, org['id'], org['name'], org['type'], 
-                            json.dumps(org.get('billing_address', {})),
-                            json.dumps(org.get('primary_contact', {})),
-                            org.get('subscription_tier', 'starter'))
-                
+                        """,
+                            org["id"],
+                            org["name"],
+                            org["type"],
+                            json.dumps(org.get("billing_address", {})),
+                            json.dumps(org.get("primary_contact", {})),
+                            org.get("subscription_tier", "starter"),
+                        )
+
                 # Migrate vehicles
-                if 'vehicles' in migration_data:
-                    for vehicle in migration_data['vehicles']:
-                        await conn.execute("""
+                if "vehicles" in migration_data:
+                    for vehicle in migration_data["vehicles"]:
+                        await conn.execute(
+                            """
                             INSERT INTO vehicles (id, organization_id, vin, make, model, year, 
                                                 battery_capacity_kwh, max_charge_rate_kw, max_discharge_rate_kw, 
                                                 v2g_capable, license_plate, status)
@@ -586,17 +603,26 @@ class DatabaseSchema:
                                 license_plate = EXCLUDED.license_plate,
                                 status = EXCLUDED.status,
                                 updated_at = NOW();
-                        """, vehicle['id'], vehicle['organization_id'], vehicle['vin'],
-                            vehicle.get('make'), vehicle.get('model'), vehicle.get('year'),
-                            vehicle.get('battery_capacity_kwh'), vehicle.get('max_charge_rate_kw'),
-                            vehicle.get('max_discharge_rate_kw'), vehicle.get('v2g_capable', False),
-                            vehicle.get('license_plate'), vehicle.get('status', 'active'))
-                
+                        """,
+                            vehicle["id"],
+                            vehicle["organization_id"],
+                            vehicle["vin"],
+                            vehicle.get("make"),
+                            vehicle.get("model"),
+                            vehicle.get("year"),
+                            vehicle.get("battery_capacity_kwh"),
+                            vehicle.get("max_charge_rate_kw"),
+                            vehicle.get("max_discharge_rate_kw"),
+                            vehicle.get("v2g_capable", False),
+                            vehicle.get("license_plate"),
+                            vehicle.get("status", "active"),
+                        )
+
                 self.logger.info("Data migration completed successfully")
-                
+
             finally:
                 await conn.close()
-                
+
         except Exception as e:
             self.logger.error(f"Failed to migrate data: {e}")
             raise

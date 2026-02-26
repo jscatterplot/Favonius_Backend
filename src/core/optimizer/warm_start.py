@@ -13,7 +13,7 @@ import pyomo.environ as pyo
 from ..models import DepotConfig, DepotState, OptimizationResult
 
 if TYPE_CHECKING:
-    from pyomo.core import ConcreteModel
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +55,8 @@ def warm_start_model(
     # Initialize P_charge and y_charge for existing vehicles
     for vehicle_id in vehicles_to_initialize:
         prev_sched = previous_schedule.get(vehicle_id, {})
-        prev_power = prev_sched.get('charging_power', [])
-        prev_soc = prev_sched.get('soc', [])
+        prev_power = prev_sched.get("charging_power", [])
+        prev_soc = prev_sched.get("soc", [])
 
         # Handle rolling horizon: align timesteps
         # For simplicity, we assume timesteps align (t=0 in previous = t=0 in current)
@@ -139,4 +139,3 @@ def warm_start_model(
         model.P_peak.value = max(0.0, previous_result.peak_demand_kw)
 
     logger.info("Warm-start initialization complete")
-

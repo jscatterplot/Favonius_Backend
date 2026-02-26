@@ -1,26 +1,24 @@
 """Unit tests for core managers."""
 
-import pytest
-import asyncio
-import time
-from unittest.mock import Mock, AsyncMock, patch
-from datetime import datetime, timezone, timedelta
-from decimal import Decimal
+import os
 
 # Import managers
 import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from unittest.mock import AsyncMock, Mock
 
-from websocket_handler.device_model import DeviceModel, ComponentType, VariableType
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
 from websocket_handler.charging_profile_manager import ChargingProfileManager
-from websocket_handler.transaction_manager import TransactionManager
-from websocket_handler.certificate_manager import CertificateManager
-from websocket_handler.monitoring_manager import MonitoringManager
-from websocket_handler.display_manager import DisplayManager
-from websocket_handler.tariff_manager import TariffManager
+from websocket_handler.device_model import DeviceModel
+from websocket_handler.error_handler import CircuitBreaker, RetryManager
 from websocket_handler.privacy_manager import PrivacyManager
-from websocket_handler.error_handler import CircuitBreaker, RetryManager, DeadLetterQueue
+from websocket_handler.tariff_manager import TariffManager
+from websocket_handler.transaction_manager import TransactionManager
 
 
 class TestDeviceModel:
@@ -33,12 +31,14 @@ class TestDeviceModel:
         client.store_device_component = AsyncMock()
         client.store_device_variable = AsyncMock()
         client.get_device_variables = AsyncMock()
-        client.get_device_variable = AsyncMock(return_value={
-            "status": "Accepted",
-            "value": "TestVendor",
-            "reason_code": None,
-            "additional_info": None
-        })
+        client.get_device_variable = AsyncMock(
+            return_value={
+                "status": "Accepted",
+                "value": "TestVendor",
+                "reason_code": None,
+                "additional_info": None,
+            }
+        )
         client.set_device_variable = AsyncMock()
         return client
 
@@ -59,7 +59,7 @@ class TestDeviceModel:
             "max_power": 22.0,
             "v2x_capable": True,
             "num_evses": 2,
-            "num_connectors": 4
+            "num_connectors": 4,
         }
 
         await device_model.initialize_complete_device_model(station_id, station_info)
@@ -76,14 +76,14 @@ class TestDeviceModel:
             {
                 "component_name": "ChargingStation",
                 "variable_name": "VendorName",
-                "actual_value": "TestVendor"
+                "actual_value": "TestVendor",
             }
         ]
 
-        result = await device_model.get_variables("TEST_STATION", [{
-            "component": {"name": "ChargingStation"},
-            "variable": {"name": "VendorName"}
-        }])
+        result = await device_model.get_variables(
+            "TEST_STATION",
+            [{"component": {"name": "ChargingStation"}, "variable": {"name": "VendorName"}}],
+        )
 
         assert len(result) == 1
         assert result[0]["attributeStatus"] == "Accepted"
@@ -93,7 +93,7 @@ class TestDeviceModel:
     async def test_set_variables(self, device_model, mock_timescale_client):
         """Test variable setting."""
         mock_timescale_client.set_device_variable = AsyncMock()
-        
+
         # Initialize device model first
         station_id = "TEST_STATION"
         station_info = {
@@ -102,16 +102,21 @@ class TestDeviceModel:
             "serial_number": "TEST123",
             "firmware_version": "1.0.0",
             "num_evses": 2,
-            "num_connectors": 4
+            "num_connectors": 4,
         }
         await device_model.initialize_complete_device_model(station_id, station_info)
 
-        result = await device_model.set_variables("TEST_STATION", [{
-            "component": {"name": "ChargingStation"},
-            "variable": {"name": "HeartbeatInterval"},
-            "attributeType": "Actual",
-            "attributeValue": "300"
-        }])
+        result = await device_model.set_variables(
+            "TEST_STATION",
+            [
+                {
+                    "component": {"name": "ChargingStation"},
+                    "variable": {"name": "HeartbeatInterval"},
+                    "attributeType": "Actual",
+                    "attributeValue": "300",
+                }
+            ],
+        )
 
         assert len(result) == 1
         assert result[0]["attributeStatus"] == "Accepted"
@@ -143,7 +148,7 @@ class TestChargingProfileManager:
         # Mock the methods that will be called internally
         mock_timescale_client.get_charging_profiles = AsyncMock(return_value=[])
         mock_timescale_client.store_charging_profile = AsyncMock()
-        
+
         # Create test profile as dictionary (not OCPP datatype)
         profile = {
             "id": 1,
@@ -153,14 +158,9 @@ class TestChargingProfileManager:
             "chargingSchedule": {
                 "id": 1,
                 "chargingRateUnit": "W",
-                "chargingSchedulePeriod": [
-                    {
-                        "startPeriod": 0,
-                        "limit": 22.0
-                    }
-                ],
-                "duration": 3600
-            }
+                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 22.0}],
+                "duration": 3600,
+            },
         }
 
         result = await profile_manager.set_charging_profile("TEST_STATION", 1, profile)
@@ -183,12 +183,10 @@ class TestChargingProfileManager:
                     "chargingSchedule": {
                         "id": 1,
                         "chargingRateUnit": "W",
-                        "chargingSchedulePeriod": [
-                            {"startPeriod": 0, "limit": 22.0}
-                        ],
-                        "duration": 3600
-                    }
-                }
+                        "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 22.0}],
+                        "duration": 3600,
+                    },
+                },
             }
         ]
 
@@ -221,13 +219,14 @@ class TestTransactionManager:
     async def test_request_start_transaction(self, transaction_manager, mock_timescale_client):
         """Test transaction start request."""
         from ocpp.v21.datatypes import IdTokenType
-        from ocpp.v21.enums import AuthorizationStatusEnumType
 
         # Mock authorization
-        mock_timescale_client.get_id_token_info = AsyncMock(return_value={
-            "status": "Accepted",
-            "cache_timeout": datetime.now(timezone.utc) + timedelta(hours=1)
-        })
+        mock_timescale_client.get_id_token_info = AsyncMock(
+            return_value={
+                "status": "Accepted",
+                "cache_timeout": datetime.now(timezone.utc) + timedelta(hours=1),
+            }
+        )
         mock_timescale_client.store_transaction = AsyncMock()
         mock_timescale_client.get_evse_status = AsyncMock(return_value={"status": "Available"})
 
@@ -260,6 +259,7 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_circuit_breaker_closed_state(self, circuit_breaker):
         """Test circuit breaker in closed state."""
+
         async def success_func():
             return "success"
 
@@ -270,6 +270,7 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_circuit_breaker_opens_on_failures(self, circuit_breaker):
         """Test circuit breaker opens after threshold failures."""
+
         async def failing_func():
             raise Exception("Test failure")
 
@@ -314,6 +315,7 @@ class TestRetryManager:
     @pytest.mark.asyncio
     async def test_retry_success_on_first_attempt(self, retry_manager):
         """Test retry manager succeeds on first attempt."""
+
         async def success_func():
             return "success"
 
@@ -339,6 +341,7 @@ class TestRetryManager:
     @pytest.mark.asyncio
     async def test_retry_exhausts_attempts(self, retry_manager):
         """Test retry manager exhausts all attempts."""
+
         async def always_failing_func():
             raise Exception("Permanent failure")
 
@@ -374,13 +377,8 @@ class TestTariffManager:
             "currency": "USD",
             "priority": 1,
             "elements": [
-                {
-                    "type": "Energy",
-                    "price_per_unit": 0.20,
-                    "unit": "kWh",
-                    "currency": "USD"
-                }
-            ]
+                {"type": "Energy", "price_per_unit": 0.20, "unit": "kWh", "currency": "USD"}
+            ],
         }
 
         result = await tariff_manager.set_tariff("TEST_STATION", tariff_data)
@@ -392,17 +390,14 @@ class TestTariffManager:
     async def test_calculate_transaction_cost(self, tariff_manager, mock_timescale_client):
         """Test transaction cost calculation."""
         mock_timescale_client.get_active_tariffs.return_value = [
-            {
-                "tariff_id": "TARIFF_001",
-                "tariff_currency": "USD"
-            }
+            {"tariff_id": "TARIFF_001", "tariff_currency": "USD"}
         ]
         mock_timescale_client.get_tariff_elements.return_value = [
             {
                 "element_type": "Energy",
-                "price_per_unit": Decimal('0.20'),
+                "price_per_unit": Decimal("0.20"),
                 "unit": "kWh",
-                "currency": "USD"
+                "currency": "USD",
             }
         ]
         mock_timescale_client.calculate_tou_multiplier.return_value = 1.0
@@ -435,7 +430,9 @@ class TestPrivacyManager:
         return PrivacyManager(mock_timescale_client)
 
     @pytest.mark.asyncio
-    async def test_handle_customer_information_request(self, privacy_manager, mock_timescale_client):
+    async def test_handle_customer_information_request(
+        self, privacy_manager, mock_timescale_client
+    ):
         """Test customer information request handling."""
         from ocpp.v21.datatypes import IdTokenType
 

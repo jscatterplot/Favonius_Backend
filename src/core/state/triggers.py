@@ -87,7 +87,7 @@ class TriggerMonitor:
         self,
         config: TriggerConfig,
         on_trigger: Callable[[str], None],  # async callback
-        assembler: Optional['StateAssembler'] = None,
+        assembler: Optional["StateAssembler"] = None,
         pool: Optional[asyncpg.Pool] = None,
         depot_id: Optional[str] = None,
     ):
@@ -115,13 +115,13 @@ class TriggerMonitor:
         self._last_trigger_time: Optional[datetime] = None
         self._trigger_cooldown_sec: float = config.trigger_cooldown_minutes * 60.0
         self._last_scheduled_hour: Optional[int] = None  # Track last scheduled trigger hour
-        self._last_vdv463_update_at: Optional[datetime] = None  # VDV 463 charging request change trigger
+        self._last_vdv463_update_at: Optional[datetime] = (
+            None  # VDV 463 charging request change trigger
+        )
 
         # Validate that we have a way to fetch state
         if assembler is None and (pool is None or depot_id is None):
-            raise ValueError(
-                "Either assembler or (pool + depot_id) must be provided"
-            )
+            raise ValueError("Either assembler or (pool + depot_id) must be provided")
 
         logger.info("Initialized TriggerMonitor")
 
@@ -152,9 +152,7 @@ class TriggerMonitor:
         self.last_prices = prices
         logger.debug(f"Updated price baseline: {len(prices)} price points")
 
-    async def check_soc_deviation(
-        self, current_socs: dict[str, float]
-    ) -> Optional[str]:
+    async def check_soc_deviation(self, current_socs: dict[str, float]) -> Optional[str]:
         """Check if any vehicle SoC deviates from expected.
 
         Args:
@@ -176,9 +174,7 @@ class TriggerMonitor:
                     return reason
         return None
 
-    async def check_price_change(
-        self, current_prices: dict[datetime, float]
-    ) -> Optional[str]:
+    async def check_price_change(self, current_prices: dict[datetime, float]) -> Optional[str]:
         """Check if prices changed significantly.
 
         Args:
@@ -234,25 +230,20 @@ class TriggerMonitor:
                     return reason
         return None
 
-    def trigger_interdepot_handoff(
-        self, message_id: UUID, vehicle_id: UUID
-    ) -> str:
+    def trigger_interdepot_handoff(self, message_id: UUID, vehicle_id: UUID) -> str:
         """Create trigger for inter-depot handoff receipt.
-        
+
         Per PRD Section 5.3, inter-depot handoff messages trigger
         re-optimization immediately (event-driven trigger).
-        
+
         Args:
             message_id: Handoff message identifier
             vehicle_id: Vehicle identifier arriving from another depot
-            
+
         Returns:
             Trigger reason string
         """
-        reason = (
-            f"interdepot_handoff: message_id={message_id}, "
-            f"vehicle_id={vehicle_id}"
-        )
+        reason = f"interdepot_handoff: message_id={message_id}, " f"vehicle_id={vehicle_id}"
         logger.info(f"Inter-depot handoff trigger: {reason}")
         return reason
 
@@ -293,7 +284,7 @@ class TriggerMonitor:
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id)
-            return {str(row['vehicle_id']): float(row['soc']) for row in rows}
+            return {str(row["vehicle_id"]): float(row["soc"]) for row in rows}
         except asyncio.TimeoutError as e:
             logger.warning(f"Timeout fetching vehicle SoCs: {e}")
             return {}
@@ -347,7 +338,7 @@ class TriggerMonitor:
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id)
-            return {row['time']: float(row['price_per_kwh']) for row in rows}
+            return {row["time"]: float(row["price_per_kwh"]) for row in rows}
         except Exception as e:
             logger.error(f"Error fetching prices: {e}")
             return {}
@@ -379,7 +370,7 @@ class TriggerMonitor:
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id)
-            return {str(row['vehicle_id']): row['return_time'] for row in rows}
+            return {str(row["vehicle_id"]): row["return_time"] for row in rows}
         except asyncio.TimeoutError as e:
             logger.warning(f"Timeout fetching return times: {e}")
             return {}
@@ -440,14 +431,14 @@ class TriggerMonitor:
             try:
                 now = datetime.utcnow()
                 current_hour = now.hour
-                
+
                 # Scheduled trigger: hourly 24/7 (once per hour)
                 scheduled_trigger = None
                 if self._last_scheduled_hour is None or self._last_scheduled_hour != current_hour:
                     scheduled_trigger = "scheduled"
                     self._last_scheduled_hour = current_hour
                     logger.info(f"Scheduled trigger fired for hour {current_hour}")
-                
+
                 # Fetch current state
                 current_socs = await self._get_current_vehicle_socs()
                 current_prices = await self._get_current_prices()
@@ -456,9 +447,7 @@ class TriggerMonitor:
                 # Check all triggers
                 soc_trigger = await self.check_soc_deviation(current_socs)
                 price_trigger = await self.check_price_change(current_prices)
-                return_trigger = await self.check_return_time_deviation(
-                    actual_returns
-                )
+                return_trigger = await self.check_return_time_deviation(actual_returns)
                 vdv463_trigger = await self.check_vdv463_charging_request_change()
 
                 # Fire callback if any trigger detected (with cooldown)
@@ -467,12 +456,7 @@ class TriggerMonitor:
                     await self.on_trigger(scheduled_trigger)
                     self._last_trigger_time = now
                 elif soc_trigger or price_trigger or return_trigger or vdv463_trigger:
-                    reason = (
-                        soc_trigger
-                        or price_trigger
-                        or return_trigger
-                        or vdv463_trigger
-                    )
+                    reason = soc_trigger or price_trigger or return_trigger or vdv463_trigger
 
                     # Check cooldown to prevent rapid-fire triggers
                     if (
@@ -483,24 +467,26 @@ class TriggerMonitor:
                         logger.info(
                             f"Trigger fired: {reason}",
                             extra={
-                                'trigger_type': (
-                                    'soc_deviation'
+                                "trigger_type": (
+                                    "soc_deviation"
                                     if soc_trigger
-                                    else 'price_change'
-                                    if price_trigger
-                                    else 'return_delay'
-                                    if return_trigger
-                                    else 'vdv463_charging_request_change'
+                                    else (
+                                        "price_change"
+                                        if price_trigger
+                                        else (
+                                            "return_delay"
+                                            if return_trigger
+                                            else "vdv463_charging_request_change"
+                                        )
+                                    )
                                 ),
-                                'depot_id': self.depot_id,
+                                "depot_id": self.depot_id,
                             },
                         )
                         await self.on_trigger(reason)
                         self._last_trigger_time = now
                     else:
-                        time_since_last = (
-                            now - self._last_trigger_time
-                        ).total_seconds()
+                        time_since_last = (now - self._last_trigger_time).total_seconds()
                         logger.debug(
                             f"Trigger suppressed (cooldown): {reason} "
                             f"(last trigger {time_since_last:.0f}s ago, "
@@ -520,4 +506,3 @@ class TriggerMonitor:
         """Stop monitoring."""
         self._running = False
         logger.info("Stopping trigger monitor")
-

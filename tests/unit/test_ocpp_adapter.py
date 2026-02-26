@@ -20,8 +20,8 @@ from src.adapters.ocpp import (
 )
 from src.core.models import OptimizationResult
 
-
 # ============ Fixtures ============
+
 
 @pytest.fixture
 def mock_websocket():
@@ -36,7 +36,7 @@ def mock_websocket():
 @pytest.fixture
 def sample_charge_point_id():
     """Sample charge point ID."""
-    return 'charger_001'
+    return "charger_001"
 
 
 @pytest.fixture
@@ -44,17 +44,17 @@ def sample_optimization_result():
     """Sample optimization result."""
     return OptimizationResult(
         run_id=uuid4(),
-        status='completed',
+        status="completed",
         objective_value=1000.0,
         solve_time=5.0,
         schedule={
-            'bus_1': {
-                'charging_power': [80.0, 60.0, 80.0, 0.0],
-                'soc': [0.3, 0.5, 0.7, 0.9],
+            "bus_1": {
+                "charging_power": [80.0, 60.0, 80.0, 0.0],
+                "soc": [0.3, 0.5, 0.7, 0.9],
             },
-            'bus_2': {
-                'charging_power': [70.0, 70.0, 0.0, 0.0],
-                'soc': [0.4, 0.6, 0.8, 0.95],
+            "bus_2": {
+                "charging_power": [70.0, 70.0, 0.0, 0.0],
+                "soc": [0.4, 0.6, 0.8, 0.95],
             },
         },
         battery_dispatch=[10.0, -5.0, 0.0, 0.0],
@@ -64,6 +64,7 @@ def sample_optimization_result():
 
 
 # ============ Charge Point Tests ============
+
 
 def test_fleet_charge_point_initialization(mock_websocket, sample_charge_point_id):
     """Test FleetChargePoint initialization."""
@@ -78,10 +79,10 @@ def test_fleet_charge_point_initialization(mock_websocket, sample_charge_point_i
 async def test_boot_notification_handler(mock_websocket, sample_charge_point_id):
     """Test BootNotification handler."""
     cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
-    response = await cp.on_boot_notification('Vendor', 'Model')
+    response = await cp.on_boot_notification("Vendor", "Model")
 
     assert isinstance(response, call_result.BootNotification)
-    assert response.status == 'Accepted'
+    assert response.status == "Accepted"
     assert response.interval == 300
 
 
@@ -96,14 +97,12 @@ async def test_status_notification_handler(mock_websocket, sample_charge_point_i
         callback_called = True
         callback_data = (cp_id, conn_id, status)
 
-    cp = FleetChargePoint(
-        sample_charge_point_id, mock_websocket, on_status_change=status_callback
-    )
-    response = await cp.on_status_notification(1, 'NoError', 'Available')
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket, on_status_change=status_callback)
+    response = await cp.on_status_notification(1, "NoError", "Available")
 
     assert isinstance(response, call_result.StatusNotification)
     assert callback_called
-    assert callback_data == (sample_charge_point_id, 1, 'Available')
+    assert callback_data == (sample_charge_point_id, 1, "Available")
 
 
 @pytest.mark.asyncio
@@ -117,16 +116,14 @@ async def test_meter_values_handler(mock_websocket, sample_charge_point_id):
         callback_called = True
         callback_data = (cp_id, conn_id, soc, power, timestamp)
 
-    cp = FleetChargePoint(
-        sample_charge_point_id, mock_websocket, on_meter_values=meter_callback
-    )
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket, on_meter_values=meter_callback)
 
     meter_value = [
         {
-            'timestamp': datetime.utcnow().isoformat(),
-            'sampledValue': [
-                {'measurand': 'SoC', 'value': '75.5', 'unit': ''},
-                {'measurand': 'Power.Active.Import', 'value': '8000', 'unit': 'W'},
+            "timestamp": datetime.utcnow().isoformat(),
+            "sampledValue": [
+                {"measurand": "SoC", "value": "75.5", "unit": ""},
+                {"measurand": "Power.Active.Import", "value": "8000", "unit": "W"},
             ],
         }
     ]
@@ -148,12 +145,12 @@ async def test_set_charging_profile(mock_websocket, sample_charge_point_id):
 
     # Mock the call method
     mock_response = MagicMock()
-    mock_response.status = 'Accepted'
+    mock_response.status = "Accepted"
     cp.call = AsyncMock(return_value=mock_response)
 
     schedule = [
-        {'startPeriod': 0, 'limit': 80000, 'numberPhases': 3},
-        {'startPeriod': 900, 'limit': 60000, 'numberPhases': 3},
+        {"startPeriod": 0, "limit": 80000, "numberPhases": 3},
+        {"startPeriod": 900, "limit": 60000, "numberPhases": 3},
     ]
 
     result = await cp.set_charging_profile(1, schedule)
@@ -169,11 +166,11 @@ async def test_remote_start_stop_transaction(mock_websocket, sample_charge_point
 
     # Mock the call method
     mock_response = MagicMock()
-    mock_response.status = 'Accepted'
+    mock_response.status = "Accepted"
     cp.call = AsyncMock(return_value=mock_response)
 
     # Test remote start
-    result = await cp.remote_start_transaction(1, 'TAG001')
+    result = await cp.remote_start_transaction(1, "TAG001")
     assert result is True
 
     # Test remote stop
@@ -189,24 +186,25 @@ def test_charging_profile_conversion():
     profile = convert_schedule_to_ocpp_profile(schedule, delta_t=0.25)
 
     assert len(profile) == 3
-    assert profile[0]['startPeriod'] == 0
-    assert profile[0]['limit'] == 80000  # 80kW * 1000
-    assert profile[1]['startPeriod'] == 900  # 1 * 0.25 * 3600
-    assert profile[1]['limit'] == 60000  # 60kW * 1000
-    assert profile[2]['startPeriod'] == 1800  # 2 * 0.25 * 3600
-    assert all(p['numberPhases'] == 3 for p in profile)
+    assert profile[0]["startPeriod"] == 0
+    assert profile[0]["limit"] == 80000  # 80kW * 1000
+    assert profile[1]["startPeriod"] == 900  # 1 * 0.25 * 3600
+    assert profile[1]["limit"] == 60000  # 60kW * 1000
+    assert profile[2]["startPeriod"] == 1800  # 2 * 0.25 * 3600
+    assert all(p["numberPhases"] == 3 for p in profile)
 
 
 # ============ Server Tests ============
 
+
 @pytest.mark.asyncio
 async def test_ocpp_server_initialization():
     """Test OCPPServer initialization."""
-    server = OCPPServer(host='127.0.0.1', port=9001)
-    assert server.host == '127.0.0.1'
+    server = OCPPServer(host="127.0.0.1", port=9001)
+    assert server.host == "127.0.0.1"
     assert server.port == 9001
     assert len(server.charge_points) == 0
-    assert server.is_connected('test_id') is False
+    assert server.is_connected("test_id") is False
 
 
 @pytest.mark.asyncio
@@ -215,19 +213,19 @@ async def test_connection_handling(mock_websocket):
     server = OCPPServer()
 
     # Mock websocket path
-    mock_websocket.path = '/charger_001'
+    mock_websocket.path = "/charger_001"
 
     # Mock charge point start to avoid infinite loop
-    with patch.object(FleetChargePoint, 'start', new_callable=AsyncMock) as mock_start:
+    with patch.object(FleetChargePoint, "start", new_callable=AsyncMock) as mock_start:
         mock_start.side_effect = asyncio.CancelledError()  # Simulate disconnect
 
         try:
-            await server.on_connect(mock_websocket, '/charger_001')
+            await server.on_connect(mock_websocket, "/charger_001")
         except asyncio.CancelledError:
             pass  # Expected
 
         # Verify charge point was registered and cleaned up
-        assert 'charger_001' not in server.charge_points
+        assert "charger_001" not in server.charge_points
 
 
 @pytest.mark.asyncio
@@ -236,19 +234,19 @@ async def test_charge_point_registration(mock_websocket):
     server = OCPPServer()
 
     # Manually register a charge point
-    cp = FleetChargePoint('test_charger', mock_websocket)
-    server.charge_points['test_charger'] = cp
+    cp = FleetChargePoint("test_charger", mock_websocket)
+    server.charge_points["test_charger"] = cp
 
-    assert server.is_connected('test_charger') is True
-    assert server.get_charge_point('test_charger') == cp
-    assert server.get_charge_point('nonexistent') is None
+    assert server.is_connected("test_charger") is True
+    assert server.get_charge_point("test_charger") == cp
+    assert server.get_charge_point("nonexistent") is None
 
 
 @pytest.mark.asyncio
 async def test_disconnect_cleanup(mock_websocket):
     """Test cleanup on disconnect."""
     server = OCPPServer()
-    server.charge_points['test_charger'] = FleetChargePoint('test_charger', mock_websocket)
+    server.charge_points["test_charger"] = FleetChargePoint("test_charger", mock_websocket)
 
     await server.stop()
 
@@ -257,17 +255,18 @@ async def test_disconnect_cleanup(mock_websocket):
 
 # ============ Integration Tests ============
 
+
 @pytest.mark.asyncio
 async def test_end_to_end_connection(mock_websocket):
     """Test end-to-end connection flow."""
     server = OCPPServer()
 
     # Mock charge point start
-    with patch.object(FleetChargePoint, 'start', new_callable=AsyncMock) as mock_start:
+    with patch.object(FleetChargePoint, "start", new_callable=AsyncMock) as mock_start:
         mock_start.side_effect = asyncio.CancelledError()
 
         try:
-            await server.on_connect(mock_websocket, '/charger_001')
+            await server.on_connect(mock_websocket, "/charger_001")
         except asyncio.CancelledError:
             pass
 
@@ -285,43 +284,37 @@ async def test_meter_values_storage():
     mock_conn.__aexit__ = AsyncMock(return_value=None)
 
     timestamp = datetime.utcnow()
-    await store_meter_values(
-        mock_pool, 'charger_001', 1, 0.75, 8.0, timestamp, vehicle_id='bus_1'
-    )
+    await store_meter_values(mock_pool, "charger_001", 1, 0.75, 8.0, timestamp, vehicle_id="bus_1")
 
     mock_conn.execute.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_charging_profile_dispatch(
-    sample_optimization_result, mock_websocket
-):
+async def test_charging_profile_dispatch(sample_optimization_result, mock_websocket):
     """Test charging profile dispatch from optimization."""
     server = OCPPServer()
 
     # Create mock charge points
-    cp1 = FleetChargePoint('charger_1', mock_websocket)
-    cp2 = FleetChargePoint('charger_2', mock_websocket)
+    cp1 = FleetChargePoint("charger_1", mock_websocket)
+    cp2 = FleetChargePoint("charger_2", mock_websocket)
 
     # Mock set_charging_profile
     cp1.set_charging_profile = AsyncMock(return_value=True)
     cp2.set_charging_profile = AsyncMock(return_value=True)
 
-    server.charge_points['charger_1'] = cp1
-    server.charge_points['charger_2'] = cp2
+    server.charge_points["charger_1"] = cp1
+    server.charge_points["charger_2"] = cp2
 
     # Vehicle to charger mapping
     vehicle_map = {
-        'bus_1': ('charger_1', 1),
-        'bus_2': ('charger_2', 1),
+        "bus_1": ("charger_1", 1),
+        "bus_2": ("charger_2", 1),
     }
 
-    results = await dispatch_charging_profiles(
-        server, sample_optimization_result, vehicle_map
-    )
+    results = await dispatch_charging_profiles(server, sample_optimization_result, vehicle_map)
 
-    assert results['bus_1'] is True
-    assert results['bus_2'] is True
+    assert results["bus_1"] is True
+    assert results["bus_2"] is True
     assert cp1.set_charging_profile.called
     assert cp2.set_charging_profile.called
 
@@ -334,14 +327,12 @@ async def test_charging_profile_dispatch_missing_charger(
     server = OCPPServer()
 
     vehicle_map = {
-        'bus_1': ('charger_1', 1),  # Not connected
+        "bus_1": ("charger_1", 1),  # Not connected
     }
 
-    results = await dispatch_charging_profiles(
-        server, sample_optimization_result, vehicle_map
-    )
+    results = await dispatch_charging_profiles(server, sample_optimization_result, vehicle_map)
 
-    assert results['bus_1'] is False
+    assert results["bus_1"] is False
 
 
 @pytest.mark.asyncio
@@ -353,10 +344,7 @@ async def test_charging_profile_dispatch_missing_vehicle(
 
     vehicle_map = {}  # Empty mapping
 
-    results = await dispatch_charging_profiles(
-        server, sample_optimization_result, vehicle_map
-    )
+    results = await dispatch_charging_profiles(server, sample_optimization_result, vehicle_map)
 
     # All vehicles should fail
     assert all(not v for v in results.values())
-

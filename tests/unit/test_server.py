@@ -1,20 +1,19 @@
 """Unit tests for OCPP WebSocket server."""
 
-import pytest
 import asyncio
 import json
-import time
-import uuid
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
-from datetime import datetime, timezone
+import os
 
 # Import test dependencies
 import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+from unittest.mock import AsyncMock, Mock, patch
 
-from websocket_handler.server import OCPPWebSocketServer
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
 from websocket_handler.config import Config
+from websocket_handler.server import OCPPWebSocketServer
 from websocket_handler.timescale_client import TimescaleClient
 
 
@@ -100,14 +99,18 @@ class TestOCPPWebSocketServer:
         # Mock websockets.serve to return a mock server
         mock_server = Mock()
         mock_server.wait_closed = AsyncMock()
-        
+
         # Mock the component initialization to avoid V2XController issues
-        with patch.object(server, '_initialize_components', new_callable=AsyncMock) as mock_init, \
-             patch('websockets.serve', new_callable=AsyncMock, return_value=mock_server) as mock_serve:
+        with (
+            patch.object(server, "_initialize_components", new_callable=AsyncMock) as mock_init,
+            patch(
+                "websockets.serve", new_callable=AsyncMock, return_value=mock_server
+            ) as mock_serve,
+        ):
             await server.start()
             mock_serve.assert_called_once()
             mock_init.assert_called_once()
-        
+
         await server.stop()
         assert True  # Graceful completion
 
@@ -118,19 +121,23 @@ class TestOCPPWebSocketServer:
         # Test without SSL (should return None)
         ssl_context = server._setup_ssl_context()
         assert ssl_context is None
-        
+
         # Test with SSL configuration
         server.config.tls.cert_path = "/path/to/cert.pem"
         server.config.tls.key_path = "/path/to/key.pem"
-        
-        with patch('os.path.exists', return_value=True), \
-             patch('ssl.SSLContext') as mock_ssl_context:
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("ssl.SSLContext") as mock_ssl_context,
+        ):
             mock_context = Mock()
             mock_ssl_context.return_value = mock_context
-            
+
             ssl_context = server._setup_ssl_context()
             assert ssl_context == mock_context
-            mock_context.load_cert_chain.assert_called_once_with("/path/to/cert.pem", "/path/to/key.pem")
+            mock_context.load_cert_chain.assert_called_once_with(
+                "/path/to/cert.pem", "/path/to/key.pem"
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -142,16 +149,16 @@ class TestOCPPWebSocketServer:
         mock_websocket.send = AsyncMock()
         mock_websocket.close = AsyncMock()
         mock_websocket.subprotocol = "ocpp2.1"
-        
+
         # Mock message handler
         server.message_handler = Mock()
         server.message_handler.handle_message = AsyncMock()
-        
+
         # Mock connection manager
         server.connection_manager = Mock()
         server.connection_manager.add_connection = AsyncMock()
         server.connection_manager.remove_connection = AsyncMock()
-        
+
         # Test connection handling without raising exceptions
         try:
             await server._handle_connection(mock_websocket, "/test")
@@ -167,16 +174,16 @@ class TestOCPPWebSocketServer:
         """Test message processing functionality."""
         mock_websocket = Mock()
         mock_websocket.remote_address = ("127.0.0.1", 12345)
-        
+
         # Mock message handler
         server.message_handler = Mock()
         server.message_handler.handle_message = AsyncMock()
-        
+
         # Test valid JSON message
-        test_message = json.dumps([2, "1", "BootNotification", {"reason": "PowerUp"}])
-        
+        json.dumps([2, "1", "BootNotification", {"reason": "PowerUp"}])
+
         # Test the actual connection handling method
-        with patch.object(server, '_handle_connection', new_callable=AsyncMock) as mock_handle:
+        with patch.object(server, "_handle_connection", new_callable=AsyncMock) as mock_handle:
             await server._handle_connection(mock_websocket, "/test")
             mock_handle.assert_called_once()
 
@@ -187,11 +194,11 @@ class TestOCPPWebSocketServer:
         mock_websocket = Mock()
         mock_websocket.remote_address = ("127.0.0.1", 12345)
         mock_websocket.send = AsyncMock()
-        
+
         # Test with invalid JSON
-        with patch.object(server, '_handle_connection', new_callable=AsyncMock) as mock_handle:
+        with patch.object(server, "_handle_connection", new_callable=AsyncMock):
             await server._handle_connection(mock_websocket, "/test")
-            
+
             # Should handle gracefully without raising exception
             assert True
 
@@ -200,26 +207,27 @@ class TestOCPPWebSocketServer:
     async def test_rate_limiting(self, server):
         """Test rate limiting functionality."""
         connection_id = "test_connection"
-        
+
         # Test rate limit check - should pass initially
         result, _ = await server._check_rate_limit(connection_id)
         assert result is True
-        
+
         # Configure mock to return rate limit exceeded after multiple calls
         call_count = 0
+
         def rate_limit_side_effect(station_id):
             nonlocal call_count
             call_count += 1
             if call_count > server.config.websocket.rate_limit_per_minute:
                 return (False, "Rate limit exceeded")
             return (True, "OK")
-        
+
         server.connection_manager.check_message_rate_limit.side_effect = rate_limit_side_effect
-        
+
         # Simulate exceeding rate limit
         for _ in range(server.config.websocket.rate_limit_per_minute + 1):
             await server._check_rate_limit(connection_id)
-        
+
         result, _ = await server._check_rate_limit(connection_id)
         assert result is False
 
@@ -229,18 +237,18 @@ class TestOCPPWebSocketServer:
         """Test connection cleanup functionality."""
         connection_id = "test_connection"
         station_id = "TEST_STATION_001"
-        
+
         # Add test connection
         server.connections[connection_id] = Mock()
         server.station_connections[station_id] = connection_id
-        
+
         # Mock connection manager
         server.connection_manager = Mock()
         server.connection_manager.unregister_connection = AsyncMock()
-        
+
         mock_websocket = Mock()
         await server._cleanup_connection(connection_id, mock_websocket, station_id)
-        
+
         assert connection_id not in server.connections
         assert station_id not in server.station_connections
         server.connection_manager.unregister_connection.assert_called_once()
@@ -251,29 +259,29 @@ class TestOCPPWebSocketServer:
         """Test heartbeat task functionality."""
         # Set server as running
         server.running = True
-        
+
         # Mock charge points
         mock_charge_point = Mock()
         mock_charge_point.heartbeat = AsyncMock()
         server.charge_points["TEST_STATION_001"] = mock_charge_point
-        
+
         # Test heartbeat task - it just sleeps, doesn't call heartbeat
-        with patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             # Start the task
             task = asyncio.create_task(server._heartbeat_monitor())
-            
+
             # Let it run briefly
             await asyncio.sleep(0.1)
-            
+
             # Stop the server
             server.running = False
-            
+
             # Wait for task to complete
             try:
                 await asyncio.wait_for(task, timeout=1.0)
             except asyncio.TimeoutError:
                 task.cancel()
-            
+
             # Should have called sleep
             assert mock_sleep.called
 
@@ -284,11 +292,11 @@ class TestOCPPWebSocketServer:
         # Test that the rate limit cleanup task is started
         assert server._rate_limit_task is not None
         assert not server._rate_limit_task.done()
-        
+
         # Test that the cleanup task can be cancelled
         result = server._rate_limit_task.cancel()
         assert result is True
-        
+
         # Test that the task is marked as cancelled
         assert server._rate_limit_task.cancelled() is False  # Mock returns False
 
@@ -301,7 +309,7 @@ class TestOCPPWebSocketServer:
             await server._initialize_components()
             # Should complete without error
             assert True
-        except Exception as e:
+        except Exception:
             # Expected to handle initialization errors gracefully
             assert True
 
@@ -312,11 +320,11 @@ class TestOCPPWebSocketServer:
         # Add test charge points
         server.charge_points["station1"] = Mock()
         server.charge_points["station2"] = Mock()
-        
+
         # Test getting specific charge point
         charge_point = server.get_charge_point("station1")
         assert charge_point is not None
-        
+
         # Test getting all charge points
         all_charge_points = server.get_all_charge_points()
         assert len(all_charge_points) == 2
@@ -329,7 +337,7 @@ class TestOCPPWebSocketServer:
         mock_websocket.remote_address = ("127.0.0.1", 12345)
         mock_websocket.send = AsyncMock()
         mock_websocket.subprotocol = "ocpp2.1"
-        
+
         # Test connection error handling
         try:
             await server._handle_connection(mock_websocket, "/test")
@@ -344,7 +352,7 @@ class TestOCPPWebSocketServer:
     async def test_server_health_check(self, server):
         """Test server health check."""
         server.running = True
-        
+
         # Test basic server state
         assert server.running is True
         assert server.server is None  # Not started yet
@@ -354,7 +362,7 @@ class TestOCPPWebSocketServer:
     async def test_server_health_check_degraded(self, server):
         """Test server health check when degraded."""
         server.running = False
-        
+
         # Test degraded state
         assert server.running is False
 
@@ -364,10 +372,10 @@ class TestOCPPWebSocketServer:
         assert server.config.websocket.host is not None
         assert server.config.websocket.port > 0
         assert server.config.websocket.max_connections > 0
-        
+
         # Test configuration access
-        assert hasattr(server.config, 'websocket')
-        assert hasattr(server.config, 'tls')
+        assert hasattr(server.config, "websocket")
+        assert hasattr(server.config, "tls")
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -382,16 +390,16 @@ class TestOCPPWebSocketServer:
             mock_ws.close = AsyncMock()
             mock_ws.subprotocol = "ocpp2.1"
             connections.append(mock_ws)
-        
+
         # Test concurrent connection handling
         tasks = []
         for conn in connections:
             task = asyncio.create_task(server._handle_connection(conn, "/test"))
             tasks.append(task)
-        
+
         # Wait for all connections to be handled
         await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Should handle all connections without error
         assert True
 

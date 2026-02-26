@@ -2,17 +2,17 @@
 
 See PRD_v2.md Section 10.4 for security requirements.
 """
+
 from __future__ import annotations
 
 import re
 from uuid import UUID
-from typing import Any
+
 from fastapi import HTTPException, status
 
 # Validation patterns
 UUID_PATTERN = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
-    re.IGNORECASE
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE
 )
 
 
@@ -29,7 +29,7 @@ def validate_uuid(value: str, field_name: str) -> UUID:
     if not UUID_PATTERN.match(value):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid UUID format for {field_name}"
+            detail=f"Invalid UUID format for {field_name}",
         )
     return UUID(value)
 
@@ -47,7 +47,7 @@ def validate_soc(value: float, field_name: str) -> float:
     if not (0.0 <= value <= 1.0):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"{field_name} must be between 0.0 and 1.0, got {value}"
+            detail=f"{field_name} must be between 0.0 and 1.0, got {value}",
         )
     return value
 
@@ -66,12 +66,12 @@ def validate_power(value: float, field_name: str, max_site_power: float) -> floa
     if value < 0:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"{field_name} must be non-negative, got {value}"
+            detail=f"{field_name} must be non-negative, got {value}",
         )
     if value > max_site_power:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"{field_name} exceeds max site power ({max_site_power} kW)"
+            detail=f"{field_name} exceeds max site power ({max_site_power} kW)",
         )
     return value
 
@@ -82,10 +82,8 @@ def sanitize_sql_identifier(value: str) -> str:
     Only allows alphanumeric and underscore characters.
     Primary protection is parameterized queries.
     """
-    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', value):
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", value):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Invalid identifier format"
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid identifier format"
         )
     return value
-

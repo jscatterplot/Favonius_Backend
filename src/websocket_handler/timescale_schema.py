@@ -1,10 +1,8 @@
 """TimescaleDB schema creation and management."""
 
-import asyncio
-import os
-from typing import List, Dict, Any
+from typing import Any, Dict
+
 import asyncpg
-from datetime import datetime, timezone
 
 from .config import TimescaleConfig
 from .monitoring import get_logger
@@ -12,12 +10,12 @@ from .monitoring import get_logger
 
 class TimescaleSchema:
     """TimescaleDB schema management."""
-    
+
     def __init__(self, config: TimescaleConfig):
         """Initialize TimescaleDB schema manager."""
         self.config = config
         self.logger = get_logger(__name__)
-    
+
     async def create_schema(self) -> None:
         """Create all TimescaleDB tables, hypertables, and policies."""
         try:
@@ -28,40 +26,40 @@ class TimescaleSchema:
                 database=self.config.database,
                 user=self.config.user,
                 password=self.config.password,
-                ssl=self.config.sslmode
+                ssl=self.config.sslmode,
             )
-            
+
             try:
                 # Enable TimescaleDB extension
                 await self._enable_timescaledb(conn)
-                
+
                 # Create tables
                 await self._create_tables(conn)
-                
+
                 # Create hypertables
                 await self._create_hypertables(conn)
-                
+
                 # Create indexes
                 await self._create_indexes(conn)
-                
+
                 # Create continuous aggregates
                 await self._create_continuous_aggregates(conn)
-                
+
                 # Setup compression policies
                 await self._setup_compression_policies(conn)
-                
+
                 # Setup retention policies
                 await self._setup_retention_policies(conn)
-                
+
                 self.logger.info("TimescaleDB schema created successfully")
-                
+
             finally:
                 await conn.close()
-                
+
         except Exception as e:
             self.logger.error(f"Failed to create TimescaleDB schema: {e}")
             raise
-    
+
     async def _enable_timescaledb(self, conn: asyncpg.Connection) -> None:
         """Enable TimescaleDB extension."""
         try:
@@ -69,10 +67,10 @@ class TimescaleSchema:
             self.logger.info("TimescaleDB extension enabled")
         except Exception as e:
             self.logger.warning(f"TimescaleDB extension may already exist: {e}")
-    
+
     async def _create_tables(self, conn: asyncpg.Connection) -> None:
         """Create all database tables."""
-        
+
         # Charging sessions table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_sessions (
@@ -98,7 +96,7 @@ class TimescaleSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Telemetry data table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS telemetry_data (
@@ -119,7 +117,7 @@ class TimescaleSchema:
                 power_factor DECIMAL(3,2)
             );
         """)
-        
+
         # Optimization decisions table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS optimization_decisions (
@@ -139,7 +137,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Vehicle routes table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicle_routes (
@@ -162,7 +160,7 @@ class TimescaleSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Vehicle fleet table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicle_fleet (
@@ -184,7 +182,7 @@ class TimescaleSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Price forecasts table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS price_forecasts (
@@ -201,7 +199,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Demand forecasts table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS demand_forecasts (
@@ -217,7 +215,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Charging schedules table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_schedules (
@@ -237,7 +235,7 @@ class TimescaleSchema:
                 execution_status VARCHAR(50)
             );
         """)
-        
+
         # Electricity prices table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS electricity_prices (
@@ -267,7 +265,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Grid signals table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS grid_signals (
@@ -281,7 +279,7 @@ class TimescaleSchema:
                 region VARCHAR(100)
             );
         """)
-        
+
         # Vehicle telemetry table (for real-time vehicle state)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS vehicle_telemetry (
@@ -296,15 +294,15 @@ class TimescaleSchema:
                 last_seen TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # V2G-specific tables
         await self._create_v2g_tables(conn)
-        
+
         self.logger.info("All tables created successfully")
-    
+
     async def _create_v2g_tables(self, conn: asyncpg.Connection) -> None:
         """Create V2G-specific tables."""
-        
+
         # Enhanced charging profiles table with V2G fields
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS charging_profiles_v2g (
@@ -329,7 +327,7 @@ class TimescaleSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Enhanced EV charging needs table with V2G parameters
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS ev_charging_needs_v2g (
@@ -354,7 +352,7 @@ class TimescaleSchema:
                 timestamp TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # DER controls table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS der_controls (
@@ -371,7 +369,7 @@ class TimescaleSchema:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # DER events table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS der_events (
@@ -384,7 +382,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # External charging limits table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS external_charging_limits (
@@ -399,7 +397,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Enhanced transaction events table with V2G fields
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS transaction_events_v2g (
@@ -428,7 +426,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Enhanced telemetry data table with V2G measurands
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS telemetry_data_v2g (
@@ -455,7 +453,7 @@ class TimescaleSchema:
                 operation_mode VARCHAR(50)
             );
         """)
-        
+
         # Device model variables table for V2G components
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS device_model_variables_v2g (
@@ -473,7 +471,7 @@ class TimescaleSchema:
                 UNIQUE(station_id, component_name, variable_name)
             );
         """)
-        
+
         # ISO 15118 certificates table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS iso15118_certificates (
@@ -492,7 +490,7 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         # Authorization records table for Plug & Charge
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS authorization_records (
@@ -506,190 +504,190 @@ class TimescaleSchema:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        
+
         self.logger.info("V2G tables created successfully")
-    
+
     async def _create_hypertables(self, conn: asyncpg.Connection) -> None:
         """Create TimescaleDB hypertables."""
-        
+
         # Create hypertable for telemetry data
         await conn.execute(f"""
             SELECT create_hypertable('telemetry_data', 'time', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         # Create hypertable for optimization decisions
         await conn.execute(f"""
             SELECT create_hypertable('optimization_decisions', 'time', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         # Create hypertable for electricity prices
         await conn.execute(f"""
             SELECT create_hypertable('electricity_prices', 'time', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        await conn.execute(f"""
+        await conn.execute("""
             SELECT create_hypertable('electricity_price_forecasts', 'time', create_default_indexes => FALSE)
             ON CONFLICT DO NOTHING;
         """)
-        
+
         # Create hypertable for grid signals
         await conn.execute(f"""
             SELECT create_hypertable('grid_signals', 'time', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         # Create hypertable for vehicle telemetry
         await conn.execute(f"""
             SELECT create_hypertable('vehicle_telemetry', 'time', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         # Create V2G hypertables
         await self._create_v2g_hypertables(conn)
-        
+
         self.logger.info("All hypertables created successfully")
-    
+
     async def _create_v2g_hypertables(self, conn: asyncpg.Connection) -> None:
         """Create V2G-specific hypertables."""
-        
+
         # Create hypertable for V2G telemetry data
         await conn.execute(f"""
             SELECT create_hypertable('telemetry_data_v2g', 'time', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         # Create hypertable for transaction events V2G
         await conn.execute(f"""
             SELECT create_hypertable('transaction_events_v2g', 'timestamp', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         # Create hypertable for DER events
         await conn.execute(f"""
             SELECT create_hypertable('der_events', 'timestamp', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         # Create hypertable for external charging limits
         await conn.execute(f"""
             SELECT create_hypertable('external_charging_limits', 'timestamp', 
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
-        
+
         self.logger.info("V2G hypertables created successfully")
-    
+
     async def _create_indexes(self, conn: asyncpg.Connection) -> None:
         """Create database indexes for performance."""
-        
+
         # Charging sessions indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sessions_station_time 
             ON charging_sessions(station_id, start_time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sessions_fleet 
             ON charging_sessions(fleet_operator_id, start_time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sessions_sync_status 
             ON charging_sessions(sync_status, created_at);
         """)
-        
+
         # Telemetry data indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_telemetry_station 
             ON telemetry_data(station_id, time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_telemetry_session 
             ON telemetry_data(session_id, time DESC);
         """)
-        
+
         # Optimization decisions indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_optimization_fleet 
             ON optimization_decisions(fleet_operator_id, time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_optimization_sync_status 
             ON optimization_decisions(sync_status, created_at);
         """)
-        
+
         # Vehicle routes indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_routes_vehicle 
             ON vehicle_routes(vehicle_id, departure_time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_routes_station 
             ON vehicle_routes(station_id, departure_time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_routes_status 
             ON vehicle_routes(route_status, created_at);
         """)
-        
+
         # Vehicle fleet indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_fleet_station 
             ON vehicle_fleet(station_id, is_active);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_fleet_active 
             ON vehicle_fleet(is_active, updated_at DESC);
         """)
-        
+
         # Price forecasts indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_price_forecasts_time 
             ON price_forecasts(forecast_time DESC, horizon_start);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_price_forecasts_node 
             ON price_forecasts(node_id, forecast_time DESC);
         """)
-        
+
         # Demand forecasts indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_demand_forecasts_time 
             ON demand_forecasts(forecast_time DESC, horizon_start);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_demand_forecasts_station 
             ON demand_forecasts(station_id, forecast_time DESC);
         """)
-        
+
         # Charging schedules indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_schedules_station 
             ON charging_schedules(station_id, start_time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_schedules_decision 
             ON charging_schedules(decision_id);
         """)
-        
+
         # Electricity prices indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_prices_node 
@@ -699,37 +697,37 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_price_forecasts_node_time
             ON electricity_price_forecasts (node_id, time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_prices_market 
             ON electricity_prices(market_type, time DESC);
         """)
-        
+
         # Grid signals indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_grid_signals_type 
             ON grid_signals(signal_type, time DESC);
         """)
-        
+
         # Vehicle telemetry indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vehicle_telemetry_vehicle 
             ON vehicle_telemetry(vehicle_id, time DESC);
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vehicle_telemetry_org 
             ON vehicle_telemetry(organization_id, time DESC);
         """)
-        
+
         # V2G-specific indexes
         await self._create_v2g_indexes(conn)
-        
+
         self.logger.info("All indexes created successfully")
-    
+
     async def _create_v2g_indexes(self, conn: asyncpg.Connection) -> None:
         """Create V2G-specific indexes."""
-        
+
         # Charging profiles V2G indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_charging_profiles_v2g_station 
@@ -739,7 +737,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_charging_profiles_v2g_purpose 
             ON charging_profiles_v2g(purpose, stack_level);
         """)
-        
+
         # EV charging needs V2G indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_ev_charging_needs_v2g_station 
@@ -749,7 +747,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_ev_charging_needs_v2g_timestamp 
             ON ev_charging_needs_v2g(timestamp DESC);
         """)
-        
+
         # DER controls indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_der_controls_station 
@@ -759,7 +757,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_der_controls_priority 
             ON der_controls(priority, start_time);
         """)
-        
+
         # DER events indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_der_events_station 
@@ -769,7 +767,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_der_events_timestamp 
             ON der_events(timestamp DESC);
         """)
-        
+
         # External charging limits indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_external_limits_station 
@@ -779,7 +777,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_external_limits_source 
             ON external_charging_limits(source, is_grid_critical);
         """)
-        
+
         # Transaction events V2G indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_transaction_events_v2g_station 
@@ -793,7 +791,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_transaction_events_v2g_v2g 
             ON transaction_events_v2g(is_v2g_event, trigger_reason);
         """)
-        
+
         # Telemetry data V2G indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_telemetry_v2g_station 
@@ -803,7 +801,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_telemetry_v2g_session 
             ON telemetry_data_v2g(session_id, time DESC);
         """)
-        
+
         # Device model variables V2G indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_device_model_v2g_station 
@@ -813,7 +811,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_device_model_v2g_variable 
             ON device_model_variables_v2g(component_name, variable_name);
         """)
-        
+
         # ISO 15118 certificates indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_certificates_station 
@@ -823,7 +821,7 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_certificates_status 
             ON iso15118_certificates(status, valid_to);
         """)
-        
+
         # Authorization records indexes
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_auth_records_station 
@@ -833,12 +831,12 @@ class TimescaleSchema:
             CREATE INDEX IF NOT EXISTS idx_auth_records_time 
             ON authorization_records(authorization_time DESC);
         """)
-        
+
         self.logger.info("V2G indexes created successfully")
-    
+
     async def _create_continuous_aggregates(self, conn: asyncpg.Connection) -> None:
         """Create continuous aggregates for performance."""
-        
+
         # Hourly energy aggregates
         await conn.execute("""
             CREATE MATERIALIZED VIEW IF NOT EXISTS hourly_energy_aggregates
@@ -856,7 +854,7 @@ class TimescaleSchema:
             FROM telemetry_data
             GROUP BY hour, station_id;
         """)
-        
+
         # Add continuous aggregate policy
         await conn.execute("""
             SELECT add_continuous_aggregate_policy('hourly_energy_aggregates',
@@ -864,7 +862,7 @@ class TimescaleSchema:
                 end_offset => INTERVAL '1 hour',
                 schedule_interval => INTERVAL '1 hour');
         """)
-        
+
         # Daily fleet metrics
         await conn.execute("""
             CREATE MATERIALIZED VIEW IF NOT EXISTS daily_fleet_metrics
@@ -881,7 +879,7 @@ class TimescaleSchema:
             WHERE cs.end_time IS NOT NULL
             GROUP BY day, cs.fleet_operator_id;
         """)
-        
+
         # Add continuous aggregate policy for daily metrics
         await conn.execute("""
             SELECT add_continuous_aggregate_policy('daily_fleet_metrics',
@@ -889,7 +887,7 @@ class TimescaleSchema:
                 end_offset => INTERVAL '1 day',
                 schedule_interval => INTERVAL '1 day');
         """)
-        
+
         # Hourly optimization performance
         await conn.execute("""
             CREATE MATERIALIZED VIEW IF NOT EXISTS hourly_optimization_performance
@@ -904,7 +902,7 @@ class TimescaleSchema:
             FROM optimization_decisions
             GROUP BY hour, fleet_operator_id;
         """)
-        
+
         # Add continuous aggregate policy for optimization performance
         await conn.execute("""
             SELECT add_continuous_aggregate_policy('hourly_optimization_performance',
@@ -912,12 +910,12 @@ class TimescaleSchema:
                 end_offset => INTERVAL '1 hour',
                 schedule_interval => INTERVAL '1 hour');
         """)
-        
+
         self.logger.info("All continuous aggregates created successfully")
-    
+
     async def _setup_compression_policies(self, conn: asyncpg.Connection) -> None:
         """Setup compression policies for older data."""
-        
+
         # Enable compression on telemetry data
         await conn.execute("""
             ALTER TABLE telemetry_data SET (
@@ -926,12 +924,12 @@ class TimescaleSchema:
                 timescaledb.compress_orderby = 'time DESC'
             );
         """)
-        
+
         # Add compression policy
         await conn.execute(f"""
             SELECT add_compression_policy('telemetry_data', INTERVAL '{self.config.compression_after}');
         """)
-        
+
         # Enable compression on electricity prices
         await conn.execute("""
             ALTER TABLE electricity_prices SET (
@@ -940,7 +938,7 @@ class TimescaleSchema:
                 timescaledb.compress_orderby = 'time DESC'
             );
         """)
-        
+
         # Add compression policy for prices
         await conn.execute("""
             SELECT add_compression_policy('electricity_prices', INTERVAL '30 days');
@@ -949,7 +947,7 @@ class TimescaleSchema:
             SELECT add_compression_policy('electricity_price_forecasts', INTERVAL '30 days')
             ON CONFLICT DO NOTHING;
         """)
-        
+
         # Enable compression on grid signals
         await conn.execute("""
             ALTER TABLE grid_signals SET (
@@ -958,12 +956,12 @@ class TimescaleSchema:
                 timescaledb.compress_orderby = 'time DESC'
             );
         """)
-        
+
         # Add compression policy for grid signals
         await conn.execute("""
             SELECT add_compression_policy('grid_signals', INTERVAL '30 days');
         """)
-        
+
         # Enable compression on vehicle telemetry
         await conn.execute("""
             ALTER TABLE vehicle_telemetry SET (
@@ -972,32 +970,32 @@ class TimescaleSchema:
                 timescaledb.compress_orderby = 'time DESC'
             );
         """)
-        
+
         # Add compression policy for vehicle telemetry
         await conn.execute(f"""
             SELECT add_compression_policy('vehicle_telemetry', INTERVAL '{self.config.compression_after}');
         """)
-        
+
         self.logger.info("All compression policies created successfully")
-    
+
     async def _setup_retention_policies(self, conn: asyncpg.Connection) -> None:
         """Setup retention policies for data lifecycle management."""
-        
+
         # Retention policy for telemetry data
         await conn.execute(f"""
             SELECT add_retention_policy('telemetry_data', INTERVAL '{self.config.retention_period}');
         """)
-        
+
         # Retention policy for grid signals
         await conn.execute("""
             SELECT add_retention_policy('grid_signals', INTERVAL '1 year');
         """)
-        
+
         # Retention policy for vehicle telemetry
         await conn.execute(f"""
             SELECT add_retention_policy('vehicle_telemetry', INTERVAL '{self.config.retention_period}');
         """)
-        
+
         # Retention policy for electricity prices
         await conn.execute("""
             SELECT add_retention_policy('electricity_prices', INTERVAL '2 years');
@@ -1006,13 +1004,13 @@ class TimescaleSchema:
             SELECT add_retention_policy('electricity_price_forecasts', INTERVAL '2 years')
             ON CONFLICT DO NOTHING;
         """)
-        
+
         # Keep optimization decisions indefinitely for model training
         # Keep charging sessions indefinitely for billing and analytics
         # Keep electricity prices indefinitely for historical analysis
-        
+
         self.logger.info("All retention policies created successfully")
-    
+
     async def get_schema_info(self) -> Dict[str, Any]:
         """Get information about the current schema."""
         try:
@@ -1022,46 +1020,46 @@ class TimescaleSchema:
                 database=self.config.database,
                 user=self.config.user,
                 password=self.config.password,
-                ssl=self.config.sslmode
+                ssl=self.config.sslmode,
             )
-            
+
             try:
                 # Get hypertables
                 hypertables = await conn.fetch("""
                     SELECT hypertable_name, num_dimensions, num_chunks
                     FROM timescaledb_information.hypertables;
                 """)
-                
+
                 # Get continuous aggregates
                 continuous_aggregates = await conn.fetch("""
                     SELECT view_name, materialized_only, finalized
                     FROM timescaledb_information.continuous_aggregates;
                 """)
-                
+
                 # Get compression policies
                 compression_policies = await conn.fetch("""
                     SELECT hypertable_name, compress_after
                     FROM timescaledb_information.jobs
                     WHERE proc_name = 'policy_compression';
                 """)
-                
+
                 # Get retention policies
                 retention_policies = await conn.fetch("""
                     SELECT hypertable_name, drop_after
                     FROM timescaledb_information.jobs
                     WHERE proc_name = 'policy_retention';
                 """)
-                
+
                 return {
                     "hypertables": [dict(row) for row in hypertables],
                     "continuous_aggregates": [dict(row) for row in continuous_aggregates],
                     "compression_policies": [dict(row) for row in compression_policies],
-                    "retention_policies": [dict(row) for row in retention_policies]
+                    "retention_policies": [dict(row) for row in retention_policies],
                 }
-                
+
             finally:
                 await conn.close()
-                
+
         except Exception as e:
             self.logger.error(f"Failed to get schema info: {e}")
             raise

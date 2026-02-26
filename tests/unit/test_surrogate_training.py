@@ -6,8 +6,8 @@ Reference: Development plan Step 2.2, PRD.md#11-2-unit-test-requirements
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import UUID, uuid4
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -21,8 +21,8 @@ from src.core.surrogate import (
     train_and_validate,
 )
 
-
 # ============ Fixtures ============
+
 
 @pytest.fixture
 def mock_pool():
@@ -47,21 +47,22 @@ def sample_schedule_rows():
     base_time = datetime.now() - timedelta(days=10)
     return [
         {
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': base_time + timedelta(days=i),
-            'energy_kwh': 150.0 + i * 5,
-            'temp_avg_f': 70.0 + i,
-            'temp_max_f': 80.0 + i,
-            'temp_min_f': 60.0 + i,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
+            "vehicle_type": "bus_large",
+            "route_id": "route_1",
+            "departure_time": base_time + timedelta(days=i),
+            "energy_kwh": 150.0 + i * 5,
+            "temp_avg_f": 70.0 + i,
+            "temp_max_f": 80.0 + i,
+            "temp_min_f": 60.0 + i,
+            "rain_inches": 0.0,
+            "solar_radiation": 500.0,
         }
         for i in range(20)
     ]
 
 
 # ============ School Day Tests ============
+
 
 def test_is_school_day_weekday():
     """Test that Monday-Friday returns True."""
@@ -106,6 +107,7 @@ def test_is_school_day_edge_cases():
 
 # ============ Fetch Training Data Tests ============
 
+
 @pytest.mark.asyncio
 async def test_fetch_training_data_basic(mock_pool, sample_depot_id, sample_schedule_rows):
     """Test basic fetch_training_data functionality."""
@@ -121,8 +123,8 @@ async def test_fetch_training_data_basic(mock_pool, sample_depot_id, sample_sche
     assert len(energies) == 20
     assert all(isinstance(inp, PredictionInput) for inp in inputs)
     assert all(isinstance(energy, float) for energy in energies)
-    assert inputs[0].bus_size == 'large'
-    assert inputs[0].route_id == 'route_1'
+    assert inputs[0].bus_size == "large"
+    assert inputs[0].route_id == "route_1"
 
 
 @pytest.mark.asyncio
@@ -130,15 +132,15 @@ async def test_fetch_training_data_missing_weather(mock_pool, sample_depot_id):
     """Test handling of missing weather data."""
     rows_with_missing_weather = [
         {
-            'vehicle_type': 'bus_small',
-            'route_id': 'route_2',
-            'departure_time': datetime.now() - timedelta(days=5),
-            'energy_kwh': 100.0,
-            'temp_avg_f': None,  # Missing weather
-            'temp_max_f': None,
-            'temp_min_f': None,
-            'rain_inches': None,
-            'solar_radiation': None,
+            "vehicle_type": "bus_small",
+            "route_id": "route_2",
+            "departure_time": datetime.now() - timedelta(days=5),
+            "energy_kwh": 100.0,
+            "temp_avg_f": None,  # Missing weather
+            "temp_max_f": None,
+            "temp_min_f": None,
+            "rain_inches": None,
+            "solar_radiation": None,
         }
     ]
 
@@ -177,37 +179,37 @@ async def test_fetch_training_data_vehicle_type_mapping(mock_pool, sample_depot_
     """Test vehicle_type to bus_size mapping."""
     rows = [
         {
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': datetime.now() - timedelta(days=1),
-            'energy_kwh': 150.0,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
+            "vehicle_type": "bus_large",
+            "route_id": "route_1",
+            "departure_time": datetime.now() - timedelta(days=1),
+            "energy_kwh": 150.0,
+            "temp_avg_f": 70.0,
+            "temp_max_f": 80.0,
+            "temp_min_f": 60.0,
+            "rain_inches": 0.0,
+            "solar_radiation": 500.0,
         },
         {
-            'vehicle_type': 'bus_small',
-            'route_id': 'route_2',
-            'departure_time': datetime.now() - timedelta(days=2),
-            'energy_kwh': 100.0,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
+            "vehicle_type": "bus_small",
+            "route_id": "route_2",
+            "departure_time": datetime.now() - timedelta(days=2),
+            "energy_kwh": 100.0,
+            "temp_avg_f": 70.0,
+            "temp_max_f": 80.0,
+            "temp_min_f": 60.0,
+            "rain_inches": 0.0,
+            "solar_radiation": 500.0,
         },
         {
-            'vehicle_type': 'unknown_type',
-            'route_id': 'route_3',
-            'departure_time': datetime.now() - timedelta(days=3),
-            'energy_kwh': 120.0,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
+            "vehicle_type": "unknown_type",
+            "route_id": "route_3",
+            "departure_time": datetime.now() - timedelta(days=3),
+            "energy_kwh": 120.0,
+            "temp_avg_f": 70.0,
+            "temp_max_f": 80.0,
+            "temp_min_f": 60.0,
+            "rain_inches": 0.0,
+            "solar_radiation": 500.0,
         },
     ]
 
@@ -218,9 +220,9 @@ async def test_fetch_training_data_vehicle_type_mapping(mock_pool, sample_depot_
 
     inputs, _ = await fetch_training_data(mock_pool, sample_depot_id, lookback_days=30)
 
-    assert inputs[0].bus_size == 'large'
-    assert inputs[1].bus_size == 'small'
-    assert inputs[2].bus_size == 'large'  # Default for unknown
+    assert inputs[0].bus_size == "large"
+    assert inputs[1].bus_size == "small"
+    assert inputs[2].bus_size == "large"  # Default for unknown
 
 
 @pytest.mark.asyncio
@@ -233,26 +235,26 @@ async def test_fetch_training_data_school_day_calculation(mock_pool, sample_depo
 
     rows = [
         {
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': monday,
-            'energy_kwh': 150.0,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
+            "vehicle_type": "bus_large",
+            "route_id": "route_1",
+            "departure_time": monday,
+            "energy_kwh": 150.0,
+            "temp_avg_f": 70.0,
+            "temp_max_f": 80.0,
+            "temp_min_f": 60.0,
+            "rain_inches": 0.0,
+            "solar_radiation": 500.0,
         },
         {
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': saturday,
-            'energy_kwh': 150.0,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
+            "vehicle_type": "bus_large",
+            "route_id": "route_1",
+            "departure_time": saturday,
+            "energy_kwh": 150.0,
+            "temp_avg_f": 70.0,
+            "temp_max_f": 80.0,
+            "temp_min_f": 60.0,
+            "rain_inches": 0.0,
+            "solar_radiation": 500.0,
         },
     ]
 
@@ -279,6 +281,7 @@ async def test_fetch_training_data_invalid_lookback_days(mock_pool, sample_depot
 
 # ============ Train and Validate Tests ============
 
+
 @pytest.mark.asyncio
 async def test_train_and_validate_basic(mock_pool, sample_depot_id):
     """Test end-to-end training with mock data."""
@@ -287,17 +290,19 @@ async def test_train_and_validate_basic(mock_pool, sample_depot_id):
     rows = []
     for i in range(40):  # 40 samples over ~37 days
         day_offset = i // 2  # Roughly 2 samples per day
-        rows.append({
-            'vehicle_type': 'bus_large' if i % 2 == 0 else 'bus_small',
-            'route_id': f'route_{i % 3 + 1}',
-            'departure_time': base_time + timedelta(days=day_offset),
-            'energy_kwh': 100.0 + i * 2.0,
-            'temp_avg_f': 70.0 + (i % 10),
-            'temp_max_f': 80.0 + (i % 10),
-            'temp_min_f': 60.0 + (i % 10),
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
-        })
+        rows.append(
+            {
+                "vehicle_type": "bus_large" if i % 2 == 0 else "bus_small",
+                "route_id": f"route_{i % 3 + 1}",
+                "departure_time": base_time + timedelta(days=day_offset),
+                "energy_kwh": 100.0 + i * 2.0,
+                "temp_avg_f": 70.0 + (i % 10),
+                "temp_max_f": 80.0 + (i % 10),
+                "temp_min_f": 60.0 + (i % 10),
+                "rain_inches": 0.0,
+                "solar_radiation": 500.0,
+            }
+        )
 
     mock_conn = AsyncMock()
     mock_conn.fetch = AsyncMock(return_value=rows)
@@ -320,17 +325,19 @@ async def test_train_and_validate_split(mock_pool, sample_depot_id):
     base_time = datetime.now() - timedelta(days=20)
     rows = []
     for i in range(20):
-        rows.append({
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': base_time + timedelta(days=i),
-            'energy_kwh': 100.0 + i,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
-        })
+        rows.append(
+            {
+                "vehicle_type": "bus_large",
+                "route_id": "route_1",
+                "departure_time": base_time + timedelta(days=i),
+                "energy_kwh": 100.0 + i,
+                "temp_avg_f": 70.0,
+                "temp_max_f": 80.0,
+                "temp_min_f": 60.0,
+                "rain_inches": 0.0,
+                "solar_radiation": 500.0,
+            }
+        )
 
     mock_conn = AsyncMock()
     mock_conn.fetch = AsyncMock(return_value=rows)
@@ -356,17 +363,19 @@ async def test_train_and_validate_r2_score(mock_pool, sample_depot_id):
         # Energy correlated with temperature
         temp = 60.0 + i
         energy = 100.0 + temp * 0.5
-        rows.append({
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': base_time + timedelta(days=i),
-            'energy_kwh': energy,
-            'temp_avg_f': temp,
-            'temp_max_f': temp + 10.0,
-            'temp_min_f': temp - 10.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
-        })
+        rows.append(
+            {
+                "vehicle_type": "bus_large",
+                "route_id": "route_1",
+                "departure_time": base_time + timedelta(days=i),
+                "energy_kwh": energy,
+                "temp_avg_f": temp,
+                "temp_max_f": temp + 10.0,
+                "temp_min_f": temp - 10.0,
+                "rain_inches": 0.0,
+                "solar_radiation": 500.0,
+            }
+        )
 
     mock_conn = AsyncMock()
     mock_conn.fetch = AsyncMock(return_value=rows)
@@ -400,19 +409,21 @@ async def test_train_and_validate_route_extraction(mock_pool, sample_depot_id):
     """Test that unique routes are extracted from training data."""
     base_time = datetime.now() - timedelta(days=20)
     rows = []
-    routes = ['route_1', 'route_2', 'route_3']
+    routes = ["route_1", "route_2", "route_3"]
     for i in range(30):
-        rows.append({
-            'vehicle_type': 'bus_large',
-            'route_id': routes[i % 3],
-            'departure_time': base_time + timedelta(days=i),
-            'energy_kwh': 100.0 + i,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
-        })
+        rows.append(
+            {
+                "vehicle_type": "bus_large",
+                "route_id": routes[i % 3],
+                "departure_time": base_time + timedelta(days=i),
+                "energy_kwh": 100.0 + i,
+                "temp_avg_f": 70.0,
+                "temp_max_f": 80.0,
+                "temp_min_f": 60.0,
+                "rain_inches": 0.0,
+                "solar_radiation": 500.0,
+            }
+        )
 
     mock_conn = AsyncMock()
     mock_conn.fetch = AsyncMock(return_value=rows)
@@ -425,7 +436,7 @@ async def test_train_and_validate_route_extraction(mock_pool, sample_depot_id):
 
     # Model should know about all routes from training data
     assert len(model.known_routes) == 3
-    assert set(model.known_routes) == {'route_1', 'route_2', 'route_3'}
+    assert set(model.known_routes) == {"route_1", "route_2", "route_3"}
 
 
 @pytest.mark.asyncio
@@ -440,6 +451,7 @@ async def test_train_and_validate_invalid_parameters(mock_pool, sample_depot_id)
 
 # ============ Save Trained Model Tests ============
 
+
 @pytest.mark.asyncio
 async def test_save_trained_model(mock_pool, sample_depot_id):
     """Test saving trained model to disk."""
@@ -447,17 +459,19 @@ async def test_save_trained_model(mock_pool, sample_depot_id):
     base_time = datetime.now() - timedelta(days=20)
     rows = []
     for i in range(20):
-        rows.append({
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': base_time + timedelta(days=i),
-            'energy_kwh': 100.0 + i,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
-        })
+        rows.append(
+            {
+                "vehicle_type": "bus_large",
+                "route_id": "route_1",
+                "departure_time": base_time + timedelta(days=i),
+                "energy_kwh": 100.0 + i,
+                "temp_avg_f": 70.0,
+                "temp_max_f": 80.0,
+                "temp_min_f": 60.0,
+                "rain_inches": 0.0,
+                "solar_radiation": 500.0,
+            }
+        )
 
     mock_conn = AsyncMock()
     mock_conn.fetch = AsyncMock(return_value=rows)
@@ -474,7 +488,7 @@ async def test_save_trained_model(mock_pool, sample_depot_id):
         model_path = await save_trained_model(model, sample_depot_id, model_dir, r2)
 
         assert model_path.exists()
-        assert model_path.suffix == '.joblib'
+        assert model_path.suffix == ".joblib"
         assert sample_depot_id in model_path.name
 
         # Verify model can be loaded
@@ -489,17 +503,19 @@ async def test_save_trained_model_creates_directory(mock_pool, sample_depot_id):
     base_time = datetime.now() - timedelta(days=20)
     rows = []
     for i in range(10):
-        rows.append({
-            'vehicle_type': 'bus_large',
-            'route_id': 'route_1',
-            'departure_time': base_time + timedelta(days=i),
-            'energy_kwh': 100.0 + i,
-            'temp_avg_f': 70.0,
-            'temp_max_f': 80.0,
-            'temp_min_f': 60.0,
-            'rain_inches': 0.0,
-            'solar_radiation': 500.0,
-        })
+        rows.append(
+            {
+                "vehicle_type": "bus_large",
+                "route_id": "route_1",
+                "departure_time": base_time + timedelta(days=i),
+                "energy_kwh": 100.0 + i,
+                "temp_avg_f": 70.0,
+                "temp_max_f": 80.0,
+                "temp_min_f": 60.0,
+                "rain_inches": 0.0,
+                "solar_radiation": 500.0,
+            }
+        )
 
     mock_conn = AsyncMock()
     mock_conn.fetch = AsyncMock(return_value=rows)
@@ -512,7 +528,7 @@ async def test_save_trained_model_creates_directory(mock_pool, sample_depot_id):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create a subdirectory that doesn't exist
-        model_dir = Path(tmpdir) / 'models' / 'surrogate'
+        model_dir = Path(tmpdir) / "models" / "surrogate"
         assert not model_dir.exists()
 
         model_path = await save_trained_model(model, sample_depot_id, model_dir, r2)
@@ -523,6 +539,7 @@ async def test_save_trained_model_creates_directory(mock_pool, sample_depot_id):
 
 # ============ Integration Tests ============
 
+
 @pytest.mark.asyncio
 async def test_training_pipeline_end_to_end(mock_pool, sample_depot_id):
     """Test full training pipeline end-to-end."""
@@ -532,17 +549,19 @@ async def test_training_pipeline_end_to_end(mock_pool, sample_depot_id):
     for i in range(60):  # 60 samples
         day_offset = i // 2
         temp = 60.0 + (i % 20)
-        rows.append({
-            'vehicle_type': 'bus_large' if i % 2 == 0 else 'bus_small',
-            'route_id': f'route_{i % 5 + 1}',
-            'departure_time': base_time + timedelta(days=day_offset),
-            'energy_kwh': 100.0 + temp * 0.5 + (i % 10) * 2,
-            'temp_avg_f': temp,
-            'temp_max_f': temp + 10.0,
-            'temp_min_f': temp - 10.0,
-            'rain_inches': 0.1 if i % 10 == 0 else 0.0,
-            'solar_radiation': 400.0 + (i % 20) * 10,
-        })
+        rows.append(
+            {
+                "vehicle_type": "bus_large" if i % 2 == 0 else "bus_small",
+                "route_id": f"route_{i % 5 + 1}",
+                "departure_time": base_time + timedelta(days=day_offset),
+                "energy_kwh": 100.0 + temp * 0.5 + (i % 10) * 2,
+                "temp_avg_f": temp,
+                "temp_max_f": temp + 10.0,
+                "temp_min_f": temp - 10.0,
+                "rain_inches": 0.1 if i % 10 == 0 else 0.0,
+                "solar_radiation": 400.0 + (i % 20) * 10,
+            }
+        )
 
     mock_conn = AsyncMock()
     mock_conn.fetch = AsyncMock(return_value=rows)
@@ -569,8 +588,8 @@ async def test_training_pipeline_end_to_end(mock_pool, sample_depot_id):
 
         # Test prediction
         test_input = PredictionInput(
-            bus_size='large',
-            route_id='route_1',
+            bus_size="large",
+            route_id="route_1",
             temp_avg_f=70.0,
             temp_max_f=80.0,
             temp_min_f=60.0,
@@ -583,4 +602,3 @@ async def test_training_pipeline_end_to_end(mock_pool, sample_depot_id):
         assert len(std) == 1
         assert mean[0] > 0
         assert std[0] > 0
-
