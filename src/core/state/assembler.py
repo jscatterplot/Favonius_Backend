@@ -55,9 +55,7 @@ class StateAssembler:
         ```
     """
 
-    def __init__(
-        self, pool: asyncpg.Pool, depot_id: str | UUID, config: DepotConfig
-    ):
+    def __init__(self, pool: asyncpg.Pool, depot_id: str | UUID, config: DepotConfig):
         """Initialize state assembler.
 
         Args:
@@ -88,9 +86,7 @@ class StateAssembler:
         """
         # Validate horizon
         if horizon_hours <= 0 or horizon_hours > 48:
-            raise ValueError(
-                f"horizon_hours must be in (0, 48], got {horizon_hours}"
-            )
+            raise ValueError(f"horizon_hours must be in (0, 48], got {horizon_hours}")
 
         import time
 
@@ -115,18 +111,13 @@ class StateAssembler:
             )
             # Use default SoC for all configured vehicles
             vehicle_socs = {
-                vid: 0.5  # Default SoC
-                for vid in self.config.vehicle_capacities.keys()
+                vid: 0.5 for vid in self.config.vehicle_capacities.keys()  # Default SoC
             }
 
         # Ensure all vehicles in config have SoC data
-        missing_vehicles = set(self.config.vehicle_capacities.keys()) - set(
-            vehicle_socs.keys()
-        )
+        missing_vehicles = set(self.config.vehicle_capacities.keys()) - set(vehicle_socs.keys())
         if missing_vehicles:
-            logger.warning(
-                f"Missing SoC for vehicles: {missing_vehicles}, using default 0.5"
-            )
+            logger.warning(f"Missing SoC for vehicles: {missing_vehicles}, using default 0.5")
             for vid in missing_vehicles:
                 vehicle_socs[vid] = 0.5
 
@@ -139,9 +130,13 @@ class StateAssembler:
         # Fetch schedules and VDV 463 charging requests; merge (VDV 463 overrides for same vehicle)
         schedules = await self._get_schedules(now, horizon_end)
         vdv463_requests = await self._get_vdv463_charging_requests(now, horizon_end)
-        schedules, vehicle_departure_soc_min, vehicle_departure_soc_max, vehicle_priorities, preconditioning_requests = (
-            self._merge_vdv463_into_schedules(schedules, vdv463_requests, now)
-        )
+        (
+            schedules,
+            vehicle_departure_soc_min,
+            vehicle_departure_soc_max,
+            vehicle_priorities,
+            preconditioning_requests,
+        ) = self._merge_vdv463_into_schedules(schedules, vdv463_requests, now)
         availability = self._compute_availability(schedules, now, n_steps)
         departure_times = self._compute_departure_times(schedules, now)
         energy_requirements = self._compute_energy_requirements(schedules)
@@ -171,7 +166,9 @@ class StateAssembler:
             if vehicle_id_str not in self.config.vehicle_max_charge_kw:
                 self.config.vehicle_max_charge_kw[vehicle_id_str] = incoming.max_charge_kw
             # Set availability: False before arrival, True after (per PRD Section 8.1 Constraint 12)
-            arrival_timestep = int((incoming.arrival_time - now).total_seconds() / (self.config.delta_t * 3600))
+            arrival_timestep = int(
+                (incoming.arrival_time - now).total_seconds() / (self.config.delta_t * 3600)
+            )
             if 0 <= arrival_timestep < n_steps:
                 if vehicle_id_str not in availability:
                     availability[vehicle_id_str] = [False] * n_steps
@@ -205,11 +202,11 @@ class StateAssembler:
             f"{len(prices)} price points, {len(schedules)} schedules "
             f"(took {assembly_time:.3f}s)",
             extra={
-                'depot_id': self.depot_id,
-                'assembly_time_seconds': assembly_time,
-                'n_vehicles': len(vehicle_socs),
-                'n_price_points': len(prices),
-                'n_schedules': len(schedules),
+                "depot_id": self.depot_id,
+                "assembly_time_seconds": assembly_time,
+                "n_vehicles": len(vehicle_socs),
+                "n_price_points": len(prices),
+                "n_schedules": len(schedules),
             },
         )
         return state
@@ -236,13 +233,11 @@ class StateAssembler:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id)
 
-            result = {str(row['vehicle_id']): float(row['soc']) for row in rows}
+            result = {str(row["vehicle_id"]): float(row["soc"]) for row in rows}
             logger.debug(f"Retrieved SoC for {len(result)} vehicles")
             return result
         except asyncpg.PostgresError as e:
-            logger.error(
-                f"Database error fetching vehicle SoCs for depot {self.depot_id}: {e}"
-            )
+            logger.error(f"Database error fetching vehicle SoCs for depot {self.depot_id}: {e}")
             raise
 
     async def _get_battery_soc(self) -> float:
@@ -264,9 +259,7 @@ class StateAssembler:
         logger.debug("Using default battery SoC 0.5 (MVP)")
         return 0.5
 
-    async def _get_prices(
-        self, start: datetime, end: datetime, n_steps: int
-    ) -> list[float]:
+    async def _get_prices(self, start: datetime, end: datetime, n_steps: int) -> list[float]:
         """Get electricity prices for horizon with proper interpolation.
 
         Args:
@@ -309,7 +302,7 @@ class StateAssembler:
             return [0.15] * n_steps  # Default price
 
         # Build time-indexed price map
-        price_map = {row['time']: float(row['price_per_kwh']) for row in rows}
+        price_map = {row["time"]: float(row["price_per_kwh"]) for row in rows}
 
         # Generate prices for each timestep
         delta_t = timedelta(hours=self.config.delta_t)
@@ -339,9 +332,7 @@ class StateAssembler:
         )
         return prices[:n_steps]
 
-    async def _get_vdv463_charging_requests(
-        self, start: datetime, end: datetime
-    ) -> list[dict]:
+    async def _get_vdv463_charging_requests(self, start: datetime, end: datetime) -> list[dict]:
         """Get active VDV 463 charging requests whose window overlaps [start, end].
 
         Returns list of dicts with: vehicle_id (str), expected_arrival, requested_departure,
@@ -375,9 +366,7 @@ class StateAssembler:
                     extra={"depot_id": self.depot_id},
                 )
                 return []
-            logger.error(
-                f"Database error fetching VDV 463 requests for depot {self.depot_id}: {e}"
-            )
+            logger.error(f"Database error fetching VDV 463 requests for depot {self.depot_id}: {e}")
             raise
 
     def _merge_vdv463_into_schedules(
@@ -403,7 +392,7 @@ class StateAssembler:
         vehicle_departure_soc_max: dict[str, float] = {}
         vehicle_priorities: dict[str, int] = {}
         preconditioning_requests: list[dict] = []
-        vdv_vehicle_ids = {r["vehicle_id"] for r in vdv463_requests}
+        {r["vehicle_id"] for r in vdv463_requests}
 
         # Schedule dicts: vehicle_id, return_time, departure_time, estimated_energy_kwh
         schedule_by_vehicle: dict[str, dict] = {}
@@ -441,17 +430,27 @@ class StateAssembler:
 
             # Preconditioning: build list of {vehicle_id, start_time, end_time, power_kw}
             precond_type = r.get("preconditioning_type")
-            if precond_type == "manual" and r.get("preconditioning_start") and r.get("hvac_aux_power") is not None:
+            if (
+                precond_type == "manual"
+                and r.get("preconditioning_start")
+                and r.get("hvac_aux_power") is not None
+            ):
                 start_ts = r["preconditioning_start"]
                 end_ts = dep
                 power_kw = (r["hvac_aux_power"] or 0) / 1000.0
-                preconditioning_requests.append({
-                    "vehicle_id": vid,
-                    "start_time": start_ts,
-                    "end_time": end_ts,
-                    "power_kw": power_kw,
-                })
-            elif precond_type == "automatic" and r.get("requested_finish_time") and r.get("ambient_temperature") is not None:
+                preconditioning_requests.append(
+                    {
+                        "vehicle_id": vid,
+                        "start_time": start_ts,
+                        "end_time": end_ts,
+                        "power_kw": power_kw,
+                    }
+                )
+            elif (
+                precond_type == "automatic"
+                and r.get("requested_finish_time")
+                and r.get("ambient_temperature") is not None
+            ):
                 # Duration ~ (targetTemp - ambientTemp) * 3 min/°C; target default 18°C (AT-10)
                 ambient = float(r["ambient_temperature"])
                 target = 18.0
@@ -461,12 +460,14 @@ class StateAssembler:
                     start_ts = finish_ts - timedelta(minutes=duration_min)
                 else:
                     start_ts = finish_ts
-                preconditioning_requests.append({
-                    "vehicle_id": vid,
-                    "start_time": start_ts,
-                    "end_time": finish_ts,
-                    "power_kw": 10.0,
-                })
+                preconditioning_requests.append(
+                    {
+                        "vehicle_id": vid,
+                        "start_time": start_ts,
+                        "end_time": finish_ts,
+                        "power_kw": 10.0,
+                    }
+                )
 
         merged = list(schedule_by_vehicle.values())
         return (
@@ -477,9 +478,7 @@ class StateAssembler:
             preconditioning_requests,
         )
 
-    async def _get_schedules(
-        self, start: datetime, end: datetime
-    ) -> list[dict]:
+    async def _get_schedules(self, start: datetime, end: datetime) -> list[dict]:
         """Get vehicle schedules.
 
         Args:
@@ -510,9 +509,7 @@ class StateAssembler:
             logger.debug(f"Retrieved {len(schedules)} schedules")
             return schedules
         except asyncpg.PostgresError as e:
-            logger.error(
-                f"Database error fetching schedules for depot {self.depot_id}: {e}"
-            )
+            logger.error(f"Database error fetching schedules for depot {self.depot_id}: {e}")
             raise
 
     def _compute_availability(
@@ -531,18 +528,16 @@ class StateAssembler:
         delta_t = timedelta(hours=self.config.delta_t)
 
         # Initialize all vehicles as available
-        availability = {
-            vid: [True] * n_steps for vid in self.config.vehicle_capacities.keys()
-        }
+        availability = {vid: [True] * n_steps for vid in self.config.vehicle_capacities.keys()}
 
         for sched in schedules:
-            vid = sched['vehicle_id']
+            vid = sched["vehicle_id"]
             if vid not in availability:
                 # Ignore unknown vehicles not in depot config
                 continue
 
-            dep = sched['departure_time']
-            ret = sched['return_time']
+            dep = sched["departure_time"]
+            ret = sched["return_time"]
 
             for t in range(n_steps):
                 step_time = start + t * delta_t
@@ -552,9 +547,7 @@ class StateAssembler:
 
         return availability
 
-    def _compute_departure_times(
-        self, schedules: list[dict], start: datetime
-    ) -> dict[str, int]:
+    def _compute_departure_times(self, schedules: list[dict], start: datetime) -> dict[str, int]:
         """Compute timestep index for each vehicle's next departure.
 
         Args:
@@ -568,8 +561,8 @@ class StateAssembler:
         departures = {}
 
         for sched in schedules:
-            vid = sched['vehicle_id']
-            dep = sched['departure_time']
+            vid = sched["vehicle_id"]
+            dep = sched["departure_time"]
             t_idx = int((dep - start) / delta_t)
 
             # Keep earliest departure for each vehicle
@@ -578,9 +571,7 @@ class StateAssembler:
 
         return departures
 
-    def _compute_energy_requirements(
-        self, schedules: list[dict]
-    ) -> dict[str, float]:
+    def _compute_energy_requirements(self, schedules: list[dict]) -> dict[str, float]:
         """Compute energy needed for each vehicle's next trip.
 
         Args:
@@ -591,8 +582,8 @@ class StateAssembler:
         """
         requirements = {}
         for sched in schedules:
-            vid = sched['vehicle_id']
-            energy = sched.get('estimated_energy_kwh') or 100.0  # default
+            vid = sched["vehicle_id"]
+            energy = sched.get("estimated_energy_kwh") or 100.0  # default
             if vid not in requirements:
                 requirements[vid] = float(energy)
         return requirements
@@ -612,18 +603,18 @@ class StateAssembler:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, self.depot_id)
 
-        peak = float(row['peak']) if row and row['peak'] else 0.0
+        peak = float(row["peak"]) if row and row["peak"] else 0.0
         logger.debug(f"Current month peak: {peak} kW")
         return peak
 
     async def _get_demand_charge_rate(self) -> float:
         """Get demand charge rate ($/kW) with PRD-compliant priority.
-        
+
         Per PRD Section 8.1, priority is:
         1. prices.demand_kw (most recent price row)
         2. depots.demand_charge_rate_kw
         3. Default $20/kW
-        
+
         Returns:
             Demand charge rate in $/kW
         """
@@ -638,11 +629,11 @@ class StateAssembler:
         """
         async with self.pool.acquire() as conn:
             price_row = await conn.fetchrow(price_query, self.depot_id)
-            if price_row and price_row['demand_kw'] is not None:
-                rate = float(price_row['demand_kw'])
+            if price_row and price_row["demand_kw"] is not None:
+                rate = float(price_row["demand_kw"])
                 logger.debug(f"Demand charge rate from prices: ${rate}/kW")
                 return rate
-        
+
         # Priority 2: Fall back to depots.demand_charge_rate_kw
         depot_query = """
         SELECT demand_charge_rate_kw
@@ -651,15 +642,13 @@ class StateAssembler:
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(depot_query, self.depot_id)
-            if row and row['demand_charge_rate_kw'] is not None:
-                rate = float(row['demand_charge_rate_kw'])
+            if row and row["demand_charge_rate_kw"] is not None:
+                rate = float(row["demand_charge_rate_kw"])
                 logger.debug(f"Demand charge rate from depot config: ${rate}/kW")
                 return rate
-        
+
         # Priority 3: Fallback to default
-        logger.warning(
-            f"Depot {self.depot_id} not found or rate is NULL, using default $20/kW"
-        )
+        logger.warning(f"Depot {self.depot_id} not found or rate is NULL, using default $20/kW")
         return 20.0  # Default PG&E E-19 rate
 
     async def _get_building_power(
@@ -704,7 +693,7 @@ class StateAssembler:
             return self._get_building_power_forecast(start, end, n_steps)
 
         # Build time-indexed power map
-        power_map = {row['time']: float(row['power_kw']) for row in rows}
+        power_map = {row["time"]: float(row["power_kw"]) for row in rows}
 
         # Generate power for each timestep with interpolation
         delta_t = timedelta(hours=self.config.delta_t)
@@ -773,9 +762,7 @@ class StateAssembler:
         )
         return building_power
 
-    async def _get_incoming_vehicles(
-        self, start: datetime, end: datetime
-    ) -> list[IncomingVehicle]:
+    async def _get_incoming_vehicles(self, start: datetime, end: datetime) -> list[IncomingVehicle]:
         """Get incoming vehicles from inter-depot handoffs.
 
         Per PRD Section 5.3, queries pending inter-depot arrivals where
@@ -815,13 +802,13 @@ class StateAssembler:
             incoming_vehicles = []
             for row in rows:
                 incoming = IncomingVehicle(
-                    vehicle_id=row['vehicle_id'],
-                    external_id=row['external_id'] or f"vehicle_{row['vehicle_id']}",
-                    expected_soc=float(row['expected_soc']),
-                    arrival_time=row['arrival_time'],
-                    battery_kwh=float(row['battery_kwh']),
-                    max_charge_kw=float(row['max_charge_kw']),
-                    origin_depot_id=row['origin_depot_id'],
+                    vehicle_id=row["vehicle_id"],
+                    external_id=row["external_id"] or f"vehicle_{row['vehicle_id']}",
+                    expected_soc=float(row["expected_soc"]),
+                    arrival_time=row["arrival_time"],
+                    battery_kwh=float(row["battery_kwh"]),
+                    max_charge_kw=float(row["max_charge_kw"]),
+                    origin_depot_id=row["origin_depot_id"],
                 )
                 incoming_vehicles.append(incoming)
 
@@ -873,7 +860,7 @@ class StateAssembler:
         if not depot_row:
             raise ValueError(f"Depot {depot_id_str} not found")
 
-        max_site_power = float(depot_row['max_grid_kw'])
+        max_site_power = float(depot_row["max_grid_kw"])
 
         # Query vehicles
         vehicles_query = """
@@ -890,10 +877,10 @@ class StateAssembler:
         vehicle_capacities = {}
         vehicle_to_ocpp = {}
         for row in vehicle_rows:
-            vid = row['vehicle_id']
-            vehicle_capacities[vid] = float(row['battery_kwh'])
-            if row['id_tag']:
-                vehicle_to_ocpp[vid] = row['id_tag']
+            vid = row["vehicle_id"]
+            vehicle_capacities[vid] = float(row["battery_kwh"])
+            if row["id_tag"]:
+                vehicle_to_ocpp[vid] = row["id_tag"]
 
         # Query chargers - aggregate by rated_kw per PRD Section 8.3
         chargers_query = """
@@ -915,13 +902,13 @@ class StateAssembler:
             charger_groups = {}
             charger_efficiency = None
             for row in charger_rows:
-                rated_kw = float(row['rated_kw'])
-                count = int(row['count'])
+                rated_kw = float(row["rated_kw"])
+                count = int(row["count"])
                 charger_groups[rated_kw] = count
                 # Use efficiency from first charger (assumed uniform per PRD)
                 if charger_efficiency is None:
-                    charger_efficiency = float(row['efficiency'])
-            
+                    charger_efficiency = float(row["efficiency"])
+
             if charger_efficiency is None:
                 charger_efficiency = 0.95  # Default
 
@@ -936,11 +923,11 @@ class StateAssembler:
             battery_row = await conn.fetchrow(battery_query, depot_id_str)
 
         if battery_row:
-            battery_capacity = float(battery_row['capacity_kwh'])
-            battery_power = float(battery_row['max_power_kw'])
-            battery_efficiency = float(battery_row.get('efficiency', 0.92))
-            battery_soc_min = float(battery_row.get('soc_min', 0.2))
-            battery_soc_max = float(battery_row.get('soc_max', 0.8))
+            battery_capacity = float(battery_row["capacity_kwh"])
+            battery_power = float(battery_row["max_power_kw"])
+            battery_efficiency = float(battery_row.get("efficiency", 0.92))
+            battery_soc_min = float(battery_row.get("soc_min", 0.2))
+            battery_soc_max = float(battery_row.get("soc_max", 0.8))
         else:
             # Defaults if no battery found
             logger.warning(f"No battery storage found for depot {depot_id_str}, using defaults")
@@ -965,8 +952,8 @@ class StateAssembler:
         # Build charger_vehicle_access dict: charger_id -> set of vehicle_ids
         charger_vehicle_access = {}
         for row in access_rows:
-            charger_id = row['charger_id']
-            vehicle_id = row['vehicle_id']
+            charger_id = row["charger_id"]
+            vehicle_id = row["vehicle_id"]
             if charger_id not in charger_vehicle_access:
                 charger_vehicle_access[charger_id] = set()
             charger_vehicle_access[charger_id].add(vehicle_id)
@@ -974,8 +961,8 @@ class StateAssembler:
         # Build vehicle_max_charge_kw dict
         vehicle_max_charge_kw = {}
         for row in vehicle_rows:
-            vid = row['vehicle_id']
-            vehicle_max_charge_kw[vid] = float(row['max_charge_kw'])
+            vid = row["vehicle_id"]
+            vehicle_max_charge_kw[vid] = float(row["max_charge_kw"])
 
         config = DepotConfig(
             vehicle_capacities=vehicle_capacities,

@@ -8,10 +8,11 @@ AND preconditioning is scheduled to start before departure
 AND preconditioning power is included in grid power calculation.
 """
 
-import pytest
 from datetime import datetime, timedelta
 
-from src.core.models import DepotState, DepotConfig
+import pytest
+
+from src.core.models import DepotConfig, DepotState
 from src.core.optimizer.milp_model import build_optimization_model
 
 

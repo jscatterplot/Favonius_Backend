@@ -3,7 +3,6 @@
 Reference: Development plan Step 3.2, PRD.md#11-2-unit-test-requirements
 """
 
-import asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -18,7 +17,6 @@ from src.adapters.caiso import (
     get_latest_price,
     store_prices,
 )
-
 
 # ============ Fixtures ============
 
@@ -144,7 +142,7 @@ async def test_get_day_ahead_prices_custom_node(caiso_adapter):
 @pytest.mark.asyncio
 async def test_get_current_price(caiso_adapter):
     """Test getting current price."""
-    with patch('src.adapters.caiso.prices.datetime') as mock_dt:
+    with patch("src.adapters.caiso.prices.datetime") as mock_dt:
         mock_dt.utcnow.return_value = datetime(2025, 12, 4, 12, 0, 0)
         mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
 
@@ -159,7 +157,7 @@ async def test_store_prices_to_db(caiso_adapter, sample_caiso_prices, mock_pool)
     """Test storing prices to database."""
     depot_id = uuid4()
     stored_count = await caiso_adapter.store_prices_to_db(
-        sample_caiso_prices[:5], depot_id, source='caiso_dam'
+        sample_caiso_prices[:5], depot_id, source="caiso_dam"
     )
 
     assert stored_count == 5
@@ -177,9 +175,7 @@ async def test_store_prices_to_db_no_pool(caiso_adapter, sample_caiso_prices):
 
 
 @pytest.mark.asyncio
-async def test_get_prices_for_depot_with_cache(
-    caiso_adapter, sample_caiso_prices, mock_pool
-):
+async def test_get_prices_for_depot_with_cache(caiso_adapter, sample_caiso_prices, mock_pool):
     """Test getting prices with cache hit."""
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0)
@@ -188,18 +184,16 @@ async def test_get_prices_for_depot_with_cache(
     # Mock cached prices
     cached_rows = [
         {
-            'time': p.timestamp,
-            'energy_kwh': p.lmp / 1000.0,
-            'demand_kw': None,
-            'source': 'caiso_dam',
+            "time": p.timestamp,
+            "energy_kwh": p.lmp / 1000.0,
+            "demand_kw": None,
+            "source": "caiso_dam",
         }
         for p in sample_caiso_prices[:5]
     ]
     mock_pool.acquire.return_value.fetch = AsyncMock(return_value=cached_rows)
 
-    prices = await caiso_adapter.get_prices_for_depot(
-        depot_id, start, end, use_cache=True
-    )
+    prices = await caiso_adapter.get_prices_for_depot(depot_id, start, end, use_cache=True)
 
     assert len(prices) == 5
     # Verify prices were converted from cache
@@ -216,9 +210,7 @@ async def test_get_prices_for_depot_no_cache(caiso_adapter, mock_pool):
     # Mock no cached prices
     mock_pool.acquire.return_value.fetch = AsyncMock(return_value=[])
 
-    prices = await caiso_adapter.get_prices_for_depot(
-        depot_id, start, end, use_cache=False
-    )
+    prices = await caiso_adapter.get_prices_for_depot(depot_id, start, end, use_cache=False)
 
     assert len(prices) == 24  # Full day
     # Verify prices were stored
@@ -233,7 +225,7 @@ async def test_store_prices(mock_pool, sample_caiso_prices):
     """Test store_prices function."""
     depot_id = uuid4()
     stored_count = await store_prices(
-        mock_pool, sample_caiso_prices[:10], depot_id, source='caiso_dam'
+        mock_pool, sample_caiso_prices[:10], depot_id, source="caiso_dam"
     )
 
     assert stored_count == 10
@@ -258,7 +250,7 @@ async def test_store_prices_with_demand_charge(mock_pool, sample_caiso_prices):
         mock_pool,
         sample_caiso_prices[:5],
         depot_id,
-        source='utility_tou',
+        source="utility_tou",
         demand_charge_per_kw=demand_charge,
     )
 
@@ -277,10 +269,10 @@ async def test_get_cached_prices(mock_pool):
 
     cached_rows = [
         {
-            'time': datetime(2025, 12, 4, h, 0, 0),
-            'energy_kwh': 0.15,
-            'demand_kw': 20.0,
-            'source': 'caiso_dam',
+            "time": datetime(2025, 12, 4, h, 0, 0),
+            "energy_kwh": 0.15,
+            "demand_kw": 20.0,
+            "source": "caiso_dam",
         }
         for h in range(24)
     ]
@@ -289,7 +281,7 @@ async def test_get_cached_prices(mock_pool):
     prices = await get_cached_prices(mock_pool, depot_id, start, end)
 
     assert len(prices) == 24
-    assert all(p['energy_kwh'] == 0.15 for p in prices)
+    assert all(p["energy_kwh"] == 0.15 for p in prices)
 
 
 @pytest.mark.asyncio
@@ -312,18 +304,18 @@ async def test_get_latest_price(mock_pool):
     depot_id = uuid4()
 
     latest_row = {
-        'time': datetime(2025, 12, 4, 12, 0, 0),
-        'energy_kwh': 0.15,
-        'demand_kw': 20.0,
-        'source': 'caiso_dam',
+        "time": datetime(2025, 12, 4, 12, 0, 0),
+        "energy_kwh": 0.15,
+        "demand_kw": 20.0,
+        "source": "caiso_dam",
     }
     mock_pool.acquire.return_value.fetchrow = AsyncMock(return_value=latest_row)
 
     price = await get_latest_price(mock_pool, depot_id)
 
     assert price is not None
-    assert price['energy_kwh'] == 0.15
-    assert price['time'] == datetime(2025, 12, 4, 12, 0, 0)
+    assert price["energy_kwh"] == 0.15
+    assert price["time"] == datetime(2025, 12, 4, 12, 0, 0)
 
 
 @pytest.mark.asyncio
@@ -408,4 +400,3 @@ async def test_store_prices_conversion(mock_pool):
     # Verify conversion: 250.0 $/MWh -> 0.25 $/kWh
     call_args = mock_pool.acquire.return_value.execute.call_args[0]
     assert call_args[3] == 0.25  # energy_kwh
-

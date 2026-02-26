@@ -9,15 +9,12 @@ Per PRD Section 5.4, receive_handoff should:
 Reference: PRD_v2.md#5-4-inter-depot-handoff
 """
 
-import pytest
-import pytest_asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 import asyncpg
-
-from src.api.main import receive_handoff
-from src.core.models import HandoffReceiveRequest
+import pytest
+import pytest_asyncio
 
 
 @pytest.mark.integration
@@ -31,8 +28,8 @@ class TestHandoffDepartureTime:
         import os
 
         db_url = os.getenv(
-            'TEST_DATABASE_URL',
-            'postgresql://postgres:postgres@localhost:5432/favonius_test',
+            "TEST_DATABASE_URL",
+            "postgresql://postgres:postgres@localhost:5432/favonius_test",
         )
 
         try:
@@ -59,10 +56,10 @@ class TestHandoffDepartureTime:
                 SET name = EXCLUDED.name
                 """,
                 depot_id,
-                'Depot A',
+                "Depot A",
                 34.0522,
                 -118.2437,
-                'America/Los_Angeles',
+                "America/Los_Angeles",
                 1000.0,
                 20.0,
             )
@@ -71,10 +68,10 @@ class TestHandoffDepartureTime:
 
         async with test_db_pool.acquire() as conn:
             await conn.execute(
-                'DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1',
-                depot_id
+                "DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1",
+                depot_id,
             )
-            await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+            await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
     @pytest_asyncio.fixture
     async def depot_b_id(self, test_db_pool):
@@ -93,10 +90,10 @@ class TestHandoffDepartureTime:
                 SET name = EXCLUDED.name
                 """,
                 depot_id,
-                'Depot B',
+                "Depot B",
                 37.7749,
                 -122.4194,
-                'America/Los_Angeles',
+                "America/Los_Angeles",
                 1000.0,
                 20.0,
             )
@@ -105,10 +102,10 @@ class TestHandoffDepartureTime:
 
         async with test_db_pool.acquire() as conn:
             await conn.execute(
-                'DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1',
-                depot_id
+                "DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1",
+                depot_id,
             )
-            await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+            await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
     @pytest_asyncio.fixture
     async def vehicle_id(self, test_db_pool, depot_a_id):
@@ -126,7 +123,7 @@ class TestHandoffDepartureTime:
                 """,
                 vehicle_id,
                 depot_a_id,
-                'bus',
+                "bus",
                 324.0,
                 150.0,
             )
@@ -134,14 +131,14 @@ class TestHandoffDepartureTime:
         yield vehicle_id
 
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM vehicles WHERE vehicle_id = $1', vehicle_id)
+            await conn.execute("DELETE FROM vehicles WHERE vehicle_id = $1", vehicle_id)
 
     @pytest.mark.asyncio
     async def test_receive_handoff_uses_original_departure_time(
         self, test_db_pool, depot_a_id, depot_b_id, vehicle_id
     ):
         """Test receive_handoff queries original message for departure_time.
-        
+
         Per PRD Section 5.4, receive_handoff should use actual departure_time
         from original pending message, not acknowledged_at.
         """
@@ -168,7 +165,7 @@ class TestHandoffDepartureTime:
                 datetime.utcnow() + timedelta(hours=1),
                 324.0,
                 150.0,
-                'pending',
+                "pending",
             )
 
         # Simulate receive_handoff call (would need to mock FastAPI dependencies)
@@ -191,9 +188,9 @@ class TestHandoffDepartureTime:
             )
 
         assert original_message is not None, "Original message should exist"
-        assert original_message['departure_time'] == original_departure_time, (
-            "Should retrieve original departure_time from pending message"
-        )
+        assert (
+            original_message["departure_time"] == original_departure_time
+        ), "Should retrieve original departure_time from pending message"
 
     @pytest.mark.asyncio
     async def test_receive_handoff_fallback_to_acknowledged_at(
@@ -223,15 +220,15 @@ class TestHandoffDepartureTime:
                 vehicle_id,
             )
 
-        if original_message and original_message['departure_time']:
-            departure_time = original_message['departure_time']
+        if original_message and original_message["departure_time"]:
+            departure_time = original_message["departure_time"]
         else:
             # Fallback to acknowledged_at
             departure_time = acknowledged_at
 
-        assert departure_time == acknowledged_at, (
-            "Should fall back to acknowledged_at when original message not found"
-        )
+        assert (
+            departure_time == acknowledged_at
+        ), "Should fall back to acknowledged_at when original message not found"
 
     @pytest.mark.asyncio
     async def test_departure_time_stored_correctly(
@@ -262,7 +259,7 @@ class TestHandoffDepartureTime:
                 datetime.utcnow() + timedelta(hours=1),
                 324.0,
                 150.0,
-                'pending',
+                "pending",
             )
 
         # Simulate receive_handoff storing acknowledged message
@@ -285,8 +282,8 @@ class TestHandoffDepartureTime:
             )
 
         departure_time = acknowledged_at  # Default
-        if original_message and original_message['departure_time']:
-            departure_time = original_message['departure_time']
+        if original_message and original_message["departure_time"]:
+            departure_time = original_message["departure_time"]
 
         # Store acknowledged message with departure_time
         acknowledged_message_id = uuid4()
@@ -308,7 +305,7 @@ class TestHandoffDepartureTime:
                 datetime.utcnow() + timedelta(hours=1),
                 324.0,
                 150.0,
-                'acknowledged',
+                "acknowledged",
                 acknowledged_at,
             )
 
@@ -324,9 +321,9 @@ class TestHandoffDepartureTime:
             )
 
         assert row is not None
-        assert row['departure_time'] == original_departure_time, (
-            "Stored departure_time should match original message, not acknowledged_at"
-        )
-        assert row['acknowledged_at'] == acknowledged_at, (
-            "acknowledged_at should be separate from departure_time"
-        )
+        assert (
+            row["departure_time"] == original_departure_time
+        ), "Stored departure_time should match original message, not acknowledged_at"
+        assert (
+            row["acknowledged_at"] == acknowledged_at
+        ), "acknowledged_at should be separate from departure_time"

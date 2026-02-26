@@ -6,7 +6,6 @@ Reference: PRD_v2.md Section 6.1 (Database Schema)
 """
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 
@@ -21,20 +20,20 @@ from websocket_handler.monitoring import get_logger
 async def main():
     """Initialize database schema."""
     logger = get_logger(__name__)
-    
+
     try:
         # Load configuration
         config = Config.from_env()
-        
+
         logger.info("Initializing database schema...")
         logger.info(f"Database host: {config.supabase.db_host}")
         logger.info(f"Database name: {config.supabase.db_name}")
-        
+
         # Create schema
         await create_schema_from_config(config.supabase)
-        
+
         logger.info("Database schema initialized successfully!")
-        
+
     except Exception as e:
         logger.error(f"Failed to initialize database schema: {e}")
         sys.exit(1)

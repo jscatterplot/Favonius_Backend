@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
@@ -35,7 +34,7 @@ class ControllerManager:
     def __init__(
         self,
         pool: asyncpg.Pool,
-        ocpp_server: Optional['OCPPServer'] = None,
+        ocpp_server: Optional["OCPPServer"] = None,
         controller_config: Optional[ControllerConfig] = None,
     ):
         """Initialize controller manager.
@@ -76,7 +75,7 @@ class ControllerManager:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(query)
 
-            depot_ids = [row['depot_id'] for row in rows]
+            depot_ids = [row["depot_id"] for row in rows]
 
             if not depot_ids:
                 logger.warning("No depots found in database")
@@ -90,13 +89,11 @@ class ControllerManager:
                     await self.add_controller(depot_id)
                 except Exception as e:
                     logger.error(
-                        f"Failed to start controller for depot {depot_id}: {e}",
-                        exc_info=True
+                        f"Failed to start controller for depot {depot_id}: {e}", exc_info=True
                     )
 
             logger.info(
-                f"Started {len(self.controllers)} controllers "
-                f"out of {len(depot_ids)} depots"
+                f"Started {len(self.controllers)} controllers " f"out of {len(depot_ids)} depots"
             )
 
         except Exception as e:
@@ -115,9 +112,7 @@ class ControllerManager:
         stop_tasks: list[asyncio.Task] = []
         for depot_id, controller in self.controllers.items():
             stop_tasks.append(
-                asyncio.create_task(
-                    self._stop_controller_async(depot_id, controller)
-                )
+                asyncio.create_task(self._stop_controller_async(depot_id, controller))
             )
 
         # Wait for all to stop (with timeout)
@@ -128,10 +123,7 @@ class ControllerManager:
                     timeout=self.controller_config.shutdown_timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    "Some controllers did not stop within timeout, "
-                    "cancelling tasks"
-                )
+                logger.warning("Some controllers did not stop within timeout, " "cancelling tasks")
                 for task in stop_tasks:
                     if not task.done():
                         task.cancel()
@@ -140,9 +132,7 @@ class ControllerManager:
         self._controller_tasks.clear()
         logger.info("All controllers stopped")
 
-    async def _stop_controller_async(
-        self, depot_id: str, controller: DepotController
-    ) -> None:
+    async def _stop_controller_async(self, depot_id: str, controller: DepotController) -> None:
         """Stop a single controller asynchronously.
 
         Args:
@@ -150,18 +140,11 @@ class ControllerManager:
             controller: Controller instance to stop
         """
         try:
-            await controller.stop_async(
-                timeout=self.controller_config.shutdown_timeout_seconds
-            )
+            await controller.stop_async(timeout=self.controller_config.shutdown_timeout_seconds)
         except Exception as e:
-            logger.error(
-                f"Error stopping controller for depot {depot_id}: {e}",
-                exc_info=True
-            )
+            logger.error(f"Error stopping controller for depot {depot_id}: {e}", exc_info=True)
 
-    async def add_controller(
-        self, depot_id: str | UUID
-    ) -> DepotController:
+    async def add_controller(self, depot_id: str | UUID) -> DepotController:
         """Add and start a controller for a depot.
 
         Args:
@@ -182,9 +165,7 @@ class ControllerManager:
 
         try:
             # Load depot configuration
-            depot_config, _ = await StateAssembler.load_depot_config(
-                self.pool, depot_id_str
-            )
+            depot_config, _ = await StateAssembler.load_depot_config(self.pool, depot_id_str)
 
             # Create controller
             controller = DepotController(
@@ -210,8 +191,7 @@ class ControllerManager:
             raise
         except Exception as e:
             logger.error(
-                f"Unexpected error adding controller for depot {depot_id_str}: {e}",
-                exc_info=True
+                f"Unexpected error adding controller for depot {depot_id_str}: {e}", exc_info=True
             )
             raise
 
@@ -241,9 +221,7 @@ class ControllerManager:
         del self.controllers[depot_id_str]
         logger.info(f"Removed controller for depot {depot_id_str}")
 
-    def get_controller(
-        self, depot_id: str | UUID
-    ) -> Optional[DepotController]:
+    def get_controller(self, depot_id: str | UUID) -> Optional[DepotController]:
         """Get controller instance for a depot.
 
         Args:
@@ -254,9 +232,7 @@ class ControllerManager:
         """
         return self.controllers.get(str(depot_id))
 
-    async def get_or_create_controller(
-        self, depot_id: str | UUID
-    ) -> DepotController:
+    async def get_or_create_controller(self, depot_id: str | UUID) -> DepotController:
         """Get existing controller or create new one.
 
         Args:
@@ -298,21 +274,17 @@ class ControllerManager:
                 circuit_breaker_open = controller._circuit_breaker_open
 
                 health_status[depot_id] = {
-                    'running': is_running,
-                    'last_run_time': last_run.isoformat() if last_run else None,
-                    'optimization_failures': failures,
-                    'circuit_breaker_open': circuit_breaker_open,
-                    'status': 'healthy' if is_running and not circuit_breaker_open else 'degraded',
+                    "running": is_running,
+                    "last_run_time": last_run.isoformat() if last_run else None,
+                    "optimization_failures": failures,
+                    "circuit_breaker_open": circuit_breaker_open,
+                    "status": "healthy" if is_running and not circuit_breaker_open else "degraded",
                 }
             except Exception as e:
-                logger.error(
-                    f"Error checking health for depot {depot_id}: {e}",
-                    exc_info=True
-                )
+                logger.error(f"Error checking health for depot {depot_id}: {e}", exc_info=True)
                 health_status[depot_id] = {
-                    'status': 'error',
-                    'error': str(e),
+                    "status": "error",
+                    "error": str(e),
                 }
 
         return health_status
-

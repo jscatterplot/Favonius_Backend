@@ -9,13 +9,10 @@ Tests:
 Reference: PRD_v2.md#10-2-reliability
 """
 
-import pytest
-import pytest_asyncio
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from src.core.controller import DepotController
-from src.core.controller_config import ControllerConfig
+import pytest
+
 from src.core.models import DepotConfig
 
 
@@ -28,8 +25,8 @@ class TestServiceResilience:
     def depot_config(self):
         """Depot configuration."""
         return DepotConfig(
-            vehicle_capacities={'bus_1': 324.0},
-            vehicle_max_charge_kw={'bus_1': 80.0},
+            vehicle_capacities={"bus_1": 324.0},
+            vehicle_max_charge_kw={"bus_1": 80.0},
             charger_groups={80.0: 2},
             charger_efficiency=0.95,
             charger_vehicle_access={},
@@ -46,16 +43,16 @@ class TestServiceResilience:
         mock_ws_client.query_connected_charge_points = AsyncMock(
             side_effect=ConnectionError("WebSocket Handler unavailable")
         )
-        
+
         # Main API should handle error gracefully
         try:
-            charge_points = await mock_ws_client.query_connected_charge_points()
+            await mock_ws_client.query_connected_charge_points()
             assert False, "Should have raised ConnectionError"
         except ConnectionError as e:
             # Error should be caught and handled gracefully
             # (In real code, Main API would log error and continue)
             assert "WebSocket Handler unavailable" in str(e)
-        
+
         # Main API should still be able to perform other operations
         # (e.g., optimization without real-time charger state)
 
@@ -67,16 +64,16 @@ class TestServiceResilience:
         mock_api_client.send_optimization_result = AsyncMock(
             side_effect=ConnectionError("Main API unavailable")
         )
-        
+
         # WebSocket Handler should handle error gracefully
         try:
-            success = await mock_api_client.send_optimization_result({})
+            await mock_api_client.send_optimization_result({})
             assert False, "Should have raised ConnectionError"
         except ConnectionError as e:
             # Error should be caught and handled gracefully
             # (In real code, WebSocket Handler would log error and continue)
             assert "Main API unavailable" in str(e)
-        
+
         # WebSocket Handler should still be able to perform other operations
         # (e.g., receive telemetry, store to database)
 
@@ -86,14 +83,14 @@ class TestServiceResilience:
         # Simulate service outage and recovery
         mock_service = MagicMock()
         mock_service.is_available = False
-        
+
         # Service is down
         assert mock_service.is_available is False
-        
+
         # Simulate recovery
         mock_service.is_available = True
         mock_service.connect = AsyncMock(return_value=True)
-        
+
         # Service should recover
         connected = await mock_service.connect()
         assert connected is True
@@ -106,7 +103,7 @@ class TestServiceResilience:
         max_failures = 3
         failure_count = 0
         circuit_open = False
-        
+
         # Simulate failures
         for i in range(max_failures):
             try:
@@ -116,15 +113,14 @@ class TestServiceResilience:
                 failure_count += 1
                 if failure_count >= max_failures:
                     circuit_open = True
-        
+
         assert circuit_open is True, "Circuit breaker should open after max failures"
-        
+
         # Circuit breaker should reset after timeout
         # (In real code, this would be time-based)
-        reset_timeout = 60  # 60 seconds
         # After timeout, circuit should close
         circuit_open = False  # Simulate timeout expiration
-        
+
         assert circuit_open is False, "Circuit breaker should reset after timeout"
 
     @pytest.mark.asyncio
@@ -133,17 +129,17 @@ class TestServiceResilience:
         # Mock controller with circuit breaker
         mock_controller = MagicMock()
         mock_controller.circuit_breaker_open = True
-        
+
         # Optimization should be blocked when circuit is open
         if mock_controller.circuit_breaker_open:
             # Should not attempt optimization
             optimization_attempted = False
         else:
             optimization_attempted = True
-        
-        assert optimization_attempted is False, (
-            "Optimization should be blocked when circuit breaker is open"
-        )
+
+        assert (
+            optimization_attempted is False
+        ), "Optimization should be blocked when circuit breaker is open"
 
     @pytest.mark.asyncio
     async def test_retry_logic_exponential_backoff(self):
@@ -151,11 +147,11 @@ class TestServiceResilience:
         max_retries = 3
         base_delay = 1.0  # 1 second
         retry_delays = []
-        
+
         for attempt in range(max_retries):
-            delay = base_delay * (2 ** attempt)  # Exponential backoff
+            delay = base_delay * (2**attempt)  # Exponential backoff
             retry_delays.append(delay)
-        
+
         # Verify exponential backoff: 1s, 2s, 4s
         assert retry_delays[0] == 1.0
         assert retry_delays[1] == 2.0
@@ -166,7 +162,7 @@ class TestServiceResilience:
         """Test max retry attempts limit."""
         max_retries = 3
         attempt_count = 0
-        
+
         # Simulate retries
         while attempt_count < max_retries:
             try:
@@ -177,7 +173,7 @@ class TestServiceResilience:
                 if attempt_count >= max_retries:
                     # Max retries reached, give up
                     break
-        
+
         assert attempt_count == max_retries, "Should stop after max retries"
 
     @pytest.mark.asyncio
@@ -187,15 +183,15 @@ class TestServiceResilience:
         # 1. Continue optimization (can work without real-time charger state)
         # 2. Use cached/last known charger states
         # 3. Log warnings but don't crash
-        
+
         mock_ws_handler_available = False
-        
+
         if not mock_ws_handler_available:
             # Use fallback mechanisms
             use_cached_state = True
             log_warning = True
             continue_optimization = True
-        
+
         assert use_cached_state is True
         assert log_warning is True
         assert continue_optimization is True
@@ -205,12 +201,12 @@ class TestServiceResilience:
         """Test service health monitoring."""
         # Services should monitor their own health
         mock_service = MagicMock()
-        mock_service.health_check = AsyncMock(return_value={'status': 'healthy'})
-        
+        mock_service.health_check = AsyncMock(return_value={"status": "healthy"})
+
         health = await mock_service.health_check()
-        assert health['status'] == 'healthy'
-        
+        assert health["status"] == "healthy"
+
         # Unhealthy service
-        mock_service.health_check = AsyncMock(return_value={'status': 'unhealthy'})
+        mock_service.health_check = AsyncMock(return_value={"status": "unhealthy"})
         health = await mock_service.health_check()
-        assert health['status'] == 'unhealthy'
+        assert health["status"] == "unhealthy"

@@ -1,16 +1,16 @@
 """Tests for VDV 463 handler."""
 
-import json
-import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+import json
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 pytest.importorskip("websockets")
 
 from adapters.vdv463.handler import VDV463Handler
-from adapters.vdv463.messages import ValidationMode, VDVMessageEnvelope
-from adapters.vdv463.vehicle_resolver import VehicleResolver
+from adapters.vdv463.messages import ValidationMode
 
 
 @pytest.fixture
@@ -52,14 +52,16 @@ async def test_handler_initialization(mock_websocket, mock_connection_manager, m
         connection_manager=mock_connection_manager,
         config=mock_config,
     )
-    
+
     assert handler.presystem_id == "presystem_001"
     assert handler.validation_mode == ValidationMode.HARD
-    assert handler.running == False
+    assert not handler.running
 
 
 @pytest.mark.asyncio
-async def test_handle_provide_charging_requests(mock_websocket, mock_connection_manager, mock_config):
+async def test_handle_provide_charging_requests(
+    mock_websocket, mock_connection_manager, mock_config
+):
     """Test handling ProvideChargingRequests message."""
     handler = VDV463Handler(
         presystem_id="presystem_001",
@@ -67,7 +69,7 @@ async def test_handle_provide_charging_requests(mock_websocket, mock_connection_
         connection_manager=mock_connection_manager,
         config=mock_config,
     )
-    
+
     message = [
         1,  # Request
         "BMS",
@@ -91,22 +93,23 @@ async def test_handle_provide_charging_requests(mock_websocket, mock_connection_
             ]
         },
     ]
-    
+
     import json
+
     raw_message = json.dumps(message)
-    
+
     # Mock websocket iteration
     async def mock_iter():
         yield raw_message
-    
+
     mock_websocket.__aiter__ = mock_iter
-    
+
     # Run handler (will process one message then exit)
     try:
         await asyncio.wait_for(handler.run(), timeout=1.0)
     except asyncio.TimeoutError:
         pass  # Expected - handler runs indefinitely
-    
+
     # Verify response was sent
     assert mock_websocket.send.called
 
@@ -135,14 +138,14 @@ async def test_rate_limit_exceeded(mock_websocket, mock_connection_manager, mock
     mock_connection_manager.check_message_rate_limit = AsyncMock(
         return_value=(False, "Rate limit exceeded")
     )
-    
+
     handler = VDV463Handler(
         presystem_id="presystem_001",
         websocket=mock_websocket,
         connection_manager=mock_connection_manager,
         config=mock_config,
     )
-    
+
     message = [
         1,
         "BMS",
@@ -152,10 +155,11 @@ async def test_rate_limit_exceeded(mock_websocket, mock_connection_manager, mock
         "ProvideChargingRequests",
         {"chargingRequestList": []},
     ]
-    
+
     import json
+
     await handler._handle_message(json.dumps(message))
-    
+
     # Should send error response
     assert mock_websocket.send.called
 
@@ -169,11 +173,11 @@ async def test_cleanup(mock_websocket, mock_connection_manager, mock_config):
         connection_manager=mock_connection_manager,
         config=mock_config,
     )
-    
+
     handler.running = True
     handler._charging_info_task = asyncio.create_task(asyncio.sleep(60))
-    
+
     await handler._cleanup()
-    
-    assert handler.running == False
+
+    assert not handler.running
     assert mock_connection_manager.unregister_connection.called

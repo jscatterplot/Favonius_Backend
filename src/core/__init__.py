@@ -17,20 +17,19 @@ from .state import StateAssembler, TriggerConfig, TriggerMonitor
 
 __all__ = [
     # Controller
-    'DepotController',
+    "DepotController",
     # Models
-    'Depot',
-    'DepotConfig',
-    'DepotState',
-    'OptimizationResult',
-    'Vehicle',
+    "Depot",
+    "DepotConfig",
+    "DepotState",
+    "OptimizationResult",
+    "Vehicle",
     # Optimizer
-    'build_optimization_model',
-    'optimize',
-    'solve_model',
+    "build_optimization_model",
+    "optimize",
+    "solve_model",
     # State
-    'StateAssembler',
-    'TriggerMonitor',
-    'TriggerConfig',
+    "StateAssembler",
+    "TriggerMonitor",
+    "TriggerConfig",
 ]
-

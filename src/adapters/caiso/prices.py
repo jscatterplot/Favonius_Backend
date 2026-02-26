@@ -14,7 +14,7 @@ from uuid import UUID
 import asyncpg
 import httpx
 
-from .storage import store_prices, get_cached_prices, get_latest_price
+from .storage import get_cached_prices, store_prices
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ class CAISOAdapter:
                 lmp = 80.0  # $/MWh
 
             # Convert $/MWh to $/kWh
-            lmp_per_kwh = lmp / 1000.0
+            lmp / 1000.0
 
             prices.append(
                 CAISOPrice(
@@ -143,14 +143,10 @@ class CAISOAdapter:
             )
             current += timedelta(hours=1)
 
-        logger.debug(
-            f"Generated {len(prices)} mock prices from {start_date} to {end_date}"
-        )
+        logger.debug(f"Generated {len(prices)} mock prices from {start_date} to {end_date}")
         return prices
 
-    async def get_current_price(
-        self, node: Optional[str] = None
-    ) -> Optional[CAISOPrice]:
+    async def get_current_price(self, node: Optional[str] = None) -> Optional[CAISOPrice]:
         """Get current real-time price.
 
         Args:
@@ -160,16 +156,14 @@ class CAISOAdapter:
             CAISOPrice for current hour, or None if unavailable
         """
         now = datetime.utcnow()
-        prices = await self.get_day_ahead_prices(
-            now, now + timedelta(hours=1), node
-        )
+        prices = await self.get_day_ahead_prices(now, now + timedelta(hours=1), node)
         return prices[0] if prices else None
 
     async def store_prices_to_db(
         self,
         prices: list[CAISOPrice],
         depot_id: str | UUID,
-        source: str = 'caiso_dam',
+        source: str = "caiso_dam",
         demand_charge_per_kw: Optional[float] = None,
     ) -> int:
         """Store fetched prices to database.
@@ -189,9 +183,7 @@ class CAISOAdapter:
         if not self.pool:
             raise RuntimeError("Database pool not configured for CAISOAdapter")
 
-        return await store_prices(
-            self.pool, prices, depot_id, source, demand_charge_per_kw
-        )
+        return await store_prices(self.pool, prices, depot_id, source, demand_charge_per_kw)
 
     async def get_prices_for_depot(
         self,
@@ -200,7 +192,7 @@ class CAISOAdapter:
         end_date: datetime,
         node: Optional[str] = None,
         use_cache: bool = True,
-        source: str = 'caiso_dam',
+        source: str = "caiso_dam",
     ) -> list[CAISOPrice]:
         """Get prices for a specific depot, with caching support.
 
@@ -221,18 +213,16 @@ class CAISOAdapter:
         # Try to get cached prices first
         if use_cache and self.pool:
             try:
-                cached = await get_cached_prices(
-                    self.pool, depot_id, start_date, end_date
-                )
+                cached = await get_cached_prices(self.pool, depot_id, start_date, end_date)
                 if cached:
                     # Convert cached prices back to CAISOPrice objects
                     prices = []
                     for row in cached:
                         # Convert $/kWh back to $/MWh for LMP
-                        lmp = row['energy_kwh'] * 1000.0
+                        lmp = row["energy_kwh"] * 1000.0
                         prices.append(
                             CAISOPrice(
-                                timestamp=row['time'],
+                                timestamp=row["time"],
                                 lmp=lmp,
                                 energy=lmp * 0.8,  # Estimate components
                                 congestion=lmp * 0.15,
@@ -240,9 +230,7 @@ class CAISOAdapter:
                                 node=node or self.default_node,
                             )
                         )
-                    logger.debug(
-                        f"Using {len(prices)} cached prices for depot {depot_id}"
-                    )
+                    logger.debug(f"Using {len(prices)} cached prices for depot {depot_id}")
                     return prices
             except Exception as e:
                 logger.warning(f"Error getting cached prices: {e}, fetching new")
@@ -262,4 +250,3 @@ class CAISOAdapter:
     async def close(self) -> None:
         """Close HTTP client."""
         await self.client.aclose()
-

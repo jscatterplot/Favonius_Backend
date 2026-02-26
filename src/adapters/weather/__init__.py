@@ -11,13 +11,12 @@ from .storage import (
 )
 
 __all__ = [
-    'OpenMeteoAdapter',
-    'WeatherData',
-    'WeatherIngestionService',
-    'store_weather_forecasts',
-    'get_cached_forecasts',
-    'get_latest_forecast',
-    'get_depot_location',
-    'convert_solar_radiation_wm2_to_calcm2',
+    "OpenMeteoAdapter",
+    "WeatherData",
+    "WeatherIngestionService",
+    "store_weather_forecasts",
+    "get_cached_forecasts",
+    "get_latest_forecast",
+    "get_depot_location",
+    "convert_solar_radiation_wm2_to_calcm2",
 ]
-

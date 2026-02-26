@@ -2,23 +2,23 @@
 
 import json
 import os
-import pytest
 from datetime import datetime
 from uuid import uuid4
+
+import pytest
 
 os.environ.setdefault("VDV463_VALIDATION_MODE", "soft")
 
 from adapters.vdv463.messages import (
+    ChargingPointInfo,
+    ChargingStationInfo,
+    DepotInfo,
     ValidationMode,
-    parse_message,
-    parse_charging_request_item,
-    get_schema_registry,
-    get_validation_mode,
     VDV463ValidationError,
     build_provide_charging_information_message,
-    DepotInfo,
-    ChargingStationInfo,
-    ChargingPointInfo,
+    get_validation_mode,
+    parse_charging_request_item,
+    parse_message,
 )
 
 
@@ -184,7 +184,9 @@ class TestProvideChargingInformationSchema:
                     charging_station_id="d1",
                     charging_station_status="Available",
                     charging_point_info_list=[
-                        ChargingPointInfo(charging_point_id="cp-1", charging_point_status="Available"),
+                        ChargingPointInfo(
+                            charging_point_id="cp-1", charging_point_status="Available"
+                        ),
                     ],
                 )
             ],
@@ -203,7 +205,9 @@ class TestProvideChargingInformationSchema:
         depot = DepotInfo(
             depot_id="d1",
             charging_stations=[
-                ChargingPointInfo(charging_point_id="cp-1", status="Occupied", current_power_kw=30.0),
+                ChargingPointInfo(
+                    charging_point_id="cp-1", status="Occupied", current_power_kw=30.0
+                ),
             ],
         )
         msg = build_provide_charging_information_message("ps1", [depot])

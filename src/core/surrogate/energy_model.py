@@ -25,7 +25,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 if TYPE_CHECKING:
-    import joblib
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +55,7 @@ class PredictionInput:
     is_school_day: bool
 
 
-def compute_degree_days(
-    temp_avg_f: float, base_temp: float = 65.0
-) -> tuple[float, float]:
+def compute_degree_days(temp_avg_f: float, base_temp: float = 65.0) -> tuple[float, float]:
     """Compute Heating and Cooling Degree Days.
 
     Args:
@@ -91,35 +89,33 @@ class EnergySurrogateModel:
         self.known_routes = known_routes
 
         # Preprocessing pipeline
-        categorical_features = ['bus_size', 'route_id']
+        categorical_features = ["bus_size", "route_id"]
         numerical_features = [
-            'temp_avg_f',
-            'temp_max_f',
-            'temp_min_f',
-            'rain_inches',
-            'solar_radiation',
-            'hdd',
-            'cdd',
-            'is_school_day',
+            "temp_avg_f",
+            "temp_max_f",
+            "temp_min_f",
+            "rain_inches",
+            "solar_radiation",
+            "hdd",
+            "cdd",
+            "is_school_day",
         ]
 
         self.preprocessor = ColumnTransformer(
             transformers=[
                 (
-                    'cat',
-                    OneHotEncoder(handle_unknown='ignore'),
+                    "cat",
+                    OneHotEncoder(handle_unknown="ignore"),
                     categorical_features,
                 ),
-                ('num', StandardScaler(), numerical_features),
+                ("num", StandardScaler(), numerical_features),
             ]
         )
 
         # GP kernel (following Stanford approach)
-        kernel = (
-            ConstantKernel(1.0, (1e-3, 1e3))
-            * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2))
-            + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-5, 1e1))
-        )
+        kernel = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(
+            length_scale=1.0, length_scale_bounds=(1e-2, 1e2)
+        ) + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-5, 1e1))
 
         self.gp = GaussianProcessRegressor(
             kernel=kernel,
@@ -128,20 +124,18 @@ class EnergySurrogateModel:
             random_state=42,
         )
 
-        self.pipeline = Pipeline([
-            ('preprocess', self.preprocessor),
-            ('gp', self.gp),
-        ])
+        self.pipeline = Pipeline(
+            [
+                ("preprocess", self.preprocessor),
+                ("gp", self.gp),
+            ]
+        )
 
         self._is_fitted = False
 
-        logger.info(
-            f"Initialized EnergySurrogateModel with {len(known_routes)} known routes"
-        )
+        logger.info(f"Initialized EnergySurrogateModel with {len(known_routes)} known routes")
 
-    def _prepare_features(
-        self, inputs: list[PredictionInput]
-    ) -> pd.DataFrame:
+    def _prepare_features(self, inputs: list[PredictionInput]) -> pd.DataFrame:
         """Convert PredictionInput list to feature matrix.
 
         Args:
@@ -153,24 +147,24 @@ class EnergySurrogateModel:
         records = []
         for inp in inputs:
             hdd, cdd = compute_degree_days(inp.temp_avg_f)
-            records.append({
-                'bus_size': inp.bus_size,
-                'route_id': inp.route_id,
-                'temp_avg_f': inp.temp_avg_f,
-                'temp_max_f': inp.temp_max_f,
-                'temp_min_f': inp.temp_min_f,
-                'rain_inches': inp.rain_inches,
-                'solar_radiation': inp.solar_radiation,
-                'hdd': hdd,
-                'cdd': cdd,
-                'is_school_day': int(inp.is_school_day),
-            })
+            records.append(
+                {
+                    "bus_size": inp.bus_size,
+                    "route_id": inp.route_id,
+                    "temp_avg_f": inp.temp_avg_f,
+                    "temp_max_f": inp.temp_max_f,
+                    "temp_min_f": inp.temp_min_f,
+                    "rain_inches": inp.rain_inches,
+                    "solar_radiation": inp.solar_radiation,
+                    "hdd": hdd,
+                    "cdd": cdd,
+                    "is_school_day": int(inp.is_school_day),
+                }
+            )
 
         return pd.DataFrame(records)
 
-    def fit(
-        self, inputs: list[PredictionInput], energy_kwh: list[float]
-    ) -> None:
+    def fit(self, inputs: list[PredictionInput], energy_kwh: list[float]) -> None:
         """Train the surrogate model on historical data.
 
         Args:
@@ -200,9 +194,7 @@ class EnergySurrogateModel:
 
         logger.info("Model fitting complete")
 
-    def predict(
-        self, inputs: list[PredictionInput]
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def predict(self, inputs: list[PredictionInput]) -> tuple[np.ndarray, np.ndarray]:
         """Predict energy consumption with uncertainty.
 
         Args:
@@ -233,9 +225,7 @@ class EnergySurrogateModel:
 
         return mean, std
 
-    def get_r2_score(
-        self, inputs: list[PredictionInput], y_true: list[float]
-    ) -> float:
+    def get_r2_score(self, inputs: list[PredictionInput], y_true: list[float]) -> float:
         """Compute R² score on validation data.
 
         Args:
@@ -259,15 +249,15 @@ class EnergySurrogateModel:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
-            'pipeline': self.pipeline,
-            'routes': self.known_routes,
+            "pipeline": self.pipeline,
+            "routes": self.known_routes,
         }
 
         joblib.dump(data, path)
         logger.info(f"Model saved to {path}")
 
     @classmethod
-    def load(cls, path: Path) -> 'EnergySurrogateModel':
+    def load(cls, path: Path) -> "EnergySurrogateModel":
         """Load model from disk.
 
         Args:
@@ -285,14 +275,13 @@ class EnergySurrogateModel:
             raise FileNotFoundError(f"Model file not found: {path}")
 
         data = joblib.load(path)
-        model = cls(data['routes'])
-        model.pipeline = data['pipeline']
+        model = cls(data["routes"])
+        model.pipeline = data["pipeline"]
         # Restore fitted components from the loaded pipeline
-        model.preprocessor = model.pipeline.named_steps['preprocess']
-        model.gp = model.pipeline.named_steps['gp']
+        model.preprocessor = model.pipeline.named_steps["preprocess"]
+        model.gp = model.pipeline.named_steps["gp"]
         model._is_fitted = True
 
         logger.info(f"Model loaded from {path}")
 
         return model
-

@@ -7,16 +7,16 @@ with optional VehicleInfo and ChargingProcessInfo (full schema compliance).
 
 from __future__ import annotations
 
-from typing import Optional, Any, List
 from datetime import datetime
+from typing import Any, List, Optional
 
 from .messages import (
-    DepotInfo,
     ChargingPointInfo,
-    ChargingStationInfo,
-    VehicleInfo,
     ChargingProcessInfo,
+    ChargingStationInfo,
+    DepotInfo,
     PreconditioningInfo,
+    VehicleInfo,
 )
 
 
@@ -76,7 +76,9 @@ async def get_depot_charging_info(
                 telem_time = None
                 if telem and telem["charging_kw"] is not None:
                     current_power = float(telem["charging_kw"])
-                    vehicle_external_id = telem["external_id"] or (str(telem["vehicle_id"]) if telem["vehicle_id"] else None)
+                    vehicle_external_id = telem["external_id"] or (
+                        str(telem["vehicle_id"]) if telem["vehicle_id"] else None
+                    )
                     if telem.get("soc") is not None:
                         s = float(telem["soc"])
                         soc_pct = int(s * 100) if s <= 1 else int(s)
@@ -85,8 +87,12 @@ async def get_depot_charging_info(
                 vehicle_info: Optional[VehicleInfo] = None
                 charging_process_info: Optional[ChargingProcessInfo] = None
                 if vehicle_external_id:
-                    vehicle_charging_status = "Charging" if current_power and current_power > 0 else "ReadyToCharge"
-                    traction_battery_info = {"stateOfCharge": soc_pct} if soc_pct is not None else None
+                    vehicle_charging_status = (
+                        "Charging" if current_power and current_power > 0 else "ReadyToCharge"
+                    )
+                    traction_battery_info = (
+                        {"stateOfCharge": soc_pct} if soc_pct is not None else None
+                    )
                     vehicle_info = VehicleInfo(
                         vehicle_id=vehicle_external_id,
                         vehicle_status_info={},
@@ -94,10 +100,16 @@ async def get_depot_charging_info(
                         preconditioning_info=PreconditioningInfo(),
                         traction_battery_info=traction_battery_info,
                     )
-                    start_time = telem_time.isoformat() if telem_time else datetime.utcnow().isoformat() + "Z"
+                    start_time = (
+                        telem_time.isoformat()
+                        if telem_time
+                        else datetime.utcnow().isoformat() + "Z"
+                    )
                     charging_process_info = ChargingProcessInfo(
                         charging_process_id=f"cp-{charger_id}",
-                        process_status="Charging" if current_power and current_power > 0 else "Preparing",
+                        process_status=(
+                            "Charging" if current_power and current_power > 0 else "Preparing"
+                        ),
                         start_time=start_time,
                         electric_data_charging_power=current_power or 0.0,
                         charging_prediction_data={},

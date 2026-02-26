@@ -82,9 +82,7 @@ async def store_weather_forecasts(
         async with pool.acquire() as conn:
             for forecast in forecasts:
                 # Convert solar radiation from W/m² to cal/cm²
-                solar_rad_calcm2 = convert_solar_radiation_wm2_to_calcm2(
-                    forecast.solar_radiation
-                )
+                solar_rad_calcm2 = convert_solar_radiation_wm2_to_calcm2(forecast.solar_radiation)
 
                 await conn.execute(
                     query,
@@ -98,9 +96,7 @@ async def store_weather_forecasts(
                 )
                 stored_count += 1
 
-        logger.info(
-            f"Stored {stored_count} weather forecasts for depot {depot_id_str}"
-        )
+        logger.info(f"Stored {stored_count} weather forecasts for depot {depot_id_str}")
         return stored_count
 
     except asyncpg.PostgresError as e:
@@ -156,9 +152,7 @@ async def get_cached_forecasts(
         raise
 
 
-async def get_latest_forecast(
-    pool: asyncpg.Pool, depot_id: str | UUID
-) -> Optional[dict]:
+async def get_latest_forecast(pool: asyncpg.Pool, depot_id: str | UUID) -> Optional[dict]:
     """Get the most recent weather forecast for a depot.
 
     Args:
@@ -216,11 +210,10 @@ async def get_depot_location(
         async with pool.acquire() as conn:
             row = await conn.fetchrow(query, depot_id_str)
 
-        if row and row['latitude'] is not None and row['longitude'] is not None:
-            return (float(row['latitude']), float(row['longitude']))
+        if row and row["latitude"] is not None and row["longitude"] is not None:
+            return (float(row["latitude"]), float(row["longitude"]))
         return None
 
     except asyncpg.PostgresError as e:
         logger.error(f"Database error getting depot location: {e}")
         raise
-

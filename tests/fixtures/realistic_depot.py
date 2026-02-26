@@ -10,9 +10,10 @@ These fixtures use production-like data including:
 - Inter-depot handoff scenarios
 """
 
-import pytest
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
+
+import pytest
 
 from src.core.models import (
     DepotConfig,
@@ -21,34 +22,28 @@ from src.core.models import (
     OptimizationResult,
 )
 
-
 # ============ Stable UUIDs for consistent testing ============
 
 # Depot identifiers
-DEPOT_ID = UUID('550e8400-e29b-41d4-a716-446655440000')
-DEPOT_A_ID = UUID('550e8400-e29b-41d4-a716-446655440001')
-DEPOT_B_ID = UUID('550e8400-e29b-41d4-a716-446655440002')
+DEPOT_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
+DEPOT_A_ID = UUID("550e8400-e29b-41d4-a716-446655440001")
+DEPOT_B_ID = UUID("550e8400-e29b-41d4-a716-446655440002")
 
 # Vehicle identifiers (20 vehicles for realistic fleet)
-VEHICLE_IDS = [
-    UUID(f'660e8400-e29b-41d4-a716-44665544{i:04d}')
-    for i in range(20)
-]
+VEHICLE_IDS = [UUID(f"660e8400-e29b-41d4-a716-44665544{i:04d}") for i in range(20)]
 
 # Vehicle external IDs (human-readable)
-VEHICLE_EXTERNAL_IDS = [f'bus_{i}' for i in range(20)]
+VEHICLE_EXTERNAL_IDS = [f"bus_{i}" for i in range(20)]
 
 # Charger identifiers (10 chargers)
-CHARGER_IDS = [
-    UUID(f'770e8400-e29b-41d4-a716-44665544{i:04d}')
-    for i in range(10)
-]
+CHARGER_IDS = [UUID(f"770e8400-e29b-41d4-a716-44665544{i:04d}") for i in range(10)]
 
 # Charger external IDs
-CHARGER_EXTERNAL_IDS = [f'charger_{i}' for i in range(10)]
+CHARGER_EXTERNAL_IDS = [f"charger_{i}" for i in range(10)]
 
 
 # ============ TOU Pricing Patterns ============
+
 
 def generate_tou_prices(n_timesteps: int = 96) -> list[float]:
     """Generate realistic TOU prices for 24-hour horizon.
@@ -79,7 +74,7 @@ def generate_tou_prices(n_timesteps: int = 96) -> list[float]:
 def generate_price_spike_prices(
     n_timesteps: int = 96,
     spike_start: int = 64,  # 4pm
-    spike_end: int = 84,    # 9pm
+    spike_end: int = 84,  # 9pm
     spike_price: float = 0.50,
 ) -> list[float]:
     """Generate prices with a spike period.
@@ -100,6 +95,7 @@ def generate_price_spike_prices(
 
 
 # ============ Building Load Patterns ============
+
 
 def generate_building_load(n_timesteps: int = 96) -> list[float]:
     """Generate realistic building load profile.
@@ -137,6 +133,7 @@ def generate_building_load(n_timesteps: int = 96) -> list[float]:
 
 # ============ Pytest Fixtures ============
 
+
 @pytest.fixture
 def realistic_depot_config() -> DepotConfig:
     """Realistic depot configuration with 20 vehicles and 10 chargers.
@@ -154,8 +151,8 @@ def realistic_depot_config() -> DepotConfig:
         vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
         vehicle_max_charge_kw={vid: 150.0 for vid in vehicle_ids},
         charger_groups={
-            80.0: 10,   # 10 standard chargers
-            150.0: 5,   # 5 DC fast chargers
+            80.0: 10,  # 10 standard chargers
+            150.0: 5,  # 5 DC fast chargers
         },
         charger_efficiency=0.95,
         charger_vehicle_access={},  # All vehicles can use all chargers
@@ -256,7 +253,7 @@ def state_with_incoming_vehicle(realistic_depot_config) -> tuple[DepotState, Inc
     # Incoming vehicle from depot_A
     incoming_vehicle = IncomingVehicle(
         vehicle_id=VEHICLE_IDS[19],  # bus_19
-        external_id='bus_19',
+        external_id="bus_19",
         expected_soc=0.35,
         arrival_time=datetime.utcnow() + timedelta(hours=2),
         battery_kwh=324.0,
@@ -335,6 +332,7 @@ def state_for_return_time_deviation(realistic_depot_config) -> DepotState:
 
 # ============ Helper Functions ============
 
+
 def create_optimization_result_for_test(
     config: DepotConfig,
     state: DepotState,
@@ -374,8 +372,8 @@ def create_optimization_result_for_test(
             current_soc = min(1.0, current_soc)
 
         schedule[vid] = {
-            'charging_power': charging_power,
-            'soc': soc,
+            "charging_power": charging_power,
+            "soc": soc,
         }
 
     return OptimizationResult(
@@ -386,5 +384,5 @@ def create_optimization_result_for_test(
         peak_demand=300.0,
         objective_value=1500.0,
         solve_time=5.0,
-        status='completed',
+        status="completed",
     )

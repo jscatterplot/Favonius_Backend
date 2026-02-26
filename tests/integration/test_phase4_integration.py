@@ -6,12 +6,12 @@ Reference: Development plan Phase 4, PRD.md#11-3-integration-test-requirements
 """
 
 import asyncio
-import pytest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import asyncpg
+import pytest
 
 from src.core.controller import DepotController
 from src.core.models import DepotConfig, OptimizationResult
@@ -29,7 +29,7 @@ def mock_db_pool():
 @pytest.fixture
 def depot_config():
     """Depot configuration for testing."""
-    vehicle_ids = ['bus_1', 'bus_2']
+    vehicle_ids = ["bus_1", "bus_2"]
     return DepotConfig(
         vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -69,9 +69,7 @@ class TestStateAssemblerTriggerMonitorIntegration:
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         # Mock assembler methods
-        assembler._get_vehicle_socs = AsyncMock(
-            return_value={'bus_1': 0.50, 'bus_2': 0.70}
-        )
+        assembler._get_vehicle_socs = AsyncMock(return_value={"bus_1": 0.50, "bus_2": 0.70})
         assembler.get_current_state = AsyncMock()
         mock_state = MagicMock()
         mock_state.prices = [0.10] * 24
@@ -79,33 +77,31 @@ class TestStateAssemblerTriggerMonitorIntegration:
         assembler.get_current_state.return_value = mock_state
 
         # Set expected state
-        monitor.update_expected_state({'bus_1': 0.60, 'bus_2': 0.70}, {})
+        monitor.update_expected_state({"bus_1": 0.60, "bus_2": 0.70}, {})
 
         # Get current SoCs via monitor
         current_socs = await monitor._get_current_vehicle_socs()
 
-        assert current_socs == {'bus_1': 0.50, 'bus_2': 0.70}
+        assert current_socs == {"bus_1": 0.50, "bus_2": 0.70}
         assembler._get_vehicle_socs.assert_called_once()
 
         # Check deviation
         trigger = await monitor.check_soc_deviation(current_socs)
         assert trigger is not None
-        assert 'bus_1' in trigger
+        assert "bus_1" in trigger
 
     @pytest.mark.asyncio
-    async def test_expected_state_updates_propagate(
-        self, assembler, mock_db_pool, depot_id
-    ):
+    async def test_expected_state_updates_propagate(self, assembler, mock_db_pool, depot_id):
         """Test expected state updates propagate correctly."""
         config = TriggerConfig()
         callback = AsyncMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         # Initial expected state
-        expected_socs = {'bus_1': 0.60, 'bus_2': 0.70}
+        expected_socs = {"bus_1": 0.60, "bus_2": 0.70}
         expected_returns = {
-            'bus_1': datetime.utcnow() + timedelta(hours=2),
-            'bus_2': datetime.utcnow() + timedelta(hours=4),
+            "bus_1": datetime.utcnow() + timedelta(hours=2),
+            "bus_2": datetime.utcnow() + timedelta(hours=4),
         }
 
         monitor.update_expected_state(expected_socs, expected_returns)
@@ -114,16 +110,14 @@ class TestStateAssemblerTriggerMonitorIntegration:
         assert monitor.expected_return_times == expected_returns
 
         # Update with new values
-        new_socs = {'bus_1': 0.65, 'bus_2': 0.75}
+        new_socs = {"bus_1": 0.65, "bus_2": 0.75}
         monitor.update_expected_state(new_socs, {})
 
         assert monitor.expected_socs == new_socs
         assert monitor.expected_return_times == {}
 
     @pytest.mark.asyncio
-    async def test_price_baseline_updates(
-        self, assembler, mock_db_pool, depot_id, depot_config
-    ):
+    async def test_price_baseline_updates(self, assembler, mock_db_pool, depot_id, depot_config):
         """Test price baseline updates work correctly."""
         config = TriggerConfig()
         callback = AsyncMock()
@@ -155,17 +149,15 @@ class TestTriggerCooldownMechanism:
     """Test trigger cooldown prevents rapid re-optimization."""
 
     @pytest.mark.asyncio
-    async def test_cooldown_prevents_rapid_triggers(
-        self, assembler, mock_db_pool, depot_id
-    ):
+    async def test_cooldown_prevents_rapid_triggers(self, assembler, mock_db_pool, depot_id):
         """Test cooldown mechanism prevents rapid-fire triggers."""
         config = TriggerConfig(check_interval_sec=0.1)  # Fast for testing
         callback = AsyncMock()
         monitor = TriggerMonitor(config, callback, assembler=assembler)
 
         # Set up to trigger
-        monitor.update_expected_state({'bus_1': 0.60}, {})
-        assembler._get_vehicle_socs = AsyncMock(return_value={'bus_1': 0.50})
+        monitor.update_expected_state({"bus_1": 0.60}, {})
+        assembler._get_vehicle_socs = AsyncMock(return_value={"bus_1": 0.50})
         assembler._get_current_prices = AsyncMock(return_value={})
         assembler._get_actual_return_times = AsyncMock(return_value={})
 
@@ -211,9 +203,7 @@ class TestTriggerCooldownMechanism:
         callback.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cooldown_expires_after_timeout(
-        self, assembler, mock_db_pool, depot_id
-    ):
+    async def test_cooldown_expires_after_timeout(self, assembler, mock_db_pool, depot_id):
         """Test cooldown expires and allows triggers after timeout."""
         config = TriggerConfig(check_interval_sec=0.1)
         callback = AsyncMock()
@@ -222,8 +212,8 @@ class TestTriggerCooldownMechanism:
         # Set trigger cooldown to short duration for testing
         monitor._trigger_cooldown_sec = 0.2
 
-        monitor.update_expected_state({'bus_1': 0.60}, {})
-        assembler._get_vehicle_socs = AsyncMock(return_value={'bus_1': 0.50})
+        monitor.update_expected_state({"bus_1": 0.60}, {})
+        assembler._get_vehicle_socs = AsyncMock(return_value={"bus_1": 0.50})
         assembler._get_current_prices = AsyncMock(return_value={})
         assembler._get_actual_return_times = AsyncMock(return_value={})
 
@@ -285,13 +275,13 @@ class TestControllerIntegration:
         mock_result = OptimizationResult(
             run_id=uuid4(),
             schedule={
-                'bus_1': {
-                    'charging_power': [0, 80, 80, 0] * 24,
-                    'soc': [0.5, 0.52, 0.54, 0.56] * 24,
+                "bus_1": {
+                    "charging_power": [0, 80, 80, 0] * 24,
+                    "soc": [0.5, 0.52, 0.54, 0.56] * 24,
                 },
-                'bus_2': {
-                    'charging_power': [0, 0, 80, 80] * 24,
-                    'soc': [0.6, 0.6, 0.62, 0.64] * 24,
+                "bus_2": {
+                    "charging_power": [0, 0, 80, 80] * 24,
+                    "soc": [0.6, 0.6, 0.62, 0.64] * 24,
                 },
             },
             battery_dispatch=[0.0] * 96,
@@ -299,7 +289,7 @@ class TestControllerIntegration:
             peak_demand=400.0,
             objective_value=1000.0,
             solve_time=5.0,
-            status='completed',
+            status="completed",
         )
 
         # Mock assembler to return state
@@ -308,14 +298,14 @@ class TestControllerIntegration:
         controller.assembler.get_current_state = AsyncMock(return_value=mock_state)
 
         # Mock optimizer
-        with patch('src.core.controller.optimize', return_value=mock_result):
-            with patch.object(controller, '_store_result', new_callable=AsyncMock):
-                result = await controller.run_optimization("test")
+        with patch("src.core.controller.optimize", return_value=mock_result):
+            with patch.object(controller, "_store_result", new_callable=AsyncMock):
+                await controller.run_optimization("test")
 
                 # Verify trigger monitor was updated
                 assert len(controller.trigger_monitor.expected_socs) == 2
-                assert 'bus_1' in controller.trigger_monitor.expected_socs
-                assert 'bus_2' in controller.trigger_monitor.expected_socs
+                assert "bus_1" in controller.trigger_monitor.expected_socs
+                assert "bus_2" in controller.trigger_monitor.expected_socs
 
                 # Verify prices were updated
                 assert len(controller.trigger_monitor.last_prices) > 0
@@ -335,21 +325,21 @@ class TestControllerIntegration:
         # Mock optimization
         mock_result = OptimizationResult(
             run_id=uuid4(),
-            schedule={'bus_1': {'charging_power': [0] * 96, 'soc': [0.5] * 96}},
+            schedule={"bus_1": {"charging_power": [0] * 96, "soc": [0.5] * 96}},
             battery_dispatch=[0.0] * 96,
             grid_power=[0.0] * 96,
             peak_demand=100.0,
             objective_value=500.0,
             solve_time=2.0,
-            status='completed',
+            status="completed",
         )
 
         mock_state = MagicMock()
         mock_state.prices = [0.10] * 96
         controller.assembler.get_current_state = AsyncMock(return_value=mock_state)
 
-        with patch('src.core.controller.optimize', return_value=mock_result):
-            with patch.object(controller, '_store_result', new_callable=AsyncMock):
+        with patch("src.core.controller.optimize", return_value=mock_result):
+            with patch.object(controller, "_store_result", new_callable=AsyncMock):
                 # Trigger callback
                 await controller._handle_trigger("SoC deviation: bus_1")
 
@@ -380,36 +370,34 @@ class TestEndToEndFlow:
         # Mock telemetry (vehicle SoCs)
         mock_telemetry_row = MagicMock()
         mock_telemetry_row.__getitem__.side_effect = lambda k: {
-            'vehicle_id': 'bus_1',
-            'soc': 0.50,
+            "vehicle_id": "bus_1",
+            "soc": 0.50,
         }[k]
 
         # Mock prices
         base_time = datetime.utcnow()
         mock_price_row = MagicMock()
         mock_price_row.__getitem__.side_effect = lambda k, t=base_time, p=0.10: {
-            'time': t,
-            'price_per_kwh': p,
+            "time": t,
+            "price_per_kwh": p,
         }[k]
 
         # Mock schedules
         mock_schedule_row = {
-            'vehicle_id': 'bus_1',
-            'departure_time': base_time + timedelta(hours=6),
-            'return_time': base_time + timedelta(hours=10),
-            'estimated_energy_kwh': 150.0,
-            'route_id': 'route_1',
+            "vehicle_id": "bus_1",
+            "departure_time": base_time + timedelta(hours=6),
+            "return_time": base_time + timedelta(hours=10),
+            "estimated_energy_kwh": 150.0,
+            "route_id": "route_1",
         }
 
         # Mock optimization_runs (for peak demand)
         mock_peak_row = MagicMock()
-        mock_peak_row.__getitem__.side_effect = lambda k: {'peak': 200.0}[k]
+        mock_peak_row.__getitem__.side_effect = lambda k: {"peak": 200.0}[k]
 
         # Mock depots (for demand charge rate)
         mock_depot_row = MagicMock()
-        mock_depot_row.__getitem__.side_effect = lambda k: {
-            'demand_charge_rate_kw': 20.0
-        }[k]
+        mock_depot_row.__getitem__.side_effect = lambda k: {"demand_charge_rate_kw": 20.0}[k]
 
         # Set up fetch side effects
         mock_conn.fetch.side_effect = [
@@ -427,9 +415,9 @@ class TestEndToEndFlow:
         mock_result = OptimizationResult(
             run_id=uuid4(),
             schedule={
-                'bus_1': {
-                    'charging_power': [0, 80, 80, 0] * 24,
-                    'soc': [0.5, 0.52, 0.54, 0.56] * 24,
+                "bus_1": {
+                    "charging_power": [0, 80, 80, 0] * 24,
+                    "soc": [0.5, 0.52, 0.54, 0.56] * 24,
                 }
             },
             battery_dispatch=[0.0] * 96,
@@ -437,19 +425,18 @@ class TestEndToEndFlow:
             peak_demand=300.0,
             objective_value=800.0,
             solve_time=3.0,
-            status='completed',
+            status="completed",
         )
 
-        with patch('src.core.controller.optimize', return_value=mock_result):
-            with patch.object(controller, '_store_result', new_callable=AsyncMock):
+        with patch("src.core.controller.optimize", return_value=mock_result):
+            with patch.object(controller, "_store_result", new_callable=AsyncMock):
                 # Run optimization
                 result = await controller.run_optimization("test")
 
                 # Verify state was assembled
                 assert result is not None
-                assert result.status == 'completed'
+                assert result.status == "completed"
 
                 # Verify trigger monitor was updated
                 assert len(controller.trigger_monitor.expected_socs) > 0
                 assert len(controller.trigger_monitor.last_prices) > 0
-

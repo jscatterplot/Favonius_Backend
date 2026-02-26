@@ -1,7 +1,6 @@
 """Database schema for OCPP 2.0.1 compliance features."""
 
-from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 
 def get_ocpp_schema_sql() -> str:
@@ -1352,7 +1351,7 @@ def get_ocpp_schema_migrations() -> List[Dict[str, Any]]:
                 DROP TABLE IF EXISTS device_reports CASCADE;
                 DROP TABLE IF EXISTS device_variables CASCADE;
                 DROP TABLE IF EXISTS device_components CASCADE;
-            """
+            """,
         }
     ]
 
@@ -1368,7 +1367,11 @@ def get_standard_ocpp_variables() -> Dict[str, List[Dict[str, Any]]]:
             {"name": "Modem", "type": "string", "mutability": "ReadOnly"},
             {"name": "SupportedFeatures", "type": "string", "mutability": "ReadOnly"},
             {"name": "SupportedProtocols", "type": "string", "mutability": "ReadOnly"},
-            {"name": "SupportedChargingProfilePurposeTypes", "type": "string", "mutability": "ReadOnly"},
+            {
+                "name": "SupportedChargingProfilePurposeTypes",
+                "type": "string",
+                "mutability": "ReadOnly",
+            },
             {"name": "SupportedChargingProfileTypes", "type": "string", "mutability": "ReadOnly"},
             {"name": "SupportedMeasurands", "type": "string", "mutability": "ReadOnly"},
             {"name": "SupportedCableTypes", "type": "string", "mutability": "ReadOnly"},
@@ -1415,13 +1418,29 @@ def get_standard_ocpp_variables() -> Dict[str, List[Dict[str, Any]]]:
         ],
         "SmartCharging": [
             {"name": "ChargingProfileMaxStackLevel", "type": "integer", "mutability": "ReadOnly"},
-            {"name": "ChargingScheduleAllowedChargingRateUnit", "type": "string", "mutability": "ReadOnly"},
+            {
+                "name": "ChargingScheduleAllowedChargingRateUnit",
+                "type": "string",
+                "mutability": "ReadOnly",
+            },
             {"name": "ChargingScheduleMaxPeriods", "type": "integer", "mutability": "ReadOnly"},
-            {"name": "ConnectorSwitch3to1PhaseSupported", "type": "boolean", "mutability": "ReadOnly"},
+            {
+                "name": "ConnectorSwitch3to1PhaseSupported",
+                "type": "boolean",
+                "mutability": "ReadOnly",
+            },
             {"name": "MaxChargingProfilesInstalled", "type": "integer", "mutability": "ReadOnly"},
             {"name": "MaxScheduledChargingProfiles", "type": "integer", "mutability": "ReadOnly"},
-            {"name": "MaxScheduledChargingProfilesPerEVSE", "type": "integer", "mutability": "ReadOnly"},
-            {"name": "MaxScheduledChargingProfilesPerEVSEConnector", "type": "integer", "mutability": "ReadOnly"},
+            {
+                "name": "MaxScheduledChargingProfilesPerEVSE",
+                "type": "integer",
+                "mutability": "ReadOnly",
+            },
+            {
+                "name": "MaxScheduledChargingProfilesPerEVSEConnector",
+                "type": "integer",
+                "mutability": "ReadOnly",
+            },
         ],
         "V2XController": [
             {"name": "Enabled", "type": "boolean", "mutability": "ReadWrite"},
@@ -1429,14 +1448,18 @@ def get_standard_ocpp_variables() -> Dict[str, List[Dict[str, Any]]]:
             {"name": "TxUpdatedInterval", "type": "string", "mutability": "ReadWrite"},
         ],
         "Security": [
-            {"name": "AdditionalRootCertificateCheck", "type": "boolean", "mutability": "ReadWrite"},
+            {
+                "name": "AdditionalRootCertificateCheck",
+                "type": "boolean",
+                "mutability": "ReadWrite",
+            },
             {"name": "CertificateSignedMaxChainSize", "type": "integer", "mutability": "ReadOnly"},
             {"name": "CertificateStoreMaxLength", "type": "integer", "mutability": "ReadOnly"},
             {"name": "CpoName", "type": "string", "mutability": "ReadWrite"},
             {"name": "SecurityProfile", "type": "integer", "mutability": "ReadOnly"},
             {"name": "SupportedFileTransferProtocols", "type": "string", "mutability": "ReadOnly"},
             {"name": "TlsCipherSuite", "type": "string", "mutability": "ReadWrite"},
-        ]
+        ],
     }
 
 
@@ -1452,13 +1475,22 @@ def get_initial_device_data(station_id: str, station_info: Dict[str, Any]) -> Li
                 {"name": "Model", "value": station_info.get("model", "Unknown")},
                 {"name": "VendorName", "value": station_info.get("vendor_name", "Unknown")},
                 {"name": "SerialNumber", "value": station_info.get("serial_number", "Unknown")},
-                {"name": "FirmwareVersion", "value": station_info.get("firmware_version", "Unknown")},
+                {
+                    "name": "FirmwareVersion",
+                    "value": station_info.get("firmware_version", "Unknown"),
+                },
                 {"name": "Modem", "value": station_info.get("modem", "Unknown")},
                 {"name": "SupportedFeatures", "value": "Core,SmartCharging,RemoteTrigger"},
                 {"name": "SupportedProtocols", "value": "OCPP2.0.1"},
-                {"name": "SupportedChargingProfilePurposeTypes", "value": "ChargingStationMaxProfile,TxDefaultProfile,TxProfile,V2XProfile"},
+                {
+                    "name": "SupportedChargingProfilePurposeTypes",
+                    "value": "ChargingStationMaxProfile,TxDefaultProfile,TxProfile,V2XProfile",
+                },
                 {"name": "SupportedChargingProfileTypes", "value": "Absolute,Recurring,Relative"},
-                {"name": "SupportedMeasurands", "value": "Energy.Active.Import.Register,Power.Active.Import,SoC,Voltage,Current.Import"},
+                {
+                    "name": "SupportedMeasurands",
+                    "value": "Energy.Active.Import.Register,Power.Active.Import,SoC,Voltage,Current.Import",
+                },
                 {"name": "SupportedCableTypes", "value": "IEC_62196_T2"},
                 {"name": "SupportedConnectorTypes", "value": "IEC_62196_T2"},
                 {"name": "SupportedDisplayMessageTypes", "value": "Normal"},
@@ -1470,7 +1502,7 @@ def get_initial_device_data(station_id: str, station_info: Dict[str, Any]) -> Li
                 {"name": "SupportedUnitTypes", "value": "Wh,kWh"},
                 {"name": "SupportedV2GModes", "value": "CentralSetpoint"},
                 {"name": "SupportedV2XChargingCtrlrTypes", "value": "CentralSetpoint"},
-            ]
+            ],
         },
         # EVSE components
         {
@@ -1487,7 +1519,7 @@ def get_initial_device_data(station_id: str, station_info: Dict[str, Any]) -> Li
                 {"name": "MaxEnergy", "value": "100.0"},
                 {"name": "MinEnergy", "value": "0.1"},
                 {"name": "PowerType", "value": "AC_3_PHASE"},
-            ]
+            ],
         },
         # Connector components
         {
@@ -1504,7 +1536,7 @@ def get_initial_device_data(station_id: str, station_info: Dict[str, Any]) -> Li
                 {"name": "NominalVoltage", "value": "400.0"},
                 {"name": "Power", "value": "22.0"},
                 {"name": "PowerType", "value": "AC_3_PHASE"},
-            ]
+            ],
         },
         # Smart Charging components
         {
@@ -1520,7 +1552,7 @@ def get_initial_device_data(station_id: str, station_info: Dict[str, Any]) -> Li
                 {"name": "MaxScheduledChargingProfiles", "value": "4"},
                 {"name": "MaxScheduledChargingProfilesPerEVSE", "value": "4"},
                 {"name": "MaxScheduledChargingProfilesPerEVSEConnector", "value": "4"},
-            ]
+            ],
         },
         # Security components
         {
@@ -1535,7 +1567,7 @@ def get_initial_device_data(station_id: str, station_info: Dict[str, Any]) -> Li
                 {"name": "SecurityProfile", "value": "1"},
                 {"name": "SupportedFileTransferProtocols", "value": "HTTPS"},
                 {"name": "TlsCipherSuite", "value": "TLS_AES_256_GCM_SHA384"},
-            ]
+            ],
         },
         # V2X Controller components
         {
@@ -1546,6 +1578,6 @@ def get_initial_device_data(station_id: str, station_info: Dict[str, Any]) -> Li
                 {"name": "Enabled", "value": "true"},
                 {"name": "SupportedOperationModes", "value": "CentralSetpoint"},
                 {"name": "TxUpdatedInterval", "value": "CentralSetpoint:30"},
-            ]
-        }
+            ],
+        },
     ]

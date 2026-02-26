@@ -8,15 +8,15 @@ Per PRD Section 8.1, demand charge rate resolution priority is:
 Reference: PRD_v2.md#8-1-optimization-formulation
 """
 
-import pytest
-import pytest_asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 import asyncpg
+import pytest
+import pytest_asyncio
 
-from src.core.state.assembler import StateAssembler
 from src.core.models import DepotConfig
+from src.core.state.assembler import StateAssembler
 
 
 @pytest.mark.integration
@@ -30,8 +30,8 @@ class TestDemandChargeRateResolution:
         import os
 
         db_url = os.getenv(
-            'TEST_DATABASE_URL',
-            'postgresql://postgres:postgres@localhost:5432/favonius_test',
+            "TEST_DATABASE_URL",
+            "postgresql://postgres:postgres@localhost:5432/favonius_test",
         )
 
         try:
@@ -56,10 +56,10 @@ class TestDemandChargeRateResolution:
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
                 depot_id,
-                'Test Depot',
+                "Test Depot",
                 34.0522,
                 -118.2437,
-                'America/Los_Angeles',
+                "America/Los_Angeles",
                 1000.0,
                 25.0,  # Depot config has $25/kW
             )
@@ -67,15 +67,15 @@ class TestDemandChargeRateResolution:
         yield depot_id
 
         async with test_db_pool.acquire() as conn:
-            await conn.execute('DELETE FROM prices WHERE depot_id = $1', depot_id)
-            await conn.execute('DELETE FROM depots WHERE depot_id = $1', depot_id)
+            await conn.execute("DELETE FROM prices WHERE depot_id = $1", depot_id)
+            await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
     @pytest.fixture
     def depot_config(self):
         """Depot configuration."""
         return DepotConfig(
-            vehicle_capacities={'bus_1': 324.0},
-            vehicle_max_charge_kw={'bus_1': 80.0},
+            vehicle_capacities={"bus_1": 324.0},
+            vehicle_max_charge_kw={"bus_1": 80.0},
             charger_groups={80.0: 2},
             charger_efficiency=0.95,
             charger_vehicle_access={},
@@ -101,16 +101,14 @@ class TestDemandChargeRateResolution:
                 depot_id,
                 datetime.utcnow(),
                 0.10,
-                'utility_tou',
+                "utility_tou",
                 30.0,  # prices.demand_kw = $30/kW (should take precedence over depot $25/kW)
             )
 
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
         rate = await assembler._get_demand_charge_rate()
 
-        assert rate == 30.0, (
-            "Should use prices.demand_kw ($30/kW) over depot config ($25/kW)"
-        )
+        assert rate == 30.0, "Should use prices.demand_kw ($30/kW) over depot config ($25/kW)"
 
     @pytest.mark.asyncio
     async def test_demand_charge_rate_fallback_to_depot_config(
@@ -129,24 +127,22 @@ class TestDemandChargeRateResolution:
                 depot_id,
                 datetime.utcnow(),
                 0.10,
-                'utility_tou',
+                "utility_tou",
                 None,  # prices.demand_kw is NULL
             )
 
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
         rate = await assembler._get_demand_charge_rate()
 
-        assert rate == 25.0, (
-            "Should fall back to depot config ($25/kW) when prices.demand_kw is NULL"
-        )
+        assert (
+            rate == 25.0
+        ), "Should fall back to depot config ($25/kW) when prices.demand_kw is NULL"
 
     @pytest.mark.asyncio
-    async def test_demand_charge_rate_most_recent_price(
-        self, test_db_pool, depot_id, depot_config
-    ):
+    async def test_demand_charge_rate_most_recent_price(self, test_db_pool, depot_id, depot_config):
         """Test that most recent price row is used when multiple price rows exist."""
         now = datetime.utcnow()
-        
+
         # Insert older price row
         async with test_db_pool.acquire() as conn:
             await conn.execute(
@@ -159,7 +155,7 @@ class TestDemandChargeRateResolution:
                 depot_id,
                 now - timedelta(hours=2),
                 0.10,
-                'utility_tou',
+                "utility_tou",
                 20.0,  # Older price has $20/kW
             )
 
@@ -175,21 +171,17 @@ class TestDemandChargeRateResolution:
                 depot_id,
                 now,
                 0.12,
-                'utility_tou',
+                "utility_tou",
                 35.0,  # Newer price has $35/kW (should be used)
             )
 
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
         rate = await assembler._get_demand_charge_rate()
 
-        assert rate == 35.0, (
-            "Should use most recent price row ($35/kW), not older row ($20/kW)"
-        )
+        assert rate == 35.0, "Should use most recent price row ($35/kW), not older row ($20/kW)"
 
     @pytest.mark.asyncio
-    async def test_demand_charge_rate_default_fallback(
-        self, test_db_pool, depot_id, depot_config
-    ):
+    async def test_demand_charge_rate_default_fallback(self, test_db_pool, depot_id, depot_config):
         """Test demand charge rate falls back to default when both are NULL."""
         # Create depot with NULL demand_charge_rate_kw
         async with test_db_pool.acquire() as conn:
@@ -206,9 +198,9 @@ class TestDemandChargeRateResolution:
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
         rate = await assembler._get_demand_charge_rate()
 
-        assert rate == 20.0, (
-            "Should use default $20/kW when both prices.demand_kw and depot config are NULL"
-        )
+        assert (
+            rate == 20.0
+        ), "Should use default $20/kW when both prices.demand_kw and depot config are NULL"
 
     @pytest.mark.asyncio
     async def test_demand_charge_rate_resolution_in_state_assembly(
@@ -227,15 +219,15 @@ class TestDemandChargeRateResolution:
                 depot_id,
                 datetime.utcnow(),
                 0.10,
-                'utility_tou',
+                "utility_tou",
                 28.0,  # prices.demand_kw = $28/kW
             )
 
         assembler = StateAssembler(test_db_pool, depot_id, depot_config)
-        
+
         # State assembly should use demand charge rate from prices
         state = await assembler.get_current_state()
 
-        assert state.demand_charge_rate == 28.0, (
-            "State assembly should use demand charge rate from prices.demand_kw"
-        )
+        assert (
+            state.demand_charge_rate == 28.0
+        ), "State assembly should use demand charge rate from prices.demand_kw"

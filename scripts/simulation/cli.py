@@ -9,20 +9,18 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from src.core.models import DepotConfig
-from scripts.simulation.depot_sim import DepotSimulator, SimulationOptimizer
+from scripts.simulation.depot_sim import SimulationOptimizer
 from scripts.simulation.scenarios import (
+    demand_charge_scenario,
     morning_rush_scenario,
     price_spike_scenario,
-    soc_deviation_scenario,
-    demand_charge_scenario,
     realistic_depot_scenario,
+    soc_deviation_scenario,
 )
-
+from src.core.models import DepotConfig
 
 SCENARIO_MAP = {
     "morning_rush": morning_rush_scenario,
@@ -33,9 +31,7 @@ SCENARIO_MAP = {
 }
 
 
-def get_depot_config(
-    n_vehicles: int, n_chargers: int
-) -> DepotConfig:
+def get_depot_config(n_vehicles: int, n_chargers: int) -> DepotConfig:
     """Create depot configuration.
 
     Args:
@@ -46,14 +42,12 @@ def get_depot_config(
         DepotConfig instance
     """
     # Default vehicle capacities
-    vehicle_capacities = {
-        f"bus_{i}": 324.0 for i in range(n_vehicles)
-    }
+    vehicle_capacities = {f"bus_{i}": 324.0 for i in range(n_vehicles)}
 
     # Per PRD Section 8.3: Chargers aggregated by rated_kw
     # Create charger groups: all chargers at 80kW
     charger_groups = {80.0: n_chargers}
-    
+
     # Per PRD Section 6.2: DepotConfig structure
     return DepotConfig(
         vehicle_capacities=vehicle_capacities,
@@ -130,9 +124,7 @@ async def run_simulation_cmd(
 
         if verbose and step % 4 == 0:
             state = sim.get_state()
-            avg_soc = sum(v["soc"] for v in state["vehicles"]) / len(
-                state["vehicles"]
-            )
+            avg_soc = sum(v["soc"] for v in state["vehicles"]) / len(state["vehicles"])
             print(f"  Avg SoC: {avg_soc:.2f}")
 
     # Print summary
@@ -159,22 +151,17 @@ async def benchmark_cmd(
         output: Output file path (optional)
     """
     from src.core.models import DepotConfig, DepotState
-    from src.core.optimizer import optimize
 
     print(f"Benchmarking {fleet_size} vehicles ({n_runs} runs)...")
 
     # Per PRD Section 8.3: Chargers aggregated by rated_kw
     n_chargers = max(5, fleet_size // 2)
     charger_groups = {80.0: n_chargers}
-    
+
     # Per PRD Section 6.2: DepotConfig structure
     config = DepotConfig(
-        vehicle_capacities={
-            f"bus_{i}": 324.0 for i in range(fleet_size)
-        },
-        vehicle_max_charge_kw={
-            f"bus_{i}": 80.0 for i in range(fleet_size)
-        },
+        vehicle_capacities={f"bus_{i}": 324.0 for i in range(fleet_size)},
+        vehicle_max_charge_kw={f"bus_{i}": 80.0 for i in range(fleet_size)},
         charger_groups=charger_groups,
         charger_efficiency=0.95,
         charger_vehicle_access={},  # All vehicles can access all chargers
@@ -190,22 +177,14 @@ async def benchmark_cmd(
 
     n_t = config.n_timesteps
     state = DepotState(
-        vehicle_socs={
-            f"bus_{i}": 0.4 + i * 0.01 for i in range(fleet_size)
-        },
+        vehicle_socs={f"bus_{i}": 0.4 + i * 0.01 for i in range(fleet_size)},
         battery_soc=0.5,
         prices=[0.12] * n_t,
         demand_charge_rate=20.0,
         current_month_peak=400.0,
-        vehicle_availability={
-            f"bus_{i}": [True] * n_t for i in range(fleet_size)
-        },
-        energy_requirements={
-            f"bus_{i}": 200.0 for i in range(fleet_size)
-        },
-        departure_times={
-            f"bus_{i}": 24 + i % 12 for i in range(fleet_size)
-        },
+        vehicle_availability={f"bus_{i}": [True] * n_t for i in range(fleet_size)},
+        energy_requirements={f"bus_{i}": 200.0 for i in range(fleet_size)},
+        departure_times={f"bus_{i}": 24 + i % 12 for i in range(fleet_size)},
         building_power=[50.0] * n_t,
     )
 
@@ -213,9 +192,10 @@ async def benchmark_cmd(
     for run in range(n_runs):
         # Per PRD Section 8.3: Solve time target < 60 seconds
         from src.core.optimizer.milp_model import build_optimization_model, solve_model
+
         model = build_optimization_model(state, config)
         result = solve_model(model, time_limit=60.0)
-        
+
         results.append(
             {
                 "run": run + 1,
@@ -237,7 +217,7 @@ async def benchmark_cmd(
     min_time = min(solve_times)
     max_time = max(solve_times)
 
-    print(f"\nBenchmark Results:")
+    print("\nBenchmark Results:")
     print(f"  Average solve time: {avg_time:.2f}s")
     print(f"  Min solve time: {min_time:.2f}s")
     print(f"  Max solve time: {max_time:.2f}s")
@@ -360,9 +340,7 @@ def main():
     )
 
     # Benchmark command
-    bench_parser = subparsers.add_parser(
-        "benchmark", help="Run performance benchmarks"
-    )
+    bench_parser = subparsers.add_parser("benchmark", help="Run performance benchmarks")
     bench_parser.add_argument(
         "--fleet-size",
         type=int,
@@ -381,9 +359,7 @@ def main():
     )
 
     # Validate command
-    validate_parser = subparsers.add_parser(
-        "validate", help="Run acceptance test validation"
-    )
+    validate_parser = subparsers.add_parser("validate", help="Run acceptance test validation")
     validate_parser.add_argument(
         "--acceptance-test",
         required=True,
@@ -431,4 +407,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

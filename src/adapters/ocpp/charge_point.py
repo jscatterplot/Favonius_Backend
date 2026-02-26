@@ -24,16 +24,13 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from ocpp.routing import on
 from ocpp.v16 import ChargePoint as CP16
 from ocpp.v16 import call, call_result
 from ocpp.v16.enums import (
     AuthorizationStatus,
-    AvailabilityType,
-    ChargePointStatus,
     RegistrationStatus,
-    ResetType,
 )
-from ocpp.routing import on
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +38,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Transaction ID Generator
 # ---------------------------------------------------------------------------
+
 
 class TransactionIdGenerator:
     """Thread-safe, monotonically increasing transaction ID generator.
@@ -63,6 +61,7 @@ _tx_id_gen = TransactionIdGenerator()
 # ---------------------------------------------------------------------------
 # FleetChargePoint
 # ---------------------------------------------------------------------------
+
 
 class FleetChargePoint(CP16):
     """Custom ChargePoint handler for fleet optimization.
@@ -137,7 +136,7 @@ class FleetChargePoint(CP16):
     # Incoming message handlers (CP → CSMS)
     # ===================================================================
 
-    @on('BootNotification')
+    @on("BootNotification")
     async def on_boot_notification(
         self, charge_point_vendor: str, charge_point_model: str, **kwargs
     ):
@@ -147,8 +146,8 @@ class FleetChargePoint(CP16):
         """
         self.vendor = charge_point_vendor
         self.model = charge_point_model
-        self.serial_number = kwargs.get('charge_point_serial_number')
-        self.firmware_version = kwargs.get('firmware_version')
+        self.serial_number = kwargs.get("charge_point_serial_number")
+        self.firmware_version = kwargs.get("firmware_version")
 
         logger.info(
             f"BootNotification from {self.id}: {charge_point_vendor} "
@@ -160,8 +159,12 @@ class FleetChargePoint(CP16):
         if self._cb_boot:
             try:
                 result = await self._cb_boot(
-                    self.id, charge_point_vendor, charge_point_model,
-                    self.serial_number, self.firmware_version, **kwargs,
+                    self.id,
+                    charge_point_vendor,
+                    charge_point_model,
+                    self.serial_number,
+                    self.firmware_version,
+                    **kwargs,
                 )
                 if result is not None:
                     status = result
@@ -174,14 +177,12 @@ class FleetChargePoint(CP16):
             status=status,
         )
 
-    @on('Heartbeat')
+    @on("Heartbeat")
     async def on_heartbeat(self, **kwargs):
         """Handle Heartbeat from charger. Returns current server time."""
-        return call_result.Heartbeat(
-            current_time=datetime.utcnow().isoformat()
-        )
+        return call_result.Heartbeat(current_time=datetime.utcnow().isoformat())
 
-    @on('StatusNotification')
+    @on("StatusNotification")
     async def on_status_notification(
         self, connector_id: int, error_code: str, status: str, **kwargs
     ):
@@ -199,9 +200,13 @@ class FleetChargePoint(CP16):
         if self._cb_status_change:
             try:
                 await self._cb_status_change(
-                    self.id, connector_id, status, error_code,
-                    kwargs.get('timestamp'), kwargs.get('vendor_id'),
-                    kwargs.get('vendor_error_code'),
+                    self.id,
+                    connector_id,
+                    status,
+                    error_code,
+                    kwargs.get("timestamp"),
+                    kwargs.get("vendor_id"),
+                    kwargs.get("vendor_error_code"),
                 )
             except TypeError:
                 # Backward-compat: old callbacks only accept (cp_id, connector, status)
@@ -214,7 +219,7 @@ class FleetChargePoint(CP16):
 
         return call_result.StatusNotification()
 
-    @on('MeterValues')
+    @on("MeterValues")
     async def on_meter_values(self, connector_id: int, meter_value: list, **kwargs):
         """Handle MeterValues from charger — comprehensive parsing.
 
@@ -228,36 +233,32 @@ class FleetChargePoint(CP16):
 
         Also captures transaction_id and context for proper correlation.
         """
-        transaction_id = kwargs.get('transaction_id')
+        transaction_id = kwargs.get("transaction_id")
 
         soc: Optional[float] = None
         power_kw: Optional[float] = None
         energy_kwh: Optional[float] = None
         max_charge_kw: Optional[float] = None
-        current_a: Optional[float] = None
-        voltage_v: Optional[float] = None
         timestamp: Optional[datetime] = None
         raw_samples: list[dict] = []
 
         for mv in meter_value:
-            ts_raw = mv.get('timestamp')
+            ts_raw = mv.get("timestamp")
             if ts_raw:
                 if isinstance(ts_raw, str):
                     try:
-                        timestamp = datetime.fromisoformat(
-                            ts_raw.replace('Z', '+00:00')
-                        )
+                        timestamp = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
                     except ValueError:
                         logger.warning(f"Invalid timestamp from {self.id}: {ts_raw}")
                 elif isinstance(ts_raw, datetime):
                     timestamp = ts_raw
 
-            for sv in mv.get('sampledValue', mv.get('sampled_value', [])):
-                measurand = sv.get('measurand', 'Energy.Active.Import.Register')
-                value_str = sv.get('value', '0')
-                unit = sv.get('unit', '')
-                context = sv.get('context', '')
-                phase = sv.get('phase')
+            for sv in mv.get("sampledValue", mv.get("sampled_value", [])):
+                measurand = sv.get("measurand", "Energy.Active.Import.Register")
+                value_str = sv.get("value", "0")
+                unit = sv.get("unit", "")
+                context = sv.get("context", "")
+                phase = sv.get("phase")
 
                 try:
                     value = float(value_str)
@@ -265,41 +266,46 @@ class FleetChargePoint(CP16):
                     logger.warning(f"Invalid meter value from {self.id}: {value_str}")
                     continue
 
-                raw_samples.append({
-                    'measurand': measurand, 'value': value,
-                    'unit': unit, 'context': context, 'phase': phase,
-                })
+                raw_samples.append(
+                    {
+                        "measurand": measurand,
+                        "value": value,
+                        "unit": unit,
+                        "context": context,
+                        "phase": phase,
+                    }
+                )
 
-                if measurand == 'SoC':
+                if measurand == "SoC":
                     soc = value / 100.0
 
-                elif measurand == 'Power.Active.Import':
-                    if unit in ('kW', 'kw'):
+                elif measurand == "Power.Active.Import":
+                    if unit in ("kW", "kw"):
                         power_kw = value
                     else:
                         power_kw = value / 1000.0
 
-                elif measurand == 'Energy.Active.Import.Register':
-                    if unit in ('kWh', 'kwh'):
+                elif measurand == "Energy.Active.Import.Register":
+                    if unit in ("kWh", "kwh"):
                         energy_kwh = value
                     else:
                         energy_kwh = value / 1000.0
 
-                elif measurand == 'Power.Offered':
-                    if unit in ('kW', 'kw'):
+                elif measurand == "Power.Offered":
+                    if unit in ("kW", "kw"):
                         max_charge_kw = value
                     else:
                         max_charge_kw = value / 1000.0
 
-                elif measurand == 'Current.Import':
-                    current_a = value
+                elif measurand == "Current.Import":
+                    pass
 
-                elif measurand == 'Voltage':
-                    voltage_v = value
+                elif measurand == "Voltage":
+                    pass
 
-                elif measurand in ('maxChargingRate', 'MaxChargingRate'):
+                elif measurand in ("maxChargingRate", "MaxChargingRate"):
                     if max_charge_kw is None:
-                        if unit in ('kW', 'kw'):
+                        if unit in ("kW", "kw"):
                             max_charge_kw = value
                         else:
                             max_charge_kw = value / 1000.0
@@ -314,18 +320,26 @@ class FleetChargePoint(CP16):
             if self._cb_meter_values and timestamp:
                 try:
                     await self._cb_meter_values(
-                        self.id, connector_id,
-                        soc or 0.0, power_kw or 0.0, energy_kwh,
-                        timestamp, transaction_id, max_charge_kw,
+                        self.id,
+                        connector_id,
+                        soc or 0.0,
+                        power_kw or 0.0,
+                        energy_kwh,
+                        timestamp,
+                        transaction_id,
+                        max_charge_kw,
                         raw_samples,
                     )
                 except TypeError:
                     # Backward-compat: old callback (cp, conn, soc, power, ts, max_kw)
                     try:
                         await self._cb_meter_values(
-                            self.id, connector_id,
-                            soc or 0.0, power_kw or 0.0,
-                            timestamp, max_charge_kw,
+                            self.id,
+                            connector_id,
+                            soc or 0.0,
+                            power_kw or 0.0,
+                            timestamp,
+                            max_charge_kw,
                         )
                     except Exception as e:
                         logger.error(f"Error in meter values callback: {e}")
@@ -334,10 +348,14 @@ class FleetChargePoint(CP16):
 
         return call_result.MeterValues()
 
-    @on('StartTransaction')
+    @on("StartTransaction")
     async def on_start_transaction(
-        self, connector_id: int, id_tag: str, meter_start: int,
-        timestamp: str, **kwargs,
+        self,
+        connector_id: int,
+        id_tag: str,
+        meter_start: int,
+        timestamp: str,
+        **kwargs,
     ):
         """Handle StartTransaction from charger.
 
@@ -349,7 +367,11 @@ class FleetChargePoint(CP16):
         if self._cb_tx_start:
             try:
                 result = await self._cb_tx_start(
-                    self.id, connector_id, id_tag, meter_start, timestamp,
+                    self.id,
+                    connector_id,
+                    id_tag,
+                    meter_start,
+                    timestamp,
                 )
                 if result is not None:
                     auth_status = result
@@ -370,20 +392,23 @@ class FleetChargePoint(CP16):
 
         return call_result.StartTransaction(
             transaction_id=tx_id,
-            id_tag_info={'status': auth_status},
+            id_tag_info={"status": auth_status},
         )
 
-    @on('StopTransaction')
+    @on("StopTransaction")
     async def on_stop_transaction(
-        self, transaction_id: int, meter_stop: int, timestamp: str,
+        self,
+        transaction_id: int,
+        meter_stop: int,
+        timestamp: str,
         **kwargs,
     ):
         """Handle StopTransaction from charger.
 
         Cleans up transaction tracking and notifies callback with stop reason.
         """
-        id_tag = kwargs.get('id_tag', '')
-        reason = kwargs.get('reason', 'Local')
+        id_tag = kwargs.get("id_tag", "")
+        reason = kwargs.get("reason", "Local")
 
         logger.info(
             f"StopTransaction from {self.id}, tx_id={transaction_id}, "
@@ -400,17 +425,19 @@ class FleetChargePoint(CP16):
         if self._cb_tx_stop:
             try:
                 await self._cb_tx_stop(
-                    self.id, transaction_id, id_tag, meter_stop,
-                    timestamp, reason,
+                    self.id,
+                    transaction_id,
+                    id_tag,
+                    meter_stop,
+                    timestamp,
+                    reason,
                 )
             except Exception as e:
                 logger.error(f"Error in transaction stop callback: {e}")
 
-        return call_result.StopTransaction(
-            id_tag_info={'status': AuthorizationStatus.accepted}
-        )
+        return call_result.StopTransaction(id_tag_info={"status": AuthorizationStatus.accepted})
 
-    @on('Authorize')
+    @on("Authorize")
     async def on_authorize_request(self, id_tag: str, **kwargs):
         """Handle Authorize from charger.
 
@@ -427,28 +454,29 @@ class FleetChargePoint(CP16):
                 logger.error(f"Error in authorize callback: {e}")
 
         logger.info(f"Authorize from {self.id}: id_tag={id_tag}, status={auth_status}")
-        return call_result.Authorize(
-            id_tag_info={'status': auth_status}
-        )
+        return call_result.Authorize(id_tag_info={"status": auth_status})
 
-    @on('DataTransfer')
+    @on("DataTransfer")
     async def on_data_transfer_request(self, vendor_id: str, **kwargs):
         """Handle DataTransfer from charger — vendor-specific messages."""
-        message_id = kwargs.get('message_id', '')
-        data = kwargs.get('data', '')
+        message_id = kwargs.get("message_id", "")
+        data = kwargs.get("data", "")
 
         logger.info(
             f"DataTransfer from {self.id}: vendor={vendor_id}, "
             f"msg_id={message_id}, data_len={len(str(data))}"
         )
 
-        status = 'Accepted'
+        status = "Accepted"
         response_data = None
 
         if self._cb_data_transfer:
             try:
                 result = await self._cb_data_transfer(
-                    self.id, vendor_id, message_id, data,
+                    self.id,
+                    vendor_id,
+                    message_id,
+                    data,
                 )
                 if result is not None:
                     status, response_data = result
@@ -457,7 +485,7 @@ class FleetChargePoint(CP16):
 
         return call_result.DataTransfer(status=status, data=response_data)
 
-    @on('DiagnosticsStatusNotification')
+    @on("DiagnosticsStatusNotification")
     async def on_diagnostics_status_notification(self, status: str, **kwargs):
         """Handle DiagnosticsStatusNotification from charger."""
         logger.info(f"DiagnosticsStatus from {self.id}: {status}")
@@ -468,7 +496,7 @@ class FleetChargePoint(CP16):
                 logger.error(f"Error in diagnostics callback: {e}")
         return call_result.DiagnosticsStatusNotification()
 
-    @on('FirmwareStatusNotification')
+    @on("FirmwareStatusNotification")
     async def on_firmware_status_notification(self, status: str, **kwargs):
         """Handle FirmwareStatusNotification from charger."""
         logger.info(f"FirmwareStatus from {self.id}: {status}")
@@ -487,9 +515,9 @@ class FleetChargePoint(CP16):
         self,
         connector_id: int,
         charging_schedule: list[dict],
-        profile_purpose: str = 'TxProfile',
-        profile_kind: str = 'Absolute',
-        charging_rate_unit: str = 'W',
+        profile_purpose: str = "TxProfile",
+        profile_kind: str = "Absolute",
+        charging_rate_unit: str = "W",
         stack_level: int = 0,
         profile_id: int = 1,
         valid_from: Optional[str] = None,
@@ -520,21 +548,21 @@ class FleetChargePoint(CP16):
             True if accepted, False otherwise
         """
         profile_dict: dict[str, Any] = {
-            'charging_profile_id': profile_id,
-            'stack_level': stack_level,
-            'charging_profile_purpose': profile_purpose,
-            'charging_profile_kind': profile_kind,
-            'charging_schedule': {
-                'charging_rate_unit': charging_rate_unit,
-                'charging_schedule_period': charging_schedule,
+            "charging_profile_id": profile_id,
+            "stack_level": stack_level,
+            "charging_profile_purpose": profile_purpose,
+            "charging_profile_kind": profile_kind,
+            "charging_schedule": {
+                "charging_rate_unit": charging_rate_unit,
+                "charging_schedule_period": charging_schedule,
             },
         }
         if valid_from:
-            profile_dict['valid_from'] = valid_from
+            profile_dict["valid_from"] = valid_from
         if valid_to:
-            profile_dict['valid_to'] = valid_to
+            profile_dict["valid_to"] = valid_to
         if recurrency_kind:
-            profile_dict['recurrency_kind'] = recurrency_kind
+            profile_dict["recurrency_kind"] = recurrency_kind
 
         for attempt in range(max_retries):
             try:
@@ -543,7 +571,7 @@ class FleetChargePoint(CP16):
                     cs_charging_profiles=profile_dict,
                 )
                 response = await self.call(payload)
-                accepted = response.status == 'Accepted'
+                accepted = response.status == "Accepted"
 
                 if accepted:
                     logger.info(
@@ -589,13 +617,13 @@ class FleetChargePoint(CP16):
         """
         kwargs: dict[str, Any] = {}
         if profile_id is not None:
-            kwargs['id'] = profile_id
+            kwargs["id"] = profile_id
         if connector_id is not None:
-            kwargs['connector_id'] = connector_id
+            kwargs["connector_id"] = connector_id
         if charging_profile_purpose is not None:
-            kwargs['charging_profile_purpose'] = charging_profile_purpose
+            kwargs["charging_profile_purpose"] = charging_profile_purpose
         if stack_level is not None:
-            kwargs['stack_level'] = stack_level
+            kwargs["stack_level"] = stack_level
 
         try:
             payload = call.ClearChargingProfile(**kwargs)
@@ -604,7 +632,7 @@ class FleetChargePoint(CP16):
             return response.status
         except Exception as e:
             logger.error(f"Error ClearChargingProfile to {self.id}: {e}")
-            return 'Unknown'
+            return "Unknown"
 
     async def get_composite_schedule(
         self,
@@ -623,22 +651,22 @@ class FleetChargePoint(CP16):
             Composite schedule dict or None if rejected
         """
         kwargs: dict[str, Any] = {
-            'connector_id': connector_id,
-            'duration': duration,
+            "connector_id": connector_id,
+            "duration": duration,
         }
         if charging_rate_unit:
-            kwargs['charging_rate_unit'] = charging_rate_unit
+            kwargs["charging_rate_unit"] = charging_rate_unit
 
         try:
             payload = call.GetCompositeSchedule(**kwargs)
             response = await self.call(payload)
-            if response.status == 'Accepted':
+            if response.status == "Accepted":
                 logger.info(f"GetCompositeSchedule from {self.id}: Accepted")
                 return {
-                    'status': response.status,
-                    'connector_id': getattr(response, 'connector_id', connector_id),
-                    'schedule_start': getattr(response, 'schedule_start', None),
-                    'charging_schedule': getattr(response, 'charging_schedule', None),
+                    "status": response.status,
+                    "connector_id": getattr(response, "connector_id", connector_id),
+                    "schedule_start": getattr(response, "schedule_start", None),
+                    "charging_schedule": getattr(response, "charging_schedule", None),
                 }
             else:
                 logger.warning(f"GetCompositeSchedule from {self.id}: {response.status}")
@@ -665,15 +693,15 @@ class FleetChargePoint(CP16):
         """
         try:
             kwargs: dict[str, Any] = {
-                'connector_id': connector_id,
-                'id_tag': id_tag,
+                "connector_id": connector_id,
+                "id_tag": id_tag,
             }
             if charging_profile:
-                kwargs['charging_profile'] = charging_profile
+                kwargs["charging_profile"] = charging_profile
 
             payload = call.RemoteStartTransaction(**kwargs)
             response = await self.call(payload)
-            accepted = response.status == 'Accepted'
+            accepted = response.status == "Accepted"
             logger.info(
                 f"RemoteStartTransaction to {self.id}, connector {connector_id}: "
                 f"{'Accepted' if accepted else 'Rejected'}"
@@ -688,7 +716,7 @@ class FleetChargePoint(CP16):
         try:
             payload = call.RemoteStopTransaction(transaction_id=transaction_id)
             response = await self.call(payload)
-            accepted = response.status == 'Accepted'
+            accepted = response.status == "Accepted"
             logger.info(
                 f"RemoteStopTransaction to {self.id}, tx={transaction_id}: "
                 f"{'Accepted' if accepted else 'Rejected'}"
@@ -698,7 +726,7 @@ class FleetChargePoint(CP16):
             logger.error(f"Error RemoteStopTransaction to {self.id}: {e}")
             return False
 
-    async def reset(self, reset_type: str = 'Soft') -> str:
+    async def reset(self, reset_type: str = "Soft") -> str:
         """Send Reset command. Returns 'Accepted' or 'Rejected'."""
         try:
             payload = call.Reset(type=reset_type)
@@ -707,10 +735,12 @@ class FleetChargePoint(CP16):
             return response.status
         except Exception as e:
             logger.error(f"Error Reset to {self.id}: {e}")
-            return 'Rejected'
+            return "Rejected"
 
     async def change_availability(
-        self, connector_id: int, availability_type: str = 'Operative',
+        self,
+        connector_id: int,
+        availability_type: str = "Operative",
     ) -> str:
         """Change charger/connector availability.
 
@@ -718,7 +748,8 @@ class FleetChargePoint(CP16):
         """
         try:
             payload = call.ChangeAvailability(
-                connector_id=connector_id, type=availability_type,
+                connector_id=connector_id,
+                type=availability_type,
             )
             response = await self.call(payload)
             logger.info(
@@ -728,10 +759,12 @@ class FleetChargePoint(CP16):
             return response.status
         except Exception as e:
             logger.error(f"Error ChangeAvailability to {self.id}: {e}")
-            return 'Rejected'
+            return "Rejected"
 
     async def trigger_message(
-        self, requested_message: str, connector_id: Optional[int] = None,
+        self,
+        requested_message: str,
+        connector_id: Optional[int] = None,
     ) -> str:
         """Request charger to send a specific message on demand.
 
@@ -742,29 +775,29 @@ class FleetChargePoint(CP16):
         Returns 'Accepted', 'Rejected', or 'NotImplemented'.
         """
         try:
-            kwargs: dict[str, Any] = {'requested_message': requested_message}
+            kwargs: dict[str, Any] = {"requested_message": requested_message}
             if connector_id is not None:
-                kwargs['connector_id'] = connector_id
+                kwargs["connector_id"] = connector_id
             payload = call.TriggerMessage(**kwargs)
             response = await self.call(payload)
-            logger.info(
-                f"TriggerMessage to {self.id} ({requested_message}): {response.status}"
-            )
+            logger.info(f"TriggerMessage to {self.id} ({requested_message}): {response.status}")
             return response.status
         except Exception as e:
             logger.error(f"Error TriggerMessage to {self.id}: {e}")
-            return 'Rejected'
+            return "Rejected"
 
     async def unlock_connector(self, connector_id: int) -> str:
         """Unlock a connector. Returns 'Unlocked', 'UnlockFailed', or 'NotSupported'."""
         try:
             payload = call.UnlockConnector(connector_id=connector_id)
             response = await self.call(payload)
-            logger.info(f"UnlockConnector to {self.id}, connector {connector_id}: {response.status}")
+            logger.info(
+                f"UnlockConnector to {self.id}, connector {connector_id}: {response.status}"
+            )
             return response.status
         except Exception as e:
             logger.error(f"Error UnlockConnector to {self.id}: {e}")
-            return 'UnlockFailed'
+            return "UnlockFailed"
 
     async def change_configuration(self, key: str, value: str) -> str:
         """Change a configuration key on the charger.
@@ -778,7 +811,7 @@ class FleetChargePoint(CP16):
             return response.status
         except Exception as e:
             logger.error(f"Error ChangeConfiguration to {self.id}: {e}")
-            return 'Rejected'
+            return "Rejected"
 
     async def get_configuration(self, keys: Optional[list[str]] = None) -> dict:
         """Get configuration values from charger.
@@ -788,16 +821,16 @@ class FleetChargePoint(CP16):
         try:
             kwargs: dict[str, Any] = {}
             if keys:
-                kwargs['key'] = keys
+                kwargs["key"] = keys
             payload = call.GetConfiguration(**kwargs)
             response = await self.call(payload)
             return {
-                'configuration_key': getattr(response, 'configuration_key', []) or [],
-                'unknown_key': getattr(response, 'unknown_key', []) or [],
+                "configuration_key": getattr(response, "configuration_key", []) or [],
+                "unknown_key": getattr(response, "unknown_key", []) or [],
             }
         except Exception as e:
             logger.error(f"Error GetConfiguration to {self.id}: {e}")
-            return {'configuration_key': [], 'unknown_key': []}
+            return {"configuration_key": [], "unknown_key": []}
 
     async def clear_cache(self) -> str:
         """Clear authorization cache. Returns 'Accepted' or 'Rejected'."""
@@ -808,10 +841,12 @@ class FleetChargePoint(CP16):
             return response.status
         except Exception as e:
             logger.error(f"Error ClearCache to {self.id}: {e}")
-            return 'Rejected'
+            return "Rejected"
 
     async def send_local_list(
-        self, list_version: int, update_type: str = 'Full',
+        self,
+        list_version: int,
+        update_type: str = "Full",
         local_authorization_list: Optional[list[dict]] = None,
     ) -> str:
         """Send/update local authorization list.
@@ -820,18 +855,18 @@ class FleetChargePoint(CP16):
         """
         try:
             kwargs: dict[str, Any] = {
-                'list_version': list_version,
-                'update_type': update_type,
+                "list_version": list_version,
+                "update_type": update_type,
             }
             if local_authorization_list:
-                kwargs['local_authorization_list'] = local_authorization_list
+                kwargs["local_authorization_list"] = local_authorization_list
             payload = call.SendLocalList(**kwargs)
             response = await self.call(payload)
             logger.info(f"SendLocalList to {self.id}: {response.status}")
             return response.status
         except Exception as e:
             logger.error(f"Error SendLocalList to {self.id}: {e}")
-            return 'Failed'
+            return "Failed"
 
     async def get_local_list_version(self) -> int:
         """Get current local list version. Returns version number (-1 on error)."""
@@ -844,8 +879,12 @@ class FleetChargePoint(CP16):
             return -1
 
     async def reserve_now(
-        self, connector_id: int, expiry_date: str, id_tag: str,
-        reservation_id: int, parent_id_tag: Optional[str] = None,
+        self,
+        connector_id: int,
+        expiry_date: str,
+        id_tag: str,
+        reservation_id: int,
+        parent_id_tag: Optional[str] = None,
     ) -> str:
         """Reserve a connector.
 
@@ -853,20 +892,20 @@ class FleetChargePoint(CP16):
         """
         try:
             kwargs: dict[str, Any] = {
-                'connector_id': connector_id,
-                'expiry_date': expiry_date,
-                'id_tag': id_tag,
-                'reservation_id': reservation_id,
+                "connector_id": connector_id,
+                "expiry_date": expiry_date,
+                "id_tag": id_tag,
+                "reservation_id": reservation_id,
             }
             if parent_id_tag:
-                kwargs['parent_id_tag'] = parent_id_tag
+                kwargs["parent_id_tag"] = parent_id_tag
             payload = call.ReserveNow(**kwargs)
             response = await self.call(payload)
             logger.info(f"ReserveNow to {self.id}, connector {connector_id}: {response.status}")
             return response.status
         except Exception as e:
             logger.error(f"Error ReserveNow to {self.id}: {e}")
-            return 'Rejected'
+            return "Rejected"
 
     async def cancel_reservation(self, reservation_id: int) -> str:
         """Cancel a reservation. Returns 'Accepted' or 'Rejected'."""
@@ -877,21 +916,25 @@ class FleetChargePoint(CP16):
             return response.status
         except Exception as e:
             logger.error(f"Error CancelReservation to {self.id}: {e}")
-            return 'Rejected'
+            return "Rejected"
 
     async def update_firmware(
-        self, location: str, retrieve_date: str,
-        retries: Optional[int] = None, retry_interval: Optional[int] = None,
+        self,
+        location: str,
+        retrieve_date: str,
+        retries: Optional[int] = None,
+        retry_interval: Optional[int] = None,
     ) -> None:
         """Request charger to download and install firmware."""
         try:
             kwargs: dict[str, Any] = {
-                'location': location, 'retrieve_date': retrieve_date,
+                "location": location,
+                "retrieve_date": retrieve_date,
             }
             if retries is not None:
-                kwargs['retries'] = retries
+                kwargs["retries"] = retries
             if retry_interval is not None:
-                kwargs['retry_interval'] = retry_interval
+                kwargs["retry_interval"] = retry_interval
             payload = call.UpdateFirmware(**kwargs)
             await self.call(payload)
             logger.info(f"UpdateFirmware to {self.id}: {location}")
@@ -899,24 +942,27 @@ class FleetChargePoint(CP16):
             logger.error(f"Error UpdateFirmware to {self.id}: {e}")
 
     async def get_diagnostics(
-        self, location: str, start_time: Optional[str] = None,
-        stop_time: Optional[str] = None, retries: Optional[int] = None,
+        self,
+        location: str,
+        start_time: Optional[str] = None,
+        stop_time: Optional[str] = None,
+        retries: Optional[int] = None,
         retry_interval: Optional[int] = None,
     ) -> Optional[str]:
         """Request charger to upload diagnostics. Returns filename or None."""
         try:
-            kwargs: dict[str, Any] = {'location': location}
+            kwargs: dict[str, Any] = {"location": location}
             if start_time:
-                kwargs['start_time'] = start_time
+                kwargs["start_time"] = start_time
             if stop_time:
-                kwargs['stop_time'] = stop_time
+                kwargs["stop_time"] = stop_time
             if retries is not None:
-                kwargs['retries'] = retries
+                kwargs["retries"] = retries
             if retry_interval is not None:
-                kwargs['retry_interval'] = retry_interval
+                kwargs["retry_interval"] = retry_interval
             payload = call.GetDiagnostics(**kwargs)
             response = await self.call(payload)
-            filename = getattr(response, 'file_name', None)
+            filename = getattr(response, "file_name", None)
             logger.info(f"GetDiagnostics from {self.id}: {filename}")
             return filename
         except Exception as e:
@@ -924,7 +970,9 @@ class FleetChargePoint(CP16):
             return None
 
     async def data_transfer(
-        self, vendor_id: str, message_id: Optional[str] = None,
+        self,
+        vendor_id: str,
+        message_id: Optional[str] = None,
         data: Optional[str] = None,
     ) -> tuple[str, Optional[str]]:
         """Send DataTransfer to charger (vendor-specific).
@@ -932,28 +980,29 @@ class FleetChargePoint(CP16):
         Returns (status, response_data).
         """
         try:
-            kwargs: dict[str, Any] = {'vendor_id': vendor_id}
+            kwargs: dict[str, Any] = {"vendor_id": vendor_id}
             if message_id:
-                kwargs['message_id'] = message_id
+                kwargs["message_id"] = message_id
             if data:
-                kwargs['data'] = data
+                kwargs["data"] = data
             payload = call.DataTransfer(**kwargs)
             response = await self.call(payload)
-            return response.status, getattr(response, 'data', None)
+            return response.status, getattr(response, "data", None)
         except Exception as e:
             logger.error(f"Error DataTransfer to {self.id}: {e}")
-            return 'Rejected', None
+            return "Rejected", None
 
 
 # ---------------------------------------------------------------------------
 # Schedule conversion utility
 # ---------------------------------------------------------------------------
 
+
 def convert_schedule_to_ocpp_profile(
     schedule: list[tuple[int, float]],
     delta_t: float = 0.25,
     number_phases: int = 3,
-    charging_rate_unit: str = 'W',
+    charging_rate_unit: str = "W",
 ) -> list[dict]:
     """Convert optimization schedule to OCPP charging profile format.
 
@@ -970,15 +1019,17 @@ def convert_schedule_to_ocpp_profile(
     for timestep, power_kw in schedule:
         start_period = int(timestep * delta_t * 3600)
 
-        if charging_rate_unit == 'A':
+        if charging_rate_unit == "A":
             voltage = 230.0
             limit = (power_kw * 1000.0) / (number_phases * voltage)
         else:
             limit = int(power_kw * 1000)
 
-        periods.append({
-            'startPeriod': start_period,
-            'limit': limit,
-            'numberPhases': number_phases,
-        })
+        periods.append(
+            {
+                "startPeriod": start_period,
+                "limit": limit,
+                "numberPhases": number_phases,
+            }
+        )
     return periods

@@ -5,12 +5,13 @@ See PRD_v2.md Section 10.4.
 
 Reference: Development Plan Step 4.5.7
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Optional, Any
-from uuid import UUID
 import logging
+from datetime import datetime, timedelta
+from typing import Optional
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ async def get_latest_vehicle_soc(
         LIMIT 1
     """
     row = await db.fetchrow(query, vehicle_id, cutoff_time)
-    return row['soc'] if row else None
+    return row["soc"] if row else None
 
 
 async def insert_telemetry(
@@ -117,8 +118,17 @@ async def insert_telemetry(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     """
     await db.execute(
-        query, timestamp, vehicle_id, charger_id, soc, charging_kw,
-        max_charge_kw, is_plugged, location_lat, location_lon, odometer_km
+        query,
+        timestamp,
+        vehicle_id,
+        charger_id,
+        soc,
+        charging_kw,
+        max_charge_kw,
+        is_plugged,
+        location_lat,
+        location_lon,
+        odometer_km,
     )
 
 
@@ -291,9 +301,18 @@ async def insert_optimization_run(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     """
     await db.execute(
-        query, run_id, depot_id, datetime.utcnow(), trigger_reason,
-        horizon_start, horizon_end, solve_time_s, objective_value,
-        peak_demand_kw, status, json.dumps(schedule_json)
+        query,
+        run_id,
+        depot_id,
+        datetime.utcnow(),
+        trigger_reason,
+        horizon_start,
+        horizon_end,
+        solve_time_s,
+        objective_value,
+        peak_demand_kw,
+        status,
+        json.dumps(schedule_json),
     )
 
 
@@ -359,10 +378,17 @@ async def insert_interdepot_message(
         RETURNING message_id
     """
     row = await db.fetchrow(
-        query, origin_depot_id, dest_depot_id, vehicle_id, departure_time,
-        expected_soc, arrival_time, battery_kwh, max_charge_kw
+        query,
+        origin_depot_id,
+        dest_depot_id,
+        vehicle_id,
+        departure_time,
+        expected_soc,
+        arrival_time,
+        battery_kwh,
+        max_charge_kw,
     )
-    return row['message_id']
+    return row["message_id"]
 
 
 async def get_pending_interdepot_messages(
@@ -410,7 +436,7 @@ async def acknowledge_interdepot_message(
           AND status = 'pending'
     """
     result = await db.execute(query, message_id, datetime.utcnow())
-    return result != 'UPDATE 0'
+    return result != "UPDATE 0"
 
 
 # ============ BUILDING LOAD QUERIES ============
@@ -500,10 +526,8 @@ async def insert_trigger_log(
         RETURNING trigger_id
     """
     details_json = json.dumps(details) if details else None
-    row = await db.fetchrow(
-        query, depot_id, trigger_type, datetime.utcnow(), details_json, run_id
-    )
-    return row['trigger_id']
+    row = await db.fetchrow(query, depot_id, trigger_type, datetime.utcnow(), details_json, run_id)
+    return row["trigger_id"]
 
 
 async def get_recent_triggers(
@@ -579,4 +603,4 @@ async def update_vehicle_max_charge_kw(
         WHERE vehicle_id = $1
     """
     result = await db.execute(query, vehicle_id, max_charge_kw)
-    return result != 'UPDATE 0'
+    return result != "UPDATE 0"

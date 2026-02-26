@@ -7,13 +7,12 @@ Per PRD Section 5.3, price trigger uses OR logic:
 Reference: PRD_v2.md#5-3-triggers
 """
 
-import pytest
-import asyncio
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock, AsyncMock
+from datetime import datetime
+from unittest.mock import MagicMock
 
-from src.core.models import DepotConfig, DepotState
-from src.core.optimizer import optimize
+import pytest
+
+from src.core.models import DepotConfig
 from src.core.state.triggers import TriggerConfig, TriggerMonitor
 
 
@@ -25,7 +24,7 @@ class TestPriceTriggerORLogic:
     @pytest.fixture
     def depot_config(self):
         """Depot configuration."""
-        vehicle_ids = ['bus_1', 'bus_2']
+        vehicle_ids = ["bus_1", "bus_2"]
         return DepotConfig(
             vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
             vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -44,7 +43,7 @@ class TestPriceTriggerORLogic:
             price_change_percent=0.25,  # 25%
             price_change_absolute=25.0,  # $25/MWh
         )
-        
+
         trigger_fired = []
         trigger_reason = []
 
@@ -55,7 +54,7 @@ class TestPriceTriggerORLogic:
         mock_assembler = MagicMock()
         mock_assembler.config = MagicMock()
         mock_assembler.config.delta_t = 0.25
-        
+
         monitor = TriggerMonitor(config, on_trigger, assembler=mock_assembler)
 
         # Initial prices
@@ -70,8 +69,10 @@ class TestPriceTriggerORLogic:
 
         result = await monitor.check_price_change(new_prices)
 
-        assert result is not None, "Price trigger should fire with OR logic when percent threshold met"
-        assert 'Price change' in result
+        assert (
+            result is not None
+        ), "Price trigger should fire with OR logic when percent threshold met"
+        assert "Price change" in result
 
     @pytest.mark.asyncio
     async def test_price_trigger_absolute_only_triggers_optimization(self, depot_config):
@@ -80,7 +81,7 @@ class TestPriceTriggerORLogic:
             price_change_percent=0.25,  # 25%
             price_change_absolute=25.0,  # $25/MWh
         )
-        
+
         trigger_fired = []
         trigger_reason = []
 
@@ -91,7 +92,7 @@ class TestPriceTriggerORLogic:
         mock_assembler = MagicMock()
         mock_assembler.config = MagicMock()
         mock_assembler.config.delta_t = 0.25
-        
+
         monitor = TriggerMonitor(config, on_trigger, assembler=mock_assembler)
 
         # Initial prices (higher base to get absolute-only scenario)
@@ -106,8 +107,10 @@ class TestPriceTriggerORLogic:
 
         result = await monitor.check_price_change(new_prices)
 
-        assert result is not None, "Price trigger should fire with OR logic when absolute threshold met"
-        assert 'Price change' in result
+        assert (
+            result is not None
+        ), "Price trigger should fire with OR logic when absolute threshold met"
+        assert "Price change" in result
 
     @pytest.mark.asyncio
     async def test_price_trigger_cooldown_respects_or_logic(self, depot_config):
@@ -117,7 +120,7 @@ class TestPriceTriggerORLogic:
             price_change_absolute=25.0,
             trigger_cooldown_minutes=1,  # 1 minute cooldown for test
         )
-        
+
         trigger_fired = []
         trigger_reason = []
 
@@ -128,7 +131,7 @@ class TestPriceTriggerORLogic:
         mock_assembler = MagicMock()
         mock_assembler.config = MagicMock()
         mock_assembler.config.delta_t = 0.25
-        
+
         monitor = TriggerMonitor(config, on_trigger, assembler=mock_assembler)
 
         base_time = datetime.utcnow()
@@ -145,8 +148,8 @@ class TestPriceTriggerORLogic:
 
         # Second trigger immediately after (should be blocked by cooldown)
         new_prices_2 = {base_time: 0.016}  # Another 30% change
-        result2 = await monitor.check_price_change(new_prices_2)
-        
+        await monitor.check_price_change(new_prices_2)
+
         # If cooldown is active, result2 should be None
         # (cooldown check happens in run() method, not check_price_change)
         # This test verifies OR logic still works even with cooldown

@@ -2,14 +2,14 @@
 
 See PRD_v2.md Section 10.4 for rate limit specifications.
 """
+
 from __future__ import annotations
 
+import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
 from uuid import UUID
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RateLimitConfig:
     """Rate limit configuration per PRD Section 10.4."""
+
     # General API endpoints
     api_requests_per_minute: int = 100
 
@@ -30,10 +31,13 @@ class RateLimitConfig:
 @dataclass
 class RateLimiter:
     """Token bucket rate limiter."""
+
     config: RateLimitConfig = field(default_factory=RateLimitConfig)
     _api_buckets: dict = field(default_factory=lambda: defaultdict(list))
     _optimize_buckets: dict = field(default_factory=lambda: defaultdict(list))
-    _handoff_buckets: dict = field(default_factory=lambda: defaultdict(list))  # depot_pair -> timestamps
+    _handoff_buckets: dict = field(
+        default_factory=lambda: defaultdict(list)
+    )  # depot_pair -> timestamps
     _last_trigger_optimization: dict = field(default_factory=dict)
 
     def _clean_bucket(self, bucket: list, window_seconds: int) -> list:
@@ -103,13 +107,13 @@ class RateLimiter:
 
     def check_handoff_limit(self, origin_depot_id: str, dest_depot_id: str) -> bool:
         """Check if handoff rate limit is within bounds.
-        
+
         Per PRD Section 10.4: 50 messages/hour per depot pair.
-        
+
         Args:
             origin_depot_id: Origin depot identifier
             dest_depot_id: Destination depot identifier
-            
+
         Returns:
             True if request allowed, False if rate limited
         """
@@ -117,18 +121,17 @@ class RateLimiter:
         depot_pair = tuple(sorted([origin_depot_id, dest_depot_id]))
         bucket = self._clean_bucket(self._handoff_buckets[depot_pair], 3600)  # 1 hour window
         self._handoff_buckets[depot_pair] = bucket
-        
+
         if len(bucket) >= 50:  # 50 messages/hour per depot pair
             logger.warning(
                 f"Handoff rate limit exceeded for depot pair "
                 f"{origin_depot_id} <-> {dest_depot_id}"
             )
             return False
-        
+
         self._handoff_buckets[depot_pair].append(time.time())
         return True
 
 
 # Global rate limiter instance
 rate_limiter = RateLimiter()
-

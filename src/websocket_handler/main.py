@@ -4,119 +4,117 @@ import asyncio
 import signal
 import sys
 import time
-import uvloop
 from typing import Optional
 
+import uvloop
+
+from .analytics_service import AnalyticsService
+from .api_server import APIServer
+from .auth_manager import AuthManager
 from .config import Config
 from .config_validator import ConfigValidator
-from .server import OCPPWebSocketServer
-from .health import HealthCheckServer
-from .monitoring import setup_monitoring, get_logger
 from .connection_monitor import ConnectionMonitor
-from .supabase_client import SupabaseClient
-from .auth_manager import AuthManager
 from .data_sync import DataSyncService
-from .api_server import APIServer
 from .database_schema import create_schema_from_config
+from .health import HealthCheckServer
+from .monitoring import get_logger, setup_monitoring
+from .optimization_engine import OptimizationEngine
+from .price_feeder import PriceFeederService
+from .resilience_manager import resilience_manager
+from .server import OCPPWebSocketServer
+from .supabase_client import SupabaseClient
 from .timescale_client import TimescaleClient
 from .timescale_schema import create_timescale_schema_from_config
-from .price_feeder import PriceFeederService
-from .optimization_engine import OptimizationEngine
-from .resilience_manager import resilience_manager
-from .enhanced_error_handler import error_handler
-from .analytics_service import AnalyticsService
 
 
 class Application:
     """Main application orchestrator."""
-    
+
     def __init__(self, config: Config):
         """Initialize application."""
         self.config = config
         self.logger = get_logger(__name__)
-        
+
         # Core components
         self.websocket_server: Optional[OCPPWebSocketServer] = None
         self.health_server: Optional[HealthCheckServer] = None
-        
+
         # Supabase components
         self.supabase_client: Optional[SupabaseClient] = None
         self.auth_manager: Optional[AuthManager] = None
         self.data_sync_service: Optional[DataSyncService] = None
         self.api_server: Optional[APIServer] = None
-        
+
         # TimescaleDB components
         self.timescale_client: Optional[TimescaleClient] = None
         self.analytics_service: Optional[AnalyticsService] = None
         self.price_feeder: Optional[PriceFeederService] = None
         self.optimization_engine: Optional[OptimizationEngine] = None
-        
+
         # Connection monitoring
         self.connection_monitor: Optional[ConnectionMonitor] = None
-        
+
         # State
         self.running = False
         self.start_time = time.time()
-        
+
     async def start(self) -> None:
         """Start all application components."""
         self.logger.info("Starting EV Charging WebSocket Handler...")
-        
+
         try:
             # Validate configuration first
             await self._validate_configuration()
-            
+
             # Setup monitoring first
             setup_monitoring(self.config.monitoring)
-            
+
             # Initialize resilience manager
             await self._initialize_resilience()
-            
+
             # Initialize Supabase components
             await self._initialize_supabase_components()
-            
+
             # Initialize TimescaleDB components
             await self._initialize_timescale_components()
-            
+
             # Create WebSocket server and pass optimization engine for wiring
             self.websocket_server = OCPPWebSocketServer(
                 self.config,
                 self.timescale_client,
-                self.optimization_engine  # Pass optimization engine so it can be wired to connection manager
+                self.optimization_engine,  # Pass optimization engine so it can be wired to connection manager
             )
-            
+
             # Create health check server
             self.health_server = HealthCheckServer(self.config.monitoring.health_check_port)
-            
+
             # Create API server
             self.api_server = APIServer(
-                self.config.supabase,
-                self.supabase_client,
-                self.auth_manager
+                self.config.supabase, self.supabase_client, self.auth_manager
             )
-            
+
             # Start components
             await self.health_server.start()
             await self.api_server.start(port=8080)
-            
+
             # Start data sync service
             await self.data_sync_service.start()
-            
+
             # Initialize connection monitoring
             self.connection_monitor = ConnectionMonitor(
                 timescale_client=self.timescale_client,
                 supabase_client=self.supabase_client,
-                check_interval=30
+                check_interval=30,
             )
             await self.connection_monitor.start_monitoring()
-            
+
             # Start WebSocket server
             self.running = True
-            
+
             self.logger.info(
                 f"Application started successfully in {time.time() - self.start_time:.2f}s"
             )
-            
+
             # Start WebSocket server (this blocks until shutdown)
             # Check running flag periodically for graceful shutdown
             while self.running:
@@ -130,11 +128,11 @@ class Application:
                         await asyncio.sleep(1)  # Brief pause before retry
                     else:
                         break  # Shutdown requested
-            
+
         except Exception as e:
             self.logger.error(f"Failed to start application: {e}")
             raise
-    
+
     async def _validate_configuration(self) -> None:
         """Validate configuration before starting."""
         self.logger.info("Validating configuration...")
@@ -142,88 +140,95 @@ class Application:
         if getattr(self.config, "environment", "") == "test":
             self.logger.info("Skipping configuration validation in test environment")
             return
-        
+
         validator = ConfigValidator(self.config)
         is_valid = await validator.validate_all()
-        
+
         if not is_valid:
             report = validator.get_validation_report()
             self.logger.error(f"Configuration validation failed: {report}")
             raise Exception("Configuration validation failed")
-        
+
         self.logger.info("Configuration validation passed")
-    
+
     async def _initialize_resilience(self) -> None:
         """Initialize resilience manager and error handling."""
         self.logger.info("Initializing resilience manager...")
-        
+
         # Add health checks
         from .health_checks import create_health_checks
+
         health_checks = create_health_checks(self.config)
-        
+
         for health_check in health_checks:
             resilience_manager.add_health_check(health_check)
-        
+
         # Add circuit breakers
-        resilience_manager.add_circuit_breaker("timescale", failure_threshold=5, recovery_timeout=60.0)
-        resilience_manager.add_circuit_breaker("supabase", failure_threshold=3, recovery_timeout=30.0)
-        resilience_manager.add_circuit_breaker("websocket", failure_threshold=10, recovery_timeout=120.0)
-        
+        resilience_manager.add_circuit_breaker(
+            "timescale", failure_threshold=5, recovery_timeout=60.0
+        )
+        resilience_manager.add_circuit_breaker(
+            "supabase", failure_threshold=3, recovery_timeout=30.0
+        )
+        resilience_manager.add_circuit_breaker(
+            "websocket", failure_threshold=10, recovery_timeout=120.0
+        )
+
         # Start resilience monitoring
         await resilience_manager.start()
-        
+
         self.logger.info("Resilience manager initialized")
-    
+
     async def stop(self) -> None:
         """Stop all application components gracefully."""
         self.logger.info("Shutting down application...")
-        
+
         self.running = False
-        
+
         # Stop components in reverse order
         stop_tasks = []
-        
+
         # Stop connection monitoring
         if self.connection_monitor:
             stop_tasks.append(self.connection_monitor.stop_monitoring())
-        
+
         if self.data_sync_service:
             stop_tasks.append(self.data_sync_service.stop())
-        
+
         if self.api_server:
             stop_tasks.append(self.api_server.stop())
-        
+
         if self.websocket_server:
             stop_tasks.append(self.websocket_server.stop())
-        
+
         if self.health_server:
             stop_tasks.append(self.health_server.stop())
-        
+
         if self.timescale_client:
             stop_tasks.append(self.timescale_client.disconnect())
-        
+
         if self.supabase_client:
             stop_tasks.append(self.supabase_client.disconnect())
-        
+
         # Wait for all components to stop
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
-        
+
         self.logger.info("Application shutdown complete")
-    
+
     async def _initialize_supabase_components(self) -> None:
         """Initialize Supabase components."""
         try:
             # Create Supabase client
             self.supabase_client = SupabaseClient(self.config.supabase)
             await self.supabase_client.connect()
-            
+
             # Create auth manager
             self.auth_manager = AuthManager(self.config.supabase, self.supabase_client)
-            
+
             # Create data sync service
             self.data_sync_service = DataSyncService(self.config.supabase, self.supabase_client)
-            
+
             # Initialize database schema if needed
             if self.config.environment == "development":
                 try:
@@ -231,13 +236,13 @@ class Application:
                     self.logger.info("Database schema initialized")
                 except Exception as e:
                     self.logger.warning(f"Schema initialization failed (may already exist): {e}")
-            
+
             self.logger.info("Supabase components initialized successfully")
-            
+
         except Exception as e:
             self.logger.error(f"Failed to initialize Supabase components: {e}")
             raise
-    
+
     async def _initialize_timescale_components(self) -> None:
         """Initialize TimescaleDB components."""
         try:
@@ -251,7 +256,7 @@ class Application:
                 timescale_client=self.timescale_client,
             )
             await self.analytics_service.initialize()
-            
+
             # Telemetry ingestion service removed for simplification
 
             # Initialize optimization engine
@@ -260,67 +265,69 @@ class Application:
                     config=self.config.optimization,
                     timescale_client=self.timescale_client,
                     supabase_client=self.supabase_client,
-                    connection_manager=None  # Will be set later after WebSocket server created
+                    connection_manager=None,  # Will be set later after WebSocket server created
                 )
                 await self.optimization_engine.start()
-            
+
             # Initialize price feeder and link to optimization engine
             if self.config.price_feeder.enabled:
                 self.price_feeder = PriceFeederService(
-                    config=self.config.price_feeder,
-                    timescale_client=self.timescale_client
+                    config=self.config.price_feeder, timescale_client=self.timescale_client
                 )
                 # Link price feeder to optimization engine
                 if self.optimization_engine:
                     self.price_feeder.set_optimization_engine(self.optimization_engine)
                 await self.price_feeder.start()
-            
+
             # Initialize TimescaleDB schema if needed
             if self.config.environment == "development":
                 try:
                     await create_timescale_schema_from_config(self.config.timescale)
                     self.logger.info("TimescaleDB schema initialized")
                 except Exception as e:
-                    self.logger.warning(f"TimescaleDB schema initialization failed (may already exist): {e}")
-            
+                    self.logger.warning(
+                        f"TimescaleDB schema initialization failed (may already exist): {e}"
+                    )
+
             self.logger.info("TimescaleDB components initialized successfully")
-            
+
         except Exception as e:
             self.logger.error(f"Failed to initialize TimescaleDB components: {e}")
             raise
-    
+
     def setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
+
         def signal_handler(signum, frame):
             self.logger.info(f"Received signal {signum}, initiating shutdown...")
             # Set flag instead of creating async task from signal handler
             self.running = False
-        
+
         # Register signal handlers
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
+
         # On Unix systems, also handle SIGHUP for graceful restart
-        if hasattr(signal, 'SIGHUP'):
+        if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, signal_handler)
 
 
 async def run_application(config: Config) -> None:
     """Run the application with proper setup."""
     # Use uvloop for better async performance on Unix systems
-    if hasattr(uvloop, 'install'):
+    if hasattr(uvloop, "install"):
         uvloop.install()
-    
+
     # Create application
     app = Application(config)
-    
+
     # Setup signal handlers
     app.setup_signal_handlers()
-    
+
     try:
         # Start application
         await app.start()
-        
+
     except KeyboardInterrupt:
         app.logger.info("Received keyboard interrupt")
     except Exception as e:
@@ -335,29 +342,31 @@ def main() -> None:
     """Main entry point."""
     # Load configuration from environment
     config = Config.from_env()
-    
+
     # Setup basic logging for startup
     import logging
+
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    
+
     logger = logging.getLogger(__name__)
-    
+
     try:
         # Validate configuration
         logger.info("Loading configuration...")
-        logger.info(f"WebSocket server will bind to {config.websocket.host}:{config.websocket.port}")
+        logger.info(
+            f"WebSocket server will bind to {config.websocket.host}:{config.websocket.port}"
+        )
         logger.info(f"Environment: {config.environment}")
-        
+
         if config.debug:
             logger.warning("Debug mode is enabled")
-        
+
         # Run application
         logger.info("Starting application...")
         asyncio.run(run_application(config))
-        
+
     except KeyboardInterrupt:
         logger.info("Application interrupted by user")
         sys.exit(0)

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .config import TimescaleConfig
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
-from .config import TimescaleConfig
 
 
 class AnalyticsService:
@@ -55,14 +55,10 @@ class AnalyticsService:
         """Calculate uptime metrics."""
         return {}
 
-    def _calculate_efficiency_metrics(
-        self, fleet_operator_id: str, start_time, end_time
-    ) -> dict:
+    def _calculate_efficiency_metrics(self, fleet_operator_id: str, start_time, end_time) -> dict:
         """Calculate efficiency metrics."""
         return {}
 
-    def _calculate_reliability_metrics(
-        self, fleet_operator_id: str, start_time, end_time
-    ) -> dict:
+    def _calculate_reliability_metrics(self, fleet_operator_id: str, start_time, end_time) -> dict:
         """Calculate reliability metrics."""
         return {}

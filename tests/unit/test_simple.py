@@ -1,17 +1,23 @@
 """Simplified working tests for the Favonius Energy system."""
 
-import pytest
-import asyncio
-import time
-from unittest.mock import Mock, AsyncMock
-from datetime import datetime, timezone
+import os
 
 # Import managers
 import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+import time
+from unittest.mock import AsyncMock, Mock
 
-from websocket_handler.error_handler import CircuitBreaker, RetryManager, DeadLetterQueue, ErrorHandler, CircuitBreakerOpenError, CircuitBreakerState
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
+from websocket_handler.error_handler import (
+    CircuitBreaker,
+    CircuitBreakerState,
+    DeadLetterQueue,
+    ErrorHandler,
+    RetryManager,
+)
 
 
 class TestCircuitBreaker:
@@ -25,6 +31,7 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_circuit_breaker_closed_state(self, circuit_breaker):
         """Test circuit breaker in closed state."""
+
         async def success_func():
             return "success"
 
@@ -35,6 +42,7 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_circuit_breaker_opens_on_failures(self, circuit_breaker):
         """Test circuit breaker opens after threshold failures."""
+
         async def failing_func():
             raise Exception("Test failure")
 
@@ -79,6 +87,7 @@ class TestRetryManager:
     @pytest.mark.asyncio
     async def test_retry_success_on_first_attempt(self, retry_manager):
         """Test retry manager succeeds on first attempt."""
+
         async def success_func():
             return "success"
 
@@ -104,6 +113,7 @@ class TestRetryManager:
     @pytest.mark.asyncio
     async def test_retry_exhausts_attempts(self, retry_manager):
         """Test retry manager exhausts all attempts."""
+
         async def always_failing_func():
             raise Exception("Permanent failure")
 
@@ -148,7 +158,7 @@ class TestDeadLetterQueue:
         original_message = {"test": "data"}
         error = Exception("Test error")
         await dead_letter_queue.add_message(original_message, error)
-        
+
         # The DeadLetterQueue doesn't have process_retryable_messages method
         # This test just verifies the queue has messages
         assert len(dead_letter_queue.queue) == 1
@@ -177,7 +187,7 @@ class TestErrorHandler:
     async def test_get_circuit_breaker(self, error_handler):
         """Test getting circuit breaker."""
         circuit_breaker = error_handler.get_circuit_breaker("database")
-        
+
         assert circuit_breaker is not None
         assert circuit_breaker.name == "database"
 
@@ -205,7 +215,7 @@ class TestSystemIntegration:
         mock_timescale_client.get_retryable_dlq_messages = AsyncMock()
 
         error_handler = ErrorHandler(mock_timescale_client)
-        
+
         # Test circuit breaker
         circuit_breaker = error_handler.get_circuit_breaker("database")
         assert circuit_breaker.name == "database"
@@ -248,5 +258,3 @@ class TestSystemIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-

@@ -7,7 +7,7 @@ in vdv463_charging_requests, track depot updates for trigger monitor.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, Any, List
+from typing import Any, List, Optional
 
 from .messages import ChargingRequest
 
@@ -22,8 +22,11 @@ async def upsert_charging_request(
     message_id: str,
 ) -> None:
     """Insert or update one charging request. ON CONFLICT (depot_id, charging_request_id, presystem_id) DO UPDATE."""
-    precond = req.manual_preconditioning or req.automatic_preconditioning
-    precond_type = "manual" if req.manual_preconditioning else ("automatic" if req.automatic_preconditioning else None)
+    precond_type = (
+        "manual"
+        if req.manual_preconditioning
+        else ("automatic" if req.automatic_preconditioning else None)
+    )
     precond_start = None
     ambient_temp = None
     req_start = None

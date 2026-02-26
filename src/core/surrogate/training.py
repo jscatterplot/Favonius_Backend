@@ -6,7 +6,7 @@ Reference: Development plan Step 2.2, PRD.md#8-4-surrogate-model-specification
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -66,8 +66,7 @@ async def fetch_training_data(
     depot_id_str = str(depot_id) if isinstance(depot_id, UUID) else depot_id
 
     logger.info(
-        f"Fetching training data for depot {depot_id_str}, "
-        f"lookback_days={lookback_days}"
+        f"Fetching training data for depot {depot_id_str}, " f"lookback_days={lookback_days}"
     )
 
     query = """
@@ -110,39 +109,39 @@ async def fetch_training_data(
 
         for row in rows:
             # Map vehicle_type to bus_size
-            vehicle_type = row['vehicle_type'] or ''
-            if 'large' in vehicle_type.lower():
-                bus_size = 'large'
-            elif 'small' in vehicle_type.lower():
-                bus_size = 'small'
+            vehicle_type = row["vehicle_type"] or ""
+            if "large" in vehicle_type.lower():
+                bus_size = "large"
+            elif "small" in vehicle_type.lower():
+                bus_size = "small"
             else:
                 # Default to 'large' if unclear
-                bus_size = 'large'
-                logger.warning(
-                    f"Unknown vehicle_type '{vehicle_type}', defaulting to 'large'"
-                )
+                bus_size = "large"
+                logger.warning(f"Unknown vehicle_type '{vehicle_type}', defaulting to 'large'")
 
             # Get weather data or use defaults
-            temp_avg_f = row['temp_avg_f'] if row['temp_avg_f'] is not None else default_temp
-            temp_max_f = row['temp_max_f'] if row['temp_max_f'] is not None else (temp_avg_f + 10.0)
-            temp_min_f = row['temp_min_f'] if row['temp_min_f'] is not None else (temp_avg_f - 10.0)
-            rain_inches = row['rain_inches'] if row['rain_inches'] is not None else default_rain
-            solar_radiation = row['solar_radiation'] if row['solar_radiation'] is not None else default_solar
+            temp_avg_f = row["temp_avg_f"] if row["temp_avg_f"] is not None else default_temp
+            temp_max_f = row["temp_max_f"] if row["temp_max_f"] is not None else (temp_avg_f + 10.0)
+            temp_min_f = row["temp_min_f"] if row["temp_min_f"] is not None else (temp_avg_f - 10.0)
+            rain_inches = row["rain_inches"] if row["rain_inches"] is not None else default_rain
+            solar_radiation = (
+                row["solar_radiation"] if row["solar_radiation"] is not None else default_solar
+            )
 
-            if row['temp_avg_f'] is None:
+            if row["temp_avg_f"] is None:
                 missing_weather_count += 1
 
             # Calculate is_school_day from departure_time
-            departure_time = row['departure_time']
+            departure_time = row["departure_time"]
             if isinstance(departure_time, str):
-                departure_time = datetime.fromisoformat(departure_time.replace('Z', '+00:00'))
+                departure_time = datetime.fromisoformat(departure_time.replace("Z", "+00:00"))
             school_day = is_school_day(departure_time)
 
             # Create PredictionInput
             inputs.append(
                 PredictionInput(
                     bus_size=bus_size,
-                    route_id=row['route_id'] or 'unknown',
+                    route_id=row["route_id"] or "unknown",
                     temp_avg_f=float(temp_avg_f),
                     temp_max_f=float(temp_max_f),
                     temp_min_f=float(temp_min_f),
@@ -153,7 +152,7 @@ async def fetch_training_data(
             )
 
             # Energy consumption (already validated as NOT NULL in query)
-            energies.append(float(row['energy_kwh']))
+            energies.append(float(row["energy_kwh"]))
 
         if missing_weather_count > 0:
             logger.warning(
@@ -161,9 +160,7 @@ async def fetch_training_data(
                 "Using default values."
             )
 
-        logger.info(
-            f"Fetched {len(inputs)} training samples for depot {depot_id_str}"
-        )
+        logger.info(f"Fetched {len(inputs)} training samples for depot {depot_id_str}")
 
     except asyncpg.PostgresError as e:
         logger.error(f"Database error fetching training data: {e}")
@@ -211,9 +208,7 @@ async def train_and_validate(
 
     # Fetch data for the full period
     total_days = training_days + validation_days
-    all_inputs, all_energies = await fetch_training_data(
-        pool, depot_id, lookback_days=total_days
-    )
+    all_inputs, all_energies = await fetch_training_data(pool, depot_id, lookback_days=total_days)
 
     if len(all_inputs) == 0:
         raise RuntimeError(
@@ -243,9 +238,7 @@ async def train_and_validate(
             f"Insufficient data for validation: need at least 1 sample, got {len(val_X)}"
         )
 
-    logger.info(
-        f"Split data: {len(train_X)} training samples, {len(val_X)} validation samples"
-    )
+    logger.info(f"Split data: {len(train_X)} training samples, {len(val_X)} validation samples")
 
     # Extract unique routes from training data only
     routes = list(set(inp.route_id for inp in train_X))
@@ -298,7 +291,7 @@ async def save_trained_model(
     model_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate filename with depot_id and timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"surrogate_model_{depot_id_str}_{timestamp}.joblib"
     model_path = model_dir / filename
 
@@ -308,10 +301,6 @@ async def save_trained_model(
     model.save(model_path)
 
     # Optionally save metadata (could be extended to save JSON file)
-    logger.info(
-        f"Model saved: depot={depot_id_str}, R²={r2_score:.4f}, "
-        f"path={model_path}"
-    )
+    logger.info(f"Model saved: depot={depot_id_str}, R²={r2_score:.4f}, " f"path={model_path}")
 
     return model_path
-

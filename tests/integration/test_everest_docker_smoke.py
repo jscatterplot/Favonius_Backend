@@ -44,4 +44,3 @@ def test_everest_backend_smoke() -> None:
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
         )
-

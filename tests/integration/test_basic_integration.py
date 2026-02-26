@@ -1,17 +1,17 @@
 """Simple integration test to verify database connectivity and basic operations."""
 
-import pytest
-import pytest_asyncio
-import asyncio
-from datetime import datetime, timezone
+import os
 
 # Import test dependencies
 import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
-from websocket_handler.timescale_client import TimescaleClient
+import pytest
+import pytest_asyncio
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
 from websocket_handler.config import TimescaleConfig
+from websocket_handler.timescale_client import TimescaleClient
 
 
 class TestBasicDatabaseIntegration:
@@ -21,14 +21,14 @@ class TestBasicDatabaseIntegration:
     async def timescale_client(self):
         """Create TimescaleDB client with real connection."""
         config = TimescaleConfig(
-            service_url='postgres://tsdbadmin:lyqgv8a0j1bt1zaa@avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com:32634/tsdb?sslmode=require',
-            host='avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com',
-            user='tsdbadmin',
-            password='lyqgv8a0j1bt1zaa',
-            database='tsdb',
-            port=32634
+            service_url="postgres://tsdbadmin:lyqgv8a0j1bt1zaa@avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com:32634/tsdb?sslmode=require",
+            host="avws3fxn3w.rspy6d4hg0.tsdb.cloud.timescale.com",
+            user="tsdbadmin",
+            password="lyqgv8a0j1bt1zaa",
+            database="tsdb",
+            port=32634,
         )
-        
+
         client = TimescaleClient(config)
         try:
             await client.connect()
@@ -42,8 +42,8 @@ class TestBasicDatabaseIntegration:
         # Test health check
         health = await timescale_client.health_check()
         assert isinstance(health, dict)
-        assert health.get('asyncpg') == 'healthy'
-        
+        assert health.get("asyncpg") == "healthy"
+
         # Test basic query
         result = await timescale_client.execute_query("SELECT 1 as test_value")
         assert result is not None
@@ -54,7 +54,7 @@ class TestBasicDatabaseIntegration:
         """Test inserting telemetry data."""
         # For now, just verify the method exists and can be called
         # The actual data structure requirements are complex
-        assert hasattr(timescale_client, 'insert_telemetry_batch')
+        assert hasattr(timescale_client, "insert_telemetry_batch")
         assert True  # Placeholder - actual test would require proper data structure
 
     @pytest.mark.asyncio
@@ -62,7 +62,7 @@ class TestBasicDatabaseIntegration:
         """Test storing station information."""
         # For now, just verify the method exists and can be called
         # The actual data structure requirements are complex
-        assert hasattr(timescale_client, 'insert_station_info')
+        assert hasattr(timescale_client, "insert_station_info")
         assert True  # Placeholder - actual test would require proper data structure
 
     @pytest.mark.asyncio
@@ -70,6 +70,6 @@ class TestBasicDatabaseIntegration:
         """Test transaction lifecycle operations."""
         # For now, just verify the method exists and can be called
         # The actual data structure requirements are complex
-        assert hasattr(timescale_client, 'store_transaction')
-        assert hasattr(timescale_client, 'update_transaction')
+        assert hasattr(timescale_client, "store_transaction")
+        assert hasattr(timescale_client, "update_transaction")
         assert True  # Placeholder - actual test would require proper data structure

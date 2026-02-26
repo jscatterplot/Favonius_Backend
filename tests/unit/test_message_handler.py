@@ -1,18 +1,19 @@
 """Unit tests for OCPP message handler."""
 
-import pytest
 import asyncio
-import json
-from unittest.mock import Mock, AsyncMock, patch
-from datetime import datetime, timezone
+import os
 
 # Import test dependencies
 import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, Mock
 
-from websocket_handler.message_handler import MessageHandler
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
 from websocket_handler.config import Config
+from websocket_handler.message_handler import MessageHandler
 
 
 class TestMessageHandler:
@@ -73,14 +74,14 @@ class TestMessageHandler:
                 "model": "TestModel",
                 "vendorName": "TestVendor",
                 "serialNumber": "SN123456",
-                "firmwareVersion": "1.0.0"
+                "firmwareVersion": "1.0.0",
             },
-            "reason": "PowerUp"
+            "reason": "PowerUp",
         }
         unique_id = "1"
-        
+
         response = await message_handler._handle_boot_notification(station_id, payload, unique_id)
-        
+
         assert response["status"] == "Accepted"
         assert "currentTime" in response
         assert response["interval"] == 30
@@ -96,12 +97,12 @@ class TestMessageHandler:
             "connectorStatus": "Available",
             "evseId": 1,
             "connectorId": 1,
-            "errorCode": "NoError"
+            "errorCode": "NoError",
         }
         unique_id = "1"
-        
+
         response = await message_handler._handle_status_notification(station_id, payload, unique_id)
-        
+
         assert response == {}  # StatusNotification returns empty dict
 
     @pytest.mark.asyncio
@@ -114,19 +115,13 @@ class TestMessageHandler:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "triggerReason": "Authorized",
             "seqNo": 1,
-            "transactionInfo": {
-                "transactionId": "TXN123456",
-                "chargingState": "Charging"
-            },
-            "idToken": {
-                "idToken": "AUTH123",
-                "type": "KeyCode"
-            }
+            "transactionInfo": {"transactionId": "TXN123456", "chargingState": "Charging"},
+            "idToken": {"idToken": "AUTH123", "type": "KeyCode"},
         }
         unique_id = "1"
-        
+
         response = await message_handler._handle_transaction_event(station_id, payload, unique_id)
-        
+
         assert response == {}  # TransactionEvent returns empty dict
 
     @pytest.mark.asyncio
@@ -136,21 +131,25 @@ class TestMessageHandler:
         station_id = "TEST_STATION_001"
         payload = {
             "evseId": 1,
-            "meterValue": [{
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "sampledValue": [{
-                    "value": "22.5",
-                    "context": "Sample.Periodic",
-                    "format": "Raw",
-                    "measurand": "Energy.Active.Import.Register",
-                    "unitOfMeasure": {"unit": "kWh"}
-                }]
-            }]
+            "meterValue": [
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "sampledValue": [
+                        {
+                            "value": "22.5",
+                            "context": "Sample.Periodic",
+                            "format": "Raw",
+                            "measurand": "Energy.Active.Import.Register",
+                            "unitOfMeasure": {"unit": "kWh"},
+                        }
+                    ],
+                }
+            ],
         }
         unique_id = "1"
-        
+
         response = await message_handler._handle_meter_values(station_id, payload, unique_id)
-        
+
         assert response == {}  # MeterValues returns empty dict
 
     @pytest.mark.asyncio
@@ -160,9 +159,9 @@ class TestMessageHandler:
         station_id = "TEST_STATION_001"
         payload = {}
         unique_id = "1"
-        
+
         response = await message_handler._handle_heartbeat(station_id, payload, unique_id)
-        
+
         assert response["currentTime"] is not None
         assert isinstance(response["currentTime"], str)
 
@@ -171,16 +170,11 @@ class TestMessageHandler:
     async def test_handle_authorize(self, message_handler):
         """Test Authorize message handling."""
         station_id = "TEST_STATION_001"
-        payload = {
-            "idToken": {
-                "idToken": "AUTH123",
-                "type": "KeyCode"
-            }
-        }
+        payload = {"idToken": {"idToken": "AUTH123", "type": "KeyCode"}}
         unique_id = "1"
-        
+
         response = await message_handler._handle_authorize(station_id, payload, unique_id)
-        
+
         assert "idTokenInfo" in response
         assert response["idTokenInfo"]["status"] == "Accepted"
 
@@ -196,19 +190,19 @@ class TestMessageHandler:
                     "energyAmount": 22.5,
                     "evMinCurrent": 6,
                     "evMaxCurrent": 32,
-                    "evMaxVoltage": 400
+                    "evMaxVoltage": 400,
                 },
                 "dcChargingParameters": {
                     "energyAmount": 22.5,
                     "evMaxCurrent": 200,
-                    "evMaxVoltage": 800
-                }
-            }
+                    "evMaxVoltage": 800,
+                },
+            },
         }
         unique_id = "1"
-        
+
         response = await message_handler._handle_ev_charging_needs(station_id, payload, unique_id)
-        
+
         assert response["status"] == "Accepted"
 
     @pytest.mark.asyncio
@@ -221,16 +215,15 @@ class TestMessageHandler:
             "chargingSchedule": {
                 "id": 1,
                 "chargingRateUnit": "W",
-                "chargingSchedulePeriod": [{
-                    "startPeriod": 0,
-                    "limit": 22.0
-                }]
-            }
+                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 22.0}],
+            },
         }
         unique_id = "1"
-        
-        response = await message_handler._handle_ev_charging_schedule(station_id, payload, unique_id)
-        
+
+        response = await message_handler._handle_ev_charging_schedule(
+            station_id, payload, unique_id
+        )
+
         assert response["status"] == "Accepted"
 
     @pytest.mark.asyncio
@@ -238,15 +231,11 @@ class TestMessageHandler:
     async def test_handle_data_transfer(self, message_handler):
         """Test DataTransfer message handling."""
         station_id = "TEST_STATION_001"
-        payload = {
-            "vendorId": "TestVendor",
-            "messageId": "TestMessage",
-            "data": "Test data"
-        }
+        payload = {"vendorId": "TestVendor", "messageId": "TestMessage", "data": "Test data"}
         unique_id = "1"
-        
+
         response = await message_handler._handle_data_transfer(station_id, payload, unique_id)
-        
+
         assert response["status"] == "Accepted"
         assert "data" in response
 
@@ -259,9 +248,11 @@ class TestMessageHandler:
         unique_id = "1"
         action = "UnknownAction"
         payload = {}
-        
-        response = await message_handler.handle_message(station_id, message_type_id, unique_id, action, payload)
-        
+
+        response = await message_handler.handle_message(
+            station_id, message_type_id, unique_id, action, payload
+        )
+
         assert response["status"] == "Rejected"
 
     @pytest.mark.asyncio
@@ -273,9 +264,11 @@ class TestMessageHandler:
         unique_id = "1"
         action = "BootNotification"
         payload = {}
-        
-        response = await message_handler.handle_message(station_id, message_type_id, unique_id, action, payload)
-        
+
+        response = await message_handler.handle_message(
+            station_id, message_type_id, unique_id, action, payload
+        )
+
         assert response is None
 
     @pytest.mark.asyncio
@@ -287,13 +280,17 @@ class TestMessageHandler:
         unique_id = "1"
         action = "BootNotification"
         payload = {}
-        
+
         # Mock handler to raise exception
         original_handler = message_handler.handlers["BootNotification"]
-        message_handler.handlers["BootNotification"] = AsyncMock(side_effect=Exception("Test error"))
-        
+        message_handler.handlers["BootNotification"] = AsyncMock(
+            side_effect=Exception("Test error")
+        )
+
         try:
-            response = await message_handler.handle_message(station_id, message_type_id, unique_id, action, payload)
+            response = await message_handler.handle_message(
+                station_id, message_type_id, unique_id, action, payload
+            )
             assert response["status"] == "Rejected"
         finally:
             # Restore original handler
@@ -307,10 +304,10 @@ class TestMessageHandler:
         action = "BootNotification"
         payload = {"test": "data"}
         response = {"status": "Accepted"}
-        
+
         # Should not raise exception
         await message_handler._log_message_event(station_id, action, payload, response)
-        
+
         # Verify it completes without error
         assert True
 
@@ -324,25 +321,26 @@ class TestMessageHandler:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "triggerReason": "MeterValuePeriodic",
             "seqNo": 2,
-            "transactionInfo": {
-                "transactionId": "TXN123456",
-                "chargingState": "Charging"
-            },
-            "meterValue": [{
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "sampledValue": [{
-                    "value": "25.0",
-                    "context": "Sample.Periodic",
-                    "format": "Raw",
-                    "measurand": "Energy.Active.Import.Register",
-                    "unitOfMeasure": {"unit": "kWh"}
-                }]
-            }]
+            "transactionInfo": {"transactionId": "TXN123456", "chargingState": "Charging"},
+            "meterValue": [
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "sampledValue": [
+                        {
+                            "value": "25.0",
+                            "context": "Sample.Periodic",
+                            "format": "Raw",
+                            "measurand": "Energy.Active.Import.Register",
+                            "unitOfMeasure": {"unit": "kWh"},
+                        }
+                    ],
+                }
+            ],
         }
         unique_id = "1"
-        
+
         response = await message_handler._handle_transaction_event(station_id, payload, unique_id)
-        
+
         assert response == {}  # TransactionEvent returns empty dict
 
     @pytest.mark.asyncio
@@ -351,21 +349,18 @@ class TestMessageHandler:
         """Test Authorize with certificate-based authentication."""
         station_id = "TEST_STATION_001"
         payload = {
-            "idToken": {
-                "idToken": "CERT123",
-                "type": "Certificate"
-            },
+            "idToken": {"idToken": "CERT123", "type": "Certificate"},
             "certificateHashData": {
                 "hashAlgorithm": "SHA256",
                 "issuerNameHash": "hash1",
                 "issuerKeyHash": "hash2",
-                "serialNumber": "SN123"
-            }
+                "serialNumber": "SN123",
+            },
         }
         unique_id = "1"
-        
+
         response = await message_handler._handle_authorize(station_id, payload, unique_id)
-        
+
         assert "idTokenInfo" in response
         assert response["idTokenInfo"]["status"] == "Accepted"
 
@@ -374,7 +369,7 @@ class TestMessageHandler:
     async def test_concurrent_message_handling(self, message_handler):
         """Test concurrent message handling."""
         station_id = "TEST_STATION_001"
-        
+
         # Create multiple messages
         messages = []
         for i in range(5):
@@ -383,23 +378,26 @@ class TestMessageHandler:
                 "message_type_id": 2,
                 "unique_id": str(i),
                 "action": "Heartbeat",
-                "payload": {}
+                "payload": {},
             }
             messages.append(message)
-        
+
         # Process messages concurrently
         tasks = []
         for msg in messages:
             task = asyncio.create_task(
                 message_handler.handle_message(
-                    msg["station_id"], msg["message_type_id"], 
-                    msg["unique_id"], msg["action"], msg["payload"]
+                    msg["station_id"],
+                    msg["message_type_id"],
+                    msg["unique_id"],
+                    msg["action"],
+                    msg["payload"],
                 )
             )
             tasks.append(task)
-        
+
         responses = await asyncio.gather(*tasks)
-        
+
         # All messages should be processed successfully
         assert len(responses) == 5
         for response in responses:
@@ -410,16 +408,16 @@ class TestMessageHandler:
         """Test that all expected handlers are registered."""
         expected_handlers = [
             "BootNotification",
-            "StatusNotification", 
+            "StatusNotification",
             "TransactionEvent",
             "MeterValues",
             "NotifyEVChargingNeeds",
             "NotifyEVChargingSchedule",
             "Heartbeat",
             "Authorize",
-            "DataTransfer"
+            "DataTransfer",
         ]
-        
+
         for handler_name in expected_handlers:
             assert handler_name in message_handler.handlers
             assert callable(message_handler.handlers[handler_name])

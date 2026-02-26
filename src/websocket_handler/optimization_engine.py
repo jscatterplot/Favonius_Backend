@@ -8,13 +8,13 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 from .config import OptimizationServiceConfig
-from .monitoring import get_logger
-from .timescale_client import TimescaleClient
-from .supabase_client import SupabaseClient
 from .connection_manager import ConnectionManager
+from .monitoring import get_logger
+from .supabase_client import SupabaseClient
+from .timescale_client import TimescaleClient
 
 
 @dataclass
@@ -30,7 +30,7 @@ class StationState:
 
 class OptimizationEngine:
     """Optimization engine with heuristic approach.
-    
+
     Note: Julia MIP solver removed. Uses heuristic optimization only.
     For production-grade optimization, delegate to main optimizer in src/core/optimizer/.
     """
@@ -56,7 +56,7 @@ class OptimizationEngine:
         """Set the connection manager (called after server initialization)."""
         self.connection_manager = connection_manager
         self.logger.info("Connection manager set for optimization engine")
-    
+
     async def start(self) -> None:
         if not self.config.enabled:
             self.logger.info("Optimization engine disabled via configuration")
@@ -103,7 +103,7 @@ class OptimizationEngine:
         # Get active vehicles and routes
         vehicles = await self.timescale_client.get_active_vehicles()
         routes = await self.timescale_client.get_active_routes()
-        
+
         if not vehicles:
             self.logger.info("No active vehicles to optimize")
             return
@@ -115,18 +115,20 @@ class OptimizationEngine:
         )
 
         # Use heuristic optimization (Julia MIP solver removed)
-        await self._run_heuristic_optimization(vehicles, routes, prices, now, horizon_end, trigger_reason)
+        await self._run_heuristic_optimization(
+            vehicles, routes, prices, now, horizon_end, trigger_reason
+        )
 
     # MIP optimization using Julia removed - use main optimizer in src/core/optimizer/ for production
 
     async def _run_heuristic_optimization(
-        self, 
-        vehicles: List[Dict[str, Any]], 
-        routes: List[Dict[str, Any]], 
-        prices: List[Dict[str, Any]], 
-        now: datetime, 
+        self,
+        vehicles: List[Dict[str, Any]],
+        routes: List[Dict[str, Any]],
+        prices: List[Dict[str, Any]],
+        now: datetime,
         horizon_end: datetime,
-        trigger_reason: str
+        trigger_reason: str,
     ) -> None:
         """Run optimization using heuristic approach (fallback)."""
         self.logger.info("Running heuristic optimization (fallback)")
@@ -145,16 +147,26 @@ class OptimizationEngine:
             periods = []
             current_time = start_time
             soc = vehicle.get("current_soc_kwh", 30.0) / vehicle.get("battery_capacity_kwh", 75.0)
-            
+
             while current_time < end_time:
                 price = price_by_time.get(current_time.replace(second=0, microsecond=0), 0.0)
                 power_kw = self._determine_power(price, soc, vehicle)
-                periods.append({
+                periods.append(
+                    {
                         "startPeriod": int((current_time - start_time).total_seconds()),
                         "limit": power_kw * 1000,
                         "numberPhases": 3,
-                })
-                soc = min(1.0, max(0.0, soc + (power_kw * (self.config.timestep_minutes / 60.0)) / vehicle.get("battery_capacity_kwh", 75.0)))
+                    }
+                )
+                soc = min(
+                    1.0,
+                    max(
+                        0.0,
+                        soc
+                        + (power_kw * (self.config.timestep_minutes / 60.0))
+                        / vehicle.get("battery_capacity_kwh", 75.0),
+                    ),
+                )
                 current_time += timedelta(minutes=self.config.timestep_minutes)
 
             schedule = {
@@ -172,7 +184,8 @@ class OptimizationEngine:
             schedules.append(schedule)
             await self.timescale_client.store_charging_schedule(schedule)
 
-        await self.timescale_client.store_optimization_decision({
+        await self.timescale_client.store_optimization_decision(
+            {
                 "time": now,
                 "optimization_window_start": now,
                 "optimization_window_end": horizon_end,
@@ -183,9 +196,10 @@ class OptimizationEngine:
                 "objective_value": None,
                 "computation_time_ms": 0,
                 "constraints_satisfied": True,
-            "decision_payload": {"schedules": schedules, "trigger_reason": trigger_reason},
+                "decision_payload": {"schedules": schedules, "trigger_reason": trigger_reason},
                 "sync_status": "completed",
-        })
+            }
+        )
         self.logger.info("Heuristic optimization created %d schedules", len(schedules))
 
     def _determine_power(self, price: float, soc: float, vehicle: Dict[str, Any]) -> float:
@@ -194,7 +208,7 @@ class OptimizationEngine:
         max_charge_rate = vehicle.get("max_charge_rate_kw", 22.0)
         max_discharge_rate = vehicle.get("max_discharge_rate_kw", 10.0)
         min_soc = vehicle.get("min_soc_kwh", 15.0) / battery_capacity
-        
+
         if soc < min_soc:
             return max_charge_rate
         if price < 0:

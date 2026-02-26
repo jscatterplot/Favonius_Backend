@@ -1,5 +1,6 @@
 import pytest
-from prometheus_client import REGISTRY, CollectorRegistry
+from prometheus_client import REGISTRY
+
 
 def pytest_configure(config):
     """Clear Prometheus registry before any tests are collected."""
@@ -8,6 +9,7 @@ def pytest_configure(config):
     for collector in collectors:
         REGISTRY.unregister(collector)
 
+
 @pytest.fixture(autouse=True, scope="session")
 def clear_prometheus_registry_session():
     """Clear the Prometheus default registry at session start to avoid conflicts."""
@@ -15,13 +17,14 @@ def clear_prometheus_registry_session():
     collectors = list(REGISTRY._collector_to_names.keys())
     for collector in collectors:
         REGISTRY.unregister(collector)
-    
+
     yield
-    
+
     # Clear registry at session end
     collectors = list(REGISTRY._collector_to_names.keys())
     for collector in collectors:
         REGISTRY.unregister(collector)
+
 
 @pytest.fixture(autouse=True)
 def clear_prometheus_registry():
@@ -30,9 +33,9 @@ def clear_prometheus_registry():
     collectors = list(REGISTRY._collector_to_names.keys())
     for collector in collectors:
         REGISTRY.unregister(collector)
-    
+
     yield
-    
+
     # Clear registry after each test
     collectors = list(REGISTRY._collector_to_names.keys())
     for collector in collectors:

@@ -13,6 +13,7 @@ from uuid import UUID
 import asyncpg
 
 from src.core.models import OptimizationResult
+
 from .charge_point import convert_schedule_to_ocpp_profile
 from .mapping import get_vehicle_to_charger_map
 from .server import OCPPServer
@@ -81,9 +82,7 @@ async def dispatch_charging_profiles(
 
     results: dict[str, bool] = {}
 
-    logger.info(
-        f"Dispatching charging profiles for {len(optimization_result.schedule)} vehicles"
-    )
+    logger.info(f"Dispatching charging profiles for {len(optimization_result.schedule)} vehicles")
 
     for vehicle_id, schedule_data in optimization_result.schedule.items():
         # Get charger mapping
@@ -101,15 +100,13 @@ async def dispatch_charging_profiles(
         # Check if charge point is connected
         charge_point = server.get_charge_point(charge_point_id)
         if not charge_point:
-            logger.warning(
-                f"Charge point {charge_point_id} not connected for vehicle {vehicle_id}"
-            )
+            logger.warning(f"Charge point {charge_point_id} not connected for vehicle {vehicle_id}")
             results[vehicle_id] = False
             continue
 
         # Convert schedule to OCPP format
         # Schedule format: {'charging_power': [power_kw, ...], 'soc': [...], ...}
-        charging_power = schedule_data.get('charging_power', [])
+        charging_power = schedule_data.get("charging_power", [])
         if not charging_power:
             logger.warning(f"No charging power in schedule for vehicle {vehicle_id}")
             results[vehicle_id] = False
@@ -152,15 +149,11 @@ async def dispatch_charging_profiles(
                 f"to {charge_point_id}:{'Accepted' if success else 'Rejected'}"
             )
         except Exception as e:
-            logger.error(
-                f"Error dispatching charging profile for vehicle {vehicle_id}: {e}"
-            )
+            logger.error(f"Error dispatching charging profile for vehicle {vehicle_id}: {e}")
             results[vehicle_id] = False
 
     success_count = sum(1 for v in results.values() if v)
-    logger.info(
-        f"Charging profile dispatch complete: {success_count}/{len(results)} successful"
-    )
+    logger.info(f"Charging profile dispatch complete: {success_count}/{len(results)} successful")
 
     return results
 
@@ -196,7 +189,7 @@ async def _store_charging_command(
     import json
 
     profile_json = json.dumps(charging_profile)
-    status = 'pending'  # Will be updated when charger responds
+    status = "pending"  # Will be updated when charger responds
 
     try:
         async with pool.acquire() as conn:
@@ -214,4 +207,3 @@ async def _store_charging_command(
         # Don't raise - command was sent, just logging failed
     except Exception as e:
         logger.error(f"Unexpected error storing charging command: {e}")
-

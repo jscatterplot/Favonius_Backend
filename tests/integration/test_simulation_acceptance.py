@@ -3,19 +3,19 @@
 Reference: PRD.md#11-1-mvp-acceptance-tests
 """
 
-import pytest
-import asyncio
 from datetime import datetime, timedelta
 
-from src.core.models import DepotConfig
-from src.core.optimizer.exceptions import InfeasibleModelError, RuntimeError
-from scripts.simulation.depot_sim import DepotSimulator, SimulationOptimizer
+import pytest
+
+from scripts.simulation.depot_sim import SimulationOptimizer
 from scripts.simulation.scenarios import (
+    demand_charge_scenario,
     morning_rush_scenario,
     price_spike_scenario,
     soc_deviation_scenario,
-    demand_charge_scenario,
 )
+from src.core.models import DepotConfig
+from src.core.optimizer.exceptions import InfeasibleModelError, RuntimeError
 
 
 @pytest.mark.asyncio
@@ -29,9 +29,7 @@ async def test_at01_end_to_end_simulation():
     # Create depot config
     vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
-        vehicle_capacities={
-            v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
-        },
+        vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
         charger_groups={80.0: 5},
         charger_efficiency=0.95,
@@ -64,13 +62,13 @@ async def test_at01_end_to_end_simulation():
         sim.step()
 
     # Validate all departures satisfied
-    assert sim.metrics.vehicles_not_ready == 0, (
-        f"{sim.metrics.vehicles_not_ready} vehicles not ready at departure"
-    )
+    assert (
+        sim.metrics.vehicles_not_ready == 0
+    ), f"{sim.metrics.vehicles_not_ready} vehicles not ready at departure"
     assert sim.metrics.optimization_count > 0, "No optimizations run"
-    assert sim.metrics.avg_solve_time < 30.0, (
-        f"Average solve time {sim.metrics.avg_solve_time:.2f}s exceeds 30s"
-    )
+    assert (
+        sim.metrics.avg_solve_time < 30.0
+    ), f"Average solve time {sim.metrics.avg_solve_time:.2f}s exceeds 30s"
 
 
 @pytest.mark.asyncio
@@ -84,9 +82,7 @@ async def test_at02_demand_charge_reduction():
     # Create depot config
     vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
-        vehicle_capacities={
-            v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
-        },
+        vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
         charger_groups={80.0: 8},
         charger_efficiency=0.95,
@@ -97,12 +93,8 @@ async def test_at02_demand_charge_reduction():
     )
 
     # Calculate unmanaged baseline (all charge simultaneously)
-    unmanaged_peak = sum(
-        80.0 for _ in range(min(15, 8))
-    )  # All chargers at max
-    unmanaged_cost = (
-        unmanaged_peak * 20.0 * 24
-    )  # $20/kW * 24 hours (simplified)
+    unmanaged_peak = sum(80.0 for _ in range(min(15, 8)))  # All chargers at max
+    unmanaged_cost = unmanaged_peak * 20.0 * 24  # $20/kW * 24 hours (simplified)
 
     # Run optimized simulation
     optimizer = SimulationOptimizer(sim, config)
@@ -124,8 +116,7 @@ async def test_at02_demand_charge_reduction():
     # Validate peak demand reduction
     optimized_peak = sim.metrics.peak_demand_kw
     assert optimized_peak < unmanaged_peak * 0.9, (
-        f"Peak demand not reduced: {optimized_peak:.2f} kW vs "
-        f"{unmanaged_peak:.2f} kW unmanaged"
+        f"Peak demand not reduced: {optimized_peak:.2f} kW vs " f"{unmanaged_peak:.2f} kW unmanaged"
     )
 
     # Calculate savings
@@ -150,9 +141,7 @@ async def test_at03_price_spike_reoptimization():
     # Create depot config
     vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
-        vehicle_capacities={
-            v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
-        },
+        vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
         charger_groups={80.0: 5},
         charger_efficiency=0.95,
@@ -177,9 +166,7 @@ async def test_at03_price_spike_reoptimization():
                 try:
                     result = await optimizer.optimize(horizon_hours=24)
                     optimizer.apply_result(result)
-                    optimization_times.append(
-                        (datetime.utcnow() - start_time).total_seconds()
-                    )
+                    optimization_times.append((datetime.utcnow() - start_time).total_seconds())
                 except (InfeasibleModelError, RuntimeError) as e:
                     print(f"Warning: Optimization infeasible at spike step {step}: {e}")
                     continue
@@ -205,8 +192,7 @@ async def test_at03_price_spike_reoptimization():
     if optimization_times:
         max_opt_time = max(optimization_times)
         assert max_opt_time < 60.0, (
-            f"Re-optimization took {max_opt_time:.2f}s, "
-            f"exceeds 60s target"
+            f"Re-optimization took {max_opt_time:.2f}s, " f"exceeds 60s target"
         )
 
 
@@ -225,9 +211,7 @@ async def test_at04_soc_deviation_handling():
     # Create depot config
     vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
-        vehicle_capacities={
-            v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
-        },
+        vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
         charger_groups={80.0: 5},
         charger_efficiency=0.95,
@@ -297,9 +281,7 @@ async def test_at05_inter_depot_handoff():
     # Create depot config
     vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
-        vehicle_capacities={
-            v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
-        },
+        vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
         charger_groups={80.0: 5},
         charger_efficiency=0.95,
@@ -340,9 +322,7 @@ async def test_unmanaged_vs_optimized_comparison():
     # Create depot config
     vehicle_ids = [v.vehicle_id for v in sim.vehicles]
     config = DepotConfig(
-        vehicle_capacities={
-            v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles
-        },
+        vehicle_capacities={v.vehicle_id: v.battery_capacity_kwh for v in sim.vehicles},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
         charger_groups={80.0: 8},
         charger_efficiency=0.95,
@@ -372,21 +352,14 @@ async def test_unmanaged_vs_optimized_comparison():
     # Calculate unmanaged baseline
     # (Simplified: assume all vehicles charge simultaneously at peak)
     unmanaged_peak = min(15, 8) * 80.0  # All chargers at max
-    unmanaged_energy_cost = (
-        sum(sim.get_prices(24)) * unmanaged_peak * 0.25 * 24
-    )  # Simplified
+    unmanaged_energy_cost = sum(sim.get_prices(24)) * unmanaged_peak * 0.25 * 24  # Simplified
     unmanaged_demand_cost = unmanaged_peak * 20.0
     unmanaged_total = unmanaged_energy_cost + unmanaged_demand_cost
 
     # Get optimized costs
-    optimized_total = (
-        sim.metrics.total_energy_cost + sim.metrics.total_demand_cost
-    )
+    (sim.metrics.total_energy_cost + sim.metrics.total_demand_cost)
 
     # Validate savings
     savings = sim.get_cost_savings(unmanaged_total)
     assert savings["savings"] > 0, "No cost savings achieved"
-    assert savings["savings_percent"] > 10, (
-        f"Savings too low: {savings['savings_percent']:.1f}%"
-    )
-
+    assert savings["savings_percent"] > 10, f"Savings too low: {savings['savings_percent']:.1f}%"

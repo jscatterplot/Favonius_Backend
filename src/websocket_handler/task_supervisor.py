@@ -1,11 +1,9 @@
 """Task supervisor for managing fire-and-forget async tasks with error handling."""
 
 import asyncio
-import time
-from typing import Callable, Coroutine, Any, Dict, Optional, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from weakref import WeakSet
+from typing import Any, Callable, Coroutine, Dict, Optional, Set
 
 from .monitoring import get_logger
 
@@ -13,6 +11,7 @@ from .monitoring import get_logger
 @dataclass
 class TaskInfo:
     """Metadata about a supervised task."""
+
     name: str
     created_at: datetime
     completed_at: Optional[datetime] = None
@@ -60,7 +59,7 @@ class TaskSupervisor:
         self,
         coro: Coroutine[Any, Any, Any],
         name: str,
-        on_error: Optional[Callable[[Exception], None]] = None
+        on_error: Optional[Callable[[Exception], None]] = None,
     ) -> Optional[asyncio.Task]:
         """
         Create a supervised async task.
@@ -91,17 +90,12 @@ class TaskSupervisor:
         self._stats["total_created"] += 1
 
         # Add completion callback
-        task.add_done_callback(
-            lambda t: self._handle_task_done(t, name, on_error)
-        )
+        task.add_done_callback(lambda t: self._handle_task_done(t, name, on_error))
 
         return task
 
     def _handle_task_done(
-        self,
-        task: asyncio.Task,
-        name: str,
-        on_error: Optional[Callable[[Exception], None]]
+        self, task: asyncio.Task, name: str, on_error: Optional[Callable[[Exception], None]]
     ) -> None:
         """Handle task completion, logging any errors."""
         # Remove from active set
@@ -119,16 +113,17 @@ class TaskSupervisor:
 
             # Log the error
             self.logger.error(
-                f"[{self.name}] Task '{name}' failed: {error_msg}",
-                exc_info=exception
+                f"[{self.name}] Task '{name}' failed: {error_msg}", exc_info=exception
             )
 
             # Store in recent errors
-            self._recent_errors.append({
-                "task_name": name,
-                "error": error_msg,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
+            self._recent_errors.append(
+                {
+                    "task_name": name,
+                    "error": error_msg,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             if len(self._recent_errors) > self._max_recent_errors:
                 self._recent_errors.pop(0)
 
@@ -180,8 +175,7 @@ class TaskSupervisor:
         # Wait for them to finish (with timeout)
         try:
             await asyncio.wait_for(
-                asyncio.gather(*self._active_tasks, return_exceptions=True),
-                timeout=timeout
+                asyncio.gather(*self._active_tasks, return_exceptions=True), timeout=timeout
             )
         except asyncio.TimeoutError:
             self.logger.warning(
@@ -224,7 +218,9 @@ async def shutdown_all_supervisors(timeout: float = 10.0) -> None:
 
     for name, supervisor in _supervisors.items():
         try:
-            cancelled = await supervisor.cancel_all(timeout=timeout / len(_supervisors) if _supervisors else timeout)
+            cancelled = await supervisor.cancel_all(
+                timeout=timeout / len(_supervisors) if _supervisors else timeout
+            )
             logger.info(f"Supervisor '{name}' cancelled {cancelled} tasks")
         except Exception as e:
             logger.error(f"Error shutting down supervisor '{name}': {e}")

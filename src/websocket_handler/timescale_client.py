@@ -1,15 +1,17 @@
 """TimescaleDB client for time-series data operations."""
 
 import asyncio
+import base64
 import json
 import random
-from typing import Dict, Any, List, Optional, Union
-from datetime import datetime, timezone, timedelta
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 import asyncpg
 import pandas as pd
-from sqlalchemy import create_engine, text
-from sqlalchemy.pool import QueuePool
 from cryptography import x509
+from sqlalchemy import text
 
 from .config import TimescaleConfig
 from .monitoring import get_logger
@@ -17,27 +19,28 @@ from .monitoring import get_logger
 
 class TimescaleClient:
     """TimescaleDB client for time-series operations."""
-    
+
     def __init__(self, config: TimescaleConfig):
         """Initialize TimescaleDB client."""
         self.config = config
         self.logger = get_logger(__name__)
-        
+
         # Enhanced connection pool
         from .connection_pool import EnhancedConnectionPool
+
         self.connection_pool: Optional[EnhancedConnectionPool] = None
-        
+
         # Legacy connection pools (for backward compatibility)
         self.pg_pool: Optional[asyncpg.Pool] = None
         self.sqlalchemy_engine = None
-        
+
         # Connection state
         self.connected = False
-        
+
     async def connect(self) -> None:
         """Establish connections to TimescaleDB with retry logic."""
         await self._connect_with_retry()
-    
+
     async def _connect_with_retry(self, max_retries: int = 3, base_delay: float = 1.0) -> None:
         """Connect with exponential backoff retry and jitter."""
         for attempt in range(max_retries):
@@ -45,50 +48,55 @@ class TimescaleClient:
                 await self._establish_connections()
                 await self._verify_timescale_extension()
                 await self._test_connections()
-                
+
                 self.connected = True
                 self.logger.info("TimescaleDB client connected successfully")
                 return
-                
+
             except Exception as e:
                 if attempt == max_retries - 1:
-                    self.logger.error(f"Failed to connect to TimescaleDB after {max_retries} attempts: {e}")
+                    self.logger.error(
+                        f"Failed to connect to TimescaleDB after {max_retries} attempts: {e}"
+                    )
                     raise
-                
+
                 # Calculate delay with exponential backoff
-                delay = base_delay * (2 ** attempt)
+                delay = base_delay * (2**attempt)
                 # Add jitter: 50-100% of base delay to prevent connection storms
-                delay *= (0.5 + random.random() * 0.5)
-                
-                self.logger.warning(f"TimescaleDB connection attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s")
+                delay *= 0.5 + random.random() * 0.5
+
+                self.logger.warning(
+                    f"TimescaleDB connection attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s"
+                )
                 await asyncio.sleep(delay)
-    
+
     async def _establish_connections(self) -> None:
         """Establish the actual database connections."""
         # Create enhanced connection pool
         from .connection_pool import EnhancedConnectionPool, PoolStrategy
+
         self.connection_pool = EnhancedConnectionPool(self.config, PoolStrategy.HYBRID)
         await self.connection_pool.initialize()
-        
+
         # Set legacy pools for backward compatibility
         self.pg_pool = self.connection_pool.asyncpg_pool
         self.sqlalchemy_engine = self.connection_pool.sqlalchemy_engine
-    
+
     async def disconnect(self) -> None:
         """Close all connections."""
         if self.connection_pool:
             await self.connection_pool.close()
-        
+
         # Legacy cleanup
         if self.pg_pool:
             await self.pg_pool.close()
-        
+
         if self.sqlalchemy_engine:
             self.sqlalchemy_engine.dispose()
-        
+
         self.connected = False
         self.logger.info("TimescaleDB client disconnected")
-    
+
     async def _verify_timescale_extension(self) -> None:
         """Verify TimescaleDB extension is installed."""
         try:
@@ -106,41 +114,41 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to verify TimescaleDB extension: {e}")
             raise
-    
+
     async def health_check(self) -> bool:
         """Check connection health."""
         try:
             if not self.connected or not self.pg_pool:
                 return False
-            
+
             async with self.pg_pool.acquire() as conn:
                 await conn.execute("SELECT 1")
             return True
         except Exception as e:
             self.logger.warning(f"TimescaleDB health check failed: {e}")
             return False
-    
+
     async def reconnect(self) -> None:
         """Reconnect to TimescaleDB."""
         self.logger.info("Attempting to reconnect to TimescaleDB")
         await self.disconnect()
         await self.connect()
-    
+
     async def _test_connections(self) -> None:
         """Test all connections."""
         # Test asyncpg connection
         async with self.pg_pool.acquire() as conn:
-            result = await conn.fetchval('SELECT 1')
+            result = await conn.fetchval("SELECT 1")
             if result != 1:
                 raise Exception("AsyncPG connection test failed")
-        
+
         # Test SQLAlchemy connection (if available)
         if self.sqlalchemy_engine:
             with self.sqlalchemy_engine.connect() as conn:
-                result = conn.execute(text('SELECT 1')).scalar()
+                result = conn.execute(text("SELECT 1")).scalar()
                 if result != 1:
                     raise Exception("SQLAlchemy connection test failed")
-    
+
     # Telemetry Data Operations
     async def insert_telemetry_batch(self, telemetry_data: List[Dict[str, Any]]) -> None:
         """Insert batch of telemetry data into main telemetry table.
@@ -150,7 +158,7 @@ class TimescaleClient:
         """
         if not telemetry_data:
             return
-        
+
         try:
             async with self.pg_pool.acquire() as conn:
                 inserted = 0
@@ -163,7 +171,9 @@ class TimescaleClient:
                     if not vehicle_id:
                         vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
                     if not vehicle_id:
-                        vehicle_id = await self._resolve_vehicle_id_from_id_token(conn, station_id, connector_id)
+                        vehicle_id = await self._resolve_vehicle_id_from_id_token(
+                            conn, station_id, connector_id
+                        )
 
                     if not vehicle_id:
                         self.logger.debug(
@@ -194,13 +204,13 @@ class TimescaleClient:
                         soc,
                         charging_kw,
                         is_plugged,
-                        max_charge_kw
+                        max_charge_kw,
                     )
                     inserted += 1
 
                 if inserted:
                     self.logger.debug(f"Inserted {inserted} telemetry records into telemetry")
-                
+
         except Exception as e:
             self.logger.error(f"Failed to insert telemetry batch: {e}")
             raise
@@ -211,8 +221,7 @@ class TimescaleClient:
         if not session_id:
             return None
         row = await conn.fetchrow(
-            "SELECT vehicle_id FROM charging_sessions WHERE session_id = $1 LIMIT 1",
-            session_id
+            "SELECT vehicle_id FROM charging_sessions WHERE session_id = $1 LIMIT 1", session_id
         )
         return row["vehicle_id"] if row and row["vehicle_id"] else None
 
@@ -230,7 +239,7 @@ class TimescaleClient:
             LIMIT 1
             """,
             station_id,
-            connector_id
+            connector_id,
         )
         if not row or not row["id_token"]:
             return None
@@ -244,8 +253,7 @@ class TimescaleClient:
         if not token_value:
             return None
         vehicle_row = await conn.fetchrow(
-            "SELECT vehicle_id FROM vehicles WHERE id_tag = $1 LIMIT 1",
-            token_value
+            "SELECT vehicle_id FROM vehicles WHERE id_tag = $1 LIMIT 1", token_value
         )
         return vehicle_row["vehicle_id"] if vehicle_row else None
 
@@ -255,8 +263,7 @@ class TimescaleClient:
         if not station_id:
             return None
         row = await conn.fetchrow(
-            "SELECT charger_id FROM chargers WHERE ocpp_id = $1 LIMIT 1",
-            station_id
+            "SELECT charger_id FROM chargers WHERE ocpp_id = $1 LIMIT 1", station_id
         )
         return row["charger_id"] if row else None
 
@@ -269,25 +276,34 @@ class TimescaleClient:
         try:
             async with self.pg_pool.acquire() as conn:
                 await conn.copy_records_to_table(
-                    'electricity_prices',
-                    records=[(
-                        point['time'],
-                        point['node_id'],
-                        point['market_type'],
-                        point.get('lmp_price_mwh'),
-                        point.get('energy_component_mwh'),
-                        point.get('congestion_component_mwh'),
-                        point.get('loss_component_mwh'),
-                        point.get('ghg_adder_mwh'),
-                        point.get('price_confidence'),
-                        point.get('forecast_horizon_minutes')
-                    ) for point in price_points],
+                    "electricity_prices",
+                    records=[
+                        (
+                            point["time"],
+                            point["node_id"],
+                            point["market_type"],
+                            point.get("lmp_price_mwh"),
+                            point.get("energy_component_mwh"),
+                            point.get("congestion_component_mwh"),
+                            point.get("loss_component_mwh"),
+                            point.get("ghg_adder_mwh"),
+                            point.get("price_confidence"),
+                            point.get("forecast_horizon_minutes"),
+                        )
+                        for point in price_points
+                    ],
                     columns=[
-                        'time', 'node_id', 'market_type', 'lmp_price_mwh',
-                        'energy_component_mwh', 'congestion_component_mwh',
-                        'loss_component_mwh', 'ghg_adder_mwh', 'price_confidence',
-                        'forecast_horizon_minutes'
-                    ]
+                        "time",
+                        "node_id",
+                        "market_type",
+                        "lmp_price_mwh",
+                        "energy_component_mwh",
+                        "congestion_component_mwh",
+                        "loss_component_mwh",
+                        "ghg_adder_mwh",
+                        "price_confidence",
+                        "forecast_horizon_minutes",
+                    ],
                 )
 
         except Exception as e:
@@ -314,9 +330,10 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to fetch electricity prices: {e}")
             raise
-    
-    async def get_telemetry_data(self, station_id: str, start_time: datetime, 
-                               end_time: datetime, limit: int = 1000) -> List[Dict[str, Any]]:
+
+    async def get_telemetry_data(
+        self, station_id: str, start_time: datetime, end_time: datetime, limit: int = 1000
+    ) -> List[Dict[str, Any]]:
         """Get telemetry data for a station."""
         try:
             async with self.pg_pool.acquire() as conn:
@@ -332,45 +349,46 @@ class TimescaleClient:
                     ORDER BY time DESC
                     LIMIT $4
                 """
-                
+
                 rows = await conn.fetch(query, station_id, start_time, end_time, limit)
                 return [dict(row) for row in rows]
-                
+
         except Exception as e:
             self.logger.error(f"Failed to get telemetry data: {e}")
             raise
-    
+
     # Charging Sessions Operations
     async def create_charging_session(self, session_data: Dict[str, Any]) -> str:
         """Create a new charging session."""
         try:
             async with self.pg_pool.acquire() as conn:
-                session_id = await conn.fetchval("""
+                session_id = await conn.fetchval(
+                    """
                     INSERT INTO charging_sessions (
                         station_id, evse_id, connector_id, vehicle_id, id_token,
                         start_time, start_soc_percent, operation_mode,
                         fleet_operator_id, site_id
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     RETURNING session_id
-                """, 
-                session_data['station_id'],
-                session_data['evse_id'],
-                session_data['connector_id'],
-                session_data.get('vehicle_id'),
-                session_data.get('id_token'),
-                session_data['start_time'],
-                session_data.get('start_soc_percent'),
-                session_data.get('operation_mode'),
-                session_data.get('fleet_operator_id'),
-                session_data.get('site_id')
+                """,
+                    session_data["station_id"],
+                    session_data["evse_id"],
+                    session_data["connector_id"],
+                    session_data.get("vehicle_id"),
+                    session_data.get("id_token"),
+                    session_data["start_time"],
+                    session_data.get("start_soc_percent"),
+                    session_data.get("operation_mode"),
+                    session_data.get("fleet_operator_id"),
+                    session_data.get("site_id"),
                 )
-                
+
                 return str(session_id)
-                
+
         except Exception as e:
             self.logger.error(f"Failed to create charging session: {e}")
             raise
-    
+
     async def update_charging_session(self, session_id: str, updates: Dict[str, Any]) -> None:
         """Update charging session."""
         try:
@@ -379,32 +397,39 @@ class TimescaleClient:
                 set_clauses = []
                 values = []
                 param_count = 1
-                
+
                 for key, value in updates.items():
-                    if key in ['end_time', 'end_soc_percent', 'energy_delivered_kwh', 
-                              'energy_received_kwh', 'max_charge_power_kw', 'max_discharge_power_kw']:
+                    if key in [
+                        "end_time",
+                        "end_soc_percent",
+                        "energy_delivered_kwh",
+                        "energy_received_kwh",
+                        "max_charge_power_kw",
+                        "max_discharge_power_kw",
+                    ]:
                         set_clauses.append(f"{key} = ${param_count}")
                         values.append(value)
                         param_count += 1
-                
+
                 if set_clauses:
                     set_clauses.append("updated_at = NOW()")
                     values.append(session_id)
-                    
+
                     query = f"""
                         UPDATE charging_sessions 
                         SET {', '.join(set_clauses)}
                         WHERE session_id = ${param_count}
                     """
-                    
+
                     await conn.execute(query, *values)
-                    
+
         except Exception as e:
             self.logger.error(f"Failed to update charging session: {e}")
             raise
-    
-    async def get_charging_sessions(self, fleet_operator_id: str, start_time: datetime,
-                                  end_time: datetime, limit: int = 100) -> List[Dict[str, Any]]:
+
+    async def get_charging_sessions(
+        self, fleet_operator_id: str, start_time: datetime, end_time: datetime, limit: int = 100
+    ) -> List[Dict[str, Any]]:
         """Get charging sessions for a fleet operator."""
         try:
             async with self.pg_pool.acquire() as conn:
@@ -420,20 +445,21 @@ class TimescaleClient:
                     ORDER BY start_time DESC
                     LIMIT $4
                 """
-                
+
                 rows = await conn.fetch(query, fleet_operator_id, start_time, end_time, limit)
                 return [dict(row) for row in rows]
-                
+
         except Exception as e:
             self.logger.error(f"Failed to get charging sessions: {e}")
             raise
-    
+
     # Optimization Decisions Operations
     async def store_optimization_decision(self, decision_data: Dict[str, Any]) -> str:
         """Store optimization decision."""
         try:
             async with self.pg_pool.acquire() as conn:
-                decision_id = await conn.fetchval("""
+                decision_id = await conn.fetchval(
+                    """
                     INSERT INTO optimization_decisions (
                         time, optimization_window_start, optimization_window_end,
                         fleet_operator_id, site_id, algorithm_version,
@@ -442,30 +468,31 @@ class TimescaleClient:
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     RETURNING decision_id
                 """,
-                decision_data['time'],
-                decision_data['optimization_window_start'],
-                decision_data['optimization_window_end'],
-                decision_data.get('fleet_operator_id'),
-                decision_data.get('site_id'),
-                decision_data.get('algorithm_version'),
-                decision_data.get('objective_function'),
-                decision_data.get('objective_value'),
-                decision_data.get('computation_time_ms'),
-                decision_data.get('constraints_satisfied'),
-                json.dumps(decision_data.get('decision_payload', {}))
+                    decision_data["time"],
+                    decision_data["optimization_window_start"],
+                    decision_data["optimization_window_end"],
+                    decision_data.get("fleet_operator_id"),
+                    decision_data.get("site_id"),
+                    decision_data.get("algorithm_version"),
+                    decision_data.get("objective_function"),
+                    decision_data.get("objective_value"),
+                    decision_data.get("computation_time_ms"),
+                    decision_data.get("constraints_satisfied"),
+                    json.dumps(decision_data.get("decision_payload", {})),
                 )
-                
+
                 return str(decision_id)
-                
+
         except Exception as e:
             self.logger.error(f"Failed to store optimization decision: {e}")
             raise
-    
+
     async def insert_station_info(self, station_info: Dict[str, Any]) -> None:
         """Insert station information."""
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO station_info (
                         station_id, serial_number, model, vendor_name, 
                         firmware_version, modem, boot_reason, timestamp
@@ -478,129 +505,143 @@ class TimescaleClient:
                         modem = EXCLUDED.modem,
                         boot_reason = EXCLUDED.boot_reason,
                         timestamp = EXCLUDED.timestamp
-                """, 
-                station_info["station_id"],
-                station_info["serial_number"],
-                station_info["model"],
-                station_info["vendor_name"],
-                station_info.get("firmware_version"),
-                station_info.get("modem"),
-                station_info["boot_reason"],
-                station_info["timestamp"]
+                """,
+                    station_info["station_id"],
+                    station_info["serial_number"],
+                    station_info["model"],
+                    station_info["vendor_name"],
+                    station_info.get("firmware_version"),
+                    station_info.get("modem"),
+                    station_info["boot_reason"],
+                    station_info["timestamp"],
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert station info: {e}")
             raise
-    
+
     async def insert_connector_status(self, status_data: Dict[str, Any]) -> None:
         """Insert connector status."""
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO connector_status (
                         station_id, connector_id, status, error_code, timestamp
                     ) VALUES ($1, $2, $3, $4, $5)
                 """,
-                status_data["station_id"],
-                status_data["connector_id"],
-                status_data["status"],
-                status_data["error_code"],
-                status_data["timestamp"]
+                    status_data["station_id"],
+                    status_data["connector_id"],
+                    status_data["status"],
+                    status_data["error_code"],
+                    status_data["timestamp"],
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert connector status: {e}")
             raise
-    
+
     async def insert_transaction_event(self, transaction_data: Dict[str, Any]) -> None:
         """Insert transaction event."""
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO transaction_events (
                         transaction_id, event_type, timestamp, station_id,
                         evse_id, connector_id, charging_state, stopped_reason, remote_start_id
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
-                transaction_data["transaction_id"],
-                transaction_data["event_type"],
-                transaction_data["timestamp"],
-                transaction_data["station_id"],
-                transaction_data["evse_id"],
-                transaction_data["connector_id"],
-                transaction_data.get("charging_state"),
-                transaction_data.get("stopped_reason"),
-                transaction_data.get("remote_start_id")
+                    transaction_data["transaction_id"],
+                    transaction_data["event_type"],
+                    transaction_data["timestamp"],
+                    transaction_data["station_id"],
+                    transaction_data["evse_id"],
+                    transaction_data["connector_id"],
+                    transaction_data.get("charging_state"),
+                    transaction_data.get("stopped_reason"),
+                    transaction_data.get("remote_start_id"),
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert transaction event: {e}")
             raise
-    
+
     async def insert_data_transfer(self, transfer_data: Dict[str, Any]) -> None:
         """Insert data transfer information."""
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO data_transfers (
                         station_id, vendor_id, message_id, data, timestamp
                     ) VALUES ($1, $2, $3, $4, $5)
                 """,
-                transfer_data["station_id"],
-                transfer_data["vendor_id"],
-                transfer_data["message_id"],
-                transfer_data.get("data"),
-                transfer_data["timestamp"]
+                    transfer_data["station_id"],
+                    transfer_data["vendor_id"],
+                    transfer_data["message_id"],
+                    transfer_data.get("data"),
+                    transfer_data["timestamp"],
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert data transfer: {e}")
             raise
-    
+
     async def insert_ev_charging_needs(self, needs_data: Dict[str, Any]) -> None:
         """Insert EV charging needs."""
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO ev_charging_needs (
                         station_id, evse_id, requested_energy_transfer, departure_time,
                         ac_charging_parameters, dc_charging_parameters, timestamp
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
-                needs_data["station_id"],
-                needs_data["evse_id"],
-                needs_data.get("requested_energy_transfer"),
-                needs_data.get("departure_time"),
-                json.dumps(needs_data.get("ac_charging_parameters")) if needs_data.get("ac_charging_parameters") else None,
-                json.dumps(needs_data.get("dc_charging_parameters")) if needs_data.get("dc_charging_parameters") else None,
-                needs_data["timestamp"]
+                    needs_data["station_id"],
+                    needs_data["evse_id"],
+                    needs_data.get("requested_energy_transfer"),
+                    needs_data.get("departure_time"),
+                    (
+                        json.dumps(needs_data.get("ac_charging_parameters"))
+                        if needs_data.get("ac_charging_parameters")
+                        else None
+                    ),
+                    (
+                        json.dumps(needs_data.get("dc_charging_parameters"))
+                        if needs_data.get("dc_charging_parameters")
+                        else None
+                    ),
+                    needs_data["timestamp"],
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert EV charging needs: {e}")
             raise
-    
+
     async def insert_ev_charging_schedule(self, schedule_data: Dict[str, Any]) -> None:
         """Insert EV charging schedule."""
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO ev_charging_schedules (
                         station_id, evse_id, time_base, charging_schedule_period,
                         duration, start_schedule, charging_rate_unit, timestamp
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
-                schedule_data["station_id"],
-                schedule_data["evse_id"],
-                schedule_data["time_base"],
-                json.dumps(schedule_data.get("charging_schedule_period", [])),
-                schedule_data.get("duration"),
-                schedule_data.get("start_schedule"),
-                schedule_data.get("charging_rate_unit"),
-                schedule_data["timestamp"]
+                    schedule_data["station_id"],
+                    schedule_data["evse_id"],
+                    schedule_data["time_base"],
+                    json.dumps(schedule_data.get("charging_schedule_period", [])),
+                    schedule_data.get("duration"),
+                    schedule_data.get("start_schedule"),
+                    schedule_data.get("charging_rate_unit"),
+                    schedule_data["timestamp"],
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert EV charging schedule: {e}")
             raise
-    
-    async def get_optimization_decisions(self, fleet_operator_id: str, start_time: datetime,
-                                       end_time: datetime) -> List[Dict[str, Any]]:
+
+    async def get_optimization_decisions(
+        self, fleet_operator_id: str, start_time: datetime, end_time: datetime
+    ) -> List[Dict[str, Any]]:
         """Get optimization decisions."""
         try:
             async with self.pg_pool.acquire() as conn:
@@ -614,20 +655,21 @@ class TimescaleClient:
                         AND time <= $3
                     ORDER BY time DESC
                 """
-                
+
                 rows = await conn.fetch(query, fleet_operator_id, start_time, end_time)
                 return [dict(row) for row in rows]
-                
+
         except Exception as e:
             self.logger.error(f"Failed to get optimization decisions: {e}")
             raise
-    
+
     # Charging Schedules Operations
     async def store_charging_schedule(self, schedule_data: Dict[str, Any]) -> str:
         """Store charging schedule."""
         try:
             async with self.pg_pool.acquire() as conn:
-                schedule_id = await conn.fetchval("""
+                schedule_id = await conn.fetchval(
+                    """
                     INSERT INTO charging_schedules (
                         station_id, evse_id, decision_id, profile_id,
                         start_time, end_time, schedule_periods,
@@ -635,25 +677,27 @@ class TimescaleClient:
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     RETURNING schedule_id
                 """,
-                schedule_data['station_id'],
-                schedule_data['evse_id'],
-                schedule_data.get('decision_id'),
-                schedule_data['profile_id'],
-                schedule_data['start_time'],
-                schedule_data['end_time'],
-                json.dumps(schedule_data['schedule_periods']),
-                schedule_data.get('priority', 0),
-                schedule_data.get('stacking_level', 0),
-                schedule_data.get('purpose')
+                    schedule_data["station_id"],
+                    schedule_data["evse_id"],
+                    schedule_data.get("decision_id"),
+                    schedule_data["profile_id"],
+                    schedule_data["start_time"],
+                    schedule_data["end_time"],
+                    json.dumps(schedule_data["schedule_periods"]),
+                    schedule_data.get("priority", 0),
+                    schedule_data.get("stacking_level", 0),
+                    schedule_data.get("purpose"),
                 )
-                
+
                 return str(schedule_id)
-                
+
         except Exception as e:
             self.logger.error(f"Failed to store charging schedule: {e}")
             raise
 
-    async def get_active_charging_sessions(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    async def get_active_charging_sessions(
+        self, start: datetime, end: datetime
+    ) -> List[Dict[str, Any]]:
         """Retrieve charging sessions within a time window."""
         try:
             async with self.pg_pool.acquire() as conn:
@@ -670,64 +714,81 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to get active charging sessions: {e}")
             raise
-    
-    async def update_schedule_execution(self, schedule_id: str, executed_at: datetime, 
-                                      execution_status: str) -> None:
+
+    async def update_schedule_execution(
+        self, schedule_id: str, executed_at: datetime, execution_status: str
+    ) -> None:
         """Update schedule execution status."""
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     UPDATE charging_schedules 
                     SET executed_at = $1, execution_status = $2
                     WHERE schedule_id = $3
-                """, executed_at, execution_status, schedule_id)
-                
+                """,
+                    executed_at,
+                    execution_status,
+                    schedule_id,
+                )
+
         except Exception as e:
             self.logger.error(f"Failed to update schedule execution: {e}")
             raise
-    
+
     # Electricity Prices Operations
-    async def store_electricity_prices(self, price_data: List[Dict[str, Any]]) -> None:
+    async def store_electricity_prices(  # noqa: F811
+        self, price_data: List[Dict[str, Any]]
+    ) -> None:
         """Store electricity price data."""
         if not price_data:
             return
-        
+
         try:
             async with self.pg_pool.acquire() as conn:
                 values = []
                 for data in price_data:
-                    values.append((
-                        data['time'],
-                        data['node_id'],
-                        data['market_type'],
-                        data.get('lmp_price_mwh'),
-                        data.get('energy_component_mwh'),
-                        data.get('congestion_component_mwh'),
-                        data.get('loss_component_mwh'),
-                        data.get('ghg_adder_mwh'),
-                        data.get('price_confidence'),
-                        data.get('forecast_horizon_minutes')
-                    ))
-                
+                    values.append(
+                        (
+                            data["time"],
+                            data["node_id"],
+                            data["market_type"],
+                            data.get("lmp_price_mwh"),
+                            data.get("energy_component_mwh"),
+                            data.get("congestion_component_mwh"),
+                            data.get("loss_component_mwh"),
+                            data.get("ghg_adder_mwh"),
+                            data.get("price_confidence"),
+                            data.get("forecast_horizon_minutes"),
+                        )
+                    )
+
                 await conn.copy_records_to_table(
-                    'electricity_prices',
+                    "electricity_prices",
                     records=values,
                     columns=[
-                        'time', 'node_id', 'market_type', 'lmp_price_mwh',
-                        'energy_component_mwh', 'congestion_component_mwh',
-                        'loss_component_mwh', 'ghg_adder_mwh', 'price_confidence',
-                        'forecast_horizon_minutes'
-                    ]
+                        "time",
+                        "node_id",
+                        "market_type",
+                        "lmp_price_mwh",
+                        "energy_component_mwh",
+                        "congestion_component_mwh",
+                        "loss_component_mwh",
+                        "ghg_adder_mwh",
+                        "price_confidence",
+                        "forecast_horizon_minutes",
+                    ],
                 )
-                
+
                 self.logger.debug(f"Stored {len(price_data)} electricity price records")
-                
+
         except Exception as e:
             self.logger.error(f"Failed to store electricity prices: {e}")
             raise
-    
-    async def get_electricity_prices(self, node_id: str, start_time: datetime,
-                                   end_time: datetime, market_type: str = None) -> List[Dict[str, Any]]:
+
+    async def get_electricity_prices(
+        self, node_id: str, start_time: datetime, end_time: datetime, market_type: str = None
+    ) -> List[Dict[str, Any]]:
         """Get electricity prices."""
         try:
             async with self.pg_pool.acquire() as conn:
@@ -742,23 +803,24 @@ class TimescaleClient:
                         AND time <= $3
                 """
                 params = [node_id, start_time, end_time]
-                
+
                 if market_type:
                     query += " AND market_type = $4"
                     params.append(market_type)
-                
+
                 query += " ORDER BY time DESC"
-                
+
                 rows = await conn.fetch(query, *params)
                 return [dict(row) for row in rows]
-                
+
         except Exception as e:
             self.logger.error(f"Failed to get electricity prices: {e}")
             raise
-    
+
     # Analytics Operations
-    async def get_hourly_energy_aggregates(self, station_id: str, start_time: datetime,
-                                         end_time: datetime) -> pd.DataFrame:
+    async def get_hourly_energy_aggregates(
+        self, station_id: str, start_time: datetime, end_time: datetime
+    ) -> pd.DataFrame:
         """Get hourly energy aggregates using pandas."""
         try:
             query = """
@@ -770,21 +832,20 @@ class TimescaleClient:
                     AND hour <= %s
                 ORDER BY hour DESC
             """
-            
+
             df = pd.read_sql(
-                query,
-                self.sqlalchemy_engine,
-                params=[station_id, start_time, end_time]
+                query, self.sqlalchemy_engine, params=[station_id, start_time, end_time]
             )
-            
+
             return df
-            
+
         except Exception as e:
             self.logger.error(f"Failed to get hourly energy aggregates: {e}")
             raise
-    
-    async def get_daily_fleet_metrics(self, fleet_operator_id: str, start_time: datetime,
-                                    end_time: datetime) -> pd.DataFrame:
+
+    async def get_daily_fleet_metrics(
+        self, fleet_operator_id: str, start_time: datetime, end_time: datetime
+    ) -> pd.DataFrame:
         """Get daily fleet metrics."""
         try:
             query = """
@@ -797,21 +858,20 @@ class TimescaleClient:
                     AND day <= %s
                 ORDER BY day DESC
             """
-            
+
             df = pd.read_sql(
-                query,
-                self.sqlalchemy_engine,
-                params=[fleet_operator_id, start_time, end_time]
+                query, self.sqlalchemy_engine, params=[fleet_operator_id, start_time, end_time]
             )
-            
+
             return df
-            
+
         except Exception as e:
             self.logger.error(f"Failed to get daily fleet metrics: {e}")
             raise
-    
-    async def get_energy_usage_summary(self, fleet_operator_id: str, start_time: datetime,
-                                     end_time: datetime) -> Dict[str, Any]:
+
+    async def get_energy_usage_summary(
+        self, fleet_operator_id: str, start_time: datetime, end_time: datetime
+    ) -> Dict[str, Any]:
         """Get energy usage summary."""
         try:
             async with self.pg_pool.acquire() as conn:
@@ -828,59 +888,65 @@ class TimescaleClient:
                         AND start_time <= $3
                         AND end_time IS NOT NULL
                 """
-                
+
                 result = await conn.fetchrow(query, fleet_operator_id, start_time, end_time)
                 return dict(result) if result else {}
-                
+
         except Exception as e:
             self.logger.error(f"Failed to get energy usage summary: {e}")
             raise
-    
+
     # Health Check
-    async def health_check(self) -> Dict[str, Any]:
+    async def health_check(self) -> Dict[str, Any]:  # noqa: F811
         """Check TimescaleDB connection health."""
         try:
             if not self.connected:
                 return {"status": "disconnected", "error": "Not connected"}
-            
+
             # Test asyncpg connection
             pg_status = "healthy"
             try:
                 async with self.pg_pool.acquire() as conn:
-                    await conn.fetchval('SELECT 1')
+                    await conn.fetchval("SELECT 1")
             except Exception as e:
                 pg_status = f"unhealthy: {str(e)}"
-            
+
             # Test SQLAlchemy connection
             sqlalchemy_status = "healthy"
             try:
                 with self.sqlalchemy_engine.connect() as conn:
-                    conn.execute(text('SELECT 1'))
+                    conn.execute(text("SELECT 1"))
             except Exception as e:
                 sqlalchemy_status = f"unhealthy: {str(e)}"
-            
+
             # Check TimescaleDB extension
             timescale_status = "healthy"
             try:
                 async with self.pg_pool.acquire() as conn:
-                    result = await conn.fetchval("SELECT extname FROM pg_extension WHERE extname = 'timescaledb'")
+                    result = await conn.fetchval(
+                        "SELECT extname FROM pg_extension WHERE extname = 'timescaledb'"
+                    )
                     if not result:
                         timescale_status = "timescaledb extension not found"
             except Exception as e:
                 timescale_status = f"unhealthy: {str(e)}"
-            
+
             return {
-                "status": "healthy" if all(s == "healthy" for s in [pg_status, sqlalchemy_status, timescale_status]) else "degraded",
+                "status": (
+                    "healthy"
+                    if all(s == "healthy" for s in [pg_status, sqlalchemy_status, timescale_status])
+                    else "degraded"
+                ),
                 "asyncpg": pg_status,
                 "sqlalchemy": sqlalchemy_status,
                 "timescaledb": timescale_status,
                 "pool_size": self.pg_pool.get_size() if self.pg_pool else 0,
-                "max_connections": self.config.max_connections
+                "max_connections": self.config.max_connections,
             }
-            
+
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}
-    
+
     # Utility Methods
     async def execute_query(self, query: str, *args) -> List[Dict[str, Any]]:
         """Execute a custom query with enhanced performance monitoring."""
@@ -889,7 +955,7 @@ class TimescaleClient:
         else:
             # Fallback to legacy method
             return await self._legacy_execute_query(query, *args)
-    
+
     async def _legacy_execute_query(self, query: str, *args) -> List[Dict[str, Any]]:
         """Legacy query execution method."""
         try:
@@ -899,7 +965,7 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to execute query: {e}")
             raise
-    
+
     async def execute_command(self, command: str, *args) -> str:
         """Execute a command (INSERT, UPDATE, DELETE)."""
         try:
@@ -909,81 +975,143 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to execute command: {e}")
             raise
-    
+
     # ===== NEW OCPP 2.0.1 DATABASE METHODS =====
-    
-    async def create_device_component(self, station_id: str, component_name: str, instance: str) -> None:
+
+    async def create_device_component(
+        self, station_id: str, component_name: str, instance: str
+    ) -> None:
         """Create device component."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO device_components (station_id, component_name, instance, created_at)
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (station_id, component_name, instance) DO NOTHING
-            """, station_id, component_name, instance, datetime.now(timezone.utc))
-    
-    async def get_device_variable(self, station_id: str, component_name: str, component_instance: str,
-                                variable_name: str, variable_instance: str, attribute_type: str) -> Optional[Dict[str, Any]]:
+            """,
+                station_id,
+                component_name,
+                instance,
+                datetime.now(timezone.utc),
+            )
+
+    async def get_device_variable(
+        self,
+        station_id: str,
+        component_name: str,
+        component_instance: str,
+        variable_name: str,
+        variable_instance: str,
+        attribute_type: str,
+    ) -> Optional[Dict[str, Any]]:
         """Get device variable value."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT value FROM device_variables
                 WHERE station_id = $1 AND component_name = $2 AND component_instance = $3
                 AND variable_name = $4 AND variable_instance = $5 AND attribute_type = $6
-            """, station_id, component_name, component_instance, variable_name, variable_instance, attribute_type)
-            
+            """,
+                station_id,
+                component_name,
+                component_instance,
+                variable_name,
+                variable_instance,
+                attribute_type,
+            )
+
             return dict(row) if row else None
-    
-    async def set_device_variable(self, station_id: str, component_name: str, component_instance: str,
-                                variable_name: str, variable_instance: str, attribute_type: str, value: Any) -> None:
+
+    async def set_device_variable(
+        self,
+        station_id: str,
+        component_name: str,
+        component_instance: str,
+        variable_name: str,
+        variable_instance: str,
+        attribute_type: str,
+        value: Any,
+    ) -> None:
         """Set device variable value."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO device_variables (
                     station_id, component_name, component_instance, variable_name, 
                     variable_instance, attribute_type, value, updated_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (station_id, component_name, component_instance, variable_name, variable_instance, attribute_type)
                 DO UPDATE SET value = $7, updated_at = $8
-            """, station_id, component_name, component_instance, variable_name, 
-                variable_instance, attribute_type, str(value), datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                component_name,
+                component_instance,
+                variable_name,
+                variable_instance,
+                attribute_type,
+                str(value),
+                datetime.now(timezone.utc),
+            )
+
     async def get_device_components(self, station_id: str) -> List[Dict[str, Any]]:
         """Get device components."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT component_name, instance FROM device_components
                 WHERE station_id = $1 ORDER BY component_name, instance
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def get_device_variables(self, station_id: str) -> List[Dict[str, Any]]:
         """Get device variables."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT component_name, component_instance, variable_name, variable_instance,
                        actual_value, target_value, default_value
                 FROM device_variables WHERE station_id = $1
                 ORDER BY component_name, variable_name
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
-    async def store_device_report(self, station_id: str, request_id: int, generated_at: str,
-                                tbc: bool, seq_no: int, report_data: List[Dict[str, Any]]) -> None:
+
+    async def store_device_report(
+        self,
+        station_id: str,
+        request_id: int,
+        generated_at: str,
+        tbc: bool,
+        seq_no: int,
+        report_data: List[Dict[str, Any]],
+    ) -> None:
         """Store device report."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO device_reports (
                     station_id, request_id, generated_at, tbc, seq_no, report_data, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            """, station_id, request_id, generated_at, tbc, seq_no, 
-                json.dumps(report_data), datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                request_id,
+                generated_at,
+                tbc,
+                seq_no,
+                json.dumps(report_data),
+                datetime.now(timezone.utc),
+            )
+
     async def store_charging_profile(self, profile_data: Dict[str, Any]) -> None:
         """Store charging profile."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO charging_profiles (
                     station_id, evse_id, profile_id, stack_level, purpose, kind,
                     schedule, valid_from, valid_to, transaction_id, created_at
@@ -992,25 +1120,41 @@ class TimescaleClient:
                 DO UPDATE SET stack_level = $4, purpose = $5, kind = $6,
                              schedule = $7, valid_from = $8, valid_to = $9,
                              transaction_id = $10, updated_at = $11
-            """, 
-                profile_data["station_id"], profile_data["evse_id"], profile_data["profile_id"],
-                profile_data["stack_level"], profile_data["purpose"], profile_data["kind"],
-                json.dumps(profile_data["schedule"]), profile_data.get("valid_from"),
-                profile_data.get("valid_to"), profile_data.get("transaction_id"),
-                datetime.now(timezone.utc))
-    
+            """,
+                profile_data["station_id"],
+                profile_data["evse_id"],
+                profile_data["profile_id"],
+                profile_data["stack_level"],
+                profile_data["purpose"],
+                profile_data["kind"],
+                json.dumps(profile_data["schedule"]),
+                profile_data.get("valid_from"),
+                profile_data.get("valid_to"),
+                profile_data.get("transaction_id"),
+                datetime.now(timezone.utc),
+            )
+
     async def remove_charging_profile(self, station_id: str, evse_id: int, profile_id: int) -> None:
         """Remove charging profile."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM charging_profiles
                 WHERE station_id = $1 AND evse_id = $2 AND profile_id = $3
-            """, station_id, evse_id, profile_id)
-    
-    async def get_charging_profiles(self, station_id: str, evse_id: int,
-                                  profile_id: Optional[int] = None,
-                                  purpose: Optional[str] = None,
-                                  stack_level: Optional[int] = None) -> List[Dict[str, Any]]:
+            """,
+                station_id,
+                evse_id,
+                profile_id,
+            )
+
+    async def get_charging_profiles(
+        self,
+        station_id: str,
+        evse_id: int,
+        profile_id: Optional[int] = None,
+        purpose: Optional[str] = None,
+        stack_level: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """Get charging profiles."""
         async with self.pg_pool.acquire() as conn:
             query = """
@@ -1018,7 +1162,7 @@ class TimescaleClient:
                 WHERE station_id = $1 AND evse_id = $2
             """
             params = [station_id, evse_id]
-            
+
             if profile_id is not None:
                 query += " AND profile_id = $3"
                 params.append(profile_id)
@@ -1028,113 +1172,154 @@ class TimescaleClient:
             elif stack_level is not None:
                 query += " AND stack_level = $3"
                 params.append(stack_level)
-            
+
             query += " ORDER BY stack_level DESC, created_at DESC"
-            
+
             rows = await conn.fetch(query, *params)
             return [{"schedule": json.loads(row["schedule"])} for row in rows]
-    
-    async def get_active_charging_profiles(self, station_id: str, evse_id: int, 
-                                         current_time: datetime) -> List[Dict[str, Any]]:
+
+    async def get_active_charging_profiles(
+        self, station_id: str, evse_id: int, current_time: datetime
+    ) -> List[Dict[str, Any]]:
         """Get active charging profiles."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT schedule FROM charging_profiles
                 WHERE station_id = $1 AND evse_id = $2
                 AND (valid_from IS NULL OR valid_from <= $3)
                 AND (valid_to IS NULL OR valid_to >= $3)
                 ORDER BY stack_level DESC, created_at DESC
-            """, station_id, evse_id, current_time)
-            
+            """,
+                station_id,
+                evse_id,
+                current_time,
+            )
+
             return [{"schedule": json.loads(row["schedule"])} for row in rows]
-    
+
     async def store_reported_charging_profile(self, profile_data: Dict[str, Any]) -> None:
         """Store reported charging profile."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO reported_charging_profiles (
                     station_id, evse_id, request_id, profile, reported_at
                 ) VALUES ($1, $2, $3, $4, $5)
-            """, 
-                profile_data["station_id"], profile_data["evse_id"], 
-                profile_data["request_id"], json.dumps(profile_data["profile"]),
-                profile_data["reported_at"])
-    
+            """,
+                profile_data["station_id"],
+                profile_data["evse_id"],
+                profile_data["request_id"],
+                json.dumps(profile_data["profile"]),
+                profile_data["reported_at"],
+            )
+
     async def store_transaction(self, transaction_data: Dict[str, Any]) -> None:
         """Store transaction."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO transactions (
                     station_id, transaction_id, evse_id, connector_id,
                     id_token, id_token_type, charging_state, remote_start_id, started_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (station_id, transaction_id)
                 DO UPDATE SET charging_state = $7, updated_at = $9
-            """, 
-                transaction_data["station_id"], transaction_data["transaction_id"],
-                transaction_data["evse_id"], transaction_data["connector_id"],
-                transaction_data["id_token"], transaction_data["id_token_type"],
-                transaction_data["charging_state"], transaction_data.get("remote_start_id"),
-                transaction_data["started_at"])
-    
+            """,
+                transaction_data["station_id"],
+                transaction_data["transaction_id"],
+                transaction_data["evse_id"],
+                transaction_data["connector_id"],
+                transaction_data["id_token"],
+                transaction_data["id_token_type"],
+                transaction_data["charging_state"],
+                transaction_data.get("remote_start_id"),
+                transaction_data["started_at"],
+            )
+
     async def update_transaction(self, transaction_data: Dict[str, Any]) -> None:
         """Update transaction."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE transactions SET
                     charging_state = $3, stopped_reason = $4, time_spent_charging = $5,
                     ended_at = $6, updated_at = $6
                 WHERE station_id = $1 AND transaction_id = $2
-            """, 
-                transaction_data["station_id"], transaction_data["transaction_id"],
-                transaction_data["charging_state"], transaction_data.get("stopped_reason"),
-                transaction_data.get("time_spent_charging"), transaction_data["ended_at"])
-    
-    async def get_transaction(self, station_id: str, transaction_id: str) -> Optional[Dict[str, Any]]:
+            """,
+                transaction_data["station_id"],
+                transaction_data["transaction_id"],
+                transaction_data["charging_state"],
+                transaction_data.get("stopped_reason"),
+                transaction_data.get("time_spent_charging"),
+                transaction_data["ended_at"],
+            )
+
+    async def get_transaction(
+        self, station_id: str, transaction_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Get transaction."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT transaction_id, charging_state, time_spent_charging, stopped_reason,
                        remote_start_id, evse_id, connector_id
                 FROM transactions WHERE station_id = $1 AND transaction_id = $2
-            """, station_id, transaction_id)
-            
+            """,
+                station_id,
+                transaction_id,
+            )
+
             return dict(row) if row else None
-    
+
     async def store_transaction_event(self, event_data: Dict[str, Any]) -> None:
         """Store transaction event."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO transaction_events (
                     station_id, transaction_id, event_type, timestamp, charging_state,
                     time_spent_charging, stopped_reason, remote_start_id, evse_id,
                     connector_id, meter_value, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            """, 
-                event_data["station_id"], event_data["transaction_id"], event_data["event_type"],
-                event_data["timestamp"], event_data.get("charging_state"),
-                event_data.get("time_spent_charging"), event_data.get("stopped_reason"),
-                event_data.get("remote_start_id"), event_data.get("evse_id"),
-                event_data.get("connector_id"), json.dumps(event_data.get("meter_value", [])),
-                datetime.now(timezone.utc))
-    
+            """,
+                event_data["station_id"],
+                event_data["transaction_id"],
+                event_data["event_type"],
+                event_data["timestamp"],
+                event_data.get("charging_state"),
+                event_data.get("time_spent_charging"),
+                event_data.get("stopped_reason"),
+                event_data.get("remote_start_id"),
+                event_data.get("evse_id"),
+                event_data.get("connector_id"),
+                json.dumps(event_data.get("meter_value", [])),
+                datetime.now(timezone.utc),
+            )
+
     async def get_id_token_info(self, id_token: str, token_type: str) -> Optional[Dict[str, Any]]:
         """Get ID token information."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT cache_timeout, charging_priority, language1, language2,
                        group_id_token, personal_message
                 FROM authorization_cache
                 WHERE id_token = $1 AND token_type = $2
                 AND expires_at > $3
-            """, id_token, token_type, datetime.now(timezone.utc))
-            
+            """,
+                id_token,
+                token_type,
+                datetime.now(timezone.utc),
+            )
+
             return dict(row) if row else None
-    
+
     async def store_tariff(self, station_id: str, tariff_data: Dict[str, Any]) -> None:
         """Store tariff."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO tariffs (
                     station_id, tariff_id, currency, tariff_element,
                     start_date_time, end_date_time, min_price, max_price, created_at
@@ -1143,33 +1328,43 @@ class TimescaleClient:
                 DO UPDATE SET currency = $3, tariff_element = $4,
                              start_date_time = $5, end_date_time = $6,
                              min_price = $7, max_price = $8, updated_at = $9
-            """, 
-                station_id, tariff_data["tariff_id"], tariff_data["currency"],
-                json.dumps(tariff_data["tariff_element"]), tariff_data.get("start_date_time"),
-                tariff_data.get("end_date_time"), tariff_data.get("min_price"),
-                tariff_data.get("max_price"), datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                tariff_data["tariff_id"],
+                tariff_data["currency"],
+                json.dumps(tariff_data["tariff_element"]),
+                tariff_data.get("start_date_time"),
+                tariff_data.get("end_date_time"),
+                tariff_data.get("min_price"),
+                tariff_data.get("max_price"),
+                datetime.now(timezone.utc),
+            )
+
     async def get_tariff(self, station_id: str) -> Optional[Dict[str, Any]]:
         """Get tariff."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT tariff_id, currency, tariff_element, start_date_time,
                        end_date_time, min_price, max_price
                 FROM tariffs WHERE station_id = $1
                 ORDER BY created_at DESC LIMIT 1
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             if row:
                 data = dict(row)
                 data["tariff_element"] = json.loads(data["tariff_element"])
                 return data
-            
+
             return None
-    
+
     async def get_transaction_energy(self, station_id: str, transaction_id: str) -> Dict[str, Any]:
         """Get transaction energy consumption."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT SUM(energy_kwh) as energy_kwh, SUM(power_kw) as power_kw
                 FROM telemetry
                 WHERE station_id = $1 AND session_id = $2
@@ -1177,14 +1372,18 @@ class TimescaleClient:
                     SELECT started_at FROM transactions 
                     WHERE station_id = $1 AND transaction_id = $2
                 )
-            """, station_id, transaction_id)
-            
+            """,
+                station_id,
+                transaction_id,
+            )
+
             return dict(row) if row else {"energy_kwh": 0.0, "power_kw": 0.0}
-    
+
     async def store_transaction_cost(self, cost_data: Dict[str, Any]) -> None:
         """Store transaction cost."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO transaction_costs (
                     station_id, transaction_id, total_cost, currency,
                     cost_breakdown, calculated_at
@@ -1192,72 +1391,97 @@ class TimescaleClient:
                 ON CONFLICT (station_id, transaction_id)
                 DO UPDATE SET total_cost = $3, currency = $4,
                              cost_breakdown = $5, calculated_at = $6
-            """, 
-                cost_data["station_id"], cost_data["transaction_id"],
-                cost_data["total_cost"], cost_data["currency"],
-                json.dumps(cost_data["cost_breakdown"]), cost_data["calculated_at"])
-    
+            """,
+                cost_data["station_id"],
+                cost_data["transaction_id"],
+                cost_data["total_cost"],
+                cost_data["currency"],
+                json.dumps(cost_data["cost_breakdown"]),
+                cost_data["calculated_at"],
+            )
+
     async def get_evse_status(self, station_id: str, evse_id: int) -> Optional[Dict[str, Any]]:
         """Get EVSE status."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT status FROM connector_status
                 WHERE station_id = $1 AND evse_id = $2
                 ORDER BY timestamp DESC LIMIT 1
-            """, station_id, evse_id)
-            
+            """,
+                station_id,
+                evse_id,
+            )
+
             return dict(row) if row else None
-    
+
     async def store_reset_request(self, reset_data: Dict[str, Any]) -> None:
         """Store reset request."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO reset_requests (
                     station_id, reset_type, evse_id, requested_at
                 ) VALUES ($1, $2, $3, $4)
-            """, 
-                reset_data["station_id"], reset_data["reset_type"],
-                reset_data.get("evse_id"), reset_data["requested_at"])
-    
+            """,
+                reset_data["station_id"],
+                reset_data["reset_type"],
+                reset_data.get("evse_id"),
+                reset_data["requested_at"],
+            )
+
     async def store_availability_change(self, availability_data: Dict[str, Any]) -> None:
         """Store availability change."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO availability_changes (
                     station_id, evse_id, operational_status, changed_at
                 ) VALUES ($1, $2, $3, $4)
-            """, 
-                availability_data["station_id"], availability_data.get("evse_id"),
-                availability_data["operational_status"], availability_data["changed_at"])
-    
+            """,
+                availability_data["station_id"],
+                availability_data.get("evse_id"),
+                availability_data["operational_status"],
+                availability_data["changed_at"],
+            )
+
     async def store_trigger_message(self, trigger_data: Dict[str, Any]) -> None:
         """Store trigger message."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO trigger_messages (
                     station_id, evse_id, requested_message, triggered_at
                 ) VALUES ($1, $2, $3, $4)
-            """, 
-                trigger_data["station_id"], trigger_data.get("evse_id"),
-                trigger_data["requested_message"], trigger_data["triggered_at"])
-    
+            """,
+                trigger_data["station_id"],
+                trigger_data.get("evse_id"),
+                trigger_data["requested_message"],
+                trigger_data["triggered_at"],
+            )
+
     async def store_unlock_connector(self, unlock_data: Dict[str, Any]) -> None:
         """Store unlock connector request."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO unlock_connector_requests (
                     station_id, evse_id, connector_id, unlocked_at
                 ) VALUES ($1, $2, $3, $4)
-            """, 
-                unlock_data["station_id"], unlock_data["evse_id"],
-                unlock_data["connector_id"], unlock_data["unlocked_at"])
-    
+            """,
+                unlock_data["station_id"],
+                unlock_data["evse_id"],
+                unlock_data["connector_id"],
+                unlock_data["unlocked_at"],
+            )
+
     # ===== CERTIFICATE MANAGEMENT METHODS =====
-    
+
     async def store_certificate(self, certificate_data: Dict[str, Any]) -> None:
         """Store certificate."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO certificates (
                     station_id, certificate_type, certificate_data, certificate_chain,
                     issuer_name, subject_name, serial_number, valid_from, valid_to,
@@ -1268,187 +1492,261 @@ class TimescaleClient:
                              issuer_name = $5, subject_name = $6,
                              valid_from = $8, valid_to = $9, status = $10,
                              installation_date = $11, updated_at = $12
-            """, 
-                certificate_data["station_id"], certificate_data["certificate_type"],
-                certificate_data["certificate_data"], certificate_data["certificate_chain"],
-                certificate_data["issuer_name"], certificate_data["subject_name"],
-                certificate_data["serial_number"], certificate_data["valid_from"],
-                certificate_data["valid_to"], certificate_data["status"],
-                certificate_data["installation_date"], datetime.now(timezone.utc))
-    
-    async def get_certificate(self, station_id: str, certificate_type: str) -> Optional[Dict[str, Any]]:
+            """,
+                certificate_data["station_id"],
+                certificate_data["certificate_type"],
+                certificate_data["certificate_data"],
+                certificate_data["certificate_chain"],
+                certificate_data["issuer_name"],
+                certificate_data["subject_name"],
+                certificate_data["serial_number"],
+                certificate_data["valid_from"],
+                certificate_data["valid_to"],
+                certificate_data["status"],
+                certificate_data["installation_date"],
+                datetime.now(timezone.utc),
+            )
+
+    async def get_certificate(
+        self, station_id: str, certificate_type: str
+    ) -> Optional[Dict[str, Any]]:
         """Get certificate."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT certificate_data, certificate_chain, issuer_name, subject_name,
                        serial_number, valid_from, valid_to, status, installation_date
                 FROM certificates WHERE station_id = $1 AND certificate_type = $2
                 ORDER BY installation_date DESC LIMIT 1
-            """, station_id, certificate_type)
-            
+            """,
+                station_id,
+                certificate_type,
+            )
+
             return dict(row) if row else None
-    
+
     async def count_certificates(self, station_id: str, certificate_type: str) -> int:
         """Count certificates of a type."""
         async with self.pg_pool.acquire() as conn:
-            count = await conn.fetchval("""
+            count = await conn.fetchval(
+                """
                 SELECT COUNT(*) FROM certificates
                 WHERE station_id = $1 AND certificate_type = $2
-            """, station_id, certificate_type)
-            
+            """,
+                station_id,
+                certificate_type,
+            )
+
             return count or 0
-    
-    async def get_installed_certificates(self, station_id: str, certificate_type: Optional[str]) -> List[Dict[str, Any]]:
+
+    async def get_installed_certificates(
+        self, station_id: str, certificate_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
         """Get installed certificates."""
         async with self.pg_pool.acquire() as conn:
             if certificate_type:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT certificate_type, certificate_data, certificate_chain,
                            issuer_name, subject_name, serial_number, valid_from,
                            valid_to, status, installation_date
                     FROM certificates WHERE station_id = $1 AND certificate_type = $2
                     ORDER BY installation_date DESC
-                """, station_id, certificate_type)
+                """,
+                    station_id,
+                    certificate_type,
+                )
             else:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT certificate_type, certificate_data, certificate_chain,
                            issuer_name, subject_name, serial_number, valid_from,
                            valid_to, status, installation_date
                     FROM certificates WHERE station_id = $1
                     ORDER BY installation_date DESC
-                """, station_id)
-            
+                """,
+                    station_id,
+                )
+
             return [dict(row) for row in rows]
-    
-    async def find_certificate_by_hash(self, station_id: str, certificate_type: str,
-                                     hash_algorithm: str, issuer_name_hash: str,
-                                     issuer_key_hash: str, serial_number: str) -> Optional[str]:
+
+    async def find_certificate_by_hash(
+        self,
+        station_id: str,
+        certificate_type: str,
+        hash_algorithm: str,
+        issuer_name_hash: str,
+        issuer_key_hash: str,
+        serial_number: str,
+    ) -> Optional[str]:
         """Find certificate by hash data."""
         async with self.pg_pool.acquire() as conn:
-            certificate_id = await conn.fetchval("""
+            certificate_id = await conn.fetchval(
+                """
                 SELECT id FROM certificates
                 WHERE station_id = $1 AND certificate_type = $2
                 AND serial_number = $3
                 ORDER BY installation_date DESC LIMIT 1
-            """, station_id, certificate_type, serial_number)
-            
+            """,
+                station_id,
+                certificate_type,
+                serial_number,
+            )
+
             return str(certificate_id) if certificate_id else None
-    
+
     async def delete_certificate(self, station_id: str, certificate_id: str) -> None:
         """Delete certificate."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM certificates
                 WHERE station_id = $1 AND id = $2
-            """, station_id, certificate_id)
-    
+            """,
+                station_id,
+                certificate_id,
+            )
+
     # ===== SECURITY MANAGEMENT METHODS =====
-    
+
     async def store_auth_token(self, token_data: Dict[str, Any]) -> None:
         """Store authentication token."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO auth_tokens (
                     station_id, token, token_type, expires_at, created_at
                 ) VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (station_id, token_type)
                 DO UPDATE SET token = $2, expires_at = $4, created_at = $5
-            """, 
-                token_data["station_id"], token_data["token"], token_data["token_type"],
-                token_data["expires_at"], token_data["created_at"])
-    
+            """,
+                token_data["station_id"],
+                token_data["token"],
+                token_data["token_type"],
+                token_data["expires_at"],
+                token_data["created_at"],
+            )
+
     async def update_token_usage(self, station_id: str, token: str, last_used: datetime) -> None:
         """Update token usage statistics."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE auth_tokens SET
                     last_used = $3, usage_count = usage_count + 1
                 WHERE station_id = $1 AND token = $2
-            """, station_id, token, last_used)
-    
+            """,
+                station_id,
+                token,
+                last_used,
+            )
+
     async def revoke_auth_token(self, station_id: str, revoked_at: datetime) -> None:
         """Revoke authentication token."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE auth_tokens SET
                     revoked_at = $2, expires_at = $2
                 WHERE station_id = $1 AND revoked_at IS NULL
-            """, station_id, revoked_at)
-    
+            """,
+                station_id,
+                revoked_at,
+            )
+
     async def store_security_event(self, event_data: Dict[str, Any]) -> None:
         """Store security event."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO security_events (
                     station_id, event_type, timestamp, tech_info, additional_info, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6)
-            """, 
-                event_data["station_id"], event_data["event_type"], event_data["timestamp"],
-                event_data.get("tech_info"), json.dumps(event_data.get("additional_info", {})),
-                datetime.now(timezone.utc))
-    
-    async def get_security_events(self, station_id: Optional[str] = None,
-                                event_type: Optional[str] = None,
-                                start_time: Optional[datetime] = None,
-                                end_time: Optional[datetime] = None) -> List[Dict[str, Any]]:
+            """,
+                event_data["station_id"],
+                event_data["event_type"],
+                event_data["timestamp"],
+                event_data.get("tech_info"),
+                json.dumps(event_data.get("additional_info", {})),
+                datetime.now(timezone.utc),
+            )
+
+    async def get_security_events(
+        self,
+        station_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
         """Get security events with filters."""
         async with self.pg_pool.acquire() as conn:
             query = "SELECT event_type, timestamp, tech_info, additional_info FROM security_events WHERE 1=1"
             params = []
-            
+
             if station_id:
                 query += " AND station_id = $" + str(len(params) + 1)
                 params.append(station_id)
-            
+
             if event_type:
                 query += " AND event_type = $" + str(len(params) + 1)
                 params.append(event_type)
-            
+
             if start_time:
                 query += " AND timestamp >= $" + str(len(params) + 1)
                 params.append(start_time)
-            
+
             if end_time:
                 query += " AND timestamp <= $" + str(len(params) + 1)
                 params.append(end_time)
-            
+
             query += " ORDER BY timestamp DESC LIMIT 1000"
-            
+
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
-    
+
     async def validate_api_key(self, station_id: str, api_key: str) -> bool:
         """Validate API key."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT id FROM api_keys
                 WHERE station_id = $1 AND api_key = $2 AND active = true
                 AND (expires_at IS NULL OR expires_at > $3)
-            """, station_id, api_key, datetime.now(timezone.utc))
-            
+            """,
+                station_id,
+                api_key,
+                datetime.now(timezone.utc),
+            )
+
             return row is not None
-    
+
     async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
         """Validate basic authentication credentials."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT password_hash FROM station_credentials
                 WHERE station_id = $1 AND username = $2 AND active = true
-            """, station_id, username)
-            
+            """,
+                station_id,
+                username,
+            )
+
             if not row:
                 return False
-            
+
             # Verify password hash
             import bcrypt
-            return bcrypt.checkpw(password.encode('utf-8'), row['password_hash'].encode('utf-8'))
-    
+
+            return bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8"))
+
     # ===== PLUG & CHARGE METHODS =====
-    
+
     async def store_contract_info(self, contract_data: Dict[str, Any]) -> None:
         """Store contract information."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO contracts (
                     contract_id, ev_contract_id, certificate_chain, contract_certificate,
                     valid_from, valid_to, status, energy_contract_id, tariff_id,
@@ -1459,35 +1757,50 @@ class TimescaleClient:
                              contract_certificate = $4, valid_from = $5, valid_to = $6,
                              status = $7, energy_contract_id = $8, tariff_id = $9,
                              max_power = $10, max_energy = $11, updated_at = $12
-            """, 
-                contract_data["contract_id"], contract_data["ev_contract_id"],
-                contract_data["certificate_chain"], contract_data["contract_certificate"],
-                contract_data["valid_from"], contract_data["valid_to"], contract_data["status"],
-                contract_data.get("energy_contract_id"), contract_data.get("tariff_id"),
-                contract_data.get("max_power"), contract_data.get("max_energy"),
-                datetime.now(timezone.utc))
-    
+            """,
+                contract_data["contract_id"],
+                contract_data["ev_contract_id"],
+                contract_data["certificate_chain"],
+                contract_data["contract_certificate"],
+                contract_data["valid_from"],
+                contract_data["valid_to"],
+                contract_data["status"],
+                contract_data.get("energy_contract_id"),
+                contract_data.get("tariff_id"),
+                contract_data.get("max_power"),
+                contract_data.get("max_energy"),
+                datetime.now(timezone.utc),
+            )
+
     async def get_contract_info(self, contract_id: str) -> Optional[Dict[str, Any]]:
         """Get contract information."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT contract_id, ev_contract_id, certificate_chain, contract_certificate,
                        valid_from, valid_to, status, energy_contract_id, tariff_id,
                        max_power, max_energy
                 FROM contracts WHERE contract_id = $1
-            """, contract_id)
-            
+            """,
+                contract_id,
+            )
+
             return dict(row) if row else None
-    
+
     async def revoke_contract(self, contract_id: str, reason: str, revoked_at: datetime) -> None:
         """Revoke contract."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE contracts SET
                     status = 'Revoked', revoked_at = $2, revoked_reason = $3
                 WHERE contract_id = $1
-            """, contract_id, revoked_at, reason)
-    
+            """,
+                contract_id,
+                revoked_at,
+                reason,
+            )
+
     async def get_trusted_root_certificates(self) -> List[x509.Certificate]:
         """Get trusted root certificates."""
         async with self.pg_pool.acquire() as conn:
@@ -1495,7 +1808,7 @@ class TimescaleClient:
                 SELECT certificate_data FROM certificates
                 WHERE certificate_type = 'V2GRootCertificate' AND status = 'Valid'
             """)
-            
+
             certificates = []
             for row in rows:
                 try:
@@ -1504,55 +1817,71 @@ class TimescaleClient:
                     certificates.append(cert)
                 except Exception as e:
                     self.logger.error(f"Error loading trusted root certificate: {e}")
-            
+
             return certificates
-    
+
     async def get_energy_contract(self, energy_contract_id: str) -> Optional[Dict[str, Any]]:
         """Get energy contract."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT energy_contract_id, active, valid_from, valid_to, max_power, max_energy
                 FROM energy_contracts WHERE energy_contract_id = $1
-            """, energy_contract_id)
-            
+            """,
+                energy_contract_id,
+            )
+
             return dict(row) if row else None
-    
+
     async def get_tariff_by_id(self, tariff_id: str) -> Optional[Dict[str, Any]]:
         """Get tariff by ID."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT tariff_id, active, valid_from, valid_to, currency, tariff_element
                 FROM tariffs WHERE tariff_id = $1
-            """, tariff_id)
-            
+            """,
+                tariff_id,
+            )
+
             return dict(row) if row else None
-    
-    async def get_evse_capabilities(self, station_id: str, evse_id: int) -> Optional[Dict[str, Any]]:
+
+    async def get_evse_capabilities(
+        self, station_id: str, evse_id: int
+    ) -> Optional[Dict[str, Any]]:
         """Get EVSE capabilities."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT max_power, connector_types, supported_protocols, v2g_capable
                 FROM evse_capabilities WHERE station_id = $1 AND evse_id = $2
-            """, station_id, evse_id)
-            
+            """,
+                station_id,
+                evse_id,
+            )
+
             return dict(row) if row else None
-    
+
     async def get_token_balance(self, id_token: str) -> Optional[Dict[str, Any]]:
         """Get token balance."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT balance, currency, last_updated
                 FROM token_balances WHERE id_token = $1
-            """, id_token)
-            
+            """,
+                id_token,
+            )
+
             return dict(row) if row else None
-    
+
     # ===== SMART CHARGING METHODS =====
-    
+
     async def store_grid_constraint(self, constraint_data: Dict[str, Any]) -> None:
         """Store grid constraint."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO grid_constraints (
                     constraint_id, constraint_type, location, max_power, min_power,
                     valid_from, valid_to, priority, description, created_at
@@ -1561,24 +1890,34 @@ class TimescaleClient:
                 DO UPDATE SET constraint_type = $2, location = $3, max_power = $4,
                              min_power = $5, valid_from = $6, valid_to = $7,
                              priority = $8, description = $9, updated_at = $10
-            """, 
-                constraint_data["constraint_id"], constraint_data["constraint_type"],
-                constraint_data["location"], constraint_data["max_power"],
-                constraint_data["min_power"], constraint_data.get("valid_from"),
-                constraint_data.get("valid_to"), constraint_data["priority"],
-                constraint_data.get("description"), datetime.now(timezone.utc))
-    
+            """,
+                constraint_data["constraint_id"],
+                constraint_data["constraint_type"],
+                constraint_data["location"],
+                constraint_data["max_power"],
+                constraint_data["min_power"],
+                constraint_data.get("valid_from"),
+                constraint_data.get("valid_to"),
+                constraint_data["priority"],
+                constraint_data.get("description"),
+                datetime.now(timezone.utc),
+            )
+
     async def remove_grid_constraint(self, constraint_id: str) -> None:
         """Remove grid constraint."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM grid_constraints WHERE constraint_id = $1
-            """, constraint_id)
-    
+            """,
+                constraint_id,
+            )
+
     async def get_active_grid_constraints(self, location: str) -> List[Dict[str, Any]]:
         """Get active grid constraints for location."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT constraint_id, constraint_type, location, max_power, min_power,
                        valid_from, valid_to, priority, description
                 FROM grid_constraints
@@ -1586,123 +1925,174 @@ class TimescaleClient:
                 AND (valid_from IS NULL OR valid_from <= $2)
                 AND (valid_to IS NULL OR valid_to >= $2)
                 ORDER BY priority DESC
-            """, location, datetime.now(timezone.utc))
-            
+            """,
+                location,
+                datetime.now(timezone.utc),
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def store_demand_response_event(self, event_data: Dict[str, Any]) -> None:
         """Store demand response event."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO demand_response_events (
                     event_id, signal, start_time, end_time, target_reduction,
                     target_increase, affected_stations, priority, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            """, 
-                event_data["event_id"], event_data["signal"], event_data["start_time"],
-                event_data["end_time"], event_data.get("target_reduction"),
-                event_data.get("target_increase"), event_data["affected_stations"],
-                event_data["priority"], datetime.now(timezone.utc))
-    
+            """,
+                event_data["event_id"],
+                event_data["signal"],
+                event_data["start_time"],
+                event_data["end_time"],
+                event_data.get("target_reduction"),
+                event_data.get("target_increase"),
+                event_data["affected_stations"],
+                event_data["priority"],
+                datetime.now(timezone.utc),
+            )
+
     async def get_station_evse_ids(self, station_id: str) -> List[int]:
         """Get all EVSE IDs for station."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT DISTINCT evse_id FROM evse_capabilities
                 WHERE station_id = $1 ORDER BY evse_id
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [row["evse_id"] for row in rows]
-    
+
     async def get_evse_priority(self, station_id: str, evse_id: int) -> Optional[str]:
         """Get EVSE priority."""
         async with self.pg_pool.acquire() as conn:
-            priority = await conn.fetchval("""
+            priority = await conn.fetchval(
+                """
                 SELECT priority FROM evse_priorities
                 WHERE station_id = $1 AND evse_id = $2
-            """, station_id, evse_id)
-            
+            """,
+                station_id,
+                evse_id,
+            )
+
             return priority
-    
+
     async def get_evse_price_sensitivity(self, station_id: str, evse_id: int) -> Optional[float]:
         """Get EVSE price sensitivity."""
         async with self.pg_pool.acquire() as conn:
-            sensitivity = await conn.fetchval("""
+            sensitivity = await conn.fetchval(
+                """
                 SELECT price_sensitivity FROM evse_configurations
                 WHERE station_id = $1 AND evse_id = $2
-            """, station_id, evse_id)
-            
+            """,
+                station_id,
+                evse_id,
+            )
+
             return sensitivity
-    
+
     async def get_current_evse_power(self, station_id: str, evse_id: int) -> Optional[float]:
         """Get current EVSE power consumption."""
         async with self.pg_pool.acquire() as conn:
-            power = await conn.fetchval("""
+            power = await conn.fetchval(
+                """
                 SELECT power_kw FROM telemetry
                 WHERE station_id = $1 AND evse_id = $2
                 ORDER BY time DESC LIMIT 1
-            """, station_id, evse_id)
-            
+            """,
+                station_id,
+                evse_id,
+            )
+
             return power
-    
+
     async def get_current_electricity_prices(self, station_id: str) -> Dict[str, float]:
         """Get current electricity prices."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT current_price, forecast_prices FROM electricity_prices
                 WHERE station_id = $1
                 ORDER BY timestamp DESC LIMIT 1
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             if row:
                 return {
                     "current": row["current_price"],
-                    "forecast": json.loads(row.get("forecast_prices", "{}"))
+                    "forecast": json.loads(row.get("forecast_prices", "{}")),
                 }
-            
+
             return {}
-    
+
     async def get_evse_v2g_capability(self, station_id: str, evse_id: int) -> Optional[bool]:
         """Get EVSE V2G capability."""
         async with self.pg_pool.acquire() as conn:
-            v2g_capable = await conn.fetchval("""
+            v2g_capable = await conn.fetchval(
+                """
                 SELECT v2g_capable FROM evse_capabilities
                 WHERE station_id = $1 AND evse_id = $2
-            """, station_id, evse_id)
-            
+            """,
+                station_id,
+                evse_id,
+            )
+
             return v2g_capable
-    
-    async def update_evse_power_limit(self, station_id: str, evse_id: int, multiplier: float) -> None:
+
+    async def update_evse_power_limit(
+        self, station_id: str, evse_id: int, multiplier: float
+    ) -> None:
         """Update EVSE power limit."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE evse_capabilities SET
                     current_power_limit = max_power * $3,
                     updated_at = $4
                 WHERE station_id = $1 AND evse_id = $2
-            """, station_id, evse_id, multiplier, datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                evse_id,
+                multiplier,
+                datetime.now(timezone.utc),
+            )
+
     # ===== ADVANCED METERING METHODS =====
-    
+
     async def store_signed_meter_value(self, meter_data: Dict[str, Any]) -> None:
         """Store signed meter value."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO signed_meter_values (
                     station_id, evse_id, timestamp, sampled_value, reading_context,
                     format, signature, signature_method, encoding_method, public_key,
                     signed_data, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            """, 
-                meter_data["station_id"], meter_data["evse_id"], meter_data["timestamp"],
-                meter_data["sampled_value"], meter_data["reading_context"], meter_data["format"],
-                meter_data["signature"], meter_data["signature_method"], meter_data["encoding_method"],
-                meter_data["public_key"], meter_data["signed_data"], datetime.now(timezone.utc))
-    
+            """,
+                meter_data["station_id"],
+                meter_data["evse_id"],
+                meter_data["timestamp"],
+                meter_data["sampled_value"],
+                meter_data["reading_context"],
+                meter_data["format"],
+                meter_data["signature"],
+                meter_data["signature_method"],
+                meter_data["encoding_method"],
+                meter_data["public_key"],
+                meter_data["signed_data"],
+                datetime.now(timezone.utc),
+            )
+
     async def store_energy_accounting(self, accounting_data: Dict[str, Any]) -> None:
         """Store energy accounting."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO energy_accounting (
                     station_id, evse_id, connector_id, transaction_id,
                     energy_import_kwh, energy_export_kwh, reactive_energy_import_kvarh,
@@ -1713,19 +2103,28 @@ class TimescaleClient:
                 DO UPDATE SET energy_import_kwh = $5, energy_export_kwh = $6,
                              reactive_energy_import_kvarh = $7, reactive_energy_export_kvarh = $8,
                              end_time = $10, billing_accuracy = $11, updated_at = $12
-            """, 
-                accounting_data["station_id"], accounting_data["evse_id"],
-                accounting_data["connector_id"], accounting_data.get("transaction_id"),
-                accounting_data["energy_import_kwh"], accounting_data["energy_export_kwh"],
-                accounting_data["reactive_energy_import_kvarh"], accounting_data["reactive_energy_export_kvarh"],
-                accounting_data["start_time"], accounting_data.get("end_time"),
-                accounting_data["billing_accuracy"], datetime.now(timezone.utc))
-    
-    async def get_energy_accounting(self, station_id: str, evse_id: int, 
-                                  transaction_id: Optional[str]) -> Optional[Dict[str, Any]]:
+            """,
+                accounting_data["station_id"],
+                accounting_data["evse_id"],
+                accounting_data["connector_id"],
+                accounting_data.get("transaction_id"),
+                accounting_data["energy_import_kwh"],
+                accounting_data["energy_export_kwh"],
+                accounting_data["reactive_energy_import_kvarh"],
+                accounting_data["reactive_energy_export_kvarh"],
+                accounting_data["start_time"],
+                accounting_data.get("end_time"),
+                accounting_data["billing_accuracy"],
+                datetime.now(timezone.utc),
+            )
+
+    async def get_energy_accounting(
+        self, station_id: str, evse_id: int, transaction_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
         """Get energy accounting."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT station_id, evse_id, connector_id, transaction_id,
                        energy_import_kwh, energy_export_kwh, reactive_energy_import_kvarh,
                        reactive_energy_export_kvarh, start_time, end_time, billing_accuracy
@@ -1733,342 +2132,482 @@ class TimescaleClient:
                 WHERE station_id = $1 AND evse_id = $2 AND connector_id = $3
                 AND (transaction_id = $4 OR ($4 IS NULL AND transaction_id IS NULL))
                 ORDER BY created_at DESC LIMIT 1
-            """, station_id, evse_id, 1, transaction_id)
-            
+            """,
+                station_id,
+                evse_id,
+                1,
+                transaction_id,
+            )
+
             return dict(row) if row else None
-    
+
     async def store_meter_calibration(self, calibration_data: Dict[str, Any]) -> None:
         """Store meter calibration."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO meter_calibrations (
                     station_id, calibration_data, calibrated_at, accuracy, created_at
                 ) VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (station_id)
                 DO UPDATE SET calibration_data = $2, calibrated_at = $3,
                              accuracy = $4, updated_at = $5
-            """, 
-                calibration_data["station_id"], calibration_data["calibration_data"],
-                calibration_data["calibrated_at"], calibration_data["accuracy"],
-                datetime.now(timezone.utc))
-    
+            """,
+                calibration_data["station_id"],
+                calibration_data["calibration_data"],
+                calibration_data["calibrated_at"],
+                calibration_data["accuracy"],
+                datetime.now(timezone.utc),
+            )
+
     async def get_meter_calibration(self, station_id: str) -> Optional[Dict[str, Any]]:
         """Get meter calibration."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT calibration_data, calibrated_at, accuracy
                 FROM meter_calibrations WHERE station_id = $1
                 ORDER BY calibrated_at DESC LIMIT 1
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return dict(row) if row else None
-    
+
     async def get_meter_accuracy(self, station_id: str) -> Optional[float]:
         """Get meter accuracy."""
         async with self.pg_pool.acquire() as conn:
-            accuracy = await conn.fetchval("""
+            accuracy = await conn.fetchval(
+                """
                 SELECT accuracy FROM meter_calibrations
                 WHERE station_id = $1 ORDER BY calibrated_at DESC LIMIT 1
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return accuracy
-    
+
     async def store_power_quality_events(self, event_data: Dict[str, Any]) -> None:
         """Store power quality events."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO power_quality_events (
                     station_id, timestamp, events, voltage_l1, voltage_l2, voltage_l3,
                     current_l1, current_l2, current_l3, frequency, power_factor,
                     thd_voltage, thd_current, phase_imbalance, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            """, 
-                event_data["station_id"], event_data["timestamp"], json.dumps(event_data["events"]),
-                event_data.get("voltage_l1"), event_data.get("voltage_l2"), event_data.get("voltage_l3"),
-                event_data.get("current_l1"), event_data.get("current_l2"), event_data.get("current_l3"),
-                event_data.get("frequency"), event_data.get("power_factor"),
-                event_data.get("thd_voltage"), event_data.get("thd_current"),
-                event_data.get("phase_imbalance"), datetime.now(timezone.utc))
-    
-    async def get_power_quality_readings(self, station_id: str, start_time: datetime, 
-                                       end_time: datetime) -> List[Dict[str, Any]]:
+            """,
+                event_data["station_id"],
+                event_data["timestamp"],
+                json.dumps(event_data["events"]),
+                event_data.get("voltage_l1"),
+                event_data.get("voltage_l2"),
+                event_data.get("voltage_l3"),
+                event_data.get("current_l1"),
+                event_data.get("current_l2"),
+                event_data.get("current_l3"),
+                event_data.get("frequency"),
+                event_data.get("power_factor"),
+                event_data.get("thd_voltage"),
+                event_data.get("thd_current"),
+                event_data.get("phase_imbalance"),
+                datetime.now(timezone.utc),
+            )
+
+    async def get_power_quality_readings(
+        self, station_id: str, start_time: datetime, end_time: datetime
+    ) -> List[Dict[str, Any]]:
         """Get power quality readings."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT timestamp, events, voltage_l1, voltage_l2, voltage_l3,
                        current_l1, current_l2, current_l3, frequency, power_factor,
                        thd_voltage, thd_current, phase_imbalance
                 FROM power_quality_events
                 WHERE station_id = $1 AND timestamp >= $2 AND timestamp <= $3
                 ORDER BY timestamp
-            """, station_id, start_time, end_time)
-            
+            """,
+                station_id,
+                start_time,
+                end_time,
+            )
+
             readings = []
             for row in rows:
                 reading = dict(row)
                 reading["events"] = json.loads(reading["events"])
                 readings.append(reading)
-            
+
             return readings
-    
+
     # ===== DIAGNOSTICS & FIRMWARE METHODS =====
-    
+
     async def store_log_request(self, log_data: Dict[str, Any]) -> None:
         """Store log request."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO log_requests (
                     station_id, log_type, request_id, retry_count, retry_interval,
                     status, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            """, 
-                log_data["station_id"], log_data["log_type"], log_data["request_id"],
-                log_data["retry_count"], log_data["retry_interval"], log_data["status"],
-                log_data["created_at"])
-    
-    async def update_log_request_status(self, station_id: str, request_id: int,
-                                      status: str, additional_info: Optional[str] = None) -> None:
+            """,
+                log_data["station_id"],
+                log_data["log_type"],
+                log_data["request_id"],
+                log_data["retry_count"],
+                log_data["retry_interval"],
+                log_data["status"],
+                log_data["created_at"],
+            )
+
+    async def update_log_request_status(
+        self, station_id: str, request_id: int, status: str, additional_info: Optional[str] = None
+    ) -> None:
         """Update log request status."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE log_requests SET
                     status = $3, additional_info = $4, updated_at = $5
                 WHERE station_id = $1 AND request_id = $2
-            """, station_id, request_id, status, additional_info, datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                request_id,
+                status,
+                additional_info,
+                datetime.now(timezone.utc),
+            )
+
     async def store_log_file(self, log_file_data: Dict[str, Any]) -> None:
         """Store log file information."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO log_files (
                     station_id, request_id, log_type, file_path, file_size, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6)
-            """, 
-                log_file_data["station_id"], log_file_data["request_id"],
-                log_file_data["log_type"], log_file_data["file_path"],
-                log_file_data["file_size"], log_file_data["created_at"])
-    
+            """,
+                log_file_data["station_id"],
+                log_file_data["request_id"],
+                log_file_data["log_type"],
+                log_file_data["file_path"],
+                log_file_data["file_size"],
+                log_file_data["created_at"],
+            )
+
     async def store_notify_event(self, event_data: Dict[str, Any]) -> None:
         """Store notify event."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO notify_events (
                     station_id, event_type, timestamp, tech_info, additional_info, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6)
-            """, 
-                event_data["station_id"], event_data["event_type"], event_data["timestamp"],
-                event_data.get("tech_info"), event_data.get("additional_info"),
-                datetime.now(timezone.utc))
-    
+            """,
+                event_data["station_id"],
+                event_data["event_type"],
+                event_data["timestamp"],
+                event_data.get("tech_info"),
+                event_data.get("additional_info"),
+                datetime.now(timezone.utc),
+            )
+
     async def get_diagnostic_logs(self, station_id: str) -> List[Dict[str, Any]]:
         """Get diagnostic logs."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT timestamp, level, message, component, event_type, additional_info
                 FROM diagnostic_logs
                 WHERE station_id = $1
                 ORDER BY timestamp DESC
                 LIMIT 10000
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def get_security_logs(self, station_id: str) -> List[Dict[str, Any]]:
         """Get security logs."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT timestamp, event_type, tech_info, additional_info
                 FROM security_events
                 WHERE station_id = $1
                 ORDER BY timestamp DESC
                 LIMIT 10000
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def get_firmware_status_logs(self, station_id: str) -> List[Dict[str, Any]]:
         """Get firmware status logs."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT timestamp, status, additional_info
                 FROM firmware_status_logs
                 WHERE station_id = $1
                 ORDER BY timestamp DESC
                 LIMIT 10000
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def get_local_list_logs(self, station_id: str) -> List[Dict[str, Any]]:
         """Get local list logs."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT timestamp, action, id_token, additional_info
                 FROM local_list_logs
                 WHERE station_id = $1
                 ORDER BY timestamp DESC
                 LIMIT 10000
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def get_supported_log_types(self, station_id: str) -> List[str]:
         """Get supported log types for station."""
         async with self.pg_pool.acquire() as conn:
-            supported_types = await conn.fetchval("""
+            supported_types = await conn.fetchval(
+                """
                 SELECT supported_log_types FROM station_capabilities
                 WHERE station_id = $1
-            """, station_id)
-            
-            return supported_types.split(',') if supported_types else []
-    
+            """,
+                station_id,
+            )
+
+            return supported_types.split(",") if supported_types else []
+
     async def store_firmware_request(self, firmware_data: Dict[str, Any]) -> None:
         """Store firmware request."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO firmware_requests (
                     station_id, request_id, location, retrieve_date_time, retry_interval,
                     retries, retry_back_off_random_range, checksum, checksum_algorithm,
                     signing_certificate, signature, signing_certificate_chain,
                     request_start_time, request_stop_time, status, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-            """, 
-                firmware_data["station_id"], firmware_data["request_id"], firmware_data["location"],
-                firmware_data["retrieve_date_time"], firmware_data.get("retry_interval"),
-                firmware_data.get("retries"), firmware_data.get("retry_back_off_random_range"),
-                firmware_data.get("checksum"), firmware_data.get("checksum_algorithm"),
-                firmware_data.get("signing_certificate"), firmware_data.get("signature"),
-                firmware_data.get("signing_certificate_chain"), firmware_data.get("request_start_time"),
-                firmware_data.get("request_stop_time"), firmware_data["status"], firmware_data["created_at"])
-    
-    async def update_firmware_request_status(self, station_id: str, request_id: int,
-                                           status: str, additional_info: Optional[str] = None) -> None:
+            """,
+                firmware_data["station_id"],
+                firmware_data["request_id"],
+                firmware_data["location"],
+                firmware_data["retrieve_date_time"],
+                firmware_data.get("retry_interval"),
+                firmware_data.get("retries"),
+                firmware_data.get("retry_back_off_random_range"),
+                firmware_data.get("checksum"),
+                firmware_data.get("checksum_algorithm"),
+                firmware_data.get("signing_certificate"),
+                firmware_data.get("signature"),
+                firmware_data.get("signing_certificate_chain"),
+                firmware_data.get("request_start_time"),
+                firmware_data.get("request_stop_time"),
+                firmware_data["status"],
+                firmware_data["created_at"],
+            )
+
+    async def update_firmware_request_status(
+        self, station_id: str, request_id: int, status: str, additional_info: Optional[str] = None
+    ) -> None:
         """Update firmware request status."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE firmware_requests SET
                     status = $3, additional_info = $4, updated_at = $5
                 WHERE station_id = $1 AND request_id = $2
-            """, station_id, request_id, status, additional_info, datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                request_id,
+                status,
+                additional_info,
+                datetime.now(timezone.utc),
+            )
+
     async def get_firmware_request_status(self, station_id: str, request_id: int) -> Optional[str]:
         """Get firmware request status."""
         async with self.pg_pool.acquire() as conn:
-            status = await conn.fetchval("""
+            status = await conn.fetchval(
+                """
                 SELECT status FROM firmware_requests
                 WHERE station_id = $1 AND request_id = $2
-            """, station_id, request_id)
-            
+            """,
+                station_id,
+                request_id,
+            )
+
             return status
-    
-    async def get_firmware_request_info(self, station_id: str, request_id: Optional[int]) -> Optional[Dict[str, Any]]:
+
+    async def get_firmware_request_info(
+        self, station_id: str, request_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
         """Get firmware request information."""
         async with self.pg_pool.acquire() as conn:
             if request_id:
-                row = await conn.fetchrow("""
+                row = await conn.fetchrow(
+                    """
                     SELECT location, retrieve_date_time, checksum, checksum_algorithm,
                            signing_certificate, signature, status
                     FROM firmware_requests
                     WHERE station_id = $1 AND request_id = $2
-                """, station_id, request_id)
+                """,
+                    station_id,
+                    request_id,
+                )
             else:
-                row = await conn.fetchrow("""
+                row = await conn.fetchrow(
+                    """
                     SELECT location, retrieve_date_time, checksum, checksum_algorithm,
                            signing_certificate, signature, status
                     FROM firmware_requests
                     WHERE station_id = $1
                     ORDER BY created_at DESC LIMIT 1
-                """, station_id)
-            
+                """,
+                    station_id,
+                )
+
             return dict(row) if row else None
-    
+
     async def cancel_firmware_request(self, station_id: str, checksum: str) -> None:
         """Cancel firmware request."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE firmware_requests SET
                     status = 'Cancelled', updated_at = $3
                 WHERE station_id = $1 AND checksum = $2
-            """, station_id, checksum, datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                checksum,
+                datetime.now(timezone.utc),
+            )
+
     async def store_firmware_update_event(self, event_data: Dict[str, Any]) -> None:
         """Store firmware update event."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO firmware_update_events (
                     station_id, tech_info, additional_info, timestamp, created_at
                 ) VALUES ($1, $2, $3, $4, $5)
-            """, 
-                event_data["station_id"], event_data.get("tech_info"),
-                event_data.get("additional_info"), event_data["timestamp"],
-                datetime.now(timezone.utc))
-    
+            """,
+                event_data["station_id"],
+                event_data.get("tech_info"),
+                event_data.get("additional_info"),
+                event_data["timestamp"],
+                datetime.now(timezone.utc),
+            )
+
     async def store_firmware_failure_event(self, event_data: Dict[str, Any]) -> None:
         """Store firmware failure event."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO firmware_failure_events (
                     station_id, request_id, failure_type, timestamp, created_at
                 ) VALUES ($1, $2, $3, $4, $5)
-            """, 
-                event_data["station_id"], event_data.get("request_id"),
-                event_data["failure_type"], event_data["timestamp"],
-                datetime.now(timezone.utc))
-    
+            """,
+                event_data["station_id"],
+                event_data.get("request_id"),
+                event_data["failure_type"],
+                event_data["timestamp"],
+                datetime.now(timezone.utc),
+            )
+
     async def update_station_firmware_version(self, station_id: str, version: str) -> None:
         """Update station firmware version."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE device_variables SET
                     value = $3, updated_at = $4
                 WHERE station_id = $1 AND component_name = 'ChargingStation' 
                 AND variable_name = 'FirmwareVersion' AND attribute_type = 'Actual'
-            """, station_id, version, datetime.now(timezone.utc))
-    
+            """,
+                station_id,
+                version,
+                datetime.now(timezone.utc),
+            )
+
     async def store_reset_event(self, event_data: Dict[str, Any]) -> None:
         """Store reset event."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO reset_events (
                     station_id, reset_type, tech_info, timestamp, created_at
                 ) VALUES ($1, $2, $3, $4, $5)
-            """, 
-                event_data["station_id"], event_data["reset_type"],
-                event_data.get("tech_info"), event_data["timestamp"],
-                datetime.now(timezone.utc))
-    
+            """,
+                event_data["station_id"],
+                event_data["reset_type"],
+                event_data.get("tech_info"),
+                event_data["timestamp"],
+                datetime.now(timezone.utc),
+            )
+
     # ===== MONITORING & ALERTING METHODS =====
-    
+
     async def store_monitoring_report(self, report_data: Dict[str, Any]) -> None:
         """Store monitoring report."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO monitoring_reports (
                     station_id, request_id, monitoring_base, monitoring_criteria,
                     component_variable, generated_at, tbc, seq_no, report_data, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            """, 
-                report_data["station_id"], report_data["request_id"], report_data["monitoring_base"],
-                report_data.get("monitoring_criteria"), report_data.get("component_variable"),
-                report_data["generated_at"], report_data["tbc"], report_data["seq_no"],
-                report_data["report_data"], report_data["created_at"])
-    
+            """,
+                report_data["station_id"],
+                report_data["request_id"],
+                report_data["monitoring_base"],
+                report_data.get("monitoring_criteria"),
+                report_data.get("component_variable"),
+                report_data["generated_at"],
+                report_data["tbc"],
+                report_data["seq_no"],
+                report_data["report_data"],
+                report_data["created_at"],
+            )
+
     async def store_notified_monitoring_report(self, report_data: Dict[str, Any]) -> None:
         """Store notified monitoring report."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO notified_monitoring_reports (
                     station_id, request_id, generated_at, tbc, seq_no, report_data, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            """, 
-                report_data["station_id"], report_data["request_id"], report_data["generated_at"],
-                report_data["tbc"], report_data["seq_no"], report_data["report_data"],
-                report_data["created_at"])
-    
+            """,
+                report_data["station_id"],
+                report_data["request_id"],
+                report_data["generated_at"],
+                report_data["tbc"],
+                report_data["seq_no"],
+                report_data["report_data"],
+                report_data["created_at"],
+            )
+
     async def store_variable_monitoring(self, monitoring_data: Dict[str, Any]) -> None:
         """Store variable monitoring configuration."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO variable_monitoring (
                     station_id, component_name, component_instance, variable_name,
                     variable_instance, monitoring_criterion, severity, threshold,
@@ -2077,76 +2616,109 @@ class TimescaleClient:
                 ON CONFLICT (station_id, component_name, component_instance, variable_name, variable_instance)
                 DO UPDATE SET monitoring_criterion = $6, severity = $7, threshold = $8,
                              delta = $9, period = $10, enabled = $11, updated_at = $12
-            """, 
-                monitoring_data["station_id"], monitoring_data["component_name"],
-                monitoring_data["component_instance"], monitoring_data["variable_name"],
-                monitoring_data["variable_instance"], monitoring_data["monitoring_criterion"],
-                monitoring_data["severity"], monitoring_data.get("threshold"),
-                monitoring_data.get("delta"), monitoring_data.get("period"),
-                monitoring_data["enabled"], monitoring_data["created_at"])
-    
-    async def remove_variable_monitoring(self, station_id: str, component_name: str,
-                                       component_instance: str, variable_name: str,
-                                       variable_instance: str) -> None:
+            """,
+                monitoring_data["station_id"],
+                monitoring_data["component_name"],
+                monitoring_data["component_instance"],
+                monitoring_data["variable_name"],
+                monitoring_data["variable_instance"],
+                monitoring_data["monitoring_criterion"],
+                monitoring_data["severity"],
+                monitoring_data.get("threshold"),
+                monitoring_data.get("delta"),
+                monitoring_data.get("period"),
+                monitoring_data["enabled"],
+                monitoring_data["created_at"],
+            )
+
+    async def remove_variable_monitoring(
+        self,
+        station_id: str,
+        component_name: str,
+        component_instance: str,
+        variable_name: str,
+        variable_instance: str,
+    ) -> None:
         """Remove variable monitoring."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM variable_monitoring
                 WHERE station_id = $1 AND component_name = $2 AND component_instance = $3
                 AND variable_name = $4 AND variable_instance = $5
-            """, station_id, component_name, component_instance, variable_name, variable_instance)
-    
+            """,
+                station_id,
+                component_name,
+                component_instance,
+                variable_name,
+                variable_instance,
+            )
+
     async def remove_all_variable_monitoring(self, station_id: str) -> None:
         """Remove all variable monitoring for station."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM variable_monitoring WHERE station_id = $1
-            """, station_id)
-    
+            """,
+                station_id,
+            )
+
     async def get_configuration_variables(self, station_id: str) -> List[Dict[str, Any]]:
         """Get configuration variables."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT component_name, component_instance, variable_name, variable_instance,
                        actual_value, target_value, default_value
                 FROM device_variables
                 WHERE station_id = $1 AND component_name IN ('ChargingStation', 'EVSE', 'Connector')
                 ORDER BY component_name, variable_name
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def get_all_variables(self, station_id: str) -> List[Dict[str, Any]]:
         """Get all variables."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT component_name, component_instance, variable_name, variable_instance,
                        actual_value, target_value, default_value, min_set_value, max_set_value
                 FROM device_variables WHERE station_id = $1
                 ORDER BY component_name, variable_name
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def get_inventory_summary(self, station_id: str) -> List[Dict[str, Any]]:
         """Get inventory summary."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT component_name, instance, COUNT(*) as variable_count,
                        MAX(updated_at) as last_updated
                 FROM device_variables WHERE station_id = $1
                 GROUP BY component_name, instance
                 ORDER BY component_name, instance
-            """, station_id)
-            
+            """,
+                station_id,
+            )
+
             return [dict(row) for row in rows]
-    
-    async def get_variable_monitoring_config(self, component_name: str, variable_name: str,
-                                           monitoring_criterion: Optional[str] = None) -> Optional[Dict[str, Any]]:
+
+    async def get_variable_monitoring_config(
+        self, component_name: str, variable_name: str, monitoring_criterion: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """Get variable monitoring configuration."""
         async with self.pg_pool.acquire() as conn:
             if monitoring_criterion:
-                row = await conn.fetchrow("""
+                row = await conn.fetchrow(
+                    """
                     SELECT station_id, component_name, component_instance, variable_name,
                            variable_instance, monitoring_criterion, severity, threshold,
                            delta, period, enabled
@@ -2154,19 +2726,27 @@ class TimescaleClient:
                     WHERE component_name = $1 AND variable_name = $2 
                     AND monitoring_criterion = $3 AND enabled = true
                     LIMIT 1
-                """, component_name, variable_name, monitoring_criterion)
+                """,
+                    component_name,
+                    variable_name,
+                    monitoring_criterion,
+                )
             else:
-                row = await conn.fetchrow("""
+                row = await conn.fetchrow(
+                    """
                     SELECT station_id, component_name, component_instance, variable_name,
                            variable_instance, monitoring_criterion, severity, threshold,
                            delta, period, enabled
                     FROM variable_monitoring
                     WHERE component_name = $1 AND variable_name = $2 AND enabled = true
                     LIMIT 1
-                """, component_name, variable_name)
-            
+                """,
+                    component_name,
+                    variable_name,
+                )
+
             return dict(row) if row else None
-    
+
     async def get_all_active_variable_monitoring(self) -> List[Dict[str, Any]]:
         """Get all active variable monitoring."""
         async with self.pg_pool.acquire() as conn:
@@ -2176,48 +2756,67 @@ class TimescaleClient:
                        delta, period
                 FROM variable_monitoring WHERE enabled = true
             """)
-            
+
             return [dict(row) for row in rows]
-    
-    async def get_current_variable_value(self, station_id: str, component_name: str,
-                                       variable_name: str) -> Optional[Any]:
+
+    async def get_current_variable_value(
+        self, station_id: str, component_name: str, variable_name: str
+    ) -> Optional[Any]:
         """Get current variable value."""
         async with self.pg_pool.acquire() as conn:
-            value = await conn.fetchval("""
+            value = await conn.fetchval(
+                """
                 SELECT actual_value FROM device_variables
                 WHERE station_id = $1 AND component_name = $2 AND variable_name = $3
                 ORDER BY updated_at DESC LIMIT 1
-            """, station_id, component_name, variable_name)
-            
+            """,
+                station_id,
+                component_name,
+                variable_name,
+            )
+
             return value
-    
-    async def get_previous_variable_value(self, station_id: str, component_name: str,
-                                        variable_name: str) -> Optional[Any]:
+
+    async def get_previous_variable_value(
+        self, station_id: str, component_name: str, variable_name: str
+    ) -> Optional[Any]:
         """Get previous variable value."""
         async with self.pg_pool.acquire() as conn:
-            value = await conn.fetchval("""
+            value = await conn.fetchval(
+                """
                 SELECT actual_value FROM device_variables
                 WHERE station_id = $1 AND component_name = $2 AND variable_name = $3
                 ORDER BY updated_at DESC LIMIT 1 OFFSET 1
-            """, station_id, component_name, variable_name)
-            
+            """,
+                station_id,
+                component_name,
+                variable_name,
+            )
+
             return value
-    
+
     async def store_periodic_monitoring_data(self, data: Dict[str, Any]) -> None:
         """Store periodic monitoring data."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO periodic_monitoring_data (
                     station_id, component_name, variable_name, value, timestamp, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6)
-            """, 
-                data["station_id"], data["component_name"], data["variable_name"],
-                data["value"], data["timestamp"], datetime.now(timezone.utc))
-    
+            """,
+                data["station_id"],
+                data["component_name"],
+                data["variable_name"],
+                data["value"],
+                data["timestamp"],
+                datetime.now(timezone.utc),
+            )
+
     async def store_alert_rule(self, rule_data: Dict[str, Any]) -> None:
         """Store alert rule."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO alert_rules (
                     rule_id, name, description, component_name, variable_name,
                     condition, threshold, severity, enabled, cooldown_minutes,
@@ -2228,20 +2827,31 @@ class TimescaleClient:
                              variable_name = $5, condition = $6, threshold = $7,
                              severity = $8, enabled = $9, cooldown_minutes = $10,
                              notification_channels = $11, updated_at = $12
-            """, 
-                rule_data["rule_id"], rule_data["name"], rule_data["description"],
-                rule_data["component_name"], rule_data["variable_name"], rule_data["condition"],
-                rule_data["threshold"], rule_data["severity"], rule_data["enabled"],
-                rule_data["cooldown_minutes"], rule_data["notification_channels"],
-                rule_data["created_at"])
-    
+            """,
+                rule_data["rule_id"],
+                rule_data["name"],
+                rule_data["description"],
+                rule_data["component_name"],
+                rule_data["variable_name"],
+                rule_data["condition"],
+                rule_data["threshold"],
+                rule_data["severity"],
+                rule_data["enabled"],
+                rule_data["cooldown_minutes"],
+                rule_data["notification_channels"],
+                rule_data["created_at"],
+            )
+
     async def remove_alert_rule(self, rule_id: str) -> None:
         """Remove alert rule."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM alert_rules WHERE rule_id = $1
-            """, rule_id)
-    
+            """,
+                rule_id,
+            )
+
     async def get_enabled_alert_rules(self) -> List[Dict[str, Any]]:
         """Get enabled alert rules."""
         async with self.pg_pool.acquire() as conn:
@@ -2250,50 +2860,72 @@ class TimescaleClient:
                        condition, threshold, severity, cooldown_minutes
                 FROM alert_rules WHERE enabled = true
             """)
-            
+
             return [dict(row) for row in rows]
-    
-    async def get_alert_rules_for_variable(self, component_name: str, variable_name: str) -> List[Dict[str, Any]]:
+
+    async def get_alert_rules_for_variable(
+        self, component_name: str, variable_name: str
+    ) -> List[Dict[str, Any]]:
         """Get alert rules for variable."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT rule_id, name, condition, threshold, severity, cooldown_minutes
                 FROM alert_rules
                 WHERE component_name = $1 AND variable_name = $2 AND enabled = true
-            """, component_name, variable_name)
-            
+            """,
+                component_name,
+                variable_name,
+            )
+
             return [dict(row) for row in rows]
-    
-    async def get_stations_with_component_variable(self, component_name: str, variable_name: str) -> List[Dict[str, Any]]:
+
+    async def get_stations_with_component_variable(
+        self, component_name: str, variable_name: str
+    ) -> List[Dict[str, Any]]:
         """Get stations with component variable."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT DISTINCT station_id, actual_value as value
                 FROM device_variables
                 WHERE component_name = $1 AND variable_name = $2
                 ORDER BY station_id
-            """, component_name, variable_name)
-            
+            """,
+                component_name,
+                variable_name,
+            )
+
             return [dict(row) for row in rows]
-    
+
     async def store_alert(self, alert_data: Dict[str, Any]) -> None:
         """Store alert."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO alerts (
                     alert_id, rule_id, station_id, component_name, variable_name,
                     current_value, threshold_value, severity, status, message,
                     triggered_at, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            """, 
-                alert_data["alert_id"], alert_data["rule_id"], alert_data["station_id"],
-                alert_data["component_name"], alert_data["variable_name"],
-                alert_data["current_value"], alert_data["threshold_value"],
-                alert_data["severity"], alert_data["status"], alert_data["message"],
-                alert_data["triggered_at"], alert_data["created_at"])
-    
-    async def get_active_alerts(self, station_id: Optional[str] = None,
-                              severity: Optional[str] = None) -> List[Dict[str, Any]]:
+            """,
+                alert_data["alert_id"],
+                alert_data["rule_id"],
+                alert_data["station_id"],
+                alert_data["component_name"],
+                alert_data["variable_name"],
+                alert_data["current_value"],
+                alert_data["threshold_value"],
+                alert_data["severity"],
+                alert_data["status"],
+                alert_data["message"],
+                alert_data["triggered_at"],
+                alert_data["created_at"],
+            )
+
+    async def get_active_alerts(
+        self, station_id: Optional[str] = None, severity: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Get active alerts."""
         async with self.pg_pool.acquire() as conn:
             query = """
@@ -2303,51 +2935,67 @@ class TimescaleClient:
                 FROM alerts WHERE status = 'Active'
             """
             params = []
-            
+
             if station_id:
                 query += " AND station_id = $" + str(len(params) + 1)
                 params.append(station_id)
-            
+
             if severity:
                 query += " AND severity = $" + str(len(params) + 1)
                 params.append(severity)
-            
+
             query += " ORDER BY triggered_at DESC"
-            
+
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
-    
-    async def acknowledge_alert(self, alert_id: str, acknowledged_by: str, acknowledged_at: datetime) -> None:
+
+    async def acknowledge_alert(
+        self, alert_id: str, acknowledged_by: str, acknowledged_at: datetime
+    ) -> None:
         """Acknowledge alert."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE alerts SET
                     status = 'Acknowledged', acknowledged_at = $2, acknowledged_by = $3
                 WHERE alert_id = $1
-            """, alert_id, acknowledged_at, acknowledged_by)
-    
+            """,
+                alert_id,
+                acknowledged_at,
+                acknowledged_by,
+            )
+
     async def resolve_alert(self, alert_id: str, resolved_by: str, resolved_at: datetime) -> None:
         """Resolve alert."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE alerts SET
                     status = 'Resolved', resolved_at = $2, resolved_by = $3
                 WHERE alert_id = $1
-            """, alert_id, resolved_at, resolved_by)
-    
+            """,
+                alert_id,
+                resolved_at,
+                resolved_by,
+            )
+
     async def cleanup_old_alerts(self, cutoff_date: datetime) -> None:
         """Clean up old alerts."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM alerts WHERE triggered_at < $1
-            """, cutoff_date)
+            """,
+                cutoff_date,
+            )
 
     # ===== DISPLAY MESSAGE MANAGEMENT =====
 
     async def store_display_message(self, message_data: Dict[str, Any]) -> None:
         """Store display message."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO display_messages (
                     message_id, station_id, evse_id, connector_id, message_type,
                     message_content, language, priority, state, valid_from, valid_to,
@@ -2363,18 +3011,29 @@ class TimescaleClient:
                     valid_from = EXCLUDED.valid_from,
                     valid_to = EXCLUDED.valid_to,
                     updated_at = EXCLUDED.updated_at
-            """, 
-                message_data["message_id"], message_data["station_id"],
-                message_data.get("evse_id"), message_data.get("connector_id"),
-                message_data["message_type"], message_data["message_content"],
-                message_data.get("language", "en"), message_data.get("priority", 0),
-                message_data.get("state", "active"), message_data.get("valid_from"),
-                message_data.get("valid_to"), message_data["created_at"],
-                message_data["updated_at"])
+            """,
+                message_data["message_id"],
+                message_data["station_id"],
+                message_data.get("evse_id"),
+                message_data.get("connector_id"),
+                message_data["message_type"],
+                message_data["message_content"],
+                message_data.get("language", "en"),
+                message_data.get("priority", 0),
+                message_data.get("state", "active"),
+                message_data.get("valid_from"),
+                message_data.get("valid_to"),
+                message_data["created_at"],
+                message_data["updated_at"],
+            )
 
-    async def get_display_messages(self, station_id: str, evse_id: Optional[int] = None,
-                                 connector_id: Optional[int] = None,
-                                 state: str = "active") -> List[Dict[str, Any]]:
+    async def get_display_messages(
+        self,
+        station_id: str,
+        evse_id: Optional[int] = None,
+        connector_id: Optional[int] = None,
+        state: str = "active",
+    ) -> List[Dict[str, Any]]:
         """Get display messages for station."""
         async with self.pg_pool.acquire() as conn:
             query = """
@@ -2382,31 +3041,37 @@ class TimescaleClient:
                 WHERE station_id = $1 AND state = $2
             """
             params = [station_id, state]
-            
+
             if evse_id is not None:
                 query += " AND (evse_id = $" + str(len(params) + 1) + " OR evse_id IS NULL)"
                 params.append(evse_id)
-            
+
             if connector_id is not None:
-                query += " AND (connector_id = $" + str(len(params) + 1) + " OR connector_id IS NULL)"
+                query += (
+                    " AND (connector_id = $" + str(len(params) + 1) + " OR connector_id IS NULL)"
+                )
                 params.append(connector_id)
-            
+
             query += " ORDER BY priority DESC, created_at DESC"
-            
+
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
 
     async def clear_display_message(self, message_id: str) -> None:
         """Clear display message."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE display_messages
                 SET state = 'inactive', updated_at = NOW()
                 WHERE message_id = $1
-            """, message_id)
+            """,
+                message_id,
+            )
 
-    async def clear_all_display_messages(self, station_id: str, evse_id: Optional[int] = None,
-                                       connector_id: Optional[int] = None) -> None:
+    async def clear_all_display_messages(
+        self, station_id: str, evse_id: Optional[int] = None, connector_id: Optional[int] = None
+    ) -> None:
         """Clear all display messages for station/EVSE/connector."""
         async with self.pg_pool.acquire() as conn:
             query = """
@@ -2415,32 +3080,42 @@ class TimescaleClient:
                 WHERE station_id = $1 AND state = 'active'
             """
             params = [station_id]
-            
+
             if evse_id is not None:
                 query += " AND (evse_id = $" + str(len(params) + 1) + " OR evse_id IS NULL)"
                 params.append(evse_id)
-            
+
             if connector_id is not None:
-                query += " AND (connector_id = $" + str(len(params) + 1) + " OR connector_id IS NULL)"
+                query += (
+                    " AND (connector_id = $" + str(len(params) + 1) + " OR connector_id IS NULL)"
+                )
                 params.append(connector_id)
-            
+
             await conn.execute(query, *params)
 
     async def store_display_message_history(self, history_data: Dict[str, Any]) -> None:
         """Store display message history."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO display_message_history (
                     message_id, station_id, action, timestamp, details
                 ) VALUES ($1, $2, $3, $4, $5)
-            """, 
-                history_data["message_id"], history_data["station_id"],
-                history_data["action"], history_data["timestamp"],
-                json.dumps(history_data.get("details", {})))
+            """,
+                history_data["message_id"],
+                history_data["station_id"],
+                history_data["action"],
+                history_data["timestamp"],
+                json.dumps(history_data.get("details", {})),
+            )
 
-    async def get_display_message_history(self, station_id: str, message_id: Optional[str] = None,
-                                        start_time: Optional[datetime] = None,
-                                        end_time: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    async def get_display_message_history(
+        self,
+        station_id: str,
+        message_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
         """Get display message history."""
         async with self.pg_pool.acquire() as conn:
             query = """
@@ -2448,21 +3123,21 @@ class TimescaleClient:
                 WHERE station_id = $1
             """
             params = [station_id]
-            
+
             if message_id:
                 query += " AND message_id = $" + str(len(params) + 1)
                 params.append(message_id)
-            
+
             if start_time:
                 query += " AND timestamp >= $" + str(len(params) + 1)
                 params.append(start_time)
-            
+
             if end_time:
                 query += " AND timestamp <= $" + str(len(params) + 1)
                 params.append(end_time)
-            
+
             query += " ORDER BY timestamp DESC"
-            
+
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
 
@@ -2477,10 +3152,11 @@ class TimescaleClient:
 
     # ===== TARIFF AND COST MANAGEMENT =====
 
-    async def store_tariff(self, tariff_data: Dict[str, Any]) -> None:
+    async def store_tariff(self, tariff_data: Dict[str, Any]) -> None:  # noqa: F811
         """Store tariff."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO tariffs (
                     tariff_id, station_id, tariff_description, tariff_currency,
                     tariff_priority, valid_from, valid_to, tariff_data,
@@ -2495,33 +3171,46 @@ class TimescaleClient:
                     valid_to = EXCLUDED.valid_to,
                     tariff_data = EXCLUDED.tariff_data,
                     updated_at = EXCLUDED.updated_at
-            """, 
-                tariff_data["tariff_id"], tariff_data["station_id"],
-                tariff_data.get("tariff_description"), tariff_data.get("tariff_currency", "USD"),
-                tariff_data.get("tariff_priority", 0), tariff_data.get("valid_from"),
-                tariff_data.get("valid_to"), json.dumps(tariff_data["tariff_data"]),
-                tariff_data["created_at"], tariff_data["updated_at"])
+            """,
+                tariff_data["tariff_id"],
+                tariff_data["station_id"],
+                tariff_data.get("tariff_description"),
+                tariff_data.get("tariff_currency", "USD"),
+                tariff_data.get("tariff_priority", 0),
+                tariff_data.get("valid_from"),
+                tariff_data.get("valid_to"),
+                json.dumps(tariff_data["tariff_data"]),
+                tariff_data["created_at"],
+                tariff_data["updated_at"],
+            )
 
-    async def get_active_tariffs(self, station_id: str, timestamp: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    async def get_active_tariffs(
+        self, station_id: str, timestamp: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
         """Get active tariffs for station."""
         if timestamp is None:
             timestamp = datetime.now(timezone.utc)
-        
+
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT * FROM tariffs
                 WHERE station_id = $1
                 AND (valid_from IS NULL OR valid_from <= $2)
                 AND (valid_to IS NULL OR valid_to > $2)
                 ORDER BY tariff_priority DESC, created_at DESC
-            """, station_id, timestamp)
-            
+            """,
+                station_id,
+                timestamp,
+            )
+
             return [dict(row) for row in rows]
 
     async def store_tariff_element(self, element_data: Dict[str, Any]) -> None:
         """Store tariff element."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO tariff_elements (
                     element_id, tariff_id, element_type, price_per_unit,
                     currency, unit, valid_from, valid_to, created_at
@@ -2534,33 +3223,45 @@ class TimescaleClient:
                     unit = EXCLUDED.unit,
                     valid_from = EXCLUDED.valid_from,
                     valid_to = EXCLUDED.valid_to
-            """, 
-                element_data["element_id"], element_data["tariff_id"],
-                element_data["element_type"], element_data["price_per_unit"],
-                element_data.get("currency", "USD"), element_data["unit"],
-                element_data.get("valid_from"), element_data.get("valid_to"),
-                element_data["created_at"])
+            """,
+                element_data["element_id"],
+                element_data["tariff_id"],
+                element_data["element_type"],
+                element_data["price_per_unit"],
+                element_data.get("currency", "USD"),
+                element_data["unit"],
+                element_data.get("valid_from"),
+                element_data.get("valid_to"),
+                element_data["created_at"],
+            )
 
-    async def get_tariff_elements(self, tariff_id: str, timestamp: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    async def get_tariff_elements(
+        self, tariff_id: str, timestamp: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
         """Get tariff elements."""
         if timestamp is None:
             timestamp = datetime.now(timezone.utc)
-        
+
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT * FROM tariff_elements
                 WHERE tariff_id = $1
                 AND (valid_from IS NULL OR valid_from <= $2)
                 AND (valid_to IS NULL OR valid_to > $2)
                 ORDER BY element_type, created_at
-            """, tariff_id, timestamp)
-            
+            """,
+                tariff_id,
+                timestamp,
+            )
+
             return [dict(row) for row in rows]
 
     async def store_tou_period(self, period_data: Dict[str, Any]) -> None:
         """Store time-of-use period."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO tou_periods (
                     period_id, tariff_id, period_name, start_time, end_time,
                     day_of_week, month, day_of_month, price_multiplier, created_at
@@ -2574,45 +3275,67 @@ class TimescaleClient:
                     month = EXCLUDED.month,
                     day_of_month = EXCLUDED.day_of_month,
                     price_multiplier = EXCLUDED.price_multiplier
-            """, 
-                period_data["period_id"], period_data["tariff_id"],
-                period_data["period_name"], period_data["start_time"],
-                period_data["end_time"], period_data.get("day_of_week"),
-                period_data.get("month"), period_data.get("day_of_month"),
-                period_data.get("price_multiplier", 1.0), period_data["created_at"])
+            """,
+                period_data["period_id"],
+                period_data["tariff_id"],
+                period_data["period_name"],
+                period_data["start_time"],
+                period_data["end_time"],
+                period_data.get("day_of_week"),
+                period_data.get("month"),
+                period_data.get("day_of_month"),
+                period_data.get("price_multiplier", 1.0),
+                period_data["created_at"],
+            )
 
-    async def get_tou_periods(self, tariff_id: str, timestamp: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    async def get_tou_periods(
+        self, tariff_id: str, timestamp: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
         """Get time-of-use periods for tariff."""
         if timestamp is None:
             timestamp = datetime.now(timezone.utc)
-        
+
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT * FROM tou_periods
                 WHERE tariff_id = $1
                 ORDER BY day_of_week, start_time
-            """, tariff_id)
-            
+            """,
+                tariff_id,
+            )
+
             return [dict(row) for row in rows]
 
     async def store_cost_update(self, cost_data: Dict[str, Any]) -> None:
         """Store cost update."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO cost_updates (
                     update_id, station_id, transaction_id, evse_id, connector_id,
                     total_cost, currency, cost_breakdown, calculated_at, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            """, 
-                cost_data["update_id"], cost_data["station_id"],
-                cost_data.get("transaction_id"), cost_data.get("evse_id"),
-                cost_data.get("connector_id"), cost_data["total_cost"],
-                cost_data.get("currency", "USD"), json.dumps(cost_data.get("cost_breakdown", {})),
-                cost_data["calculated_at"], cost_data["created_at"])
+            """,
+                cost_data["update_id"],
+                cost_data["station_id"],
+                cost_data.get("transaction_id"),
+                cost_data.get("evse_id"),
+                cost_data.get("connector_id"),
+                cost_data["total_cost"],
+                cost_data.get("currency", "USD"),
+                json.dumps(cost_data.get("cost_breakdown", {})),
+                cost_data["calculated_at"],
+                cost_data["created_at"],
+            )
 
-    async def get_cost_updates(self, station_id: str, transaction_id: Optional[str] = None,
-                             start_time: Optional[datetime] = None,
-                             end_time: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    async def get_cost_updates(
+        self,
+        station_id: str,
+        transaction_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
         """Get cost updates."""
         async with self.pg_pool.acquire() as conn:
             query = """
@@ -2620,41 +3343,43 @@ class TimescaleClient:
                 WHERE station_id = $1
             """
             params = [station_id]
-            
+
             if transaction_id:
                 query += " AND transaction_id = $" + str(len(params) + 1)
                 params.append(transaction_id)
-            
+
             if start_time:
                 query += " AND calculated_at >= $" + str(len(params) + 1)
                 params.append(start_time)
-            
+
             if end_time:
                 query += " AND calculated_at <= $" + str(len(params) + 1)
                 params.append(end_time)
-            
+
             query += " ORDER BY calculated_at DESC"
-            
+
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
 
     async def calculate_tou_multiplier(self, tariff_id: str, timestamp: datetime) -> float:
         """Calculate time-of-use multiplier for given timestamp."""
         periods = await self.get_tou_periods(tariff_id, timestamp)
-        
+
         current_time = timestamp.time()
         current_weekday = timestamp.weekday()  # 0=Monday, 6=Sunday
         current_month = timestamp.month
         current_day = timestamp.day
-        
+
         for period in periods:
             # Check if period matches current time
-            if (period["start_time"] <= current_time <= period["end_time"] and
-                (period["day_of_week"] is None or period["day_of_week"] == current_weekday) and
-                (period["month"] is None or period["month"] == current_month) and
-                (period["day_of_month"] is None or period["day_of_month"] == current_day)):
+            if (
+                period["start_time"] <= current_time <= period["end_time"]
+                and (period["day_of_week"] is None or period["day_of_week"] == current_weekday)
+                and (period["month"] is None or period["month"] == current_month)
+                and (period["day_of_month"] is None or period["day_of_month"] == current_day)
+            ):
                 return float(period["price_multiplier"])
-        
+
         return 1.0  # Default multiplier
 
     # ===== GDPR COMPLIANCE =====
@@ -2662,41 +3387,58 @@ class TimescaleClient:
     async def store_customer_information_request(self, request_data: Dict[str, Any]) -> None:
         """Store customer information request."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO customer_information (
                     request_id, station_id, customer_certificate_id, id_token,
                     customer_identifier, request_type, status, requested_at,
                     created_at, updated_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            """, 
-                request_data["request_id"], request_data["station_id"],
-                request_data.get("customer_certificate_id"), request_data.get("id_token"),
-                request_data.get("customer_identifier"), request_data["request_type"],
-                request_data.get("status", "pending"), request_data["requested_at"],
-                request_data["created_at"], request_data["updated_at"])
+            """,
+                request_data["request_id"],
+                request_data["station_id"],
+                request_data.get("customer_certificate_id"),
+                request_data.get("id_token"),
+                request_data.get("customer_identifier"),
+                request_data["request_type"],
+                request_data.get("status", "pending"),
+                request_data["requested_at"],
+                request_data["created_at"],
+                request_data["updated_at"],
+            )
 
     async def get_customer_information_request(self, request_id: str) -> Optional[Dict[str, Any]]:
         """Get customer information request."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT * FROM customer_information WHERE request_id = $1
-            """, request_id)
+            """,
+                request_id,
+            )
             return dict(row) if row else None
 
-    async def update_customer_information_status(self, request_id: str, status: str,
-                                              error_message: Optional[str] = None) -> None:
+    async def update_customer_information_status(
+        self, request_id: str, status: str, error_message: Optional[str] = None
+    ) -> None:
         """Update customer information request status."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE customer_information
                 SET status = $1, error_message = $2, updated_at = NOW()
                 WHERE request_id = $3
-            """, status, error_message, request_id)
+            """,
+                status,
+                error_message,
+                request_id,
+            )
 
     async def store_data_retention_policy(self, policy_data: Dict[str, Any]) -> None:
         """Store data retention policy."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO data_retention_policies (
                     policy_id, data_type, retention_period_days, anonymization_required,
                     deletion_method, policy_description, created_at, updated_at
@@ -2708,20 +3450,30 @@ class TimescaleClient:
                     deletion_method = EXCLUDED.deletion_method,
                     policy_description = EXCLUDED.policy_description,
                     updated_at = EXCLUDED.updated_at
-            """, 
-                policy_data["policy_id"], policy_data["data_type"],
-                policy_data["retention_period_days"], policy_data.get("anonymization_required", False),
-                policy_data.get("deletion_method", "soft"), policy_data.get("policy_description"),
-                policy_data["created_at"], policy_data["updated_at"])
+            """,
+                policy_data["policy_id"],
+                policy_data["data_type"],
+                policy_data["retention_period_days"],
+                policy_data.get("anonymization_required", False),
+                policy_data.get("deletion_method", "soft"),
+                policy_data.get("policy_description"),
+                policy_data["created_at"],
+                policy_data["updated_at"],
+            )
 
-    async def get_data_retention_policies(self, data_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_data_retention_policies(
+        self, data_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Get data retention policies."""
         async with self.pg_pool.acquire() as conn:
             if data_type:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM data_retention_policies WHERE data_type = $1
                     ORDER BY created_at DESC
-                """, data_type)
+                """,
+                    data_type,
+                )
             else:
                 rows = await conn.fetch("""
                     SELECT * FROM data_retention_policies ORDER BY created_at DESC
@@ -2731,7 +3483,8 @@ class TimescaleClient:
     async def store_consent_record(self, consent_data: Dict[str, Any]) -> None:
         """Store consent record."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO consent_records (
                     consent_id, customer_identifier, consent_type, consent_status,
                     consent_date, revocation_date, expiry_date, consent_method,
@@ -2743,128 +3496,181 @@ class TimescaleClient:
                     revocation_date = EXCLUDED.revocation_date,
                     expiry_date = EXCLUDED.expiry_date,
                     updated_at = EXCLUDED.updated_at
-            """, 
-                consent_data["consent_id"], consent_data["customer_identifier"],
-                consent_data["consent_type"], consent_data["consent_status"],
-                consent_data["consent_date"], consent_data.get("revocation_date"),
-                consent_data.get("expiry_date"), consent_data.get("consent_method"),
-                consent_data.get("consent_source"), consent_data.get("legal_basis"),
-                consent_data["created_at"], consent_data["updated_at"])
+            """,
+                consent_data["consent_id"],
+                consent_data["customer_identifier"],
+                consent_data["consent_type"],
+                consent_data["consent_status"],
+                consent_data["consent_date"],
+                consent_data.get("revocation_date"),
+                consent_data.get("expiry_date"),
+                consent_data.get("consent_method"),
+                consent_data.get("consent_source"),
+                consent_data.get("legal_basis"),
+                consent_data["created_at"],
+                consent_data["updated_at"],
+            )
 
-    async def get_consent_records(self, customer_identifier: str,
-                                consent_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_consent_records(
+        self, customer_identifier: str, consent_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Get consent records for customer."""
         async with self.pg_pool.acquire() as conn:
             if consent_type:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM consent_records
                     WHERE customer_identifier = $1 AND consent_type = $2
                     ORDER BY consent_date DESC
-                """, customer_identifier, consent_type)
+                """,
+                    customer_identifier,
+                    consent_type,
+                )
             else:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM consent_records
                     WHERE customer_identifier = $1
                     ORDER BY consent_date DESC
-                """, customer_identifier)
+                """,
+                    customer_identifier,
+                )
             return [dict(row) for row in rows]
 
     async def store_pii_anonymization_log(self, log_data: Dict[str, Any]) -> None:
         """Store PII anonymization log."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO pii_anonymization_log (
                     log_id, customer_identifier, data_type, anonymization_method,
                     original_value_hash, anonymized_value, anonymization_date,
                     retention_policy_id, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            """, 
-                log_data["log_id"], log_data["customer_identifier"],
-                log_data["data_type"], log_data["anonymization_method"],
-                log_data.get("original_value_hash"), log_data.get("anonymized_value"),
-                log_data["anonymization_date"], log_data.get("retention_policy_id"),
-                log_data["created_at"])
+            """,
+                log_data["log_id"],
+                log_data["customer_identifier"],
+                log_data["data_type"],
+                log_data["anonymization_method"],
+                log_data.get("original_value_hash"),
+                log_data.get("anonymized_value"),
+                log_data["anonymization_date"],
+                log_data.get("retention_policy_id"),
+                log_data["created_at"],
+            )
 
-    async def get_pii_anonymization_log(self, customer_identifier: str,
-                                      data_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_pii_anonymization_log(
+        self, customer_identifier: str, data_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Get PII anonymization log."""
         async with self.pg_pool.acquire() as conn:
             if data_type:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM pii_anonymization_log
                     WHERE customer_identifier = $1 AND data_type = $2
                     ORDER BY anonymization_date DESC
-                """, customer_identifier, data_type)
+                """,
+                    customer_identifier,
+                    data_type,
+                )
             else:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM pii_anonymization_log
                     WHERE customer_identifier = $1
                     ORDER BY anonymization_date DESC
-                """, customer_identifier)
+                """,
+                    customer_identifier,
+                )
             return [dict(row) for row in rows]
 
     async def store_data_subject_request(self, request_data: Dict[str, Any]) -> None:
         """Store data subject rights request."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO data_subject_requests (
                     request_id, customer_identifier, request_type, request_status,
                     request_date, completion_date, verification_method, verification_status,
                     request_details, response_data, created_at, updated_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            """, 
-                request_data["request_id"], request_data["customer_identifier"],
-                request_data["request_type"], request_data.get("request_status", "pending"),
-                request_data["request_date"], request_data.get("completion_date"),
-                request_data.get("verification_method"), request_data.get("verification_status", "pending"),
+            """,
+                request_data["request_id"],
+                request_data["customer_identifier"],
+                request_data["request_type"],
+                request_data.get("request_status", "pending"),
+                request_data["request_date"],
+                request_data.get("completion_date"),
+                request_data.get("verification_method"),
+                request_data.get("verification_status", "pending"),
                 json.dumps(request_data.get("request_details", {})),
                 json.dumps(request_data.get("response_data", {})),
-                request_data["created_at"], request_data["updated_at"])
+                request_data["created_at"],
+                request_data["updated_at"],
+            )
 
-    async def get_data_subject_requests(self, customer_identifier: str,
-                                      request_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_data_subject_requests(
+        self, customer_identifier: str, request_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Get data subject rights requests."""
         async with self.pg_pool.acquire() as conn:
             if request_type:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM data_subject_requests
                     WHERE customer_identifier = $1 AND request_type = $2
                     ORDER BY request_date DESC
-                """, customer_identifier, request_type)
+                """,
+                    customer_identifier,
+                    request_type,
+                )
             else:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM data_subject_requests
                     WHERE customer_identifier = $1
                     ORDER BY request_date DESC
-                """, customer_identifier)
+                """,
+                    customer_identifier,
+                )
             return [dict(row) for row in rows]
 
     async def anonymize_customer_data(self, customer_identifier: str, data_type: str) -> None:
         """Anonymize customer data based on retention policy."""
         async with self.pg_pool.acquire() as conn:
             # Get retention policy for data type
-            policy = await conn.fetchrow("""
+            policy = await conn.fetchrow(
+                """
                 SELECT * FROM data_retention_policies WHERE data_type = $1
-            """, data_type)
-            
+            """,
+                data_type,
+            )
+
             if not policy:
                 return
-            
+
             # Anonymize based on policy
             if policy["deletion_method"] == "anonymize":
                 # Update records to anonymized values
-                await conn.execute("""
+                await conn.execute(
+                    """
                     UPDATE transactions
                     SET id_token = 'ANONYMIZED', customer_id = 'ANONYMIZED'
                     WHERE customer_id = $1
-                """, customer_identifier)
-                
-                await conn.execute("""
+                """,
+                    customer_identifier,
+                )
+
+                await conn.execute(
+                    """
                     UPDATE transaction_events
                     SET id_token = 'ANONYMIZED'
                     WHERE id_token = $1
-                """, customer_identifier)
-                
+                """,
+                    customer_identifier,
+                )
+
                 # Log anonymization
                 log_data = {
                     "log_id": str(uuid.uuid4()),
@@ -2873,20 +3679,26 @@ class TimescaleClient:
                     "anonymization_method": "anonymize",
                     "anonymization_date": datetime.now(timezone.utc),
                     "retention_policy_id": policy["policy_id"],
-                    "created_at": datetime.now(timezone.utc)
+                    "created_at": datetime.now(timezone.utc),
                 }
                 await self.store_pii_anonymization_log(log_data)
-            
+
             elif policy["deletion_method"] == "hard":
                 # Hard delete records
-                await conn.execute("""
+                await conn.execute(
+                    """
                     DELETE FROM transactions WHERE customer_id = $1
-                """, customer_identifier)
-                
-                await conn.execute("""
+                """,
+                    customer_identifier,
+                )
+
+                await conn.execute(
+                    """
                     DELETE FROM transaction_events WHERE id_token = $1
-                """, customer_identifier)
-                
+                """,
+                    customer_identifier,
+                )
+
                 # Log deletion
                 log_data = {
                     "log_id": str(uuid.uuid4()),
@@ -2895,7 +3707,7 @@ class TimescaleClient:
                     "anonymization_method": "delete",
                     "anonymization_date": datetime.now(timezone.utc),
                     "retention_policy_id": policy["policy_id"],
-                    "created_at": datetime.now(timezone.utc)
+                    "created_at": datetime.now(timezone.utc),
                 }
                 await self.store_pii_anonymization_log(log_data)
 
@@ -2904,7 +3716,8 @@ class TimescaleClient:
     async def store_circuit_breaker_state(self, state_data: Dict[str, Any]) -> None:
         """Store circuit breaker state."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO circuit_breaker_states (
                     service_name, state, failure_count, last_failure_time,
                     last_success_time, failure_threshold, timeout_seconds,
@@ -2917,34 +3730,48 @@ class TimescaleClient:
                     last_failure_time = EXCLUDED.last_failure_time,
                     last_success_time = EXCLUDED.last_success_time,
                     updated_at = EXCLUDED.updated_at
-            """, 
-                state_data["service_name"], state_data["state"],
-                state_data["failure_count"], state_data["last_failure_time"],
-                state_data["last_success_time"], state_data["failure_threshold"],
-                state_data["timeout_seconds"], state_data["created_at"],
-                state_data["updated_at"])
+            """,
+                state_data["service_name"],
+                state_data["state"],
+                state_data["failure_count"],
+                state_data["last_failure_time"],
+                state_data["last_success_time"],
+                state_data["failure_threshold"],
+                state_data["timeout_seconds"],
+                state_data["created_at"],
+                state_data["updated_at"],
+            )
 
     async def get_circuit_breaker_state(self, service_name: str) -> Optional[Dict[str, Any]]:
         """Get circuit breaker state."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT * FROM circuit_breaker_states WHERE service_name = $1
-            """, service_name)
+            """,
+                service_name,
+            )
             return dict(row) if row else None
 
     async def store_dead_letter_message(self, message_data: Dict[str, Any]) -> None:
         """Store dead letter queue message."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO dead_letter_queue (
                     message_id, original_message, error_message, error_type,
                     retry_count, max_retries, next_retry_at, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            """, 
-                message_data["message_id"], json.dumps(message_data["original_message"]),
-                message_data["error_message"], message_data["error_type"],
-                message_data["retry_count"], message_data["max_retries"],
-                message_data["next_retry_at"], message_data["created_at"])
+            """,
+                message_data["message_id"],
+                json.dumps(message_data["original_message"]),
+                message_data["error_message"],
+                message_data["error_type"],
+                message_data["retry_count"],
+                message_data["max_retries"],
+                message_data["next_retry_at"],
+                message_data["created_at"],
+            )
 
     async def get_retryable_dlq_messages(self) -> List[Dict[str, Any]]:
         """Get messages ready for retry."""
@@ -2956,52 +3783,72 @@ class TimescaleClient:
             """)
             return [dict(row) for row in rows]
 
-    async def update_dlq_message_retry(self, message_id: str, retry_count: int,
-                                    next_retry_at: datetime) -> None:
+    async def update_dlq_message_retry(
+        self, message_id: str, retry_count: int, next_retry_at: datetime
+    ) -> None:
         """Update dead letter queue message retry info."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE dead_letter_queue
                 SET retry_count = $1, next_retry_at = $2
                 WHERE message_id = $3
-            """, retry_count, next_retry_at, message_id)
+            """,
+                retry_count,
+                next_retry_at,
+                message_id,
+            )
 
     async def mark_dlq_message_processed(self, message_id: str) -> None:
         """Mark dead letter queue message as processed."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE dead_letter_queue
                 SET processed_at = NOW()
                 WHERE message_id = $1
-            """, message_id)
+            """,
+                message_id,
+            )
 
     async def store_retry_attempt(self, attempt_data: Dict[str, Any]) -> None:
         """Store retry attempt."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO retry_attempts (
                     attempt_id, message_id, attempt_number, error_message,
                     attempt_time, success, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            """, 
-                attempt_data["attempt_id"], attempt_data["message_id"],
-                attempt_data["attempt_number"], attempt_data["error_message"],
-                attempt_data["attempt_time"], attempt_data["success"],
-                attempt_data["created_at"])
+            """,
+                attempt_data["attempt_id"],
+                attempt_data["message_id"],
+                attempt_data["attempt_number"],
+                attempt_data["error_message"],
+                attempt_data["attempt_time"],
+                attempt_data["success"],
+                attempt_data["created_at"],
+            )
 
     async def store_health_check_result(self, result_data: Dict[str, Any]) -> None:
         """Store health check result."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO health_check_results (
                     check_id, service_name, check_type, status,
                     response_time_ms, error_message, check_time, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            """, 
-                result_data["check_id"], result_data["service_name"],
-                result_data["check_type"], result_data["status"],
-                result_data["response_time_ms"], result_data["error_message"],
-                result_data["check_time"], result_data["created_at"])
+            """,
+                result_data["check_id"],
+                result_data["service_name"],
+                result_data["check_type"],
+                result_data["status"],
+                result_data["response_time_ms"],
+                result_data["error_message"],
+                result_data["check_time"],
+                result_data["created_at"],
+            )
 
     async def get_degradation_rules(self) -> List[Dict[str, Any]]:
         """Get degradation rules."""
@@ -3015,16 +3862,20 @@ class TimescaleClient:
     async def cleanup_old_health_check_results(self, cutoff_date: datetime) -> None:
         """Clean up old health check results."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM health_check_results WHERE check_time < $1
-            """, cutoff_date)
+            """,
+                cutoff_date,
+            )
 
     # Vehicle Routes and Fleet Management Methods
-    
+
     async def store_vehicle_route(self, route_data: Dict[str, Any]) -> None:
         """Store vehicle route data."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO vehicle_routes (
                     route_id, vehicle_id, station_id, departure_time, arrival_time,
                     destination, route_distance_km, required_soc_percent, actual_soc_percent,
@@ -3032,30 +3883,43 @@ class TimescaleClient:
                     override_type, override_reason, operator_id, created_at, updated_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             """,
-                route_data["route_id"], route_data["vehicle_id"], route_data["station_id"],
-                route_data["departure_time"], route_data.get("arrival_time"),
-                route_data.get("destination"), route_data.get("route_distance_km"),
-                route_data["required_soc_percent"], route_data.get("actual_soc_percent"),
-                route_data.get("route_status", "scheduled"), route_data.get("route_priority", 1),
-                route_data.get("estimated_duration_hours"), route_data.get("override_type"),
-                route_data.get("override_reason"), route_data.get("operator_id"),
-                route_data["created_at"], route_data.get("updated_at", route_data["created_at"])
+                route_data["route_id"],
+                route_data["vehicle_id"],
+                route_data["station_id"],
+                route_data["departure_time"],
+                route_data.get("arrival_time"),
+                route_data.get("destination"),
+                route_data.get("route_distance_km"),
+                route_data["required_soc_percent"],
+                route_data.get("actual_soc_percent"),
+                route_data.get("route_status", "scheduled"),
+                route_data.get("route_priority", 1),
+                route_data.get("estimated_duration_hours"),
+                route_data.get("override_type"),
+                route_data.get("override_reason"),
+                route_data.get("operator_id"),
+                route_data["created_at"],
+                route_data.get("updated_at", route_data["created_at"]),
             )
-    
+
     async def get_vehicle_routes(self, vehicle_id: str) -> List[Dict[str, Any]]:
         """Get all routes for a vehicle."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT * FROM vehicle_routes 
                 WHERE vehicle_id = $1 
                 ORDER BY departure_time DESC
-            """, vehicle_id)
+            """,
+                vehicle_id,
+            )
             return [dict(row) for row in rows]
-    
+
     async def update_vehicle_route(self, update_data: Dict[str, Any]) -> None:
         """Update vehicle route data."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE vehicle_routes SET
                     departure_time = COALESCE($2, departure_time),
                     arrival_time = COALESCE($3, arrival_time),
@@ -3072,25 +3936,35 @@ class TimescaleClient:
                     updated_at = $14
                 WHERE route_id = $1
             """,
-                update_data["route_id"], update_data.get("departure_time"),
-                update_data.get("arrival_time"), update_data.get("destination"),
-                update_data.get("route_distance_km"), update_data.get("required_soc_percent"),
-                update_data.get("actual_soc_percent"), update_data.get("route_status"),
-                update_data.get("route_priority"), update_data.get("estimated_duration_hours"),
-                update_data.get("override_type"), update_data.get("override_reason"),
-                update_data.get("operator_id"), update_data["updated_at"]
+                update_data["route_id"],
+                update_data.get("departure_time"),
+                update_data.get("arrival_time"),
+                update_data.get("destination"),
+                update_data.get("route_distance_km"),
+                update_data.get("required_soc_percent"),
+                update_data.get("actual_soc_percent"),
+                update_data.get("route_status"),
+                update_data.get("route_priority"),
+                update_data.get("estimated_duration_hours"),
+                update_data.get("override_type"),
+                update_data.get("override_reason"),
+                update_data.get("operator_id"),
+                update_data["updated_at"],
             )
-    
+
     async def cancel_vehicle_routes(self, vehicle_id: str) -> None:
         """Cancel all routes for a vehicle."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE vehicle_routes SET
                     route_status = 'cancelled',
                     updated_at = NOW()
                 WHERE vehicle_id = $1 AND route_status IN ('scheduled', 'in_progress')
-            """, vehicle_id)
-    
+            """,
+                vehicle_id,
+            )
+
     async def get_active_routes(self) -> List[Dict[str, Any]]:
         """Get all active routes."""
         async with self.pg_pool.acquire() as conn:
@@ -3101,11 +3975,12 @@ class TimescaleClient:
                 ORDER BY departure_time ASC
             """)
             return [dict(row) for row in rows]
-    
+
     async def store_vehicle_fleet(self, vehicle_data: Dict[str, Any]) -> None:
         """Store vehicle fleet data."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO vehicle_fleet (
                     vehicle_id, station_id, battery_capacity_kwh, max_charge_rate_kw,
                     max_discharge_rate_kw, current_soc_kwh, min_soc_kwh,
@@ -3128,15 +4003,24 @@ class TimescaleClient:
                     is_active = EXCLUDED.is_active,
                     updated_at = EXCLUDED.updated_at
             """,
-                vehicle_data["vehicle_id"], vehicle_data["station_id"],
-                vehicle_data["battery_capacity_kwh"], vehicle_data["max_charge_rate_kw"],
-                vehicle_data["max_discharge_rate_kw"], vehicle_data.get("current_soc_kwh"),
-                vehicle_data.get("min_soc_kwh", 15.0), vehicle_data.get("charge_efficiency", 0.95),
-                vehicle_data.get("discharge_efficiency", 0.90), vehicle_data.get("vehicle_type"),
-                vehicle_data.get("make"), vehicle_data.get("model"), vehicle_data.get("year"),
-                vehicle_data.get("is_active", True), vehicle_data["created_at"], vehicle_data.get("updated_at", vehicle_data["created_at"])
+                vehicle_data["vehicle_id"],
+                vehicle_data["station_id"],
+                vehicle_data["battery_capacity_kwh"],
+                vehicle_data["max_charge_rate_kw"],
+                vehicle_data["max_discharge_rate_kw"],
+                vehicle_data.get("current_soc_kwh"),
+                vehicle_data.get("min_soc_kwh", 15.0),
+                vehicle_data.get("charge_efficiency", 0.95),
+                vehicle_data.get("discharge_efficiency", 0.90),
+                vehicle_data.get("vehicle_type"),
+                vehicle_data.get("make"),
+                vehicle_data.get("model"),
+                vehicle_data.get("year"),
+                vehicle_data.get("is_active", True),
+                vehicle_data["created_at"],
+                vehicle_data.get("updated_at", vehicle_data["created_at"]),
             )
-    
+
     async def get_all_vehicles(self) -> List[Dict[str, Any]]:
         """Get all vehicles."""
         async with self.pg_pool.acquire() as conn:
@@ -3146,7 +4030,7 @@ class TimescaleClient:
                 ORDER BY vehicle_id
             """)
             return [dict(row) for row in rows]
-    
+
     async def get_active_vehicles(self) -> List[Dict[str, Any]]:
         """Get active vehicles."""
         async with self.pg_pool.acquire() as conn:
@@ -3159,44 +4043,62 @@ class TimescaleClient:
                 ORDER BY vf.vehicle_id
             """)
             return [dict(row) for row in rows]
-    
+
     async def store_price_forecast(self, forecast_data: Dict[str, Any]) -> None:
         """Store price forecast data."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO price_forecasts (
                     forecast_id, forecast_time, horizon_start, horizon_end,
                     node_id, market_type, forecast_prices, confidence_intervals,
                     model_version, accuracy_score, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             """,
-                forecast_data["forecast_id"], forecast_data["forecast_time"],
-                forecast_data["horizon_start"], forecast_data["horizon_end"],
-                forecast_data["node_id"], forecast_data["market_type"],
+                forecast_data["forecast_id"],
+                forecast_data["forecast_time"],
+                forecast_data["horizon_start"],
+                forecast_data["horizon_end"],
+                forecast_data["node_id"],
+                forecast_data["market_type"],
                 json.dumps(forecast_data["forecast_prices"]),
-                json.dumps(forecast_data.get("confidence_intervals")) if forecast_data.get("confidence_intervals") else None,
-                forecast_data.get("model_version"), forecast_data.get("accuracy_score"),
-                forecast_data["created_at"]
+                (
+                    json.dumps(forecast_data.get("confidence_intervals"))
+                    if forecast_data.get("confidence_intervals")
+                    else None
+                ),
+                forecast_data.get("model_version"),
+                forecast_data.get("accuracy_score"),
+                forecast_data["created_at"],
             )
-    
+
     async def store_demand_forecast(self, forecast_data: Dict[str, Any]) -> None:
         """Store demand forecast data."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO demand_forecasts (
                     forecast_id, forecast_time, horizon_start, horizon_end,
                     station_id, forecast_demand, confidence_intervals,
                     model_version, accuracy_score, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             """,
-                forecast_data["forecast_id"], forecast_data["forecast_time"],
-                forecast_data["horizon_start"], forecast_data["horizon_end"],
-                forecast_data["station_id"], json.dumps(forecast_data["forecast_demand"]),
-                json.dumps(forecast_data.get("confidence_intervals")) if forecast_data.get("confidence_intervals") else None,
-                forecast_data.get("model_version"), forecast_data.get("accuracy_score"),
-                forecast_data["created_at"]
+                forecast_data["forecast_id"],
+                forecast_data["forecast_time"],
+                forecast_data["horizon_start"],
+                forecast_data["horizon_end"],
+                forecast_data["station_id"],
+                json.dumps(forecast_data["forecast_demand"]),
+                (
+                    json.dumps(forecast_data.get("confidence_intervals"))
+                    if forecast_data.get("confidence_intervals")
+                    else None
+                ),
+                forecast_data.get("model_version"),
+                forecast_data.get("accuracy_score"),
+                forecast_data["created_at"],
             )
-    
+
     async def get_optimization_status(self) -> Dict[str, Any]:
         """Get current optimization status."""
         async with self.pg_pool.acquire() as conn:
@@ -3207,25 +4109,37 @@ class TimescaleClient:
                 ORDER BY time DESC
                 LIMIT 1
             """)
-            
+
             # Get active vehicles count
             active_vehicles = await conn.fetchval("""
                 SELECT COUNT(*) FROM vehicle_fleet WHERE is_active = true
             """)
-            
+
             # Get pending routes count
             pending_routes = await conn.fetchval("""
                 SELECT COUNT(*) FROM vehicle_routes 
                 WHERE route_status = 'scheduled' AND departure_time > NOW()
             """)
-            
+
             return {
                 "is_running": False,  # TODO: Implement actual running status
                 "last_run_time": latest_decision["time"] if latest_decision else None,
                 "next_run_time": None,  # TODO: Implement next run time calculation
                 "active_vehicles": active_vehicles or 0,
                 "pending_routes": pending_routes or 0,
-                "solver_status": "optimal" if latest_decision and latest_decision["constraints_satisfied"] else "unknown",
-                "last_objective_value": float(latest_decision["objective_value"]) if latest_decision and latest_decision["objective_value"] else None,
-                "last_solve_time_ms": float(latest_decision["computation_time_ms"]) if latest_decision and latest_decision["computation_time_ms"] else None
+                "solver_status": (
+                    "optimal"
+                    if latest_decision and latest_decision["constraints_satisfied"]
+                    else "unknown"
+                ),
+                "last_objective_value": (
+                    float(latest_decision["objective_value"])
+                    if latest_decision and latest_decision["objective_value"]
+                    else None
+                ),
+                "last_solve_time_ms": (
+                    float(latest_decision["computation_time_ms"])
+                    if latest_decision and latest_decision["computation_time_ms"]
+                    else None
+                ),
             }

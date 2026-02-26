@@ -5,12 +5,13 @@ See PRD_v2.md Section 5.3 for data freshness requirements.
 
 Reference: Development Plan Step 4.5.8
 """
+
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ MAX_SCHEDULE_AGE = timedelta(hours=1)
 @dataclass
 class FreshnessStatus:
     """Status of data freshness checks."""
+
     telemetry_fresh: bool
     price_fresh: bool
     weather_fresh: bool
@@ -204,9 +206,7 @@ def check_optimization_prerequisites(
     can_optimize = len(errors) == 0
 
     if not can_optimize:
-        logger.error(
-            f"Optimization prerequisites not met: {', '.join(errors)}"
-        )
+        logger.error(f"Optimization prerequisites not met: {', '.join(errors)}")
 
     return can_optimize, errors
 

@@ -9,35 +9,38 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any
-from websockets import WebSocketServerProtocol
+from typing import Any, Dict, Optional
+
 import websockets
+from websockets import WebSocketServerProtocol
 
 try:
     import structlog
+
     _HAS_STRUCTLOG = True
 except ImportError:
     import logging
+
     structlog = None  # type: ignore
     _HAS_STRUCTLOG = False
 
+from . import repository as vdv_repo
+from .charging_point_resolver import ChargingPointResolver
+from .depot_state import get_depot_charging_info
 from .messages import (
-    ValidationMode,
-    VDVMessageEnvelope,
-    parse_message,
-    build_error,
-    build_provide_charging_requests_response,
-    build_provide_charging_information_message,
+    ChargingPointInfo,
     ChargingRequest,
     DepotInfo,
-    ChargingPointInfo,
+    ValidationMode,
     VDV463ValidationError,
+    VDVMessageEnvelope,
+    build_error,
+    build_provide_charging_information_message,
+    build_provide_charging_requests_response,
     parse_charging_request_item,
+    parse_message,
 )
 from .vehicle_resolver import VehicleResolver
-from .charging_point_resolver import ChargingPointResolver
-from . import repository as vdv_repo
-from .depot_state import get_depot_charging_info
 
 
 def _stdlib_log_adapter(logger_instance: Any) -> Any:
@@ -77,7 +80,7 @@ logger = get_logger(__name__)
 
 class VDV463Handler:
     """Handles VDV 463 protocol messages from BMS/ITCS systems."""
-    
+
     def __init__(
         self,
         presystem_id: str,
@@ -121,16 +124,12 @@ class VDV463Handler:
 
         # In-memory fallback when db_pool is None (testing)
         self.charging_requests: Dict[str, ChargingRequest] = {}
-    
+
     async def run(self) -> None:
         """Run the VDV 463 handler main loop."""
         self.connection_id = f"vdv463_{self.presystem_id}_{id(self)}"
-        client_ip = (
-            self.websocket.remote_address[0] 
-            if self.websocket.remote_address 
-            else "unknown"
-        )
-        
+        client_ip = self.websocket.remote_address[0] if self.websocket.remote_address else "unknown"
+
         # Register connection
         await self.connection_manager.register_connection(
             self.presystem_id,
@@ -138,7 +137,7 @@ class VDV463Handler:
             client_ip,
             self.websocket,
         )
-        
+
         self.logger.info(
             "VDV 463 connection established",
             presystem_id=self.presystem_id,
@@ -146,21 +145,16 @@ class VDV463Handler:
             client_ip=client_ip,
             connection_id=self.connection_id,
         )
-        
+
         # Start periodic ProvideChargingInformation task
         self.running = True
-        self._charging_info_task = asyncio.create_task(
-            self._periodic_charging_information()
-        )
-        
+        self._charging_info_task = asyncio.create_task(self._periodic_charging_information())
+
         try:
             # Main message loop
             while self.running:
                 try:
-                    message = await asyncio.wait_for(
-                        self.websocket.recv(),
-                        timeout=1.0
-                    )
+                    message = await asyncio.wait_for(self.websocket.recv(), timeout=1.0)
                     await self._handle_message(message)
                 except asyncio.TimeoutError:
                     # Continue loop to check running flag
@@ -180,7 +174,7 @@ class VDV463Handler:
             )
         finally:
             await self._cleanup()
-    
+
     async def _handle_message(self, raw_message: str) -> None:
         """Handle incoming WebSocket message."""
         try:
@@ -248,7 +242,7 @@ class VDV463Handler:
                 self.presystem_id,
                 len(raw_message.encode("utf-8")),
             )
-            
+
             # Parse and validate message
             try:
                 envelope = parse_message(raw_message, self.validation_mode)
@@ -295,10 +289,10 @@ class VDV463Handler:
                     ]
                     await self.websocket.send(json.dumps(error_msg))
                 return
-            
+
             # Update metrics
             self._record_message_received(envelope.message_action)
-            
+
             # Route to appropriate handler
             if envelope.message_type == 1:  # Request
                 await self._handle_request(envelope)
@@ -312,7 +306,7 @@ class VDV463Handler:
                     presystem_id=self.presystem_id,
                     message_type=envelope.message_type,
                 )
-        
+
         except json.JSONDecodeError as e:
             self.logger.error(
                 "Invalid JSON message",
@@ -336,11 +330,11 @@ class VDV463Handler:
                 error_type=type(e).__name__,
             )
             self._record_error("UnexpectedError")
-    
+
     async def _handle_request(self, envelope: VDVMessageEnvelope) -> None:
         """Handle VDV 463 request message."""
         action = envelope.message_action
-        
+
         if action == "ProvideChargingRequests":
             await self._handle_provide_charging_requests(envelope)
         elif action == "BootNotification":
@@ -367,9 +361,7 @@ class VDV463Handler:
                     f"Action not supported: {action}",
                 )
 
-    async def _handle_provide_charging_requests(
-        self, envelope: VDVMessageEnvelope
-    ) -> None:
+    async def _handle_provide_charging_requests(self, envelope: VDVMessageEnvelope) -> None:
         """Handle ProvideChargingRequests message: validate, resolve IDs, persist, terminate absent."""
         payload = envelope.payload
         charging_request_list = payload.get("chargingRequestList", [])
@@ -530,7 +522,9 @@ class VDV463Handler:
                         )
                     continue
             else:
-                request_key = f"{charging_request.charging_request_id}_{charging_request.vehicle_external_id}"
+                request_key = (
+                    f"{charging_request.charging_request_id}_{charging_request.vehicle_external_id}"
+                )
                 self.charging_requests[request_key] = charging_request
                 processed_ids.append(charging_request.charging_request_id)
 
@@ -563,10 +557,8 @@ class VDV463Handler:
         response = build_provide_charging_requests_response(envelope)
         await self.websocket.send(json.dumps(response))
         self._record_message_sent("ProvideChargingRequests")
-    
-    async def _handle_boot_notification(
-        self, envelope: VDVMessageEnvelope
-    ) -> None:
+
+    async def _handle_boot_notification(self, envelope: VDVMessageEnvelope) -> None:
         """Handle BootNotification message."""
         self.logger.info(
             "BootNotification received",
@@ -600,7 +592,7 @@ class VDV463Handler:
         ]
         await self.websocket.send(json.dumps(response))
         self._record_message_sent("BootNotification")
-    
+
     async def _handle_confirmation(self, envelope: VDVMessageEnvelope) -> None:
         """Handle confirmation message."""
         self.logger.debug(
@@ -608,13 +600,13 @@ class VDV463Handler:
             presystem_id=self.presystem_id,
             action=envelope.message_action,
         )
-    
+
     async def _handle_error(self, envelope: VDVMessageEnvelope) -> None:
         """Handle error message."""
         error_payload = envelope.payload
         error_code = error_payload.get("errorCode", "UnknownError")
         error_description = error_payload.get("errorDescription", "Unknown error")
-        
+
         self.logger.error(
             "Error message received",
             presystem_id=self.presystem_id,
@@ -622,7 +614,7 @@ class VDV463Handler:
             error_description=error_description,
         )
         self._record_error(error_code)
-    
+
     async def _periodic_charging_information(self) -> None:
         """Periodically send ProvideChargingInformation messages (every 15s)."""
         while self.running:
@@ -666,15 +658,15 @@ class VDV463Handler:
                     self.presystem_id,
                     depot_info_list,
                 )
-                
+
                 await self.websocket.send(json.dumps(message))
                 self._record_message_sent("ProvideChargingInformation")
-                
+
                 self.logger.debug(
                     "Sent ProvideChargingInformation",
                     presystem_id=self.presystem_id,
                 )
-            
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -684,61 +676,67 @@ class VDV463Handler:
                     error=str(e),
                 )
                 await asyncio.sleep(5)  # Wait before retry
-    
+
     def _record_message_received(self, message_name: str) -> None:
         """Record message received metric."""
         # Import here to avoid circular dependency
         try:
             import sys
             from pathlib import Path
+
             # Add src to path for absolute imports
             src_path = Path(__file__).parent.parent.parent
             if str(src_path) not in sys.path:
                 sys.path.insert(0, str(src_path))
             from websocket_handler.monitoring import MESSAGES_RECEIVED_TOTAL
+
             MESSAGES_RECEIVED_TOTAL.labels(
                 station_id=self.presystem_id,
                 message_type=f"vdv463_{message_name}",
             ).inc()
         except Exception as e:
             self.logger.debug(f"Could not record metric: {e}")
-    
+
     def _record_message_sent(self, message_name: str) -> None:
         """Record message sent metric."""
         try:
             import sys
             from pathlib import Path
+
             src_path = Path(__file__).parent.parent.parent
             if str(src_path) not in sys.path:
                 sys.path.insert(0, str(src_path))
             from websocket_handler.monitoring import MESSAGES_SENT_TOTAL
+
             MESSAGES_SENT_TOTAL.labels(
                 station_id=self.presystem_id,
                 message_type=f"vdv463_{message_name}",
             ).inc()
         except Exception as e:
             self.logger.debug(f"Could not record metric: {e}")
-    
+
     def _record_error(self, error_code: str) -> None:
         """Record error metric."""
         try:
             import sys
             from pathlib import Path
+
             src_path = Path(__file__).parent.parent.parent
             if str(src_path) not in sys.path:
                 sys.path.insert(0, str(src_path))
             from websocket_handler.monitoring import ERRORS_TOTAL
+
             ERRORS_TOTAL.labels(
                 error_type=f"vdv463_{error_code}",
                 station_id=self.presystem_id,
             ).inc()
         except Exception as e:
             self.logger.debug(f"Could not record metric: {e}")
-    
+
     async def _cleanup(self) -> None:
         """Cleanup handler resources."""
         self.running = False
-        
+
         # Mark VDV 463 connection as disconnected (per dev plan Phase 5)
         if self.db_pool and self.depot_id:
             try:
@@ -760,14 +758,14 @@ class VDV463Handler:
                 await self._charging_info_task
             except asyncio.CancelledError:
                 pass
-        
+
         # Unregister connection
         if self.connection_manager:
             await self.connection_manager.unregister_connection(
                 self.presystem_id,
                 self.connection_id,
             )
-        
+
         self.logger.info(
             "VDV 463 handler cleaned up",
             presystem_id=self.presystem_id,

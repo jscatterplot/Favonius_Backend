@@ -116,7 +116,7 @@ class PriceFeederService:
             except Exception as exc:
                 consecutive_failures += 1
                 # Exponential backoff: 2^failures seconds, capped at max_backoff
-                backoff = min(2 ** consecutive_failures, max_backoff)
+                backoff = min(2**consecutive_failures, max_backoff)
                 self.logger.error(
                     f"Price feeder loop error (failure {consecutive_failures}): {exc}. "
                     f"Backing off {backoff}s"
@@ -210,9 +210,7 @@ class PriceFeederService:
             body = await response.text()
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, self._parse_entsoe_xml, body, zone_id
-        )
+        return await loop.run_in_executor(None, self._parse_entsoe_xml, body, zone_id)
 
     def _parse_entsoe_xml(self, xml_text: str, zone_id: str) -> List[dict]:
         """Parse ENTSO-E Publication_MarketDocument XML into price point dicts.
@@ -265,18 +263,20 @@ class PriceFeederService:
                         last_price = point_map[pos]
 
                     ts_time = period_start + timedelta(minutes=(pos - 1) * step_minutes)
-                    points.append({
-                        "time": ts_time,
-                        "node_id": zone_id,
-                        "market_type": "ENTSOE_DAM",
-                        "lmp_price_mwh": last_price,
-                        "energy_component_mwh": last_price,
-                        "congestion_component_mwh": None,
-                        "loss_component_mwh": None,
-                        "ghg_adder_mwh": None,
-                        "price_confidence": None,
-                        "forecast_horizon_minutes": None,
-                    })
+                    points.append(
+                        {
+                            "time": ts_time,
+                            "node_id": zone_id,
+                            "market_type": "ENTSOE_DAM",
+                            "lmp_price_mwh": last_price,
+                            "energy_component_mwh": last_price,
+                            "congestion_component_mwh": None,
+                            "loss_component_mwh": None,
+                            "ghg_adder_mwh": None,
+                            "price_confidence": None,
+                            "forecast_horizon_minutes": None,
+                        }
+                    )
 
         return points
 
@@ -292,7 +292,9 @@ class PriceFeederService:
                         reader = csv.DictReader(io.TextIOWrapper(csvfile, encoding="utf-8"))
                         for row in reader:
                             try:
-                                timestamp = datetime.fromisoformat(row["INTERVALSTARTTIME_GMT"].replace("Z", "+00:00"))
+                                timestamp = datetime.fromisoformat(
+                                    row["INTERVALSTARTTIME_GMT"].replace("Z", "+00:00")
+                                )
                                 points.append(
                                     {
                                         "time": timestamp,
@@ -300,7 +302,9 @@ class PriceFeederService:
                                         "market_type": row.get("MARKET_RUN_ID", "DAM"),
                                         "lmp_price_mwh": _safe_float(row.get("LMP")),
                                         "energy_component_mwh": _safe_float(row.get("ENERGY")),
-                                        "congestion_component_mwh": _safe_float(row.get("CONGESTION")),
+                                        "congestion_component_mwh": _safe_float(
+                                            row.get("CONGESTION")
+                                        ),
                                         "loss_component_mwh": _safe_float(row.get("LOSS")),
                                         "ghg_adder_mwh": _safe_float(row.get("GHG")),
                                         "price_confidence": None,

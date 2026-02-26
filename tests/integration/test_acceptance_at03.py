@@ -9,10 +9,10 @@ THEN re-optimization starts within 60 seconds
 AND new schedule shifts charging away from high-price period
 """
 
-import pytest
-import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock
+
+import pytest
 
 from src.core.models import DepotConfig, DepotState
 from src.core.optimizer import optimize
@@ -28,7 +28,7 @@ class TestAT03PriceSpikeReoptimization:
     @pytest.fixture
     def depot_config(self):
         """Depot configuration."""
-        vehicle_ids = [f'bus_{i}' for i in range(10)]
+        vehicle_ids = [f"bus_{i}" for i in range(10)]
         return DepotConfig(
             vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
             vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -47,16 +47,14 @@ class TestAT03PriceSpikeReoptimization:
         prices = [0.10] * n_t  # Flat $0.10/kWh
 
         return DepotState(
-            vehicle_socs={f'bus_{i}': 0.4 for i in range(10)},
+            vehicle_socs={f"bus_{i}": 0.4 for i in range(10)},
             battery_soc=0.5,
             prices=prices,
             demand_charge_rate=20.0,
             current_month_peak=200.0,
-            vehicle_availability={
-                f'bus_{i}': [True] * n_t for i in range(10)
-            },
-            energy_requirements={f'bus_{i}': 200.0 for i in range(10)},
-            departure_times={f'bus_{i}': 48 + i % 24 for i in range(10)},
+            vehicle_availability={f"bus_{i}": [True] * n_t for i in range(10)},
+            energy_requirements={f"bus_{i}": 200.0 for i in range(10)},
+            departure_times={f"bus_{i}": 48 + i % 24 for i in range(10)},
             building_power=[50.0] * n_t,
         )
 
@@ -75,23 +73,19 @@ class TestAT03PriceSpikeReoptimization:
                 prices.append(0.10)
 
         return DepotState(
-            vehicle_socs={f'bus_{i}': 0.4 for i in range(10)},
+            vehicle_socs={f"bus_{i}": 0.4 for i in range(10)},
             battery_soc=0.5,
             prices=prices,
             demand_charge_rate=20.0,
             current_month_peak=200.0,
-            vehicle_availability={
-                f'bus_{i}': [True] * n_t for i in range(10)
-            },
-            energy_requirements={f'bus_{i}': 200.0 for i in range(10)},
-            departure_times={f'bus_{i}': 48 + i % 24 for i in range(10)},
+            vehicle_availability={f"bus_{i}": [True] * n_t for i in range(10)},
+            energy_requirements={f"bus_{i}": 200.0 for i in range(10)},
+            departure_times={f"bus_{i}": 48 + i % 24 for i in range(10)},
             building_power=[50.0] * n_t,
         )
 
     @pytest.mark.asyncio
-    async def test_at03_price_spike_trigger(
-        self, initial_state, spiked_state, depot_config
-    ):
+    async def test_at03_price_spike_trigger(self, initial_state, spiked_state, depot_config):
         """AT-03: Verify price spike triggers re-optimization."""
         # Create trigger monitor
         trigger_fired = []
@@ -105,17 +99,17 @@ class TestAT03PriceSpikeReoptimization:
             price_change_percent=0.25,  # 25%
             price_change_absolute=25.0,  # $25/MWh
         )
-        
+
         # Create mock assembler for TriggerMonitor
         mock_assembler = MagicMock()
         mock_assembler.config = MagicMock()
         mock_assembler.config.delta_t = 0.25
-        
+
         monitor = TriggerMonitor(config, on_trigger, assembler=mock_assembler)
 
         # Run initial optimization
         initial_result = optimize(initial_state, depot_config, time_limit=30.0)
-        assert initial_result.status == 'completed'
+        assert initial_result.status == "completed"
 
         # Update monitor with initial prices
         initial_prices_dict = {
@@ -141,7 +135,7 @@ class TestAT03PriceSpikeReoptimization:
         # Verify trigger detected price change
         assert price_trigger is not None, "Price trigger should fire"
         assert "Price change" in price_trigger
-        
+
         # Verify OR logic: price spike triggers because BOTH thresholds are met
         # (50% change > 25% AND $50/MWh change > $25/MWh)
         # This test verifies the trigger works; OR logic is tested in unit tests
@@ -152,9 +146,7 @@ class TestAT03PriceSpikeReoptimization:
         reopt_time = (datetime.utcnow() - reopt_start).total_seconds()
 
         # Verify re-optimization completes within 60 seconds
-        assert reopt_time < 60.0, (
-            f"Re-optimization took {reopt_time:.2f}s > 60s"
-        )
+        assert reopt_time < 60.0, f"Re-optimization took {reopt_time:.2f}s > 60s"
 
         # Verify new schedule shifts charging away from high-price period
         # Peak hours: 4pm-9pm = timesteps 64-80 (assuming t=0 at midnight)
@@ -167,8 +159,8 @@ class TestAT03PriceSpikeReoptimization:
         spiked_peak_charging = []
 
         for vehicle_id in initial_result.schedule.keys():
-            initial_power = initial_result.schedule[vehicle_id]['charging_power']
-            spiked_power = spiked_result.schedule[vehicle_id]['charging_power']
+            initial_power = initial_result.schedule[vehicle_id]["charging_power"]
+            spiked_power = spiked_result.schedule[vehicle_id]["charging_power"]
 
             for t in peak_timesteps:
                 if t < len(initial_power):
@@ -177,13 +169,12 @@ class TestAT03PriceSpikeReoptimization:
                     spiked_peak_charging.append(spiked_power[t])
 
         if initial_peak_charging and spiked_peak_charging:
-            avg_initial = sum(initial_peak_charging) / len(initial_peak_charging)
-            avg_spiked = sum(spiked_peak_charging) / len(spiked_peak_charging)
+            sum(initial_peak_charging) / len(initial_peak_charging)
+            sum(spiked_peak_charging) / len(spiked_peak_charging)
 
             # New schedule should reduce charging during peak (higher price)
             # This is a soft check - optimization may still charge during peak
             # if necessary to meet departure requirements
             # But overall, we expect some reduction
             assert spiked_result.objective_value is not None
-            assert spiked_result.status == 'completed'
-
+            assert spiked_result.status == "completed"

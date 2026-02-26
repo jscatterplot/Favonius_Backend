@@ -24,7 +24,6 @@ def isolate_prometheus_registry():
     """Isolate Prometheus registry for each test."""
     # Create a new registry for each test
     test_registry = CollectorRegistry()
-    original_registry = REGISTRY
     REGISTRY._names_to_collectors.clear()
     REGISTRY._collector_to_names.clear()
     yield test_registry

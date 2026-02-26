@@ -39,7 +39,7 @@ class OCPPServer:
 
     def __init__(
         self,
-        host: str = '0.0.0.0',
+        host: str = "0.0.0.0",
         port: int = 9000,
         pool: Optional[asyncpg.Pool] = None,
         on_status_change: Optional[Callable] = None,
@@ -80,14 +80,12 @@ class OCPPServer:
 
         logger.info(f"Initialized OCPPServer on {host}:{port}")
 
-    async def on_connect(
-        self, websocket: WebSocketServerProtocol, path: str
-    ) -> None:
+    async def on_connect(self, websocket: WebSocketServerProtocol, path: str) -> None:
         """Handle new charge point connection.
 
         Extracts charge point ID from path and creates FleetChargePoint instance.
         """
-        charge_point_id = path.strip('/')
+        charge_point_id = path.strip("/")
         if not charge_point_id:
             logger.warning(f"Invalid connection path: {path}")
             await websocket.close()
@@ -151,16 +149,19 @@ class OCPPServer:
     # ------------------------------------------------------------------
 
     async def _handle_status_change(
-        self, charge_point_id: str, connector_id: int, status: str,
-        *args, **kwargs,
+        self,
+        charge_point_id: str,
+        connector_id: int,
+        status: str,
+        *args,
+        **kwargs,
     ) -> None:
         """Handle status change callback with persistence."""
-        error_code = args[0] if len(args) > 0 else kwargs.get('error_code')
-        timestamp = args[1] if len(args) > 1 else kwargs.get('timestamp')
+        error_code = args[0] if len(args) > 0 else kwargs.get("error_code")
+        timestamp = args[1] if len(args) > 1 else kwargs.get("timestamp")
 
         logger.debug(
-            f"Status change: {charge_point_id}, connector {connector_id}, "
-            f"status={status}"
+            f"Status change: {charge_point_id}, connector {connector_id}, " f"status={status}"
         )
 
         # Update cache
@@ -179,7 +180,11 @@ class OCPPServer:
         if self.pool:
             try:
                 await self._store_status_update(
-                    charge_point_id, connector_id, status, error_code, timestamp,
+                    charge_point_id,
+                    connector_id,
+                    status,
+                    error_code,
+                    timestamp,
                 )
             except Exception as e:
                 logger.error(f"Error storing status update: {e}")
@@ -197,9 +202,7 @@ class OCPPServer:
         # Parse args flexibly for backward compatibility
         energy_kwh = None
         timestamp = None
-        transaction_id = None
         max_charge_kw = None
-        raw_samples = None
 
         if args:
             # New signature: (cp, conn, soc, power, energy, ts, tx_id, max_kw, raw)
@@ -211,9 +214,9 @@ class OCPPServer:
                 else:
                     energy_kwh = args[0]
                     timestamp = args[1] if len(args) > 1 else None
-                    transaction_id = args[2] if len(args) > 2 else None
+                    args[2] if len(args) > 2 else None
                     max_charge_kw = args[3] if len(args) > 3 else None
-                    raw_samples = args[4] if len(args) > 4 else None
+                    args[4] if len(args) > 4 else None
 
         logger.debug(
             f"Meter values: {charge_point_id}, connector {connector_id}, "
@@ -242,8 +245,13 @@ class OCPPServer:
         if self.pool and timestamp:
             try:
                 await self._store_meter_values(
-                    charge_point_id, connector_id, soc, power_kw, energy_kwh,
-                    timestamp, max_charge_kw,
+                    charge_point_id,
+                    connector_id,
+                    soc,
+                    power_kw,
+                    energy_kwh,
+                    timestamp,
+                    max_charge_kw,
                 )
             except Exception as e:
                 logger.error(f"Error storing meter values: {e}")
@@ -271,9 +279,15 @@ class OCPPServer:
             charger_id = None
 
         await store_meter_values(
-            self.pool, charge_point_id, connector_id,
-            soc, power_kw, timestamp,
-            vehicle_id=None, max_charge_kw=max_charge_kw, charger_id=charger_id,
+            self.pool,
+            charge_point_id,
+            connector_id,
+            soc,
+            power_kw,
+            timestamp,
+            vehicle_id=None,
+            max_charge_kw=max_charge_kw,
+            charger_id=charger_id,
             energy_kwh=energy_kwh,
         )
 
@@ -308,12 +322,13 @@ class OCPPServer:
                         error_code = EXCLUDED.error_code,
                         updated_at = EXCLUDED.updated_at
                     """,
-                    charge_point_id, connector_id, status,
-                    error_code, ts,
+                    charge_point_id,
+                    connector_id,
+                    status,
+                    error_code,
+                    ts,
                 )
-                logger.debug(
-                    f"Stored status: {charge_point_id}:{connector_id} = {status}"
-                )
+                logger.debug(f"Stored status: {charge_point_id}:{connector_id} = {status}")
         except asyncpg.UndefinedTableError:
             # Table doesn't exist yet — log and skip
             logger.debug(
@@ -328,7 +343,9 @@ class OCPPServer:
     # ------------------------------------------------------------------
 
     def get_connector_status(
-        self, charge_point_id: str, connector_id: int,
+        self,
+        charge_point_id: str,
+        connector_id: int,
     ) -> Optional[str]:
         """Get cached connector status.
 
@@ -339,9 +356,7 @@ class OCPPServer:
         Returns:
             Status string or None if unknown
         """
-        return self._connector_status_cache.get(
-            charge_point_id, {}
-        ).get(connector_id)
+        return self._connector_status_cache.get(charge_point_id, {}).get(connector_id)
 
     def get_all_connector_statuses(self) -> dict[str, dict[int, str]]:
         """Get all cached connector statuses.
@@ -372,7 +387,7 @@ class OCPPServer:
             self.on_connect,
             self.host,
             self.port,
-            subprotocols=['ocpp1.6'],
+            subprotocols=["ocpp1.6"],
         ) as server:
             self.server = server
             logger.info(f"OCPP server started on ws://{self.host}:{self.port}")

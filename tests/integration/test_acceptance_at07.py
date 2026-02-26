@@ -10,10 +10,9 @@ AND peak demand includes building load contribution
 """
 
 import pytest
-from datetime import datetime
 
 from src.core.models import DepotConfig, DepotState
-from src.core.optimizer import optimize, build_optimization_model, solve_model
+from src.core.optimizer import build_optimization_model, optimize
 
 
 @pytest.mark.integration
@@ -30,7 +29,7 @@ class TestAT07BuildingLoadIntegration:
     @pytest.fixture
     def depot_config(self):
         """Depot configuration for building load test."""
-        vehicle_ids = [f'bus_{i}' for i in range(5)]
+        vehicle_ids = [f"bus_{i}" for i in range(5)]
         return DepotConfig(
             vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
             vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -71,7 +70,7 @@ class TestAT07BuildingLoadIntegration:
     def depot_state_with_building_load(self, depot_config, building_load_profile):
         """Depot state with realistic building load."""
         n_t = depot_config.n_timesteps
-        vehicle_ids = [f'bus_{i}' for i in range(5)]
+        vehicle_ids = [f"bus_{i}" for i in range(5)]
 
         return DepotState(
             vehicle_socs={vid: 0.4 for vid in vehicle_ids},
@@ -89,7 +88,7 @@ class TestAT07BuildingLoadIntegration:
     def depot_state_zero_building_load(self, depot_config):
         """Depot state with zero building load for comparison."""
         n_t = depot_config.n_timesteps
-        vehicle_ids = [f'bus_{i}' for i in range(5)]
+        vehicle_ids = [f"bus_{i}" for i in range(5)]
 
         return DepotState(
             vehicle_socs={vid: 0.4 for vid in vehicle_ids},
@@ -108,14 +107,13 @@ class TestAT07BuildingLoadIntegration:
     ):
         """AT-07: Verify grid power accounts for building load at each timestep."""
         result = optimize(depot_state_with_building_load, depot_config, time_limit=30.0)
-        assert result.status == 'completed'
+        assert result.status == "completed"
 
         # Check grid power balance at each timestep
         for t in range(depot_config.n_timesteps):
             # Calculate total vehicle charging power
             total_vehicle_charging = sum(
-                result.schedule[vid]['charging_power'][t]
-                for vid in result.schedule.keys()
+                result.schedule[vid]["charging_power"][t] for vid in result.schedule.keys()
             )
 
             building_power = depot_state_with_building_load.building_power[t]
@@ -138,21 +136,21 @@ class TestAT07BuildingLoadIntegration:
     ):
         """AT-07: Verify peak demand includes building load contribution."""
         result = optimize(depot_state_with_building_load, depot_config, time_limit=30.0)
-        assert result.status == 'completed'
+        assert result.status == "completed"
 
         # Peak demand should be the maximum grid power
         max_grid_power = max(result.grid_power)
 
         # Peak should be >= max building load (80 kW) since we have charging too
         max_building_load = max(depot_state_with_building_load.building_power)
-        assert result.peak_demand >= max_building_load, (
-            f"Peak demand {result.peak_demand:.2f} kW < max building load {max_building_load:.2f} kW"
-        )
+        assert (
+            result.peak_demand >= max_building_load
+        ), f"Peak demand {result.peak_demand:.2f} kW < max building load {max_building_load:.2f} kW"
 
         # Peak should match or exceed maximum grid power
-        assert result.peak_demand >= max_grid_power - 0.1, (
-            f"Peak demand {result.peak_demand:.2f} kW < max grid power {max_grid_power:.2f} kW"
-        )
+        assert (
+            result.peak_demand >= max_grid_power - 0.1
+        ), f"Peak demand {result.peak_demand:.2f} kW < max grid power {max_grid_power:.2f} kW"
 
     def test_at07_building_load_affects_optimization(
         self,
@@ -168,8 +166,8 @@ class TestAT07BuildingLoadIntegration:
             depot_state_zero_building_load, depot_config, time_limit=30.0
         )
 
-        assert result_with_building.status == 'completed'
-        assert result_without_building.status == 'completed'
+        assert result_with_building.status == "completed"
+        assert result_without_building.status == "completed"
 
         # Peak demand should be higher with building load
         assert result_with_building.peak_demand > result_without_building.peak_demand, (
@@ -191,26 +189,26 @@ class TestAT07BuildingLoadIntegration:
         model = build_optimization_model(depot_state_with_building_load, depot_config)
 
         # Verify grid_balance constraint exists
-        assert hasattr(model, 'grid_balance'), "Model should have grid_balance constraint"
+        assert hasattr(model, "grid_balance"), "Model should have grid_balance constraint"
 
         # Verify building_power is a parameter in the model
-        assert hasattr(model, 'building_power'), "Model should have building_power parameter"
+        assert hasattr(model, "building_power"), "Model should have building_power parameter"
 
         # Verify building_power values match input
         for t in range(depot_config.n_timesteps):
             expected = depot_state_with_building_load.building_power[t]
             # building_power[t] should match the input building power
             model_value = model.building_power[t].value
-            assert abs(model_value - expected) < 0.01, (
-                f"building_power[{t}] = {model_value}, expected {expected}"
-            )
+            assert (
+                abs(model_value - expected) < 0.01
+            ), f"building_power[{t}] = {model_value}, expected {expected}"
 
     def test_at07_site_power_limit_with_building_load(
         self, depot_state_with_building_load, depot_config
     ):
         """Verify site power limit is respected including building load."""
         result = optimize(depot_state_with_building_load, depot_config, time_limit=30.0)
-        assert result.status == 'completed'
+        assert result.status == "completed"
 
         # All grid power values should be within site limit
         for t, grid_power in enumerate(result.grid_power):
@@ -224,7 +222,7 @@ class TestAT07BuildingLoadIntegration:
     ):
         """Optimizer should reduce charging during building load peaks."""
         result = optimize(depot_state_with_building_load, depot_config, time_limit=30.0)
-        assert result.status == 'completed'
+        assert result.status == "completed"
 
         # Morning peak hours (6-9 AM = timesteps 24-36)
         peak_timesteps = list(range(24, 36))
@@ -237,15 +235,15 @@ class TestAT07BuildingLoadIntegration:
 
         for vid in result.schedule.keys():
             for t in peak_timesteps:
-                if t < len(result.schedule[vid]['charging_power']):
-                    peak_charging.append(result.schedule[vid]['charging_power'][t])
+                if t < len(result.schedule[vid]["charging_power"]):
+                    peak_charging.append(result.schedule[vid]["charging_power"][t])
             for t in off_peak_timesteps:
-                if t < len(result.schedule[vid]['charging_power']):
-                    off_peak_charging.append(result.schedule[vid]['charging_power'][t])
+                if t < len(result.schedule[vid]["charging_power"]):
+                    off_peak_charging.append(result.schedule[vid]["charging_power"][t])
 
         if peak_charging and off_peak_charging:
-            avg_peak = sum(peak_charging) / len(peak_charging)
-            avg_off_peak = sum(off_peak_charging) / len(off_peak_charging)
+            sum(peak_charging) / len(peak_charging)
+            sum(off_peak_charging) / len(off_peak_charging)
 
             # With demand charge optimization, charging may shift to off-peak
             # when building load is high during peak
@@ -256,7 +254,7 @@ class TestAT07BuildingLoadIntegration:
     def test_at07_variable_building_load_profile(self, depot_config):
         """Test with highly variable building load profile."""
         n_t = depot_config.n_timesteps
-        vehicle_ids = [f'bus_{i}' for i in range(5)]
+        vehicle_ids = [f"bus_{i}" for i in range(5)]
 
         # Create variable building load (oscillating)
         building_power = []
@@ -277,13 +275,12 @@ class TestAT07BuildingLoadIntegration:
         )
 
         result = optimize(state, depot_config, time_limit=30.0)
-        assert result.status == 'completed'
+        assert result.status == "completed"
 
         # Grid power should still follow balance equation
         for t in range(min(10, n_t)):  # Check first 10 timesteps
             total_charging = sum(
-                result.schedule[vid]['charging_power'][t]
-                for vid in result.schedule.keys()
+                result.schedule[vid]["charging_power"][t] for vid in result.schedule.keys()
             )
             expected_grid = total_charging + building_power[t] - result.battery_dispatch[t]
             assert abs(result.grid_power[t] - expected_grid) < 1.0
@@ -291,7 +288,7 @@ class TestAT07BuildingLoadIntegration:
     def test_at07_high_building_load_still_meets_requirements(self, depot_config):
         """Verify vehicles still meet SoC requirements with high building load."""
         n_t = depot_config.n_timesteps
-        vehicle_ids = [f'bus_{i}' for i in range(3)]  # Fewer vehicles
+        vehicle_ids = [f"bus_{i}" for i in range(3)]  # Fewer vehicles
 
         # Very high building load (200 kW constant)
         state = DepotState(
@@ -307,15 +304,14 @@ class TestAT07BuildingLoadIntegration:
         )
 
         result = optimize(state, depot_config, time_limit=30.0)
-        assert result.status == 'completed'
+        assert result.status == "completed"
 
         # All vehicles should still meet departure requirements
         for vid in vehicle_ids:
             t_dep = state.departure_times[vid]
-            soc_at_departure = result.schedule[vid]['soc'][t_dep]
+            soc_at_departure = result.schedule[vid]["soc"][t_dep]
             assert soc_at_departure >= 0.98, (
-                f"{vid} SoC at departure ({soc_at_departure:.3f}) < 0.98 "
-                "with high building load"
+                f"{vid} SoC at departure ({soc_at_departure:.3f}) < 0.98 " "with high building load"
             )
 
     def test_at07_building_load_validation(self, depot_config):
@@ -323,7 +319,7 @@ class TestAT07BuildingLoadIntegration:
         from src.core.optimizer import InvalidStateError
 
         n_t = depot_config.n_timesteps
-        vehicle_ids = [f'bus_{i}' for i in range(3)]
+        vehicle_ids = [f"bus_{i}" for i in range(3)]
 
         # Wrong length building_power should raise error
         state_wrong_length = DepotState(
@@ -340,4 +336,4 @@ class TestAT07BuildingLoadIntegration:
 
         with pytest.raises(InvalidStateError) as exc_info:
             build_optimization_model(state_wrong_length, depot_config)
-        assert 'building' in str(exc_info.value).lower()
+        assert "building" in str(exc_info.value).lower()

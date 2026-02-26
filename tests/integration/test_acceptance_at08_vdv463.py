@@ -9,13 +9,12 @@ AND bus reaches >= 90% SoC by departure
 AND vehicleId and chargingPointId resolve to known internal entities.
 """
 
-import pytest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
 
-from src.core.models import DepotState, DepotConfig
+import pytest
+
+from src.core.models import DepotConfig, DepotState
 from src.core.optimizer.milp_model import build_optimization_model
-from src.core.optimizer import optimize
 
 
 @pytest.mark.acceptance
@@ -28,7 +27,6 @@ class TestAT08VDV463ChargingRequestIntegration:
         now = datetime.utcnow()
         horizon_start = now
         n_steps = 96
-        delta_t = 0.25
         t_depart = 20  # 5 hours in
 
         state = DepotState(
