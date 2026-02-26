@@ -7,6 +7,39 @@ from pydantic import BaseModel, ConfigDict, Field, validator
 
 from .secrets_manager import SecretsConfig, SecretsManager
 
+def _parse_int_env(primary_name: str, fallback_name: Optional[str] = None, default: int = 0) -> int:
+    """Parse integer env vars safely, tolerating unresolved templates like '$PORT'."""
+    candidates = [primary_name]
+    if fallback_name:
+        candidates.append(fallback_name)
+
+    for name in candidates:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        value = value.strip()
+        if not value or value.startswith("$"):
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+
+    return default
+
+
+def _parse_int_value(raw_value: Optional[str], default: int) -> int:
+    """Parse an integer-like string and fall back for unresolved templates/invalid values."""
+    if raw_value is None:
+        return default
+    value = str(raw_value).strip()
+    if not value or value.startswith("$"):
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
 # Redis and Kafka configuration removed for simplification
 
 
@@ -188,7 +221,7 @@ class Config(BaseModel):
                 verify_client=os.getenv("TLS_VERIFY_CLIENT", "false").lower() == "true",
             ),
             websocket=WebSocketConfig(
-                port=int(os.getenv("WEBSOCKET_PORT") or os.getenv("PORT", "9000")),
+                port=_parse_int_env("WEBSOCKET_PORT", "PORT", 9000),
                 host=os.getenv("WEBSOCKET_HOST", "0.0.0.0"),
                 max_connections=int(os.getenv("MAX_CONNECTIONS", "100")),
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),
@@ -200,9 +233,8 @@ class Config(BaseModel):
                 service_url=secrets_manager.get_secret("TIMESCALE_SERVICE_URL")
                 or os.getenv("TIMESCALE_SERVICE_URL"),
                 host=secrets_manager.get_secret("PGHOST") or os.getenv("PGHOST"),
-                port=int(secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT", "5432")),
-                database=secrets_manager.get_secret("PGDATABASE")
-                or os.getenv("PGDATABASE", "tsdb"),
+                port=_parse_int_value(secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT"), 5432),
+                database=secrets_manager.get_secret("PGDATABASE") or os.getenv("PGDATABASE", "tsdb"),
                 user=secrets_manager.get_secret("PGUSER") or os.getenv("PGUSER"),
                 password=secrets_manager.get_secret("PGPASSWORD") or os.getenv("PGPASSWORD"),
                 sslmode=secrets_manager.get_secret("PGSSLMODE")
@@ -232,37 +264,22 @@ class Config(BaseModel):
             ),
             supabase=SupabaseConfig(
                 url=secrets_manager.get_secret("SUPABASE_URL") or os.getenv("SUPABASE_URL"),
-                anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY")
-                or os.getenv("SUPABASE_ANON_KEY"),
-                service_key=secrets_manager.get_secret("SUPABASE_SERVICE_KEY")
-                or os.getenv("SUPABASE_SERVICE_KEY"),
-                db_host=secrets_manager.get_secret("SUPABASE_DB_HOST")
-                or os.getenv("SUPABASE_DB_HOST"),
-                db_port=int(
-                    secrets_manager.get_secret("SUPABASE_DB_PORT")
-                    or os.getenv("SUPABASE_DB_PORT", "6543")
-                ),
-                db_name=secrets_manager.get_secret("SUPABASE_DB_NAME")
-                or os.getenv("SUPABASE_DB_NAME", "postgres"),
-                db_user=secrets_manager.get_secret("SUPABASE_DB_USER")
-                or os.getenv("SUPABASE_DB_USER"),
-                db_password=secrets_manager.get_secret("SUPABASE_DB_PASSWORD")
-                or os.getenv("SUPABASE_DB_PASSWORD"),
-                max_connections=int(
-                    secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS")
-                    or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")
-                ),
-                connection_timeout=int(
-                    secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT")
-                    or os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")
-                ),
+                anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY"),
+                service_key=secrets_manager.get_secret("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_KEY"),
+                db_host=secrets_manager.get_secret("SUPABASE_DB_HOST") or os.getenv("SUPABASE_DB_HOST"),
+                db_port=_parse_int_value(secrets_manager.get_secret("SUPABASE_DB_PORT") or os.getenv("SUPABASE_DB_PORT"), 6543),
+                db_name=secrets_manager.get_secret("SUPABASE_DB_NAME") or os.getenv("SUPABASE_DB_NAME", "postgres"),
+                db_user=secrets_manager.get_secret("SUPABASE_DB_USER") or os.getenv("SUPABASE_DB_USER"),
+                db_password=secrets_manager.get_secret("SUPABASE_DB_PASSWORD") or os.getenv("SUPABASE_DB_PASSWORD"),
+                max_connections=int(secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS") or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")),
+                connection_timeout=int(secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT") or os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")),
                 enable_realtime=os.getenv("SUPABASE_ENABLE_REALTIME", "true").lower() == "true",
             ),
             monitoring=MonitoringConfig(
-                metrics_port=int(os.getenv("METRICS_PORT", "8080")),
+                metrics_port=_parse_int_env("METRICS_PORT", default=8080),
                 log_level=os.getenv("LOG_LEVEL", "INFO"),
                 enable_telemetry=os.getenv("ENABLE_TELEMETRY", "true").lower() == "true",
-                health_check_port=int(os.getenv("HEALTH_CHECK_PORT", "8081")),
+                health_check_port=_parse_int_env("HEALTH_CHECK_PORT", default=8081),
             ),
             price_feeder=PriceFeederConfig(
                 enabled=os.getenv("PRICE_FEEDER_ENABLED", "true").lower() == "true",

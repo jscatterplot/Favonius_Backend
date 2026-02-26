@@ -478,6 +478,27 @@ class TestConfig:
         assert config.environment == "development"
         assert config.debug is False
 
+
+    @patch.dict(os.environ, {
+        "WEBSOCKET_PORT": "$PORT",
+        "PORT": "8123",
+        "TIMESCALE_SERVICE_URL": "postgres://test:test@localhost:5432/test",
+        "PGHOST": "localhost",
+        "PGUSER": "test",
+        "PGPASSWORD": "test",
+        "SUPABASE_URL": "https://example.supabase.co",
+        "SUPABASE_ANON_KEY": "anon",
+        "SUPABASE_SERVICE_KEY": "service",
+        "SUPABASE_DB_HOST": "db.host",
+        "SUPABASE_DB_USER": "user",
+        "SUPABASE_DB_PASSWORD": "pass",
+    }, clear=True)
+    def test_config_from_env_ignores_unresolved_port_template(self):
+        """Test WEBSOCKET_PORT='$PORT' falls back to Railway PORT value."""
+        config = Config.from_env()
+
+        assert config.websocket.port == 8123
+
     def test_config_validation(self):
         """Test config validation."""
         # Test valid config
