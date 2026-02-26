@@ -45,6 +45,7 @@ Both services use the same repo and same Dockerfile. Configure each service in t
 | Variable | Required | Secret? | Description |
 |----------|----------|---------|-------------|
 | `WEBSOCKET_PORT` | No | No | Optional: set to `$PORT` or leave unset; app uses Railway's `PORT` when set |
+| `STRICT_STARTUP_VALIDATION` | No | No | `false` on Railway if DBs may be temporarily unavailable during boot; `true` for fail-fast behavior |
 | `TIMESCALE_SERVICE_URL` or `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`/`PGSSLMODE` | Yes | Yes for credentials | Same TimescaleDB as API |
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY` | Yes | Yes for keys | Supabase project |
 | `SUPABASE_DB_HOST`, `SUPABASE_DB_PORT`, `SUPABASE_DB_NAME`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD` | Yes | Yes for password | Supabase DB connection |
@@ -105,6 +106,7 @@ Use this when setting up from scratch in the Railway dashboard.
      - `sh -c 'exec uvicorn src.api.main:app --host 0.0.0.0 --port "${PORT}"'`
    - Why: the Dockerfile default already runs API, but setting it explicitly avoids ambiguity when sharing one repo for multiple services.
    - If Railway shows `Failed to parse start command`, remove surrounding backticks/JSON and paste only the raw command string in the Start Command field.
+   - Example (safe quoting): `sh -c 'exec uvicorn src.api.main:app --host 0.0.0.0 --port "${PORT}"'`
 
 3. **Set API environment variables**
    - Required secrets:
@@ -156,6 +158,7 @@ Use this when setting up from scratch in the Railway dashboard.
    - Important:
      - Do **not** set `WEBSOCKET_PORT=$PORT` in Railway Variables. Railway stores it literally as `$PORT`, which will fail integer parsing in older versions.
      - If you set `WEBSOCKET_PORT`, set a numeric value only (for example `9000` in local/non-Railway environments).
+   - If dependency validation blocks startup during platform boot, set `STRICT_STARTUP_VALIDATION=false` and rely on runtime reconnect logic.
    - Secrets/config for data backends:
      - Timescale: `TIMESCALE_SERVICE_URL` **or** `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`/`PGSSLMODE`
      - Supabase: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`
