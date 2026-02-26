@@ -188,6 +188,13 @@ class Config(BaseModel):
         default="development", description="Environment (development/staging/production)"
     )
     debug: bool = Field(default=False, description="Debug mode")
+    strict_startup_validation: bool = Field(
+        default=True,
+        description=(
+            "Fail fast when startup dependency validation fails. "
+            "Set to false to allow startup while external services are temporarily unavailable."
+        ),
+    )
 
     # Secrets management
     secrets_manager: Optional[SecretsManager] = None
@@ -319,5 +326,7 @@ class Config(BaseModel):
             ),
             environment=os.getenv("ENVIRONMENT", "development"),
             debug=os.getenv("DEBUG", "false").lower() == "true",
+            strict_startup_validation=os.getenv("STRICT_STARTUP_VALIDATION", "true").lower()
+            == "true",
             secrets_manager=secrets_manager,
         )

@@ -146,8 +146,15 @@ class Application:
 
         if not is_valid:
             report = validator.get_validation_report()
-            self.logger.error(f"Configuration validation failed: {report}")
-            raise Exception("Configuration validation failed")
+            if self.config.strict_startup_validation:
+                self.logger.error(f"Configuration validation failed: {report}")
+                raise Exception("Configuration validation failed")
+
+            self.logger.warning(
+                "Configuration validation reported issues but strict startup validation is disabled: "
+                f"{report}"
+            )
+            return
 
         self.logger.info("Configuration validation passed")
 
