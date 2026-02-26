@@ -90,6 +90,111 @@ When API and simulator/WebSocket services are deployed from the **same repo**, a
 7. Validate: connect to `wss://<ws-domain>/ocpp/{charge_point_id}` with subprotocol `ocpp1.6` and verify handshake/session.
 8. Confirm TimescaleDB tables exist and telemetry writes (e.g. from OCPP MeterValues) succeed.
 
+### Detailed Railway setup playbook (API + WebSocket Handler)
+
+Use this when setting up from scratch in the Railway dashboard.
+
+#### A) API service (FastAPI + optimization)
+
+1. **Create service from this repo**
+   - In Railway project, add a service from GitHub repo root.
+   - Keep root directory as `/` and build using `Dockerfile`.
+
+2. **Set runtime command**
+   - Service start command:
+     - `sh -c 'exec uvicorn src.api.main:app --host 0.0.0.0 --port "${PORT}"'`
+   - Why: the Dockerfile default already runs API, but setting it explicitly avoids ambiguity when sharing one repo for multiple services.
+   - If Railway shows `Failed to parse start command`, remove surrounding backticks/JSON and paste only the raw command string in the Start Command field.
+
+3. **Set API environment variables**
+   - Required secrets:
+     - `DATABASE_URL=<external_timescaledb_url>`
+     - `JWT_SECRET_KEY=<random_secret>`
+   - Recommended non-secret variables:
+     - `ENVIRONMENT=production`
+     - `OCPP_SERVER_ENABLED=false`
+     - `OCPP_USE_SAME_PORT=false`
+     - `CORS_ORIGINS=<frontend_origin_or_csv>`
+
+4. **Configure pre-deploy migration step**
+   - Pre-deploy command:
+     - `python scripts/run_migrations.py`
+   - Migrations should run only on API service.
+
+5. **Configure healthcheck**
+   - Healthcheck path: `/health`
+   - Timeout: 60s (or Railway default if unset).
+   - The API must listen on Railway-provided `$PORT`.
+
+6. **Networking/domain**
+   - Generate public domain for API service.
+   - Validate API endpoint:
+     - `curl https://<api-domain>/health`
+
+7. **Deploy and validate logs**
+   - Confirm in logs:
+     - DB pool initializes
+     - Controllers start
+     - No repeated fatal startup exceptions
+
+#### B) WebSocket Handler service (OCPP/VDV/BACnet)
+
+1. **Create second service from same repo**
+   - Add another service from the same GitHub repo/root.
+   - Use same `Dockerfile`, but different runtime command and variables.
+
+2. **Set runtime command (critical)**
+   - Service start command:
+     - `python -m src.websocket_handler.main`
+   - Why: Dockerfile default starts API (`uvicorn ...`), not the WebSocket handler.
+
+3. **Set WebSocket handler environment variables**
+   - Core runtime:
+     - `ENVIRONMENT=production`
+     - `WEBSOCKET_PORT` **unset** (recommended) so the app uses Railway `PORT` automatically
+
+   - Important:
+     - Do **not** set `WEBSOCKET_PORT=$PORT` in Railway Variables. Railway stores it literally as `$PORT`, which will fail integer parsing in older versions.
+     - If you set `WEBSOCKET_PORT`, set a numeric value only (for example `9000` in local/non-Railway environments).
+   - Secrets/config for data backends:
+     - Timescale: `TIMESCALE_SERVICE_URL` **or** `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`/`PGSSLMODE`
+     - Supabase: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`
+     - Supabase DB: `SUPABASE_DB_HOST`, `SUPABASE_DB_PORT`, `SUPABASE_DB_NAME`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD`
+   - Secrets loading mode (Railway):
+     - `USE_KUBERNETES_SECRETS=false`
+     - `FALLBACK_TO_ENV=true`
+
+4. **Healthcheck settings**
+   - Do **not** set HTTP healthcheck path by default for this service.
+   - This service is primarily WebSocket and should not inherit API `/health` checks.
+
+5. **Networking/domain**
+   - Generate public domain for WebSocket service.
+   - Chargers/simulators must connect to this domain (not API domain):
+     - `wss://<ws-domain>/ocpp/{charge_point_id}`
+     - Subprotocol: `ocpp1.6`
+
+6. **Deploy and validate logs**
+   - Confirm startup includes configuration validation and server start.
+   - During test connections, confirm `BootNotification` and subsequent OCPP exchanges are received.
+
+#### C) Cross-service sanity checks (recommended order)
+
+1. Deploy API service first (runs migrations).
+2. Deploy WebSocket Handler second.
+3. Verify API health endpoint returns 200.
+4. Verify WebSocket handshake against WS domain with `ocpp1.6`.
+5. Verify telemetry rows arrive in Timescale after MeterValues.
+6. Verify no repeated `BootNotification` timeout/retry loops from simulator.
+
+#### D) Common misconfigurations to avoid
+
+- Running only one Railway service with Dockerfile default command (API only) and expecting OCPP WS handler to be active.
+- Pointing chargers/simulator to API domain instead of WebSocket domain.
+- Reusing API healthcheck config on WebSocket service.
+- Forgetting to disable Kubernetes secret mode on Railway (`USE_KUBERNETES_SECRETS=false`).
+- Omitting Supabase/Timescale variables for WebSocket service while API variables are present.
+
 ### Updated advice (Railway docs + MCP)
 
 **Railway MCP:** The Railway MCP tools depend on the [Railway CLI](https://docs.railway.com/guides/cli) being installed and authenticated (`railway login`). If the CLI is not available in the environment (e.g. Cursor’s backend), `check-railway-status`, `list-projects`, `list-services`, and `list-variables` will fail with “railway: command not found”. To use the MCP against your project: install the CLI, run `railway login`, and in this repo run `railway link` to link the project; then the MCP can list services/variables and help with deploys from a session where the CLI is on PATH.
