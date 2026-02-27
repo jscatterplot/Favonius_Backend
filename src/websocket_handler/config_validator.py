@@ -71,7 +71,9 @@ class ConfigValidator:
                     all_valid = False
                     self.logger.error(f"Validation failed for {name}")
                 else:
-                    self._record_detail(name, "Validation passed")
+                    # Only record generic success if no specific detail was already recorded
+                    if name not in self.validation_details:
+                        self._record_detail(name, "Validation passed")
                     self.logger.info(f"Validation passed for {name}")
             except Exception as e:
                 self.logger.error(f"Validation error for {name}: {e}")
