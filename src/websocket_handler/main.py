@@ -172,8 +172,9 @@ class Application:
 
         attempt = 0
         delay_seconds = 2
+        max_attempts = 10
 
-        while True:
+        while attempt < max_attempts:
             attempt += 1
             try:
                 await initializer()
@@ -183,10 +184,17 @@ class Application:
                     )
                 return
             except Exception as exc:
+                if attempt >= max_attempts:
+                    self.logger.error(
+                        f"{component_name} initialization failed after {max_attempts} attempts: {exc}"
+                    )
+                    raise
                 self.logger.warning(
                     f"{component_name} initialization attempt {attempt} failed: {exc}. "
                     f"Retrying in {delay_seconds}s because strict startup validation is disabled."
                 )
+                # Clean up partially initialized components before retrying
+                await self._cleanup_component(component_name)
                 await asyncio.sleep(delay_seconds)
                 delay_seconds = min(delay_seconds * 2, 30)
 
@@ -254,6 +262,45 @@ class Application:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
 
         self.logger.info("Application shutdown complete")
+
+    async def _cleanup_component(self, component_name: str) -> None:
+        """Clean up partially initialized components before retry."""
+        if component_name == "Supabase":
+            if self.supabase_client:
+                try:
+                    await self.supabase_client.disconnect()
+                except Exception:
+                    pass
+                self.supabase_client = None
+            self.auth_manager = None
+            self.data_sync_service = None
+        elif component_name == "TimescaleDB":
+            if self.price_feeder:
+                try:
+                    await self.price_feeder.stop()
+                except Exception:
+                    pass
+                self.price_feeder = None
+            if self.optimization_engine:
+                try:
+                    await self.optimization_engine.stop()
+                except Exception:
+                    pass
+                self.optimization_engine = None
+            if self.analytics_service:
+                try:
+                    # AnalyticsService may not have a stop method, but try to clean up if it does
+                    if hasattr(self.analytics_service, "stop"):
+                        await self.analytics_service.stop()
+                except Exception:
+                    pass
+                self.analytics_service = None
+            if self.timescale_client:
+                try:
+                    await self.timescale_client.disconnect()
+                except Exception:
+                    pass
+                self.timescale_client = None
 
     async def _initialize_supabase_components(self) -> None:
         """Initialize Supabase components."""
