@@ -25,6 +25,29 @@ class ConfigValidator:
         self.config = config
         self.logger = structlog.get_logger(__name__)
         self.validation_results: Dict[str, bool] = {}
+        self.validation_details: Dict[str, str] = {}
+
+    def _record_detail(self, component: str, detail: str) -> None:
+        """Record human-readable validation detail for diagnostics."""
+        self.validation_details[component] = detail
+
+    def _is_placeholder(self, value: Any) -> bool:
+        """Check whether a value looks like an unresolved template."""
+        if value is None:
+            return True
+        text = str(value).strip()
+        return text == "" or text.startswith("$")
+
+    def _missing_fields(self, component: str, mapping: Dict[str, Any]) -> bool:
+        """Validate required fields and record missing values with env var names."""
+        missing = [name for name, value in mapping.items() if self._is_placeholder(value)]
+        if missing:
+            self._record_detail(component, f"Missing required configuration: {', '.join(missing)}")
+            self.logger.error(
+                f"{component.capitalize()} validation failed: missing required configuration values: {', '.join(missing)}"
+            )
+            return True
+        return False
 
     async def validate_all(self) -> bool:
         """Validate all configuration components."""
@@ -48,9 +71,13 @@ class ConfigValidator:
                     all_valid = False
                     self.logger.error(f"Validation failed for {name}")
                 else:
+                    # Only record generic success if no specific detail was already recorded
+                    if name not in self.validation_details:
+                        self._record_detail(name, "Validation passed")
                     self.logger.info(f"Validation passed for {name}")
             except Exception as e:
                 self.logger.error(f"Validation error for {name}: {e}")
+                self._record_detail(name, f"Validation error: {e}")
                 self.validation_results[name] = False
                 all_valid = False
 
@@ -83,6 +110,30 @@ class ConfigValidator:
     async def _validate_timescale(self) -> bool:
         """Validate TimescaleDB connection and schema."""
         try:
+            if self._missing_fields(
+                "timescale",
+                {
+                    "PGHOST": self.config.timescale.host,
+                    "PGPORT": self.config.timescale.port,
+                    "PGDATABASE": self.config.timescale.database,
+                    "PGUSER": self.config.timescale.user,
+                    "PGPASSWORD": self.config.timescale.password,
+                },
+            ):
+                return False
+
+            if (
+                self.config.environment == "production"
+                and str(self.config.timescale.host).strip().lower() in {"localhost", "127.0.0.1", "::1"}
+            ):
+                message = (
+                    "Timescale host points to localhost in production. "
+                    "Set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD to your external TimescaleDB instance."
+                )
+                self._record_detail("timescale", message)
+                self.logger.error(message)
+                return False
+
             # Test connection
             conn = await asyncpg.connect(
                 host=self.config.timescale.host,
@@ -96,6 +147,8 @@ class ConfigValidator:
             # Test TimescaleDB extension
             result = await conn.fetchval("SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'")
             if not result:
+                detail = "TimescaleDB extension not found. Ensure target database has timescaledb extension enabled."
+                self._record_detail("timescale", detail)
                 self.logger.error("TimescaleDB extension not found")
                 await conn.close()
                 return False
@@ -104,17 +157,32 @@ class ConfigValidator:
             await conn.fetchval("SELECT 1")
 
             await conn.close()
+            self._record_detail("timescale", "Connected and query checks passed")
             self.logger.info("TimescaleDB validation passed")
             return True
         except Exception as e:
+            detail = f"Connection failed: {e}"
+            if "Connect call failed" in str(e):
+                detail += "; verify PGHOST/PGPORT are reachable from Railway"
+            self._record_detail("timescale", detail)
             self.logger.error(f"TimescaleDB validation failed: {e}")
             return False
 
     async def _validate_supabase(self) -> bool:
         """Validate Supabase connection."""
         try:
-            if not self.config.supabase.url or not self.config.supabase.service_key:
-                self.logger.error("Supabase URL or service key not configured")
+            if self._missing_fields(
+                "supabase",
+                {
+                    "SUPABASE_URL": self.config.supabase.url,
+                    "SUPABASE_SERVICE_KEY": self.config.supabase.service_key,
+                    "SUPABASE_DB_HOST": self.config.supabase.db_host,
+                    "SUPABASE_DB_PORT": self.config.supabase.db_port,
+                    "SUPABASE_DB_NAME": self.config.supabase.db_name,
+                    "SUPABASE_DB_USER": self.config.supabase.db_user,
+                    "SUPABASE_DB_PASSWORD": self.config.supabase.db_password,
+                },
+            ):
                 return False
 
             # Test Supabase client
@@ -129,12 +197,19 @@ class ConfigValidator:
             with engine.connect() as conn:
                 result = conn.execute(text("SELECT 1")).fetchone()
                 if not result:
+                    detail = "Supabase query returned no rows"
+                    self._record_detail("supabase", detail)
                     self.logger.error("Supabase database query failed")
                     return False
 
+            self._record_detail("supabase", "Connected and query checks passed")
             self.logger.info("Supabase validation passed")
             return True
         except Exception as e:
+            detail = f"Connection failed: {e}"
+            if "Tenant or user not found" in str(e):
+                detail += "; verify SUPABASE_DB_USER/SUPABASE_DB_PASSWORD and pooler host"
+            self._record_detail("supabase", detail)
             self.logger.error(f"Supabase validation failed: {e}")
             return False
 
@@ -219,6 +294,7 @@ class ConfigValidator:
         return {
             "overall_status": all(self.validation_results.values()),
             "validation_results": self.validation_results,
+            "validation_details": self.validation_details,
             "environment": self.config.environment,
             "debug_mode": self.config.debug,
         }

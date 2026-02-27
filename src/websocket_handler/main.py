@@ -73,10 +73,16 @@ class Application:
             await self._initialize_resilience()
 
             # Initialize Supabase components
-            await self._initialize_supabase_components()
+            await self._initialize_with_retry(
+                component_name="Supabase",
+                initializer=self._initialize_supabase_components,
+            )
 
             # Initialize TimescaleDB components
-            await self._initialize_timescale_components()
+            await self._initialize_with_retry(
+                component_name="TimescaleDB",
+                initializer=self._initialize_timescale_components,
+            )
 
             # Create WebSocket server and pass optimization engine for wiring
             self.websocket_server = OCPPWebSocketServer(
@@ -158,6 +164,40 @@ class Application:
 
         self.logger.info("Configuration validation passed")
 
+    async def _initialize_with_retry(self, component_name: str, initializer) -> None:
+        """Initialize critical components with optional retry behavior."""
+        if self.config.strict_startup_validation:
+            await initializer()
+            return
+
+        attempt = 0
+        delay_seconds = 2
+        max_attempts = 10
+
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                await initializer()
+                if attempt > 1:
+                    self.logger.info(
+                        f"{component_name} initialized successfully after {attempt} attempts"
+                    )
+                return
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    self.logger.error(
+                        f"{component_name} initialization failed after {max_attempts} attempts: {exc}"
+                    )
+                    raise
+                self.logger.warning(
+                    f"{component_name} initialization attempt {attempt} failed: {exc}. "
+                    f"Retrying in {delay_seconds}s because strict startup validation is disabled."
+                )
+                # Clean up partially initialized components before retrying
+                await self._cleanup_component(component_name)
+                await asyncio.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 2, 30)
+
     async def _initialize_resilience(self) -> None:
         """Initialize resilience manager and error handling."""
         self.logger.info("Initializing resilience manager...")
@@ -222,6 +262,45 @@ class Application:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
 
         self.logger.info("Application shutdown complete")
+
+    async def _cleanup_component(self, component_name: str) -> None:
+        """Clean up partially initialized components before retry."""
+        if component_name == "Supabase":
+            if self.supabase_client:
+                try:
+                    await self.supabase_client.disconnect()
+                except Exception:
+                    pass
+                self.supabase_client = None
+            self.auth_manager = None
+            self.data_sync_service = None
+        elif component_name == "TimescaleDB":
+            if self.price_feeder:
+                try:
+                    await self.price_feeder.stop()
+                except Exception:
+                    pass
+                self.price_feeder = None
+            if self.optimization_engine:
+                try:
+                    await self.optimization_engine.stop()
+                except Exception:
+                    pass
+                self.optimization_engine = None
+            if self.analytics_service:
+                try:
+                    # AnalyticsService may not have a stop method, but try to clean up if it does
+                    if hasattr(self.analytics_service, "stop"):
+                        await self.analytics_service.stop()
+                except Exception:
+                    pass
+                self.analytics_service = None
+            if self.timescale_client:
+                try:
+                    await self.timescale_client.disconnect()
+                except Exception:
+                    pass
+                self.timescale_client = None
 
     async def _initialize_supabase_components(self) -> None:
         """Initialize Supabase components."""

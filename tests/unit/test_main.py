@@ -18,6 +18,7 @@ class TestApplication:
         config = Mock(spec=Config)
         config.environment = "test"
         config.debug = False
+        config.strict_startup_validation = True
         config.monitoring = Mock()
         config.monitoring.health_check_port = 8081
         config.supabase = Mock()
@@ -110,6 +111,39 @@ class TestApplication:
             mock_analytics_service.initialize.assert_called_once()
             mock_optimization_engine.start.assert_called_once()
             mock_price_feeder.start.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(30)
+    async def test_initialize_with_retry_retries_when_non_strict(self, mock_config):
+        """Test retry behavior for component initialization when strict mode is disabled."""
+        app = Application(mock_config)
+        app.config.strict_startup_validation = False
+
+        attempts = {"count": 0}
+
+        async def flaky_initializer():
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise Exception("temporary error")
+
+        with patch("src.websocket_handler.main.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            await app._initialize_with_retry("Supabase", flaky_initializer)
+
+        assert attempts["count"] == 3
+        assert mock_sleep.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(30)
+    async def test_initialize_with_retry_fails_fast_when_strict(self, mock_config):
+        """Test fail-fast behavior for component initialization in strict mode."""
+        app = Application(mock_config)
+        app.config.strict_startup_validation = True
+
+        async def broken_initializer():
+            raise Exception("permanent error")
+
+        with pytest.raises(Exception, match="permanent error"):
+            await app._initialize_with_retry("TimescaleDB", broken_initializer)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
