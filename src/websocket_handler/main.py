@@ -73,10 +73,16 @@ class Application:
             await self._initialize_resilience()
 
             # Initialize Supabase components
-            await self._initialize_supabase_components()
+            await self._initialize_with_retry(
+                component_name="Supabase",
+                initializer=self._initialize_supabase_components,
+            )
 
             # Initialize TimescaleDB components
-            await self._initialize_timescale_components()
+            await self._initialize_with_retry(
+                component_name="TimescaleDB",
+                initializer=self._initialize_timescale_components,
+            )
 
             # Create WebSocket server and pass optimization engine for wiring
             self.websocket_server = OCPPWebSocketServer(
@@ -157,6 +163,32 @@ class Application:
             return
 
         self.logger.info("Configuration validation passed")
+
+    async def _initialize_with_retry(self, component_name: str, initializer) -> None:
+        """Initialize critical components with optional retry behavior."""
+        if self.config.strict_startup_validation:
+            await initializer()
+            return
+
+        attempt = 0
+        delay_seconds = 2
+
+        while True:
+            attempt += 1
+            try:
+                await initializer()
+                if attempt > 1:
+                    self.logger.info(
+                        f"{component_name} initialized successfully after {attempt} attempts"
+                    )
+                return
+            except Exception as exc:
+                self.logger.warning(
+                    f"{component_name} initialization attempt {attempt} failed: {exc}. "
+                    f"Retrying in {delay_seconds}s because strict startup validation is disabled."
+                )
+                await asyncio.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 2, 30)
 
     async def _initialize_resilience(self) -> None:
         """Initialize resilience manager and error handling."""
