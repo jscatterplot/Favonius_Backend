@@ -115,6 +115,7 @@ class DepotConfig:
     max_site_power: float = 1000.0
     delta_t: float = 0.25  # hours (15 min)
     n_timesteps: int = 96  # 24 hours
+    charger_switching_penalty: float = 0.0  # $/session — penalises MILP charging restarts
 
     # Property aliases for backwards compatibility
     @property
