@@ -33,6 +33,9 @@ class DataSyncService:
         self.sync_running = False
         self._sync_task: Optional[asyncio.Task] = None
 
+        # Track which tables exist so we skip missing ones with a one-time warning
+        self._available_tables: Dict[str, bool] = {}
+
     async def start(self) -> None:
         """Start the data synchronization service."""
         try:
@@ -49,6 +52,9 @@ class DataSyncService:
             )
 
             self.sync_running = True
+
+            # Check which tables exist before starting sync
+            await self._check_available_tables()
 
             # Start sync task (tracked for proper shutdown)
             self._sync_task = asyncio.create_task(self._sync_loop())
@@ -77,6 +83,30 @@ class DataSyncService:
 
         self.logger.info("Data sync service stopped")
 
+    async def _check_available_tables(self) -> None:
+        """Check which sync-related tables exist in TimescaleDB and log warnings for missing ones."""
+        required_tables = ["charging_sessions", "vehicle_telemetry", "optimization_decisions"]
+        if not self.timescale_pool:
+            return
+
+        async with self.timescale_pool.acquire() as conn:
+            for table_name in required_tables:
+                exists = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = $1
+                    )
+                    """,
+                    table_name,
+                )
+                self._available_tables[table_name] = exists
+                if not exists:
+                    self.logger.warning(
+                        f"Table '{table_name}' does not exist in TimescaleDB — "
+                        f"skipping sync for this table"
+                    )
+
     async def _sync_loop(self) -> None:
         """Main synchronization loop."""
         while self.sync_running:
@@ -104,6 +134,9 @@ class DataSyncService:
         """Sync completed charging sessions from TimescaleDB to Supabase."""
         try:
             if not self.timescale_pool:
+                return
+
+            if not self._available_tables.get("charging_sessions", False):
                 return
 
             # Get last sync time
@@ -199,6 +232,9 @@ class DataSyncService:
             if not self.timescale_pool:
                 return
 
+            if not self._available_tables.get("vehicle_telemetry", False):
+                return
+
             # Get last sync time
             last_sync = self.last_sync_times.get(
                 "vehicle_states", datetime.now(timezone.utc) - timedelta(minutes=5)
@@ -265,6 +301,9 @@ class DataSyncService:
         """Sync optimization decisions to Supabase."""
         try:
             if not self.timescale_pool:
+                return
+
+            if not self._available_tables.get("optimization_decisions", False):
                 return
 
             # Get last sync time
@@ -346,6 +385,9 @@ class DataSyncService:
         """Sync energy metrics and analytics to Supabase."""
         try:
             if not self.timescale_pool:
+                return
+
+            if not self._available_tables.get("charging_sessions", False):
                 return
 
             # Get last sync time
