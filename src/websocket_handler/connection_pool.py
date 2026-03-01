@@ -175,6 +175,9 @@ class EnhancedConnectionPool:
             if not service_url:
                 # Construct service URL
                 service_url = f"postgresql://{self.config.user}:{self.config.password}@{self.config.host}:{self.config.port}/{self.config.database}"
+            elif service_url.startswith("postgres://"):
+                # SQLAlchemy expects the canonical dialect name "postgresql".
+                service_url = service_url.replace("postgres://", "postgresql://", 1)
 
             self.sqlalchemy_engine = create_engine(
                 service_url,

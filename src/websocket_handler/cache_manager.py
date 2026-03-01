@@ -35,10 +35,18 @@ class CacheEntry:
 class CacheManager:
     """Advanced caching system with multiple strategies."""
 
-    def __init__(self, max_size: int = 10000, default_ttl: timedelta = timedelta(minutes=5)):
+    def __init__(
+        self,
+        max_size: int = 10000,
+        default_ttl: timedelta = timedelta(minutes=5),
+        ttl_seconds: Optional[int] = None,
+    ):
         """Initialize cache manager."""
         self.max_size = max_size
-        self.default_ttl = default_ttl
+        # Backward-compatibility: older callers pass ttl_seconds.
+        self.default_ttl = (
+            timedelta(seconds=ttl_seconds) if ttl_seconds is not None else default_ttl
+        )
         self.logger = get_logger(__name__)
 
         # Cache storage
