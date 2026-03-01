@@ -108,10 +108,11 @@ class SupabaseConfig(BaseModel):
 class MonitoringConfig(BaseModel):
     """Monitoring and observability configuration."""
 
-    metrics_port: int = Field(default=8080, description="Prometheus metrics port")
+    metrics_port: int = Field(default=9090, description="Prometheus metrics port")
     log_level: str = Field(default="INFO", description="Log level")
     enable_telemetry: bool = Field(default=True, description="Enable telemetry collection")
     health_check_port: int = Field(default=8081, description="Health check port")
+    api_port: int = Field(default=8082, description="REST API server port")
     expected_stations: int = Field(default=100, description="Expected number of charging stations")
     rate_limit_enabled: bool = Field(default=True, description="Enable rate limiting")
 
@@ -283,10 +284,11 @@ class Config(BaseModel):
                 enable_realtime=os.getenv("SUPABASE_ENABLE_REALTIME", "true").lower() == "true",
             ),
             monitoring=MonitoringConfig(
-                metrics_port=_parse_int_env("METRICS_PORT", default=8080),
+                metrics_port=_parse_int_env("METRICS_PORT", default=9090),
                 log_level=os.getenv("LOG_LEVEL", "INFO"),
                 enable_telemetry=os.getenv("ENABLE_TELEMETRY", "true").lower() == "true",
                 health_check_port=_parse_int_env("HEALTH_CHECK_PORT", default=8081),
+                api_port=_parse_int_env("API_PORT", default=8082),
             ),
             price_feeder=PriceFeederConfig(
                 enabled=os.getenv("PRICE_FEEDER_ENABLED", "true").lower() == "true",

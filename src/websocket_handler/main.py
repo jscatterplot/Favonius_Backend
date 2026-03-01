@@ -99,9 +99,12 @@ class Application:
                 self.config.supabase, self.supabase_client, self.auth_manager
             )
 
+            # Validate no port conflicts before starting listeners
+            self._check_port_conflicts()
+
             # Start components
             await self.health_server.start()
-            await self.api_server.start(port=8080)
+            await self.api_server.start(port=self.config.monitoring.api_port)
 
             # Start data sync service
             await self.data_sync_service.start()
@@ -163,6 +166,26 @@ class Application:
             return
 
         self.logger.info("Configuration validation passed")
+
+    def _check_port_conflicts(self) -> None:
+        """Check for port conflicts between services and fail fast with a clear message."""
+        ports = {
+            "WebSocket server": self.config.websocket.port,
+            "Health check server": self.config.monitoring.health_check_port,
+            "API server": self.config.monitoring.api_port,
+        }
+        if self.config.monitoring.enable_telemetry:
+            ports["Prometheus metrics server"] = self.config.monitoring.metrics_port
+
+        seen: dict[int, str] = {}
+        for name, port in ports.items():
+            if port in seen:
+                raise RuntimeError(
+                    f"Port conflict: {name} and {seen[port]} are both configured "
+                    f"to use port {port}. Set distinct ports via environment variables "
+                    f"(WEBSOCKET_PORT, API_PORT, METRICS_PORT, HEALTH_CHECK_PORT)."
+                )
+            seen[port] = name
 
     async def _initialize_with_retry(self, component_name: str, initializer) -> None:
         """Initialize critical components with optional retry behavior."""
@@ -444,6 +467,8 @@ def main() -> None:
         logger.info(
             f"WebSocket server will bind to {config.websocket.host}:{config.websocket.port}"
         )
+        logger.info(f"API server will bind to port {config.monitoring.api_port}")
+        logger.info(f"Prometheus metrics on port {config.monitoring.metrics_port}")
         logger.info(f"Environment: {config.environment}")
 
         if config.debug:

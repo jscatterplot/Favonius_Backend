@@ -1,5 +1,6 @@
 """Unit tests for DataSyncService."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -83,6 +84,27 @@ class TestDataSyncService:
         await data_sync_service.stop()
 
         assert data_sync_service.sync_running is False
+        mock_pool.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_stop_cancels_sync_task(self, data_sync_service):
+        """Test that stop() cancels the background sync task."""
+        mock_pool = AsyncMock()
+        data_sync_service.timescale_pool = mock_pool
+        data_sync_service.sync_running = True
+
+        # Create a real asyncio task that blocks
+        async def blocking_sync():
+            while True:
+                await asyncio.sleep(1)
+
+        data_sync_service._sync_task = asyncio.create_task(blocking_sync())
+
+        await data_sync_service.stop()
+
+        assert data_sync_service.sync_running is False
+        assert data_sync_service._sync_task is None
         mock_pool.close.assert_called_once()
 
     @pytest.mark.asyncio

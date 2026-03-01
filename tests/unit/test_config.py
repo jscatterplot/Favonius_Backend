@@ -209,10 +209,11 @@ class TestMonitoringConfig:
         """Test monitoring config defaults."""
         config = MonitoringConfig()
 
-        assert config.metrics_port == 8080
+        assert config.metrics_port == 9090
         assert config.log_level == "INFO"
         assert config.enable_telemetry is True
         assert config.health_check_port == 8081
+        assert config.api_port == 8082
 
     def test_monitoring_config_custom_values(self):
         """Test monitoring config with custom values."""
@@ -546,7 +547,8 @@ class TestConfig:
         # Test accessing nested configs
         assert config.websocket.port == 9000
         assert config.tls.verify_client is False
-        assert config.monitoring.metrics_port == 8080
+        assert config.monitoring.metrics_port == 9090
+        assert config.monitoring.api_port == 8082
         assert config.price_feeder.nodes == ["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"]
         assert config.optimization.horizon_hours == 4
 
