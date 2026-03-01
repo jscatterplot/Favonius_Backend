@@ -115,15 +115,17 @@ class EnhancedConnectionPool:
             ssl_context: Optional[ssl.SSLContext | bool] = None
             if sslmode in ("disable", "false", "0"):
                 ssl_context = False
-            elif sslmode in ("require", "prefer", "verify-ca", "verify-full"):
+            elif sslmode in ("verify-ca", "verify-full"):
                 ssl_context = ssl.create_default_context()
-                # Timescale Cloud uses standard PostgreSQL certs; hostname verification may be required
-                if sslmode in ("verify-ca", "verify-full"):
-                    ssl_context.check_hostname = True
-                    ssl_context.verify_mode = ssl.CERT_REQUIRED
-                else:
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_REQUIRED
+                ssl_context.check_hostname = sslmode == "verify-full"
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+            elif sslmode in ("require", "prefer"):
+                # PostgreSQL "require" = encrypt but do NOT verify server certificate.
+                # create_default_context() loads system CAs; we disable verification
+                # so self-signed certs (e.g. Timescale Cloud) are accepted.
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
             else:
                 ssl_context = True
 
@@ -143,13 +145,14 @@ class EnhancedConnectionPool:
                     "tcp_keepalives_idle": "600",
                     "tcp_keepalives_interval": "30",
                     "tcp_keepalives_count": "3",
-                    "shared_preload_libraries": "timescaledb",
-                    "max_connections": str(self.max_connections),
-                    "shared_buffers": "256MB",
-                    "effective_cache_size": "1GB",
+                    # Note: shared_preload_libraries, max_connections, shared_buffers
+                    # are server-level (postmaster) settings and cannot be set per-session.
+                    # They are omitted here to avoid errors on managed services like
+                    # Timescale Cloud.
                     "work_mem": "4MB",
                     "maintenance_work_mem": "64MB",
                     "random_page_cost": "1.1",
+                    "effective_cache_size": "1GB",
                     "effective_io_concurrency": "200",
                 },
             )
