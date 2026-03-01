@@ -4,7 +4,6 @@ import asyncio
 import time
 from typing import Any, Dict, List
 
-import websockets
 
 from .config import Config
 from .resilience_manager import HealthCheck
@@ -70,15 +69,12 @@ def create_health_checks(config: Config) -> List[HealthCheck]:
 def _check_timescale_health(config: Config) -> bool:
     """Check TimescaleDB health."""
     try:
+
         async def _run_check() -> bool:
             timescale_client = TimescaleClient(config.timescale)
             await timescale_client.connect()
             try:
-                result = await timescale_client.fetch_one("SELECT 1")
-                timescale_check = await timescale_client.fetch_one(
-                    "SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'"
-                )
-                return result is not None and timescale_check is not None
+                return await timescale_client.health_check()
             finally:
                 await timescale_client.disconnect()
 
@@ -109,12 +105,16 @@ def _check_supabase_health(config: Config) -> bool:
 def _check_websocket_health(config: Config) -> bool:
     """Check WebSocket server health."""
     try:
-        async def _run_check() -> bool:
-            scheme = "wss" if config.tls.enabled else "ws"
-            uri = f"{scheme}://{config.websocket.host}:{config.websocket.port}/health"
 
-            async with websockets.connect(uri, open_timeout=5, close_timeout=5):
-                return True
+        async def _run_check() -> bool:
+            # Service-level health means the websocket listener is reachable.
+            # Use a raw TCP probe so this check does not depend on a specific path/subprotocol.
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(config.websocket.host, config.websocket.port), timeout=5
+            )
+            writer.close()
+            await writer.wait_closed()
+            return reader is not None
 
         return asyncio.run(_run_check())
 

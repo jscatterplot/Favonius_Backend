@@ -328,6 +328,14 @@ class Application:
     async def _initialize_supabase_components(self) -> None:
         """Initialize Supabase components."""
         try:
+            # Initialize database schema before services start using tables.
+            # This is safe to run in all environments because schema creation uses IF NOT EXISTS.
+            try:
+                await create_schema_from_config(self.config.supabase)
+                self.logger.info("Database schema initialized")
+            except Exception as e:
+                self.logger.warning(f"Schema initialization failed (may already exist): {e}")
+
             # Create Supabase client
             self.supabase_client = SupabaseClient(self.config.supabase)
             await self.supabase_client.connect()
@@ -338,14 +346,6 @@ class Application:
             # Create data sync service
             self.data_sync_service = DataSyncService(self.config.supabase, self.supabase_client)
 
-            # Initialize database schema if needed
-            if self.config.environment == "development":
-                try:
-                    await create_schema_from_config(self.config.supabase)
-                    self.logger.info("Database schema initialized")
-                except Exception as e:
-                    self.logger.warning(f"Schema initialization failed (may already exist): {e}")
-
             self.logger.info("Supabase components initialized successfully")
 
         except Exception as e:
@@ -355,6 +355,16 @@ class Application:
     async def _initialize_timescale_components(self) -> None:
         """Initialize TimescaleDB components."""
         try:
+            # Initialize TimescaleDB schema before starting services that write/query tables.
+            # This is safe to run in all environments because schema creation uses IF NOT EXISTS.
+            try:
+                await create_timescale_schema_from_config(self.config.timescale)
+                self.logger.info("TimescaleDB schema initialized")
+            except Exception as e:
+                self.logger.warning(
+                    f"TimescaleDB schema initialization failed (may already exist): {e}"
+                )
+
             # Create TimescaleDB client
             self.timescale_client = TimescaleClient(self.config.timescale)
             await self.timescale_client.connect()
@@ -387,16 +397,6 @@ class Application:
                 if self.optimization_engine:
                     self.price_feeder.set_optimization_engine(self.optimization_engine)
                 await self.price_feeder.start()
-
-            # Initialize TimescaleDB schema if needed
-            if self.config.environment == "development":
-                try:
-                    await create_timescale_schema_from_config(self.config.timescale)
-                    self.logger.info("TimescaleDB schema initialized")
-                except Exception as e:
-                    self.logger.warning(
-                        f"TimescaleDB schema initialization failed (may already exist): {e}"
-                    )
 
             self.logger.info("TimescaleDB components initialized successfully")
 
