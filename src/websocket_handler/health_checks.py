@@ -4,6 +4,8 @@ import asyncio
 import time
 from typing import Any, Dict, List
 
+import websockets
+
 from .config import Config
 from .resilience_manager import HealthCheck
 from .supabase_client import SupabaseClient
@@ -68,33 +70,19 @@ def create_health_checks(config: Config) -> List[HealthCheck]:
 def _check_timescale_health(config: Config) -> bool:
     """Check TimescaleDB health."""
     try:
-        # Create a temporary client for health check
-        timescale_client = TimescaleClient(config.timescale)
-
-        # Run health check in a separate thread to avoid blocking
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        try:
-            # Test connection
-            loop.run_until_complete(timescale_client.connect())
-
-            # Test basic query
-            result = loop.run_until_complete(timescale_client.fetch_one("SELECT 1"))
-
-            # Test TimescaleDB extension
-            timescale_check = loop.run_until_complete(
-                timescale_client.fetch_one(
+        async def _run_check() -> bool:
+            timescale_client = TimescaleClient(config.timescale)
+            await timescale_client.connect()
+            try:
+                result = await timescale_client.fetch_one("SELECT 1")
+                timescale_check = await timescale_client.fetch_one(
                     "SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'"
                 )
-            )
+                return result is not None and timescale_check is not None
+            finally:
+                await timescale_client.disconnect()
 
-            loop.run_until_complete(timescale_client.close())
-
-            return result is not None and timescale_check is not None
-
-        finally:
-            loop.close()
+        return asyncio.run(_run_check())
 
     except Exception:
         return False
@@ -103,26 +91,16 @@ def _check_timescale_health(config: Config) -> bool:
 def _check_supabase_health(config: Config) -> bool:
     """Check Supabase health."""
     try:
-        # Create a temporary client for health check
-        supabase_client = SupabaseClient(config.supabase)
+        async def _run_check() -> bool:
+            supabase_client = SupabaseClient(config.supabase)
+            await supabase_client.connect()
+            try:
+                result = await supabase_client.fetch_one("SELECT 1")
+                return result is not None
+            finally:
+                await supabase_client.close()
 
-        # Run health check in a separate thread to avoid blocking
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        try:
-            # Test connection
-            loop.run_until_complete(supabase_client.connect())
-
-            # Test basic query
-            result = loop.run_until_complete(supabase_client.fetch_one("SELECT 1"))
-
-            loop.run_until_complete(supabase_client.close())
-
-            return result is not None
-
-        finally:
-            loop.close()
+        return asyncio.run(_run_check())
 
     except Exception:
         return False
@@ -131,17 +109,14 @@ def _check_supabase_health(config: Config) -> bool:
 def _check_websocket_health(config: Config) -> bool:
     """Check WebSocket server health."""
     try:
-        # Check if WebSocket port is available
-        import socket
+        async def _run_check() -> bool:
+            scheme = "wss" if config.tls.enabled else "ws"
+            uri = f"{scheme}://{config.websocket.host}:{config.websocket.port}/health"
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
+            async with websockets.connect(uri, open_timeout=5, close_timeout=5):
+                return True
 
-        try:
-            result = sock.connect_ex((config.websocket.host, config.websocket.port))
-            return result == 0  # Port is open
-        finally:
-            sock.close()
+        return asyncio.run(_run_check())
 
     except Exception:
         return False
