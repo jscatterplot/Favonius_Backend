@@ -130,7 +130,7 @@ class OCPPWebSocketServer:
 
         except Exception as e:
             self.logger.error(f"Failed to start WebSocket server: {e}")
-            ERRORS_TOTAL.labels(operation_type="startup_error").inc()
+            ERRORS_TOTAL.labels(error_type="startup_error", station_id="unknown").inc()
             raise
 
     async def stop(self) -> None:
@@ -229,7 +229,7 @@ class OCPPWebSocketServer:
         if len(self.connections) >= self.config.websocket.max_connections:
             self.logger.warning(f"Connection limit exceeded, rejecting {client_ip}")
             await websocket.close(1008, "Server overloaded")
-            ERRORS_TOTAL.labels(operation_type="connection_limit_exceeded").inc()
+            ERRORS_TOTAL.labels(error_type="connection_limit_exceeded", station_id="unknown").inc()
             return
 
         # Parse path for protocol routing
@@ -268,7 +268,7 @@ class OCPPWebSocketServer:
                 self.logger.info(f"VDV 463 connection {connection_id} closed normally")
             except Exception as e:
                 self.logger.error(f"Error handling VDV 463 connection {connection_id}: {e}")
-                ERRORS_TOTAL.labels(operation_type="connection_error").inc()
+                ERRORS_TOTAL.labels(error_type="connection_error", station_id="unknown").inc()
             return
 
         # Default to OCPP handling (legacy or /ocpp/{charge_point_id} paths)
@@ -276,7 +276,7 @@ class OCPPWebSocketServer:
         if websocket.subprotocol != "ocpp2.1":
             self.logger.warning(f"Invalid subprotocol from {client_ip}: {websocket.subprotocol}")
             await websocket.close(1002, "Invalid subprotocol")
-            ERRORS_TOTAL.labels(operation_type="invalid_subprotocol").inc()
+            ERRORS_TOTAL.labels(error_type="invalid_subprotocol", station_id="unknown").inc()
             return
 
         # Extract station ID from path
@@ -334,7 +334,7 @@ class OCPPWebSocketServer:
             self.logger.info(f"Connection {connection_id} closed normally")
         except Exception as e:
             self.logger.error(f"Error handling connection {connection_id}: {e}")
-            ERRORS_TOTAL.labels(operation_type="connection_error").inc()
+            ERRORS_TOTAL.labels(error_type="connection_error", station_id="unknown").inc()
         finally:
             await self._cleanup_connection(connection_id, websocket, station_id)
 
