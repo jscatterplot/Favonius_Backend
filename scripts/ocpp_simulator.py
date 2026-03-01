@@ -205,6 +205,13 @@ async def run_charger(charger_id: str, server_url: str, response_delay: float = 
                     raise
                 finally:
                     handler_task.cancel()
+                    try:
+                        await handler_task
+                    except asyncio.CancelledError:
+                        pass
+                    except websockets.exceptions.ConnectionClosed:
+                        # Expected when peer closes while reconnect loop restarts.
+                        pass
 
         except asyncio.CancelledError:
             return
@@ -227,6 +234,12 @@ async def main():
     logger.info(f"Starting {num_chargers} simulated chargers")
     logger.info(f"Server URL: {server_url}")
     logger.info(f"Mode: {simulation_mode}")
+
+    if "/ocpp" not in server_url.rstrip("/"):
+        logger.warning(
+            "OCPP_SERVER_URL does not include '/ocpp'. Most deployments expect URLs like "
+            "wss://<host>/ocpp; missing path can cause BootNotification timeouts."
+        )
 
     # Wait for server to be ready
     await asyncio.sleep(5)
