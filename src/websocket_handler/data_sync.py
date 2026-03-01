@@ -31,6 +31,7 @@ class DataSyncService:
         # Sync state tracking
         self.last_sync_times: Dict[str, datetime] = {}
         self.sync_running = False
+        self._sync_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         """Start the data synchronization service."""
@@ -49,8 +50,8 @@ class DataSyncService:
 
             self.sync_running = True
 
-            # Start sync tasks
-            asyncio.create_task(self._sync_loop())
+            # Start sync task (tracked for proper shutdown)
+            self._sync_task = asyncio.create_task(self._sync_loop())
 
             self.logger.info("Data sync service started")
 
@@ -61,6 +62,15 @@ class DataSyncService:
     async def stop(self) -> None:
         """Stop the data synchronization service."""
         self.sync_running = False
+
+        # Cancel the background sync task before closing the pool
+        if self._sync_task:
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except asyncio.CancelledError:
+                pass
+            self._sync_task = None
 
         if self.timescale_pool:
             await self.timescale_pool.close()
@@ -73,6 +83,8 @@ class DataSyncService:
             try:
                 await self.sync_all_data()
                 await asyncio.sleep(self.sync_interval)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 self.logger.error(f"Sync loop error: {e}")
                 await asyncio.sleep(60)  # Wait 1 minute before retry

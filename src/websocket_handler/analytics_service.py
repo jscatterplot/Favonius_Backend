@@ -25,7 +25,7 @@ class AnalyticsService:
         """Initialize analytics resources."""
         if self.timescale_client is None:
             self.timescale_client = TimescaleClient(self.config)
-        if self.timescale_client:
+        if self.timescale_client and not self.timescale_client.connected:
             await self.timescale_client.connect()
         self.logger.info("Analytics service initialized")
 

@@ -21,6 +21,11 @@ class TestApplication:
         config.strict_startup_validation = True
         config.monitoring = Mock()
         config.monitoring.health_check_port = 8081
+        config.monitoring.metrics_port = 9090
+        config.monitoring.api_port = 8082
+        config.monitoring.enable_telemetry = True
+        config.websocket = Mock()
+        config.websocket.port = 9000
         config.supabase = Mock()
         config.timescale = Mock()
         config.optimization = Mock()
@@ -277,6 +282,55 @@ class TestApplication:
                 await app.start()
 
             assert app.running is True
+
+
+    @pytest.mark.timeout(10)
+    def test_check_port_conflicts_no_conflict(self, mock_config):
+        """Test port conflict detection with no conflicts."""
+        app = Application(mock_config)
+        # All ports are different — should not raise
+        app._check_port_conflicts()
+
+    @pytest.mark.timeout(10)
+    def test_check_port_conflicts_ws_vs_api(self, mock_config):
+        """Test port conflict between WebSocket and API server."""
+        app = Application(mock_config)
+        mock_config.websocket.port = 8080
+        mock_config.monitoring.api_port = 8080
+
+        with pytest.raises(RuntimeError, match="Port conflict"):
+            app._check_port_conflicts()
+
+    @pytest.mark.timeout(10)
+    def test_check_port_conflicts_metrics_vs_api(self, mock_config):
+        """Test port conflict between Prometheus metrics and API server."""
+        app = Application(mock_config)
+        mock_config.monitoring.metrics_port = 8082
+        mock_config.monitoring.api_port = 8082
+
+        with pytest.raises(RuntimeError, match="Port conflict"):
+            app._check_port_conflicts()
+
+    @pytest.mark.timeout(10)
+    def test_check_port_conflicts_ws_vs_metrics(self, mock_config):
+        """Test port conflict between WebSocket and Prometheus metrics."""
+        app = Application(mock_config)
+        mock_config.websocket.port = 9090
+        mock_config.monitoring.metrics_port = 9090
+
+        with pytest.raises(RuntimeError, match="Port conflict"):
+            app._check_port_conflicts()
+
+    @pytest.mark.timeout(10)
+    def test_check_port_conflicts_skips_metrics_when_disabled(self, mock_config):
+        """Test that metrics port is excluded from conflict check when telemetry is disabled."""
+        app = Application(mock_config)
+        mock_config.monitoring.enable_telemetry = False
+        # Set metrics port same as API — no conflict because metrics is disabled
+        mock_config.monitoring.metrics_port = 8082
+        mock_config.monitoring.api_port = 8082
+
+        app._check_port_conflicts()  # Should not raise
 
 
 class TestRunApplication:
