@@ -94,5 +94,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # Per PRD Section 7.1: REST API, OCPP WebSocket (same port when OCPP_USE_SAME_PORT=true)
 EXPOSE 8000 9000
 
-# Run the application. PORT is set by Railway at runtime (e.g. 8080); default 8000 for local.
-CMD ["sh", "-c", "exec uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Run migrations then start the application.
+# Migrations are idempotent (skip already-applied files) so running them on every
+# container start is safe and ensures schema is always up-to-date before the API
+# tries to query tables like "depots".
+# PORT is set by Railway at runtime (e.g. 8080); default 8000 for local.
+CMD ["sh", "-c", "python scripts/run_migrations.py && exec uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
