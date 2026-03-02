@@ -153,14 +153,20 @@ class SimulatedChargePoint(CP):
         """Transition to charging state."""
         await asyncio.sleep(0.5)
         self.status = ChargePointStatus.charging
-        await self.send_status_notification()
+        try:
+            await self.send_status_notification()
+        except Exception:
+            pass  # Connection may have closed before this task ran
 
     async def _stop_charging(self):
         """Transition to available state."""
         await asyncio.sleep(0.5)
         self.status = ChargePointStatus.available
         self.transaction_id = None
-        await self.send_status_notification()
+        try:
+            await self.send_status_notification()
+        except Exception:
+            pass  # Connection may have closed before this task ran
 
     async def simulate_charging(self):
         """Simulate charging progression."""
@@ -189,9 +195,16 @@ async def run_charger(charger_id: str, server_url: str, response_delay: float = 
                 handler_task = asyncio.create_task(cp.start())
 
                 if not await cp.send_boot_notification():
-                    logger.error(f"[{charger_id}] Boot rejected")
+                    # Server rejected boot (e.g. still starting up).
+                    # Cancel the receive-loop task, then let the reconnect
+                    # backoff handle the retry — do NOT return permanently.
                     handler_task.cancel()
-                    return
+                    try:
+                        await handler_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    logger.error(f"[{charger_id}] Boot rejected, will retry with backoff")
+                    raise RuntimeError("BootNotification rejected")
 
                 await cp.send_status_notification(ChargePointStatus.available)
 
@@ -254,10 +267,13 @@ async def main():
 
     try:
         await asyncio.gather(*tasks)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # asyncio.run() converts SIGINT into CancelledError on the gather
+        # coroutine, so we must catch both to guarantee cleanup runs.
         logger.info("Shutting down simulator")
         for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
