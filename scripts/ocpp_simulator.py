@@ -191,24 +191,15 @@ async def run_charger(charger_id: str, server_url: str, response_delay: float = 
             ) as ws:
                 backoff = 2.0  # Reset on successful connection
                 cp = SimulatedChargePoint(charger_id, ws, response_delay)
-
                 handler_task = asyncio.create_task(cp.start())
 
-                if not await cp.send_boot_notification():
-                    # Server rejected boot (e.g. still starting up).
-                    # Cancel the receive-loop task, then let the reconnect
-                    # backoff handle the retry — do NOT return permanently.
-                    handler_task.cancel()
-                    try:
-                        await handler_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    logger.error(f"[{charger_id}] Boot rejected, will retry with backoff")
-                    raise RuntimeError("BootNotification rejected")
-
-                await cp.send_status_notification(ChargePointStatus.available)
-
                 try:
+                    if not await cp.send_boot_notification():
+                        logger.error(f"[{charger_id}] Boot rejected, will retry with backoff")
+                        raise RuntimeError("BootNotification rejected")
+
+                    await cp.send_status_notification(ChargePointStatus.available)
+
                     while True:
                         await asyncio.sleep(60)  # Every minute
                         await cp.send_meter_values()
@@ -223,8 +214,11 @@ async def run_charger(charger_id: str, server_url: str, response_delay: float = 
                     except asyncio.CancelledError:
                         pass
                     except websockets.exceptions.ConnectionClosed:
-                        # Expected when peer closes while reconnect loop restarts.
+                        # Normal shutdown/reconnect path: peer closed.
                         pass
+                    except Exception as task_exc:
+                        # Prevent "Task exception was never retrieved" warnings.
+                        logger.debug(f"[{charger_id}] OCPP receive loop ended: {task_exc}")
 
         except asyncio.CancelledError:
             return
