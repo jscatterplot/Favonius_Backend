@@ -126,18 +126,24 @@ async def lifespan(app: FastAPI):
     global db_pool, controller_manager, ocpp_server
 
     # Initialize database connection pool
-    database_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/favonius",
-    )
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        # Fail startup immediately so the orchestrator restarts with the env var set,
+        # rather than running indefinitely in a broken state.
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Set it to a valid PostgreSQL connection string before starting the API."
+        )
+
     try:
         db_pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
         logger.info("Database connection pool initialized")
     except Exception as e:
+        # Re-raise so uvicorn/Railway sees a failed startup and can restart the pod.
+        # Continuing with db_pool=None would start the API in a permanently broken
+        # state (every endpoint returns 503) with no automatic recovery.
         logger.error(f"Failed to initialize database pool: {e}")
-        db_pool = None
-        yield
-        return
+        raise
 
     # Initialize OCPP server (if enabled)
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
@@ -1733,7 +1739,7 @@ def check_gurobi_license() -> str:
     summary="Health check endpoint",
     description="""
     Check the health status of the API and its components.
-    
+
     **Response:**
     - `status`: Overall status ("healthy" or "degraded")
     - `timestamp`: Current timestamp (ISO 8601)
@@ -1741,13 +1747,15 @@ def check_gurobi_license() -> str:
       - `database`: "healthy" or "unavailable"
       - `ocpp_server`: "healthy", "unavailable", or "unknown"
       - `gurobi_license`: "valid", "invalid", or "unavailable"
-    
-    Always returns 200 status code with component details.
-    
+
+    Returns **200** when healthy, **503** when degraded (database unavailable).
+    A Gurobi license issue is treated as degraded-but-functional (HiGHS fallback
+    is available) and returns 200 with status "degraded".
+
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """,
 )
-async def health_check():
+async def health_check(response: Response):
     """Health check endpoint.
 
     Per PRD Section 7.1: Health endpoint reports component status including
@@ -1760,9 +1768,15 @@ async def health_check():
     ocpp_status = await check_ocpp_server_health()
     gurobi_status = check_gurobi_license()
 
-    # Overall status is healthy if database is healthy
-    # Gurobi license invalid is degraded but not fatal (HiGHS fallback available)
+    # Database unavailability means every real endpoint returns 503; the pod is
+    # non-functional.  Signal this to load balancers and Railway probes by
+    # returning 503 so they stop routing traffic here.
+    # A missing Gurobi license is not fatal (HiGHS fallback) so we stay 200 in
+    # that case and let the "degraded" status field surface the issue.
     overall_status = "healthy" if db_status == "healthy" else "degraded"
+
+    if db_status != "healthy":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return {
         "status": overall_status,
