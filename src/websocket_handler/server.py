@@ -149,6 +149,14 @@ class OCPPWebSocketServer:
                 f"WebSocket server started on {self.config.websocket.host}:{self.config.websocket.port}"
             )
 
+            # Signal the health check that the port is now bound so it stops
+            # reporting spurious failures during the startup grace period.
+            try:
+                from .health_checks import notify_websocket_ready
+                notify_websocket_ready()
+            except Exception:
+                pass
+
             # Start background tasks
             self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor())
             self._rate_limit_task = asyncio.create_task(self._rate_limit_cleanup())
@@ -314,8 +322,11 @@ class OCPPWebSocketServer:
             return
 
         # Default to OCPP handling (legacy or /ocpp/{charge_point_id} paths)
-        # Validate OCPP subprotocol for OCPP connections
-        if websocket.subprotocol != "ocpp2.1":
+        # Accept both OCPP 1.6 and OCPP 2.x connections.  The server is listed
+        # as supporting "ocpp1.6" in the handshake so rejecting it here is
+        # contradictory and causes chargers to wait 30 s for a response that
+        # never arrives before the close frame lands.
+        if websocket.subprotocol not in ("ocpp1.6", "ocpp2.0.1", "ocpp2.1"):
             self.logger.warning(f"Invalid subprotocol from {client_ip}: {websocket.subprotocol}")
             await websocket.close(1002, "Invalid subprotocol")
             ERRORS_TOTAL.labels(error_type="invalid_subprotocol", station_id="unknown").inc()

@@ -1,6 +1,7 @@
 """Resilience and fault tolerance management."""
 
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -231,10 +232,16 @@ class ResilienceManager:
             try:
                 start_time = time.time()
 
-                # Run health check with timeout
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(health_check.check_func), timeout=health_check.timeout
-                )
+                # Support both sync and async check functions.
+                # Async functions are awaited directly (no thread hop needed because they
+                # use the live client pools already running on this event loop).
+                # Sync functions are offloaded to a thread to avoid blocking the loop.
+                if inspect.iscoroutinefunction(health_check.check_func):
+                    coro = health_check.check_func()
+                else:
+                    coro = asyncio.to_thread(health_check.check_func)
+
+                result = await asyncio.wait_for(coro, timeout=health_check.timeout)
 
                 response_time = (time.time() - start_time) * 1000
 

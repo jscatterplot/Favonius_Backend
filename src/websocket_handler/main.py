@@ -17,7 +17,8 @@ from .connection_monitor import ConnectionMonitor
 from .data_sync import DataSyncService
 from .database_schema import create_schema_from_config
 from .health import HealthCheckServer
-from .monitoring import get_logger, setup_monitoring
+from .health_checks import create_health_checks, notify_websocket_ready
+from .monitoring import get_logger, setup_logging, setup_monitoring
 from .optimization_engine import OptimizationEngine
 from .price_feeder import PriceFeederService
 from .resilience_manager import resilience_manager
@@ -66,7 +67,8 @@ class Application:
             # Validate configuration first
             await self._validate_configuration()
 
-            # Setup monitoring first
+            # Start Prometheus metrics HTTP server (logging is already configured
+            # by main() before Application is created).
             setup_monitoring(self.config.monitoring)
 
             # Initialize resilience manager
@@ -225,9 +227,9 @@ class Application:
         """Initialize resilience manager and error handling."""
         self.logger.info("Initializing resilience manager...")
 
-        # Add health checks
-        from .health_checks import create_health_checks
-
+        # Register placeholder health checks (no live clients yet).
+        # _refresh_health_checks() upgrades them to pool-backed checks once
+        # the clients are available.
         health_checks = create_health_checks(self.config)
 
         for health_check in health_checks:
@@ -248,6 +250,22 @@ class Application:
         await resilience_manager.start()
 
         self.logger.info("Resilience manager initialized")
+
+    def _refresh_health_checks(self) -> None:
+        """Upgrade health-check functions to use the live client pools.
+
+        Called after both timescale_client and supabase_client are ready so
+        subsequent health-check cycles probe the existing connections instead
+        of spinning up disposable ones.
+        """
+        upgraded = create_health_checks(
+            self.config,
+            timescale_client=self.timescale_client,
+            supabase_client=self.supabase_client,
+        )
+        for hc in upgraded:
+            if hc.name in resilience_manager.health_checks:
+                resilience_manager.health_checks[hc.name].check_func = hc.check_func
 
     async def stop(self) -> None:
         """Stop all application components gracefully."""
@@ -402,6 +420,10 @@ class Application:
 
             self.logger.info("TimescaleDB components initialized successfully")
 
+            # Both clients are now live — upgrade health checks to use their pools
+            # so subsequent cycles don't create/destroy throwaway connections.
+            self._refresh_health_checks()
+
         except Exception as e:
             self.logger.error(f"Failed to initialize TimescaleDB components: {e}")
             raise
@@ -451,32 +473,27 @@ async def run_application(config: Config) -> None:
 
 def main() -> None:
     """Main entry point."""
-    # Load configuration from environment
+    # Load configuration first so logging can be set up with the right level.
     config = Config.from_env()
 
-    # Setup basic logging for startup
-    import logging
+    # Configure structlog immediately so ALL log output — including the lines
+    # below — uses a single, consistent format (JSON in production).
+    setup_logging(config.monitoring)
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-
-    logger = logging.getLogger(__name__)
+    logger = get_logger(__name__)
 
     try:
-        # Validate configuration
-        logger.info("Loading configuration...")
         logger.info(
-            f"WebSocket server will bind to {config.websocket.host}:{config.websocket.port}"
+            "Loading configuration...",
+            ws_bind=f"{config.websocket.host}:{config.websocket.port}",
+            api_port=config.monitoring.api_port,
+            metrics_port=config.monitoring.metrics_port,
+            environment=config.environment,
         )
-        logger.info(f"API server will bind to port {config.monitoring.api_port}")
-        logger.info(f"Prometheus metrics on port {config.monitoring.metrics_port}")
-        logger.info(f"Environment: {config.environment}")
 
         if config.debug:
             logger.warning("Debug mode is enabled")
 
-        # Run application
         logger.info("Starting application...")
         asyncio.run(run_application(config))
 
@@ -484,7 +501,7 @@ def main() -> None:
         logger.info("Application interrupted by user")
         sys.exit(0)
     except Exception as e:
-        logger.error(f"Application startup failed: {e}")
+        logger.error("Application startup failed", error=str(e))
         sys.exit(1)
 
 
