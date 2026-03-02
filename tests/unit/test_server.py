@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from websocket_handler.config import Config
-from websocket_handler.server import OCPPWebSocketServer
+from websocket_handler.server import OCPPWebSocketServer, _SuppressHandshakeEOFErrors
 from websocket_handler.timescale_client import TimescaleClient
 
 
@@ -402,6 +402,155 @@ class TestOCPPWebSocketServer:
 
         # Should handle all connections without error
         assert True
+
+
+class TestSuppressHandshakeEOFErrors:
+    """Tests for the _SuppressHandshakeEOFErrors logging filter."""
+
+    @pytest.fixture
+    def log_filter(self):
+        return _SuppressHandshakeEOFErrors()
+
+    def _make_record(self, level: int, exc: Exception | None = None) -> logging.LogRecord:
+        """Build a minimal LogRecord with optional exception info."""
+        record = logging.LogRecord(
+            name="websockets.server",
+            level=level,
+            pathname="",
+            lineno=0,
+            msg="opening handshake failed",
+            args=(),
+            exc_info=(type(exc), exc, None) if exc else None,
+        )
+        return record
+
+    def _chain(self, *exceptions: Exception) -> Exception:
+        """Chain exceptions so each is the __cause__ of the next."""
+        for outer, inner in zip(exceptions, exceptions[1:]):
+            outer.__cause__ = inner
+        return exceptions[0]
+
+    def test_suppresses_zero_byte_eof_error(self, log_filter):
+        """Filter drops ERROR records whose cause chain includes 'stream ends after 0 bytes'."""
+        root = EOFError("stream ends after 0 bytes, before end of line")
+        mid = EOFError("connection closed while reading HTTP request line")
+        top = Exception("did not receive a valid HTTP request")
+        exc = self._chain(top, mid, root)
+
+        record = self._make_record(logging.ERROR, exc)
+        assert log_filter.filter(record) is False
+
+    def test_allows_other_eof_errors(self, log_filter):
+        """Filter passes ERROR records whose EOFError has a different message."""
+        exc = self._chain(Exception("handshake failed"), EOFError("connection reset"))
+        record = self._make_record(logging.ERROR, exc)
+        assert log_filter.filter(record) is True
+
+    def test_allows_non_error_levels(self, log_filter):
+        """Filter never suppresses WARNING or INFO records."""
+        root = EOFError("stream ends after 0 bytes, before end of line")
+        for level in (logging.WARNING, logging.INFO, logging.DEBUG):
+            record = self._make_record(level, root)
+            assert log_filter.filter(record) is True
+
+    def test_allows_error_without_exc_info(self, log_filter):
+        """Filter passes ERROR records that carry no exception (no exc_info)."""
+        record = self._make_record(logging.ERROR, exc=None)
+        assert log_filter.filter(record) is True
+
+    def test_filter_installed_on_server_init(self, mock_config, mock_timescale_client):
+        """OCPPWebSocketServer __init__ installs the filter on the websockets.server logger."""
+        import logging as _logging
+
+        ws_logger = _logging.getLogger("websockets.server")
+        before = len(ws_logger.filters)
+        OCPPWebSocketServer(mock_config, mock_timescale_client)
+        assert len(ws_logger.filters) == before + 1
+        assert any(isinstance(f, _SuppressHandshakeEOFErrors) for f in ws_logger.filters)
+
+    @pytest.fixture
+    def mock_config(self):
+        config = Mock(spec=Config)
+        config.websocket = Mock()
+        config.websocket.host = "localhost"
+        config.websocket.port = 9000
+        config.websocket.max_message_size = 65536
+        config.websocket.max_connections = 100
+        config.websocket.heartbeat_interval = 30
+        config.websocket.message_timeout = 60
+        config.websocket.rate_limit_per_minute = 100
+        config.tls = Mock()
+        config.tls.cert_path = None
+        config.tls.key_path = None
+        config.tls.ca_path = None
+        config.tls.verify_client = False
+        return config
+
+    @pytest.fixture
+    def mock_timescale_client(self):
+        client = Mock(spec=TimescaleClient)
+        client.health_check = AsyncMock(return_value={"status": "healthy"})
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        return client
+
+
+class TestProcessRequest:
+    """Tests for OCPPWebSocketServer._process_request health-check handler."""
+
+    @pytest.fixture
+    def server(self):
+        config = Mock(spec=Config)
+        config.websocket = Mock()
+        config.websocket.host = "localhost"
+        config.websocket.port = 9000
+        config.websocket.max_message_size = 65536
+        config.websocket.max_connections = 100
+        config.websocket.heartbeat_interval = 30
+        config.websocket.message_timeout = 60
+        config.websocket.rate_limit_per_minute = 100
+        config.tls = Mock()
+        config.tls.cert_path = None
+        config.tls.key_path = None
+        return OCPPWebSocketServer(config, Mock(spec=TimescaleClient))
+
+    def _make_request(self, path: str):
+        """Build a minimal mock request with a path attribute."""
+        req = Mock()
+        req.path = path
+        return req
+
+    def _make_connection(self):
+        """Build a mock connection whose respond() returns a sentinel response."""
+        conn = Mock()
+        conn.respond = Mock(return_value=Mock(name="http_200_response"))
+        return conn
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/", "/health", "/healthz", "/ready"])
+    async def test_health_paths_return_200(self, server, path):
+        """_process_request returns an HTTP response for known health-check paths."""
+        import http
+
+        connection = self._make_connection()
+        request = self._make_request(path)
+
+        result = await server._process_request(connection, request)
+
+        assert result is not None
+        connection.respond.assert_called_once_with(http.HTTPStatus.OK, "OK\n")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/ocpp/CP001", "/vdv463/pre1", "/some/other/path"])
+    async def test_non_health_paths_return_none(self, server, path):
+        """_process_request returns None for paths that should proceed to WebSocket upgrade."""
+        connection = self._make_connection()
+        request = self._make_request(path)
+
+        result = await server._process_request(connection, request)
+
+        assert result is None
+        connection.respond.assert_not_called()
 
 
 if __name__ == "__main__":

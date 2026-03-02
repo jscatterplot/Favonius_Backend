@@ -1,6 +1,7 @@
 """OCPP 2.1 WebSocket server implementation."""
 
 import asyncio
+import http
 import logging
 import ssl
 import uuid
@@ -40,6 +41,28 @@ except ImportError:
 # Prometheus metrics - imported from monitoring module
 from .monitoring import ERRORS_TOTAL
 from .monitoring import WEBSOCKET_CONNECTIONS as CONNECTIONS_TOTAL
+
+
+class _SuppressHandshakeEOFErrors(logging.Filter):
+    """Suppress websockets ERROR logs caused by TCP probes that close with zero bytes.
+
+    Load balancers and infrastructure health checkers often open a TCP connection
+    and close it immediately without sending any data. The websockets library logs
+    these at ERROR level under ``websockets.server``, but they are expected and
+    harmless. This filter drops only records whose exception cause chain includes
+    ``EOFError: stream ends after 0 bytes``; all other errors pass through.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        """Return False to suppress zero-byte TCP probe errors, True otherwise."""
+        if record.levelno != logging.ERROR or not record.exc_info:
+            return True
+        exc = record.exc_info[1]
+        while exc is not None:
+            if isinstance(exc, EOFError) and "stream ends after 0 bytes" in str(exc):
+                return False
+            exc = getattr(exc, "__cause__", None)
+        return True
 
 
 class OCPPWebSocketServer:
@@ -88,6 +111,10 @@ class OCPPWebSocketServer:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._rate_limit_task: Optional[asyncio.Task] = None
 
+        # Suppress noisy ERROR logs from TCP health probes (zero-byte connections).
+        # Applied once per server instance; harmless if added multiple times.
+        logging.getLogger("websockets.server").addFilter(_SuppressHandshakeEOFErrors())
+
     async def start(self) -> None:
         """Start the WebSocket server and initialize components."""
         self.logger.info("Starting OCPP WebSocket server...")
@@ -114,6 +141,7 @@ class OCPPWebSocketServer:
                 ping_interval=self.config.websocket.heartbeat_interval,
                 ping_timeout=10,
                 compression=None,  # Disable compression for performance
+                process_request=self._process_request,
             )
 
             self.running = True
@@ -219,6 +247,20 @@ class OCPPWebSocketServer:
         context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS")
 
         return context
+
+    async def _process_request(self, connection, request):
+        """Respond to plain HTTP health-check GETs before the WebSocket handshake.
+
+        Infrastructure probes (Railway, load balancers) sometimes send a plain
+        HTTP GET to the WebSocket port instead of a WebSocket upgrade request.
+        Returning a 200 OK here satisfies the probe and prevents a confusing
+        handshake-failure error in the logs.
+
+        Requires websockets >= 13 (``connection.respond()`` API).
+        """
+        if request.path.rstrip("/") in ("", "/health", "/healthz", "/ready"):
+            return connection.respond(http.HTTPStatus.OK, "OK\n")
+        return None
 
     async def _handle_connection(self, websocket: WebSocketServerProtocol, path: str) -> None:
         """Handle new WebSocket connection with path-based protocol routing."""
