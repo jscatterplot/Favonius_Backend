@@ -136,7 +136,16 @@ async def lifespan(app: FastAPI):
         )
 
     try:
-        db_pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
+        db_pool = await asyncpg.create_pool(
+            database_url,
+            min_size=2,
+            max_size=10,
+            # Supabase Supavisor (the connection pooler at *.pooler.supabase.com)
+            # does not support prepared statements.  Setting statement_cache_size=0
+            # disables asyncpg's prepared-statement cache so every query is sent
+            # as a simple query, compatible with any pgBouncer-style pooler.
+            statement_cache_size=0,
+        )
         logger.info("Database connection pool initialized")
     except Exception as e:
         # Re-raise so uvicorn/Railway sees a failed startup and can restart the pod.
