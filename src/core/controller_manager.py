@@ -96,6 +96,13 @@ class ControllerManager:
                 f"Started {len(self.controllers)} controllers " f"out of {len(depot_ids)} depots"
             )
 
+        except asyncpg.exceptions.UndefinedTableError as e:
+            logger.error(
+                f"Database schema not initialised ({e}). "
+                "Run migrations before starting the API: python scripts/run_migrations.py",
+                exc_info=True,
+            )
+            raise
         except Exception as e:
             logger.error(f"Error starting controllers: {e}", exc_info=True)
             raise
