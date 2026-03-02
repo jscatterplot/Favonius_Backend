@@ -228,9 +228,29 @@ async def run_charger(charger_id: str, server_url: str, response_delay: float = 
             backoff = min(backoff * 2, max_backoff)
 
 
+def _normalize_ocpp_server_url(raw: str) -> str:
+    """Normalize OCPP_SERVER_URL so it is always a valid ws/wss base URL with /ocpp path.
+
+    Accepts bare hostnames (e.g. from Railway private/public domains) and ensures
+    scheme (ws for localhost, wss otherwise) and path /ocpp are present.
+    """
+    s = raw.strip()
+    if not s:
+        return "ws://localhost:9000/ocpp"
+    if not s.startswith(("ws://", "wss://")):
+        host = s.split("/")[0].split(":")[0]
+        scheme = "ws://" if host in ("localhost", "127.0.0.1") else "wss://"
+        s = scheme + s
+    s = s.rstrip("/")
+    if "/ocpp" not in s:
+        s = s + "/ocpp"
+    return s
+
+
 async def main():
     """Main entry point."""
-    server_url = os.environ.get("OCPP_SERVER_URL", "ws://localhost:9000/ocpp")
+    raw_url = os.environ.get("OCPP_SERVER_URL", "ws://localhost:9000/ocpp")
+    server_url = _normalize_ocpp_server_url(raw_url)
     num_chargers = int(os.environ.get("NUM_CHARGERS", "10"))
     charger_prefix = os.environ.get("CHARGER_PREFIX", "test_charger_")
     simulation_mode = os.environ.get("SIMULATION_MODE", "responsive")
@@ -241,12 +261,6 @@ async def main():
     logger.info(f"Starting {num_chargers} simulated chargers")
     logger.info(f"Server URL: {server_url}")
     logger.info(f"Mode: {simulation_mode}")
-
-    if "/ocpp" not in server_url.rstrip("/"):
-        logger.warning(
-            "OCPP_SERVER_URL does not include '/ocpp'. Most deployments expect URLs like "
-            "wss://<host>/ocpp; missing path can cause BootNotification timeouts."
-        )
 
     # Wait for server to be ready
     await asyncio.sleep(5)

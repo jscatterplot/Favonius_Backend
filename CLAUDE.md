@@ -8,6 +8,7 @@ This file provides guidance for AI assistants working in this codebase.
 
 These preferences govern how all work in this repo should be approached. Apply them when reviewing plans, writing code, and making recommendations.
 
+- **When resolving user requests** — Always offer **three options** to address the request (or fewer only if the problem admits fewer). For each option give **pros and cons**. **Recommend one option** and state **why** (e.g. robustness, maintainability, least change, or fit with project preferences). This gives the user a clear choice and a justified default.
 - **DRY is important** — flag repetition aggressively. If the same logic appears twice, it should be extracted.
 - **Well-tested code is non-negotiable** — err toward more tests, not fewer. Cover happy paths, sad paths, and edge cases.
 - **"Engineered enough"** — avoid both under-engineering (fragile, hacky, no error handling) and over-engineering (premature abstraction, unnecessary complexity, features no one asked for).

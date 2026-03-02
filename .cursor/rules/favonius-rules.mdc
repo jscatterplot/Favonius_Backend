@@ -15,6 +15,7 @@ This file complements the root `.cursorrules` file and domain-specific rules in 
 
 ## Key Patterns
 
+- **Resolving requests:** When addressing a user request, offer **three options** (or fewer if the problem admits it). For each option give pros and cons. **Recommend one option** and state **why** (e.g. robustness, maintainability, least change, project fit).
 - Use dataclasses for data models (see PRD Section 6.2)
 - Use asyncpg for database operations
 - Use Pyomo for optimization modeling with Gurobi solver (primary) and HiGHS fallback (see `.cursor/rules/optimization.mdc`)
