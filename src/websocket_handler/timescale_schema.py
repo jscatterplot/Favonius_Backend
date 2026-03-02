@@ -518,7 +518,26 @@ class TimescaleSchema:
         try:
             await conn.execute(sql)
         except Exception as e:
-            self.logger.warning(f"Skipping hypertable for '{table}': {e}")
+            # For legacy deployments, certain tables may already have unique
+            # indexes that are incompatible with Timescale hypertables. In
+            # particular, optimization_decisions might have a unique index
+            # that does not include the partitioning column (time), which
+            # causes create_hypertable to fail with:
+            # \"cannot create a unique index without the column \\\"time\\\"\".
+            # In that case we log a clear warning but do not abort schema
+            # creation; the table will still function as a regular table.
+            if (
+                table == "optimization_decisions"
+                and "cannot create a unique index without the column \"time\"" in str(e)
+            ):
+                self.logger.warning(
+                    "Skipping hypertable for 'optimization_decisions' because an existing "
+                    "unique index does not include the partitioning column 'time'. "
+                    "Consider dropping or altering the legacy unique index so that it "
+                    "includes 'time' before enabling this hypertable."
+                )
+            else:
+                self.logger.warning(f"Skipping hypertable for '{table}': {e}")
 
     async def _create_hypertables(self, conn: asyncpg.Connection) -> None:
         """Create TimescaleDB hypertables."""
@@ -861,12 +880,21 @@ class TimescaleSchema:
             GROUP BY hour, station_id;
         """)
 
-        # Add continuous aggregate policy
+        # Add continuous aggregate policy (idempotent)
         await conn.execute("""
-            SELECT add_continuous_aggregate_policy('hourly_energy_aggregates',
-                start_offset => INTERVAL '3 hours',
-                end_offset => INTERVAL '1 hour',
-                schedule_interval => INTERVAL '1 hour');
+            DO $$
+            BEGIN
+                PERFORM add_continuous_aggregate_policy('hourly_energy_aggregates',
+                    start_offset => INTERVAL '3 hours',
+                    end_offset => INTERVAL '1 hour',
+                    schedule_interval => INTERVAL '1 hour');
+            EXCEPTION
+                WHEN unique_violation THEN
+                    NULL;
+                WHEN duplicate_object THEN
+                    NULL;
+            END
+            $$;
         """)
 
         # Daily fleet metrics
@@ -886,12 +914,21 @@ class TimescaleSchema:
             GROUP BY day, cs.fleet_operator_id;
         """)
 
-        # Add continuous aggregate policy for daily metrics
+        # Add continuous aggregate policy for daily metrics (idempotent)
         await conn.execute("""
-            SELECT add_continuous_aggregate_policy('daily_fleet_metrics',
-                start_offset => INTERVAL '3 days',
-                end_offset => INTERVAL '1 day',
-                schedule_interval => INTERVAL '1 day');
+            DO $$
+            BEGIN
+                PERFORM add_continuous_aggregate_policy('daily_fleet_metrics',
+                    start_offset => INTERVAL '3 days',
+                    end_offset => INTERVAL '1 day',
+                    schedule_interval => INTERVAL '1 day');
+            EXCEPTION
+                WHEN unique_violation THEN
+                    NULL;
+                WHEN duplicate_object THEN
+                    NULL;
+            END
+            $$;
         """)
 
         # Hourly optimization performance
@@ -909,12 +946,21 @@ class TimescaleSchema:
             GROUP BY hour, fleet_operator_id;
         """)
 
-        # Add continuous aggregate policy for optimization performance
+        # Add continuous aggregate policy for optimization performance (idempotent)
         await conn.execute("""
-            SELECT add_continuous_aggregate_policy('hourly_optimization_performance',
-                start_offset => INTERVAL '3 hours',
-                end_offset => INTERVAL '1 hour',
-                schedule_interval => INTERVAL '1 hour');
+            DO $$
+            BEGIN
+                PERFORM add_continuous_aggregate_policy('hourly_optimization_performance',
+                    start_offset => INTERVAL '3 hours',
+                    end_offset => INTERVAL '1 hour',
+                    schedule_interval => INTERVAL '1 hour');
+            EXCEPTION
+                WHEN unique_violation THEN
+                    NULL;
+                WHEN duplicate_object THEN
+                    NULL;
+            END
+            $$;
         """)
 
         self.logger.info("All continuous aggregates created successfully")

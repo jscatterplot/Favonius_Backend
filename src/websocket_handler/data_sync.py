@@ -129,7 +129,8 @@ class DataSyncService:
                         end_time,
                         energy_delivered_kwh,
                         energy_received_kwh,
-                        session_duration_minutes,
+                        EXTRACT(EPOCH FROM (end_time - start_time))/60
+                            AS session_duration_minutes,
                         cost_total,
                         revenue_v2g,
                         status
@@ -284,12 +285,8 @@ class DataSyncService:
                     SELECT
                         decision_id,
                         fleet_operator_id,
-                        vehicle_id,
-                        station_id,
-                        decision_type,
-                        power_setpoint_kw,
-                        duration_minutes,
-                        cost_savings,
+                        site_id,
+                        decision_payload,
                         created_at
                     FROM optimization_decisions
                     WHERE created_at > $1
@@ -308,20 +305,8 @@ class DataSyncService:
                             {
                                 "decision_id": decision["decision_id"],
                                 "organization_id": decision["fleet_operator_id"],
-                                "vehicle_id": decision["vehicle_id"],
-                                "station_id": decision["station_id"],
-                                "decision_type": decision["decision_type"],
-                                "power_setpoint_kw": (
-                                    float(decision["power_setpoint_kw"])
-                                    if decision["power_setpoint_kw"]
-                                    else 0
-                                ),
-                                "duration_minutes": decision["duration_minutes"],
-                                "cost_savings": (
-                                    float(decision["cost_savings"])
-                                    if decision["cost_savings"]
-                                    else 0
-                                ),
+                                "site_id": decision["site_id"],
+                                "decision_payload": decision["decision_payload"],
                                 "created_at": decision["created_at"].isoformat(),
                             }
                         )
@@ -368,7 +353,8 @@ class DataSyncService:
                         COUNT(DISTINCT vehicle_id) as vehicles_charged,
                         SUM(energy_delivered_kwh) as total_energy_charged,
                         SUM(energy_received_kwh) as total_energy_discharged,
-                        AVG(session_duration_minutes) as avg_session_duration,
+                        AVG(EXTRACT(EPOCH FROM (end_time - start_time))/60)
+                            AS avg_session_duration,
                         SUM(cost_total) as total_cost,
                         SUM(revenue_v2g) as total_v2g_revenue
                     FROM charging_sessions

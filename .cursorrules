@@ -32,7 +32,7 @@ Before code changes in plan mode:
 
 ## Single source of truth
 
-- **PRD:** `docs/PRD_v2_7_Building_Integration.md` — authoritative for features, Section 6 data models, Section 11 acceptance criteria. Use `@PRD_v2.md#section-name`. Do not deviate from data models without updating the PRD.
+- **PRD:** `docs/PRD_v2_7_Building_Integration.md` — authoritative for features, Section 6 data models, Section 11 acceptance criteria. Use `@PRD_v2_7_Building_Integration.md#section-name` or `@PRD_v2.md#section-name`. Do not deviate from data models without updating the PRD.
 - **Domain rules:** `.cursor/rules/` — `optimization.mdc` (MILP, Section 8), `ocpp.mdc` (Section 9.1), `vdv463.mdc` (Section 9.6), `timescale.mdc` (Section 6).
 
 ---
@@ -63,7 +63,7 @@ Before code changes in plan mode:
 
 **TimescaleDB:** PRD §6; hypertables for time-series; compression/retention; include building_load.
 
-**Triggers:** Price >25% OR >$25/MWh; SoC deviation >5%; return >15 min late; inter-depot on receipt; scheduled hourly 7AM–11PM.
+**Triggers:** Price >25% OR >$25/MWh; SoC deviation >5%; return >15 min late; inter-depot on receipt; scheduled hourly 24/7.
 
 ---
 

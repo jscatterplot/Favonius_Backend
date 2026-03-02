@@ -149,6 +149,13 @@ class PriceFeederService:
             }
             try:
                 async with self.session.get(self.config.base_url, params=params) as response:
+                    if response.status == 429:
+                        # Rate limited for this node; log and skip until next interval.
+                        self.logger.warning(
+                            "CAISO rate limit hit (429) for node %s; skipping until next fetch window",
+                            node,
+                        )
+                        continue
                     if response.status != 200:
                         raise RuntimeError(f"CAISO response code: {response.status}")
                     body = await response.read()

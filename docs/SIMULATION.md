@@ -395,7 +395,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 - Development Plan Step 6.1: Simulation Harness
 - Development Plan Step 6.2: Integration Tests
-- PRD_v2.md Section 11.1: MVP Acceptance Tests
-- PRD_v2.md Section 11.3: Integration Test Requirements
-- PRD_v2.md Section 8.5: Performance Targets
+- PRD Section 11.1: MVP Acceptance Tests — [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md)
+- PRD Section 11.3: Integration Test Requirements
+- PRD Section 8.5: Performance Targets
 

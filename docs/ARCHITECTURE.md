@@ -1,7 +1,7 @@
 # System Architecture
 
 ## Reference
-This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD_v2.md#5-system-architecture](PRD_v2.md#5-system-architecture).
+This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD_v2_7_Building_Integration.md#5-system-architecture](PRD_v2_7_Building_Integration.md#5-system-architecture).
 
 ## Service Architecture Overview
 
@@ -245,7 +245,7 @@ Both services share access to the dual-database architecture (Supabase for refer
 **Periodic Triggers:**
 - Price change: Evaluated on each price ingestion event (every 5 minutes)
   - Threshold: > 25% OR > $25/MWh (OR logic)
-- Scheduled: Evaluated hourly 24/7 (configurable: default 7 AM - 11 PM)
+- Scheduled: Evaluated hourly 24/7
 
 **Cooldown:** 5-minute minimum between triggers (configurable via `trigger_cooldown_minutes`)
 
@@ -293,5 +293,5 @@ The codebase is organized as follows:
 - `src/api/` - FastAPI REST endpoints
 - `src/db/` - Database models & migrations
 
-For detailed specifications, see [PRD_v2.md](PRD_v2.md).
+For detailed specifications, see [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md).
 

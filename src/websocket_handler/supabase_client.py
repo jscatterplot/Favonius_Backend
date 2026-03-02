@@ -48,6 +48,11 @@ class SupabaseClient:
                 min_size=2,
                 max_size=self.config.max_connections,
                 command_timeout=self.config.connection_timeout,
+                # Disable per-connection prepared statement caching so that
+                # PgBouncer in transaction/statement mode can be used safely.
+                # Prepared statements are not compatible with these modes.
+                statement_cache_size=0,
+                max_cached_statement_lifetime=0,
             )
 
             self.logger.info("Supabase client connected successfully")

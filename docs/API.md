@@ -1,7 +1,7 @@
 # API Specifications
 
 ## Reference
-This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD_v2.md#7-api-specifications](PRD_v2.md#7-api-specifications).
+This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD_v2_7_Building_Integration.md#7-api-specifications](PRD_v2_7_Building_Integration.md#7-api-specifications).
 
 ## REST API Endpoints
 
@@ -241,7 +241,7 @@ The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{ocpp_id
 
 Faults from StatusNotification are exposed via GET /depots/{id}/alerts.
 
-For detailed OCPP integration specifications, see [PRD_v2.md#9-1-ocpp-integration](PRD_v2.md#9-1-ocpp-integration).
+For detailed OCPP integration specifications, see [PRD_v2_7_Building_Integration.md#9-1-ocpp-integration](PRD_v2_7_Building_Integration.md#9-1-ocpp-integration).
 
 ---
 
@@ -254,5 +254,5 @@ For detailed OCPP integration specifications, see [PRD_v2.md#9-1-ocpp-integratio
 - Request/response logging included
 - OpenAPI schema auto-generated from FastAPI
 
-For complete specifications, see [PRD_v2.md](PRD_v2.md).
+For complete specifications, see [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md).
 

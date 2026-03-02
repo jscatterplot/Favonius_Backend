@@ -11,7 +11,7 @@ This PRD serves as the **single source of truth** for building the Favonius MVP.
 2. **AI coding agents (Cursor, Claude Code)** — Precise specifications, code patterns, and validation rules
 
 **How to use this document with Cursor IDE:**
-- Reference sections using `@PRD_v2.md#section-name`
+- Reference sections using `@PRD_v2_7_Building_Integration.md#section-name` or `@PRD_v2.md#section-name`
 - AI agents should check acceptance criteria before marking tasks complete
 - Data models are authoritative — do not deviate without updating this document
 
@@ -2955,7 +2955,7 @@ Code Style:
 
 Place these in your Cursor project for automatic context:
 
-1. `docs/PRD_v2.md` — This document
+1. `docs/PRD_v2_7_Building_Integration.md` — This document
 2. `docs/ARCHITECTURE.md` — System architecture diagram
 3. `docs/API.md` — OpenAPI specification
 4. `src/core/models.py` — Data models

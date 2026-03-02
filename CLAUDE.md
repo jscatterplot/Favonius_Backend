@@ -284,7 +284,7 @@ These come directly from the PRD and are non-negotiable:
 | SoC deviation | > 5% | Section 5.1 |
 | Return time deviation | > 15 minutes late | Section 5.1 |
 | Inter-depot handoff | On message receipt | Section 5.4 |
-| Scheduled | Hourly 7AM–11PM | Section 5.1 |
+| Scheduled | Hourly 24/7 | Section 5.1 |
 
 ---
 

@@ -10,7 +10,7 @@ This file complements the root `.cursorrules` file and domain-specific rules in 
 ## Primary References
 
 - **Root rules:** `.cursorrules` - Main AI assistant configuration
-- **PRD:** `PRD_v2.md` - Single source of truth for all specifications
+- **PRD:** `docs/PRD_v2_7_Building_Integration.md` - Single source of truth for all specifications
 - **Domain rules:** See `.cursor/rules/optimization.mdc`, `.cursor/rules/ocpp.mdc`, `.cursor/rules/timescale.mdc`
 
 ## Key Patterns

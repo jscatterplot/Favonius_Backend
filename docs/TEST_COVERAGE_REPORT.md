@@ -71,7 +71,7 @@ This document provides a comprehensive overview of test coverage for the Favoniu
 - ✅ SoC deviation trigger (>5%)
 - ✅ Price change trigger (OR logic: >25% OR >$25/MWh)
 - ✅ Return time deviation trigger (>15 minutes)
-- ✅ Scheduled trigger (hourly 7AM-11PM)
+- ✅ Scheduled trigger (hourly 24/7)
 - ✅ Inter-depot handoff trigger
 - ✅ Trigger cooldown configuration
 
@@ -218,7 +218,7 @@ This document provides a comprehensive overview of test coverage for the Favoniu
 - ✅ SoC deviation (>5%)
 - ✅ Price change (OR logic: >25% OR >$25/MWh)
 - ✅ Return time deviation (>15 minutes)
-- ✅ Scheduled (hourly 7AM-11PM)
+- ✅ Scheduled (hourly 24/7)
 - ✅ Inter-depot handoff
 
 ### Section 8.1: Optimization Formulation

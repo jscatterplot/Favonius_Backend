@@ -1,7 +1,7 @@
 # TimescaleDB Best Practices
 
 ## Reference
-Primary reference: PRD_v2.md#6-data-models
+Primary reference: docs/PRD_v2_7_Building_Integration.md#6-data-models
 
 ## Hypertable Creation
 
