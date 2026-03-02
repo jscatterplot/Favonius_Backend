@@ -85,7 +85,13 @@ async def run_migrations() -> int:
         # Clean up trailing '?' if no query params remain.
         database_url = database_url.rstrip("?")
 
-    conn = await asyncpg.connect(database_url, ssl=ssl_config)
+    try:
+        conn = await asyncpg.connect(database_url, ssl=ssl_config)
+    except Exception as e:
+        url_source = "TIMESCALE_SERVICE_URL" if os.getenv("TIMESCALE_SERVICE_URL") else "DATABASE_URL"
+        print(f"Failed to connect to database ({url_source}): {e}", file=sys.stderr)
+        return 1
+
     try:
         for path in files:
             sql = path.read_text()
