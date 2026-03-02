@@ -57,6 +57,12 @@ class DatabaseSchema:
     async def _create_tables(self, conn: asyncpg.Connection) -> None:
         """Create all database tables."""
 
+        # Enable PostGIS for geographic types used in sites and vehicle_realtime_state
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+        except Exception as e:
+            self.logger.warning(f"PostGIS extension unavailable, geography columns will fail: {e}")
+
         # Organizations table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS organizations (

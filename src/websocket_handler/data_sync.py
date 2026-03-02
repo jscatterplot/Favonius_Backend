@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import asyncpg
 
-from .config import SupabaseConfig
+from .config import SupabaseConfig, TimescaleConfig
 from .monitoring import get_logger
 from .supabase_client import SupabaseClient
 
@@ -14,10 +14,16 @@ from .supabase_client import SupabaseClient
 class DataSyncService:
     """Service for synchronizing data between TimescaleDB and Supabase."""
 
-    def __init__(self, config: SupabaseConfig, supabase_client: SupabaseClient):
+    def __init__(
+        self,
+        config: SupabaseConfig,
+        supabase_client: SupabaseClient,
+        timescale_config: TimescaleConfig,
+    ):
         """Initialize data sync service."""
         self.config = config
         self.supabase_client = supabase_client
+        self.timescale_config = timescale_config
         self.logger = get_logger(__name__)
 
         # TimescaleDB connection
@@ -36,14 +42,14 @@ class DataSyncService:
     async def start(self) -> None:
         """Start the data synchronization service."""
         try:
-            # Connect to TimescaleDB (you'll need to configure this)
-            # For now, we'll use the same connection as Supabase
+            # Connect to TimescaleDB using the dedicated TimescaleDB config
             self.timescale_pool = await asyncpg.create_pool(
-                host=self.config.db_host,
-                port=self.config.db_port,
-                database=self.config.db_name,
-                user=self.config.db_user,
-                password=self.config.db_password,
+                host=self.timescale_config.host,
+                port=self.timescale_config.port,
+                database=self.timescale_config.database,
+                user=self.timescale_config.user,
+                password=self.timescale_config.password,
+                ssl=self.timescale_config.sslmode,
                 min_size=1,
                 max_size=10,
             )

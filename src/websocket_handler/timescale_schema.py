@@ -121,7 +121,7 @@ class TimescaleSchema:
         # Optimization decisions table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS optimization_decisions (
-                decision_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                decision_id UUID NOT NULL DEFAULT gen_random_uuid(),
                 time TIMESTAMPTZ NOT NULL,
                 optimization_window_start TIMESTAMPTZ NOT NULL,
                 optimization_window_end TIMESTAMPTZ NOT NULL,
@@ -134,7 +134,8 @@ class TimescaleSchema:
                 constraints_satisfied BOOLEAN,
                 decision_payload JSONB,
                 sync_status VARCHAR(20) DEFAULT 'pending',
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (decision_id, time)
             );
         """)
 
@@ -373,20 +374,21 @@ class TimescaleSchema:
         # DER events table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS der_events (
-                event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                event_id UUID NOT NULL DEFAULT gen_random_uuid(),
                 station_id VARCHAR(255) NOT NULL,
                 event_type VARCHAR(50) NOT NULL,
                 control_id INTEGER,
                 grid_event_fault VARCHAR(50),
                 timestamp TIMESTAMPTZ NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (event_id, timestamp)
             );
         """)
 
         # External charging limits table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS external_charging_limits (
-                limit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                limit_id UUID NOT NULL DEFAULT gen_random_uuid(),
                 station_id VARCHAR(255) NOT NULL,
                 evse_id INTEGER NOT NULL,
                 source VARCHAR(50) NOT NULL,
@@ -394,14 +396,15 @@ class TimescaleSchema:
                 is_local_generation BOOLEAN DEFAULT FALSE,
                 schedule_data JSONB,
                 timestamp TIMESTAMPTZ NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (limit_id, timestamp)
             );
         """)
 
         # Enhanced transaction events table with V2G fields
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS transaction_events_v2g (
-                event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                event_id UUID NOT NULL DEFAULT gen_random_uuid(),
                 transaction_id VARCHAR(255) NOT NULL,
                 event_type VARCHAR(50) NOT NULL,
                 timestamp TIMESTAMPTZ NOT NULL,
@@ -423,7 +426,8 @@ class TimescaleSchema:
                 id_token JSONB,
                 certificate TEXT,
                 iso15118_certificate_hash_data JSONB,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (event_id, timestamp)
             );
         """)
 

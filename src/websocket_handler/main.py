@@ -344,7 +344,9 @@ class Application:
             self.auth_manager = AuthManager(self.config.supabase, self.supabase_client)
 
             # Create data sync service
-            self.data_sync_service = DataSyncService(self.config.supabase, self.supabase_client)
+            self.data_sync_service = DataSyncService(
+                self.config.supabase, self.supabase_client, self.config.timescale
+            )
 
             self.logger.info("Supabase components initialized successfully")
 
