@@ -6,6 +6,34 @@ import sys
 import time
 from typing import Any, Dict
 
+
+class _WebsocketsEOFFilter(logging.Filter):
+    """Suppress noisy EOF errors logged by the websockets library.
+
+    Load balancers and platform health checks (e.g. Railway) open TCP
+    connections to verify port reachability without completing the HTTP
+    WebSocket upgrade handshake.  The websockets library logs these at
+    ERROR level, which floods production logs with non-actionable noise.
+
+    This filter drops records from ``websockets.server`` that report a
+    failed opening handshake caused by an EOF / empty request, while
+    leaving all other websockets error records intact.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return False (suppress) for EOF-driven handshake failures."""
+        if record.levelno != logging.ERROR:
+            return True
+        if "opening handshake failed" not in record.getMessage():
+            return True
+        # Walk the exception chain looking for an EOFError root cause.
+        exc = record.exc_info[1] if record.exc_info else None
+        while exc is not None:
+            if isinstance(exc, EOFError):
+                return False  # suppress
+            exc = exc.__cause__ or exc.__context__
+        return True
+
 import structlog
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram, Info, start_http_server
 
@@ -202,6 +230,12 @@ def setup_logging(config: MonitoringConfig) -> None:
         stream=sys.stdout,
         level=log_level,
     )
+
+    # Suppress EOF handshake errors from the websockets library.
+    # These occur when load balancers / platform health checks open a TCP
+    # connection to verify port reachability without sending an HTTP request.
+    # They are harmless but produce ERROR-level noise in production logs.
+    logging.getLogger("websockets.server").addFilter(_WebsocketsEOFFilter())
 
 
 def get_logger(name: str) -> structlog.BoundLogger:

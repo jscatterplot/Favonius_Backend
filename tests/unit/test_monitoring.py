@@ -1,6 +1,7 @@
 """Unit tests for monitoring and observability."""
 
 import asyncio
+import logging
 import os
 
 # Import monitoring
@@ -17,6 +18,7 @@ from websocket_handler.monitoring import (
     HealthChecker,
     MetricsCollector,
     PerformanceTimer,
+    _WebsocketsEOFFilter,
     async_timer,
     get_logger,
     setup_health_checks,
@@ -362,6 +364,88 @@ class TestHealthChecker:
         results = health_checker.get_last_results()
         assert "test_check" in results
         assert results["test_check"]["status"] == "healthy"
+
+
+class TestWebsocketsEOFFilter:
+    """Tests for the _WebsocketsEOFFilter logging filter."""
+
+    @pytest.fixture
+    def eof_filter(self):
+        return _WebsocketsEOFFilter()
+
+    def _make_record(self, msg: str, exc_info=None) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name="websockets.server",
+            level=logging.ERROR,
+            pathname="",
+            lineno=0,
+            msg=msg,
+            args=(),
+            exc_info=exc_info,
+        )
+        return record
+
+    def test_suppresses_eof_handshake_failure(self, eof_filter):
+        """EOF-driven handshake failure records are suppressed (filter returns False)."""
+        eof = EOFError("stream ends after 0 bytes, before end of line")
+        exc = Exception("did not receive a valid HTTP request")
+        exc.__cause__ = eof
+        record = self._make_record("opening handshake failed", exc_info=(type(exc), exc, None))
+        assert eof_filter.filter(record) is False
+
+    def test_suppresses_chained_eof(self, eof_filter):
+        """Suppresses records where EOFError is deeper in the exception chain."""
+        eof = EOFError("stream ends after 0 bytes")
+        mid = RuntimeError("mid-level")
+        mid.__cause__ = eof
+        outer = Exception("did not receive a valid HTTP request")
+        outer.__cause__ = mid
+        record = self._make_record("opening handshake failed", exc_info=(type(outer), outer, None))
+        assert eof_filter.filter(record) is False
+
+    def test_passes_non_eof_handshake_failure(self, eof_filter):
+        """Non-EOF handshake failures (e.g. bad headers) are not suppressed."""
+        exc = Exception("invalid HTTP header")
+        record = self._make_record("opening handshake failed", exc_info=(type(exc), exc, None))
+        assert eof_filter.filter(record) is True
+
+    def test_passes_non_handshake_error(self, eof_filter):
+        """Records unrelated to handshake failures are not suppressed."""
+        eof = EOFError("some eof")
+        record = self._make_record("something else went wrong", exc_info=(type(eof), eof, None))
+        assert eof_filter.filter(record) is True
+
+    def test_passes_non_error_level(self, eof_filter):
+        """Records below ERROR level are never suppressed by this filter."""
+        record = logging.LogRecord(
+            name="websockets.server",
+            level=logging.WARNING,
+            pathname="",
+            lineno=0,
+            msg="opening handshake failed",
+            args=(),
+            exc_info=None,
+        )
+        assert eof_filter.filter(record) is True
+
+    def test_passes_no_exc_info(self, eof_filter):
+        """ERROR record with 'opening handshake failed' but no exc_info is not suppressed."""
+        record = self._make_record("opening handshake failed", exc_info=None)
+        assert eof_filter.filter(record) is True
+
+    @patch("websocket_handler.monitoring.structlog.configure")
+    def test_setup_logging_installs_filter(self, _mock_configure):
+        """setup_logging installs _WebsocketsEOFFilter on the websockets.server logger."""
+        import logging as stdlib_logging
+
+        ws_logger = stdlib_logging.getLogger("websockets.server")
+        # Remove any previously installed filter instances to get a clean state.
+        ws_logger.filters = [f for f in ws_logger.filters if not isinstance(f, _WebsocketsEOFFilter)]
+
+        config = MonitoringConfig(log_level="INFO")
+        setup_logging(config)
+
+        assert any(isinstance(f, _WebsocketsEOFFilter) for f in ws_logger.filters)
 
 
 class TestSetupHealthChecks:
