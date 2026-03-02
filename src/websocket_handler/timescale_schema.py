@@ -223,7 +223,7 @@ class TimescaleSchema:
                 schedule_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 station_id VARCHAR(255) NOT NULL,
                 evse_id INTEGER NOT NULL,
-                decision_id UUID REFERENCES optimization_decisions(decision_id),
+                decision_id UUID,
                 profile_id VARCHAR(255) NOT NULL,
                 start_time TIMESTAMPTZ NOT NULL,
                 end_time TIMESTAMPTZ NOT NULL,
@@ -511,44 +511,50 @@ class TimescaleSchema:
 
         self.logger.info("V2G tables created successfully")
 
+    async def _create_hypertable_safe(
+        self, conn: asyncpg.Connection, table: str, sql: str
+    ) -> None:
+        """Attempt to create a hypertable, logging failures without aborting the rest."""
+        try:
+            await conn.execute(sql)
+        except Exception as e:
+            self.logger.warning(f"Skipping hypertable for '{table}': {e}")
+
     async def _create_hypertables(self, conn: asyncpg.Connection) -> None:
         """Create TimescaleDB hypertables."""
 
-        # Create hypertable for telemetry data
-        await conn.execute(f"""
-            SELECT create_hypertable('telemetry_data', 'time', 
+        await self._create_hypertable_safe(conn, "telemetry_data", f"""
+            SELECT create_hypertable('telemetry_data', 'time',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
 
-        # Create hypertable for optimization decisions
-        await conn.execute(f"""
-            SELECT create_hypertable('optimization_decisions', 'time', 
+        await self._create_hypertable_safe(conn, "optimization_decisions", f"""
+            SELECT create_hypertable('optimization_decisions', 'time',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
 
-        # Create hypertable for electricity prices
-        await conn.execute(f"""
-            SELECT create_hypertable('electricity_prices', 'time', 
-                chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
-                if_not_exists => TRUE);
-        """)
-        await conn.execute("""
-            SELECT create_hypertable('electricity_price_forecasts', 'time', create_default_indexes => FALSE)
-            ON CONFLICT DO NOTHING;
-        """)
-
-        # Create hypertable for grid signals
-        await conn.execute(f"""
-            SELECT create_hypertable('grid_signals', 'time', 
+        await self._create_hypertable_safe(conn, "electricity_prices", f"""
+            SELECT create_hypertable('electricity_prices', 'time',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
 
-        # Create hypertable for vehicle telemetry
-        await conn.execute(f"""
-            SELECT create_hypertable('vehicle_telemetry', 'time', 
+        await self._create_hypertable_safe(conn, "electricity_price_forecasts", """
+            SELECT create_hypertable('electricity_price_forecasts', 'time',
+                create_default_indexes => FALSE,
+                if_not_exists => TRUE);
+        """)
+
+        await self._create_hypertable_safe(conn, "grid_signals", f"""
+            SELECT create_hypertable('grid_signals', 'time',
+                chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
+                if_not_exists => TRUE);
+        """)
+
+        await self._create_hypertable_safe(conn, "vehicle_telemetry", f"""
+            SELECT create_hypertable('vehicle_telemetry', 'time',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
@@ -561,30 +567,26 @@ class TimescaleSchema:
     async def _create_v2g_hypertables(self, conn: asyncpg.Connection) -> None:
         """Create V2G-specific hypertables."""
 
-        # Create hypertable for V2G telemetry data
-        await conn.execute(f"""
-            SELECT create_hypertable('telemetry_data_v2g', 'time', 
+        await self._create_hypertable_safe(conn, "telemetry_data_v2g", f"""
+            SELECT create_hypertable('telemetry_data_v2g', 'time',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
 
-        # Create hypertable for transaction events V2G
-        await conn.execute(f"""
-            SELECT create_hypertable('transaction_events_v2g', 'timestamp', 
+        await self._create_hypertable_safe(conn, "transaction_events_v2g", f"""
+            SELECT create_hypertable('transaction_events_v2g', 'timestamp',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
 
-        # Create hypertable for DER events
-        await conn.execute(f"""
-            SELECT create_hypertable('der_events', 'timestamp', 
+        await self._create_hypertable_safe(conn, "der_events", f"""
+            SELECT create_hypertable('der_events', 'timestamp',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)
 
-        # Create hypertable for external charging limits
-        await conn.execute(f"""
-            SELECT create_hypertable('external_charging_limits', 'timestamp', 
+        await self._create_hypertable_safe(conn, "external_charging_limits", f"""
+            SELECT create_hypertable('external_charging_limits', 'timestamp',
                 chunk_time_interval => INTERVAL '{self.config.chunk_time_interval}',
                 if_not_exists => TRUE);
         """)

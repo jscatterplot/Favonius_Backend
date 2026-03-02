@@ -120,11 +120,11 @@ class DataSyncService:
             async with self.timescale_pool.acquire() as conn:
                 # Query completed sessions
                 query = """
-                    SELECT 
+                    SELECT
                         session_id,
                         station_id,
                         vehicle_id,
-                        organization_id,
+                        fleet_operator_id,
                         start_time,
                         end_time,
                         energy_delivered_kwh,
@@ -151,7 +151,7 @@ class DataSyncService:
                                 "session_id": session["session_id"],
                                 "station_id": session["station_id"],
                                 "vehicle_id": session["vehicle_id"],
-                                "organization_id": session["organization_id"],
+                                "organization_id": session["fleet_operator_id"],
                                 "start_time": session["start_time"].isoformat(),
                                 "end_time": (
                                     session["end_time"].isoformat() if session["end_time"] else None
@@ -281,9 +281,9 @@ class DataSyncService:
             async with self.timescale_pool.acquire() as conn:
                 # Query recent optimization decisions
                 query = """
-                    SELECT 
+                    SELECT
                         decision_id,
-                        organization_id,
+                        fleet_operator_id,
                         vehicle_id,
                         station_id,
                         decision_type,
@@ -307,7 +307,7 @@ class DataSyncService:
                         decision_data.append(
                             {
                                 "decision_id": decision["decision_id"],
-                                "organization_id": decision["organization_id"],
+                                "organization_id": decision["fleet_operator_id"],
                                 "vehicle_id": decision["vehicle_id"],
                                 "station_id": decision["station_id"],
                                 "decision_type": decision["decision_type"],
@@ -362,8 +362,8 @@ class DataSyncService:
             async with self.timescale_pool.acquire() as conn:
                 # Query energy metrics
                 query = """
-                    SELECT 
-                        organization_id,
+                    SELECT
+                        fleet_operator_id,
                         DATE(start_time) as date,
                         COUNT(DISTINCT vehicle_id) as vehicles_charged,
                         SUM(energy_delivered_kwh) as total_energy_charged,
@@ -374,7 +374,7 @@ class DataSyncService:
                     FROM charging_sessions
                     WHERE start_time > $1
                         AND end_time IS NOT NULL
-                    GROUP BY organization_id, DATE(start_time)
+                    GROUP BY fleet_operator_id, DATE(start_time)
                     ORDER BY date DESC
                     LIMIT $2
                 """
@@ -386,7 +386,7 @@ class DataSyncService:
                     for metric in metrics:
                         await self.supabase_client.client.table("daily_energy_summary").upsert(
                             {
-                                "organization_id": metric["organization_id"],
+                                "organization_id": metric["fleet_operator_id"],
                                 "date": metric["date"].isoformat(),
                                 "vehicles_charged": metric["vehicles_charged"],
                                 "total_energy_charged": (
