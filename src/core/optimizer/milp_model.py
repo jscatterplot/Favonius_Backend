@@ -193,8 +193,6 @@ def build_optimization_model(
     # Initialize with default bounds, will be tightened below
     model.SoC = pyo.Var(model.B, model.T, bounds=(0.1, 1.0))
     model.y_charge = pyo.Var(model.B, model.T, domain=pyo.Binary)
-    if config.charger_switching_penalty > 0:
-        model.y_start = pyo.Var(model.B, model.T, domain=pyo.Binary)
     model.P_grid = pyo.Var(model.T, domain=pyo.NonNegativeReals)
     model.P_peak = pyo.Var(domain=pyo.NonNegativeReals)
 
@@ -332,17 +330,6 @@ def build_optimization_model(
 
     model.charger_power = pyo.Constraint(model.T, rule=charger_power_rule)
 
-    # Charging session restart constraints (fires once per continuous charging window)
-    # y_start[b, t] = 1 iff vehicle b begins a new charging session at timestep t.
-    # Minimising the sum of y_start discourages fragmented charging, reducing charger switches.
-    if config.charger_switching_penalty > 0:
-        def y_start_rule(m, b, t):
-            if t == 0:
-                return m.y_start[b, t] >= m.y_charge[b, t]
-            return m.y_start[b, t] >= m.y_charge[b, t] - m.y_charge[b, t - 1]
-
-        model.y_start_con = pyo.Constraint(model.B, model.T, rule=y_start_rule)
-
     # Symmetry breaking constraints (performance optimization)
     # Only apply when number of vehicles <= number of chargers to avoid infeasibility
     # When vehicles > chargers, the constraint y_charge[i,t] >= y_charge[j,t] can
@@ -471,18 +458,11 @@ def build_optimization_model(
     model.batt_dynamics = pyo.Constraint(model.T, rule=batt_dynamics_rule)
 
     # Objective: minimize energy cost + demand charges + preconditioning shortfall penalty
-    #            + optional charger-switching penalty ($/session restart)
     def objective_rule(m):
         energy_cost = sum(m.price[t] * m.P_grid[t] * config.delta_t for t in m.T)
         demand_cost = state.demand_charge_rate * m.P_peak
         precond_penalty = M_PRECOND * sum(m.precond_slack[t] for t in m.T)
-        switching_penalty = (
-            config.charger_switching_penalty
-            * sum(m.y_start[b, t] for b in m.B for t in m.T)
-            if config.charger_switching_penalty > 0
-            else 0
-        )
-        return energy_cost + demand_cost + precond_penalty + switching_penalty
+        return energy_cost + demand_cost + precond_penalty
 
     model.objective = pyo.Objective(rule=objective_rule, sense=pyo.minimize)
 

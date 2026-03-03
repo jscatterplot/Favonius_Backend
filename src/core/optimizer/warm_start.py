@@ -88,22 +88,6 @@ def warm_start_model(
                 current_soc = state.vehicle_socs.get(vehicle_id, 0.5)
                 model.SoC[vehicle_id, t].value = current_soc
 
-        # Initialize y_start from previous power schedule (mirrors y_charge transitions)
-        if hasattr(model, "y_start"):
-            for t in model.T:
-                p_t = prev_power[t] if t < len(prev_power) and prev_power[t] is not None else 0.0
-                if t == 0:
-                    model.y_start[vehicle_id, t].value = 1 if p_t > 0.1 else 0
-                else:
-                    p_prev = (
-                        prev_power[t - 1]
-                        if t - 1 < len(prev_power) and prev_power[t - 1] is not None
-                        else 0.0
-                    )
-                    model.y_start[vehicle_id, t].value = (
-                        1 if (p_t > 0.1 and p_prev <= 0.1) else 0
-                    )
-
     # Initialize new vehicles with current SoC
     for vehicle_id in new_vehicles:
         current_soc = state.vehicle_socs[vehicle_id]
@@ -117,9 +101,6 @@ def warm_start_model(
             else:
                 # Estimate SoC based on initial value
                 model.SoC[vehicle_id, t].value = current_soc
-        if hasattr(model, "y_start"):
-            for t in model.T:
-                model.y_start[vehicle_id, t].value = 0
 
     # Initialize battery variables
     if previous_result.battery_dispatch:
