@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from typing import Any, Dict
@@ -230,6 +231,19 @@ def setup_logging(config: MonitoringConfig) -> None:
         stream=sys.stdout,
         level=log_level,
     )
+
+    # Keep noisy third-party protocol chatter out of production logs by default.
+    # This preserves our own application INFO logs while preventing repetitive
+    # "connection open"/handshake spam from exhausting platform log quotas.
+    third_party_level_name = os.getenv("THIRD_PARTY_LOG_LEVEL", "WARNING").upper()
+    third_party_level = getattr(logging, third_party_level_name, logging.WARNING)
+    for logger_name in (
+        "websockets.server",
+        "websockets.protocol",
+        "ocpp",
+        "ocpp.charge_point",
+    ):
+        logging.getLogger(logger_name).setLevel(third_party_level)
 
     # Suppress EOF handshake errors from the websockets library.
     # These occur when load balancers / platform health checks open a TCP
