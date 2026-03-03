@@ -270,8 +270,17 @@ class OCPPWebSocketServer:
             return connection.respond(http.HTTPStatus.OK, "OK\n")
         return None
 
-    async def _handle_connection(self, websocket: WebSocketServerProtocol, path: str) -> None:
-        """Handle new WebSocket connection with path-based protocol routing."""
+    async def _handle_connection(
+        self, websocket: WebSocketServerProtocol, path: Optional[str] = None
+    ) -> None:
+        """Handle new WebSocket connection with path-based protocol routing.
+
+        Websockets 12+ calls the handler with a single argument (the connection).
+        Path is taken from connection.request.path when not passed.
+        """
+        if path is None:
+            req = getattr(websocket, "request", None)
+            path = getattr(req, "path", "") if req is not None else ""
         connection_id = str(uuid.uuid4())
         client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
 
