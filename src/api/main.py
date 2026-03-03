@@ -121,29 +121,6 @@ _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (c
 _config_cache_ttl: float = 300.0  # 5 minutes
 
 
-def resolve_database_url() -> tuple[str, str]:
-    """Resolve core API DB URL from environment.
-
-    The API source of truth is DATABASE_URL (Supabase core DB).
-    TIMESCALE_SERVICE_URL is accepted only as a fallback for compatibility.
-
-    Returns:
-        Tuple of (database_url, source_env_var_name)
-
-    Raises:
-        RuntimeError: If no supported database URL env var is present.
-    """
-    for env_var in ("DATABASE_URL", "TIMESCALE_SERVICE_URL"):
-        value = os.getenv(env_var)
-        if value:
-            return value, env_var
-
-    raise RuntimeError(
-        "No database URL configured. Set DATABASE_URL (preferred) or TIMESCALE_SERVICE_URL "
-        "to a valid PostgreSQL connection string before starting the API."
-    )
-
-
 def describe_database_target(database_url: str) -> str:
     """Return safe, non-secret connection target details for logs."""
     parsed = urlparse(database_url)
@@ -159,37 +136,71 @@ async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     global db_pool, controller_manager, ocpp_server
 
-    # Initialize database connection pool
-    database_url, database_url_source = resolve_database_url()
-    logger.info(
-        "Initializing database pool using %s (%s)",
-        database_url_source,
-        describe_database_target(database_url),
-    )
-
-    try:
-        db_pool = await asyncpg.create_pool(
-            database_url,
-            min_size=2,
-            max_size=10,
-            # Supabase Supavisor (the connection pooler at *.pooler.supabase.com)
-            # does not support prepared statements.  Setting statement_cache_size=0
-            # disables asyncpg's prepared-statement cache so every query is sent
-            # as a simple query, compatible with any pgBouncer-style pooler.
-            statement_cache_size=0,
+    # Initialize database connection pool.
+    # Try candidates in priority order (DATABASE_URL first, then TIMESCALE_SERVICE_URL).
+    # On InvalidPasswordError we fall through to the next candidate so the app can start
+    # while stale credentials are being corrected.  All other errors fail fast so that
+    # Railway/uvicorn restarts the pod for genuine transient failures.
+    _url_candidates = [
+        (v, k)
+        for k in ("DATABASE_URL", "TIMESCALE_SERVICE_URL")
+        if (v := os.getenv(k))
+    ]
+    if not _url_candidates:
+        raise RuntimeError(
+            "No database URL configured. Set DATABASE_URL (preferred) or "
+            "TIMESCALE_SERVICE_URL to a valid PostgreSQL connection string."
         )
-        logger.info("Database connection pool initialized")
-    except Exception as e:
-        # Re-raise so uvicorn/Railway sees a failed startup and can restart the pod.
-        # Continuing with db_pool=None would start the API in a permanently broken
-        # state (every endpoint returns 503) with no automatic recovery.
-        logger.error(
-            "Failed to initialize database pool via %s (%s): %s",
+
+    _last_auth_exc: Exception | None = None
+    for database_url, database_url_source in _url_candidates:
+        logger.info(
+            "Initializing database pool using %s (%s)",
             database_url_source,
             describe_database_target(database_url),
-            e,
         )
-        raise
+        try:
+            db_pool = await asyncpg.create_pool(
+                database_url,
+                min_size=2,
+                max_size=10,
+                # Supabase Supavisor (the connection pooler at *.pooler.supabase.com)
+                # does not support prepared statements.  Setting statement_cache_size=0
+                # disables asyncpg's prepared-statement cache so every query is sent
+                # as a simple query, compatible with any pgBouncer-style pooler.
+                statement_cache_size=0,
+            )
+            logger.info("Database connection pool initialized via %s", database_url_source)
+            break
+        except asyncpg.exceptions.InvalidPasswordError as e:
+            # Auth failures are permanent — wrong password won't self-heal.
+            # Log clearly and try the next candidate rather than crashing immediately.
+            logger.warning(
+                "Auth failure for %s (%s) — password is incorrect. "
+                "Update %s with the correct credentials. Trying next URL candidate.",
+                database_url_source,
+                describe_database_target(database_url),
+                database_url_source,
+            )
+            _last_auth_exc = e
+            continue
+        except Exception as e:
+            # Non-auth errors (network, TLS, etc.) are potentially transient.
+            # Re-raise so uvicorn/Railway restarts the pod for automatic recovery.
+            logger.error(
+                "Failed to initialize database pool via %s (%s): %s",
+                database_url_source,
+                describe_database_target(database_url),
+                e,
+            )
+            raise
+    else:
+        # Every candidate was exhausted by auth failures — no usable URL found.
+        logger.error(
+            "All database URL candidates failed authentication. "
+            "Update DATABASE_URL (and optionally TIMESCALE_SERVICE_URL) with correct credentials."
+        )
+        raise _last_auth_exc  # type: ignore[misc]
 
     # Initialize OCPP server (if enabled)
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
