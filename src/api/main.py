@@ -10,6 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse
 from uuid import UUID
 
 import asyncpg
@@ -120,20 +121,51 @@ _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (c
 _config_cache_ttl: float = 300.0  # 5 minutes
 
 
+def resolve_database_url() -> tuple[str, str]:
+    """Resolve core API DB URL from environment.
+
+    The API source of truth is DATABASE_URL (Supabase core DB).
+    TIMESCALE_SERVICE_URL is accepted only as a fallback for compatibility.
+
+    Returns:
+        Tuple of (database_url, source_env_var_name)
+
+    Raises:
+        RuntimeError: If no supported database URL env var is present.
+    """
+    for env_var in ("DATABASE_URL", "TIMESCALE_SERVICE_URL"):
+        value = os.getenv(env_var)
+        if value:
+            return value, env_var
+
+    raise RuntimeError(
+        "No database URL configured. Set DATABASE_URL (preferred) or TIMESCALE_SERVICE_URL "
+        "to a valid PostgreSQL connection string before starting the API."
+    )
+
+
+def describe_database_target(database_url: str) -> str:
+    """Return safe, non-secret connection target details for logs."""
+    parsed = urlparse(database_url)
+    host = parsed.hostname or "<unknown-host>"
+    port = parsed.port or "<default>"
+    db_name = parsed.path.lstrip("/") or "<unknown-db>"
+    user = parsed.username or "<unknown-user>"
+    return f"user={user} host={host} port={port} db={db_name}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     global db_pool, controller_manager, ocpp_server
 
     # Initialize database connection pool
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        # Fail startup immediately so the orchestrator restarts with the env var set,
-        # rather than running indefinitely in a broken state.
-        raise RuntimeError(
-            "DATABASE_URL environment variable is not set. "
-            "Set it to a valid PostgreSQL connection string before starting the API."
-        )
+    database_url, database_url_source = resolve_database_url()
+    logger.info(
+        "Initializing database pool using %s (%s)",
+        database_url_source,
+        describe_database_target(database_url),
+    )
 
     try:
         db_pool = await asyncpg.create_pool(
@@ -151,7 +183,12 @@ async def lifespan(app: FastAPI):
         # Re-raise so uvicorn/Railway sees a failed startup and can restart the pod.
         # Continuing with db_pool=None would start the API in a permanently broken
         # state (every endpoint returns 503) with no automatic recovery.
-        logger.error(f"Failed to initialize database pool: {e}")
+        logger.error(
+            "Failed to initialize database pool via %s (%s): %s",
+            database_url_source,
+            describe_database_target(database_url),
+            e,
+        )
         raise
 
     # Initialize OCPP server (if enabled)
