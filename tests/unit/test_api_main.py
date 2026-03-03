@@ -15,6 +15,8 @@ from src.api.main import (
     HandoffRequest,
     OptimizationRequest,
     app,
+    describe_database_target,
+    resolve_database_url,
     validate_depot_id,
     validate_horizon_hours,
     validate_uuid,
@@ -546,3 +548,47 @@ class TestRequestModels:
                 battery_kwh=150.0,
                 max_charge_kw=80.0,
             )
+
+
+class TestDatabaseConfiguration:
+    """Test database URL resolution helpers."""
+
+    def test_resolve_database_url_prefers_database_url(self, monkeypatch):
+        """DATABASE_URL should take precedence over TIMESCALE_SERVICE_URL."""
+        monkeypatch.setenv("TIMESCALE_SERVICE_URL", "postgresql://ts_user:ts_pw@timescale:5432/tsdb")
+        monkeypatch.setenv("DATABASE_URL", "postgresql://api_user:api_pw@api-db:5432/apidb")
+
+        database_url, source = resolve_database_url()
+
+        assert source == "DATABASE_URL"
+        assert database_url == "postgresql://api_user:api_pw@api-db:5432/apidb"
+
+    def test_resolve_database_url_uses_timescale_service_url_fallback(self, monkeypatch):
+        """TIMESCALE_SERVICE_URL should be used when DATABASE_URL is absent."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setenv("TIMESCALE_SERVICE_URL", "postgresql://ts_user:ts_pw@timescale:5432/tsdb")
+
+        database_url, source = resolve_database_url()
+
+        assert source == "TIMESCALE_SERVICE_URL"
+        assert database_url == "postgresql://ts_user:ts_pw@timescale:5432/tsdb"
+
+    def test_resolve_database_url_raises_when_unset(self, monkeypatch):
+        """Helper should fail fast when no DB URL env var is configured."""
+        monkeypatch.delenv("TIMESCALE_SERVICE_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+        with pytest.raises(RuntimeError):
+            resolve_database_url()
+
+    def test_describe_database_target_masks_password(self):
+        """Log descriptor should include target details without exposing password."""
+        description = describe_database_target(
+            "postgresql://postgres:super_secret@db.example.com:5432/favonius"
+        )
+
+        assert "super_secret" not in description
+        assert "user=postgres" in description
+        assert "host=db.example.com" in description
+        assert "port=5432" in description
+        assert "db=favonius" in description
