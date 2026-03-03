@@ -34,15 +34,16 @@ async def store_meter_values(
     max_charge_kw: Optional[float] = None,
     charger_id: Optional[UUID] = None,
     energy_kwh: Optional[float] = None,
+    ts_pool: Optional[asyncpg.Pool] = None,
 ) -> None:
-    """Store meter values in TimescaleDB telemetry table.
+    """Store meter values in the telemetry hypertable.
 
     Per PRD Section 8.4, if max_charge_kw is provided, it will be:
-    1. Stored in telemetry table
-    2. Dynamically updated in vehicles table for data consistency
+    1. Stored in telemetry table (Timescale via ts_pool)
+    2. Dynamically updated in vehicles table (Supabase via pool)
 
     Args:
-        pool: AsyncPG connection pool
+        pool: Supabase pool — used for chargers/vehicles lookups and updates
         charge_point_id: Charge point identifier (OCPP ID)
         connector_id: Connector identifier
         soc: State of charge (0.0-1.0)
@@ -52,8 +53,11 @@ async def store_meter_values(
         max_charge_kw: Optional max charge rate from OCPP (kW)
         charger_id: Optional charger UUID
         energy_kwh: Optional cumulative energy (Energy.Active.Import.Register)
+        ts_pool: Timescale pool for telemetry INSERT; falls back to pool when None
     """
-    # Resolve vehicle_id from charge_point_id if not provided
+    _ts = ts_pool if ts_pool is not None else pool
+
+    # Resolve vehicle_id from charge_point_id if not provided (Supabase)
     if vehicle_id is None:
         vehicle_id = await get_vehicle_id_from_ocpp_id(pool, charge_point_id, connector_id)
         if vehicle_id is None:
@@ -63,7 +67,7 @@ async def store_meter_values(
             )
             return
 
-    # Resolve charger_id if not provided
+    # Resolve charger_id if not provided (Supabase)
     if charger_id is None:
         try:
             async with pool.acquire() as conn:
@@ -84,7 +88,8 @@ async def store_meter_values(
     is_plugged = power_kw > 0.1
 
     try:
-        async with pool.acquire() as conn:
+        # Write telemetry to Timescale hypertable
+        async with _ts.acquire() as conn:
             await conn.execute(
                 query,
                 timestamp,
@@ -103,6 +108,7 @@ async def store_meter_values(
         )
 
         # CRITICAL: Update vehicles table if max_charge_kw provided (per PRD Section 8.4)
+        # This write goes to Supabase (vehicles is a static table)
         if max_charge_kw and max_charge_kw > 0:
             await _update_vehicle_max_charge_kw(pool, vehicle_id, max_charge_kw, timestamp)
 

@@ -6,6 +6,8 @@ Reference: PRD_v2.md#7-api-specifications
 import asyncio
 import logging
 import os
+import re
+import ssl
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -30,8 +32,28 @@ from ..security.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
 
-# Database connection pool
+# Database connection pools
+# db_pool → Supabase (static/reference tables: depots, vehicles, chargers, …)
+# ts_pool → Timescale (time-series hypertables: telemetry, prices, building_load, …)
 db_pool: Optional[asyncpg.Pool] = None
+ts_pool: Optional[asyncpg.Pool] = None
+
+
+def _build_pool_kwargs(url: str) -> tuple[str, dict]:
+    """Strip sslmode from *url* and return (clean_url, extra_kwargs) for asyncpg."""
+    kwargs: dict = {}
+    sslmode_match = re.search(r"[?&]sslmode=([^&#]*)", url)
+    if sslmode_match:
+        mode = sslmode_match.group(1).lower()
+        if mode != "disable":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            kwargs["ssl"] = ctx
+        url = re.sub(r"\?sslmode=[^&#]*&?", "?", url)
+        url = re.sub(r"&sslmode=[^&#]*", "", url)
+        url = url.rstrip("?")
+    return url, kwargs
 
 
 # ============ Input Validation Utilities ============
@@ -123,36 +145,48 @@ _config_cache_ttl: float = 300.0  # 5 minutes
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global db_pool, controller_manager, ocpp_server
+    global db_pool, ts_pool, controller_manager, ocpp_server
 
-    # Initialize database connection pool
+    # ── Supabase pool (static/reference tables) ──────────────────────────────
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
-        # Fail startup immediately so the orchestrator restarts with the env var set,
-        # rather than running indefinitely in a broken state.
         raise RuntimeError(
             "DATABASE_URL environment variable is not set. "
             "Set it to a valid PostgreSQL connection string before starting the API."
         )
 
     try:
+        clean_url, ssl_kwargs = _build_pool_kwargs(database_url)
         db_pool = await asyncpg.create_pool(
-            database_url,
+            clean_url,
             min_size=2,
             max_size=10,
-            # Supabase Supavisor (the connection pooler at *.pooler.supabase.com)
-            # does not support prepared statements.  Setting statement_cache_size=0
-            # disables asyncpg's prepared-statement cache so every query is sent
-            # as a simple query, compatible with any pgBouncer-style pooler.
+            # Supabase Supavisor does not support prepared statements.
             statement_cache_size=0,
+            **ssl_kwargs,
         )
-        logger.info("Database connection pool initialized")
+        logger.info("Supabase (static) connection pool initialized")
     except Exception as e:
-        # Re-raise so uvicorn/Railway sees a failed startup and can restart the pod.
-        # Continuing with db_pool=None would start the API in a permanently broken
-        # state (every endpoint returns 503) with no automatic recovery.
         logger.error(f"Failed to initialize database pool: {e}")
         raise
+
+    # ── Timescale pool (time-series hypertables) ──────────────────────────────
+    timescale_url = os.getenv("TIMESCALE_SERVICE_URL")
+    if timescale_url:
+        try:
+            ts_clean_url, ts_ssl_kwargs = _build_pool_kwargs(timescale_url)
+            ts_pool = await asyncpg.create_pool(
+                ts_clean_url,
+                min_size=2,
+                max_size=10,
+                statement_cache_size=0,
+                **ts_ssl_kwargs,
+            )
+            logger.info("Timescale (time-series) connection pool initialized")
+        except Exception as e:
+            # Non-fatal: fall back to Supabase pool for time-series reads/writes.
+            logger.warning(f"Timescale pool unavailable, falling back to Supabase pool: {e}")
+            ts_pool = None
 
     # Initialize OCPP server (if enabled)
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
@@ -168,6 +202,7 @@ async def lifespan(app: FastAPI):
                 host=ocpp_host,
                 port=ocpp_port,
                 pool=db_pool,
+                ts_pool=ts_pool,
             )
 
             if ocpp_use_same_port:
@@ -191,6 +226,7 @@ async def lifespan(app: FastAPI):
         try:
             controller_manager = ControllerManager(
                 pool=db_pool,
+                ts_pool=ts_pool,
                 ocpp_server=ocpp_server,
             )
 
@@ -222,10 +258,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error stopping OCPP server: {e}", exc_info=True)
 
-    # Close database connection pool
+    # Close database connection pools
+    if ts_pool:
+        await ts_pool.close()
+        logger.info("Timescale connection pool closed")
     if db_pool:
         await db_pool.close()
-        logger.info("Database connection pool closed")
+        logger.info("Supabase connection pool closed")
 
 
 app = FastAPI(
@@ -963,7 +1002,7 @@ async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
         config = await _get_depot_config(depot_id)
 
         # Assemble state
-        assembler = StateAssembler(db_pool, depot_id, config)
+        assembler = StateAssembler(db_pool, depot_id, config, ts_pool=ts_pool)
         state = await assembler.get_current_state(24)
 
         # Get current price (first timestep) or default

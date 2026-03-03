@@ -34,17 +34,21 @@ class ControllerManager:
     def __init__(
         self,
         pool: asyncpg.Pool,
+        ts_pool: Optional[asyncpg.Pool] = None,
         ocpp_server: Optional["OCPPServer"] = None,
         controller_config: Optional[ControllerConfig] = None,
     ):
         """Initialize controller manager.
 
         Args:
-            pool: Database connection pool
+            pool: Supabase connection pool (static/reference tables)
+            ts_pool: Timescale connection pool (time-series hypertables); falls
+                back to *pool* when not provided.
             ocpp_server: Optional OCPP server for charger communication
             controller_config: Optional controller configuration
         """
         self.pool = pool
+        self.ts_pool = ts_pool
         self.ocpp_server = ocpp_server
         self.controller_config = controller_config or ControllerConfig.from_env()
         self.controllers: dict[str, DepotController] = {}
@@ -177,6 +181,7 @@ class ControllerManager:
             # Create controller
             controller = DepotController(
                 pool=self.pool,
+                ts_pool=self.ts_pool,
                 depot_id=depot_id_str,
                 config=depot_config,
                 ocpp_server=self.ocpp_server,

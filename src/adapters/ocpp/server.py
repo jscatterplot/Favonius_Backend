@@ -42,6 +42,7 @@ class OCPPServer:
         host: str = "0.0.0.0",
         port: int = 9000,
         pool: Optional[asyncpg.Pool] = None,
+        ts_pool: Optional[asyncpg.Pool] = None,
         on_status_change: Optional[Callable] = None,
         on_meter_values: Optional[Callable] = None,
         on_boot: Optional[Callable] = None,
@@ -54,7 +55,9 @@ class OCPPServer:
         Args:
             host: Server host address (default '0.0.0.0')
             port: Server port (default 9000)
-            pool: Optional asyncpg connection pool for database operations
+            pool: Supabase connection pool (static tables: chargers, vehicles, connector_status)
+            ts_pool: Timescale connection pool (telemetry hypertable); falls back to
+                *pool* when not provided.
             on_status_change: Optional callback for status changes
             on_meter_values: Optional callback for meter value updates
             on_boot: Optional callback for boot notification validation
@@ -65,6 +68,7 @@ class OCPPServer:
         self.host = host
         self.port = port
         self.pool = pool
+        self.ts_pool = ts_pool
         self.charge_points: dict[str, FleetChargePoint] = {}
         self.on_status_change = on_status_change
         self.on_meter_values = on_meter_values
@@ -289,6 +293,7 @@ class OCPPServer:
             max_charge_kw=max_charge_kw,
             charger_id=charger_id,
             energy_kwh=energy_kwh,
+            ts_pool=self.ts_pool,
         )
 
     async def _store_status_update(

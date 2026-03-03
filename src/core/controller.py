@@ -79,22 +79,26 @@ class DepotController:
         config: DepotConfig,
         ocpp_server: Optional["OCPPServer"] = None,
         controller_config: Optional[ControllerConfig] = None,
+        ts_pool: Optional[asyncpg.Pool] = None,
     ):
         """Initialize depot controller.
 
         Args:
-            pool: Database connection pool
+            pool: Supabase connection pool (static/reference tables)
             depot_id: Depot identifier
             config: Depot configuration
             ocpp_server: Optional OCPP server for charger communication
             controller_config: Optional controller configuration
+            ts_pool: Timescale connection pool (time-series hypertables); falls
+                back to *pool* when not provided.
         """
         self.pool = pool
+        self.ts_pool = ts_pool
         self.depot_id = str(depot_id)
         self.config = config
         self.ocpp_server = ocpp_server
         self.controller_config = controller_config or ControllerConfig.from_env()
-        self.assembler = StateAssembler(pool, self.depot_id, config)
+        self.assembler = StateAssembler(pool, self.depot_id, config, ts_pool=ts_pool)
 
         self.trigger_monitor = TriggerMonitor(
             TriggerConfig(trigger_cooldown_minutes=self.controller_config.trigger_cooldown_minutes),

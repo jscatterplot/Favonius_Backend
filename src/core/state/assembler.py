@@ -214,24 +214,38 @@ class StateAssembler:
     async def _get_vehicle_socs(self) -> dict[str, float]:
         """Get latest SoC for all vehicles.
 
+        Queries Supabase for vehicle IDs belonging to this depot, then queries
+        Timescale for their latest SoC.  The two-step approach avoids a
+        cross-database JOIN when the pools point to different servers.
+
         Returns:
             Dictionary mapping vehicle_id (str) to SoC (float 0-1)
 
         Raises:
             asyncpg.PostgresError: If database query fails
         """
-        query = """
-        SELECT DISTINCT ON (t.vehicle_id)
-            t.vehicle_id::text AS vehicle_id,
-            t.soc
-        FROM telemetry t
-        JOIN vehicles v ON t.vehicle_id = v.vehicle_id
-        WHERE v.depot_id = $1
-        ORDER BY t.vehicle_id, t.time DESC
-        """
         try:
+            # Step 1: vehicle IDs for this depot (Supabase — static table)
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, self.depot_id)
+                vehicle_rows = await conn.fetch(
+                    "SELECT vehicle_id::text FROM vehicles WHERE depot_id = $1",
+                    self.depot_id,
+                )
+            vehicle_ids = [row["vehicle_id"] for row in vehicle_rows]
+            if not vehicle_ids:
+                return {}
+
+            # Step 2: latest SoC per vehicle (Timescale — hypertable)
+            query = """
+            SELECT DISTINCT ON (vehicle_id)
+                vehicle_id::text AS vehicle_id,
+                soc
+            FROM telemetry
+            WHERE vehicle_id = ANY($1::uuid[])
+            ORDER BY vehicle_id, time DESC
+            """
+            async with self._ts.acquire() as conn:
+                rows = await conn.fetch(query, vehicle_ids)
 
             result = {str(row["vehicle_id"]): float(row["soc"]) for row in rows}
             logger.debug(f"Retrieved SoC for {len(result)} vehicles")
@@ -284,7 +298,7 @@ class StateAssembler:
         ORDER BY time
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._ts.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id, start, end)
         except asyncpg.PostgresError as e:
             logger.error(
@@ -618,7 +632,7 @@ class StateAssembler:
         Returns:
             Demand charge rate in $/kW
         """
-        # Priority 1: Check prices.demand_kw from most recent price row
+        # Priority 1: Check prices.demand_kw from most recent price row (Timescale)
         price_query = """
         SELECT demand_kw
         FROM prices
@@ -627,14 +641,14 @@ class StateAssembler:
         ORDER BY time DESC
         LIMIT 1
         """
-        async with self.pool.acquire() as conn:
+        async with self._ts.acquire() as conn:
             price_row = await conn.fetchrow(price_query, self.depot_id)
             if price_row and price_row["demand_kw"] is not None:
                 rate = float(price_row["demand_kw"])
                 logger.debug(f"Demand charge rate from prices: ${rate}/kW")
                 return rate
 
-        # Priority 2: Fall back to depots.demand_charge_rate_kw
+        # Priority 2: Fall back to depots.demand_charge_rate_kw (Supabase)
         depot_query = """
         SELECT demand_charge_rate_kw
         FROM depots
@@ -675,7 +689,7 @@ class StateAssembler:
         ORDER BY time
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._ts.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id, start, end)
         except asyncpg.PostgresError as e:
             logger.warning(

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Run TimescaleDB migrations in order. For Railway pre-deploy or local.
+"""Run database migrations in order. For Railway pre-deploy or local.
 
-Reads TIMESCALE_SERVICE_URL (preferred) or DATABASE_URL from env.
-Runs migrations/001_*.sql, 003_*.sql, 004_*.sql, etc.
+Runs against two targets when both are configured:
+  - TIMESCALE_SERVICE_URL (Timescale): full schema including hypertables.
+  - DATABASE_URL (Supabase): static/reference schema; TimescaleDB-specific
+    calls (create_hypertable, add_compression_policy, etc.) are stripped.
+
+If only one variable is set, migrations run against that target only.
 Exits 0 on success, 1 on failure.
 """
 
@@ -19,6 +23,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
 
+# Matches TimescaleDB-specific function calls to strip when targeting plain
+# PostgreSQL (Supabase).  DOTALL so multi-line calls are captured.
+_TIMESCALE_CALL_RE = re.compile(
+    r"SELECT\s+(create_hypertable|add_compression_policy|add_retention_policy)"
+    r"\s*\([^;]*\)\s*;?",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def _read_migrations_dir() -> list[Path]:
     if not MIGRATIONS_DIR.is_dir():
@@ -27,74 +39,57 @@ def _read_migrations_dir() -> list[Path]:
     return [f for f in files if f.name[0].isdigit()]
 
 
-async def run_migrations() -> int:
-    database_url = os.getenv("TIMESCALE_SERVICE_URL") or os.getenv("DATABASE_URL")
-    if not database_url:
-        print(
-            "TIMESCALE_SERVICE_URL or DATABASE_URL must be set",
-            file=sys.stderr,
-        )
-        return 1
+def _parse_url(url: str) -> tuple[str, ssl.SSLContext | bool | None]:
+    """Return (cleaned_url, ssl_config) for asyncpg, stripping the sslmode param."""
+    ssl_config: ssl.SSLContext | bool | None = None
 
+    sslmode_match = re.search(r"[?&]sslmode=([^&#]*)", url)
+    sslmode: str | None = sslmode_match.group(1) if sslmode_match else None
+
+    if sslmode:
+        mode = sslmode.lower()
+        if mode == "disable":
+            ssl_config = False
+        else:
+            ctx = ssl.create_default_context()
+            if mode in {"require", "allow", "prefer"}:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            ssl_config = ctx
+
+        url = re.sub(r"\?sslmode=[^&#]*&?", "?", url)
+        url = re.sub(r"&sslmode=[^&#]*", "", url)
+        url = url.rstrip("?")
+
+    return url, ssl_config
+
+
+async def _run_against(
+    url: str,
+    label: str,
+    files: list[Path],
+    strip_timescale: bool = False,
+) -> int:
+    """Connect to *url* and apply *files*. Returns 0 on success, 1 on failure."""
     try:
         import asyncpg
     except ImportError:
         print("asyncpg not installed", file=sys.stderr)
         return 1
 
-    files = _read_migrations_dir()
-    if not files:
-        print("No migration files found under migrations/", file=sys.stderr)
-        return 1
-
-    # Build SSL configuration when sslmode is present in the URL.
-    # asyncpg needs an explicit ssl.SSLContext or bool for cloud-hosted databases.
-    ssl_config: ssl.SSLContext | bool | None = None
-
-    # Extract sslmode from the query string without full URL round-trip.
-    # Using urlparse/urlunparse can mangle passwords containing special
-    # characters (%, +, @, etc.), causing authentication failures.
-    sslmode_match = re.search(r"[?&]sslmode=([^&#]*)", database_url)
-    sslmode: str | None = sslmode_match.group(1) if sslmode_match else None
-
-    if sslmode:
-        mode = sslmode.lower()
-        if mode == "disable":
-            # Explicitly requested no SSL.
-            ssl_config = False
-        else:
-            # For all non-disable modes we establish an SSL context.
-            # libpq-style negotiation modes like "allow" and "prefer" cannot be
-            # expressed directly in asyncpg, so we treat them as "require" from
-            # the client's perspective.
-            ctx = ssl.create_default_context()
-            if mode in {"require", "allow", "prefer"}:
-                # Timescale Cloud / most managed DBs use valid certs, but if the
-                # provider uses self-signed certs, fall back to unverified context.
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            # For verify-ca / verify-full we keep default verification behaviour.
-            ssl_config = ctx
-
-        # Strip sslmode param from the URL so asyncpg doesn't choke on it.
-        # Operate directly on the string to avoid password mangling.
-        # Case 1: sslmode is the first (or only) query param — ?sslmode=val(&...)
-        database_url = re.sub(r"\?sslmode=[^&#]*&?", "?", database_url)
-        # Case 2: sslmode appears after another param — &sslmode=val
-        database_url = re.sub(r"&sslmode=[^&#]*", "", database_url)
-        # Clean up trailing '?' if no query params remain.
-        database_url = database_url.rstrip("?")
+    cleaned_url, ssl_config = _parse_url(url)
 
     try:
-        conn = await asyncpg.connect(database_url, ssl=ssl_config)
+        conn = await asyncpg.connect(cleaned_url, ssl=ssl_config)
     except Exception as e:
-        url_source = "TIMESCALE_SERVICE_URL" if os.getenv("TIMESCALE_SERVICE_URL") else "DATABASE_URL"
-        print(f"Failed to connect to database ({url_source}): {e}", file=sys.stderr)
+        print(f"Failed to connect to database ({label}): {e}", file=sys.stderr)
         return 1
 
     try:
         for path in files:
             sql = path.read_text()
+            if strip_timescale:
+                sql = _TIMESCALE_CALL_RE.sub("", sql)
             try:
                 await conn.execute(sql)
             except Exception as e:
@@ -109,8 +104,38 @@ async def run_migrations() -> int:
     finally:
         await conn.close()
 
-    url_source = "TIMESCALE_SERVICE_URL" if os.getenv("TIMESCALE_SERVICE_URL") else "DATABASE_URL"
-    print(f"Migrations completed successfully (via {url_source}).")
+    print(f"Migrations completed successfully (via {label}).")
+    return 0
+
+
+async def run_migrations() -> int:
+    timescale_url = os.getenv("TIMESCALE_SERVICE_URL")
+    database_url = os.getenv("DATABASE_URL")
+
+    if not timescale_url and not database_url:
+        print(
+            "TIMESCALE_SERVICE_URL or DATABASE_URL must be set",
+            file=sys.stderr,
+        )
+        return 1
+
+    files = _read_migrations_dir()
+    if not files:
+        print("No migration files found under migrations/", file=sys.stderr)
+        return 1
+
+    # Run against Timescale first (full schema with hypertables).
+    if timescale_url:
+        rc = await _run_against(timescale_url, "TIMESCALE_SERVICE_URL", files, strip_timescale=False)
+        if rc != 0:
+            return rc
+
+    # Run against Supabase / plain Postgres (strip TimescaleDB-specific calls).
+    if database_url:
+        rc = await _run_against(database_url, "DATABASE_URL", files, strip_timescale=True)
+        if rc != 0:
+            return rc
+
     return 0
 
 
