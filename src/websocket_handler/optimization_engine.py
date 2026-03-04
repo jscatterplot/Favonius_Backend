@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from .config import OptimizationServiceConfig
+import aiohttp
+
+from .config import MainApiConfig, OptimizationServiceConfig
 from .connection_manager import ConnectionManager
 from .monitoring import get_logger
 from .supabase_client import SupabaseClient
@@ -41,16 +43,21 @@ class OptimizationEngine:
         timescale_client: TimescaleClient,
         supabase_client: SupabaseClient,
         connection_manager: Optional[ConnectionManager],
+        main_api_config: Optional[MainApiConfig] = None,
     ) -> None:
         self.config = config
         self.timescale_client = timescale_client
         self.supabase_client = supabase_client
         self.connection_manager = connection_manager
+        self.main_api_config = main_api_config
         self.logger = get_logger(__name__)
         self._lock = asyncio.Lock()
         self._pending_reason: Optional[str] = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        # Tracks the last time an HTTP push to the main API succeeded.
+        # Used as the fast-path (Layer 1) in _main_api_alive().
+        self._last_successful_push: Optional[datetime] = None
 
     def set_connection_manager(self, connection_manager: ConnectionManager) -> None:
         """Set the connection manager (called after server initialization)."""
@@ -94,8 +101,90 @@ class OptimizationEngine:
                     self.logger.error(f"Optimization run failed: {exc}")
             await asyncio.sleep(30)  # Run every 30 seconds
 
+    def record_successful_push(self) -> None:
+        """Record that a push to the main API just succeeded.
+
+        Updates the fast-path timestamp used by Layer 1 of _main_api_alive()
+        so we skip the DB and HTTP checks when events are flowing normally.
+        """
+        self._last_successful_push = datetime.now(timezone.utc)
+
+    async def _main_api_alive(self) -> bool:
+        """Three-layer liveness check for the main API optimizer.
+
+        Layer 1 — recent successful push (no I/O, fastest):
+            A push succeeded within heartbeat_stale_seconds → definitely alive.
+        Layer 2 — DB heartbeat (one async DB query):
+            Read the service_heartbeat row the main API writes every 30 s.
+        Layer 3 — HTTP health check (final fallback, used when DB is also down):
+            GET /health on the main API directly.
+
+        Returns False (→ activate heuristic) only when all three fail.
+        """
+        cfg = self.main_api_config
+        if cfg is None or not cfg.enabled:
+            return False  # No main API configured — always use heuristic.
+
+        stale_threshold = cfg.heartbeat_stale_seconds
+
+        # Layer 1: fast-path — recent push proves the main API was alive moments ago.
+        if self._last_successful_push is not None:
+            age = (datetime.now(timezone.utc) - self._last_successful_push).total_seconds()
+            if age < stale_threshold:
+                return True
+
+        # Layer 2: DB heartbeat written by the main API every 30 s.
+        try:
+            if self.timescale_client.pg_pool:
+                async with self.timescale_client.pg_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT last_seen FROM service_heartbeat WHERE service = 'optimizer'"
+                    )
+                if row and row["last_seen"]:
+                    last_seen = row["last_seen"]
+                    if last_seen.tzinfo is None:
+                        last_seen = last_seen.replace(tzinfo=timezone.utc)
+                    age = (datetime.now(timezone.utc) - last_seen).total_seconds()
+                    if age < stale_threshold:
+                        self.logger.debug("Main API alive via DB heartbeat (age=%.0fs)", age)
+                        return True
+        except Exception as e:
+            self.logger.warning("DB heartbeat check failed: %s", e)
+
+        # Layer 3: direct HTTP health check — used when DB is also unreachable.
+        try:
+            headers = {"X-Internal-Token": cfg.internal_token} if cfg.internal_token else {}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{cfg.url}/health",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=5.0),
+                ) as resp:
+                    if resp.status == 200:
+                        self.logger.info(
+                            "Main API alive via HTTP health check "
+                            "(DB heartbeat stale or unreachable)"
+                        )
+                        return True
+        except Exception as e:
+            self.logger.warning("HTTP health check failed: %s", e)
+
+        return False
+
     async def _run_optimization(self, trigger_reason: str) -> None:
         self.logger.info("Running optimization triggered by %s", trigger_reason)
+
+        if await self._main_api_alive():
+            self.logger.info(
+                "Main API optimizer is active — deferring heuristic fallback (trigger: %s)",
+                trigger_reason,
+            )
+            return
+
+        self.logger.warning(
+            "Main API optimizer unavailable — activating heuristic fallback (trigger: %s)",
+            trigger_reason,
+        )
 
         now = datetime.now(timezone.utc)
         horizon_end = now + timedelta(hours=self.config.horizon_hours)

@@ -170,6 +170,30 @@ async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
         ) from e
 
 
+_INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
+
+
+async def _heartbeat_loop(ts_pool: asyncpg.Pool) -> None:
+    """Write optimizer heartbeat to TimescaleDB every 30 s.
+
+    The websocket_handler reads this row to decide whether the main API
+    optimizer is alive before falling back to its own heuristic.
+    """
+    while True:
+        try:
+            async with ts_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO service_heartbeat (service, last_seen)
+                    VALUES ('optimizer', NOW())
+                    ON CONFLICT (service) DO UPDATE SET last_seen = NOW()
+                    """
+                )
+        except Exception as e:
+            logger.warning("Heartbeat write failed: %s", e)
+        await asyncio.sleep(30)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -244,6 +268,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize controller manager: {e}", exc_info=True)
         controller_manager = None
+
+    # ── Optimizer heartbeat ───────────────────────────────────────────────────
+    # Writes a timestamp to service_heartbeat every 30 s so the websocket_handler
+    # can detect main API health without a direct HTTP call in the hot path.
+    asyncio.create_task(_heartbeat_loop(ts_pool))
+    logger.info("Optimizer heartbeat task started")
 
     yield
 
@@ -1698,6 +1728,65 @@ async def receive_handoff(
             extra={"depot_id": depot_id, "vehicle_id": request.vehicle_id},
         )
         raise HTTPException(status_code=500, detail=f"Failed to receive handoff: {str(e)}")
+
+
+# ── Internal OCPP event endpoint ─────────────────────────────────────────────
+# Called by the websocket_handler to push OCPP events directly so the
+# TriggerMonitor does not have to wait for its 60-second polling cycle.
+
+
+class _OcppEventPayload(BaseModel):
+    charge_point_id: str
+    event_type: str  # "meter_values" | "status_notification" | "boot_notification"
+    data: dict = Field(default_factory=dict)
+
+
+@app.post("/internal/ocpp-event", include_in_schema=False)
+async def receive_ocpp_event(
+    payload: _OcppEventPayload,
+    request: Request,
+) -> dict:
+    """Receive an OCPP event from the websocket_handler and trigger immediate re-evaluation.
+
+    Not exposed in the public OpenAPI schema. Protected by X-Internal-Token header
+    when INTERNAL_API_TOKEN env var is set.
+    """
+    if _INTERNAL_API_TOKEN:
+        token = request.headers.get("X-Internal-Token", "")
+        if token != _INTERNAL_API_TOKEN:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not controller_manager or not db_pools:
+        return {"status": "unavailable"}
+
+    # Resolve depot_id from charge_point_id (ocpp_id → depot_id via Supabase).
+    try:
+        async with db_pools.static.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT depot_id::text FROM chargers WHERE ocpp_id = $1",
+                payload.charge_point_id,
+            )
+    except Exception as e:
+        logger.warning("Could not resolve depot for charger %s: %s", payload.charge_point_id, e)
+        return {"status": "error", "detail": "depot lookup failed"}
+
+    if not row:
+        return {"status": "unknown_charger", "charge_point_id": payload.charge_point_id}
+
+    depot_id = row["depot_id"]
+    reason = f"ocpp_event:{payload.event_type}:{payload.charge_point_id}"
+
+    try:
+        controller = await controller_manager.get_or_create_controller(depot_id)
+        # Fire-and-forget: don't block the response waiting for MILP to solve.
+        asyncio.create_task(controller._handle_trigger(reason))
+        return {"status": "triggered", "depot_id": depot_id}
+    except Exception as e:
+        logger.warning("Failed to trigger optimization for depot %s: %s", depot_id, e)
+        return {"status": "error", "detail": str(e)}
+
+
+# ── Health checks ─────────────────────────────────────────────────────────────
 
 
 async def check_database_health() -> str:

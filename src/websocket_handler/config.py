@@ -155,6 +155,34 @@ class OptimizationServiceConfig(BaseModel):
     battery_capacity_kwh: float = Field(default=75.0, description="Default battery capacity in kWh")
 
 
+class MainApiConfig(BaseModel):
+    """Configuration for direct communication with the main API optimizer.
+
+    When url is set the websocket_handler will:
+    - Push significant OCPP events to /internal/ocpp-event for near-real-time triggers.
+    - Read the service_heartbeat DB row to check main API liveness (primary).
+    - Fall back to GET /health when the DB heartbeat is stale (secondary).
+    - Only activate the heuristic optimizer when all three checks fail.
+    """
+
+    url: str = Field(default="", description="Base URL of the main API, e.g. http://api:8000")
+    internal_token: str = Field(default="", description="Shared secret sent as X-Internal-Token")
+    heartbeat_stale_seconds: int = Field(
+        default=120, description="DB heartbeat age (s) before trying the HTTP health check"
+    )
+    push_timeout_seconds: float = Field(
+        default=3.0, description="HTTP timeout for OCPP event pushes"
+    )
+    push_retry_attempts: int = Field(
+        default=2, description="Extra retry attempts on push failure (0 = one try only)"
+    )
+
+    @property
+    def enabled(self) -> bool:
+        """True when a main API URL has been configured."""
+        return bool(self.url)
+
+
 class VDV463Config(BaseModel):
     """VDV 463 transit operations configuration."""
 
@@ -183,6 +211,7 @@ class Config(BaseModel):
     price_feeder: PriceFeederConfig = Field(default_factory=PriceFeederConfig)
     optimization: OptimizationServiceConfig = Field(default_factory=OptimizationServiceConfig)
     vdv463: VDV463Config = Field(default_factory=VDV463Config)
+    main_api: MainApiConfig = Field(default_factory=MainApiConfig)
 
     # Environment-specific settings
     environment: str = Field(
@@ -325,6 +354,15 @@ class Config(BaseModel):
                 validation_mode=os.getenv("VDV463_VALIDATION_MODE", "soft"),
                 schema_dir=os.getenv("VDV463_SCHEMA_DIR"),
                 default_depot_id=os.getenv("VDV463_DEFAULT_DEPOT_ID"),
+            ),
+            main_api=MainApiConfig(
+                url=os.getenv("MAIN_API_URL", ""),
+                internal_token=os.getenv("MAIN_API_INTERNAL_TOKEN", ""),
+                heartbeat_stale_seconds=_parse_int_env(
+                    "MAIN_API_HEARTBEAT_STALE_SECONDS", default=120
+                ),
+                push_timeout_seconds=float(os.getenv("MAIN_API_PUSH_TIMEOUT_SECONDS", "3.0")),
+                push_retry_attempts=_parse_int_env("MAIN_API_PUSH_RETRY_ATTEMPTS", default=2),
             ),
             environment=os.getenv("ENVIRONMENT", "development"),
             debug=os.getenv("DEBUG", "false").lower() == "true",

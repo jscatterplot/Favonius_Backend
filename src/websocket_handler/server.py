@@ -221,11 +221,13 @@ class OCPPWebSocketServer:
         # Initialize connection manager
         self.connection_manager = ConnectionManager(config=self.config)
 
-        # Initialize message handler
+        # Initialize message handler — pass optimization_engine so successful
+        # HTTP event pushes update the fast-path liveness timestamp.
         self.message_handler = MessageHandler(
             connection_manager=self.connection_manager,
             config=self.config,
             timescale_client=self.timescale_client,
+            optimization_engine=self.optimization_engine,
         )
 
         # Initialize V2G managers with cache manager
