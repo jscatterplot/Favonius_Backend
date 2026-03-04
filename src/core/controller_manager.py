@@ -10,6 +10,8 @@ import logging
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
+import asyncpg
+
 from .controller import DepotController
 from .controller_config import ControllerConfig
 from .state.assembler import StateAssembler

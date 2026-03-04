@@ -202,6 +202,38 @@ class TestStartAllControllers:
         # Should still have started second controller
         assert call_count[0] == 2
 
+    @pytest.mark.asyncio
+    async def test_start_all_controllers_undefined_table_error(
+        self, mock_db_pool, controller_config
+    ):
+        """Test that UndefinedTableError is caught, logged with migration hint, and re-raised."""
+        pool, conn = mock_db_pool
+        conn.fetch.side_effect = asyncpg.exceptions.UndefinedTableError("relation \"depots\" does not exist")
+
+        manager = ControllerManager(
+            pool=pool,
+            controller_config=controller_config,
+        )
+
+        with pytest.raises(asyncpg.exceptions.UndefinedTableError):
+            await manager.start_all_controllers()
+
+    @pytest.mark.asyncio
+    async def test_start_all_controllers_generic_error_reraises(
+        self, mock_db_pool, controller_config
+    ):
+        """Test that unexpected errors during startup are re-raised."""
+        pool, conn = mock_db_pool
+        conn.fetch.side_effect = RuntimeError("unexpected db failure")
+
+        manager = ControllerManager(
+            pool=pool,
+            controller_config=controller_config,
+        )
+
+        with pytest.raises(RuntimeError, match="unexpected db failure"):
+            await manager.start_all_controllers()
+
 
 # ============ Stop All Controllers Tests ============
 

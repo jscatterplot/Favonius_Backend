@@ -27,6 +27,7 @@ from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.state.assembler import StateAssembler
 from ..db.pools import DatabasePools
+from ..monitoring.metrics import CONTROLLER_MANAGER_UP
 from ..security.auth import verify_token
 from ..security.rate_limiter import rate_limiter
 
@@ -264,9 +265,15 @@ async def lifespan(app: FastAPI):
         )
 
         await controller_manager.start_all_controllers()
+        CONTROLLER_MANAGER_UP.set(1)
         logger.info("Controller manager initialized and controllers started")
     except Exception as e:
-        logger.error(f"Failed to initialize controller manager: {e}", exc_info=True)
+        logger.critical(
+            "Controller manager failed to start — optimization engine is DOWN. "
+            f"No depot controllers will run. Error: {e}",
+            exc_info=True,
+        )
+        CONTROLLER_MANAGER_UP.set(0)
         controller_manager = None
 
     # ── Optimizer heartbeat ───────────────────────────────────────────────────
@@ -1912,15 +1919,18 @@ async def health_check(response: Response):
     db_status = await check_database_health()
     ocpp_status = await check_ocpp_server_health()
     gurobi_status = check_gurobi_license()
+    controller_status = "healthy" if controller_manager is not None else "unavailable"
 
-    # Database unavailability means every real endpoint returns 503; the pod is
-    # non-functional.  Signal this to load balancers and Railway probes by
-    # returning 503 so they stop routing traffic here.
-    # A missing Gurobi license is not fatal (HiGHS fallback) so we stay 200 in
-    # that case and let the "degraded" status field surface the issue.
-    overall_status = "healthy" if db_status == "healthy" else "degraded"
+    # Database unavailability means every real endpoint returns 503.
+    # Controller manager unavailable means the optimization engine is down —
+    # also fatal since the platform's core function is optimization.
+    # A missing Gurobi license is not fatal (HiGHS fallback) so we stay 200
+    # in that case and let the "degraded" status field surface the issue.
+    overall_status = (
+        "healthy" if db_status == "healthy" and controller_status == "healthy" else "degraded"
+    )
 
-    if db_status != "healthy":
+    if db_status != "healthy" or controller_status == "unavailable":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return {
@@ -1930,6 +1940,7 @@ async def health_check(response: Response):
             "database": db_status,
             "ocpp_server": ocpp_status,
             "gurobi_license": gurobi_status,
+            "controller_manager": controller_status,
         },
     }
 
