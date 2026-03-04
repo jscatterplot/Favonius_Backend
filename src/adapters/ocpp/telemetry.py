@@ -19,12 +19,13 @@ from uuid import UUID
 import asyncpg
 
 from .mapping import get_vehicle_id_from_ocpp_id
+from ...db.pools import DatabasePools
 
 logger = logging.getLogger(__name__)
 
 
 async def store_meter_values(
-    pool: asyncpg.Pool,
+    pools: DatabasePools,
     charge_point_id: str,
     connector_id: int,
     soc: float,
@@ -38,11 +39,11 @@ async def store_meter_values(
     """Store meter values in TimescaleDB telemetry table.
 
     Per PRD Section 8.4, if max_charge_kw is provided, it will be:
-    1. Stored in telemetry table
-    2. Dynamically updated in vehicles table for data consistency
+    1. Stored in telemetry table (ts pool)
+    2. Dynamically updated in vehicles table (static pool) for data consistency
 
     Args:
-        pool: AsyncPG connection pool
+        pools: Dual database pools (static=Supabase, ts=TimescaleDB)
         charge_point_id: Charge point identifier (OCPP ID)
         connector_id: Connector identifier
         soc: State of charge (0.0-1.0)
@@ -53,9 +54,9 @@ async def store_meter_values(
         charger_id: Optional charger UUID
         energy_kwh: Optional cumulative energy (Energy.Active.Import.Register)
     """
-    # Resolve vehicle_id from charge_point_id if not provided
+    # Resolve vehicle_id via charger lookup in Supabase (static)
     if vehicle_id is None:
-        vehicle_id = await get_vehicle_id_from_ocpp_id(pool, charge_point_id, connector_id)
+        vehicle_id = await get_vehicle_id_from_ocpp_id(pools.static, charge_point_id, connector_id)
         if vehicle_id is None:
             logger.warning(
                 f"Could not find vehicle_id for charge_point_id={charge_point_id}, "
@@ -63,10 +64,10 @@ async def store_meter_values(
             )
             return
 
-    # Resolve charger_id if not provided
+    # Resolve charger_id from Supabase (chargers table is static)
     if charger_id is None:
         try:
-            async with pool.acquire() as conn:
+            async with pools.static.acquire() as conn:
                 charger_row = await conn.fetchrow(
                     "SELECT charger_id FROM chargers WHERE ocpp_id = $1", charge_point_id
                 )
@@ -84,7 +85,8 @@ async def store_meter_values(
     is_plugged = power_kw > 0.1
 
     try:
-        async with pool.acquire() as conn:
+        # Write telemetry to TimescaleDB (ts pool)
+        async with pools.ts.acquire() as conn:
             await conn.execute(
                 query,
                 timestamp,
@@ -103,8 +105,9 @@ async def store_meter_values(
         )
 
         # CRITICAL: Update vehicles table if max_charge_kw provided (per PRD Section 8.4)
+        # vehicles table is in Supabase (static pool)
         if max_charge_kw and max_charge_kw > 0:
-            await _update_vehicle_max_charge_kw(pool, vehicle_id, max_charge_kw, timestamp)
+            await _update_vehicle_max_charge_kw(pools.static, vehicle_id, max_charge_kw, timestamp)
 
     except asyncpg.PostgresError as e:
         logger.error(f"Database error storing meter values: {e}")
@@ -115,17 +118,18 @@ async def store_meter_values(
 
 
 async def _update_vehicle_max_charge_kw(
-    pool: asyncpg.Pool,
+    static_pool: asyncpg.Pool,
     vehicle_id: UUID | str,
     max_charge_kw: float,
     timestamp: datetime,
 ) -> None:
-    """Update vehicle's max_charge_kw in database from OCPP MeterValues.
+    """Update vehicle's max_charge_kw in Supabase from OCPP MeterValues.
 
     Per PRD Section 8.4, OCPP values take precedence over static config.
+    vehicles table lives in Supabase (static pool).
     """
     try:
-        async with pool.acquire() as conn:
+        async with static_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE vehicles
@@ -145,20 +149,22 @@ async def _update_vehicle_max_charge_kw(
 
 
 async def store_status_update(
-    pool: asyncpg.Pool,
+    ts_pool: asyncpg.Pool,
     charge_point_id: str,
     connector_id: int,
     status: str,
     error_code: Optional[str],
     timestamp: Optional[datetime] = None,
 ) -> None:
-    """Store connector status update in database.
+    """Store connector status update in TimescaleDB.
 
     Upserts into the connector_status table (migration 004) if it exists.
     Falls back to logging if table is not yet created.
 
+    connector_status is an operational/time-series table → TimescaleDB (ts pool).
+
     Args:
-        pool: AsyncPG connection pool
+        ts_pool: TimescaleDB connection pool
         charge_point_id: Charge point identifier
         connector_id: Connector identifier
         status: Connector status (Available, Preparing, Charging, etc.)
@@ -169,7 +175,7 @@ async def store_status_update(
         timestamp = datetime.utcnow()
 
     try:
-        async with pool.acquire() as conn:
+        async with ts_pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO connector_status

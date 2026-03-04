@@ -10,11 +10,10 @@ import logging
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
-import asyncpg
-
 from .controller import DepotController
 from .controller_config import ControllerConfig
 from .state.assembler import StateAssembler
+from ..db.pools import DatabasePools
 
 if TYPE_CHECKING:
     from ..adapters.ocpp.server import OCPPServer
@@ -33,18 +32,18 @@ class ControllerManager:
 
     def __init__(
         self,
-        pool: asyncpg.Pool,
+        pools: DatabasePools,
         ocpp_server: Optional["OCPPServer"] = None,
         controller_config: Optional[ControllerConfig] = None,
     ):
         """Initialize controller manager.
 
         Args:
-            pool: Database connection pool
+            pools: Dual database connection pools (static=Supabase, ts=TimescaleDB)
             ocpp_server: Optional OCPP server for charger communication
             controller_config: Optional controller configuration
         """
-        self.pool = pool
+        self.pools = pools
         self.ocpp_server = ocpp_server
         self.controller_config = controller_config or ControllerConfig.from_env()
         self.controllers: dict[str, DepotController] = {}
@@ -66,13 +65,13 @@ class ControllerManager:
         logger.info("Starting controllers for all active depots")
 
         try:
-            # Query all depots from database
+            # Query all depots from Supabase (static pool)
             query = """
             SELECT depot_id::text
             FROM depots
             ORDER BY created_at
             """
-            async with self.pool.acquire() as conn:
+            async with self.pools.static.acquire() as conn:
                 rows = await conn.fetch(query)
 
             depot_ids = [row["depot_id"] for row in rows]
@@ -171,12 +170,12 @@ class ControllerManager:
             return self.controllers[depot_id_str]
 
         try:
-            # Load depot configuration
-            depot_config, _ = await StateAssembler.load_depot_config(self.pool, depot_id_str)
+            # Load depot configuration (static tables via pools)
+            depot_config, _ = await StateAssembler.load_depot_config(self.pools, depot_id_str)
 
             # Create controller
             controller = DepotController(
-                pool=self.pool,
+                pools=self.pools,
                 depot_id=depot_id_str,
                 config=depot_config,
                 ocpp_server=self.ocpp_server,

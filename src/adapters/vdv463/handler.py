@@ -27,6 +27,7 @@ except ImportError:
 from . import repository as vdv_repo
 from .charging_point_resolver import ChargingPointResolver
 from .depot_state import get_depot_charging_info
+from ...db.pools import DatabasePools
 from .messages import (
     ChargingPointInfo,
     ChargingRequest,
@@ -91,6 +92,7 @@ class VDV463Handler:
         validation_mode: ValidationMode = ValidationMode.HARD,
         vehicle_resolver: Optional[VehicleResolver] = None,
         charging_point_resolver: Optional[ChargingPointResolver] = None,
+        pools: Optional[DatabasePools] = None,
         db_pool: Any = None,
     ):
         """Initialize VDV 463 handler.
@@ -104,7 +106,9 @@ class VDV463Handler:
             validation_mode: Validation mode (HARD or SOFT)
             vehicle_resolver: Optional vehicle resolver (creates default if None)
             charging_point_resolver: Optional charging point resolver (creates default if None)
-            db_pool: asyncpg Pool for persistence (optional; if None, no DB writes)
+            pools: DatabasePools with static (Supabase) and ts (TimescaleDB) pools.
+                   Preferred over db_pool when provided.
+            db_pool: Deprecated single asyncpg Pool for persistence (used when pools is None)
         """
         self.presystem_id = presystem_id
         self.websocket = websocket
@@ -112,9 +116,19 @@ class VDV463Handler:
         self.config = config
         self.depot_id = depot_id or getattr(config, "default_depot_id", None)
         self.validation_mode = validation_mode
-        self.db_pool = db_pool
-        self.vehicle_resolver = vehicle_resolver or VehicleResolver(db_pool)
-        self.charging_point_resolver = charging_point_resolver or ChargingPointResolver(db_pool)
+        self._pools = pools
+        if pools is not None:
+            # Dual-DB mode: vdv_repo.* writes go to TimescaleDB; static lookups use Supabase.
+            self.db_pool = pools.ts
+            _static_pool = pools.static
+        else:
+            # Legacy single-pool mode (e.g. websocket_handler with only TimescaleDB).
+            self.db_pool = db_pool
+            _static_pool = db_pool
+        self.vehicle_resolver = vehicle_resolver or VehicleResolver(_static_pool)
+        self.charging_point_resolver = charging_point_resolver or ChargingPointResolver(
+            _static_pool
+        )
         self.logger = get_logger(__name__)
 
         # Connection state
@@ -629,6 +643,7 @@ class VDV463Handler:
                     depot_info_list = await get_depot_charging_info(
                         self.db_pool,
                         self.depot_id,
+                        static_pool=self._pools.static if self._pools else None,
                     )
                 else:
                     depot_info_list = [

@@ -24,6 +24,7 @@ from .message_handler import MessageHandler
 from .monitoring import get_logger, setup_monitoring
 from .ocpp_handler import EnhancedOCPPChargePoint
 from .priority_charging_manager import PriorityChargingManager
+from .supabase_client import SupabaseClient
 from .timescale_client import TimescaleClient
 
 # VDV 463 integration
@@ -68,11 +69,18 @@ class _SuppressHandshakeEOFErrors(logging.Filter):
 class OCPPWebSocketServer:
     """High-performance OCPP 2.1 WebSocket server."""
 
-    def __init__(self, config: Config, timescale_client: TimescaleClient, optimization_engine=None):
+    def __init__(
+        self,
+        config: Config,
+        timescale_client: TimescaleClient,
+        optimization_engine=None,
+        supabase_client: Optional[SupabaseClient] = None,
+    ):
         """Initialize the WebSocket server."""
         self.config = config
         self.logger = get_logger(__name__)
         self.timescale_client = timescale_client
+        self.supabase_client = supabase_client
         self.optimization_engine = optimization_engine
 
         # Core components
@@ -213,11 +221,13 @@ class OCPPWebSocketServer:
         # Initialize connection manager
         self.connection_manager = ConnectionManager(config=self.config)
 
-        # Initialize message handler
+        # Initialize message handler — pass optimization_engine so successful
+        # HTTP event pushes update the fast-path liveness timestamp.
         self.message_handler = MessageHandler(
             connection_manager=self.connection_manager,
             config=self.config,
             timescale_client=self.timescale_client,
+            optimization_engine=self.optimization_engine,
         )
 
         # Initialize V2G managers with cache manager

@@ -13,6 +13,7 @@ from uuid import UUID
 import asyncpg
 
 from ..models import DepotConfig, DepotState, IncomingVehicle
+from ...db.pools import DatabasePools
 
 if TYPE_CHECKING:
     pass
@@ -55,15 +56,15 @@ class StateAssembler:
         ```
     """
 
-    def __init__(self, pool: asyncpg.Pool, depot_id: str | UUID, config: DepotConfig):
+    def __init__(self, pools: DatabasePools, depot_id: str | UUID, config: DepotConfig):
         """Initialize state assembler.
 
         Args:
-            pool: Database connection pool
+            pools: Dual database connection pools (static=Supabase, ts=TimescaleDB)
             depot_id: Depot identifier
             config: Depot configuration
         """
-        self.pool = pool
+        self.pools = pools
         self.depot_id = str(depot_id)
         self.config = config
         logger.info(f"Initialized StateAssembler for depot {self.depot_id}")
@@ -214,26 +215,41 @@ class StateAssembler:
     async def _get_vehicle_socs(self) -> dict[str, float]:
         """Get latest SoC for all vehicles.
 
+        Vehicles live in Supabase (static pool); telemetry lives in TimescaleDB (ts pool).
+        We fetch vehicle_ids from the static pool first, then query the ts pool.
+
         Returns:
             Dictionary mapping vehicle_id (str) to SoC (float 0-1)
 
         Raises:
             asyncpg.PostgresError: If database query fails
         """
-        query = """
-        SELECT DISTINCT ON (t.vehicle_id)
-            t.vehicle_id::text AS vehicle_id,
-            t.soc
-        FROM telemetry t
-        JOIN vehicles v ON t.vehicle_id = v.vehicle_id
-        WHERE v.depot_id = $1
-        ORDER BY t.vehicle_id, t.time DESC
-        """
         try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, self.depot_id)
+            # Step 1: Get vehicle_ids for this depot from Supabase (static)
+            async with self.pools.static.acquire() as conn:
+                vehicle_rows = await conn.fetch(
+                    "SELECT vehicle_id::text FROM vehicles WHERE depot_id = $1",
+                    self.depot_id,
+                )
+            vehicle_ids = [row["vehicle_id"] for row in vehicle_rows]
+            if not vehicle_ids:
+                return {}
 
-            result = {str(row["vehicle_id"]): float(row["soc"]) for row in rows}
+            # Step 2: Get latest SoC per vehicle from TimescaleDB (ts)
+            async with self.pools.ts.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT ON (vehicle_id)
+                        vehicle_id::text AS vehicle_id,
+                        soc
+                    FROM telemetry
+                    WHERE vehicle_id = ANY($1::uuid[])
+                    ORDER BY vehicle_id, time DESC
+                    """,
+                    vehicle_ids,
+                )
+
+            result = {str(row["vehicle_id"]): float(row["soc"]) for row in rows if row["soc"] is not None}
             logger.debug(f"Retrieved SoC for {len(result)} vehicles")
             return result
         except asyncpg.PostgresError as e:
@@ -284,7 +300,7 @@ class StateAssembler:
         ORDER BY time
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self.pools.ts.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id, start, end)
         except asyncpg.PostgresError as e:
             logger.error(
@@ -341,7 +357,7 @@ class StateAssembler:
         system_aux_power, charging_point_id.
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self.pools.ts.acquire() as conn:
                 rows = await conn.fetch(
                     """
                     SELECT vehicle_id::text, expected_arrival, requested_departure,
@@ -502,7 +518,8 @@ class StateAssembler:
         ORDER BY departure_time
         """
         try:
-            async with self.pool.acquire() as conn:
+            # schedules and vehicles both live in Supabase (static pool)
+            async with self.pools.static.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id, start, end)
 
             schedules = [dict(row) for row in rows]
@@ -600,7 +617,7 @@ class StateAssembler:
         WHERE depot_id = $1
           AND date_trunc('month', run_time) = date_trunc('month', NOW())
         """
-        async with self.pool.acquire() as conn:
+        async with self.pools.ts.acquire() as conn:
             row = await conn.fetchrow(query, self.depot_id)
 
         peak = float(row["peak"]) if row and row["peak"] else 0.0
@@ -618,7 +635,7 @@ class StateAssembler:
         Returns:
             Demand charge rate in $/kW
         """
-        # Priority 1: Check prices.demand_kw from most recent price row
+        # Priority 1: Check prices.demand_kw from most recent price row (TimescaleDB)
         price_query = """
         SELECT demand_kw
         FROM prices
@@ -627,20 +644,20 @@ class StateAssembler:
         ORDER BY time DESC
         LIMIT 1
         """
-        async with self.pool.acquire() as conn:
+        async with self.pools.ts.acquire() as conn:
             price_row = await conn.fetchrow(price_query, self.depot_id)
             if price_row and price_row["demand_kw"] is not None:
                 rate = float(price_row["demand_kw"])
                 logger.debug(f"Demand charge rate from prices: ${rate}/kW")
                 return rate
 
-        # Priority 2: Fall back to depots.demand_charge_rate_kw
+        # Priority 2: Fall back to depots.demand_charge_rate_kw (Supabase)
         depot_query = """
         SELECT demand_charge_rate_kw
         FROM depots
         WHERE depot_id = $1
         """
-        async with self.pool.acquire() as conn:
+        async with self.pools.static.acquire() as conn:
             row = await conn.fetchrow(depot_query, self.depot_id)
             if row and row["demand_charge_rate_kw"] is not None:
                 rate = float(row["demand_charge_rate_kw"])
@@ -675,7 +692,7 @@ class StateAssembler:
         ORDER BY time
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self.pools.ts.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id, start, end)
         except asyncpg.PostgresError as e:
             logger.warning(
@@ -779,31 +796,44 @@ class StateAssembler:
             Only includes vehicles with status='acknowledged' or 'pending'
             that arrive within the optimization horizon.
         """
-        query = """
-        SELECT 
-            vehicle_id,
-            (SELECT external_id FROM vehicles WHERE vehicle_id = im.vehicle_id) as external_id,
-            expected_soc,
-            arrival_time,
-            battery_kwh,
-            max_charge_kw,
-            origin_depot_id
-        FROM interdepot_messages im
-        WHERE dest_depot_id = $1
-          AND arrival_time >= $2
-          AND arrival_time < $3
-          AND status IN ('pending', 'acknowledged')
-        ORDER BY arrival_time
-        """
+        # interdepot_messages lives in TimescaleDB; vehicles.external_id lives in Supabase.
+        # We fetch the messages first, then batch-resolve external_ids from Supabase.
         try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, self.depot_id, start, end)
+            async with self.pools.ts.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT vehicle_id, expected_soc, arrival_time,
+                           battery_kwh, max_charge_kw, origin_depot_id
+                    FROM interdepot_messages
+                    WHERE dest_depot_id = $1
+                      AND arrival_time >= $2
+                      AND arrival_time < $3
+                      AND status IN ('pending', 'acknowledged')
+                    ORDER BY arrival_time
+                    """,
+                    self.depot_id,
+                    start,
+                    end,
+                )
+
+            if not rows:
+                return []
+
+            # Batch-resolve external_ids from Supabase (static pool)
+            vehicle_ids = [str(row["vehicle_id"]) for row in rows]
+            async with self.pools.static.acquire() as conn:
+                ext_rows = await conn.fetch(
+                    "SELECT vehicle_id::text, external_id FROM vehicles WHERE vehicle_id = ANY($1::uuid[])",
+                    vehicle_ids,
+                )
+            external_id_map = {r["vehicle_id"]: r["external_id"] for r in ext_rows}
 
             incoming_vehicles = []
             for row in rows:
+                vid_str = str(row["vehicle_id"])
                 incoming = IncomingVehicle(
                     vehicle_id=row["vehicle_id"],
-                    external_id=row["external_id"] or f"vehicle_{row['vehicle_id']}",
+                    external_id=external_id_map.get(vid_str) or f"vehicle_{vid_str}",
                     expected_soc=float(row["expected_soc"]),
                     arrival_time=row["arrival_time"],
                     battery_kwh=float(row["battery_kwh"]),
@@ -825,15 +855,15 @@ class StateAssembler:
 
     @classmethod
     async def load_depot_config(
-        cls, pool: asyncpg.Pool, depot_id: str | UUID
+        cls, pools: DatabasePools, depot_id: str | UUID
     ) -> tuple[DepotConfig, dict[str, str]]:
         """Load depot configuration from database.
 
-        This is an optional enhancement that allows loading DepotConfig
-        from the database instead of passing it in during initialization.
+        All config tables (depots, vehicles, chargers, battery_storage,
+        charger_vehicle_access) live in Supabase (pools.static).
 
         Args:
-            pool: Database connection pool
+            pools: Dual database connection pools
             depot_id: Depot identifier
 
         Returns:
@@ -841,12 +871,9 @@ class StateAssembler:
 
         Raises:
             ValueError: If depot not found or configuration is invalid
-
-        Note:
-            This method queries depots, vehicles, chargers, and battery_storage
-            tables to construct a complete DepotConfig object.
         """
         depot_id_str = str(depot_id)
+        pool = pools.static  # All config tables are in Supabase
 
         # Query depot configuration
         depot_query = """

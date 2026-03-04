@@ -130,6 +130,18 @@ class SupabaseClient:
 
     # Static data access methods
 
+    async def get_active_routes(self, depot_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get active route schedules from Supabase (schedules table)."""
+        query = "SELECT * FROM schedules WHERE departure_time > NOW()"
+        if depot_id:
+            query = (
+                "SELECT s.* FROM schedules s"
+                " JOIN vehicles v ON v.vehicle_id = s.vehicle_id"
+                " WHERE v.depot_id = $1 AND s.departure_time > NOW()"
+            )
+            return await self.fetch_all(query, depot_id)
+        return await self.fetch_all(query)
+
     async def get_vehicles(self, depot_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get vehicles from Supabase."""
         query = "SELECT * FROM vehicles"

@@ -91,6 +91,7 @@ class Application:
                 self.config,
                 self.timescale_client,
                 self.optimization_engine,  # Pass optimization engine so it can be wired to connection manager
+                supabase_client=self.supabase_client,
             )
 
             # Create health check server
@@ -405,6 +406,7 @@ class Application:
                     timescale_client=self.timescale_client,
                     supabase_client=self.supabase_client,
                     connection_manager=None,  # Will be set later after WebSocket server created
+                    main_api_config=self.config.main_api,
                 )
                 await self.optimization_engine.start()
 

@@ -1,13 +1,21 @@
 """OCPP 2.1 message handler implementation."""
 
+from __future__ import annotations
+
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+import aiohttp
 
 from .config import Config
 from .monitoring import get_logger
 from .timescale_client import TimescaleClient
+
+if TYPE_CHECKING:
+    from .optimization_engine import OptimizationEngine
 
 
 class MessageHandler:
@@ -18,12 +26,14 @@ class MessageHandler:
         connection_manager: "ConnectionManager",  # noqa: F821
         config: Config,
         timescale_client: TimescaleClient,
+        optimization_engine: Optional[OptimizationEngine] = None,
     ):
         """Initialize message handler."""
         # Redis removed for simplification
         self.connection_manager = connection_manager
         self.config = config
         self.timescale_client = timescale_client
+        self.optimization_engine = optimization_engine
         self.logger = get_logger(__name__)
 
         # Message handlers mapping
@@ -87,6 +97,61 @@ class MessageHandler:
             "statusInfo": {"reasonCode": "NoError", "additionalInfo": "Boot notification accepted"},
         }
 
+    async def _push_to_main_api(
+        self,
+        charge_point_id: str,
+        event_type: str,
+        data: Dict[str, Any],
+    ) -> None:
+        """Push an OCPP event to the main API for immediate trigger evaluation.
+
+        Uses retry-tracked fire-and-forget: retries up to push_retry_attempts times
+        with linear backoff, then gives up. Calls optimization_engine.record_successful_push()
+        on success so the health fast-path stays warm while events are flowing.
+
+        Should always be invoked via asyncio.create_task() to avoid blocking
+        the OCPP message response path.
+        """
+        cfg = self.config.main_api
+        if not cfg.enabled:
+            return
+
+        body = {"charge_point_id": charge_point_id, "event_type": event_type, "data": data}
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if cfg.internal_token:
+            headers["X-Internal-Token"] = cfg.internal_token
+
+        for attempt in range(cfg.push_retry_attempts + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{cfg.url}/internal/ocpp-event",
+                        json=body,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=cfg.push_timeout_seconds),
+                    ) as resp:
+                        if resp.status < 300:
+                            if self.optimization_engine is not None:
+                                self.optimization_engine.record_successful_push()
+                            return
+                        self.logger.warning(
+                            "OCPP event push returned HTTP %s for %s (attempt %d/%d)",
+                            resp.status,
+                            charge_point_id,
+                            attempt + 1,
+                            cfg.push_retry_attempts + 1,
+                        )
+            except Exception as e:
+                self.logger.warning(
+                    "OCPP event push failed for %s (attempt %d/%d): %s",
+                    charge_point_id,
+                    attempt + 1,
+                    cfg.push_retry_attempts + 1,
+                    e,
+                )
+            if attempt < cfg.push_retry_attempts:
+                await asyncio.sleep(float(attempt + 1))  # 1 s, 2 s, …
+
     async def _handle_status_notification(
         self, station_id: str, payload: Dict[str, Any], unique_id: str
     ) -> Dict[str, Any]:
@@ -104,6 +169,14 @@ class MessageHandler:
             "timestamp": timestamp,
             "error_code": payload.get("errorCode", "NoError"),
         }
+
+        asyncio.create_task(
+            self._push_to_main_api(
+                station_id,
+                "status_notification",
+                {"status": connector_status, "evse_id": evse_id, "connector_id": connector_id},
+            )
+        )
 
         return {}  # Empty response for StatusNotification
 
@@ -142,8 +215,34 @@ class MessageHandler:
         """Handle MeterValues message."""
         meter_values = payload.get("meterValue", [])
 
+        soc_percent: Optional[float] = None
+        power_kw: Optional[float] = None
+
         for meter_value in meter_values:
             await self._process_meter_values(station_id, 1, meter_value)
+            # Capture the latest SoC/power for the event push payload.
+            for sv in meter_value.get("sampledValue", []):
+                if sv.get("measurand") == "SoC":
+                    try:
+                        soc_percent = float(sv["value"])
+                    except (KeyError, ValueError):
+                        pass
+                elif sv.get("measurand") == "Power.Active.Import":
+                    try:
+                        unit = sv.get("unitOfMeasure", {}).get("unit", "W")
+                        raw = float(sv["value"])
+                        power_kw = raw / 1000 if unit == "W" else raw
+                    except (KeyError, ValueError):
+                        pass
+
+        # Push event to main API so TriggerMonitor does not wait up to 60 s.
+        asyncio.create_task(
+            self._push_to_main_api(
+                station_id,
+                "meter_values",
+                {"soc_percent": soc_percent, "power_kw": power_kw},
+            )
+        )
 
         return {}  # Empty response for MeterValues
 

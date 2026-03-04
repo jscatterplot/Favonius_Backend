@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
-import asyncpg
 from prometheus_client import Counter, Gauge, Histogram
 
 from .controller_config import ControllerConfig
@@ -20,6 +19,7 @@ from .models import DepotConfig, OptimizationResult
 from .optimizer import optimize
 from .state.assembler import StateAssembler
 from .state.triggers import TriggerConfig, TriggerMonitor
+from ..db.pools import DatabasePools
 
 if TYPE_CHECKING:
     from ..adapters.ocpp.server import OCPPServer
@@ -74,7 +74,7 @@ class DepotController:
 
     def __init__(
         self,
-        pool: asyncpg.Pool,
+        pools: DatabasePools,
         depot_id: str | UUID,
         config: DepotConfig,
         ocpp_server: Optional["OCPPServer"] = None,
@@ -83,18 +83,18 @@ class DepotController:
         """Initialize depot controller.
 
         Args:
-            pool: Database connection pool
+            pools: Dual database connection pools (static=Supabase, ts=TimescaleDB)
             depot_id: Depot identifier
             config: Depot configuration
             ocpp_server: Optional OCPP server for charger communication
             controller_config: Optional controller configuration
         """
-        self.pool = pool
+        self.pools = pools
         self.depot_id = str(depot_id)
         self.config = config
         self.ocpp_server = ocpp_server
         self.controller_config = controller_config or ControllerConfig.from_env()
-        self.assembler = StateAssembler(pool, self.depot_id, config)
+        self.assembler = StateAssembler(pools, self.depot_id, config)
 
         self.trigger_monitor = TriggerMonitor(
             TriggerConfig(trigger_cooldown_minutes=self.controller_config.trigger_cooldown_minutes),
@@ -349,7 +349,7 @@ class DepotController:
 
         # Get vehicle-to-charger mapping from database
         try:
-            _, vehicle_to_ocpp = await StateAssembler.load_depot_config(self.pool, self.depot_id)
+            _, vehicle_to_ocpp = await StateAssembler.load_depot_config(self.pools, self.depot_id)
         except Exception as e:
             logger.error(
                 f"Failed to load vehicle-to-charger mapping: {e}",
@@ -532,7 +532,7 @@ class DepotController:
                 status = "accepted" if result.get("success") else "rejected"
                 profile_json = json.dumps(result)
 
-                async with self.pool.acquire() as conn:
+                async with self.pools.ts.acquire() as conn:
                     await conn.execute(
                         query,
                         run_id,
@@ -566,7 +566,7 @@ class DepotController:
         horizon_start = now
         horizon_end = now + timedelta(hours=24)
 
-        async with self.pool.acquire() as conn:
+        async with self.pools.ts.acquire() as conn:
             await conn.execute(
                 query,
                 result.run_id,
