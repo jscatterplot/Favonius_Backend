@@ -1,0 +1,235 @@
+"""OCPP 1.6 session adapter for the legacy WebSocket handler.
+
+Routes chargers that negotiate the ``ocpp1.6`` subprotocol through the
+correct ocpp.v16 library instead of the 2.0.1 handler.  This eliminates
+the schema-validation log storm caused by passing 1.6 messages through
+``EnhancedOCPPChargePoint`` (which uses ocpp.v201).
+
+Each ``OCPP16Session`` wraps ``FleetChargePoint`` (adapters/ocpp/charge_point.py)
+and wires its callbacks to:
+  - ``timescale_client.insert_telemetry_batch``  — telemetry persistence
+  - ``message_handler._push_to_main_api``        — real-time event push
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from adapters.ocpp.charge_point import FleetChargePoint
+
+if TYPE_CHECKING:
+    from .message_handler import MessageHandler
+    from .timescale_client import TimescaleClient
+
+logger = logging.getLogger(__name__)
+
+
+class OCPP16Session:
+    """Manages a single OCPP 1.6 charger connection.
+
+    Provides the same external interface as ``EnhancedOCPPChargePoint``
+    (``start``, ``send_charging_profile``, ``send_der_control``,
+    ``clear_der_control``) so ``OCPPWebSocketServer`` can store both types
+    in the same ``charge_points`` dict without special-casing.
+    """
+
+    def __init__(
+        self,
+        station_id: str,
+        websocket: Any,
+        timescale_client: "TimescaleClient",
+        message_handler: "MessageHandler",
+    ) -> None:
+        """Initialise the session and wire all FleetChargePoint callbacks."""
+        self._station_id = station_id
+        self._timescale = timescale_client
+        self._message_handler = message_handler
+
+        self._cp = FleetChargePoint(
+            id=station_id,
+            connection=websocket,
+            on_boot=self._on_boot,
+            on_meter_values=self._on_meter_values,
+            on_status_change=self._on_status_change,
+            on_transaction_start=self._on_transaction_start,
+            on_transaction_stop=self._on_transaction_stop,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Start processing messages from the charger (blocks until disconnect)."""
+        await self._cp.start()
+
+    # ------------------------------------------------------------------
+    # Outgoing commands (matches EnhancedOCPPChargePoint's interface)
+    # ------------------------------------------------------------------
+
+    async def send_charging_profile(self, evse_id: int, charging_profile: Dict) -> bool:
+        """Send SetChargingProfile to the charger using OCPP 1.6 semantics.
+
+        ``evse_id`` is treated as OCPP 1.6 ``connector_id`` (equivalent concept).
+        The ``charging_profile`` dict is expected to carry the standard OCPP
+        fields; the schedule periods are forwarded verbatim.
+        """
+        schedule_periods: List[Dict] = []
+        cp_schedule = charging_profile.get("chargingSchedule", {})
+        if cp_schedule:
+            schedule_periods = cp_schedule.get("chargingSchedulePeriod", [])
+        else:
+            # Flat format: list of period dicts at top level
+            schedule_periods = charging_profile.get("chargingSchedulePeriod", [])
+
+        return await self._cp.set_charging_profile(
+            connector_id=evse_id,
+            charging_schedule=schedule_periods,
+            profile_purpose=charging_profile.get(
+                "chargingProfilePurpose", "TxDefaultProfile"
+            ),
+            profile_kind=charging_profile.get("chargingProfileKind", "Absolute"),
+            charging_rate_unit=cp_schedule.get("chargingRateUnit", "W"),
+            stack_level=charging_profile.get("stackLevel", 0),
+            profile_id=charging_profile.get("chargingProfileId", 1),
+        )
+
+    async def send_der_control(self, der_control: Dict) -> bool:  # noqa: ARG002
+        """DER control is an OCPP 2.x feature; no-op for OCPP 1.6 chargers."""
+        logger.debug("send_der_control called on OCPP 1.6 session — skipping")
+        return False
+
+    async def clear_der_control(self) -> bool:
+        """DER control is an OCPP 2.x feature; no-op for OCPP 1.6 chargers."""
+        logger.debug("clear_der_control called on OCPP 1.6 session — skipping")
+        return False
+
+    # ------------------------------------------------------------------
+    # FleetChargePoint callbacks
+    # ------------------------------------------------------------------
+
+    async def _on_boot(
+        self,
+        cp_id: str,
+        vendor: str,
+        model: str,
+        serial_number: Optional[str],
+        firmware_version: Optional[str],
+        **kwargs: Any,
+    ) -> None:
+        logger.info(
+            "OCPP 1.6 boot: station=%s vendor=%s model=%s serial=%s fw=%s",
+            cp_id,
+            vendor,
+            model,
+            serial_number,
+            firmware_version,
+        )
+
+    async def _on_meter_values(
+        self,
+        cp_id: str,
+        connector_id: int,
+        soc: float,  # 0.0–1.0 fraction from FleetChargePoint
+        power_kw: float,
+        energy_kwh: Optional[float],
+        timestamp: datetime,
+        transaction_id: Optional[int],
+        max_charge_kw: Optional[float],
+        raw_samples: list,  # noqa: ARG002
+    ) -> None:
+        """Write telemetry row and push a meter_values event to the main API."""
+        # TimescaleClient expects soc_percent (0–100)
+        soc_percent = soc * 100.0 if soc is not None else None
+
+        try:
+            await self._timescale.insert_telemetry_batch(
+                [
+                    {
+                        "time": timestamp,
+                        "station_id": cp_id,
+                        "connector_id": connector_id,
+                        "session_id": str(transaction_id) if transaction_id else None,
+                        "power_kw": power_kw,
+                        "energy_kwh": energy_kwh,
+                        "soc_percent": soc_percent,
+                        "max_charge_power_kw": max_charge_kw,
+                    }
+                ]
+            )
+        except Exception as exc:
+            logger.warning("Telemetry write failed: station=%s error=%s", cp_id, exc)
+
+        asyncio.create_task(
+            self._message_handler._push_to_main_api(
+                cp_id,
+                "meter_values",
+                {"soc_percent": soc_percent, "power_kw": power_kw},
+            )
+        )
+
+    async def _on_status_change(
+        self,
+        cp_id: str,
+        connector_id: int,
+        status: str,
+        error_code: str,  # noqa: ARG002
+        timestamp: Optional[Any] = None,  # noqa: ARG002
+        vendor_id: Optional[str] = None,  # noqa: ARG002
+        vendor_error_code: Optional[str] = None,  # noqa: ARG002
+    ) -> None:
+        """Push a status_notification event to the main API."""
+        asyncio.create_task(
+            self._message_handler._push_to_main_api(
+                cp_id,
+                "status_notification",
+                {"status": status, "evse_id": connector_id, "connector_id": connector_id},
+            )
+        )
+
+    async def _on_transaction_start(
+        self,
+        cp_id: str,
+        connector_id: int,
+        id_tag: str,
+        meter_start: int,
+        timestamp: str,
+    ) -> None:
+        asyncio.create_task(
+            self._message_handler._push_to_main_api(
+                cp_id,
+                "transaction_start",
+                {
+                    "connector_id": connector_id,
+                    "id_tag": id_tag,
+                    "meter_start": meter_start,
+                    "timestamp": timestamp,
+                },
+            )
+        )
+
+    async def _on_transaction_stop(
+        self,
+        cp_id: str,
+        transaction_id: int,
+        id_tag: str,
+        meter_stop: int,
+        timestamp: str,
+        reason: str,
+    ) -> None:
+        asyncio.create_task(
+            self._message_handler._push_to_main_api(
+                cp_id,
+                "transaction_stop",
+                {
+                    "transaction_id": transaction_id,
+                    "id_tag": id_tag,
+                    "meter_stop": meter_stop,
+                    "timestamp": timestamp,
+                    "reason": reason,
+                },
+            )
+        )

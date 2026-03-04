@@ -43,6 +43,14 @@ except ImportError:
 from .monitoring import ERRORS_TOTAL
 from .monitoring import WEBSOCKET_CONNECTIONS as CONNECTIONS_TOTAL
 
+try:
+    from .ocpp16_adapter import OCPP16Session
+
+    OCPP16_AVAILABLE = True
+except ImportError:
+    OCPP16_AVAILABLE = False
+    OCPP16Session = None  # type: ignore[assignment,misc]
+
 
 class _SuppressHandshakeEOFErrors(logging.Filter):
     """Suppress websockets ERROR logs caused by TCP probes that close with zero bytes.
@@ -375,19 +383,30 @@ class OCPPWebSocketServer:
         self.station_connections[station_id] = connection_id
         CONNECTIONS_TOTAL.set(len(self.connections))
 
-        # Create enhanced OCPP charge point
-        charge_point = EnhancedOCPPChargePoint(
-            station_id=station_id,
-            connection=websocket,
-            config=self.config,
-            timescale_client=self.timescale_client,
-            connection_manager=self.connection_manager,
-            charging_profile_manager=self.charging_profile_manager,
-            der_control_manager=self.der_control_manager,
-            priority_charging_manager=self.priority_charging_manager,
-            external_control_manager=self.external_control_manager,
-            certificate_manager=self.certificate_manager,
-        )
+        # Route to the correct OCPP library based on the negotiated subprotocol.
+        # OCPP 1.6 chargers must use the v16 library; passing their messages
+        # through EnhancedOCPPChargePoint (v201) causes _validate_payload to
+        # dump the entire 2.0.1 JSON schema on every message, flooding logs.
+        if websocket.subprotocol == "ocpp1.6" and OCPP16_AVAILABLE:
+            charge_point = OCPP16Session(
+                station_id=station_id,
+                websocket=websocket,
+                timescale_client=self.timescale_client,
+                message_handler=self.message_handler,
+            )
+        else:
+            charge_point = EnhancedOCPPChargePoint(
+                station_id=station_id,
+                connection=websocket,
+                config=self.config,
+                timescale_client=self.timescale_client,
+                connection_manager=self.connection_manager,
+                charging_profile_manager=self.charging_profile_manager,
+                der_control_manager=self.der_control_manager,
+                priority_charging_manager=self.priority_charging_manager,
+                external_control_manager=self.external_control_manager,
+                certificate_manager=self.certificate_manager,
+            )
         self.charge_points[station_id] = charge_point
 
         # Register with connection manager
