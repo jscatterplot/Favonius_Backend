@@ -17,6 +17,7 @@ from src.core.models import OptimizationResult
 from .charge_point import convert_schedule_to_ocpp_profile
 from .mapping import get_vehicle_to_charger_map
 from .server import OCPPServer
+from ...db.pools import DatabasePools
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ async def dispatch_charging_profiles(
     server: OCPPServer,
     optimization_result: OptimizationResult,
     vehicle_to_charger_map: Optional[dict[str, tuple[str, int]]] = None,
-    pool: Optional[asyncpg.Pool] = None,
+    pools: Optional[DatabasePools] = None,
     depot_id: Optional[str | UUID] = None,
     delta_t: float = 0.25,
 ) -> dict[str, bool]:
@@ -38,8 +39,8 @@ async def dispatch_charging_profiles(
         server: OCPPServer instance
         optimization_result: Optimization result from MILP solver
         vehicle_to_charger_map: Optional mapping from vehicle_id to (charge_point_id, connector_id).
-                               If None and pool+depot_id provided, will be built automatically.
-        pool: Optional database pool for storing commands and building mapping
+                               If None and pools+depot_id provided, will be built automatically.
+        pools: Optional DatabasePools (static=Supabase for mapping, ts=TimescaleDB for commands)
         depot_id: Optional depot identifier (required if vehicle_to_charger_map is None)
         delta_t: Time step duration in hours (default 0.25 = 15 minutes)
 
@@ -60,18 +61,18 @@ async def dispatch_charging_profiles(
         ... )
         >>> # With automatic mapping
         >>> results = await dispatch_charging_profiles(
-        ...     server, opt_result, pool=pool, depot_id=depot_id
+        ...     server, opt_result, pools=pools, depot_id=depot_id
         ... )
     """
     # Build mapping if not provided
     if vehicle_to_charger_map is None:
-        if pool is None or depot_id is None:
+        if pools is None or depot_id is None:
             raise ValueError(
-                "Either vehicle_to_charger_map or (pool and depot_id) must be provided"
+                "Either vehicle_to_charger_map or (pools and depot_id) must be provided"
             )
         try:
             vehicle_to_charger_map = await get_vehicle_to_charger_map(
-                pool, depot_id, use_cache=True
+                pools.static, depot_id, use_cache=True
             )
             logger.debug(
                 f"Built vehicle-to-charger mapping for {len(vehicle_to_charger_map)} vehicles"
@@ -133,10 +134,10 @@ async def dispatch_charging_profiles(
             success = await charge_point.set_charging_profile(connector_id, ocpp_profile)
             results[vehicle_id] = success
 
-            # Store command in database if pool provided
-            if pool and success:
+            # Store command in database if pools provided (charging_commands is in TimescaleDB)
+            if pools and success:
                 await _store_charging_command(
-                    pool,
+                    pools.ts,
                     vehicle_id,
                     charge_point_id,
                     connector_id,

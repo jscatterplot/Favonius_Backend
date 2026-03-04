@@ -26,13 +26,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.state.assembler import StateAssembler
+from ..db.pools import DatabasePools
 from ..security.auth import verify_token
 from ..security.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
 
-# Database connection pool
-db_pool: Optional[asyncpg.Pool] = None
+# Database connection pools (set during lifespan startup)
+db_pools: Optional[DatabasePools] = None
 
 
 # ============ Input Validation Utilities ============
@@ -131,81 +132,78 @@ def describe_database_target(database_url: str) -> str:
     return f"user={user} host={host} port={port} db={db_name}"
 
 
+async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
+    """Create an asyncpg pool for a single database URL.
+
+    Args:
+        url: PostgreSQL connection string.
+        url_source: Env var name used in log messages.
+
+    Returns:
+        Connected asyncpg.Pool.
+
+    Raises:
+        RuntimeError: On permanent auth failure.
+        Exception: On transient errors (caller should let Railway restart).
+    """
+    logger.info(
+        "Initializing database pool using %s (%s)",
+        url_source,
+        describe_database_target(url),
+    )
+    try:
+        pool = await asyncpg.create_pool(
+            url,
+            min_size=2,
+            max_size=10,
+            # Supabase Supavisor does not support prepared statements.
+            # statement_cache_size=0 sends every query as a simple query,
+            # compatible with any pgBouncer-style pooler.
+            statement_cache_size=0,
+        )
+        logger.info("Database pool initialised via %s", url_source)
+        return pool
+    except asyncpg.exceptions.InvalidPasswordError as e:
+        raise RuntimeError(
+            f"Auth failure for {url_source} ({describe_database_target(url)}) — "
+            "password is incorrect. Update the env var with the correct credentials."
+        ) from e
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global db_pool, controller_manager, ocpp_server
+    global db_pools, controller_manager, ocpp_server
 
-    # Initialize database connection pool.
-    # Try candidates in priority order (DATABASE_URL first, then TIMESCALE_SERVICE_URL).
-    # On InvalidPasswordError we fall through to the next candidate so the app can start
-    # while stale credentials are being corrected.  All other errors fail fast so that
-    # Railway/uvicorn restarts the pod for genuine transient failures.
-    _url_candidates = [
-        (v, k)
-        for k in ("DATABASE_URL", "TIMESCALE_SERVICE_URL")
-        if (v := os.getenv(k))
-    ]
-    if not _url_candidates:
+    # ── Database pools ────────────────────────────────────────────────────────
+    # Supabase (static/reference data): DATABASE_URL required.
+    # TimescaleDB (time-series/operational): TIMESCALE_SERVICE_URL required;
+    #   falls back to DATABASE_URL for single-DB local dev (docker-compose).
+    static_url = os.getenv("DATABASE_URL")
+    ts_url = os.getenv("TIMESCALE_SERVICE_URL") or os.getenv("DATABASE_URL")
+
+    if not static_url:
         raise RuntimeError(
-            "No database URL configured. Set DATABASE_URL (preferred) or "
-            "TIMESCALE_SERVICE_URL to a valid PostgreSQL connection string."
+            "DATABASE_URL is not set. "
+            "Set it to the Supabase connection string (static/reference data)."
+        )
+    if not ts_url:
+        raise RuntimeError(
+            "TIMESCALE_SERVICE_URL is not set. "
+            "Set it to the TimescaleDB connection string (time-series data)."
         )
 
-    _last_auth_exc: Exception | None = None
-    for database_url, database_url_source in _url_candidates:
-        logger.info(
-            "Initializing database pool using %s (%s)",
-            database_url_source,
-            describe_database_target(database_url),
-        )
-        try:
-            db_pool = await asyncpg.create_pool(
-                database_url,
-                min_size=2,
-                max_size=10,
-                # Supabase Supavisor (the connection pooler at *.pooler.supabase.com)
-                # does not support prepared statements.  Setting statement_cache_size=0
-                # disables asyncpg's prepared-statement cache so every query is sent
-                # as a simple query, compatible with any pgBouncer-style pooler.
-                statement_cache_size=0,
-            )
-            logger.info("Database connection pool initialized via %s", database_url_source)
-            break
-        except asyncpg.exceptions.InvalidPasswordError as e:
-            # Auth failures are permanent — wrong password won't self-heal.
-            # Log clearly and try the next candidate rather than crashing immediately.
-            logger.warning(
-                "Auth failure for %s (%s) — password is incorrect. "
-                "Update %s with the correct credentials. Trying next URL candidate.",
-                database_url_source,
-                describe_database_target(database_url),
-                database_url_source,
-            )
-            _last_auth_exc = e
-            continue
-        except Exception as e:
-            # Non-auth errors (network, TLS, etc.) are potentially transient.
-            # Re-raise so uvicorn/Railway restarts the pod for automatic recovery.
-            logger.error(
-                "Failed to initialize database pool via %s (%s): %s",
-                database_url_source,
-                describe_database_target(database_url),
-                e,
-            )
-            raise
-    else:
-        # Every candidate was exhausted by auth failures — no usable URL found.
-        logger.error(
-            "All database URL candidates failed authentication. "
-            "Update DATABASE_URL (and optionally TIMESCALE_SERVICE_URL) with correct credentials."
-        )
-        raise _last_auth_exc  # type: ignore[misc]
+    static_pool = await _create_pool(static_url, "DATABASE_URL")
+    ts_pool = await _create_pool(
+        ts_url,
+        "TIMESCALE_SERVICE_URL" if os.getenv("TIMESCALE_SERVICE_URL") else "DATABASE_URL",
+    )
+    db_pools = DatabasePools(static=static_pool, ts=ts_pool)
 
-    # Initialize OCPP server (if enabled)
+    # ── OCPP server ───────────────────────────────────────────────────────────
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
     ocpp_use_same_port = os.getenv("OCPP_USE_SAME_PORT", "false").lower() == "true"
-    if ocpp_enabled and db_pool:
+    if ocpp_enabled:
         try:
             from ..adapters.ocpp.server import OCPPServer
 
@@ -215,7 +213,7 @@ async def lifespan(app: FastAPI):
             ocpp_server = OCPPServer(
                 host=ocpp_host,
                 port=ocpp_port,
-                pool=db_pool,
+                pools=db_pools,
             )
 
             if ocpp_use_same_port:
@@ -234,27 +232,24 @@ async def lifespan(app: FastAPI):
             logger.error(f"Failed to start OCPP server: {e}", exc_info=True)
             ocpp_server = None
 
-    # Initialize controller manager
-    if db_pool:
-        try:
-            controller_manager = ControllerManager(
-                pool=db_pool,
-                ocpp_server=ocpp_server,
-            )
+    # ── Controller manager ────────────────────────────────────────────────────
+    try:
+        controller_manager = ControllerManager(
+            pools=db_pools,
+            ocpp_server=ocpp_server,
+        )
 
-            # Start all controllers
-            await controller_manager.start_all_controllers()
-            logger.info("Controller manager initialized and controllers started")
-        except Exception as e:
-            logger.error(f"Failed to initialize controller manager: {e}", exc_info=True)
-            controller_manager = None
+        await controller_manager.start_all_controllers()
+        logger.info("Controller manager initialized and controllers started")
+    except Exception as e:
+        logger.error(f"Failed to initialize controller manager: {e}", exc_info=True)
+        controller_manager = None
 
     yield
 
-    # Graceful shutdown
+    # ── Graceful shutdown ─────────────────────────────────────────────────────
     logger.info("Shutting down application...")
 
-    # Stop all controllers
     if controller_manager:
         try:
             await controller_manager.stop_all_controllers()
@@ -262,7 +257,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error stopping controllers: {e}", exc_info=True)
 
-    # Stop OCPP server
     if ocpp_server:
         try:
             await ocpp_server.stop()
@@ -270,10 +264,11 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error stopping OCPP server: {e}", exc_info=True)
 
-    # Close database connection pool
-    if db_pool:
-        await db_pool.close()
-        logger.info("Database connection pool closed")
+    await static_pool.close()
+    logger.info("Static (Supabase) pool closed")
+    if ts_pool is not static_pool:
+        await ts_pool.close()
+        logger.info("TimescaleDB pool closed")
 
 
 app = FastAPI(
@@ -751,7 +746,7 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
         HTTPException 500: If configuration is invalid
         HTTPException 503: If database is not available
     """
-    if not db_pool:
+    if not db_pools:
         raise HTTPException(status_code=503, detail="Database not available")
 
     # Check cache first
@@ -766,8 +761,8 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
             del _depot_config_cache[depot_id]
 
     try:
-        # Load from database using StateAssembler
-        config, _ = await StateAssembler.load_depot_config(db_pool, depot_id)
+        # Load from database using StateAssembler (static tables only)
+        config, _ = await StateAssembler.load_depot_config(db_pools, depot_id)
 
         # Validate minimum requirements
         if not config.vehicle_capacities:
@@ -869,7 +864,7 @@ async def run_optimization(request: OptimizationRequest, user: dict = Depends(ve
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    if not db_pool:
+    if not db_pools:
         raise DatabaseError("Database not available")
 
     # Input validation (Pydantic handles most, but we add explicit checks)
@@ -1000,7 +995,7 @@ async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    if not db_pool:
+    if not db_pools:
         raise DatabaseError("Database not available")
 
     # Validate depot_id format
@@ -1011,7 +1006,7 @@ async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
         config = await _get_depot_config(depot_id)
 
         # Assemble state
-        assembler = StateAssembler(db_pool, depot_id, config)
+        assembler = StateAssembler(db_pools, depot_id, config)
         state = await assembler.get_current_state(24)
 
         # Get current price (first timestep) or default
@@ -1088,14 +1083,14 @@ async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    if not db_pool:
+    if not db_pools:
         raise DatabaseError("Database not available")
 
     # Validate depot_id format
     validate_depot_id(depot_id)
 
     try:
-        # Get latest optimization result from database
+        # Get latest optimization result from database (optimization_runs is in TimescaleDB)
         query = """
         SELECT run_id, run_time, schedule_json, horizon_start, horizon_end
         FROM optimization_runs
@@ -1103,7 +1098,7 @@ async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
         ORDER BY run_time DESC
         LIMIT 1
         """
-        async with db_pool.acquire() as conn:
+        async with db_pools.ts.acquire() as conn:
             row = await conn.fetchrow(query, depot_id)
 
         if not row:
@@ -1188,14 +1183,14 @@ async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
 )
 async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
     """GET /depots/{depot_id}/alerts — charger faults and last optimization (PRD §7.1)."""
-    if not db_pool:
+    if not db_pools:
         raise DatabaseError("Database not available")
 
     validate_depot_id(depot_id)
 
     try:
-        async with db_pool.acquire() as conn:
-            # Check depot exists (e.g. via depots or chargers)
+        # Static data: depot existence check + charger ocpp_id → charger_id map
+        async with db_pools.static.acquire() as conn:
             depot_check = await conn.fetchval(
                 "SELECT 1 FROM depots WHERE depot_id = $1",
                 depot_id,
@@ -1203,7 +1198,15 @@ async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
             if not depot_check:
                 raise HTTPException(status_code=404, detail=f"Depot {depot_id} not found")
 
-            # Last optimization
+            charger_rows = await conn.fetch(
+                "SELECT charger_id, ocpp_id FROM chargers WHERE depot_id = $1",
+                depot_id,
+            )
+        charger_map: dict[str, str] = {r["ocpp_id"]: str(r["charger_id"]) for r in charger_rows}
+        depot_ocpp_ids = list(charger_map.keys())
+
+        # Time-series data: last optimization run + connector faults
+        async with db_pools.ts.acquire() as conn:
             last_row = await conn.fetchrow(
                 """
                 SELECT run_id, run_time, status, solver_used, solve_time_s
@@ -1214,40 +1217,35 @@ async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
                 """,
                 depot_id,
             )
-            last_optimization: Optional[LastOptimizationItem] = None
-            if last_row:
-                ts = last_row["run_time"]
-                ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
-                last_optimization = LastOptimizationItem(
-                    run_id=str(last_row["run_id"]),
-                    status=last_row["status"] or "unknown",
-                    solver_used=last_row["solver_used"] or "gurobi",
-                    solve_time_s=last_row["solve_time_s"],
-                    timestamp=ts_str,
-                )
-
-            # Active charger faults: latest status per connector, join chargers for depot
-            faults_query = """
-            WITH latest AS (
+            fault_rows = await conn.fetch(
+                """
                 SELECT DISTINCT ON (station_id, connector_id)
                     station_id, connector_id, status, error_code, timestamp
                 FROM connector_status
+                WHERE station_id = ANY($1) AND status = 'Faulted'
                 ORDER BY station_id, connector_id, timestamp DESC
+                """,
+                depot_ocpp_ids,
+            ) if depot_ocpp_ids else []
+
+        last_optimization: Optional[LastOptimizationItem] = None
+        if last_row:
+            ts = last_row["run_time"]
+            ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+            last_optimization = LastOptimizationItem(
+                run_id=str(last_row["run_id"]),
+                status=last_row["status"] or "unknown",
+                solver_used=last_row["solver_used"] or "gurobi",
+                solve_time_s=last_row["solve_time_s"],
+                timestamp=ts_str,
             )
-            SELECT c.charger_id, c.ocpp_id, l.connector_id,
-                   COALESCE(l.error_code, 'Unknown') AS fault_code, l.timestamp
-            FROM latest l
-            JOIN chargers c ON c.ocpp_id = l.station_id AND c.depot_id = $1
-            WHERE l.status = 'Faulted'
-            """
-            fault_rows = await conn.fetch(faults_query, depot_id)
 
         charger_faults = [
             ChargerFaultItem(
-                charger_id=str(r["charger_id"]),
-                ocpp_id=r["ocpp_id"],
+                charger_id=charger_map[r["station_id"]],
+                ocpp_id=r["station_id"],
                 connector_id=r["connector_id"],
-                fault_code=r["fault_code"],
+                fault_code=r["error_code"] or "Unknown",
                 timestamp=(
                     r["timestamp"].isoformat()
                     if isinstance(r["timestamp"], datetime)
@@ -1255,6 +1253,7 @@ async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
                 ),
             )
             for r in fault_rows
+            if r["station_id"] in charger_map
         ]
 
         now = datetime.utcnow()
@@ -1327,7 +1326,7 @@ async def send_handoff(
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    if not db_pool:
+    if not db_pools:
         raise DatabaseError("Database not available")
 
     # Validate UUIDs
@@ -1348,13 +1347,13 @@ async def send_handoff(
         message_id = uuid4()
         departure_time = datetime.utcnow()
 
-        # Get vehicle details for handoff message
+        # Get vehicle details for handoff message (vehicles is in Supabase)
         vehicle_query = """
         SELECT external_id, battery_kwh, max_charge_kw
         FROM vehicles
         WHERE vehicle_id = $1 AND depot_id = $2
         """
-        async with db_pool.acquire() as conn:
+        async with db_pools.static.acquire() as conn:
             vehicle_row = await conn.fetchrow(vehicle_query, vehicle_id, depot_id)
 
         if not vehicle_row:
@@ -1369,14 +1368,14 @@ async def send_handoff(
             vehicle_row["max_charge_kw"]
         )
 
-        # Store message in database with status='pending'
+        # Store message in database with status='pending' (interdepot_messages is in TimescaleDB)
         query = """
         INSERT INTO interdepot_messages
             (message_id, origin_depot_id, dest_depot_id, vehicle_id,
              departure_time, expected_soc, arrival_time, battery_kwh, max_charge_kw, status)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         """
-        async with db_pool.acquire() as conn:
+        async with db_pools.ts.acquire() as conn:
             await conn.execute(
                 query,
                 message_id,
@@ -1417,13 +1416,13 @@ async def send_handoff(
                 response.raise_for_status()
                 ack_data = response.json()
 
-                # Update message status to 'acknowledged'
+                # Update message status to 'acknowledged' (ts)
                 update_query = """
                 UPDATE interdepot_messages
                 SET status = 'acknowledged', acknowledged_at = $1
                 WHERE message_id = $2
                 """
-                async with db_pool.acquire() as conn:
+                async with db_pools.ts.acquire() as conn:
                     await conn.execute(
                         update_query,
                         datetime.fromisoformat(ack_data["acknowledged_at"].replace("Z", "+00:00")),
@@ -1563,7 +1562,7 @@ async def receive_handoff(
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    if not db_pool:
+    if not db_pools:
         raise DatabaseError("Database not available")
 
     # Validate UUIDs
@@ -1594,7 +1593,7 @@ async def receive_handoff(
         # Get actual departure_time from original pending message if it exists
         # Per PRD Section 5.4, use actual departure_time instead of approximation
         departure_time = acknowledged_at  # Default fallback
-        async with db_pool.acquire() as conn:
+        async with db_pools.ts.acquire() as conn:
             original_message = await conn.fetchrow(
                 """
                 SELECT departure_time
@@ -1618,7 +1617,7 @@ async def receive_handoff(
                     "Original message not found, using acknowledged_at as departure_time approximation"
                 )
 
-        # Store message in database with status='acknowledged'
+        # Store message in database with status='acknowledged' (ts)
         query = """
         INSERT INTO interdepot_messages
             (message_id, origin_depot_id, dest_depot_id, vehicle_id,
@@ -1626,7 +1625,7 @@ async def receive_handoff(
              max_charge_kw, status, acknowledged_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         """
-        async with db_pool.acquire() as conn:
+        async with db_pools.ts.acquire() as conn:
             await conn.execute(
                 query,
                 message_id,
@@ -1707,11 +1706,11 @@ async def check_database_health() -> str:
     Returns:
         "healthy" if database is accessible, "unavailable" otherwise
     """
-    if not db_pool:
+    if not db_pools:
         return "unavailable"
 
     try:
-        async with db_pool.acquire() as conn:
+        async with db_pools.static.acquire() as conn:
             await conn.fetchval("SELECT 1")
         return "healthy"
     except Exception as e:

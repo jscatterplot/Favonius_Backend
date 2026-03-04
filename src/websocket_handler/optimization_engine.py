@@ -100,9 +100,9 @@ class OptimizationEngine:
         now = datetime.now(timezone.utc)
         horizon_end = now + timedelta(hours=self.config.horizon_hours)
 
-        # Get active vehicles and routes
-        vehicles = await self.timescale_client.get_active_vehicles()
-        routes = await self.timescale_client.get_active_routes()
+        # Get active vehicles and routes from Supabase (static reference data)
+        vehicles = await self.supabase_client.get_vehicles()
+        routes = await self.supabase_client.get_active_routes()
 
         if not vehicles:
             self.logger.info("No active vehicles to optimize")

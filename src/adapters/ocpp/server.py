@@ -24,6 +24,7 @@ from websockets.server import WebSocketServerProtocol
 from .asgi_adapter import StarletteOCPPAdapter
 from .charge_point import FleetChargePoint
 from .mapping import get_charger_id_from_ocpp_id
+from ...db.pools import DatabasePools
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class OCPPServer:
         self,
         host: str = "0.0.0.0",
         port: int = 9000,
-        pool: Optional[asyncpg.Pool] = None,
+        pools: Optional[DatabasePools] = None,
         on_status_change: Optional[Callable] = None,
         on_meter_values: Optional[Callable] = None,
         on_boot: Optional[Callable] = None,
@@ -54,7 +55,7 @@ class OCPPServer:
         Args:
             host: Server host address (default '0.0.0.0')
             port: Server port (default 9000)
-            pool: Optional asyncpg connection pool for database operations
+            pools: Optional DatabasePools for database operations (static=Supabase, ts=TimescaleDB)
             on_status_change: Optional callback for status changes
             on_meter_values: Optional callback for meter value updates
             on_boot: Optional callback for boot notification validation
@@ -64,7 +65,7 @@ class OCPPServer:
         """
         self.host = host
         self.port = port
-        self.pool = pool
+        self.pools = pools
         self.charge_points: dict[str, FleetChargePoint] = {}
         self.on_status_change = on_status_change
         self.on_meter_values = on_meter_values
@@ -177,7 +178,7 @@ class OCPPServer:
                 logger.error(f"Error in status change callback: {e}")
 
         # Persist to database
-        if self.pool:
+        if self.pools:
             try:
                 await self._store_status_update(
                     charge_point_id,
@@ -242,7 +243,7 @@ class OCPPServer:
                 logger.error(f"Error in meter values callback: {e}")
 
         # Store in database
-        if self.pool and timestamp:
+        if self.pools and timestamp:
             try:
                 await self._store_meter_values(
                     charge_point_id,
@@ -267,19 +268,19 @@ class OCPPServer:
         max_charge_kw: Optional[float] = None,
     ) -> None:
         """Store meter values in database."""
-        if not self.pool:
+        if not self.pools:
             return
 
         from .telemetry import store_meter_values
 
         try:
-            charger_id = await get_charger_id_from_ocpp_id(self.pool, charge_point_id)
+            charger_id = await get_charger_id_from_ocpp_id(self.pools.static, charge_point_id)
         except Exception as e:
             logger.debug(f"Could not resolve charger ID: {e}")
             charger_id = None
 
         await store_meter_values(
-            self.pool,
+            self.pools,
             charge_point_id,
             connector_id,
             soc,
@@ -303,13 +304,13 @@ class OCPPServer:
 
         Upserts into the connector_status table (migration 004).
         """
-        if not self.pool:
+        if not self.pools:
             return
 
         try:
             ts = timestamp or datetime.utcnow().isoformat()
 
-            async with self.pool.acquire() as conn:
+            async with self.pools.ts.acquire() as conn:
                 # Try upsert to connector_status table
                 await conn.execute(
                     """

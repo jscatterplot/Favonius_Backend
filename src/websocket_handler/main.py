@@ -91,6 +91,7 @@ class Application:
                 self.config,
                 self.timescale_client,
                 self.optimization_engine,  # Pass optimization engine so it can be wired to connection manager
+                supabase_client=self.supabase_client,
             )
 
             # Create health check server
