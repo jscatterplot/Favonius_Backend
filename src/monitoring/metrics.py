@@ -96,3 +96,8 @@ CONTROLLER_STATE = Gauge(
     "Controller state (1=running, 0=stopped)",
     ["depot_id"],
 )
+
+CONTROLLER_MANAGER_UP = Gauge(
+    "favonius_controller_manager_up",
+    "1 if controller manager initialized successfully, 0 if startup failed",
+)

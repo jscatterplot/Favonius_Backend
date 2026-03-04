@@ -467,20 +467,39 @@ class TestHealthEndpoint:
         assert "components" in data
         assert "database" in data["components"]
         assert "ocpp_server" in data["components"]
+        assert "controller_manager" in data["components"]
 
     @patch("src.api.main.check_database_health")
     @patch("src.api.main.check_ocpp_server_health")
     def test_health_check_database_unavailable(self, mock_ocpp_health, mock_db_health, client):
-        """Test health check with database unavailable."""
+        """Test health check with database unavailable returns 503."""
         mock_db_health.return_value = "unavailable"
         mock_ocpp_health.return_value = "unknown"
 
         response = client.get("/health")
 
-        assert response.status_code == http_status.HTTP_200_OK
+        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
         data = response.json()
         assert data["status"] == "degraded"
         assert data["components"]["database"] == "unavailable"
+
+    @patch("src.api.main.controller_manager", None)
+    @patch("src.api.main.check_database_health")
+    @patch("src.api.main.check_ocpp_server_health")
+    def test_health_check_controller_manager_unavailable(
+        self, mock_ocpp_health, mock_db_health, client
+    ):
+        """Test health check returns 503 and degraded when controller manager is None."""
+        mock_db_health.return_value = "healthy"
+        mock_ocpp_health.return_value = "unknown"
+
+        response = client.get("/health")
+
+        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+        data = response.json()
+        assert data["status"] == "degraded"
+        assert data["components"]["controller_manager"] == "unavailable"
+        assert data["components"]["database"] == "healthy"
 
 
 class TestErrorHandling:
