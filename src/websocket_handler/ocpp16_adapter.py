@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from adapters.ocpp.charge_point import FleetChargePoint
+from src.adapters.ocpp.charge_point import FleetChargePoint
 
 if TYPE_CHECKING:
     from .message_handler import MessageHandler

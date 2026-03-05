@@ -47,9 +47,16 @@ try:
     from .ocpp16_adapter import OCPP16Session
 
     OCPP16_AVAILABLE = True
-except ImportError:
+    logging.getLogger(__name__).info("OCPP 1.6 adapter loaded — OCPP16_AVAILABLE=True")
+except ImportError as _ocpp16_import_err:
     OCPP16_AVAILABLE = False
     OCPP16Session = None  # type: ignore[assignment,misc]
+    logging.getLogger(__name__).error(
+        "OCPP 1.6 adapter failed to import — OCPP 1.6 chargers will be misrouted "
+        "through the 2.0.1 handler and produce schema validation errors. "
+        "Import error: %s",
+        _ocpp16_import_err,
+    )
 
 
 class _SuppressHandshakeEOFErrors(logging.Filter):
