@@ -5,7 +5,7 @@ import json
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from websockets import WebSocketServerProtocol
 
@@ -113,6 +113,19 @@ class ConnectionManager:
         """Start background monitoring tasks."""
         self._monitoring_task = asyncio.create_task(self._monitor_connections())
         self._cleanup_task = asyncio.create_task(self._cleanup_stale_connections())
+
+    @staticmethod
+    def _is_websocket_closed(websocket: Any) -> bool:
+        """Compatibility check across websocket implementations."""
+        closed_attr = getattr(websocket, "closed", None)
+        if isinstance(closed_attr, bool):
+            return closed_attr
+
+        state = getattr(websocket, "state", None)
+        if state is not None and "closed" in str(state).lower():
+            return True
+
+        return getattr(websocket, "close_code", None) is not None
 
     async def register_connection(
         self,
@@ -369,7 +382,7 @@ class ConnectionManager:
                 closed_connections = []
                 async with self._lock:
                     for connection_id, websocket in self.connections.items():
-                        if websocket.closed:
+                        if self._is_websocket_closed(websocket):
                             closed_connections.append(connection_id)
 
                 for connection_id in closed_connections:
@@ -397,7 +410,7 @@ class ConnectionManager:
             websocket = self.connections[connection_id]
             try:
                 # Try to close gracefully
-                if not websocket.closed:
+                if not self._is_websocket_closed(websocket):
                     await websocket.close(1001, "Connection marked for cleanup")
             except Exception:
                 pass  # Connection might already be closed
@@ -431,7 +444,7 @@ class ConnectionManager:
         async with self._lock:
             for station_id in list(self.station_connections.keys()):
                 connection = await self.get_connection(station_id)
-                if connection and not connection.closed:
+                if connection and not self._is_websocket_closed(connection):
                     close_tasks.append(connection.close(1001, "Server shutdown"))
 
         if close_tasks:
