@@ -12,55 +12,26 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
-from prometheus_client import Counter, Gauge, Histogram
-
 from .controller_config import ControllerConfig
 from .models import DepotConfig, OptimizationResult
 from .optimizer import optimize
 from .state.assembler import StateAssembler
 from .state.triggers import TriggerConfig, TriggerMonitor
 from ..db.pools import DatabasePools
+from ..monitoring.metrics import (
+    CONTROL_LOOP_UPTIME,
+    CONTROLLER_STATE,
+    OCPP_DISPATCH_FAILURES,
+    OCPP_DISPATCH_SUCCESS,
+    OPTIMIZATION_DURATION,
+    OPTIMIZATION_FAILURES,
+    OPTIMIZATION_RUNS,
+)
 
 if TYPE_CHECKING:
     from ..adapters.ocpp.server import OCPPServer
 
 logger = logging.getLogger(__name__)
-
-# Prometheus metrics for control loop
-OPTIMIZATION_RUNS = Counter(
-    "favonius_optimization_runs_total", "Total optimization runs", ["depot_id", "trigger_reason"]
-)
-
-OPTIMIZATION_DURATION = Histogram(
-    "favonius_optimization_duration_seconds",
-    "Optimization solve time",
-    ["depot_id"],
-    buckets=[1, 5, 10, 20, 30, 60, 120],
-)
-
-OPTIMIZATION_FAILURES = Counter(
-    "favonius_optimization_failures_total",
-    "Total optimization failures",
-    ["depot_id", "failure_type"],
-)
-
-OCPP_DISPATCH_SUCCESS = Counter(
-    "favonius_ocpp_dispatch_success_total", "Total successful OCPP dispatches", ["depot_id"]
-)
-
-OCPP_DISPATCH_FAILURES = Counter(
-    "favonius_ocpp_dispatch_failures_total",
-    "Total failed OCPP dispatches",
-    ["depot_id", "error_type"],
-)
-
-CONTROL_LOOP_UPTIME = Gauge(
-    "favonius_control_loop_uptime_seconds", "Control loop uptime in seconds", ["depot_id"]
-)
-
-CONTROLLER_STATE = Gauge(
-    "favonius_controller_state", "Controller state (1=running, 0=stopped)", ["depot_id"]
-)
 
 
 class DepotController:
