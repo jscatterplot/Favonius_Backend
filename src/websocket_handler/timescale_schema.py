@@ -36,6 +36,10 @@ class TimescaleSchema:
                 # Create tables
                 await self._create_tables(conn)
 
+
+                # Apply additive compatibility migrations for existing deployments
+                await self._apply_compatibility_migrations(conn)
+
                 # Create hypertables
                 await self._create_hypertables(conn)
 
@@ -59,6 +63,16 @@ class TimescaleSchema:
         except Exception as e:
             self.logger.error(f"Failed to create TimescaleDB schema: {e}")
             raise
+
+    async def _apply_compatibility_migrations(self, conn: asyncpg.Connection) -> None:
+        """Apply additive schema updates required by current query contracts."""
+        await conn.execute(
+            """
+            ALTER TABLE charging_sessions
+            ADD COLUMN IF NOT EXISTS cost_total DECIMAL(10,2),
+            ADD COLUMN IF NOT EXISTS revenue_v2g DECIMAL(10,2)
+            """
+        )
 
     async def _enable_timescaledb(self, conn: asyncpg.Connection) -> None:
         """Enable TimescaleDB extension."""
@@ -91,6 +105,8 @@ class TimescaleSchema:
                 operation_mode VARCHAR(50),
                 fleet_operator_id UUID,
                 site_id UUID,
+                cost_total DECIMAL(10,2),
+                revenue_v2g DECIMAL(10,2),
                 sync_status VARCHAR(20) DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
