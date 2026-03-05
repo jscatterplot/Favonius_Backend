@@ -42,17 +42,23 @@ class SimulatedChargePoint(CP):
         self.transaction_id: Optional[int] = None
         self.charging_profile = None
 
-    async def send_boot_notification(self):
+    async def _call_with_timeout(self, request, timeout_s: float):
+        """Send a CALL and enforce an upper timeout bound."""
+        return await asyncio.wait_for(self.call(request), timeout=timeout_s)
+
+    async def send_boot_notification(self, timeout_s: float = 30.0):
         """Send BootNotification to server."""
         request = call.BootNotification(
             charge_point_model="SimulatedCharger",
             charge_point_vendor="FavoniusTest",
         )
-        response = await self.call(request)
+        response = await self._call_with_timeout(request, timeout_s)
         logger.info(f"[{self.id}] BootNotification response: {response.status}")
         return response.status == RegistrationStatus.accepted
 
-    async def send_status_notification(self, status: ChargePointStatus = None):
+    async def send_status_notification(
+        self, status: ChargePointStatus = None, timeout_s: float = 30.0
+    ):
         """Send StatusNotification to server."""
         if status:
             self.status = status
@@ -61,10 +67,10 @@ class SimulatedChargePoint(CP):
             error_code="NoError",
             status=self.status,
         )
-        await self.call(request)
+        await self._call_with_timeout(request, timeout_s)
         logger.info(f"[{self.id}] StatusNotification sent: {self.status}")
 
-    async def send_meter_values(self):
+    async def send_meter_values(self, timeout_s: float = 30.0):
         """Send MeterValues to server."""
         request = call.MeterValues(
             connector_id=1,
@@ -88,7 +94,7 @@ class SimulatedChargePoint(CP):
                 }
             ],
         )
-        await self.call(request)
+        await self._call_with_timeout(request, timeout_s)
         logger.debug(
             f"[{self.id}] MeterValues sent: SoC={self.current_soc:.2f}, Power={self.current_power}"
         )
@@ -178,7 +184,14 @@ class SimulatedChargePoint(CP):
             self.current_soc = min(1.0, self.current_soc + soc_increase)
 
 
-async def run_charger(charger_id: str, server_url: str, response_delay: float = 0.0):
+async def run_charger(
+    charger_id: str,
+    server_url: str,
+    response_delay: float = 0.0,
+    meter_interval_s: float = 60.0,
+    meter_jitter_s: float = 10.0,
+    call_timeout_s: float = 30.0,
+):
     """Run a single simulated charger with reconnect logic."""
     backoff = 2.0
     max_backoff = 60.0
@@ -188,21 +201,32 @@ async def run_charger(charger_id: str, server_url: str, response_delay: float = 
             async with websockets.connect(
                 f"{server_url}/{charger_id}",
                 subprotocols=["ocpp1.6"],
+                ping_interval=float(os.environ.get("WS_PING_INTERVAL", "20")),
+                ping_timeout=float(os.environ.get("WS_PING_TIMEOUT", "30")),
+                close_timeout=float(os.environ.get("WS_CLOSE_TIMEOUT", "10")),
+                max_queue=int(os.environ.get("WS_MAX_QUEUE", "32")),
             ) as ws:
                 backoff = 2.0  # Reset on successful connection
                 cp = SimulatedChargePoint(charger_id, ws, response_delay)
                 handler_task = asyncio.create_task(cp.start())
 
                 try:
-                    if not await cp.send_boot_notification():
+                    if not await cp.send_boot_notification(call_timeout_s):
                         logger.error(f"[{charger_id}] Boot rejected, will retry with backoff")
                         raise RuntimeError("BootNotification rejected")
 
-                    await cp.send_status_notification(ChargePointStatus.available)
+                    await cp.send_status_notification(ChargePointStatus.available, call_timeout_s)
+
+                    # Slightly desynchronize periodic meter updates across chargers.
+                    initial_delay = random.uniform(0.0, max(1.0, meter_jitter_s))
+                    await asyncio.sleep(initial_delay)
 
                     while True:
-                        await asyncio.sleep(60)  # Every minute
-                        await cp.send_meter_values()
+                        sleep_for = meter_interval_s + random.uniform(
+                            -meter_jitter_s, meter_jitter_s
+                        )
+                        await asyncio.sleep(max(1.0, sleep_for))
+                        await cp.send_meter_values(call_timeout_s)
                         await cp.simulate_charging()
                 except asyncio.CancelledError:
                     logger.info(f"[{charger_id}] Shutting down")
@@ -223,8 +247,12 @@ async def run_charger(charger_id: str, server_url: str, response_delay: float = 
         except asyncio.CancelledError:
             return
         except Exception as e:
-            logger.warning(f"[{charger_id}] Connection error: {e}. Retrying in {backoff:.0f}s")
-            await asyncio.sleep(backoff)
+            retry_delay = random.uniform(backoff * 0.5, backoff * 1.5)
+            logger.warning(
+                f"[{charger_id}] Connection error ({type(e).__name__}): {e}. "
+                f"Retrying in {retry_delay:.1f}s"
+            )
+            await asyncio.sleep(retry_delay)
             backoff = min(backoff * 2, max_backoff)
 
 
@@ -254,6 +282,9 @@ async def main():
     num_chargers = int(os.environ.get("NUM_CHARGERS", "10"))
     charger_prefix = os.environ.get("CHARGER_PREFIX", "test_charger_")
     simulation_mode = os.environ.get("SIMULATION_MODE", "responsive")
+    meter_interval_s = float(os.environ.get("METER_INTERVAL_SECONDS", "60"))
+    meter_jitter_s = float(os.environ.get("METER_JITTER_SECONDS", "10"))
+    call_timeout_s = float(os.environ.get("OCPP_CALL_TIMEOUT_SECONDS", "30"))
 
     # Response delay based on mode
     response_delay = 0.0 if simulation_mode == "responsive" else random.uniform(0.1, 0.5)
@@ -261,6 +292,12 @@ async def main():
     logger.info(f"Starting {num_chargers} simulated chargers")
     logger.info(f"Server URL: {server_url}")
     logger.info(f"Mode: {simulation_mode}")
+    logger.info(
+        "Intervals: meter=%ss±%ss, call_timeout=%ss",
+        meter_interval_s,
+        meter_jitter_s,
+        call_timeout_s,
+    )
 
     # Wait for server to be ready
     await asyncio.sleep(5)
@@ -269,7 +306,16 @@ async def main():
     tasks = []
     for i in range(1, num_chargers + 1):
         charger_id = f"{charger_prefix}{i:02d}"
-        task = asyncio.create_task(run_charger(charger_id, server_url, response_delay))
+        task = asyncio.create_task(
+            run_charger(
+                charger_id,
+                server_url,
+                response_delay,
+                meter_interval_s,
+                meter_jitter_s,
+                call_timeout_s,
+            )
+        )
         tasks.append(task)
         await asyncio.sleep(0.5)  # Stagger connections
 
