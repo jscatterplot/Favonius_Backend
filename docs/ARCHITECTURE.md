@@ -175,6 +175,37 @@ Both services share access to the dual-database architecture (Supabase for refer
 | **Supabase** | Static/reference data storage | Supabase (PostgreSQL) | Both services |
 | **TimescaleDB** | Time-series data storage | TimescaleDB (PostgreSQL extension) | Both services |
 
+### WebSocket Handler module classification
+
+- **Runtime‑critical (WebSocket Handler service)**:
+  - Entrypoint and orchestration: `src/websocket_handler/main.py`, `server.py`, `connection_manager.py`, `message_handler.py`, `health.py`, `health_checks.py`, `monitoring.py`, `resilience_manager.py`, `task_supervisor.py`.
+  - OCPP and security: `ocpp_handler.py`, `ocpp16_adapter.py`, `security_manager.py`, `certificate_manager.py`, `privacy_manager.py`, `pnc_handler.py`.
+  - Data plane: `timescale_client.py`, `price_feeder.py`, `optimization_engine.py`, `analytics_service.py`, `connection_monitor.py`, `cache_manager.py`.
+- **Legacy‑only / migration candidates**:
+  - Supabase‑centric data model and schema tools: `database_schema.py`, `supabase_client.py`, `init_database.py`.
+  - Timescale schema tools (replaced in production by `migrations/` + `scripts/run_migrations.py`): `timescale_schema.py`, `init_timescale.py`.
+  - Ancillary/admin modules that duplicate newer API responsibilities: `api_server.py`, `display_manager.py`, parts of `analytics_service.py` beyond the basic wrapper.
+  - Testing/compliance helpers that are not on the main runtime path: `device_model.py`, `ocpp_schema.py`.
+
+When all chargers have been migrated to the new OCPP server under `src/adapters/ocpp/`
+and the MILP optimizer is considered stable, the following `src/websocket_handler`
+modules are the primary deprecation candidates:
+
+- Supabase schema + data access: `database_schema.py`, `supabase_client.py`, `init_database.py`.
+  These encode the legacy Supabase-first data model and can be removed once all
+  static/reference data is managed via the migrations and `src/db/*`.
+- Timescale schema bootstrap: `timescale_schema.py`, `init_timescale.py`.
+  Production schema creation is owned by `migrations/*.sql` and
+  `scripts/run_migrations.py`; these remain useful only as local/dev tooling.
+- Duplicate price ingestion and analytics surface: `price_feeder.py`,
+  `analytics_service.py`, `api_server.py`, `display_manager.py`.
+  Their responsibilities are covered by `src/adapters/caiso/*`, `src/adapters/entsoe/*`,
+  and the main FastAPI API; they can be retired once no external callers depend on
+  the websocket_handler’s admin/analytics endpoints.
+- Testing and compliance helpers used only by websocket_handler tests:
+  `device_model.py`, `ocpp_schema.py`. These can be kept in tests-only directories
+  or removed if no longer required for OCPP/V2G compliance suites.
+
 ## Data Flow
 
 ### 1. INGESTION (every 5 minutes)

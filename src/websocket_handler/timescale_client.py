@@ -151,10 +151,14 @@ class TimescaleClient:
 
     # Telemetry Data Operations
     async def insert_telemetry_batch(self, telemetry_data: List[Dict[str, Any]]) -> None:
-        """Insert batch of telemetry data into main telemetry table.
+        """Insert batch of telemetry data into the unified telemetry table.
 
-        Aligns WebSocket Handler telemetry writes with the main API schema.
-        Requires telemetry table and vehicle_id resolution.
+        The schema for telemetry is defined by the SQL migrations under
+        ``migrations/`` and mirrored in ``src/db/models.py`` /
+        ``src/db/queries.py``. This method must remain aligned with those
+        definitions (columns, types, and conflict keys) and should not
+        introduce additional Timescale-specific columns that are unknown to
+        the main API layer.
         """
         if not telemetry_data:
             return
@@ -2060,187 +2064,6 @@ class TimescaleClient:
                 multiplier,
                 datetime.now(timezone.utc),
             )
-
-    # ===== ADVANCED METERING METHODS =====
-
-    async def store_signed_meter_value(self, meter_data: Dict[str, Any]) -> None:
-        """Store signed meter value."""
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO signed_meter_values (
-                    station_id, evse_id, timestamp, sampled_value, reading_context,
-                    format, signature, signature_method, encoding_method, public_key,
-                    signed_data, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            """,
-                meter_data["station_id"],
-                meter_data["evse_id"],
-                meter_data["timestamp"],
-                meter_data["sampled_value"],
-                meter_data["reading_context"],
-                meter_data["format"],
-                meter_data["signature"],
-                meter_data["signature_method"],
-                meter_data["encoding_method"],
-                meter_data["public_key"],
-                meter_data["signed_data"],
-                datetime.now(timezone.utc),
-            )
-
-    async def store_energy_accounting(self, accounting_data: Dict[str, Any]) -> None:
-        """Store energy accounting."""
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO energy_accounting (
-                    station_id, evse_id, connector_id, transaction_id,
-                    energy_import_kwh, energy_export_kwh, reactive_energy_import_kvarh,
-                    reactive_energy_export_kvarh, start_time, end_time, billing_accuracy,
-                    created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                ON CONFLICT (station_id, evse_id, connector_id, transaction_id)
-                DO UPDATE SET energy_import_kwh = $5, energy_export_kwh = $6,
-                             reactive_energy_import_kvarh = $7, reactive_energy_export_kvarh = $8,
-                             end_time = $10, billing_accuracy = $11, updated_at = $12
-            """,
-                accounting_data["station_id"],
-                accounting_data["evse_id"],
-                accounting_data["connector_id"],
-                accounting_data.get("transaction_id"),
-                accounting_data["energy_import_kwh"],
-                accounting_data["energy_export_kwh"],
-                accounting_data["reactive_energy_import_kvarh"],
-                accounting_data["reactive_energy_export_kvarh"],
-                accounting_data["start_time"],
-                accounting_data.get("end_time"),
-                accounting_data["billing_accuracy"],
-                datetime.now(timezone.utc),
-            )
-
-    async def get_energy_accounting(
-        self, station_id: str, evse_id: int, transaction_id: Optional[str]
-    ) -> Optional[Dict[str, Any]]:
-        """Get energy accounting."""
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT station_id, evse_id, connector_id, transaction_id,
-                       energy_import_kwh, energy_export_kwh, reactive_energy_import_kvarh,
-                       reactive_energy_export_kvarh, start_time, end_time, billing_accuracy
-                FROM energy_accounting
-                WHERE station_id = $1 AND evse_id = $2 AND connector_id = $3
-                AND (transaction_id = $4 OR ($4 IS NULL AND transaction_id IS NULL))
-                ORDER BY created_at DESC LIMIT 1
-            """,
-                station_id,
-                evse_id,
-                1,
-                transaction_id,
-            )
-
-            return dict(row) if row else None
-
-    async def store_meter_calibration(self, calibration_data: Dict[str, Any]) -> None:
-        """Store meter calibration."""
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO meter_calibrations (
-                    station_id, calibration_data, calibrated_at, accuracy, created_at
-                ) VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (station_id)
-                DO UPDATE SET calibration_data = $2, calibrated_at = $3,
-                             accuracy = $4, updated_at = $5
-            """,
-                calibration_data["station_id"],
-                calibration_data["calibration_data"],
-                calibration_data["calibrated_at"],
-                calibration_data["accuracy"],
-                datetime.now(timezone.utc),
-            )
-
-    async def get_meter_calibration(self, station_id: str) -> Optional[Dict[str, Any]]:
-        """Get meter calibration."""
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT calibration_data, calibrated_at, accuracy
-                FROM meter_calibrations WHERE station_id = $1
-                ORDER BY calibrated_at DESC LIMIT 1
-            """,
-                station_id,
-            )
-
-            return dict(row) if row else None
-
-    async def get_meter_accuracy(self, station_id: str) -> Optional[float]:
-        """Get meter accuracy."""
-        async with self.pg_pool.acquire() as conn:
-            accuracy = await conn.fetchval(
-                """
-                SELECT accuracy FROM meter_calibrations
-                WHERE station_id = $1 ORDER BY calibrated_at DESC LIMIT 1
-            """,
-                station_id,
-            )
-
-            return accuracy
-
-    async def store_power_quality_events(self, event_data: Dict[str, Any]) -> None:
-        """Store power quality events."""
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO power_quality_events (
-                    station_id, timestamp, events, voltage_l1, voltage_l2, voltage_l3,
-                    current_l1, current_l2, current_l3, frequency, power_factor,
-                    thd_voltage, thd_current, phase_imbalance, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            """,
-                event_data["station_id"],
-                event_data["timestamp"],
-                json.dumps(event_data["events"]),
-                event_data.get("voltage_l1"),
-                event_data.get("voltage_l2"),
-                event_data.get("voltage_l3"),
-                event_data.get("current_l1"),
-                event_data.get("current_l2"),
-                event_data.get("current_l3"),
-                event_data.get("frequency"),
-                event_data.get("power_factor"),
-                event_data.get("thd_voltage"),
-                event_data.get("thd_current"),
-                event_data.get("phase_imbalance"),
-                datetime.now(timezone.utc),
-            )
-
-    async def get_power_quality_readings(
-        self, station_id: str, start_time: datetime, end_time: datetime
-    ) -> List[Dict[str, Any]]:
-        """Get power quality readings."""
-        async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT timestamp, events, voltage_l1, voltage_l2, voltage_l3,
-                       current_l1, current_l2, current_l3, frequency, power_factor,
-                       thd_voltage, thd_current, phase_imbalance
-                FROM power_quality_events
-                WHERE station_id = $1 AND timestamp >= $2 AND timestamp <= $3
-                ORDER BY timestamp
-            """,
-                station_id,
-                start_time,
-                end_time,
-            )
-
-            readings = []
-            for row in rows:
-                reading = dict(row)
-                reading["events"] = json.loads(reading["events"])
-                readings.append(reading)
-
-            return readings
 
     # ===== DIAGNOSTICS & FIRMWARE METHODS =====
 

@@ -693,7 +693,12 @@ class VDV463Handler:
                 await asyncio.sleep(5)  # Wait before retry
 
     def _record_message_received(self, message_name: str) -> None:
-        """Record message received metric."""
+        """Record message received metric.
+
+        When running inside the legacy websocket_handler process we reuse its
+        Prometheus metrics. When running under the main API service these
+        imports are best-effort and silently skipped if unavailable.
+        """
         # Import here to avoid circular dependency
         try:
             import sys
@@ -703,7 +708,14 @@ class VDV463Handler:
             src_path = Path(__file__).parent.parent.parent
             if str(src_path) not in sys.path:
                 sys.path.insert(0, str(src_path))
-            from websocket_handler.monitoring import MESSAGES_RECEIVED_TOTAL
+            try:
+                from websocket_handler.monitoring import MESSAGES_RECEIVED_TOTAL
+            except Exception as import_error:  # pragma: no cover - defensive
+                self.logger.debug(
+                    "websocket_handler.monitoring not available; skipping metric",
+                    error=str(import_error),
+                )
+                return
 
             MESSAGES_RECEIVED_TOTAL.labels(
                 station_id=self.presystem_id,
@@ -713,7 +725,7 @@ class VDV463Handler:
             self.logger.debug(f"Could not record metric: {e}")
 
     def _record_message_sent(self, message_name: str) -> None:
-        """Record message sent metric."""
+        """Record message sent metric (optional when websocket_handler is present)."""
         try:
             import sys
             from pathlib import Path
@@ -721,7 +733,14 @@ class VDV463Handler:
             src_path = Path(__file__).parent.parent.parent
             if str(src_path) not in sys.path:
                 sys.path.insert(0, str(src_path))
-            from websocket_handler.monitoring import MESSAGES_SENT_TOTAL
+            try:
+                from websocket_handler.monitoring import MESSAGES_SENT_TOTAL
+            except Exception as import_error:  # pragma: no cover - defensive
+                self.logger.debug(
+                    "websocket_handler.monitoring not available; skipping metric",
+                    error=str(import_error),
+                )
+                return
 
             MESSAGES_SENT_TOTAL.labels(
                 station_id=self.presystem_id,
@@ -731,7 +750,7 @@ class VDV463Handler:
             self.logger.debug(f"Could not record metric: {e}")
 
     def _record_error(self, error_code: str) -> None:
-        """Record error metric."""
+        """Record error metric (optional when websocket_handler is present)."""
         try:
             import sys
             from pathlib import Path
@@ -739,7 +758,14 @@ class VDV463Handler:
             src_path = Path(__file__).parent.parent.parent
             if str(src_path) not in sys.path:
                 sys.path.insert(0, str(src_path))
-            from websocket_handler.monitoring import ERRORS_TOTAL
+            try:
+                from websocket_handler.monitoring import ERRORS_TOTAL
+            except Exception as import_error:  # pragma: no cover - defensive
+                self.logger.debug(
+                    "websocket_handler.monitoring not available; skipping metric",
+                    error=str(import_error),
+                )
+                return
 
             ERRORS_TOTAL.labels(
                 error_type=f"vdv463_{error_code}",

@@ -347,13 +347,24 @@ class Application:
     async def _initialize_supabase_components(self) -> None:
         """Initialize Supabase components."""
         try:
-            # Initialize database schema before services start using tables.
-            # This is safe to run in all environments because schema creation uses IF NOT EXISTS.
-            try:
-                await create_schema_from_config(self.config.supabase)
-                self.logger.info("Database schema initialized")
-            except Exception as e:
-                self.logger.warning(f"Schema initialization failed (may already exist): {e}")
+            # In production the Supabase schema is managed via SQL migrations
+            # (see migrations/ and scripts/run_migrations.py) and must not be
+            # mutated by this service at runtime. In lower environments we keep
+            # the convenience of creating the schema on startup.
+            if self.config.environment != "production":
+                try:
+                    await create_schema_from_config(self.config.supabase)
+                    self.logger.info("Database schema initialized")
+                except Exception as e:
+                    self.logger.warning(
+                        "Schema initialization failed or already applied; "
+                        f"continuing with existing schema: {e}"
+                    )
+            else:
+                self.logger.info(
+                    "Skipping Supabase schema initialization in production; "
+                    "migrations/ and scripts/run_migrations.py are authoritative."
+                )
 
             # Create Supabase client
             self.supabase_client = SupabaseClient(self.config.supabase)
@@ -376,14 +387,23 @@ class Application:
     async def _initialize_timescale_components(self) -> None:
         """Initialize TimescaleDB components."""
         try:
-            # Initialize TimescaleDB schema before starting services that write/query tables.
-            # This is safe to run in all environments because schema creation uses IF NOT EXISTS.
-            try:
-                await create_timescale_schema_from_config(self.config.timescale)
-                self.logger.info("TimescaleDB schema initialized")
-            except Exception as e:
-                self.logger.warning(
-                    f"TimescaleDB schema initialization failed (may already exist): {e}"
+            # In production the TimescaleDB schema is managed via SQL migrations
+            # (see migrations/ and scripts/run_migrations.py) and must not be
+            # mutated by this service at runtime. In lower environments we keep
+            # the convenience of creating the schema on startup.
+            if self.config.environment != "production":
+                try:
+                    await create_timescale_schema_from_config(self.config.timescale)
+                    self.logger.info("TimescaleDB schema initialized")
+                except Exception as e:
+                    self.logger.warning(
+                        "TimescaleDB schema initialization failed or already applied; "
+                        f"continuing with existing schema: {e}"
+                    )
+            else:
+                self.logger.info(
+                    "Skipping TimescaleDB schema initialization in production; "
+                    "migrations/ and scripts/run_migrations.py are authoritative."
                 )
 
             # Create TimescaleDB client
