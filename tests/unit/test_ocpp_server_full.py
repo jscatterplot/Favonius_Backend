@@ -29,7 +29,7 @@ class TestOCPPServerInit:
         server = OCPPServer()
         assert server.host == "0.0.0.0"
         assert server.port == 9000
-        assert server.pool is None
+        assert server.pools is None
         assert server.charge_points == {}
         assert server.on_status_change is None
         assert server.on_meter_values is None
@@ -44,14 +44,14 @@ class TestOCPPServerInit:
         server = OCPPServer(
             host="127.0.0.1",
             port=9001,
-            pool=mock_pool,
+            pools=mock_pool,
             on_status_change=mock_status_cb,
             on_meter_values=mock_meter_cb,
         )
 
         assert server.host == "127.0.0.1"
         assert server.port == 9001
-        assert server.pool is mock_pool
+        assert server.pools is mock_pool
         assert server.on_status_change is mock_status_cb
         assert server.on_meter_values is mock_meter_cb
 
@@ -202,7 +202,7 @@ class TestOCPPServerCallbacks:
         mock_conn = AsyncMock()
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        server = OCPPServer(pool=mock_pool)
+        server = OCPPServer(pools=mock_pool)
 
         with patch.object(server, "_store_status_update", new_callable=AsyncMock) as mock_store:
             await server._handle_status_change("charger_001", 1, "Charging")
@@ -216,7 +216,7 @@ class TestOCPPServerCallbacks:
 
         await server._handle_meter_values("charger_001", 1, 0.75, 50.0, ts)
 
-        on_meter.assert_called_once_with("charger_001", 1, 0.75, 50.0, ts)
+        on_meter.assert_called_once_with("charger_001", 1, 0.75, 50.0, ts, None)
 
     @pytest.mark.asyncio
     async def test_handle_meter_values_callback_error(self, server_with_callbacks):
@@ -232,7 +232,7 @@ class TestOCPPServerCallbacks:
     async def test_handle_meter_values_stores_to_db(self):
         """Test meter values stores to database when pool available."""
         mock_pool = MagicMock()
-        server = OCPPServer(pool=mock_pool)
+        server = OCPPServer(pools=mock_pool)
         ts = datetime.now(timezone.utc)
 
         with patch.object(server, "_store_meter_values", new_callable=AsyncMock) as mock_store:
@@ -374,7 +374,7 @@ class TestFleetChargePointHandlers:
             status="Available",
         )
 
-        charge_point.on_status_change.assert_called_once_with("test_charger", 1, "Available")
+        charge_point.on_status_change.assert_called_once_with("test_charger", 1, "Available", "NoError", None, None, None)
 
     @pytest.mark.asyncio
     async def test_status_notification_callback_error(self, charge_point):
@@ -749,7 +749,7 @@ class TestDatabaseStorage:
         mock_conn = AsyncMock()
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
         mock_pool.acquire.return_value.__aexit__.return_value = None
-        return OCPPServer(pool=mock_pool), mock_pool, mock_conn
+        return OCPPServer(pools=mock_pool), mock_pool, mock_conn
 
     @pytest.mark.asyncio
     async def test_store_meter_values_success(self, server_with_pool):
@@ -757,21 +757,32 @@ class TestDatabaseStorage:
         server, _, mock_conn = server_with_pool
         ts = datetime.now(timezone.utc)
 
-        with patch("src.adapters.ocpp.telemetry.get_vehicle_id_from_ocpp_id", return_value="bus_1"):
-            await server._store_meter_values("charger_001", 1, 0.75, 50.0, ts)
+        with (
+            patch("src.adapters.ocpp.server.get_charger_id_from_ocpp_id", return_value=None),
+            patch(
+                "src.adapters.ocpp.telemetry.store_meter_values", new_callable=AsyncMock
+            ) as mock_store,
+        ):
+            await server._store_meter_values("charger_001", 1, 0.75, 50.0, None, ts)
 
-        mock_conn.execute.assert_called_once()
+        mock_store.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_store_meter_values_db_error(self, server_with_pool):
         """Test meter values storage handles database errors."""
         server, _, mock_conn = server_with_pool
-        mock_conn.execute.side_effect = Exception("DB error")
         ts = datetime.now(timezone.utc)
 
-        with patch("src.adapters.ocpp.telemetry.get_vehicle_id_from_ocpp_id", return_value="bus_1"):
+        with (
+            patch("src.adapters.ocpp.server.get_charger_id_from_ocpp_id", return_value=None),
+            patch(
+                "src.adapters.ocpp.telemetry.store_meter_values",
+                new_callable=AsyncMock,
+                side_effect=Exception("DB error"),
+            ),
+        ):
             with pytest.raises(Exception, match="DB error"):
-                await server._store_meter_values("charger_001", 1, 0.75, 50.0, ts)
+                await server._store_meter_values("charger_001", 1, 0.75, 50.0, None, ts)
 
     @pytest.mark.asyncio
     async def test_store_meter_values_no_pool(self):
@@ -780,7 +791,7 @@ class TestDatabaseStorage:
         ts = datetime.now(timezone.utc)
 
         # Should not raise
-        await server._store_meter_values("charger_001", 1, 0.75, 50.0, ts)
+        await server._store_meter_values("charger_001", 1, 0.75, 50.0, None, ts)
 
 
 # ============ Edge Cases Tests ============

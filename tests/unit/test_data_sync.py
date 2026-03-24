@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.websocket_handler.config import SupabaseConfig
+from src.websocket_handler.config import SupabaseConfig, TimescaleConfig
 from src.websocket_handler.data_sync import DataSyncService
 
 
@@ -40,9 +40,21 @@ class TestDataSyncService:
         return mock_client
 
     @pytest.fixture
-    def data_sync_service(self, config, supabase_client):
+    def timescale_config(self):
+        """Mock TimescaleDB configuration."""
+        return TimescaleConfig(
+            service_url="postgresql://test:test@localhost:5432/testdb",
+            host="localhost",
+            port=5432,
+            database="testdb",
+            user="test",
+            password="test",
+        )
+
+    @pytest.fixture
+    def data_sync_service(self, config, supabase_client, timescale_config):
         """Create DataSyncService instance."""
-        return DataSyncService(config, supabase_client)
+        return DataSyncService(config, supabase_client, timescale_config)
 
     @pytest.mark.timeout(10)
     def test_data_sync_service_initialization(self, config, supabase_client):

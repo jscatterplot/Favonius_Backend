@@ -133,6 +133,24 @@ def describe_database_target(database_url: str) -> str:
     return f"user={user} host={host} port={port} db={db_name}"
 
 
+def resolve_database_url() -> tuple[str, str]:
+    """Resolve the primary database URL from environment variables.
+
+    Returns:
+        Tuple of (database_url, source_env_var_name).
+
+    Raises:
+        RuntimeError: When neither DATABASE_URL nor TIMESCALE_SERVICE_URL is set.
+    """
+    if url := os.getenv("DATABASE_URL"):
+        return url, "DATABASE_URL"
+    if url := os.getenv("TIMESCALE_SERVICE_URL"):
+        return url, "TIMESCALE_SERVICE_URL"
+    raise RuntimeError(
+        "No database URL configured. Set DATABASE_URL or TIMESCALE_SERVICE_URL."
+    )
+
+
 async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
     """Create an asyncpg pool for a single database URL.
 
@@ -901,12 +919,12 @@ async def run_optimization(request: OptimizationRequest, user: dict = Depends(ve
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    if not db_pools:
-        raise DatabaseError("Database not available")
-
-    # Input validation (Pydantic handles most, but we add explicit checks)
+    # Input validation before DB availability check (fail fast on bad input)
     validate_depot_id(request.depot_id)
     validate_horizon_hours(request.horizon_hours)
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
 
     # Log optimization request
     logger.info(
@@ -1032,11 +1050,11 @@ async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
+    # Validate depot_id format before checking DB availability
+    validate_depot_id(depot_id)
+
     if not db_pools:
         raise DatabaseError("Database not available")
-
-    # Validate depot_id format
-    validate_depot_id(depot_id)
 
     try:
         # Get depot config (raises 404 if depot not found)
@@ -1220,10 +1238,10 @@ async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
 )
 async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
     """GET /depots/{depot_id}/alerts — charger faults and last optimization (PRD §7.1)."""
+    validate_depot_id(depot_id)
+
     if not db_pools:
         raise DatabaseError("Database not available")
-
-    validate_depot_id(depot_id)
 
     try:
         # Static data: depot existence check + charger ocpp_id → charger_id map
@@ -1363,13 +1381,13 @@ async def send_handoff(
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    if not db_pools:
-        raise DatabaseError("Database not available")
-
-    # Validate UUIDs
+    # Validate UUIDs before checking DB availability
     validate_depot_id(depot_id)
     validate_vehicle_id(vehicle_id)
     validate_depot_id(request.dest_depot_id)
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
 
     # Check handoff rate limit per PRD Section 10.4 (50 messages/hour per depot pair)
     if not rate_limiter.check_handoff_limit(depot_id, request.dest_depot_id):
@@ -1921,17 +1939,13 @@ async def health_check(response: Response):
     gurobi_status = check_gurobi_license()
     controller_status = "healthy" if controller_manager is not None else "unavailable"
 
-    # Database unavailability means every real endpoint returns 503.
-    # Controller manager unavailable means the optimization engine is down —
-    # also fatal since the platform's core function is optimization.
-    # A missing Gurobi license is not fatal (HiGHS fallback) so we stay 200
-    # in that case and let the "degraded" status field surface the issue.
+    # /health always returns 200 so it remains reachable for diagnostics even
+    # when dependencies are degraded. Use the `status` and `components` fields
+    # to surface issues. A separate /readiness probe is the right place to gate
+    # load-balancer traffic.
     overall_status = (
         "healthy" if db_status == "healthy" and controller_status == "healthy" else "degraded"
     )
-
-    if db_status != "healthy" or controller_status == "unavailable":
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return {
         "status": overall_status,

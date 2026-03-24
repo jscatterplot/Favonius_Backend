@@ -13,6 +13,7 @@ from src.core.optimizer import (
     InfeasibleModelError,
     InvalidConfigError,
     InvalidStateError,
+    SolverError,
     build_optimization_model,
     optimize,
     solve_model,
@@ -309,9 +310,9 @@ def test_all_vehicles_unavailable():
         building_power=[50.0] * 96,
     )
     # This should be infeasible if departure SoC is required
-    # May raise InfeasibleModelError, ConstraintViolationError, or RuntimeError
+    # May raise InfeasibleModelError, ConstraintViolationError, SolverError, or RuntimeError
     model = build_optimization_model(state, config)
-    with pytest.raises((InfeasibleModelError, ConstraintViolationError, RuntimeError)):
+    with pytest.raises((InfeasibleModelError, ConstraintViolationError, SolverError, RuntimeError)):
         solve_model(model)
 
 

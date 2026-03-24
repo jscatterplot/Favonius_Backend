@@ -34,11 +34,14 @@ def client():
 
 @pytest.fixture
 def mock_db_pool():
-    """Mock database connection pool."""
-    pool = MagicMock(spec=asyncpg.Pool)
+    """Mock database connection pool with DatabasePools-compatible .ts and .static attrs."""
+    pool = MagicMock()
     conn = AsyncMock()
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
+    # Make .ts and .static delegate to pool so db_pools.ts.acquire works in endpoints
+    pool.ts = pool
+    pool.static = pool
     return pool, conn
 
 
@@ -330,7 +333,7 @@ class TestBoundaryValues:
 
     def test_optimize_min_horizon_hours(self, client):
         """Test optimization with minimum horizon_hours (1)."""
-        with patch("src.api.main.db_pool", MagicMock()):
+        with patch("src.api.main.db_pools", MagicMock()):
             response = client.post(
                 "/optimize",
                 json={
@@ -343,7 +346,7 @@ class TestBoundaryValues:
 
     def test_optimize_max_horizon_hours(self, client):
         """Test optimization with maximum horizon_hours (48)."""
-        with patch("src.api.main.db_pool", MagicMock()):
+        with patch("src.api.main.db_pools", MagicMock()):
             response = client.post(
                 "/optimize",
                 json={
@@ -370,7 +373,7 @@ class TestBoundaryValues:
         depot_id = str(uuid4())
         vehicle_id = str(uuid4())
 
-        with patch("src.api.main.db_pool", MagicMock()):
+        with patch("src.api.main.db_pools", MagicMock()):
             # SoC = 0.0
             response = client.post(
                 f"/depots/{depot_id}/vehicles/{vehicle_id}/handoff",
@@ -412,7 +415,7 @@ class TestConcurrentRequests:
         mock_controller.run_optimization = AsyncMock(return_value=sample_optimization_result)
         mock_controller_manager.get_or_create_controller = AsyncMock(return_value=mock_controller)
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             with patch("src.api.main.controller_manager", mock_controller_manager):
                 with patch(
                     "src.api.main._get_depot_config", AsyncMock(return_value=sample_depot_config)
@@ -448,7 +451,7 @@ class TestConcurrentRequests:
         mock_assembler = AsyncMock()
         mock_assembler.get_current_state = AsyncMock(return_value=sample_depot_state)
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             with patch(
                 "src.api.main._get_depot_config", AsyncMock(return_value=sample_depot_config)
             ):
@@ -486,7 +489,7 @@ class TestTimeoutHandling:
         mock_controller.run_optimization = slow_optimization
         mock_controller_manager.get_or_create_controller = AsyncMock(return_value=mock_controller)
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             with patch("src.api.main.controller_manager", mock_controller_manager):
                 with patch(
                     "src.api.main._get_depot_config", AsyncMock(return_value=sample_depot_config)
@@ -519,7 +522,7 @@ class TestTimeoutHandling:
 
         conn.fetchrow = slow_query
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             async with AsyncClient(
                 transport=ASGITransport(app=app),
                 base_url="http://test",
@@ -541,7 +544,7 @@ class TestDatabaseUnavailability:
 
     def test_optimize_db_unavailable(self, client):
         """Test optimization when database is unavailable."""
-        with patch("src.api.main.db_pool", None):
+        with patch("src.api.main.db_pools", None):
             response = client.post(
                 "/optimize",
                 json={
@@ -553,19 +556,19 @@ class TestDatabaseUnavailability:
 
     def test_depot_state_db_unavailable(self, client):
         """Test depot state when database is unavailable."""
-        with patch("src.api.main.db_pool", None):
+        with patch("src.api.main.db_pools", None):
             response = client.get(f"/depots/{uuid4()}/state")
             assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
 
     def test_schedule_db_unavailable(self, client):
         """Test schedule retrieval when database is unavailable."""
-        with patch("src.api.main.db_pool", None):
+        with patch("src.api.main.db_pools", None):
             response = client.get(f"/depots/{uuid4()}/schedule")
             assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
 
     def test_handoff_db_unavailable(self, client):
         """Test handoff when database is unavailable."""
-        with patch("src.api.main.db_pool", None):
+        with patch("src.api.main.db_pools", None):
             response = client.post(
                 f"/depots/{uuid4()}/vehicles/{uuid4()}/handoff",
                 json={
@@ -591,7 +594,7 @@ class TestDatabaseErrors:
         pool, conn = mock_db_pool
         conn.fetchrow.side_effect = asyncpg.PostgresError("Connection refused")
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                 response = await ac.get(f"/depots/{uuid4()}/schedule")
                 assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
@@ -602,7 +605,7 @@ class TestDatabaseErrors:
         pool, conn = mock_db_pool
         conn.execute.side_effect = asyncpg.PostgresError("Disk full")
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                 response = await ac.post(
                     f"/depots/{uuid4()}/vehicles/{uuid4()}/handoff",
@@ -646,7 +649,7 @@ class TestResponseSerialization:
             }
         )
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                 response = await ac.get(f"/depots/{depot_id}/schedule")
                 if response.status_code == 200:
@@ -678,7 +681,7 @@ class TestResponseSerialization:
         mock_assembler = AsyncMock()
         mock_assembler.get_current_state = AsyncMock(return_value=large_state)
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             with patch(
                 "src.api.main._get_depot_config", AsyncMock(return_value=sample_depot_config)
             ):
@@ -711,7 +714,7 @@ class TestErrorResponseFormat:
         pool, conn = mock_db_pool
         conn.fetchrow = AsyncMock(return_value=None)
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             response = client.get(f"/depots/{uuid4()}/schedule")
             assert response.status_code == http_status.HTTP_404_NOT_FOUND
             data = response.json()
@@ -719,7 +722,7 @@ class TestErrorResponseFormat:
 
     def test_error_response_has_timestamp(self, client):
         """Test error response includes timestamp."""
-        with patch("src.api.main.db_pool", None):
+        with patch("src.api.main.db_pools", None):
             response = client.post(
                 "/optimize",
                 json={
@@ -753,7 +756,7 @@ class TestSpecialCharacterHandling:
 
     def test_optimization_extra_fields_ignored(self, client):
         """Test optimization ignores extra fields in request."""
-        with patch("src.api.main.db_pool", MagicMock()):
+        with patch("src.api.main.db_pools", MagicMock()):
             response = client.post(
                 "/optimize",
                 json={
@@ -806,7 +809,7 @@ class TestHealthCheckEdgeCases:
         # Simulate connection error
         conn.fetchval = AsyncMock(side_effect=asyncpg.PostgresConnectionError("Connection lost"))
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                 response = await ac.get("/health")
                 # Health endpoint should still return 200 but with degraded status

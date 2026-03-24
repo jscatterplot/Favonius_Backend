@@ -282,6 +282,8 @@ async def test_meter_values_storage():
     mock_pool.acquire = MagicMock(return_value=mock_conn)
     mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_conn.__aexit__ = AsyncMock(return_value=None)
+    mock_pool.static = mock_pool
+    mock_pool.ts = mock_pool
 
     timestamp = datetime.utcnow()
     await store_meter_values(mock_pool, "charger_001", 1, 0.75, 8.0, timestamp, vehicle_id="bus_1")

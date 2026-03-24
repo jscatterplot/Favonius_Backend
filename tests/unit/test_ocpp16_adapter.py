@@ -108,13 +108,11 @@ class TestOCPP16SessionInit:
 
     def test_der_control_is_noop(self, session) -> None:
         """DER control is OCPP 2.x only; must return False without raising."""
-        result = asyncio.get_event_loop().run_until_complete(
-            session.send_der_control({"dummy": True})
-        )
+        result = asyncio.run(session.send_der_control({"dummy": True}))
         assert result is False
 
     def test_clear_der_control_is_noop(self, session) -> None:
-        result = asyncio.get_event_loop().run_until_complete(session.clear_der_control())
+        result = asyncio.run(session.clear_der_control())
         assert result is False
 
 

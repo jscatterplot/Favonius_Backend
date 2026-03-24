@@ -22,6 +22,8 @@ def mock_db_pool():
     conn = AsyncMock()
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
+    pool.static = pool
+    pool.ts = pool
     return pool, conn
 
 
@@ -248,7 +250,7 @@ class TestDispatchChargingProfiles:
                 mock_ocpp_server,
                 sample_optimization_result,
                 vehicle_to_charger_map=None,
-                pool=None,
+                pools=None,
             )
 
     @pytest.mark.asyncio
@@ -270,7 +272,7 @@ class TestDispatchChargingProfiles:
             results = await dispatch_charging_profiles(
                 mock_ocpp_server,
                 sample_optimization_result,
-                pool=pool,
+                pools=pool,
                 depot_id=depot_id,
             )
 
@@ -515,7 +517,7 @@ class TestDispatchEdgeCases:
             mock_ocpp_server,
             result,
             vehicle_to_charger_map,
-            pool=pool,
+            pools=pool,
         )
 
         # Should have stored the command

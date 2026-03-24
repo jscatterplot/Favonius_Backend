@@ -17,18 +17,19 @@ import pytest
 from src.core.controller import DepotController
 from src.core.controller_config import ControllerConfig
 from src.core.models import DepotConfig, DepotState, OptimizationResult
+from src.db.pools import DatabasePools
 
 # ============ Fixtures ============
 
 
 @pytest.fixture
 def mock_db_pool():
-    """Mock database connection pool."""
+    """Mock database connection pool wrapped in DatabasePools."""
     pool = MagicMock(spec=asyncpg.Pool)
     conn = AsyncMock()
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
-    return pool, conn
+    return DatabasePools(static=pool, ts=pool), conn
 
 
 @pytest.fixture
@@ -117,7 +118,7 @@ class TestCircuitBreakerOpenClose:
         fast_controller_config.max_optimization_failures = 3
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -156,7 +157,7 @@ class TestCircuitBreakerOpenClose:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -187,7 +188,7 @@ class TestCircuitBreakerOpenClose:
         fast_controller_config.max_optimization_failures = 1  # Open immediately on failure
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -218,7 +219,7 @@ class TestCircuitBreakerOpenClose:
         fast_controller_config.max_optimization_failures = 1
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -258,7 +259,7 @@ class TestRetryExponentialBackoff:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -298,7 +299,7 @@ class TestRetryExponentialBackoff:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -336,7 +337,7 @@ class TestRetryExponentialBackoff:
 
         for error in errors:
             controller = DepotController(
-                pool=pool,
+                pools=pool,
                 depot_id=str(uuid4()),
                 config=depot_config,
                 controller_config=fast_controller_config,
@@ -385,7 +386,7 @@ class TestGracefulDegradation:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -422,7 +423,7 @@ class TestGracefulDegradation:
         mock_ocpp.get_charge_point.return_value = mock_cp
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -466,7 +467,7 @@ class TestGracefulDegradation:
         mock_ocpp.get_charge_point.side_effect = get_charge_point
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -506,7 +507,7 @@ class TestConcurrentOptimization:
         fast_controller_config.trigger_cooldown_minutes = 1  # Enable cooldown
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -545,7 +546,7 @@ class TestConcurrentOptimization:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -589,7 +590,7 @@ class TestStateRecovery:
         fast_controller_config.max_optimization_failures = 5
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -620,7 +621,7 @@ class TestStateRecovery:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -650,7 +651,7 @@ class TestStateRecovery:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -698,7 +699,7 @@ class TestDispatchRetryLogic:
         mock_ocpp.get_charge_point.return_value = mock_cp
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -743,7 +744,7 @@ class TestDispatchRetryLogic:
         mock_ocpp.get_charge_point.return_value = mock_cp
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -784,7 +785,7 @@ class TestChargingProfileValidation:
         pool, _ = mock_db_pool
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=str(uuid4()),
             config=depot_config,
             controller_config=fast_controller_config,
@@ -804,7 +805,7 @@ class TestChargingProfileValidation:
         pool, _ = mock_db_pool
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=str(uuid4()),
             config=depot_config,
             controller_config=fast_controller_config,
@@ -823,7 +824,7 @@ class TestChargingProfileValidation:
         pool, _ = mock_db_pool
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=str(uuid4()),
             config=depot_config,
             controller_config=fast_controller_config,
@@ -840,7 +841,7 @@ class TestChargingProfileValidation:
         pool, _ = mock_db_pool
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=str(uuid4()),
             config=depot_config,
             controller_config=fast_controller_config,
@@ -873,7 +874,7 @@ class TestShutdownDuringOperation:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -915,7 +916,7 @@ class TestShutdownDuringOperation:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -959,7 +960,7 @@ class TestMetricsRecording:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
@@ -984,7 +985,7 @@ class TestMetricsRecording:
         depot_id = str(uuid4())
 
         controller = DepotController(
-            pool=pool,
+            pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
