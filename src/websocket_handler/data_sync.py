@@ -18,7 +18,7 @@ class DataSyncService:
         self,
         config: SupabaseConfig,
         supabase_client: SupabaseClient,
-        timescale_config: TimescaleConfig,
+        timescale_config: Optional[TimescaleConfig] = None,
     ):
         """Initialize data sync service."""
         self.config = config

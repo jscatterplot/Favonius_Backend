@@ -32,11 +32,18 @@ def client():
 
 @pytest.fixture
 def mock_db_pool():
-    """Mock database connection pool."""
+    """Mock database connection pool.
+
+    Returns a (pool, conn) tuple where pool.ts and pool.static both delegate
+    to pool.acquire so tests that patch db_pools with this pool work correctly.
+    """
     pool = MagicMock()
     conn = AsyncMock()
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
+    # Make .ts and .static delegate to the same pool so db_pools.ts.acquire works
+    pool.ts = pool
+    pool.static = pool
     return pool, conn
 
 
@@ -137,7 +144,7 @@ class TestOptimizeEndpoint:
     """Test /optimize endpoint."""
 
     @patch("src.api.main.controller_manager")
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     @patch("src.api.main._get_depot_config")
     def test_optimize_success(
         self,
@@ -156,7 +163,7 @@ class TestOptimizeEndpoint:
         mock_controller.run_optimization = AsyncMock(return_value=sample_optimization_result)
         mock_controller_manager.get_or_create_controller = AsyncMock(return_value=mock_controller)
 
-        with patch("src.api.main.db_pool", mock_pool):
+        with patch("src.api.main.db_pools", mock_pool):
             request = OptimizationRequest(
                 depot_id=str(uuid4()),
                 horizon_hours=24,
@@ -189,7 +196,7 @@ class TestOptimizeEndpoint:
 class TestDepotStateEndpoint:
     """Test /depots/{depot_id}/state endpoint."""
 
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     @patch("src.api.main._get_depot_config")
     @patch("src.api.main.StateAssembler")
     def test_get_depot_state_success(
@@ -210,7 +217,7 @@ class TestDepotStateEndpoint:
         mock_assembler_class.return_value = mock_assembler
 
         depot_id = str(uuid4())
-        with patch("src.api.main.db_pool", mock_pool):
+        with patch("src.api.main.db_pools", mock_pool):
             response = client.get(f"/depots/{depot_id}/state")
 
         assert response.status_code == http_status.HTTP_200_OK
@@ -230,7 +237,7 @@ class TestDepotStateEndpoint:
 class TestDepotScheduleEndpoint:
     """Test /depots/{depot_id}/schedule endpoint."""
 
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     def test_get_schedule_success(self, mock_pool, client, mock_db_pool):
         """Test successful schedule retrieval."""
         pool, conn = mock_db_pool
@@ -250,7 +257,7 @@ class TestDepotScheduleEndpoint:
             }
         )
 
-        with patch("src.api.main.db_pool", mock_pool):
+        with patch("src.api.main.db_pools", mock_pool):
             response = client.get(f"/depots/{depot_id}/schedule")
 
         assert response.status_code == http_status.HTTP_200_OK
@@ -259,7 +266,7 @@ class TestDepotScheduleEndpoint:
         assert data["run_id"] == str(run_id)
         assert "schedule" in data
 
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     def test_get_schedule_not_found(self, mock_pool, client, mock_db_pool):
         """Test schedule retrieval when no schedule exists."""
         pool, conn = mock_db_pool
@@ -268,7 +275,7 @@ class TestDepotScheduleEndpoint:
         depot_id = str(uuid4())
         conn.fetchrow = AsyncMock(return_value=None)
 
-        with patch("src.api.main.db_pool", mock_pool):
+        with patch("src.api.main.db_pools", mock_pool):
             response = client.get(f"/depots/{depot_id}/schedule")
 
         assert response.status_code == http_status.HTTP_404_NOT_FOUND
@@ -277,7 +284,7 @@ class TestDepotScheduleEndpoint:
 class TestDepotAlertsEndpoint:
     """Test GET /depots/{depot_id}/alerts (PRD §7.1, AT-16)."""
 
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     @patch("src.api.main.verify_token")
     def test_get_alerts_success_with_last_optimization(
         self, mock_verify, mock_pool, client, mock_db_pool
@@ -301,7 +308,7 @@ class TestDepotAlertsEndpoint:
         )
         conn.fetch = AsyncMock(return_value=[])
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             response = client.get(
                 f"/depots/{depot_id}/alerts",
                 headers={"Authorization": "Bearer test"},
@@ -318,7 +325,7 @@ class TestDepotAlertsEndpoint:
         assert data["last_optimization"]["solver_used"] == "gurobi"
         assert data["last_optimization"]["solve_time_s"] == 12.3
 
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     @patch("src.api.main.verify_token")
     def test_get_alerts_includes_charger_faults(self, mock_verify, mock_pool, client, mock_db_pool):
         """When connector_status has Faulted, charger_faults list is populated."""
@@ -338,19 +345,25 @@ class TestDepotAlertsEndpoint:
                 "solve_time_s": 5.0,
             }
         )
+        # fetch is called twice: (1) charger rows from static pool, (2) fault rows from ts pool
         conn.fetch = AsyncMock(
-            return_value=[
-                {
-                    "charger_id": charger_id,
-                    "ocpp_id": "CP001",
-                    "connector_id": 1,
-                    "fault_code": "PowerMeterFailure",
-                    "timestamp": now,
-                }
+            side_effect=[
+                # First call: charger rows (static pool — ocpp_id + charger_id mapping)
+                [{"ocpp_id": "CP001", "charger_id": charger_id}],
+                # Second call: fault rows (ts pool — connector_status table)
+                [
+                    {
+                        "station_id": "CP001",
+                        "connector_id": 1,
+                        "status": "Faulted",
+                        "error_code": "PowerMeterFailure",
+                        "timestamp": now,
+                    }
+                ],
             ]
         )
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             response = client.get(
                 f"/depots/{depot_id}/alerts",
                 headers={"Authorization": "Bearer test"},
@@ -363,7 +376,7 @@ class TestDepotAlertsEndpoint:
         assert data["charger_faults"][0]["fault_code"] == "PowerMeterFailure"
         assert data["charger_faults"][0]["connector_id"] == 1
 
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     @patch("src.api.main.verify_token")
     def test_get_alerts_depot_not_found(self, mock_verify, mock_pool, client, mock_db_pool):
         """Alerts returns 404 when depot does not exist."""
@@ -372,7 +385,7 @@ class TestDepotAlertsEndpoint:
         depot_id = str(uuid4())
         conn.fetchval = AsyncMock(return_value=None)
 
-        with patch("src.api.main.db_pool", pool):
+        with patch("src.api.main.db_pools", pool):
             response = client.get(
                 f"/depots/{depot_id}/alerts",
                 headers={"Authorization": "Bearer test"},
@@ -397,7 +410,7 @@ class TestDepotAlertsEndpoint:
 class TestHandoffEndpoint:
     """Test /depots/{depot_id}/vehicles/{vehicle_id}/handoff endpoint."""
 
-    @patch("src.api.main.db_pool")
+    @patch("src.api.main.db_pools")
     def test_send_handoff_success(self, mock_pool, client, mock_db_pool):
         """Test successful handoff message."""
         pool, conn = mock_db_pool
@@ -424,7 +437,7 @@ class TestHandoffEndpoint:
             "max_charge_kw": 80.0,
         }
 
-        with patch("src.api.main.db_pool", mock_pool):
+        with patch("src.api.main.db_pools", mock_pool):
             response = client.post(
                 f"/depots/{depot_id}/vehicles/{vehicle_id}/handoff", json=request
             )
@@ -472,13 +485,13 @@ class TestHealthEndpoint:
     @patch("src.api.main.check_database_health")
     @patch("src.api.main.check_ocpp_server_health")
     def test_health_check_database_unavailable(self, mock_ocpp_health, mock_db_health, client):
-        """Test health check with database unavailable returns 503."""
+        """Test health check with database unavailable returns degraded status."""
         mock_db_health.return_value = "unavailable"
         mock_ocpp_health.return_value = "unknown"
 
         response = client.get("/health")
 
-        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.status_code == http_status.HTTP_200_OK
         data = response.json()
         assert data["status"] == "degraded"
         assert data["components"]["database"] == "unavailable"
@@ -489,13 +502,13 @@ class TestHealthEndpoint:
     def test_health_check_controller_manager_unavailable(
         self, mock_ocpp_health, mock_db_health, client
     ):
-        """Test health check returns 503 and degraded when controller manager is None."""
+        """Test health check returns degraded when controller manager is None."""
         mock_db_health.return_value = "healthy"
         mock_ocpp_health.return_value = "unknown"
 
         response = client.get("/health")
 
-        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.status_code == http_status.HTTP_200_OK
         data = response.json()
         assert data["status"] == "degraded"
         assert data["components"]["controller_manager"] == "unavailable"
@@ -514,7 +527,7 @@ class TestErrorHandling:
         assert "detail" in data
         assert "error_code" in data
 
-    @patch("src.api.main.db_pool", None)
+    @patch("src.api.main.db_pools", None)
     def test_database_unavailable(self, client):
         """Test handling when database is unavailable."""
         request = OptimizationRequest(

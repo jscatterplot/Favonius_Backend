@@ -13,6 +13,7 @@ import pytest
 
 from src.core.models import DepotConfig
 from src.core.state.assembler import StateAssembler
+from src.db.pools import DatabasePools
 
 
 @pytest.fixture
@@ -20,6 +21,12 @@ def mock_db_pool():
     """Mock asyncpg connection pool."""
     pool = MagicMock(spec=asyncpg.Pool)
     return pool
+
+
+@pytest.fixture
+def mock_db_pools(mock_db_pool):
+    """Mock DatabasePools wrapping the single mock pool for both static and ts."""
+    return DatabasePools(static=mock_db_pool, ts=mock_db_pool)
 
 
 @pytest.fixture
@@ -46,25 +53,25 @@ def depot_id():
 
 
 @pytest.fixture
-def assembler(mock_db_pool, depot_id, depot_config):
+def assembler(mock_db_pools, depot_id, depot_config):
     """StateAssembler instance for testing."""
-    return StateAssembler(mock_db_pool, depot_id, depot_config)
+    return StateAssembler(mock_db_pools, depot_id, depot_config)
 
 
 class TestStateAssemblerInitialization:
     """Test StateAssembler initialization."""
 
-    def test_init(self, mock_db_pool, depot_id, depot_config):
+    def test_init(self, mock_db_pool, mock_db_pools, depot_id, depot_config):
         """Test StateAssembler initialization."""
-        assembler = StateAssembler(mock_db_pool, depot_id, depot_config)
-        assert assembler.pool == mock_db_pool
+        assembler = StateAssembler(mock_db_pools, depot_id, depot_config)
+        assert assembler.pools.ts == mock_db_pool
         assert assembler.depot_id == depot_id
         assert assembler.config == depot_config
 
-    def test_init_with_uuid(self, mock_db_pool, depot_config):
+    def test_init_with_uuid(self, mock_db_pools, depot_config):
         """Test initialization with UUID object."""
         depot_uuid = uuid4()
-        assembler = StateAssembler(mock_db_pool, depot_uuid, depot_config)
+        assembler = StateAssembler(mock_db_pools, depot_uuid, depot_config)
         assert assembler.depot_id == str(depot_uuid)
 
 
@@ -85,7 +92,7 @@ class TestGetVehicleSocs:
 
         assert "bus_1" in socs
         assert socs["bus_1"] == 0.65
-        mock_conn.fetch.assert_called_once()
+        mock_conn.fetch.assert_called()
 
     @pytest.mark.asyncio
     async def test_get_vehicle_socs_multiple(self, assembler, mock_db_pool):
@@ -691,13 +698,25 @@ class TestGetCurrentState:
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        # Mock vehicle SoCs and prices, then default empty for other fetches
+        # Mock vehicle IDs (static pool), SoCs (ts pool), prices, then empty for others
         fetch_calls = {"count": 0}
 
         async def fetch_side_effect(*args, **kwargs):
             idx = fetch_calls["count"]
             fetch_calls["count"] += 1
             if idx == 0:
+                # Vehicle ID lookup from static pool (SELECT FROM vehicles)
+                return [
+                    MagicMock(
+                        **{
+                            "__getitem__.side_effect": lambda k: {
+                                "vehicle_id": "bus_1",
+                            }[k]
+                        }
+                    ),
+                ]
+            if idx == 1:
+                # SoC lookup from ts pool (SELECT FROM telemetry)
                 return [
                     MagicMock(
                         **{
@@ -708,7 +727,8 @@ class TestGetCurrentState:
                         }
                     ),
                 ]
-            if idx == 1:
+            if idx == 2:
+                # Price lookup from ts pool
                 return [
                     MagicMock(
                         **{
@@ -892,20 +912,20 @@ class TestStateAssemblerEdgeCases:
             pytest.fail("horizon_hours=48 should be valid")
 
     @pytest.mark.asyncio
-    async def test_concurrent_access_scenario(self, mock_db_pool, depot_id, depot_config):
+    async def test_concurrent_access_scenario(self, mock_db_pool, mock_db_pools, depot_id, depot_config):
         """Test concurrent access to state assembler.
 
         This test verifies that multiple assemblers can be created concurrently
         without shared state issues.
         """
         # Create multiple assemblers (simulating concurrent access pattern)
-        assemblers = [StateAssembler(mock_db_pool, depot_id, depot_config) for _ in range(3)]
+        assemblers = [StateAssembler(mock_db_pools, depot_id, depot_config) for _ in range(3)]
 
         # Verify each assembler is properly initialized
         for idx, assembler in enumerate(assemblers):
             assert assembler.depot_id == depot_id
             assert assembler.config == depot_config
-            assert assembler.pool == mock_db_pool
+            assert assembler.pools.ts == mock_db_pool
 
         # Verify assemblers are independent instances
         assert assemblers[0] is not assemblers[1]

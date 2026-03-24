@@ -15,18 +15,19 @@ from src.core.controller import DepotController
 from src.core.controller_config import ControllerConfig
 from src.core.controller_manager import ControllerManager
 from src.core.models import DepotConfig
+from src.db.pools import DatabasePools
 
 # ============ Fixtures ============
 
 
 @pytest.fixture
 def mock_db_pool():
-    """Mock database connection pool."""
+    """Mock database connection pool wrapped in DatabasePools."""
     pool = MagicMock(spec=asyncpg.Pool)
     conn = AsyncMock()
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
-    return pool, conn
+    return DatabasePools(static=pool, ts=pool), conn
 
 
 @pytest.fixture
@@ -72,11 +73,11 @@ class TestControllerManagerInitialization:
         pool, _ = mock_db_pool
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
-        assert manager.pool == pool
+        assert manager.pools == pool
         assert manager.controller_config == controller_config
         assert manager.controllers == {}
         assert manager._running is False
@@ -87,7 +88,7 @@ class TestControllerManagerInitialization:
         mock_ocpp = MagicMock()
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             ocpp_server=mock_ocpp,
             controller_config=controller_config,
         )
@@ -101,7 +102,7 @@ class TestControllerManagerInitialization:
         with patch.object(ControllerConfig, "from_env") as mock_from_env:
             mock_from_env.return_value = ControllerConfig()
 
-            ControllerManager(pool=pool)
+            ControllerManager(pools=pool)
 
             mock_from_env.assert_called_once()
 
@@ -126,7 +127,7 @@ class TestStartAllControllers:
         ]
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -146,7 +147,7 @@ class TestStartAllControllers:
         conn.fetch.return_value = []
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -161,7 +162,7 @@ class TestStartAllControllers:
         pool, _ = mock_db_pool
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
         manager._running = True
@@ -183,7 +184,7 @@ class TestStartAllControllers:
         ]
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -211,7 +212,7 @@ class TestStartAllControllers:
         conn.fetch.side_effect = asyncpg.exceptions.UndefinedTableError("relation \"depots\" does not exist")
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -227,7 +228,7 @@ class TestStartAllControllers:
         conn.fetch.side_effect = RuntimeError("unexpected db failure")
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -247,7 +248,7 @@ class TestStopAllControllers:
         pool, _ = mock_db_pool
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
         manager._running = True
@@ -274,7 +275,7 @@ class TestStopAllControllers:
         pool, _ = mock_db_pool
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
         manager._running = False
@@ -290,7 +291,7 @@ class TestStopAllControllers:
         controller_config.shutdown_timeout_seconds = 0.1
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
         manager._running = True
@@ -323,7 +324,7 @@ class TestAddController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -344,7 +345,7 @@ class TestAddController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -364,7 +365,7 @@ class TestAddController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
         manager._running = True
@@ -385,7 +386,7 @@ class TestAddController:
         depot_uuid = uuid4()
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -405,7 +406,7 @@ class TestAddController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -431,7 +432,7 @@ class TestRemoveController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -450,7 +451,7 @@ class TestRemoveController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -476,7 +477,7 @@ class TestRemoveController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -496,7 +497,7 @@ class TestGetController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -513,7 +514,7 @@ class TestGetController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -527,7 +528,7 @@ class TestGetController:
         depot_uuid = uuid4()
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -552,7 +553,7 @@ class TestGetOrCreateController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -570,7 +571,7 @@ class TestGetOrCreateController:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -596,7 +597,7 @@ class TestListControllers:
         pool, _ = mock_db_pool
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -609,7 +610,7 @@ class TestListControllers:
         pool, _ = mock_db_pool
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -637,7 +638,7 @@ class TestHealthCheck:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -662,7 +663,7 @@ class TestHealthCheck:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 
@@ -686,7 +687,7 @@ class TestHealthCheck:
         depot_id = str(uuid4())
 
         manager = ControllerManager(
-            pool=pool,
+            pools=pool,
             controller_config=controller_config,
         )
 

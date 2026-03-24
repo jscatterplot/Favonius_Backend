@@ -32,6 +32,7 @@ class TestApplication:
         config.optimization.enabled = True
         config.price_feeder = Mock()
         config.price_feeder.enabled = True
+        config.main_api = Mock()
         return config
 
     @pytest.mark.timeout(10)
@@ -405,17 +406,16 @@ class TestMainFunction:
     @pytest.mark.timeout(10)
     def test_main_function_success(self):
         """Test successful main function execution."""
+        mock_logger = Mock()
         with (
             patch("src.websocket_handler.main.Config.from_env") as mock_from_env,
             patch("src.websocket_handler.main.asyncio.run") as mock_run,
-            patch("logging.basicConfig"),
-            patch("logging.getLogger") as mock_get_logger,
+            patch("src.websocket_handler.main.setup_logging"),
+            patch("src.websocket_handler.main.get_logger", return_value=mock_logger),
         ):
 
             mock_config = Mock()
             mock_from_env.return_value = mock_config
-            mock_logger = Mock()
-            mock_get_logger.return_value = mock_logger
 
             main()
 
@@ -426,18 +426,17 @@ class TestMainFunction:
     @pytest.mark.timeout(10)
     def test_main_function_keyboard_interrupt(self):
         """Test main function with keyboard interrupt."""
+        mock_logger = Mock()
         with (
             patch("src.websocket_handler.main.Config.from_env") as mock_from_env,
             patch("src.websocket_handler.main.asyncio.run", side_effect=KeyboardInterrupt()),
-            patch("logging.basicConfig"),
-            patch("logging.getLogger") as mock_get_logger,
+            patch("src.websocket_handler.main.setup_logging"),
+            patch("src.websocket_handler.main.get_logger", return_value=mock_logger),
             patch("sys.exit") as mock_exit,
         ):
 
             mock_config = Mock()
             mock_from_env.return_value = mock_config
-            mock_logger = Mock()
-            mock_get_logger.return_value = mock_logger
 
             main()
 
@@ -446,18 +445,17 @@ class TestMainFunction:
     @pytest.mark.timeout(10)
     def test_main_function_exception(self):
         """Test main function with exception."""
+        mock_logger = Mock()
         with (
             patch("src.websocket_handler.main.Config.from_env") as mock_from_env,
             patch("src.websocket_handler.main.asyncio.run", side_effect=Exception("Test error")),
-            patch("logging.basicConfig"),
-            patch("logging.getLogger") as mock_get_logger,
+            patch("src.websocket_handler.main.setup_logging"),
+            patch("src.websocket_handler.main.get_logger", return_value=mock_logger),
             patch("sys.exit") as mock_exit,
         ):
 
             mock_config = Mock()
             mock_from_env.return_value = mock_config
-            mock_logger = Mock()
-            mock_get_logger.return_value = mock_logger
 
             main()
 

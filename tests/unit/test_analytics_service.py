@@ -30,6 +30,7 @@ class TestAnalyticsService:
         client = AsyncMock()
         client.connect = AsyncMock()
         client.disconnect = AsyncMock()
+        client.connected = False
         return client
 
     @pytest.fixture
@@ -141,6 +142,7 @@ class TestAnalyticsService:
         with patch("src.websocket_handler.analytics_service.TimescaleClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.connect = AsyncMock()
+            mock_client.connected = False
             mock_client_class.return_value = mock_client
 
             await analytics_service.initialize()

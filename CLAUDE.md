@@ -446,6 +446,77 @@ docker-compose --profile simulation --profile monitoring up -d
 
 ---
 
+## gstack Skills
+
+gstack is installed globally at `~/.claude/skills/gstack` with individual skills symlinked into `~/.claude/skills/`. Use these slash commands at the appropriate stage of development. Browser-based skills (`/qa`, `/browse`, `/benchmark`, `/canary`, `/setup-browser-cookies`, design-only skills) are excluded — not applicable to this Python backend.
+
+To upgrade: `/gstack-upgrade`. Source: `~/.claude/skills/gstack/`.
+
+### Planning
+
+| Command | When to use |
+|---|---|
+| `/office-hours` | **Before starting any new feature** — six forcing questions that challenge premises, reframe scope, and surface alternatives before committing to an approach |
+| `/plan-ceo-review` | Strategic scope decision (4 modes: expand / selective expand / hold / reduce). Use when debating feature scope with yourself or stakeholders |
+| `/plan-eng-review` | **Before coding any non-trivial change** — sequential review: architecture → code quality → tests → performance, one issue at a time with pros/cons. Integrates with the Plan Mode Protocol above |
+| `/autoplan` | Hands-off automated CEO + Eng review pipeline. Surfaces only "taste decisions" to the user; auto-decides everything else using completeness, DRY, and pragmatism principles |
+
+> **Integration with Plan Mode Protocol:** `/plan-eng-review` is the preferred execution vehicle for the 4-section review defined in the Plan Mode Protocol above. The BIG CHANGE / SMALL CHANGE scope choice maps directly to gstack's interactive vs. autoplan modes.
+
+### Development & Debugging
+
+| Command | When to use |
+|---|---|
+| `/review` | Pre-PR staff-engineer code review — two-pass: critical (SQL safety, race conditions, TimescaleDB query patterns, JWT/OCPP trust boundaries, enum completeness) then informational (dead code, test gaps, perf). Auto-fixes what it can, batches ASK findings |
+| `/investigate` | **Bug fixing — no fix without root cause first.** 4-phase: symptoms → pattern analysis → hypothesis testing → fix + regression test. Use for solver failures, OCPP connection bugs, DB anomalies, state assembler errors. Scope-locked: won't touch unrelated files |
+
+### Security
+
+| Command | When to use |
+|---|---|
+| `/cso` | Full 14-phase audit: OWASP Top 10, STRIDE threat modeling, secrets archaeology, supply chain, CI/CD pipeline, LLM/AI security, data classification. Run before releases |
+| `/cso --owasp` | OWASP Top 10 only — run after any JWT auth, OCPP handler, or API boundary change |
+| `/cso --infra` | Infrastructure only (Phases 0–6) — after Docker, Railway, or DB config changes |
+| `/cso --code` | Code-only scan (Phases 0–1, 7, 9–11) — after rate limiter, validator, or auth changes |
+| `/cso --comprehensive` | Monthly deep scan with 2/10 confidence gate — surfaces tentative findings |
+| `/cso --diff` | Branch-diff only — combinable with any scope flag for PR-scoped audits |
+
+### Shipping & Deployment
+
+| Command | When to use |
+|---|---|
+| `/ship` | Full PR creation workflow: merge base branch, run test suite, coverage audit (traces all code paths), pre-landing review, version bump, auto-CHANGELOG, PR creation with full evidence body |
+| `/land-and-deploy` | Post-PR: waits for CI, merges, detects Railway deploy, polls until live, verifies `/health` endpoint, offers revert commit on failure |
+| `/document-release` | After shipping: syncs `docs/API.md`, `docs/ARCHITECTURE.md`, `CLAUDE.md` to reflect what actually shipped. Run after any endpoint, schema, or config change |
+| `/setup-deploy` | One-time Railway deploy configuration detection — run when first setting up CI/CD |
+| `/gstack-upgrade` | Update gstack to latest version |
+
+### Safety & Guardrails
+
+| Command | When to use |
+|---|---|
+| `/careful` | Activate at session start for production-adjacent work — intercepts `rm -rf`, `DROP TABLE`, `TRUNCATE`, `git push --force`, `git reset --hard`, `docker system prune` with a warning before execution. Allows `__pycache__` / `.pytest_cache` deletions without warning |
+| `/freeze migrations/` | Lock the `migrations/` directory from edits — use when doing work unrelated to schema changes to prevent accidental migration edits |
+| `/freeze config/` | Lock `config/` (depot_config.yaml, tariff_config.yaml) during non-config sessions |
+| `/unfreeze [path]` | Remove a freeze restriction |
+| `/guard` | Combined `/careful` + `/freeze` — activate for high-risk sessions (running migrations, production deploys, dependency upgrades) |
+
+### Retrospective
+
+| Command | When to use |
+|---|---|
+| `/retro` | Weekly engineering retrospective — commit velocity, per-contributor breakdowns, hotspot files, fix-to-feature ratio, session patterns |
+| `/retro compare` | Side-by-side: current week vs prior week |
+| `/retro global` | Cross-project retrospective across all AI-assisted coding sessions |
+
+### Excluded Skills (not applicable to this backend)
+
+The following gstack skills are **not symlinked** because they require Chromium or are UI-specific:
+`/browse`, `/qa`, `/qa-only`, `/benchmark`, `/canary`, `/setup-browser-cookies`, `/plan-design-review`, `/design-consultation`, `/design-review`.
+`/codex` is excluded because its adversarial cross-model review is already embedded inside `/review` (medium/large diffs) and `/ship`.
+
+---
+
 ## Testing
 
 ### Run tests
@@ -716,3 +787,5 @@ make docker-verify
 | `.cursor/rules/ocpp.mdc` | OCPP patterns |
 | `.cursor/rules/timescale.mdc` | TimescaleDB patterns |
 | `.cursor/rules/favonius-rules.mdc` | General dev rules |
+| `~/.claude/skills/gstack/` | gstack skill source (17 skills symlinked to `~/.claude/skills/`) |
+| `~/.claude/skills/gstack/ETHOS.md` | Boil the Lake / builder philosophy |
