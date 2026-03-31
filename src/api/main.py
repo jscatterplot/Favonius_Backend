@@ -32,7 +32,7 @@ from ..security.audit_log import AuditLogger, set_audit_logger
 from ..security.auth import verify_token
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
-from ..security.rate_limiter import rate_limiter
+from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +252,12 @@ async def lifespan(app: FastAPI):
     await audit_logger.start()
     logger.info("Security audit logger started")
 
+    # ── Rate limiter (PostgreSQL-backed for NIS2 persistence) ────────────────
+    hybrid_limiter = RateLimiter(db_pool=ts_pool)
+    set_rate_limiter(hybrid_limiter)
+    await hybrid_limiter.start()
+    logger.info("Hybrid rate limiter started")
+
     # ── OCPP server ───────────────────────────────────────────────────────────
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
     ocpp_use_same_port = os.getenv("OCPP_USE_SAME_PORT", "false").lower() == "true"
@@ -329,6 +335,12 @@ async def lifespan(app: FastAPI):
             logger.error(f"Error stopping OCPP server: {e}", exc_info=True)
 
     try:
+        await hybrid_limiter.stop()
+        logger.info("Hybrid rate limiter stopped")
+    except Exception as e:
+        logger.error(f"Error stopping rate limiter: {e}", exc_info=True)
+
+    try:
         await audit_logger.stop()
         logger.info("Security audit logger stopped")
     except Exception as e:
@@ -378,6 +390,13 @@ app = FastAPI(
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Middleware to enforce rate limits per PRD Section 10.4."""
 
+    @staticmethod
+    def _add_rate_limit_headers(response, result) -> None:
+        """Add X-RateLimit-* headers to the response."""
+        response.headers["X-RateLimit-Limit"] = str(result.limit)
+        response.headers["X-RateLimit-Remaining"] = str(result.remaining)
+        response.headers["X-RateLimit-Reset"] = str(int(result.reset_at))
+
     async def dispatch(self, request: Request, call_next):
         """Check rate limits before processing request."""
         # Skip rate limiting for health and metrics endpoints
@@ -392,13 +411,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if api_key:
             client_id = f"api_key:{api_key}"
 
+        limiter = get_rate_limiter()
+
         # Apply different rate limits based on endpoint
         path = request.url.path
+        result = None
 
         # POST /optimize: 10 requests/minute
         if path == "/optimize" and request.method == "POST":
-            if not rate_limiter.check_optimize_limit(client_id):
-                return JSONResponse(
+            result = limiter.check_optimize_limit(client_id)
+            if not result:
+                resp = JSONResponse(
                     status_code=429,
                     content=ErrorResponse(
                         detail="Rate limit exceeded: Maximum 10 optimization requests per minute",
@@ -406,19 +429,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                         timestamp=datetime.utcnow().isoformat(),
                     ).model_dump(),
                 )
+                self._add_rate_limit_headers(resp, result)
+                return resp
 
         # Inter-depot handoff: 50 messages/hour per depot pair
         elif "/handoff" in path:
-            # For handoff endpoints, we need to extract depot IDs from the request
-            # This is done after rate limit check for send_handoff and receive_handoff endpoints
-            # For now, apply general API limit, then check handoff limit in endpoint handlers
-            # (handoff limit requires reading request body which is not available in middleware)
-            pass  # Handoff rate limiting handled in endpoint handlers
+            # Handoff rate limiting handled in endpoint handlers
+            # (requires reading request body which is not available in middleware)
+            pass
 
         # General API endpoints: 100 requests/minute
         else:
-            if not rate_limiter.check_api_limit(client_id):
-                return JSONResponse(
+            result = limiter.check_api_limit(client_id)
+            if not result:
+                resp = JSONResponse(
                     status_code=429,
                     content=ErrorResponse(
                         detail="Rate limit exceeded: Maximum 100 requests per minute",
@@ -426,8 +450,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                         timestamp=datetime.utcnow().isoformat(),
                     ).model_dump(),
                 )
+                self._add_rate_limit_headers(resp, result)
+                return resp
 
-        return await call_next(request)
+        response = await call_next(request)
+
+        # Add rate limit headers to successful responses
+        if result is not None:
+            self._add_rate_limit_headers(response, result)
+
+        return response
 
 
 # ============ Logging Middleware ============
@@ -1419,7 +1451,7 @@ async def send_handoff(
         raise DatabaseError("Database not available")
 
     # Check handoff rate limit per PRD Section 10.4 (50 messages/hour per depot pair)
-    if not rate_limiter.check_handoff_limit(depot_id, request.dest_depot_id):
+    if not get_rate_limiter().check_handoff_limit(depot_id, request.dest_depot_id):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded: Maximum 50 handoff messages per hour per depot pair",
@@ -1662,7 +1694,7 @@ async def receive_handoff(
         )
 
     # Check handoff rate limit per PRD Section 10.4 (50 messages/hour per depot pair)
-    if not rate_limiter.check_handoff_limit(request.origin_depot_id, depot_id):
+    if not get_rate_limiter().check_handoff_limit(request.origin_depot_id, depot_id):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded: Maximum 50 handoff messages per hour per depot pair",
