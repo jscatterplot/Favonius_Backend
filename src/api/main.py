@@ -28,7 +28,10 @@ from ..core.models import DepotConfig
 from ..core.state.assembler import StateAssembler
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
+from ..security.audit_log import AuditLogger, set_audit_logger
 from ..security.auth import verify_token
+from ..security.geo_block import GeoBlockMiddleware
+from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -243,6 +246,12 @@ async def lifespan(app: FastAPI):
     )
     db_pools = DatabasePools(static=static_pool, ts=ts_pool)
 
+    # ── Audit logger (Article 73-3 / NIS2 compliance) ────────────────────────
+    audit_logger = AuditLogger(db_pool=ts_pool, service="main_api")
+    set_audit_logger(audit_logger)
+    await audit_logger.start()
+    logger.info("Security audit logger started")
+
     # ── OCPP server ───────────────────────────────────────────────────────────
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
     ocpp_use_same_port = os.getenv("OCPP_USE_SAME_PORT", "false").lower() == "true"
@@ -318,6 +327,12 @@ async def lifespan(app: FastAPI):
             logger.info("OCPP server stopped")
         except Exception as e:
             logger.error(f"Error stopping OCPP server: {e}", exc_info=True)
+
+    try:
+        await audit_logger.stop()
+        logger.info("Security audit logger stopped")
+    except Exception as e:
+        logger.error(f"Error stopping audit logger: {e}", exc_info=True)
 
     await static_pool.close()
     logger.info("Static (Supabase) pool closed")
@@ -482,16 +497,30 @@ app.add_middleware(RateLimitMiddleware)
 # Add logging middleware
 app.add_middleware(LoggingMiddleware)
 
-# Add CORS middleware
-cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+# Add security headers middleware (PRD Section 10.3)
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add CORS middleware — fail startup if wildcard in production
+cors_origins_str = os.getenv("CORS_ORIGINS", "*")
+_environment = os.getenv("ENVIRONMENT", "development")
+if cors_origins_str.strip() == "*" and _environment == "production":
+    raise RuntimeError(
+        "CORS_ORIGINS='*' is not allowed in production. "
+        "Set CORS_ORIGINS to your frontend origin(s), e.g. 'https://app.favonius.com'."
+    )
+cors_origins = [o.strip() for o in cors_origins_str.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins if "*" not in cors_origins else ["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
 )
+
+# Add geo-blocking middleware (outermost — executes first, before all other middleware)
+# Required by Lithuanian Electric Energy Law Article 73-3
+app.add_middleware(GeoBlockMiddleware)
 
 
 class OptimizationRequest(BaseModel):
