@@ -353,6 +353,30 @@ class OCPPWebSocketServer:
                 await websocket.close(1008, "Access denied")
                 return
 
+        # IEC 62443 zone validation — log unexpected charger network ranges
+        # In production, chargers should connect from expected network ranges.
+        # This is informational logging (not blocking) to build the zone model.
+        expected_ranges_str = os.getenv("OCPP_EXPECTED_IP_RANGES", "")
+        if expected_ranges_str and client_ip != "unknown":
+            import ipaddress as _ipaddress
+
+            try:
+                client_addr = _ipaddress.ip_address(client_ip)
+                expected = [
+                    _ipaddress.ip_network(r.strip(), strict=False)
+                    for r in expected_ranges_str.split(",")
+                    if r.strip()
+                ]
+                if expected and not any(client_addr in net for net in expected):
+                    self.logger.warning(
+                        "IEC 62443 zone alert: charger connection from unexpected "
+                        "network %s (expected: %s)",
+                        client_ip,
+                        expected_ranges_str,
+                    )
+            except ValueError:
+                pass  # Invalid IP or range config — don't block
+
         # Check connection limits
         if len(self.connections) >= self.config.websocket.max_connections:
             self.logger.warning(f"Connection limit exceeded, rejecting {client_ip}")

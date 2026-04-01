@@ -60,6 +60,13 @@ repos:
         args: [-r, src/, -ll]
         exclude: ^tests/
 
+  # Dependency vulnerability scanning (NIS2 supply chain security)
+  - repo: https://github.com/pypa/pip-audit
+    rev: v2.7.0
+    hooks:
+      - id: pip-audit
+        args: [--desc, --fix, --dry-run]
+
   # Documentation
   - repo: https://github.com/pycqa/pydocstyle
     rev: 6.3.0

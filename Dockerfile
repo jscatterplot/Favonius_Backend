@@ -39,6 +39,8 @@ RUN uv venv /app/.venv && \
     uv pip install --no-cache-dir -r /tmp/requirements.runtime.txt
 
 # ============ Runtime Stage ============
+# Pin base image for supply chain security (NIS2 Article 21)
+# Update this digest when upgrading the base image
 FROM python:3.12-slim AS runtime
 
 # Set build arguments
