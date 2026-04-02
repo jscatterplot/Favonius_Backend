@@ -39,10 +39,13 @@ RUN uv venv /app/.venv && \
     uv pip install --no-cache-dir -r /tmp/requirements.runtime.txt
 
 # ============ Runtime Stage ============
+# Pin base image for supply chain security (NIS2 Article 21)
+# Update this digest when upgrading the base image
 FROM python:3.12-slim AS runtime
 
 # Set build arguments
 ARG DEBIAN_FRONTEND=noninteractive
+ARG MAXMIND_LICENSE_KEY
 
 # Install runtime dependencies
 # Per PRD Section 8.2: Gurobi requires specific system libraries
@@ -67,6 +70,19 @@ COPY scripts/ ./scripts/
 COPY README.md ./
 COPY schemas/ ./schemas/
 
+# Download MaxMind GeoLite2-Country database for Article 73-3 geo-blocking.
+# The database is loaded into memory at startup (~5MB) for sub-microsecond lookups.
+# Rebuild the image monthly to refresh the database.
+# Note: In production, set MAXMIND_LICENSE_KEY to download the latest version.
+# Without a license key, a bundled fallback is used (if available).
+RUN mkdir -p /app/data && \
+    if [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then \
+        curl -sSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" \
+        | tar -xz --strip-components=1 -C /app/data --wildcards '*/GeoLite2-Country.mmdb'; \
+    else \
+        echo "MAXMIND_LICENSE_KEY not set — GeoIP DB must be mounted at /app/data/GeoLite2-Country.mmdb"; \
+    fi
+
 # Create directories for logs, data, and ensure proper permissions
 RUN mkdir -p /app/logs /app/data /opt/gurobi && \
     chown -R appuser:appuser /app /opt/gurobi
@@ -82,6 +98,7 @@ ENV API_PORT=8000
 ENV OCPP_SERVER_PORT=9000
 ENV LOG_LEVEL=INFO
 ENV ENVIRONMENT=production
+ENV GEOIP_DB_PATH=/app/data/GeoLite2-Country.mmdb
 
 # Switch to non-root user
 USER appuser

@@ -24,8 +24,21 @@ from .message_handler import MessageHandler
 from .monitoring import get_logger, setup_monitoring
 from .ocpp_handler import EnhancedOCPPChargePoint
 from .priority_charging_manager import PriorityChargingManager
+from .security_manager import SecurityConfig, SecurityManager
 from .supabase_client import SupabaseClient
 from .timescale_client import TimescaleClient
+
+# Geo-blocking (Article 73-3 compliance)
+try:
+    from src.security.geo_block import check_ip_blocked
+
+    GEO_BLOCK_AVAILABLE = True
+except ImportError:
+    GEO_BLOCK_AVAILABLE = False
+    check_ip_blocked = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning(
+        "Geo-blocking module not available — Article 73-3 controls inactive"
+    )
 
 # VDV 463 integration
 try:
@@ -101,6 +114,7 @@ class OCPPWebSocketServer:
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
         self.message_handler: Optional[MessageHandler] = None
+        self.security_manager: Optional[SecurityManager] = None
 
         # Cache manager for performance optimization
         self.cache_manager: Optional[CacheManager] = None
@@ -255,6 +269,20 @@ class OCPPWebSocketServer:
         self.certificate_manager = CertificateManager(self.timescale_client, self.cache_manager)
         # V2X controller removed - out of scope for MVP per PRD Section 1.2
 
+        # Initialize security manager for station authentication (Article 73-3 / NIS2)
+        # Configurable via environment: OCPP_REQUIRE_AUTH (default "true" in production)
+        import os
+
+        require_auth = os.getenv("OCPP_REQUIRE_AUTH", "true").lower() == "true"
+        security_config = SecurityConfig(
+            require_station_auth=require_auth,
+            require_mtls=False,  # Railway terminates TLS at edge
+        )
+        self.security_manager = SecurityManager(self.timescale_client, security_config)
+        self.logger.info(
+            "Security manager initialized (require_auth=%s)", require_auth
+        )
+
         self.logger.info("All managers initialized successfully")
 
     def set_optimization_engine(self, optimization_engine) -> None:
@@ -308,6 +336,46 @@ class OCPPWebSocketServer:
             path = getattr(req, "path", "") if req is not None else ""
         connection_id = str(uuid.uuid4())
         client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+
+        # Geo-blocking check (Article 73-3) — must execute before any other logic
+        if GEO_BLOCK_AVAILABLE and check_ip_blocked is not None:
+            geo_result = check_ip_blocked(client_ip)
+            if geo_result.blocked:
+                self.logger.warning(
+                    "Geo-blocked WebSocket connection from %s (country: %s, reason: %s)",
+                    client_ip,
+                    geo_result.country_code,
+                    geo_result.reason,
+                )
+                ERRORS_TOTAL.labels(
+                    error_type="geo_blocked", station_id="unknown"
+                ).inc()
+                await websocket.close(1008, "Access denied")
+                return
+
+        # IEC 62443 zone validation — log unexpected charger network ranges
+        # In production, chargers should connect from expected network ranges.
+        # This is informational logging (not blocking) to build the zone model.
+        expected_ranges_str = os.getenv("OCPP_EXPECTED_IP_RANGES", "")
+        if expected_ranges_str and client_ip != "unknown":
+            import ipaddress as _ipaddress
+
+            try:
+                client_addr = _ipaddress.ip_address(client_ip)
+                expected = [
+                    _ipaddress.ip_network(r.strip(), strict=False)
+                    for r in expected_ranges_str.split(",")
+                    if r.strip()
+                ]
+                if expected and not any(client_addr in net for net in expected):
+                    self.logger.warning(
+                        "IEC 62443 zone alert: charger connection from unexpected "
+                        "network %s (expected: %s)",
+                        client_ip,
+                        expected_ranges_str,
+                    )
+            except ValueError:
+                pass  # Invalid IP or range config — don't block
 
         # Check connection limits
         if len(self.connections) >= self.config.websocket.max_connections:
@@ -374,6 +442,42 @@ class OCPPWebSocketServer:
         else:
             # Use full UUID to avoid collisions
             station_id = f"station_{connection_id}"
+
+        # Authenticate station (Article 73-3 / NIS2 compliance)
+        # Uses the SecurityManager's fallback chain: cert → JWT → API key → basic auth
+        if self.security_manager and self.security_manager.config.require_station_auth:
+            # Extract auth data from WebSocket request headers
+            auth_data: Dict[str, Any] = {}
+            request = getattr(websocket, "request", None)
+            if request is not None:
+                headers = getattr(request, "headers", {})
+                if hasattr(headers, "get"):
+                    auth_header = headers.get("Authorization", "")
+                    if auth_header.startswith("Bearer "):
+                        auth_data["bearer_token"] = auth_header[7:]
+                    elif auth_header.startswith("Basic "):
+                        auth_data["basic_auth"] = auth_header[6:]
+                    api_key = headers.get("X-API-Key", "")
+                    if api_key:
+                        auth_data["api_key"] = api_key
+                    # Password from OCPP Basic Auth (charge_point_id as username)
+                    password = headers.get("X-OCPP-Password", "")
+                    if password:
+                        auth_data["password"] = password
+
+            auth_ok, auth_error = await self.security_manager.authenticate_station(
+                station_id, auth_data
+            )
+            if not auth_ok:
+                self.logger.warning(
+                    "Authentication failed for station %s from %s: %s",
+                    station_id, client_ip, auth_error,
+                )
+                ERRORS_TOTAL.labels(
+                    error_type="auth_failed", station_id=station_id
+                ).inc()
+                await websocket.close(1008, "Authentication failed")
+                return
 
         # Check if station already connected and clean up old connection
         if station_id in self.station_connections:
