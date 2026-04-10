@@ -4,6 +4,7 @@
 # Reference: PRD_v2.md Section 9.1 (OCPP Integration)
 #            Development Plan Phase 7
 
+# TODO: Pin by SHA256 digest for supply-chain safety (run: docker pull python:3.12-slim && docker inspect --format='{{.RepoDigests}}' python:3.12-slim)
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -28,9 +29,14 @@ ENV NUM_CHARGERS=10
 ENV CHARGER_PREFIX=charger_
 ENV SIMULATION_MODE=responsive
 
-# Health check - just verify the script is valid Python
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import ocpp_simulator" || exit 1
+# Security: run as non-root user
+RUN useradd -r -u 1001 -s /usr/sbin/nologin simulator && \
+    chown -R simulator:simulator /app
+USER simulator
+
+# Health check - verify the simulator module can be imported
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import ocpp_simulator; import sys; sys.exit(0)" || exit 1
 
 # Run simulator
 CMD ["python", "ocpp_simulator.py"]

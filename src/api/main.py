@@ -4,8 +4,11 @@ Reference: PRD_v2.md#7-api-specifications
 """
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -29,10 +32,11 @@ from ..core.state.assembler import StateAssembler
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
 from ..security.audit_log import AuditLogger, set_audit_logger
-from ..security.auth import verify_token
+from ..security.auth import verify_depot_access, verify_token
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
+from ..security.rbac import Permission, Role, require_permission, require_role
 
 logger = logging.getLogger(__name__)
 
@@ -127,13 +131,18 @@ _config_cache_ttl: float = 300.0  # 5 minutes
 
 
 def describe_database_target(database_url: str) -> str:
-    """Return safe, non-secret connection target details for logs."""
+    """Return safe, redacted connection target details for logs.
+
+    Security: only expose port; mask host/user/db to prevent
+    infrastructure reconnaissance via log scraping.
+    """
     parsed = urlparse(database_url)
-    host = parsed.hostname or "<unknown-host>"
+    host = parsed.hostname or ""
     port = parsed.port or "<default>"
-    db_name = parsed.path.lstrip("/") or "<unknown-db>"
-    user = parsed.username or "<unknown-user>"
-    return f"user={user} host={host} port={port} db={db_name}"
+    # Show only the TLD suffix (e.g. "*****.timescale.com")
+    host_parts = host.rsplit(".", 2)
+    masked_host = f"*****.{'.'.join(host_parts[-2:])}" if len(host_parts) >= 2 else "*****"
+    return f"user=***** host={masked_host} port={port} db=*****"
 
 
 def resolve_database_url() -> tuple[str, str]:
@@ -177,11 +186,12 @@ async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
         pool = await asyncpg.create_pool(
             url,
             min_size=2,
-            max_size=10,
+            max_size=int(os.getenv("DB_POOL_MAX_SIZE", "25")),
             # Supabase Supavisor does not support prepared statements.
             # statement_cache_size=0 sends every query as a simple query,
             # compatible with any pgBouncer-style pooler.
             statement_cache_size=0,
+            command_timeout=60,
         )
         logger.info("Database pool initialised via %s", url_source)
         return pool
@@ -192,7 +202,15 @@ async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
         ) from e
 
 
+# Security: INTERNAL_API_TOKEN required in production (M1).
+# Empty string disables auth — only acceptable in dev.
 _INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
+_environment = os.getenv("ENVIRONMENT", "development")
+if _environment == "production" and not _INTERNAL_API_TOKEN:
+    raise RuntimeError(
+        "INTERNAL_API_TOKEN must be set in production. "
+        "The /internal/ocpp-event endpoint is unauthenticated without it."
+    )
 
 
 async def _heartbeat_loop(ts_pool: asyncpg.Pool) -> None:
@@ -384,6 +402,32 @@ app = FastAPI(
     ],
 )
 
+# ============ Request Body Size Middleware (H12) ============
+
+_MAX_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(1 * 1024 * 1024)))  # 1 MB default
+
+
+class MaxBodySizeMiddleware(BaseHTTPMiddleware):
+    """Reject requests whose Content-Length exceeds the configured maximum."""
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > _MAX_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large"},
+            )
+        return await call_next(request)
+
+
+# ============ Solver Concurrency Limiter (H11) ============
+
+_MAX_CONCURRENT_SOLVES = int(os.getenv("MAX_CONCURRENT_SOLVES", "2"))
+_optimize_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SOLVES)
+_last_depot_solve: dict[str, float] = {}  # depot_id -> timestamp
+_DEPOT_SOLVE_COOLDOWN = float(os.getenv("DEPOT_SOLVE_COOLDOWN_SECONDS", "120"))  # 2 min
+
+
 # ============ Rate Limiting Middleware ============
 
 
@@ -399,17 +443,30 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         """Check rate limits before processing request."""
-        # Skip rate limiting for health and metrics endpoints
-        if request.url.path in ["/health", "/metrics"]:
+        # Skip rate limiting for health probes
+        if request.url.path in ["/healthz"]:
             return await call_next(request)
 
-        # Extract client identifier (IP address or API key from header)
+        # Security (H5): use authenticated user_id as primary rate-limit key.
+        # Falls back to IP only for unauthenticated endpoints — never trust
+        # X-API-Key or X-Forwarded-For blindly as they are attacker-controlled.
         client_id = request.client.host if request.client else "unknown"
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            try:
+                from ..security.auth import _get_jwt_secrets, _ALLOWED_ALGORITHMS
+                import jwt as _jwt
 
-        # Check for API key in header (if available)
-        api_key = request.headers.get("X-API-Key")
-        if api_key:
-            client_id = f"api_key:{api_key}"
+                payload = _jwt.decode(
+                    auth_header[7:],
+                    _get_jwt_secrets()[0],
+                    algorithms=_ALLOWED_ALGORITHMS,
+                    audience="authenticated",
+                    options={"verify_exp": False},
+                )
+                client_id = f"user:{payload.get('sub', client_id)}"
+            except Exception:
+                pass  # Fall back to IP-based limiting
 
         limiter = get_rate_limiter()
 
@@ -523,6 +580,9 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             raise
 
 
+# Add request body size limit middleware (H12 — outermost after geo-block)
+app.add_middleware(MaxBodySizeMiddleware)
+
 # Add rate limiting middleware (before logging to catch rate limits early)
 app.add_middleware(RateLimitMiddleware)
 
@@ -532,19 +592,20 @@ app.add_middleware(LoggingMiddleware)
 # Add security headers middleware (PRD Section 10.3)
 app.add_middleware(SecurityHeadersMiddleware)
 
-# Add CORS middleware — fail startup if wildcard in production
+# Add CORS middleware — fail startup if wildcard in production (M3)
 cors_origins_str = os.getenv("CORS_ORIGINS", "*")
-_environment = os.getenv("ENVIRONMENT", "development")
 if cors_origins_str.strip() == "*" and _environment == "production":
     raise RuntimeError(
         "CORS_ORIGINS='*' is not allowed in production. "
         "Set CORS_ORIGINS to your frontend origin(s), e.g. 'https://app.favonius.com'."
     )
 cors_origins = [o.strip() for o in cors_origins_str.split(",") if o.strip()]
+# Security (M3): never combine wildcard origins with allow_credentials=True
+_cors_is_wildcard = "*" in cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins if "*" not in cors_origins else ["*"],
-    allow_credentials=True,
+    allow_origins=["*"] if _cors_is_wildcard else cors_origins,
+    allow_credentials=not _cors_is_wildcard,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
@@ -1113,6 +1174,8 @@ async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
     """
     # Validate depot_id format before checking DB availability
     validate_depot_id(depot_id)
+    # Security (C2): verify user has access to this depot
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -1204,6 +1267,8 @@ async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
 
     # Validate depot_id format
     validate_depot_id(depot_id)
+    # Security (C2): verify user has access to this depot
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
 
     try:
         # Get latest optimization result from database (optimization_runs is in TimescaleDB)
@@ -1300,6 +1365,8 @@ async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
 async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
     """GET /depots/{depot_id}/alerts — charger faults and last optimization (PRD §7.1)."""
     validate_depot_id(depot_id)
+    # Security (C2): verify user has access to this depot
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -1446,6 +1513,8 @@ async def send_handoff(
     validate_depot_id(depot_id)
     validate_vehicle_id(vehicle_id)
     validate_depot_id(request.dest_depot_id)
+    # Security (C2): verify user has access to the origin depot
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -1512,12 +1581,21 @@ async def send_handoff(
             f"DEPOT_{request.dest_depot_id}_ENDPOINT",
             os.getenv("DEFAULT_DEPOT_ENDPOINT", "http://localhost:8000"),
         )
+        # Security (H4): require HTTPS for inter-depot communication
+        if _environment == "production" and dest_depot_endpoint.startswith("http://"):
+            logger.warning("Handoff to non-HTTPS endpoint blocked in production")
+            raise HTTPException(
+                status_code=400,
+                detail="Inter-depot handoff requires HTTPS in production",
+            )
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 receive_url = (
                     f"{dest_depot_endpoint}/depots/{request.dest_depot_id}/handoff/receive"
                 )
+                nonce = str(uuid4())
+                timestamp_str = datetime.utcnow().isoformat()
                 receive_payload = {
                     "message_id": str(message_id),
                     "origin_depot_id": depot_id,
@@ -1527,7 +1605,22 @@ async def send_handoff(
                     "arrival_time": request.arrival_time.isoformat(),
                     "battery_kwh": battery_kwh,
                     "max_charge_kw": max_charge_kw,
+                    "nonce": nonce,
+                    "timestamp": timestamp_str,
                 }
+                # Security (H4): HMAC-SHA256 signature for mutual auth
+                signing_key = os.getenv("HANDOFF_SIGNING_KEY", "")
+                if signing_key:
+                    import json as _json
+
+                    payload_bytes = _json.dumps(
+                        receive_payload, sort_keys=True
+                    ).encode()
+                    sig = hmac.new(
+                        signing_key.encode(), payload_bytes, hashlib.sha256
+                    ).hexdigest()
+                    receive_payload["signature"] = sig
+
                 response = await client.post(receive_url, json=receive_payload)
                 response.raise_for_status()
                 ack_data = response.json()
@@ -1837,10 +1930,13 @@ async def receive_ocpp_event(
     Not exposed in the public OpenAPI schema. Protected by X-Internal-Token header
     when INTERNAL_API_TOKEN env var is set.
     """
+    # Security (M11): timing-safe token comparison to prevent timing attacks
     if _INTERNAL_API_TOKEN:
         token = request.headers.get("X-Internal-Token", "")
-        if token != _INTERNAL_API_TOKEN:
+        if not secrets.compare_digest(token, _INTERNAL_API_TOKEN):
             raise HTTPException(status_code=401, detail="Unauthorized")
+    elif _environment == "production":
+        raise HTTPException(status_code=503, detail="Internal endpoint not configured")
 
     if not controller_manager or not db_pools:
         return {"status": "unavailable"}

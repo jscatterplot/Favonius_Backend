@@ -1,6 +1,7 @@
 # Test Runner Dockerfile
 # Reference: Development Plan Step 7.3
 
+# TODO: Pin by SHA256 digest for supply-chain safety (run: docker pull python:3.12-slim && docker inspect --format='{{.RepoDigests}}' python:3.12-slim)
 FROM python:3.12-slim
 
 WORKDIR /app

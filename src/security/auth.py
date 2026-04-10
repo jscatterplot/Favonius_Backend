@@ -6,14 +6,15 @@ keys during rotation windows per NIS2 Article 21 requirements.
 Environment variables:
     JWT_SECRET_KEY: Current Supabase JWT secret
     JWT_SECRET_KEY_PREVIOUS: Previous key (valid during rotation window)
-    JWT_ALGORITHM: Signing algorithm (default HS256)
+    JWT_ALGORITHM: Signing algorithm (default HS256) — must be in allowlist
+    JWT_ISSUER: Expected token issuer (optional, e.g. Supabase project URL)
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import jwt
 from fastapi import Depends, HTTPException, status
@@ -23,8 +24,18 @@ from .secrets import get_secrets_manager
 
 logger = logging.getLogger(__name__)
 
-# Supabase uses HS256 by default
+# Security: hardcoded algorithm allowlist — never trust env alone
+_ALLOWED_ALGORITHMS = ["HS256"]
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+if JWT_ALGORITHM not in _ALLOWED_ALGORITHMS:
+    raise RuntimeError(
+        f"JWT_ALGORITHM '{JWT_ALGORITHM}' is not in the allowlist {_ALLOWED_ALGORITHMS}. "
+        "Supabase uses HS256. Do NOT set this to 'none' or 'RS256' unless you update "
+        "the allowlist and verification key type accordingly."
+    )
+
+# Optional issuer validation (set to your Supabase project URL)
+JWT_ISSUER: Optional[str] = os.getenv("JWT_ISSUER")
 
 security = HTTPBearer()
 
@@ -73,14 +84,16 @@ async def verify_token(
     token_str = credentials.credentials
 
     last_error: Optional[Exception] = None
+    decode_kwargs: dict[str, Any] = {
+        "algorithms": _ALLOWED_ALGORITHMS,
+        "audience": "authenticated",
+    }
+    if JWT_ISSUER:
+        decode_kwargs["issuer"] = JWT_ISSUER
+
     for secret in secrets:
         try:
-            payload = jwt.decode(
-                token_str,
-                secret,
-                algorithms=[JWT_ALGORITHM],
-                audience="authenticated",
-            )
+            payload = jwt.decode(token_str, secret, **decode_kwargs)
             return payload
         except jwt.ExpiredSignatureError:
             # Expired tokens fail regardless of which key was used
@@ -92,10 +105,10 @@ async def verify_token(
             last_error = e
             continue  # Try next key during rotation
 
-    # All keys failed
+    # All keys failed — redact token details from the error
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail=f"Invalid token: {last_error}",
+        detail="Invalid token",
     )
 
 
@@ -119,6 +132,63 @@ def is_demo_user(token: dict) -> bool:
     """Check if the authenticated user is a demo user."""
     metadata = token.get("user_metadata", {})
     return metadata.get("is_demo", False) is True
+
+
+async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> None:
+    """Verify the authenticated user is authorized to access a specific depot.
+
+    Checks the JWT user_metadata.depot_ids claim first (fast path).
+    Falls back to a DB query against user_depot_access if the claim is absent
+    and a pool is provided. Raises 403 if access is denied.
+
+    Args:
+        depot_id: The depot being accessed.
+        user: Decoded JWT payload from verify_token.
+        pool: Optional asyncpg pool for DB-backed authorization.
+    """
+    # Fast path: check depot_ids claim in token
+    metadata = user.get("user_metadata", {})
+    depot_ids = metadata.get("depot_ids")
+    if isinstance(depot_ids, list):
+        if depot_id in depot_ids:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: you do not have permission for this depot",
+        )
+
+    # Check favonius_role — admins can access all depots
+    favonius_role = metadata.get("favonius_role", "")
+    if favonius_role == "admin":
+        return
+
+    # Fallback: DB-backed authorization check
+    if pool is not None:
+        user_id = user.get("sub")
+        if user_id:
+            try:
+                async with pool.acquire() as conn:
+                    has_access = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM user_depot_access "
+                        "WHERE user_id = $1 AND depot_id = $2::uuid)",
+                        user_id,
+                        depot_id,
+                    )
+                if has_access:
+                    return
+            except Exception:
+                # Table may not exist yet — log and deny
+                logger.warning(
+                    "user_depot_access lookup failed for user=%s depot=%s",
+                    user_id,
+                    depot_id,
+                )
+
+    # No claim, not admin, no DB match → deny
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access denied: you do not have permission for this depot",
+    )
 
 
 def get_user_role(token: dict) -> str:

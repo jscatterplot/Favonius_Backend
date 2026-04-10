@@ -74,6 +74,8 @@ dependencies = [
     "requests-cache>=1.1.0",
     "retry-requests>=2.0.0",
     "httpx>=0.25.0",
+    # Security: XXE-safe XML parsing
+    "defusedxml>=0.7.1",
 ]
 
 [project.optional-dependencies]
