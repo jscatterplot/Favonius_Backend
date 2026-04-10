@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import uuid as _uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -248,11 +249,20 @@ class DiagnosticsManager:
     async def _collect_logs(self, station_id: str, log_type: LogType, request_id: int) -> None:
         """Collect logs from station."""
         try:
-            # Create log file
+            # Security: use server-generated UUID to prevent path traversal via station_id
+            safe_id = _uuid.uuid4().hex[:12]
             log_filename = (
-                f"{station_id}_{log_type.value}_{request_id}_{int(datetime.now().timestamp())}.log"
+                f"{safe_id}_{log_type.value}_{request_id}_{int(datetime.now().timestamp())}.log"
             )
             log_filepath = os.path.join(self.log_storage_path, log_filename)
+            # Path confinement check
+            if not os.path.commonpath(
+                [os.path.abspath(log_filepath), os.path.abspath(self.log_storage_path)]
+            ) == os.path.abspath(self.log_storage_path):
+                self.logger.error(
+                    "Path traversal attempt blocked for station %s", station_id
+                )
+                return
 
             # Collect logs based on type
             if log_type == LogType.DIAGNOSTICS_LOG:
@@ -294,7 +304,16 @@ class DiagnosticsManager:
 
             async with aiofiles.open(log_filepath, "w") as f:
                 for log in logs:
-                    log_line = f"{log['timestamp']} [{log['level']}] {log['message']}\n"
+                    # Security: strip control characters to prevent log injection
+                    import re
+
+                    safe_message = re.sub(
+                        r"[\x00-\x1f\x7f-\x9f]", "", str(log.get("message", ""))
+                    )
+                    safe_level = re.sub(
+                        r"[\x00-\x1f\x7f-\x9f]", "", str(log.get("level", "INFO"))
+                    )
+                    log_line = f"{log['timestamp']} [{safe_level}] {safe_message}\n"
                     await f.write(log_line)
 
         except Exception as e:
@@ -742,6 +761,20 @@ class FirmwareManager:
                 FirmwareStatus.DOWNLOADING.value,
             )
 
+            # Security: validate firmware URL to prevent SSRF
+            if not self._validate_firmware_url(firmware_request.firmware_info.location):
+                self.logger.error(
+                    "Firmware download blocked: invalid URL for station %s",
+                    firmware_request.station_id,
+                )
+                await self.timescale_client.update_firmware_request_status(
+                    firmware_request.station_id,
+                    firmware_request.request_id,
+                    FirmwareStatus.DOWNLOAD_FAILED.value,
+                    "Firmware URL validation failed (SSRF protection)",
+                )
+                return
+
             # Download firmware
             firmware_data = await self._download_firmware_data(
                 firmware_request.firmware_info.location
@@ -773,9 +806,22 @@ class FirmwareManager:
                     )
                     return
 
-            # Store firmware locally
-            firmware_filename = f"{firmware_request.station_id}_{firmware_request.request_id}.bin"
+            # Security: use server-generated UUID to prevent path traversal via station_id
+            safe_id = _uuid.uuid4().hex[:12]
+            firmware_filename = f"{safe_id}_{firmware_request.request_id}.bin"
             firmware_filepath = os.path.join(self.firmware_storage_path, firmware_filename)
+            # Path confinement check
+            if not os.path.commonpath(
+                [
+                    os.path.abspath(firmware_filepath),
+                    os.path.abspath(self.firmware_storage_path),
+                ]
+            ) == os.path.abspath(self.firmware_storage_path):
+                self.logger.error(
+                    "Path traversal attempt blocked for station %s",
+                    firmware_request.station_id,
+                )
+                return
 
             async with aiofiles.open(firmware_filepath, "wb") as f:
                 await f.write(firmware_data)
@@ -840,6 +886,65 @@ class FirmwareManager:
                 FirmwareStatus.INSTALLATION_FAILED.value,
                 str(e),
             )
+
+    def _validate_firmware_url(self, location: str) -> bool:
+        """Validate firmware download URL to prevent SSRF attacks."""
+        import ipaddress
+        import socket
+        from urllib.parse import urlparse as _urlparse
+
+        try:
+            parsed = _urlparse(location)
+
+            # Only allow HTTPS
+            if parsed.scheme not in ("https",):
+                self.logger.warning(
+                    "Firmware URL rejected: scheme '%s' not allowed", parsed.scheme
+                )
+                return False
+
+            if not parsed.hostname:
+                return False
+
+            # Resolve hostname and block private/loopback IPs
+            try:
+                resolved_ips = socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+                for family, _type, proto, canonname, sockaddr in resolved_ips:
+                    ip = ipaddress.ip_address(sockaddr[0])
+                    if (
+                        ip.is_private
+                        or ip.is_loopback
+                        or ip.is_link_local
+                        or ip.is_reserved
+                    ):
+                        self.logger.warning(
+                            "Firmware URL rejected: resolved to private/reserved IP %s",
+                            ip,
+                        )
+                        return False
+            except socket.gaierror:
+                self.logger.warning(
+                    "Firmware URL rejected: DNS resolution failed for %s",
+                    parsed.hostname,
+                )
+                return False
+
+            # Optional: check against allowlist
+            allowed_hosts = os.getenv("ALLOWED_FIRMWARE_HOSTS", "").split(",")
+            allowed_hosts = [h.strip() for h in allowed_hosts if h.strip()]
+            if allowed_hosts and not any(
+                parsed.hostname.endswith(h) for h in allowed_hosts
+            ):
+                self.logger.warning(
+                    "Firmware URL rejected: host %s not in allowlist",
+                    parsed.hostname,
+                )
+                return False
+
+            return True
+        except Exception as e:
+            self.logger.warning("Firmware URL validation error: %s", e)
+            return False
 
     async def _download_firmware_data(self, location: str) -> bytes:
         """Download firmware data from location."""

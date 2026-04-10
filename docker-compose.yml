@@ -18,11 +18,11 @@ services:
     container_name: favonius-timescaledb
     environment:
       POSTGRES_USER: favonius
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-favonius_dev}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
       POSTGRES_DB: favonius
       TIMESCALEDB_TELEMETRY: off
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - timescale_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d
@@ -52,7 +52,7 @@ services:
       - "9000:9000"   # OCPP WebSocket (WSS in production per PRD Section 10.3)
     environment:
       # Database configuration
-      DATABASE_URL: postgresql://favonius:${DB_PASSWORD:-favonius_dev}@timescaledb:5432/favonius
+      DATABASE_URL: postgresql://favonius:${DB_PASSWORD:?DB_PASSWORD must be set in .env}@timescaledb:5432/favonius
 
       # Gurobi license (required for primary solver per PRD Section 8.2)
       GUROBI_LICENSE_FILE: /opt/gurobi/gurobi.lic
@@ -149,7 +149,7 @@ services:
       - "3000:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set in .env}
       GF_INSTALL_PLUGINS: grafana-clock-panel
     volumes:
       - grafana_data:/var/lib/grafana

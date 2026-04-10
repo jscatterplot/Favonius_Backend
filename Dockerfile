@@ -8,6 +8,7 @@
 # Run:   docker run -p 8000:8000 -p 9000:9000 favonius-api
 
 # ============ Builder Stage ============
+# TODO: Pin by SHA256 digest for supply-chain safety (run: docker pull python:3.12-slim && docker inspect --format='{{.RepoDigests}}' python:3.12-slim)
 FROM python:3.12-slim AS builder
 
 # Set build arguments
@@ -41,10 +42,15 @@ RUN uv venv /app/.venv && \
 # ============ Runtime Stage ============
 # Pin base image for supply chain security (NIS2 Article 21)
 # Update this digest when upgrading the base image
+# TODO: Pin by SHA256 digest for supply-chain safety (run: docker pull python:3.12-slim && docker inspect --format='{{.RepoDigests}}' python:3.12-slim)
 FROM python:3.12-slim AS runtime
 
 # Set build arguments
 ARG DEBIAN_FRONTEND=noninteractive
+# Security TODO: Use BuildKit --mount=type=secret instead of ARG to prevent
+# license key from appearing in docker image history.
+# Build with: docker build --secret id=maxmind_key,src=maxmind.key .
+# Then: RUN --mount=type=secret,id=maxmind_key curl ... $(cat /run/secrets/maxmind_key)
 ARG MAXMIND_LICENSE_KEY
 
 # Install runtime dependencies

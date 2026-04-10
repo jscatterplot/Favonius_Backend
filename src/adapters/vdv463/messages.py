@@ -649,6 +649,10 @@ def parse_message(
     """
     if validation_mode is None:
         validation_mode = get_validation_mode()
+    # Default to hard validation in production to prevent data poisoning
+    _env = os.getenv("ENVIRONMENT", "development")
+    if _env == "production" and validation_mode == ValidationMode.SOFT:
+        validation_mode = ValidationMode.HARD
     try:
         message = json.loads(raw_text)
     except json.JSONDecodeError as e:

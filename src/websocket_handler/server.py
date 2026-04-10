@@ -3,10 +3,11 @@
 import asyncio
 import http
 import logging
+import os
 import ssl
 import uuid
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import uvloop
 import websockets
@@ -144,6 +145,10 @@ class OCPPWebSocketServer:
         # Rate limiting - use connection manager's rate limiter
         # self.rate_limits: Dict[str, list] = defaultdict(list)  # Removed - using RateLimiter class
 
+        # Per-IP connection tracking (M8 — prevent single IP from exhausting all slots)
+        self._ip_connection_count: dict[str, int] = defaultdict(int)
+        self._max_connections_per_ip = int(os.getenv("MAX_CONNECTIONS_PER_IP", "10"))
+
         # Background task tracking
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._rate_limit_task: Optional[asyncio.Task] = None
@@ -271,8 +276,6 @@ class OCPPWebSocketServer:
 
         # Initialize security manager for station authentication (Article 73-3 / NIS2)
         # Configurable via environment: OCPP_REQUIRE_AUTH (default "true" in production)
-        import os
-
         require_auth = os.getenv("OCPP_REQUIRE_AUTH", "true").lower() == "true"
         security_config = SecurityConfig(
             require_station_auth=require_auth,
@@ -282,6 +285,13 @@ class OCPPWebSocketServer:
         self.logger.info(
             "Security manager initialized (require_auth=%s)", require_auth
         )
+
+        _environment = os.getenv("ENVIRONMENT", "development")
+        if _environment == "production" and not require_auth:
+            raise RuntimeError(
+                "OCPP_REQUIRE_AUTH must be 'true' in production. "
+                "Unauthenticated OCPP connections are a critical security risk."
+            )
 
         self.logger.info("All managers initialized successfully")
 
@@ -384,6 +394,19 @@ class OCPPWebSocketServer:
             ERRORS_TOTAL.labels(error_type="connection_limit_exceeded", station_id="unknown").inc()
             return
 
+        # Per-IP connection limit
+        if self._ip_connection_count[client_ip] >= self._max_connections_per_ip:
+            self.logger.warning(
+                "Per-IP connection limit exceeded for %s (%d/%d)",
+                client_ip,
+                self._ip_connection_count[client_ip],
+                self._max_connections_per_ip,
+            )
+            await websocket.close(1008, "Too many connections from this IP")
+            return
+
+        self._ip_connection_count[client_ip] += 1
+
         # Parse path for protocol routing
         path_parts = [p for p in path.strip("/").split("/") if p]
         protocol = path_parts[0] if path_parts else None
@@ -398,6 +421,33 @@ class OCPPWebSocketServer:
                 if self.config.vdv463.validation_mode == "hard"
                 else ValidationMode.SOFT
             )
+
+            # Security: VDV 463 connections must be authenticated (parity with OCPP)
+            if self.security_manager and self.security_manager.config.require_station_auth:
+                auth_data: Dict[str, Any] = {}
+                request = getattr(websocket, "request", None)
+                if request is not None:
+                    headers = getattr(request, "headers", {})
+                    if hasattr(headers, "get"):
+                        auth_header = headers.get("Authorization", "")
+                        if auth_header.startswith("Bearer "):
+                            auth_data["bearer_token"] = auth_header[7:]
+                        api_key = headers.get("X-API-Key", "")
+                        if api_key:
+                            auth_data["api_key"] = api_key
+
+                auth_ok, auth_error = await self.security_manager.authenticate_station(
+                    presystem_id, auth_data
+                )
+                if not auth_ok:
+                    self.logger.warning(
+                        "VDV 463 authentication failed for presystem %s from %s: %s",
+                        presystem_id,
+                        client_ip,
+                        auth_error,
+                    )
+                    await websocket.close(1008, "Authentication failed")
+                    return
 
             db_pool = self.timescale_client.pg_pool if self.timescale_client else None
             handler = VDV463Handler(
@@ -421,6 +471,14 @@ class OCPPWebSocketServer:
             except Exception as e:
                 self.logger.error(f"Error handling VDV 463 connection {connection_id}: {e}")
                 ERRORS_TOTAL.labels(error_type="connection_error", station_id="unknown").inc()
+            finally:
+                # Decrement per-IP counter
+                if client_ip in self._ip_connection_count:
+                    self._ip_connection_count[client_ip] = max(
+                        0, self._ip_connection_count[client_ip] - 1
+                    )
+                    if self._ip_connection_count[client_ip] == 0:
+                        del self._ip_connection_count[client_ip]
             return
 
         # Default to OCPP handling (legacy or /ocpp/{charge_point_id} paths)
@@ -567,6 +625,17 @@ class OCPPWebSocketServer:
 
         # Clean rate limit data - handled by RateLimiter class cleanup
         # self.rate_limits.pop(connection_id, None)  # Removed - using RateLimiter class
+
+        # Decrement per-IP counter
+        client_ip = (
+            websocket.remote_address[0] if websocket.remote_address else "unknown"
+        )
+        if client_ip in self._ip_connection_count:
+            self._ip_connection_count[client_ip] = max(
+                0, self._ip_connection_count[client_ip] - 1
+            )
+            if self._ip_connection_count[client_ip] == 0:
+                del self._ip_connection_count[client_ip]
 
         self.logger.info(f"Cleaned up connection {connection_id} (station: {station_id})")
 

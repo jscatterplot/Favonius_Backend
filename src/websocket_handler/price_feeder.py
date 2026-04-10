@@ -5,7 +5,7 @@ import contextlib
 import csv
 import io
 import os
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
 import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -290,8 +290,21 @@ class PriceFeederService:
     def _parse_zip_response(self, content: bytes, node_id: str) -> List[dict]:
         """Parse zipped CSV content returned by CAISO."""
         points: List[dict] = []
+        # Security: zip bomb protection
+        _MAX_COMPRESSED_SIZE = 10 * 1024 * 1024  # 10 MB
+        _MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024  # 100 MB
+        if len(content) > _MAX_COMPRESSED_SIZE:
+            self.logger.warning("CAISO zip file too large (%d bytes), skipping", len(content))
+            return []
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                # Check decompressed size before extraction
+                total_size = sum(info.file_size for info in zf.infolist())
+                if total_size > _MAX_DECOMPRESSED_SIZE:
+                    self.logger.warning(
+                        "CAISO zip decompressed size too large (%d bytes), skipping", total_size
+                    )
+                    return []
                 for filename in zf.namelist():
                     if not filename.lower().endswith(".csv"):
                         continue

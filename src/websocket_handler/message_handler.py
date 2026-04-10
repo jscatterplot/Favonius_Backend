@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -225,6 +226,18 @@ class MessageHandler:
                 if sv.get("measurand") == "SoC":
                     try:
                         soc_percent = float(sv["value"])
+                        if (
+                            not math.isfinite(soc_percent)
+                            or soc_percent < 0
+                            or soc_percent > 100
+                        ):
+                            self.logger.warning(
+                                "Out-of-range SoC value %.2f from station %s, dropping",
+                                soc_percent,
+                                station_id,
+                            )
+                            soc_percent = None
+                            continue
                     except (KeyError, ValueError):
                         pass
                 elif sv.get("measurand") == "Power.Active.Import":
@@ -232,6 +245,18 @@ class MessageHandler:
                         unit = sv.get("unitOfMeasure", {}).get("unit", "W")
                         raw = float(sv["value"])
                         power_kw = raw / 1000 if unit == "W" else raw
+                        if (
+                            not math.isfinite(power_kw)
+                            or power_kw < -1000
+                            or power_kw > 10000
+                        ):
+                            self.logger.warning(
+                                "Out-of-range power value %.2f kW from station %s, dropping",
+                                power_kw,
+                                station_id,
+                            )
+                            power_kw = None
+                            continue
                     except (KeyError, ValueError):
                         pass
 
