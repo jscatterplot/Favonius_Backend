@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
     id SERIAL PRIMARY KEY,
     station_id VARCHAR(255) NOT NULL,
     token TEXT NOT NULL,
+    token_hash VARCHAR(64),
     token_type VARCHAR(50) NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -243,6 +244,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     id SERIAL PRIMARY KEY,
     station_id VARCHAR(255) NOT NULL,
     api_key VARCHAR(255) NOT NULL,
+    api_key_hash VARCHAR(64),
     description TEXT,
     active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -758,6 +760,7 @@ CREATE INDEX IF NOT EXISTS idx_certificates_installation_date ON certificates(in
 -- Authentication Tokens Indexes
 CREATE INDEX IF NOT EXISTS idx_auth_tokens_station_id ON auth_tokens(station_id);
 CREATE INDEX IF NOT EXISTS idx_auth_tokens_token ON auth_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_auth_tokens_token_hash ON auth_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_auth_tokens_expires_at ON auth_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_auth_tokens_revoked_at ON auth_tokens(revoked_at);
 
@@ -769,6 +772,7 @@ CREATE INDEX IF NOT EXISTS idx_security_events_timestamp ON security_events(time
 -- API Keys Indexes
 CREATE INDEX IF NOT EXISTS idx_api_keys_station_id ON api_keys(station_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(api_key);
+CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(api_key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(active);
 CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
 
