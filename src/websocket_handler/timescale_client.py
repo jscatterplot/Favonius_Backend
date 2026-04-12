@@ -2,7 +2,10 @@
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
+import os
 import random
 import uuid
 from datetime import datetime, timezone
@@ -1615,17 +1618,19 @@ class TimescaleClient:
 
     async def store_auth_token(self, token_data: Dict[str, Any]) -> None:
         """Store authentication token."""
+        token_hash = self._hash_secret(token_data["token"])
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO auth_tokens (
-                    station_id, token, token_type, expires_at, created_at
-                ) VALUES ($1, $2, $3, $4, $5)
+                    station_id, token, token_hash, token_type, expires_at, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (station_id, token_type)
-                DO UPDATE SET token = $2, expires_at = $4, created_at = $5
+                DO UPDATE SET token = $2, token_hash = $3, expires_at = $5, created_at = $6
             """,
                 token_data["station_id"],
                 token_data["token"],
+                token_hash,
                 token_data["token_type"],
                 token_data["expires_at"],
                 token_data["created_at"],
@@ -1633,16 +1638,18 @@ class TimescaleClient:
 
     async def update_token_usage(self, station_id: str, token: str, last_used: datetime) -> None:
         """Update token usage statistics."""
+        token_hash = self._hash_secret(token)
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE auth_tokens SET
                     last_used = $3, usage_count = usage_count + 1
-                WHERE station_id = $1 AND token = $2
+                WHERE station_id = $1 AND (token_hash = $2 OR token = $4)
             """,
                 station_id,
-                token,
+                token_hash,
                 last_used,
+                token,
             )
 
     async def revoke_auth_token(self, station_id: str, revoked_at: datetime) -> None:
@@ -1710,19 +1717,38 @@ class TimescaleClient:
 
     async def validate_api_key(self, station_id: str, api_key: str) -> bool:
         """Validate API key."""
+        api_key_hash = self._hash_secret(api_key)
         async with self.pg_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT id FROM api_keys
-                WHERE station_id = $1 AND api_key = $2 AND active = true
+                WHERE station_id = $1
+                AND (
+                    api_key_hash = $2
+                    OR api_key = $4
+                )
+                AND active = true
                 AND (expires_at IS NULL OR expires_at > $3)
             """,
                 station_id,
-                api_key,
+                api_key_hash,
                 datetime.now(timezone.utc),
+                api_key,
             )
 
             return row is not None
+
+    @staticmethod
+    def _hash_secret(secret: str) -> str:
+        """Hash sensitive secrets with HMAC-SHA256 and a server-side pepper."""
+        pepper = os.getenv("AUTH_SECRET_PEPPER", "")
+        if pepper:
+            return hmac.new(
+                pepper.encode("utf-8"),
+                secret.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+        return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
     async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
         """Validate basic authentication credentials."""

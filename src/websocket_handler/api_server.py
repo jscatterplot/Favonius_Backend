@@ -1,7 +1,7 @@
 """REST API endpoints for user-facing operations."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiohttp import web
 
@@ -22,7 +22,6 @@ class APIServer:
         self.supabase_client = supabase_client
         self.auth_manager = auth_manager
         self.logger = get_logger(__name__)
-
         # Rate limiter
         self.rate_limiter = RateLimiter()
 
@@ -43,48 +42,127 @@ class APIServer:
         # Authentication
         self.app.router.add_post("/auth/login", self.login)
         self.app.router.add_post("/auth/refresh", self.refresh_token)
-        self.app.router.add_get("/auth/me", self.get_current_user)
+        self.app.router.add_get("/auth/me", self._protected(self.get_current_user))
 
         # Organizations
-        self.app.router.add_get("/organizations", self.get_organizations)
-        self.app.router.add_get("/organizations/{org_id}", self.get_organization)
-        self.app.router.add_put("/organizations/{org_id}", self.update_organization)
+        self.app.router.add_get("/organizations", self._protected(self.get_organizations))
+        self.app.router.add_get(
+            "/organizations/{org_id}",
+            self._protected(self.get_organization, resource="organization", action="read"),
+        )
+        self.app.router.add_put(
+            "/organizations/{org_id}",
+            self._protected(self.update_organization, resource="organization", action="write"),
+        )
 
         # Vehicles
-        self.app.router.add_get("/vehicles", self.get_vehicles)
-        self.app.router.add_post("/vehicles", self.create_vehicle)
-        self.app.router.add_get("/vehicles/{vehicle_id}", self.get_vehicle)
-        self.app.router.add_put("/vehicles/{vehicle_id}", self.update_vehicle)
-        self.app.router.add_delete("/vehicles/{vehicle_id}", self.delete_vehicle)
+        self.app.router.add_get(
+            "/vehicles", self._protected(self.get_vehicles, resource="vehicles", action="read")
+        )
+        self.app.router.add_post(
+            "/vehicles", self._protected(self.create_vehicle, resource="vehicles", action="write")
+        )
+        self.app.router.add_get(
+            "/vehicles/{vehicle_id}",
+            self._protected(self.get_vehicle, resource="vehicles", action="read"),
+        )
+        self.app.router.add_put(
+            "/vehicles/{vehicle_id}",
+            self._protected(self.update_vehicle, resource="vehicles", action="write"),
+        )
+        self.app.router.add_delete(
+            "/vehicles/{vehicle_id}",
+            self._protected(self.delete_vehicle, resource="vehicles", action="delete"),
+        )
 
         # Charging Stations
-        self.app.router.add_get("/stations", self.get_stations)
-        self.app.router.add_post("/stations", self.create_station)
-        self.app.router.add_get("/stations/{station_id}", self.get_station)
-        self.app.router.add_put("/stations/{station_id}", self.update_station)
+        self.app.router.add_get("/stations", self._protected(self.get_stations))
+        self.app.router.add_post("/stations", self._protected(self.create_station))
+        self.app.router.add_get("/stations/{station_id}", self._protected(self.get_station))
+        self.app.router.add_put("/stations/{station_id}", self._protected(self.update_station))
 
         # Charging Sessions
-        self.app.router.add_get("/sessions", self.get_sessions)
-        self.app.router.add_get("/sessions/active", self.get_active_sessions)
-        self.app.router.add_post("/sessions/{session_id}/stop", self.stop_session)
+        self.app.router.add_get(
+            "/sessions",
+            self._protected(self.get_sessions, resource="charging_sessions", action="read"),
+        )
+        self.app.router.add_get(
+            "/sessions/active",
+            self._protected(self.get_active_sessions, resource="charging_sessions", action="read"),
+        )
+        self.app.router.add_post(
+            "/sessions/{session_id}/stop",
+            self._protected(self.stop_session, resource="charging_sessions", action="write"),
+        )
 
         # Schedules
-        self.app.router.add_get("/schedules", self.get_schedules)
-        self.app.router.add_post("/schedules", self.create_schedule)
-        self.app.router.add_put("/schedules/{schedule_id}", self.update_schedule)
-        self.app.router.add_delete("/schedules/{schedule_id}", self.delete_schedule)
+        self.app.router.add_get("/schedules", self._protected(self.get_schedules))
+        self.app.router.add_post("/schedules", self._protected(self.create_schedule))
+        self.app.router.add_put("/schedules/{schedule_id}", self._protected(self.update_schedule))
+        self.app.router.add_delete(
+            "/schedules/{schedule_id}",
+            self._protected(self.delete_schedule),
+        )
 
         # Analytics
-        self.app.router.add_get("/analytics/energy", self.get_energy_analytics)
-        self.app.router.add_get("/analytics/costs", self.get_cost_analytics)
-        self.app.router.add_get("/analytics/savings", self.get_savings_analytics)
+        self.app.router.add_get(
+            "/analytics/energy",
+            self._protected(self.get_energy_analytics, resource="analytics", action="read"),
+        )
+        self.app.router.add_get(
+            "/analytics/costs",
+            self._protected(self.get_cost_analytics, resource="analytics", action="read"),
+        )
+        self.app.router.add_get(
+            "/analytics/savings",
+            self._protected(self.get_savings_analytics, resource="analytics", action="read"),
+        )
 
         # Real-time subscriptions
-        self.app.router.add_get("/realtime/subscribe", self.subscribe_realtime)
+        self.app.router.add_get("/realtime/subscribe", self._protected(self.subscribe_realtime))
 
         # System admin
-        self.app.router.add_get("/admin/sync-status", self.get_sync_status)
-        self.app.router.add_post("/admin/sync", self.force_sync)
+        self.app.router.add_get(
+            "/admin/sync-status",
+            self._protected(self.get_sync_status, required_roles={"owner"}),
+        )
+        self.app.router.add_post(
+            "/admin/sync",
+            self._protected(self.force_sync, required_roles={"owner"}),
+        )
+
+    def _protected(
+        self,
+        handler: Callable[[web.Request, Dict[str, Any]], Awaitable[web.Response]],
+        *,
+        resource: Optional[str] = None,
+        action: str = "read",
+        required_roles: Optional[set[str]] = None,
+    ) -> Callable[[web.Request], Awaitable[web.Response]]:
+        """Wrap aiohttp handlers with auth + optional authorization checks."""
+
+        async def wrapped(request: web.Request) -> web.Response:
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return web.json_response(
+                    {"error": "Missing or invalid authorization header"},
+                    status=401,
+                )
+
+            token = auth_header[7:]
+            user = await self.auth_manager.authenticate_user(token)
+            if not user:
+                return web.json_response({"error": "Invalid or expired token"}, status=401)
+
+            if required_roles and user.get("role") not in required_roles:
+                return web.json_response({"error": "Insufficient permissions"}, status=403)
+
+            if resource and not await self.auth_manager.authorize_action(user, resource, action):
+                return web.json_response({"error": "Insufficient permissions"}, status=403)
+
+            return await handler(request, user)
+
+        return wrapped
 
     async def start(self, host: str = "0.0.0.0", port: int = 8080) -> None:
         """Start the API server."""
@@ -552,10 +630,14 @@ class APIServer:
         """Subscribe to real-time updates."""
         try:
             # This would typically be a WebSocket endpoint
-            # For now, return subscription info
+            # Never return bearer tokens in URL query strings.
             return web.json_response(
                 {
-                    "subscription_url": f'/realtime/ws?token={request.headers.get("Authorization", "").replace("Bearer ", "")}',
+                    "subscription_url": "/realtime/ws",
+                    "auth": {
+                        "type": "bearer",
+                        "transport": "Authorization header",
+                    },
                     "channels": ["fleet_updates", "vehicle_updates", "session_updates"],
                 }
             )

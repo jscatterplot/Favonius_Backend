@@ -1,6 +1,7 @@
 """Authentication and authorization middleware for Supabase integration."""
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Dict, List, Optional
@@ -33,9 +34,17 @@ class AuthManager:
         )
 
         # JWT settings
-        self.jwt_secret = config.service_key
+        self.jwt_secret = os.getenv("WS_AUTH_JWT_SIGNING_KEY") or config.service_key
+        if not os.getenv("WS_AUTH_JWT_SIGNING_KEY"):
+            self.logger.warning(
+                "WS_AUTH_JWT_SIGNING_KEY is not set; falling back to Supabase service key. "
+                "Set WS_AUTH_JWT_SIGNING_KEY in production to enforce key separation."
+            )
+        self.jwt_previous_secret = os.getenv("WS_AUTH_JWT_SIGNING_KEY_PREVIOUS")
         self.jwt_algorithm = "HS256"
         self.token_expiry = timedelta(minutes=15)
+        self.jwt_issuer = os.getenv("WS_AUTH_JWT_ISSUER", "favonius-websocket-handler")
+        self.jwt_audience = os.getenv("WS_AUTH_JWT_AUDIENCE", "favonius-websocket-api")
 
         # Legacy cache for backward compatibility
         self.user_cache: Dict[str, Dict[str, Any]] = {}
@@ -45,12 +54,7 @@ class AuthManager:
         """Authenticate user from JWT token."""
         try:
             # Decode JWT token
-            payload = jwt.decode(
-                token,
-                self.jwt_secret,
-                algorithms=[self.jwt_algorithm],
-                options={"verify_exp": True},
-            )
+            payload = self._decode_jwt(token)
 
             user_id = payload.get("sub")
             if not user_id:
@@ -221,12 +225,15 @@ class AuthManager:
 
     def generate_token(self, user_id: str, organization_id: str, role: str) -> str:
         """Generate JWT token for user."""
+        now = datetime.now(timezone.utc)
         payload = {
             "sub": user_id,
             "organization_id": organization_id,
             "role": role,
-            "exp": datetime.now(timezone.utc) + self.token_expiry,
-            "iat": datetime.now(timezone.utc),
+            "exp": now + self.token_expiry,
+            "iat": now,
+            "iss": self.jwt_issuer,
+            "aud": self.jwt_audience,
         }
 
         return jwt.encode(payload, self.jwt_secret, algorithm=self.jwt_algorithm)
@@ -234,12 +241,7 @@ class AuthManager:
     def verify_api_key(self, api_key: str) -> Optional[Dict[str, Any]]:
         """Verify API key and return user info."""
         try:
-            payload = jwt.decode(
-                api_key,
-                self.jwt_secret,
-                algorithms=[self.jwt_algorithm],
-                options={"verify_exp": True},
-            )
+            payload = self._decode_jwt(api_key)
 
             if payload.get("type") != "api_key":
                 return None
@@ -260,6 +262,31 @@ class AuthManager:
         except Exception as e:
             self.logger.error(f"API key verification error: {e}")
             return None
+
+    def _decode_jwt(self, token: str) -> Dict[str, Any]:
+        """Decode JWT using current and previous keys with issuer/audience checks."""
+        secrets_to_try = [self.jwt_secret]
+        if self.jwt_previous_secret:
+            secrets_to_try.append(self.jwt_previous_secret)
+
+        last_error: Optional[Exception] = None
+        for secret in secrets_to_try:
+            try:
+                return jwt.decode(
+                    token,
+                    secret,
+                    algorithms=[self.jwt_algorithm],
+                    audience=self.jwt_audience,
+                    issuer=self.jwt_issuer,
+                    options={"verify_exp": True},
+                )
+            except jwt.InvalidTokenError as e:
+                last_error = e
+                continue
+
+        if last_error:
+            raise last_error
+        raise jwt.InvalidTokenError("Token validation failed")
 
     def clear_user_cache(self, user_id: str) -> None:
         """Clear user cache."""
