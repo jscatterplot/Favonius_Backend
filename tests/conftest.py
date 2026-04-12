@@ -14,6 +14,27 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# Compatibility shims for environments where fastapi/supabase expect newer pydantic symbols.
+try:
+    import pydantic
+    import pydantic.main as pydantic_main
+    from typing import Any as _Any
+
+    if not hasattr(pydantic_main, "IncEx"):
+        pydantic_main.IncEx = _Any  # type: ignore[attr-defined]
+
+    if not hasattr(pydantic, "with_config"):
+        def _with_config(config):
+            def _decorator(cls):
+                cls.model_config = config
+                return cls
+
+            return _decorator
+
+        pydantic.with_config = _with_config  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 # FastAPI auth override for unit tests (avoid 401 from JWT dependency)
 try:
     from src.api import main as api_main

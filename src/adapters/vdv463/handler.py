@@ -27,7 +27,10 @@ except ImportError:
 from . import repository as vdv_repo
 from .charging_point_resolver import ChargingPointResolver
 from .depot_state import get_depot_charging_info
-from ...db.pools import DatabasePools
+try:
+    from ...db.pools import DatabasePools
+except ImportError:  # pragma: no cover - fallback for alternate import roots in tests
+    from src.db.pools import DatabasePools
 from .messages import (
     ChargingPointInfo,
     ChargingRequest,

@@ -6,6 +6,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import websockets
 
 pytest.importorskip("websockets")
 
@@ -40,6 +41,7 @@ def mock_config():
     config.vdv463.validation_mode = "hard"
     config.vdv463.default_depot_id = "depot_001"
     config.default_depot_id = "depot_001"
+    config.websocket.max_message_size = 1048576
     return config
 
 
@@ -98,17 +100,19 @@ async def test_handle_provide_charging_requests(
 
     raw_message = json.dumps(message)
 
-    # Mock websocket iteration
-    async def mock_iter():
-        yield raw_message
+    # Mock websocket recv loop: process one message then close cleanly
+    mock_websocket.recv = AsyncMock(
+        side_effect=[
+            raw_message,
+            websockets.exceptions.ConnectionClosedOK(
+                None,
+                None,
+            ),
+        ]
+    )
 
-    mock_websocket.__aiter__ = mock_iter
-
-    # Run handler (will process one message then exit)
-    try:
-        await asyncio.wait_for(handler.run(), timeout=1.0)
-    except asyncio.TimeoutError:
-        pass  # Expected - handler runs indefinitely
+    # Run handler (will process one message then exit on simulated close)
+    await asyncio.wait_for(handler.run(), timeout=1.0)
 
     # Verify response was sent
     assert mock_websocket.send.called

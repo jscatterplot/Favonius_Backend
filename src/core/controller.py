@@ -45,11 +45,12 @@ class DepotController:
 
     def __init__(
         self,
-        pools: DatabasePools,
         depot_id: str | UUID,
         config: DepotConfig,
+        pools: Optional[DatabasePools] = None,
         ocpp_server: Optional["OCPPServer"] = None,
         controller_config: Optional[ControllerConfig] = None,
+        pool=None,
     ):
         """Initialize depot controller.
 
@@ -59,7 +60,13 @@ class DepotController:
             config: Depot configuration
             ocpp_server: Optional OCPP server for charger communication
             controller_config: Optional controller configuration
+            pool: Legacy single-pool argument; used for both static and timeseries pools
         """
+        if pools is None:
+            if pool is None:
+                raise ValueError("Either `pools` or legacy `pool` must be provided")
+            pools = DatabasePools(static=pool, ts=pool)
+
         self.pools = pools
         self.depot_id = str(depot_id)
         self.config = config

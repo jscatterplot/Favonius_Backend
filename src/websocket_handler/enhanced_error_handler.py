@@ -40,6 +40,7 @@ class RetryConfig:
                 asyncio.TimeoutError,
                 OSError,
                 IOError,
+                RuntimeError,
             ]
 
 
@@ -267,22 +268,32 @@ class ErrorHandler:
         circuit_breaker: Optional[str] = None,
         bulkhead: Optional[str] = None,
         retry_config: Optional[RetryConfig] = None,
+        treat_rejected_status_as_error: bool = True,
         **kwargs,
     ) -> Any:
         """Execute function with multiple resilience patterns."""
+        async def _invoke() -> Any:
+            result = await func(*args, **kwargs)
+            if (
+                treat_rejected_status_as_error
+                and isinstance(result, dict)
+                and result.get("status") not in (None, "Accepted")
+            ):
+                reason = result.get("statusInfo", {}).get("additionalInfo", "operation rejected")
+                raise RuntimeError(f"Operation returned non-accepted status: {reason}")
+            return result
+
         # Apply bulkhead if specified
         if bulkhead and bulkhead in self.bulkheads:
             task_id = f"{func.__name__}_{int(time.time() * 1000)}"
-            return await self.bulkheads[bulkhead].execute(task_id, func, *args, **kwargs)
+            return await self.bulkheads[bulkhead].execute(task_id, _invoke)
 
         # Apply circuit breaker if specified
         if circuit_breaker and circuit_breaker in self.circuit_breakers:
-            return await self.circuit_breakers[circuit_breaker].call(func, *args, **kwargs)
+            return await self.circuit_breakers[circuit_breaker].call(_invoke)
 
         # Apply retry logic
-        return await self.retry_manager.execute_with_retry(
-            func, *args, config=retry_config, **kwargs
-        )
+        return await self.retry_manager.execute_with_retry(_invoke, config=retry_config)
 
     def get_circuit_breaker_status(self, name: str) -> Optional[Dict[str, Any]]:
         """Get circuit breaker status."""
