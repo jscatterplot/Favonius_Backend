@@ -6,7 +6,15 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import asyncpg
-from supabase import Client, create_client
+try:
+    from supabase import Client, create_client
+except ImportError:  # pragma: no cover - keep test imports working without optional deps
+    Client = Any  # type: ignore[misc,assignment]
+
+    def create_client(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError(
+            "supabase package is unavailable. Install optional dependencies to enable Supabase access."
+        )
 
 from .config import SupabaseConfig
 from .monitoring import get_logger

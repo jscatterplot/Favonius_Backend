@@ -6,7 +6,13 @@ from typing import Any, Dict
 import asyncpg
 import structlog
 from sqlalchemy import create_engine, text
-from supabase import create_client
+try:
+    from supabase import create_client
+except ImportError:  # pragma: no cover - optional dependency during isolated test runs
+    def create_client(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError(
+            "supabase package is unavailable. Install optional dependencies to validate Supabase."
+        )
 
 from .config import Config
 

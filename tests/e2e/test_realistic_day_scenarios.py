@@ -160,7 +160,7 @@ class TestRealisticDayScenarios:
         # Optimization should prefer off-peak charging
         # (May still charge during peak if necessary for departure requirements)
 
-    def test_soc_deviations(self, depot_config):
+    async def test_soc_deviations(self, depot_config):
         """Test SoC deviations trigger re-optimization."""
         n_t = depot_config.n_timesteps
 
@@ -205,7 +205,7 @@ class TestRealisticDayScenarios:
         assert result is not None, "SoC deviation trigger should fire"
         assert "SoC deviation" in result
 
-    def test_return_time_delays(self, depot_config):
+    async def test_return_time_delays(self, depot_config):
         """Test return time delays trigger re-optimization."""
         # Expected return time
         expected_return = datetime.utcnow() + timedelta(hours=2)

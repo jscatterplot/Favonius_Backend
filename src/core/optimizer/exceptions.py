@@ -40,6 +40,10 @@ class SolverError(OptimizationError):
         self.solver_status = solver_status
 
 
+class RuntimeError(SolverError):
+    """Backward-compatible runtime exception alias for optimizer errors."""
+
+
 class InvalidStateError(OptimizationError):
     """Raised when DepotState is invalid."""
 

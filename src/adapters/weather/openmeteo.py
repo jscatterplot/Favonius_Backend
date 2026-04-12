@@ -20,10 +20,21 @@ from uuid import UUID
 
 import asyncpg
 import numpy as np
-import openmeteo_requests
 import pandas as pd
-import requests_cache
-from retry_requests import retry
+from typing import Any
+
+try:
+    import openmeteo_requests
+except ImportError:  # pragma: no cover - optional dependency for runtime API calls
+    openmeteo_requests = None  # type: ignore[assignment]
+try:
+    import requests_cache
+except ImportError:  # pragma: no cover - optional dependency for runtime API calls
+    requests_cache = None  # type: ignore[assignment]
+try:
+    from retry_requests import retry
+except ImportError:  # pragma: no cover - optional dependency for runtime API calls
+    retry = None  # type: ignore[assignment]
 
 from .storage import (
     get_cached_forecasts,
@@ -60,7 +71,7 @@ def _create_openmeteo_client(
     cache_expire_after: int = 3600,
     retries: int = 5,
     backoff_factor: float = 0.2,
-) -> openmeteo_requests.Client:
+) -> Any:
     """Create an Open-Meteo client with caching and retry support.
 
     Follows official documentation recommendations:
@@ -76,6 +87,14 @@ def _create_openmeteo_client(
     Returns:
         Configured openmeteo_requests.Client
     """
+    if openmeteo_requests is None:
+        raise RuntimeError(
+            "openmeteo_requests package is unavailable. Install optional weather dependencies."
+        )
+    if requests_cache is None or retry is None:
+        raise RuntimeError(
+            "requests-cache/retry-requests packages are unavailable. Install optional weather dependencies."
+        )
     # Ensure cache directory exists
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
 

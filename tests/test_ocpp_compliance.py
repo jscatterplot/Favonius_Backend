@@ -486,7 +486,10 @@ class TestOCPPIntegration:
     @pytest.mark.asyncio
     async def test_boot_notification_flow(self, mock_timescale_client):
         """Test complete boot notification flow."""
-        from ocpp.v21.datatypes import ChargingStationType
+        try:
+            from ocpp.v21.datatypes import ChargingStationType
+        except ModuleNotFoundError:
+            from ocpp.v201.datatypes import ChargingStationType
 
         from websocket_handler.config import Config
         from websocket_handler.connection_manager import ConnectionManager
