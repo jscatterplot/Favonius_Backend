@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import math
 import os
 import secrets
 import time
@@ -927,18 +928,26 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
     if not db_pools:
         raise HTTPException(status_code=503, detail="Database not available")
 
+    current_time = time.time()
+    if depot_id in _depot_config_cache:
+        config, cache_time = _depot_config_cache[depot_id]
+        if current_time - cache_time < _config_cache_ttl:
+            logger.debug(f"Using cached config for depot {depot_id}")
+            return config
+        _depot_config_cache.pop(depot_id, None)
+
     if depot_id not in _depot_config_locks:
         _depot_config_locks[depot_id] = asyncio.Lock()
 
     async with _depot_config_locks[depot_id]:
-        # Check cache inside the lock: first waiter fills it, subsequent waiters hit it
+        # Recheck inside the lock: first waiter fills it, subsequent waiters hit it.
         current_time = time.time()
         if depot_id in _depot_config_cache:
             config, cache_time = _depot_config_cache[depot_id]
             if current_time - cache_time < _config_cache_ttl:
                 logger.debug(f"Using cached config for depot {depot_id}")
                 return config
-            del _depot_config_cache[depot_id]
+            _depot_config_cache.pop(depot_id, None)
 
         try:
             config, _ = await StateAssembler.load_depot_config(db_pools, depot_id)
@@ -1142,6 +1151,7 @@ async def run_optimization(request: OptimizationRequest, user: dict = Depends(ve
     # Input validation before DB availability check (fail fast on bad input)
     validate_depot_id(request.depot_id)
     validate_horizon_hours(request.horizon_hours)
+    await verify_depot_access(request.depot_id, user, db_pools.static if db_pools else None)
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -2432,6 +2442,18 @@ async def _handle_depot_config_update(
         )
     if not params:
         raise HTTPException(status_code=400, detail="params must include at least one config field")
+
+    if "max_grid_kw" in params:
+        try:
+            max_grid_kw = float(params["max_grid_kw"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="max_grid_kw must be a number") from exc
+        if not math.isfinite(max_grid_kw) or max_grid_kw <= 0 or max_grid_kw > 100_000:
+            raise HTTPException(
+                status_code=422,
+                detail="max_grid_kw must be greater than 0 and no more than 100,000 kW",
+            )
+        params = {**params, "max_grid_kw": max_grid_kw}
 
     if dry_run:
         return {"depot_id": depot_id, "would_update": params, "simulated": True}
