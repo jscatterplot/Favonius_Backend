@@ -56,7 +56,7 @@ BEGIN
     SELECT ARRAY_AGG(depot_id ORDER BY depot_id)
     INTO   depot_ids
     FROM   public.user_depot_access
-    WHERE  user_id = user_id;
+    WHERE  public.user_depot_access.user_id = add_favonius_claims.user_id;
 
     -- Merge claims into user_metadata
     RETURN jsonb_set(

@@ -10,12 +10,6 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 
-# Validation patterns
-UUID_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE
-)
-
-
 def validate_uuid(value: str, field_name: str = "id") -> str:
     """Validate UUID format and return the canonical string.
 
@@ -131,35 +125,6 @@ def validate_horizon_hours(horizon_hours: int) -> int:
             detail=f"horizon_hours must be between 1 and 48, got: {horizon_hours}",
         )
     return horizon_hours
-
-
-def validate_timestamp_range(start: str, end: str, field_prefix: str = "") -> None:
-    """Validate that start is before end (ISO 8601 strings).
-
-    Args:
-        start: Start timestamp (ISO 8601)
-        end: End timestamp (ISO 8601)
-        field_prefix: Prefix for field names in error messages
-
-    Raises:
-        HTTPException 422: If start >= end
-    """
-    from datetime import datetime
-
-    try:
-        t_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        t_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid timestamp format: {e}",
-        )
-    if t_start >= t_end:
-        prefix = f"{field_prefix}_" if field_prefix else ""
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"{prefix}start must be before {prefix}end",
-        )
 
 
 def sanitize_sql_identifier(value: str) -> str:
