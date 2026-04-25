@@ -2449,7 +2449,10 @@ async def _handle_depot_config_update(
     if not row:
         raise DepotNotFoundError(f"Depot {depot_id} not found")
 
-    _depot_config_cache.pop(depot_id, None)
+    if depot_id not in _depot_config_locks:
+        _depot_config_locks[depot_id] = asyncio.Lock()
+    async with _depot_config_locks[depot_id]:
+        _depot_config_cache.pop(depot_id, None)
     return {"depot_id": depot_id, "updated": params, "current_max_grid_kw": row["max_grid_kw"]}
 
 

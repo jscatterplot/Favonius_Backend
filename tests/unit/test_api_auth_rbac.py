@@ -264,7 +264,7 @@ class TestMyDepots:
         conn.fetch = AsyncMock(
             return_value=[
                 {
-                    "id": DEPOT_ID,
+                    "depot_id": DEPOT_ID,
                     "name": "Test Depot",
                     "timezone": "Europe/Vilnius",
                     "currency": "EUR",
@@ -278,7 +278,7 @@ class TestMyDepots:
         data = response.json()
         assert "depots" in data
         assert len(data["depots"]) == 1
-        assert data["depots"][0]["id"] == DEPOT_ID
+        assert data["depots"][0]["depot_id"] == DEPOT_ID
 
     def test_returns_empty_list_when_no_depot_ids_claim(self, client, mock_db_pool):
         pool, conn = mock_db_pool
@@ -459,7 +459,7 @@ class TestDepotMetadata:
         app.dependency_overrides[_require_depot_access] = _bypass_depot_access
         conn.fetchrow = AsyncMock(
             return_value={
-                "id": DEPOT_ID,
+                "depot_id": DEPOT_ID,
                 "name": "TOKS Vilnius",
                 "timezone": "Europe/Vilnius",
                 "currency": "EUR",
