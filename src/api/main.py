@@ -748,6 +748,28 @@ class ErrorResponse(BaseModel):
     timestamp: str = Field(..., description="Error timestamp (ISO 8601)")
 
 
+# ============ Depot Metadata Models ============
+
+
+class DepotMetadata(BaseModel):
+    """Static depot metadata returned by /me/depots and /depots/{depot_id}."""
+
+    depot_id: str = Field(..., description="Depot identifier (UUID)")
+    name: str = Field(..., description="Human-readable depot name")
+    timezone: str = Field(..., description="IANA timezone (e.g. 'America/Los_Angeles')")
+    currency: str = Field(..., description="ISO 4217 currency code (e.g. 'EUR', 'USD', 'GBP')")
+    max_grid_kw: float = Field(..., description="Hard site power limit (kW)")
+    demand_charge_rate_kw: Optional[float] = Field(
+        None, description="Demand charge rate in $/kW per month"
+    )
+
+
+class DepotListResponse(BaseModel):
+    """Response from GET /me/depots."""
+
+    depots: list[DepotMetadata] = Field(default_factory=list)
+
+
 # ============ Command Dispatcher Models ============
 
 
@@ -980,6 +1002,7 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
 
 @app.get(
     "/me/depots",
+    response_model=DepotListResponse,
     tags=["depots"],
     summary="List depots accessible to the authenticated user",
     description="""
@@ -1021,6 +1044,7 @@ async def list_my_depots(user: dict = Depends(verify_token)):
 
 @app.get(
     "/depots/{depot_id}",
+    response_model=DepotMetadata,
     tags=["depots"],
     summary="Get depot metadata",
     description="""
@@ -2419,7 +2443,7 @@ async def _handle_depot_config_update(
         updates.append(f"{field} = ${i}")
         values.append(value)
 
-    query = f"UPDATE depots SET {', '.join(updates)} WHERE id = $1::uuid RETURNING max_grid_kw"
+    query = f"UPDATE depots SET {', '.join(updates)} WHERE depot_id = $1::uuid RETURNING max_grid_kw"
     async with db_pools.static.acquire() as conn:
         row = await conn.fetchrow(query, *values)
     if not row:

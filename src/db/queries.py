@@ -591,9 +591,10 @@ async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
         Dict with depot fields, or None if not found
     """
     query = """
-        SELECT id::text, name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+        SELECT depot_id::text AS depot_id,
+               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
-        WHERE id = $1::uuid
+        WHERE depot_id = $1::uuid
     """
     row = await db.fetchrow(query, depot_id)
     return dict(row) if row else None
@@ -610,9 +611,10 @@ async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
         List of depot metadata dicts (same order not guaranteed)
     """
     query = """
-        SELECT id::text, name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+        SELECT depot_id::text AS depot_id,
+               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
-        WHERE id = ANY($1::uuid[])
+        WHERE depot_id = ANY($1::uuid[])
         ORDER BY name
     """
     rows = await db.fetch(query, depot_ids)
@@ -629,7 +631,8 @@ async def get_all_depots(db) -> list[dict]:
         List of depot metadata dicts ordered by name
     """
     query = """
-        SELECT id::text, name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+        SELECT depot_id::text AS depot_id,
+               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
         ORDER BY name
     """
