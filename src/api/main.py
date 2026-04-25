@@ -2439,13 +2439,16 @@ async def _handle_depot_config_update(
     if not db_pools:
         raise DatabaseError("Database not available")
 
-    updates = []
+    set_clauses: list[str] = []
     values: list = [depot_id]
-    for i, (field, value) in enumerate(params.items(), start=2):
-        updates.append(f"{field} = ${i}")
-        values.append(value)
+    if "max_grid_kw" in params:
+        set_clauses.append(f"max_grid_kw = ${len(values) + 1}")
+        values.append(params["max_grid_kw"])
 
-    query = f"UPDATE depots SET {', '.join(updates)} WHERE depot_id = $1::uuid RETURNING max_grid_kw"
+    query = (
+        f"UPDATE depots SET {', '.join(set_clauses)} "
+        "WHERE depot_id = $1::uuid RETURNING max_grid_kw"
+    )
     async with db_pools.static.acquire() as conn:
         row = await conn.fetchrow(query, *values)
     if not row:
@@ -2477,7 +2480,7 @@ async def _handle_optimization_run(
         raise HTTPException(status_code=503, detail="Controller manager not available")
 
     controller = await controller_manager.get_or_create_controller(depot_id)
-    asyncio.create_task(controller.run_optimization("manual_command"))
+    asyncio.create_task(controller.run_optimization("manual_command", horizon_hours=horizon_hours))
     return {"depot_id": depot_id, "horizon_hours": horizon_hours, "triggered": True}
 
 
