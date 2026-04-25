@@ -580,6 +580,63 @@ async def get_vehicle_by_id_tag(
     return await db.fetchrow(query, id_tag)
 
 
+async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
+    """Get depot metadata by depot_id.
+
+    Args:
+        db: Database connection or pool
+        depot_id: Depot UUID string
+
+    Returns:
+        Dict with depot fields, or None if not found
+    """
+    query = """
+        SELECT id::text, name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+        FROM depots
+        WHERE id = $1::uuid
+    """
+    row = await db.fetchrow(query, depot_id)
+    return dict(row) if row else None
+
+
+async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
+    """Get metadata for a list of depots by their IDs.
+
+    Args:
+        db: Database connection or pool
+        depot_ids: List of depot UUID strings
+
+    Returns:
+        List of depot metadata dicts (same order not guaranteed)
+    """
+    query = """
+        SELECT id::text, name, timezone, currency, max_grid_kw
+        FROM depots
+        WHERE id = ANY($1::uuid[])
+        ORDER BY name
+    """
+    rows = await db.fetch(query, depot_ids)
+    return [dict(r) for r in rows]
+
+
+async def get_all_depots(db) -> list[dict]:
+    """Get metadata for all depots (admin use).
+
+    Args:
+        db: Database connection or pool
+
+    Returns:
+        List of depot metadata dicts ordered by name
+    """
+    query = """
+        SELECT id::text, name, timezone, currency, max_grid_kw
+        FROM depots
+        ORDER BY name
+    """
+    rows = await db.fetch(query)
+    return [dict(r) for r in rows]
+
+
 async def update_vehicle_max_charge_kw(
     db,
     vehicle_id: UUID,

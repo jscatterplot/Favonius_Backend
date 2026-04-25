@@ -160,6 +160,10 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
     # Check favonius_role — admins can access all depots
     favonius_role = metadata.get("favonius_role", "")
     if favonius_role == "admin":
+        logger.warning(
+            "Admin depot access bypass",
+            extra={"user_id": user.get("sub"), "depot_id": depot_id},
+        )
         return
 
     # Fallback: DB-backed authorization check
@@ -189,6 +193,19 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Access denied: you do not have permission for this depot",
     )
+
+
+def get_user_depot_ids(token: dict) -> list[str]:
+    """Return the list of depot UUIDs the user can access, from the JWT claim.
+
+    Returns an empty list when the claim is absent (e.g., admin users who use
+    the role-based bypass, or tokens issued before the Auth Hook was configured).
+    """
+    metadata = token.get("user_metadata", {})
+    depot_ids = metadata.get("depot_ids")
+    if isinstance(depot_ids, list):
+        return [str(d) for d in depot_ids]
+    return []
 
 
 def get_user_role(token: dict) -> str:

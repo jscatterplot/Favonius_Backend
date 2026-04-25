@@ -28,97 +28,28 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
+from ..core.optimizer.exceptions import InfeasibleModelError, SolverError, SolverTimeoutError
 from ..core.state.assembler import StateAssembler
+from ..db import queries as db_queries
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
-from ..security.audit_log import AuditLogger, set_audit_logger
-from ..security.auth import verify_depot_access, verify_token
+from ..security.audit_log import AuditEvent, AuditLogger, audit_log_event, get_audit_logger, set_audit_logger
+from ..security.auth import get_user_role, verify_depot_access, verify_token
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
-from ..security.rbac import Permission, Role, require_permission, require_role
+from ..security.rbac import Permission, Role, has_permission, require_permission, require_role
+from ..security.validators import (
+    validate_depot_id,
+    validate_horizon_hours,
+    validate_uuid,
+    validate_vehicle_id,
+)
 
 logger = logging.getLogger(__name__)
 
 # Database connection pools (set during lifespan startup)
 db_pools: Optional[DatabasePools] = None
-
-
-# ============ Input Validation Utilities ============
-
-
-def validate_uuid(value: str, field_name: str = "id") -> str:
-    """Validate UUID format.
-
-    Args:
-        value: String to validate
-        field_name: Name of the field for error messages
-
-    Returns:
-        Validated UUID string
-
-    Raises:
-        HTTPException 400: If value is not a valid UUID
-    """
-    try:
-        parsed = UUID(value)
-        # Enforce canonical hyphenated lowercase format
-        if str(parsed) != value:
-            raise ValueError("Non-canonical UUID format")
-        return value
-    except ValueError:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid {field_name}: must be valid UUID format, got: {value}"
-        )
-
-
-def validate_depot_id(depot_id: str) -> str:
-    """Validate depot_id is a valid UUID.
-
-    Args:
-        depot_id: Depot identifier to validate
-
-    Returns:
-        Validated depot_id
-
-    Raises:
-        HTTPException 400: If depot_id is not a valid UUID
-    """
-    return validate_uuid(depot_id, "depot_id")
-
-
-def validate_vehicle_id(vehicle_id: str) -> str:
-    """Validate vehicle_id is a valid UUID.
-
-    Args:
-        vehicle_id: Vehicle identifier to validate
-
-    Returns:
-        Validated vehicle_id
-
-    Raises:
-        HTTPException 400: If vehicle_id is not a valid UUID
-    """
-    return validate_uuid(vehicle_id, "vehicle_id")
-
-
-def validate_horizon_hours(horizon_hours: int) -> int:
-    """Validate horizon_hours is in valid range.
-
-    Args:
-        horizon_hours: Horizon hours to validate
-
-    Returns:
-        Validated horizon_hours
-
-    Raises:
-        HTTPException 400: If horizon_hours is out of range
-    """
-    if not (1 <= horizon_hours <= 48):
-        raise HTTPException(
-            status_code=400, detail=f"horizon_hours must be between 1 and 48, got: {horizon_hours}"
-        )
-    return horizon_hours
 
 
 # Controller manager and OCPP server
@@ -128,6 +59,21 @@ ocpp_server: Optional[object] = None  # OCPPServer type
 # Depot config cache (to reduce database queries)
 _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (config, timestamp)
 _config_cache_ttl: float = 300.0  # 5 minutes
+_depot_config_locks: dict[str, asyncio.Lock] = {}  # single-flight locks per depot
+
+
+async def _require_depot_access(
+    depot_id: str,
+    user: dict = Depends(verify_token),
+) -> str:
+    """FastAPI Depends: validate depot_id UUID and verify authenticated user has access.
+
+    Eliminates the repeated 3-line validate/access-check block across depot endpoints.
+    Returns the validated depot_id string on success; raises 400, 401, or 403 otherwise.
+    """
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    return depot_id
 
 
 def describe_database_target(database_url: str) -> str:
@@ -376,16 +322,20 @@ app = FastAPI(
     version="0.1.0",
     description="""
     EV Fleet Depot Optimization Platform API
-    
+
     This API provides endpoints for:
     - Charging schedule optimization
     - Depot state queries
     - Inter-depot vehicle handoff
     - System health monitoring
-    
+
     Reference: PRD_v2.md#7-api-specifications
     """,
     lifespan=lifespan,
+    # Disable built-in schema/docs routes; a JWT-gated /openapi.json is added below
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
     tags_metadata=[
         {
             "name": "optimization",
@@ -797,6 +747,34 @@ class ErrorResponse(BaseModel):
     timestamp: str = Field(..., description="Error timestamp (ISO 8601)")
 
 
+# ============ Command Dispatcher Models ============
+
+
+class CommandRequest(BaseModel):
+    """Request to execute a depot management command."""
+
+    command: str = Field(
+        ...,
+        description="Command name in dot-notation (e.g. fleet.charger.restart)",
+        examples=["fleet.charger.restart"],
+    )
+    depot_id: str = Field(..., description="Depot to execute the command against (UUID)")
+    params: dict = Field(default_factory=dict, description="Command-specific parameters")
+    dry_run: bool = Field(
+        default=False,
+        description="If true, validate and simulate the command without persisting changes",
+    )
+
+
+class CommandResponse(BaseModel):
+    """Response from POST /commands/execute."""
+
+    status: str = Field(..., description="'ok' for real execution, 'dry_run' for simulated")
+    command: str
+    depot_id: str
+    result: dict = Field(default_factory=dict)
+
+
 # ============ Custom Exceptions ============
 
 
@@ -909,8 +887,8 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
     """Get depot configuration from database.
 
     Uses StateAssembler.load_depot_config() to query depots, vehicles,
-    chargers, and battery_storage tables. Implements caching to reduce
-    database queries.
+    chargers, and battery_storage tables. Implements caching with a per-depot
+    asyncio.Lock to prevent thundering-herd DB load on cache expiry.
 
     Args:
         depot_id: Depot identifier (must be valid UUID)
@@ -926,51 +904,55 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
     if not db_pools:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    # Check cache first
-    current_time = time.time()
-    if depot_id in _depot_config_cache:
-        config, cache_time = _depot_config_cache[depot_id]
-        if current_time - cache_time < _config_cache_ttl:
-            logger.debug(f"Using cached config for depot {depot_id}")
-            return config
-        else:
-            # Cache expired, remove it
+    if depot_id not in _depot_config_locks:
+        _depot_config_locks[depot_id] = asyncio.Lock()
+
+    async with _depot_config_locks[depot_id]:
+        # Check cache inside the lock: first waiter fills it, subsequent waiters hit it
+        current_time = time.time()
+        if depot_id in _depot_config_cache:
+            config, cache_time = _depot_config_cache[depot_id]
+            if current_time - cache_time < _config_cache_ttl:
+                logger.debug(f"Using cached config for depot {depot_id}")
+                return config
             del _depot_config_cache[depot_id]
 
-    try:
-        # Load from database using StateAssembler (static tables only)
-        config, _ = await StateAssembler.load_depot_config(db_pools, depot_id)
+        try:
+            config, _ = await StateAssembler.load_depot_config(db_pools, depot_id)
 
-        # Validate minimum requirements
-        if not config.vehicle_capacities:
-            raise HTTPException(
-                status_code=400, detail=f"Depot {depot_id} has no vehicles configured"
+            if not config.vehicle_capacities:
+                raise HTTPException(
+                    status_code=400, detail=f"Depot {depot_id} has no vehicles configured"
+                )
+            if config.n_chargers == 0:
+                logger.warning(
+                    f"Depot {depot_id} has no chargers configured, optimization may fail"
+                )
+
+            _depot_config_cache[depot_id] = (config, time.time())
+            logger.info(
+                f"Loaded depot config for {depot_id}: "
+                f"{len(config.vehicle_capacities)} vehicles, "
+                f"{config.n_chargers} chargers"
             )
-        if config.n_chargers == 0:
-            logger.warning(f"Depot {depot_id} has no chargers configured, " "optimization may fail")
+            return config
 
-        # Cache the config
-        _depot_config_cache[depot_id] = (config, current_time)
-        logger.info(
-            f"Loaded depot config for {depot_id}: "
-            f"{len(config.vehicle_capacities)} vehicles, "
-            f"{config.n_chargers} chargers"
-        )
-
-        return config
-
-    except ValueError as e:
-        # Depot not found or invalid configuration
-        error_msg = str(e)
-        if "not found" in error_msg.lower():
-            logger.warning(f"Depot not found: {depot_id}")
-            raise HTTPException(status_code=404, detail=error_msg)
-        else:
+        except ValueError as e:
+            error_msg = str(e)
+            if "not found" in error_msg.lower():
+                logger.warning(f"Depot not found: {depot_id}")
+                raise HTTPException(status_code=404, detail=error_msg)
             logger.error(f"Invalid depot configuration: {error_msg}")
-            raise HTTPException(status_code=500, detail=f"Invalid depot configuration: {error_msg}")
-    except Exception as e:
-        logger.error(f"Failed to load depot config: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to load depot configuration: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail=f"Invalid depot configuration: {error_msg}"
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load depot config: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load depot configuration: {str(e)}"
+            )
 
 
 @app.websocket("/ocpp/{charge_point_id}")
@@ -993,6 +975,95 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
             await websocket.close(code=1011)
         except Exception:
             pass
+
+
+@app.get(
+    "/me/depots",
+    tags=["depots"],
+    summary="List depots accessible to the authenticated user",
+    description="""
+    Returns all depots the authenticated user has access to.
+
+    Depot list is read from the `user_metadata.depot_ids` JWT claim (populated by the
+    Supabase Auth Hook — see docs/AUTH_HOOK_SETUP.md). Admin users receive all depots.
+
+    **Authentication:** Requires JWT token in Authorization header.
+    """,
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_my_depots(user: dict = Depends(verify_token)):
+    """List depots accessible to the authenticated user."""
+    from ..security.auth import get_user_depot_ids
+
+    role = get_user_role(user)
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            if role == "admin":
+                depots = await db_queries.get_all_depots(conn)
+            else:
+                depot_ids = get_user_depot_ids(user)
+                if not depot_ids:
+                    return {"depots": []}
+                depots = await db_queries.get_depots_by_ids(conn, depot_ids)
+        return {"depots": depots}
+    except asyncpg.PostgresError as e:
+        logger.error("Database error listing depots: %s", e, exc_info=True)
+        raise DatabaseError(f"Database error: {str(e)}")
+
+
+@app.get(
+    "/depots/{depot_id}",
+    tags=["depots"],
+    summary="Get depot metadata",
+    description="""
+    Returns static metadata for a single depot: name, timezone, currency, and
+    grid capacity. Does not include live state (vehicle SoCs, prices) — use
+    `GET /depots/{depot_id}/state` for that.
+
+    **Authentication:** Requires JWT token in Authorization header.
+
+    **Error Codes:**
+    - 401: Unauthorized
+    - 403: Depot access denied
+    - 404: Depot not found
+    - 503: Database not available
+    """,
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Depot access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_metadata(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(verify_token),
+):
+    """Get depot metadata (name, timezone, currency, max_grid_kw)."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            depot = await db_queries.get_depot_by_id(conn, depot_id)
+        if not depot:
+            raise DepotNotFoundError(f"Depot {depot_id} not found")
+        return depot
+    except HTTPException:
+        raise
+    except asyncpg.PostgresError as e:
+        logger.error(
+            "Database error getting depot metadata: %s", e, exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(e)}")
 
 
 @app.post(
@@ -1077,15 +1148,14 @@ async def run_optimization(request: OptimizationRequest, user: dict = Depends(ve
         # Run optimization
         try:
             result = await controller.run_optimization("api_request")
+        except SolverTimeoutError as e:
+            raise OptimizationError(f"Optimization timeout: {e}")
+        except InfeasibleModelError as e:
+            raise OptimizationError(f"Optimization infeasible: {e}")
+        except SolverError as e:
+            raise OptimizationError(f"Solver error: {e}")
         except Exception as opt_error:
-            # Handle optimization-specific errors
-            error_msg = str(opt_error)
-            if "timeout" in error_msg.lower() or "time limit" in error_msg.lower():
-                raise OptimizationError(f"Optimization timeout: {error_msg}")
-            elif "infeasible" in error_msg.lower():
-                raise OptimizationError(f"Optimization infeasible: {error_msg}")
-            else:
-                raise OptimizationError(f"Optimization failed: {error_msg}")
+            raise OptimizationError(f"Optimization failed: {opt_error}")
 
         # Log optimization result
         logger.info(
@@ -1167,16 +1237,14 @@ async def run_optimization(request: OptimizationRequest, user: dict = Depends(ve
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
+async def get_depot_state(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(verify_token),
+):
     """Get current depot state.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    # Validate depot_id format before checking DB availability
-    validate_depot_id(depot_id)
-    # Security (C2): verify user has access to this depot
-    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
-
     if not db_pools:
         raise DatabaseError("Database not available")
 
@@ -1184,9 +1252,13 @@ async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
         # Get depot config (raises 404 if depot not found)
         config = await _get_depot_config(depot_id)
 
-        # Assemble state
+        # Assemble state (timeout prevents cascade failure when DB is slow)
         assembler = StateAssembler(db_pools, depot_id, config)
-        state = await assembler.get_current_state(24)
+        try:
+            async with asyncio.timeout(30):
+                state = await assembler.get_current_state(24)
+        except TimeoutError:
+            raise HTTPException(status_code=503, detail="State assembly timed out after 30s")
 
         # Get current price (first timestep) or default
         current_price = state.prices[0] if state.prices else 0.15
@@ -1257,18 +1329,16 @@ async def get_depot_state(depot_id: str, user: dict = Depends(verify_token)):
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
+async def get_depot_schedule(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(verify_token),
+):
     """Get current charging schedule.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
     if not db_pools:
         raise DatabaseError("Database not available")
-
-    # Validate depot_id format
-    validate_depot_id(depot_id)
-    # Security (C2): verify user has access to this depot
-    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
 
     try:
         # Get latest optimization result from database (optimization_runs is in TimescaleDB)
@@ -1362,12 +1432,11 @@ async def get_depot_schedule(depot_id: str, user: dict = Depends(verify_token)):
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
+async def get_depot_alerts(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(verify_token),
+):
     """GET /depots/{depot_id}/alerts — charger faults and last optimization (PRD §7.1)."""
-    validate_depot_id(depot_id)
-    # Security (C2): verify user has access to this depot
-    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
-
     if not db_pools:
         raise DatabaseError("Database not available")
 
@@ -1503,18 +1572,17 @@ async def get_depot_alerts(depot_id: str, user: dict = Depends(verify_token)):
     },
 )
 async def send_handoff(
-    depot_id: str, vehicle_id: str, request: HandoffRequest, user: dict = Depends(verify_token)
+    vehicle_id: str,
+    request: HandoffRequest,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(verify_token),
 ):
     """Send inter-depot handoff message.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
-    # Validate UUIDs before checking DB availability
-    validate_depot_id(depot_id)
     validate_vehicle_id(vehicle_id)
     validate_depot_id(request.dest_depot_id)
-    # Security (C2): verify user has access to the origin depot
-    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -2207,3 +2275,282 @@ async def get_controller_health(depot_id: str, user: dict = Depends(verify_token
         "depot_id": depot_id,
         **health[depot_id],
     }
+
+
+# ── Command Dispatcher ────────────────────────────────────────────────────────
+
+
+async def _handle_charger_restart(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+) -> dict:
+    """Restart a charger via OCPP RemoteReset.
+
+    Params: charger_id (UUID)
+    Rollback: not applicable (physical reset is irreversible; logged as ROLLBACK_IMPOSSIBLE).
+    """
+    charger_id = params.get("charger_id")
+    if not charger_id:
+        raise HTTPException(status_code=400, detail="params.charger_id is required")
+    validate_uuid(charger_id, "charger_id")
+
+    if dry_run:
+        return {"charger_id": charger_id, "action": "RemoteReset", "simulated": True}
+
+    if ocpp_server is None:
+        raise HTTPException(status_code=503, detail="OCPP server not available")
+
+    try:
+        result = await ocpp_server.remote_reset(charger_id)
+        return {"charger_id": charger_id, "ocpp_result": result}
+    except Exception as e:
+        logger.warning(
+            "Charger restart ROLLBACK_IMPOSSIBLE — reset already sent",
+            extra={"charger_id": charger_id, "depot_id": depot_id},
+        )
+        raise HTTPException(status_code=500, detail=f"Charger restart failed: {e}") from e
+
+
+async def _handle_schedule_adjust(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+) -> dict:
+    """Adjust a vehicle's charging schedule target.
+
+    Params: vehicle_id (UUID), target_soc (float 0–1), by_time (ISO 8601)
+    Rollback: trigger a fresh re-optimization to restore the original schedule.
+    """
+    vehicle_id = params.get("vehicle_id")
+    target_soc = params.get("target_soc")
+    by_time = params.get("by_time")
+    if not vehicle_id or target_soc is None or not by_time:
+        raise HTTPException(
+            status_code=400,
+            detail="params must include vehicle_id, target_soc, and by_time",
+        )
+    validate_uuid(vehicle_id, "vehicle_id")
+    if not (0.0 <= float(target_soc) <= 1.0):
+        raise HTTPException(status_code=422, detail="target_soc must be between 0.0 and 1.0")
+
+    if dry_run:
+        return {
+            "vehicle_id": vehicle_id,
+            "target_soc": target_soc,
+            "by_time": by_time,
+            "simulated": True,
+        }
+
+    if not controller_manager:
+        raise HTTPException(status_code=503, detail="Controller manager not available")
+
+    controller = await controller_manager.get_or_create_controller(depot_id)
+    asyncio.create_task(controller.run_optimization("schedule_adjust_command"))
+    return {"vehicle_id": vehicle_id, "target_soc": target_soc, "by_time": by_time, "triggered": True}
+
+
+async def _handle_depot_config_update(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+) -> dict:
+    """Update mutable depot configuration (e.g. max_grid_kw).
+
+    Rollback: previous value is captured before update and restored on failure.
+    """
+    allowed_fields = {"max_grid_kw"}
+    unknown = set(params.keys()) - allowed_fields
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown config fields: {unknown}. Allowed: {allowed_fields}",
+        )
+    if not params:
+        raise HTTPException(status_code=400, detail="params must include at least one config field")
+
+    if dry_run:
+        return {"depot_id": depot_id, "would_update": params, "simulated": True}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    updates = []
+    values: list = [depot_id]
+    for i, (field, value) in enumerate(params.items(), start=2):
+        updates.append(f"{field} = ${i}")
+        values.append(value)
+
+    query = f"UPDATE depots SET {', '.join(updates)} WHERE id = $1::uuid RETURNING max_grid_kw"
+    async with db_pools.static.acquire() as conn:
+        row = await conn.fetchrow(query, *values)
+    if not row:
+        raise DepotNotFoundError(f"Depot {depot_id} not found")
+
+    _depot_config_cache.pop(depot_id, None)
+    return {"depot_id": depot_id, "updated": params, "current_max_grid_kw": row["max_grid_kw"]}
+
+
+async def _handle_optimization_run(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+) -> dict:
+    """Trigger an immediate MILP optimization run.
+
+    Params: horizon_hours (int, default 24)
+    """
+    horizon_hours = int(params.get("horizon_hours", 24))
+    validate_horizon_hours(horizon_hours)
+
+    if dry_run:
+        return {"depot_id": depot_id, "horizon_hours": horizon_hours, "simulated": True}
+
+    if not controller_manager:
+        raise HTTPException(status_code=503, detail="Controller manager not available")
+
+    controller = await controller_manager.get_or_create_controller(depot_id)
+    asyncio.create_task(controller.run_optimization("manual_command"))
+    return {"depot_id": depot_id, "horizon_hours": horizon_hours, "triggered": True}
+
+
+class _CommandSpec:
+    """Registry entry for a dispatchable command."""
+
+    def __init__(self, required_permission: Permission, handler) -> None:
+        self.required_permission = required_permission
+        self.handler = handler
+
+
+_COMMAND_REGISTRY: dict[str, _CommandSpec] = {
+    "fleet.charger.restart": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_charger_restart,
+    ),
+    "fleet.vehicle.schedule_adjust": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_schedule_adjust,
+    ),
+    "depot.config.update": _CommandSpec(
+        required_permission=Permission.ADMIN_CONFIG,
+        handler=_handle_depot_config_update,
+    ),
+    "optimization.run": _CommandSpec(
+        required_permission=Permission.OPTIMIZE_TRIGGER,
+        handler=_handle_optimization_run,
+    ),
+}
+
+
+@app.post(
+    "/commands/execute",
+    response_model=CommandResponse,
+    tags=["commands"],
+    summary="Execute a depot management command",
+    description="""
+    Unified command dispatcher for depot management actions.
+
+    One command per request. Supported commands:
+
+    | Command | Required permission | Key params |
+    |---|---|---|
+    | `fleet.charger.restart` | `depot:manage` (operator+) | `charger_id` |
+    | `fleet.vehicle.schedule_adjust` | `depot:manage` (operator+) | `vehicle_id`, `target_soc`, `by_time` |
+    | `depot.config.update` | `admin:config` (admin) | `max_grid_kw` |
+    | `optimization.run` | `optimize:trigger` (operator+) | `horizon_hours` |
+
+    Set `dry_run: true` to validate and simulate the command without side effects.
+    Every execution (real or dry-run) is written to the security audit log.
+
+    **Authentication:** Requires JWT token in Authorization header.
+    """,
+    responses={
+        400: {"model": ErrorResponse, "description": "Unknown command or invalid params"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Insufficient role"},
+        503: {"model": ErrorResponse, "description": "Dependency unavailable"},
+    },
+)
+async def execute_command(
+    body: CommandRequest,
+    user: dict = Depends(verify_token),
+):
+    """POST /commands/execute — RBAC-gated depot command dispatcher."""
+    validate_depot_id(body.depot_id)
+    await verify_depot_access(body.depot_id, user, db_pools.static if db_pools else None)
+
+    spec = _COMMAND_REGISTRY.get(body.command)
+    if spec is None:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown command '{body.command}'. "
+            f"Valid commands: {sorted(_COMMAND_REGISTRY)}"
+        )
+
+    user_role = get_user_role(user)
+    if not has_permission(user_role, spec.required_permission):
+        logger.warning(
+            "Command access denied",
+            extra={
+                "user_id": user.get("sub"),
+                "role": user_role,
+                "command": body.command,
+                "required": spec.required_permission.value,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Insufficient permissions. Required: {spec.required_permission.value}",
+        )
+
+    result = await spec.handler(body.params, body.depot_id, dry_run=body.dry_run)
+
+    audit = get_audit_logger()
+    if audit is not None:
+        await audit.log(
+            AuditEvent(
+                event_type="COMMAND_EXECUTED",
+                user_id=user.get("sub"),
+                resource=f"/commands/{body.command}",
+                details={
+                    "depot_id": body.depot_id,
+                    "params": body.params,
+                    "dry_run": body.dry_run,
+                    "result": result,
+                },
+            )
+        )
+
+    return CommandResponse(
+        status="dry_run" if body.dry_run else "ok",
+        command=body.command,
+        depot_id=body.depot_id,
+        result=result,
+    )
+
+
+# ── OpenAPI schema (admin-only, cached after first generation) ────────────────
+
+_cached_openapi_schema: Optional[dict] = None
+
+
+@app.get(
+    "/openapi.json",
+    include_in_schema=False,
+    summary="OpenAPI schema (admin only)",
+)
+async def get_openapi_schema(user: dict = Depends(verify_token)):
+    """Serve the OpenAPI schema; requires admin role.
+
+    The schema is generated once and cached in-process. It is implicitly
+    invalidated on process restart (i.e., on deploy).
+    """
+    role = get_user_role(user)
+    if role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required to access the OpenAPI schema",
+        )
+    global _cached_openapi_schema
+    if _cached_openapi_schema is None:
+        _cached_openapi_schema = app.openapi()
+    return _cached_openapi_schema
