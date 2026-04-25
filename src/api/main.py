@@ -21,6 +21,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, field_validator
@@ -2333,6 +2334,10 @@ async def _handle_schedule_adjust(
     validate_uuid(vehicle_id, "vehicle_id")
     if not (0.0 <= float(target_soc) <= 1.0):
         raise HTTPException(status_code=422, detail="target_soc must be between 0.0 and 1.0")
+    try:
+        by_time_dt = datetime.fromisoformat(str(by_time).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="by_time must be a valid ISO 8601 datetime") from exc
 
     if dry_run:
         return {
@@ -2342,12 +2347,45 @@ async def _handle_schedule_adjust(
             "simulated": True,
         }
 
-    if not controller_manager:
-        raise HTTPException(status_code=503, detail="Controller manager not available")
+    if not controller_manager or not db_pools:
+        raise HTTPException(status_code=503, detail="Controller manager or database not available")
+
+    update_query = """
+        WITH target_schedule AS (
+            SELECT s.schedule_id
+            FROM schedules s
+            JOIN vehicles v ON v.vehicle_id = s.vehicle_id
+            WHERE s.vehicle_id = $1::uuid
+              AND v.depot_id = $2::uuid
+              AND s.departure_time >= $3
+            ORDER BY s.departure_time
+            LIMIT 1
+        )
+        UPDATE schedules s
+        SET required_soc = $4
+        FROM target_schedule ts
+        WHERE s.schedule_id = ts.schedule_id
+        RETURNING s.schedule_id::text AS schedule_id, s.departure_time, s.required_soc
+    """
+    async with db_pools.static.acquire() as conn:
+        updated_schedule = await conn.fetchrow(
+            update_query, vehicle_id, depot_id, by_time_dt, float(target_soc)
+        )
+    if not updated_schedule:
+        raise HTTPException(
+            status_code=404,
+            detail="No matching schedule found for vehicle at or after by_time in this depot",
+        )
 
     controller = await controller_manager.get_or_create_controller(depot_id)
     asyncio.create_task(controller.run_optimization("schedule_adjust_command"))
-    return {"vehicle_id": vehicle_id, "target_soc": target_soc, "by_time": by_time, "triggered": True}
+    return {
+        "vehicle_id": vehicle_id,
+        "target_soc": target_soc,
+        "by_time": by_time,
+        "schedule_id": updated_schedule["schedule_id"],
+        "triggered": True,
+    }
 
 
 async def _handle_depot_config_update(
@@ -2530,7 +2568,8 @@ async def execute_command(
 
 # ── OpenAPI schema (admin-only, cached after first generation) ────────────────
 
-_cached_openapi_schema: Optional[dict] = None
+_OPENAPI_NOT_CACHED = object()
+_cached_openapi_schema: object = _OPENAPI_NOT_CACHED
 
 
 @app.get(
@@ -2551,6 +2590,15 @@ async def get_openapi_schema(user: dict = Depends(verify_token)):
             detail="Admin role required to access the OpenAPI schema",
         )
     global _cached_openapi_schema
-    if _cached_openapi_schema is None:
-        _cached_openapi_schema = app.openapi()
+    if _cached_openapi_schema is _OPENAPI_NOT_CACHED:
+        _cached_openapi_schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            openapi_version=app.openapi_version,
+            summary=app.summary,
+            description=app.description,
+            routes=app.routes,
+            tags=app.openapi_tags,
+            servers=app.servers,
+        )
     return _cached_openapi_schema

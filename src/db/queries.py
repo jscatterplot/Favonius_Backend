@@ -610,7 +610,7 @@ async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
         List of depot metadata dicts (same order not guaranteed)
     """
     query = """
-        SELECT id::text, name, timezone, currency, max_grid_kw
+        SELECT id::text, name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
         WHERE id = ANY($1::uuid[])
         ORDER BY name
@@ -629,7 +629,7 @@ async def get_all_depots(db) -> list[dict]:
         List of depot metadata dicts ordered by name
     """
     query = """
-        SELECT id::text, name, timezone, currency, max_grid_kw
+        SELECT id::text, name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
         ORDER BY name
     """
