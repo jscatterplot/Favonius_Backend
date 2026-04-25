@@ -1092,6 +1092,8 @@ async def get_depot_metadata(
         if not depot:
             raise DepotNotFoundError(f"Depot {depot_id} not found")
         return depot
+    except DepotNotFoundError:
+        raise
     except HTTPException:
         raise
     except asyncpg.PostgresError as e:
@@ -1184,7 +1186,9 @@ async def run_optimization(request: OptimizationRequest, user: dict = Depends(ve
 
         # Run optimization
         try:
-            result = await controller.run_optimization("api_request")
+            result = await controller.run_optimization(
+                "api_request", horizon_hours=request.horizon_hours
+            )
         except SolverTimeoutError as e:
             raise OptimizationError(f"Optimization timeout: {e}")
         except InfeasibleModelError as e:
