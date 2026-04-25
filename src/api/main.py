@@ -62,6 +62,14 @@ ocpp_server: Optional[object] = None  # OCPPServer type
 _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (config, timestamp)
 _config_cache_ttl: float = 300.0  # 5 minutes
 _depot_config_locks: dict[str, asyncio.Lock] = {}  # single-flight locks per depot
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _create_background_task(coro) -> None:
+    """Create and retain a background task until completion."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def _require_depot_access(
@@ -1039,6 +1047,19 @@ async def list_my_depots(user: dict = Depends(verify_token)):
     try:
         if role != "admin":
             depot_ids = get_user_depot_ids(user)
+            if not depot_ids:
+                user_id = user.get("sub")
+                if user_id:
+                    async with db_pools.static.acquire() as conn:
+                        rows = await conn.fetch(
+                            """
+                            SELECT DISTINCT depot_id::text AS depot_id
+                            FROM user_depot_access
+                            WHERE user_id = $1
+                            """,
+                            user_id,
+                        )
+                    depot_ids = [row["depot_id"] for row in rows]
             if not depot_ids:
                 return {"depots": []}
 
@@ -2418,7 +2439,7 @@ async def _handle_schedule_adjust(
         )
 
     controller = await controller_manager.get_or_create_controller(depot_id)
-    asyncio.create_task(controller.run_optimization("schedule_adjust_command"))
+    _create_background_task(controller.run_optimization("schedule_adjust_command"))
     return {
         "vehicle_id": vehicle_id,
         "target_soc": target_soc,
@@ -2506,7 +2527,9 @@ async def _handle_optimization_run(
         raise HTTPException(status_code=503, detail="Controller manager not available")
 
     controller = await controller_manager.get_or_create_controller(depot_id)
-    asyncio.create_task(controller.run_optimization("manual_command", horizon_hours=horizon_hours))
+    _create_background_task(
+        controller.run_optimization("manual_command", horizon_hours=horizon_hours)
+    )
     return {"depot_id": depot_id, "horizon_hours": horizon_hours, "triggered": True}
 
 
