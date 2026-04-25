@@ -74,6 +74,17 @@ class TestVerifyDepotAccess:
         await verify("any-depot-id", user, pool=None)
 
     @pytest.mark.asyncio
+    async def test_admin_role_bypasses_empty_depot_ids(self, _import_verify):
+        """Admin users should bypass even when depot_ids is an empty list."""
+        verify = _import_verify
+        user = {
+            "sub": "admin-1",
+            "user_metadata": {"favonius_role": "admin", "depot_ids": []},
+        }
+        # Should not raise — admin bypasses depot_ids fast-path deny
+        await verify("any-depot-id", user, pool=None)
+
+    @pytest.mark.asyncio
     async def test_no_claim_no_admin_no_pool_denied(self, _import_verify):
         """User with no depot_ids claim, no admin role, and no DB pool gets 403."""
         from fastapi import HTTPException

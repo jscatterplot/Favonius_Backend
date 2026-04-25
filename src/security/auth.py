@@ -146,8 +146,18 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
         user: Decoded JWT payload from verify_token.
         pool: Optional asyncpg pool for DB-backed authorization.
     """
-    # Fast path: check depot_ids claim in token
     metadata = user.get("user_metadata", {})
+
+    # Check favonius_role first — admins can access all depots
+    favonius_role = metadata.get("favonius_role", "")
+    if favonius_role == "admin":
+        logger.warning(
+            "Admin depot access bypass",
+            extra={"user_id": user.get("sub"), "depot_id": depot_id},
+        )
+        return
+
+    # Fast path: check depot_ids claim in token
     depot_ids = metadata.get("depot_ids")
     if isinstance(depot_ids, list):
         if depot_id in depot_ids:
@@ -156,15 +166,6 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: you do not have permission for this depot",
         )
-
-    # Check favonius_role — admins can access all depots
-    favonius_role = metadata.get("favonius_role", "")
-    if favonius_role == "admin":
-        logger.warning(
-            "Admin depot access bypass",
-            extra={"user_id": user.get("sub"), "depot_id": depot_id},
-        )
-        return
 
     # Fallback: DB-backed authorization check
     if pool is not None:
