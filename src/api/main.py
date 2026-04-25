@@ -2517,7 +2517,14 @@ async def _handle_optimization_run(
 
     Params: horizon_hours (int, default 24)
     """
-    horizon_hours = int(params.get("horizon_hours", 24))
+    raw_horizon_hours = params.get("horizon_hours", 24)
+    try:
+        parsed_horizon_hours = float(raw_horizon_hours)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="horizon_hours must be a number") from exc
+    if not parsed_horizon_hours.is_integer():
+        raise HTTPException(status_code=422, detail="horizon_hours must be an integer")
+    horizon_hours = int(parsed_horizon_hours)
     validate_horizon_hours(horizon_hours)
 
     if dry_run:
