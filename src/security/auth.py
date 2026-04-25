@@ -151,10 +151,6 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
     # Check favonius_role first — admins can access all depots
     favonius_role = metadata.get("favonius_role", "")
     if favonius_role == "admin":
-        logger.warning(
-            "Admin depot access bypass",
-            extra={"user_id": user.get("sub"), "depot_id": depot_id},
-        )
         return
 
     # Fast path: check depot_ids claim in token

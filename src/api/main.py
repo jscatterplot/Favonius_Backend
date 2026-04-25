@@ -1028,13 +1028,15 @@ async def list_my_depots(user: dict = Depends(verify_token)):
         raise DatabaseError("Database not available")
 
     try:
+        if role != "admin":
+            depot_ids = get_user_depot_ids(user)
+            if not depot_ids:
+                return {"depots": []}
+
         async with db_pools.static.acquire() as conn:
             if role == "admin":
                 depots = await db_queries.get_all_depots(conn)
             else:
-                depot_ids = get_user_depot_ids(user)
-                if not depot_ids:
-                    return {"depots": []}
                 depots = await db_queries.get_depots_by_ids(conn, depot_ids)
         return {"depots": depots}
     except asyncpg.PostgresError as e:
