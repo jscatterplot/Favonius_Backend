@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -100,6 +101,19 @@ _ABB_SAFE_MEASURANDS: frozenset[str] = frozenset(
 
 # OCPP 1.6 spec: SendLocalList max entries per ABB integration guide is 16.
 _LOCAL_LIST_MAX_ENTRIES = 16
+
+
+def _requires_abb_safe_measurands(vendor: Optional[str]) -> bool:
+    """Return whether meter measurands should be restricted to the ABB-safe set.
+
+    When the charger has not booted yet, fail closed: provisioning/reconnect
+    races must not be able to push ABB-unsafe measurands before vendor metadata
+    is available.
+    """
+    if not vendor or not vendor.strip():
+        return True
+    vendor_tokens = re.split(r"[^a-z0-9]+", vendor.strip().lower())
+    return "abb" in vendor_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -876,8 +890,10 @@ class FleetChargePoint(CP16):
         ABB Terra AC firmware ≤1.8.21 reboot-loops when the sampled-data list
         contains unsupported measurands.
         """
-        is_abb_vendor = (self.vendor or "").strip().lower() == "abb"
-        if is_abb_vendor and key in {"MeterValuesSampledData", "MeterValuesAlignedData"}:
+        if (
+            _requires_abb_safe_measurands(self.vendor)
+            and key in {"MeterValuesSampledData", "MeterValuesAlignedData"}
+        ):
             requested = {m.strip() for m in value.split(",") if m.strip()}
             unsupported = requested - _ABB_SAFE_MEASURANDS
             if unsupported:

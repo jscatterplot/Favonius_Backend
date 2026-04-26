@@ -32,6 +32,7 @@ from src.adapters.ocpp.charge_point import (
     _KNOWN_VENDORS,
     _LOCAL_LIST_MAX_ENTRIES,
     _now_iso_z,
+    _requires_abb_safe_measurands,
 )
 
 
@@ -241,6 +242,27 @@ class TestChangeConfigurationAbbGuard:
         cp.call.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_unsafe_measurand_raises_before_boot_vendor_known(self, cp) -> None:
+        cp.vendor = None
+        cp.call = AsyncMock()
+        with pytest.raises(ValueError, match="ABB-safe set"):
+            await cp.change_configuration(
+                "MeterValuesSampledData",
+                "Energy.Active.Import.Register,Frequency",
+            )
+        cp.call.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "vendor",
+        ["ABB", "ABB EV Solutions", "ABB Inc", "abb-terra"],
+    )
+    def test_abb_vendor_variants_require_guard(self, vendor: str) -> None:
+        assert _requires_abb_safe_measurands(vendor)
+
+    def test_non_abb_vendor_does_not_require_guard_after_boot(self) -> None:
+        assert not _requires_abb_safe_measurands("Etrel")
+
+    @pytest.mark.asyncio
     async def test_aligned_data_also_guarded(self, cp) -> None:
         cp.vendor = "ABB"
         cp.call = AsyncMock()
@@ -369,3 +391,12 @@ class TestOcpp16SessionAuthorize:
         session._timescale.next_charging_profile_id.assert_awaited_once()
         kwargs = session._cp.set_charging_profile.call_args.kwargs
         assert kwargs["profile_id"] == 7
+
+    def test_profile_id_fallback_counter_is_process_seeded(self, monkeypatch) -> None:
+        from src.websocket_handler import ocpp16_adapter as adapter
+
+        monkeypatch.setattr(adapter.time, "time_ns", lambda: 123)
+        monkeypatch.setattr(adapter.secrets, "randbelow", lambda _: 456)
+
+        counter = adapter._new_profile_id_fallback_counter()
+        assert next(counter) == adapter._PROFILE_ID_FALLBACK_START + 579

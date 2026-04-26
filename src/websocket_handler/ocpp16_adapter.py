@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
+import time
 from datetime import datetime, timezone
 from itertools import count
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -29,7 +31,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _PROFILE_ID_FALLBACK_START = 2_000_000_000
-_profile_id_fallback_counter = count(_PROFILE_ID_FALLBACK_START)
+_PROFILE_ID_FALLBACK_SPAN = 100_000_000
+
+
+def _new_profile_id_fallback_counter() -> count:
+    """Create a non-constant fallback chargingProfileId stream.
+
+    The DB sequence is the durable source of truth. This fallback only runs
+    during sequence outages, so seed it from process-start entropy instead of
+    a fixed constant to avoid deterministic reuse after a crash/restart.
+    """
+    seed_offset = (time.time_ns() + secrets.randbelow(_PROFILE_ID_FALLBACK_SPAN)) % (
+        _PROFILE_ID_FALLBACK_SPAN
+    )
+    return count(_PROFILE_ID_FALLBACK_START + seed_offset)
+
+
+_profile_id_fallback_counter = _new_profile_id_fallback_counter()
 
 
 class OCPP16Session:
