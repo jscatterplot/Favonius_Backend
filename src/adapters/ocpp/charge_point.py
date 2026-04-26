@@ -84,6 +84,9 @@ _KNOWN_VENDORS: frozenset[str] = frozenset(
         "Etrel",
     }
 )
+_NORMALIZED_KNOWN_VENDORS: frozenset[str] = frozenset(
+    re.sub(r"[^a-z0-9]+", "", vendor.lower()) for vendor in _KNOWN_VENDORS
+)
 
 
 # Measurands safe to push to ABB Terra AC chargers via
@@ -121,6 +124,18 @@ def _requires_abb_safe_measurands(vendor: Optional[str]) -> bool:
     if not vendor or not vendor.strip():
         return True
     return _is_abb_vendor(vendor)
+
+
+def _is_known_data_transfer_vendor(vendor_id: str) -> bool:
+    """Return whether DataTransfer vendorId is in the allowlist.
+
+    Accepts cosmetic variants (case/spacing/punctuation) and ABB token
+    variants so behavior matches the ABB guard path.
+    """
+    if not vendor_id or not vendor_id.strip():
+        return False
+    normalized_vendor_id = re.sub(r"[^a-z0-9]+", "", vendor_id.lower())
+    return normalized_vendor_id in _NORMALIZED_KNOWN_VENDORS or _is_abb_vendor(vendor_id)
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +570,7 @@ class FleetChargePoint(CP16):
             f"msg_id={message_id}, data_len={len(str(data))}"
         )
 
-        status = "Accepted" if vendor_id in _KNOWN_VENDORS else "UnknownVendorId"
+        status = "Accepted" if _is_known_data_transfer_vendor(vendor_id) else "UnknownVendorId"
         response_data = None
 
         if self._cb_data_transfer:
@@ -969,13 +984,13 @@ class FleetChargePoint(CP16):
         would create a security gap (some idTags would never authorize).
         """
         if (
-            _is_abb_vendor(self.vendor)
+            _requires_abb_safe_measurands(self.vendor)
             and local_authorization_list is not None
             and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
         ):
             logger.warning(
-                "SendLocalList to %s: ABB charger with %d entries exceeds %d-entry cap; "
-                "refusing — caller should fall back to central Authorize.",
+                "SendLocalList to %s: ABB/unknown vendor with %d entries exceeds "
+                "%d-entry cap; refusing — caller should fall back to central Authorize.",
                 self.id,
                 len(local_authorization_list),
                 _LOCAL_LIST_MAX_ENTRIES,

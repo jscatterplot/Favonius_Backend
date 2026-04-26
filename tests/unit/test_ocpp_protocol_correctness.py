@@ -194,6 +194,16 @@ class TestDataTransferAllowlist:
         assert result.status == "UnknownVendorId"
 
     @pytest.mark.asyncio
+    async def test_vendor_variants_are_accepted(self, cp) -> None:
+        for vendor in ("abb", "ABB Inc", "abb-terra", "Favonius Energy"):
+            result = await cp.on_data_transfer_request(
+                vendor_id=vendor,
+                message_id="diag",
+                data="payload",
+            )
+            assert result.status == "Accepted"
+
+    @pytest.mark.asyncio
     async def test_callback_can_override_status(self, mock_websocket) -> None:
         cb = AsyncMock(return_value=("Rejected", None))
         cp = FleetChargePoint(
@@ -333,6 +343,22 @@ class TestSendLocalListCap:
         )
         assert result == "Accepted"
         cp.call.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_over_cap_rejected_before_boot_vendor_known(self, cp) -> None:
+        cp.vendor = None
+        cp.call = AsyncMock()
+        entries = [
+            {"id_tag": f"TAG{i:03d}", "id_tag_info": {"status": "Accepted"}}
+            for i in range(_LOCAL_LIST_MAX_ENTRIES + 1)
+        ]
+        result = await cp.send_local_list(
+            list_version=1,
+            update_type="Full",
+            local_authorization_list=entries,
+        )
+        assert result == "NotSupported"
+        cp.call.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_empty_list_passes_through(self, cp) -> None:
