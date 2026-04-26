@@ -207,6 +207,7 @@ class TestApplication:
         mock_connection_monitor = AsyncMock()
         mock_timescale_client = AsyncMock()
         mock_supabase_client = AsyncMock()
+        reconciler_task = asyncio.create_task(asyncio.sleep(3600))
 
         app.websocket_server = mock_websocket_server
         app.health_server = mock_health_server
@@ -215,6 +216,7 @@ class TestApplication:
         app.connection_monitor = mock_connection_monitor
         app.timescale_client = mock_timescale_client
         app.supabase_client = mock_supabase_client
+        app._active_tx_reconciler_task = reconciler_task
 
         await app.stop()
 
@@ -226,6 +228,7 @@ class TestApplication:
         mock_health_server.stop.assert_called_once()
         mock_timescale_client.disconnect.assert_called_once()
         mock_supabase_client.disconnect.assert_called_once()
+        assert reconciler_task.cancelled()
 
     @pytest.mark.timeout(10)
     def test_setup_signal_handlers(self, mock_config):

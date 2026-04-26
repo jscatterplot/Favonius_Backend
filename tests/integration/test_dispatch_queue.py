@@ -223,8 +223,12 @@ class FakeTimescaleClient:
         # if it's missing, which is the path we want for unit tests.
         self.pg_pool = None
 
-    async def fetch_pending_commands_all(self, limit: int = 200):
-        return [dict(r) for r in self.queue.pending()[:limit]]
+    async def fetch_pending_commands_all(
+        self, limit: int = 200, exclude_charge_point_ids: list[str] | None = None
+    ):
+        excluded = set(exclude_charge_point_ids or [])
+        pending = [r for r in self.queue.pending() if r["charge_point_id"] not in excluded]
+        return [dict(r) for r in pending[:limit]]
 
     async def mark_command_sent(self, queue_id: int) -> None:
         row = self.queue.by_id(queue_id)

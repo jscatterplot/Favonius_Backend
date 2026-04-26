@@ -2043,7 +2043,7 @@ class TimescaleClient:
             )
 
     async def fetch_pending_commands_all(
-        self, limit: int = 200
+        self, limit: int = 200, exclude_charge_point_ids: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """Return non-expired pending commands across every charger, oldest first.
 
@@ -2052,18 +2052,34 @@ class TimescaleClient:
         ``fetch_pending_commands`` is for the boot-time replay path).
         """
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT queue_id, charge_point_id, connector_id,
-                       command_type, payload, attempt_count
-                  FROM charging_command_queue
-                 WHERE status = 'pending'
-                   AND expires_at > NOW()
-                 ORDER BY enqueued_at ASC
-                 LIMIT $1
-                """,
-                limit,
-            )
+            if exclude_charge_point_ids:
+                rows = await conn.fetch(
+                    """
+                    SELECT queue_id, charge_point_id, connector_id,
+                           command_type, payload, attempt_count
+                      FROM charging_command_queue
+                     WHERE status = 'pending'
+                       AND expires_at > NOW()
+                       AND NOT (charge_point_id = ANY($2::text[]))
+                     ORDER BY enqueued_at ASC
+                     LIMIT $1
+                    """,
+                    limit,
+                    exclude_charge_point_ids,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT queue_id, charge_point_id, connector_id,
+                           command_type, payload, attempt_count
+                      FROM charging_command_queue
+                     WHERE status = 'pending'
+                       AND expires_at > NOW()
+                     ORDER BY enqueued_at ASC
+                     LIMIT $1
+                    """,
+                    limit,
+                )
             return [dict(r) for r in rows]
 
     async def expire_overdue_commands(self) -> int:

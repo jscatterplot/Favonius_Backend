@@ -360,6 +360,7 @@ class Application:
             stop_tasks.append(self.queue_consumer.stop())
         if self._active_tx_reconciler_task:
             self._active_tx_reconciler_task.cancel()
+            stop_tasks.append(self._active_tx_reconciler_task)
 
         # Stop connection monitoring
         if self.connection_monitor:

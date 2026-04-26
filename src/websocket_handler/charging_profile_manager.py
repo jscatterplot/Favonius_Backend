@@ -913,6 +913,7 @@ class ChargingCommandQueueConsumer:
     POLL_INTERVAL_SECONDS = 2.0
     DEPTH_SAMPLE_INTERVAL_SECONDS = 10.0
     EXPIRY_SCAN_INTERVAL_SECONDS = 60.0
+    EXCLUDED_OFFLINE_RETRY_SECONDS = 30.0
     NOTIFY_CHANNEL = "charging_command_queue"
 
     def __init__(
@@ -942,6 +943,7 @@ class ChargingCommandQueueConsumer:
         self._wake_event = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
         self._listen_conn = None  # asyncpg connection held for LISTEN
+        self._offline_charge_points: Dict[str, float] = {}
 
     async def start(self) -> None:
         """Spawn the consumer + LISTEN + depth-sampler tasks."""
@@ -992,8 +994,23 @@ class ChargingCommandQueueConsumer:
         Public so the boot path or the admin endpoint can force an
         immediate sweep without waiting for the next poll tick.
         """
+        now = time.monotonic()
+        offline_cp_ids = [
+            cp_id
+            for cp_id, last_seen in self._offline_charge_points.items()
+            if now - last_seen < self.EXCLUDED_OFFLINE_RETRY_SECONDS
+        ]
+        # Drop stale entries so this map stays bounded and we periodically
+        # retry stations that may have reconnected without a DB NOTIFY.
+        self._offline_charge_points = {
+            cp_id: last_seen
+            for cp_id, last_seen in self._offline_charge_points.items()
+            if now - last_seen < self.EXCLUDED_OFFLINE_RETRY_SECONDS
+        }
         try:
-            rows = await self.timescale_client.fetch_pending_commands_all(limit=200)
+            rows = await self.timescale_client.fetch_pending_commands_all(
+                limit=200, exclude_charge_point_ids=offline_cp_ids
+            )
         except Exception as exc:
             self.logger.error("fetch_pending_commands_all failed: %s", exc)
             return 0
@@ -1096,6 +1113,7 @@ class ChargingCommandQueueConsumer:
 
     def _on_notify(self, _conn, _pid, _channel, _payload) -> None:
         """asyncpg listener callback. Wakes the consumer immediately."""
+        self._offline_charge_points.clear()
         self._wake_event.set()
 
     async def _depth_sampler(self) -> None:
@@ -1138,9 +1156,7 @@ class ChargingCommandQueueConsumer:
 
         cp = self.cp_lookup(cp_id)
         if cp is None:
-            PROFILE_PUSH_LATENCY.labels(
-                station_id=cp_id, outcome="offline"
-            ).observe(0.0)
+            self._offline_charge_points[cp_id] = time.monotonic()
             return
 
         # OCPP 1.6 (OCPP16Session) and OCPP 2.0.1 (EnhancedOCPPChargePoint)
