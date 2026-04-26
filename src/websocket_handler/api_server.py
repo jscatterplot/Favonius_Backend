@@ -58,10 +58,6 @@ class APIServer:
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
 
-    def attach_websocket_server(self, server: Any) -> None:
-        """Late-bind the OCPP server (created after this instance)."""
-        self.websocket_server = server
-
     def _setup_routes(self) -> None:
         """Setup API routes."""
 

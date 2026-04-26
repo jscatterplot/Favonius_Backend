@@ -1112,9 +1112,20 @@ class ChargingCommandQueueConsumer:
                         pass
                     self._listen_conn = None
 
-    def _on_notify(self, _conn, _pid, _channel, _payload) -> None:
+    def _on_notify(self, _conn, _pid, _channel, payload) -> None:
         """asyncpg listener callback. Wakes the consumer immediately."""
-        self._offline_charge_points.clear()
+        # Payload format from migration trigger: "<queue_id>:<charge_point_id>".
+        # Only clear the single station so other offline exclusions remain.
+        if payload:
+            try:
+                _, cp_id = str(payload).split(":", 1)
+                cp_id = cp_id.strip()
+                if cp_id:
+                    self._offline_charge_points.pop(cp_id, None)
+            except ValueError:
+                self._offline_charge_points.clear()
+        else:
+            self._offline_charge_points.clear()
         self._wake_event.set()
 
     async def _depth_sampler(self) -> None:
@@ -1190,6 +1201,15 @@ class ChargingCommandQueueConsumer:
                 queue_id,
                 exc,
             )
+            # Race: cp_lookup can return a connected session but the station may
+            # disconnect before push completes. Keep pending rows for boot replay.
+            if accepts_allow_enqueue and self.cp_lookup(cp_id) is None:
+                self._offline_charge_points[cp_id] = time.monotonic()
+                if should_record_latency:
+                    PROFILE_PUSH_LATENCY.labels(
+                        station_id=cp_id, outcome="failed"
+                    ).observe(max(time.perf_counter() - start, 1e-6))
+                return False
             try:
                 await self.timescale_client.mark_command_failed(queue_id, str(exc))
             except Exception as mark_exc:
