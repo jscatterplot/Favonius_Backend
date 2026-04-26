@@ -381,10 +381,8 @@ class TestOCPP16SessionRecovery:
     async def test_send_charging_profile_falls_back_to_enqueue(
         self, session, mock_timescale
     ) -> None:
-        """When the WS push raises, the profile must hit charging_command_queue."""
-        session._cp.set_charging_profile = AsyncMock(
-            side_effect=ConnectionError("not connected")
-        )
+        """When the WS push fails, the profile must hit charging_command_queue."""
+        session._cp.set_charging_profile = AsyncMock(return_value=False)
         mock_timescale.enqueue_charging_command = AsyncMock(return_value=99)
 
         ok = await session.send_charging_profile(
@@ -516,6 +514,31 @@ class TestOCPP16SessionRecovery:
 
         assert session._cp.transactions[1] == 555
         assert session._cp.transactions[2] == 556
+
+    @pytest.mark.asyncio
+    async def test_on_boot_keeps_newest_transaction_for_connector(
+        self, session, mock_timescale
+    ) -> None:
+        older = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc)
+        newer = datetime(2026, 4, 26, 12, 5, tzinfo=timezone.utc)
+        mock_timescale.fetch_open_sessions = AsyncMock(
+            return_value=[
+                {"transaction_id": 556, "connector_id": 1, "start_time": newer},
+                {"transaction_id": 555, "connector_id": 1, "start_time": older},
+            ]
+        )
+
+        await session._on_boot(
+            cp_id="test_station_001",
+            vendor="V",
+            model="M",
+            serial_number="S",
+            firmware_version="F",
+        )
+        await asyncio.sleep(0)
+
+        assert session._cp.transactions[1] == 556
+        assert session._cp.current_transaction_id == 556
 
     @pytest.mark.asyncio
     async def test_on_boot_tolerates_fetch_failure(

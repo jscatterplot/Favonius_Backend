@@ -1828,7 +1828,7 @@ class TimescaleClient:
                  WHERE station_id = $1
                    AND end_time IS NULL
                    AND transaction_id IS NOT NULL
-                 ORDER BY start_time DESC
+                 ORDER BY start_time ASC
                 """,
                 station_id,
             )
@@ -1985,7 +1985,7 @@ class TimescaleClient:
             await conn.execute(
                 """
                 UPDATE charging_command_queue
-                   SET status = 'sent',
+                   SET status = 'acked',
                        sent_at = NOW(),
                        acked_at = NOW(),
                        attempt_count = attempt_count + 1

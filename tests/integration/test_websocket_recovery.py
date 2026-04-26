@@ -255,15 +255,13 @@ async def test_offline_profile_is_queued_then_replayed_on_boot(
 ):
     """``send_charging_profile`` against a disconnected charger writes a
     pending row to ``charging_command_queue``; replaying drains it and
-    marks the row ``sent``."""
+    marks the row ``acked``."""
     station_id = cleanup_station
 
     session = _make_session(station_id, timescale_client)
 
-    # Force the WS push to fail — simulates the charger being offline.
-    session._cp.set_charging_profile = AsyncMock(
-        side_effect=ConnectionError("not connected")
-    )
+    # FleetChargePoint catches transport failures internally and returns False.
+    session._cp.set_charging_profile = AsyncMock(return_value=False)
 
     profile = {
         "chargingProfileId": 4242,
@@ -307,7 +305,7 @@ async def test_offline_profile_is_queued_then_replayed_on_boot(
             """,
             station_id,
         )
-        assert status == "sent"
+        assert status == "acked"
 
 
 @pytest.mark.asyncio

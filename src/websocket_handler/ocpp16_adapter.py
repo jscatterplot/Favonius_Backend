@@ -155,7 +155,7 @@ class OCPP16Session:
         )
 
         try:
-            return await self._cp.set_charging_profile(
+            accepted = await self._cp.set_charging_profile(
                 connector_id=evse_id,
                 charging_schedule=schedule_periods,
                 profile_purpose=charging_profile.get(
@@ -169,25 +169,30 @@ class OCPP16Session:
         except Exception as exc:
             if not allow_enqueue:
                 raise
+            accepted = False
             logger.warning(
                 "set_charging_profile push failed for station=%s connector=%s: %s — enqueuing",
                 self._station_id,
                 evse_id,
                 exc,
             )
-            try:
-                await self._timescale.enqueue_charging_command(
-                    charge_point_id=self._station_id,
-                    connector_id=evse_id,
-                    payload=charging_profile,
-                )
-            except Exception as enq_exc:
-                logger.error(
-                    "Failed to enqueue charging profile for station=%s: %s",
-                    self._station_id,
-                    enq_exc,
-                )
+        if accepted:
+            return True
+        if not allow_enqueue:
             return False
+        try:
+            await self._timescale.enqueue_charging_command(
+                charge_point_id=self._station_id,
+                connector_id=evse_id,
+                payload=charging_profile,
+            )
+        except Exception as enq_exc:
+            logger.error(
+                "Failed to enqueue charging profile for station=%s: %s",
+                self._station_id,
+                enq_exc,
+            )
+        return False
 
     async def replay_queued_commands(self) -> int:
         """Flush ``charging_command_queue`` rows for this station.
@@ -196,7 +201,7 @@ class OCPP16Session:
         Each pending row is pushed via ``send_charging_profile`` with
         ``allow_enqueue=False`` so a transient failure during replay does not
         re-enqueue an already-queued row. Returns the number of rows that
-        were marked ``sent``.
+        were marked ``acked``.
         """
         try:
             rows = await self._timescale.fetch_pending_commands(self._station_id)
@@ -350,7 +355,13 @@ class OCPP16Session:
             logger.error(
                 "fetch_open_sessions failed for station=%s: %s", cp_id, exc
             )
-        for row in open_rows:
+        def _session_start(row: Dict[str, Any]) -> datetime:
+            start_time = row.get("start_time")
+            if isinstance(start_time, datetime):
+                return start_time
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+        for row in sorted(open_rows, key=_session_start):
             connector_id = row["connector_id"]
             tx_id = row["transaction_id"]
             if connector_id is None or tx_id is None:
