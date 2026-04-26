@@ -1770,6 +1770,39 @@ class TimescaleClient:
 
             return bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8"))
 
+    # ===== OCPP 1.6 PILOT HELPERS (migration 012) =====
+
+    async def next_transaction_id(self) -> int:
+        """Return the next OCPP 1.6 transactionId from the DB sequence.
+
+        Uses the ``ocpp_transaction_id`` sequence created in
+        migrations/012_ocpp_pilot_hardening.sql so IDs survive restarts.
+        """
+        async with self.pg_pool.acquire() as conn:
+            return int(await conn.fetchval("SELECT nextval('ocpp_transaction_id')"))
+
+    async def next_charging_profile_id(self) -> int:
+        """Return the next OCPP 1.6 chargingProfileId from the DB sequence."""
+        async with self.pg_pool.acquire() as conn:
+            return int(await conn.fetchval("SELECT nextval('ocpp_charging_profile_id')"))
+
+    async def lookup_id_tag(self, id_tag: str) -> Optional[Dict[str, Any]]:
+        """Look up an OCPP idTag in the vehicles table.
+
+        Returns ``{"vehicle_id": str, "depot_id": str}`` if the tag is
+        registered, ``None`` otherwise. Used by the Authorize handler to
+        return ``Accepted`` for known tags and ``Invalid`` for unknown ones.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT vehicle_id::text AS vehicle_id, depot_id::text AS depot_id "
+                "FROM vehicles WHERE id_tag = $1",
+                id_tag,
+            )
+            if not row:
+                return None
+            return {"vehicle_id": row["vehicle_id"], "depot_id": row["depot_id"]}
+
     # ===== PLUG & CHARGE METHODS =====
 
     async def store_contract_info(self, contract_data: Dict[str, Any]) -> None:
