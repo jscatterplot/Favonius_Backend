@@ -456,26 +456,26 @@ class OCPP16Session:
             return not closed
         state = getattr(connection, "state", None)
         if state is not None:
-            state_name = getattr(state, "name", str(state)).upper()
+            state_name = str(getattr(state, "name", state)).upper()
             if "OPEN" in state_name:
                 return True
             if any(token in state_name for token in ("CLOSED", "CLOSING")):
                 return False
         client_state = getattr(connection, "client_state", None)
         if client_state is not None:
-            state_name = getattr(client_state, "name", str(client_state)).upper()
+            state_name = str(getattr(client_state, "name", client_state)).upper()
             if state_name == "CONNECTED":
                 return True
             if state_name in {"DISCONNECTED", "CLOSED"}:
                 return False
         application_state = getattr(connection, "application_state", None)
         if application_state is not None:
-            state_name = getattr(application_state, "name", str(application_state)).upper()
+            state_name = str(getattr(application_state, "name", application_state)).upper()
             if state_name == "CONNECTED":
                 return True
             if state_name in {"DISCONNECTED", "CLOSED"}:
                 return False
-        return True
+        return False
 
     async def _on_meter_values(
         self,

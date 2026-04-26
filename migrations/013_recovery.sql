@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS charging_command_queue (
     connector_id     INTEGER NOT NULL,
     command_type     TEXT NOT NULL,                              -- 'set_charging_profile'
     payload          JSONB NOT NULL,                             -- full OCPP profile dict
-    status           TEXT NOT NULL DEFAULT 'pending',            -- pending|sent|acked|failed|expired
+    status           TEXT NOT NULL DEFAULT 'pending',            -- pending|acked|failed|expired
     enqueued_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     sent_at          TIMESTAMPTZ,
     acked_at         TIMESTAMPTZ,
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS charging_command_queue (
     last_error       TEXT,
     attempt_count    INTEGER NOT NULL DEFAULT 0,
     CONSTRAINT charging_command_queue_status_chk
-        CHECK (status IN ('pending', 'sent', 'acked', 'failed', 'expired'))
+        CHECK (status IN ('pending', 'acked', 'failed', 'expired'))
 );
 
 -- Replay path: pending commands for a given cp_id, oldest first.
