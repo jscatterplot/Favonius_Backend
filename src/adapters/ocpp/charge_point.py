@@ -531,7 +531,7 @@ class FleetChargePoint(CP16):
 
         logger.info(
             f"DataTransfer from {self.id}: vendor={vendor_id}, "
-            f"msg_id={message_id}, data={data!r}"
+            f"msg_id={message_id}, data_len={len(str(data))}"
         )
 
         status = "Accepted" if vendor_id in _KNOWN_VENDORS else "UnknownVendorId"
@@ -876,7 +876,8 @@ class FleetChargePoint(CP16):
         ABB Terra AC firmware ≤1.8.21 reboot-loops when the sampled-data list
         contains unsupported measurands.
         """
-        if key in {"MeterValuesSampledData", "MeterValuesAlignedData"}:
+        is_abb_vendor = (self.vendor or "").strip().lower() == "abb"
+        if is_abb_vendor and key in {"MeterValuesSampledData", "MeterValuesAlignedData"}:
             requested = {m.strip() for m in value.split(",") if m.strip()}
             unsupported = requested - _ABB_SAFE_MEASURANDS
             if unsupported:

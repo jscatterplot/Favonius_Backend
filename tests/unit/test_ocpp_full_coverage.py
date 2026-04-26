@@ -136,7 +136,7 @@ async def test_authorize_callback_can_reject(mock_ws):
 @pytest.mark.asyncio
 async def test_data_transfer_default_accepts(cp):
     resp = await cp.on_data_transfer_request(
-        "VendorX",
+        "ABB",
         message_id="msg1",
         data="hello",
     )

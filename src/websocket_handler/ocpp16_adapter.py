@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from itertools import count
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ocpp.v16.enums import AuthorizationStatus
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from .timescale_client import TimescaleClient
 
 logger = logging.getLogger(__name__)
+_PROFILE_ID_FALLBACK_START = 2_000_000_000
+_profile_id_fallback_counter = count(_PROFILE_ID_FALLBACK_START)
 
 
 class OCPP16Session:
@@ -98,12 +101,13 @@ class OCPP16Session:
             try:
                 profile_id = await self._timescale.next_charging_profile_id()
             except Exception as exc:
+                profile_id = next(_profile_id_fallback_counter)
                 logger.warning(
-                    "next_charging_profile_id failed for station=%s; falling back to 1: %s",
+                    "next_charging_profile_id failed for station=%s; using local fallback id=%s: %s",
                     self._station_id,
+                    profile_id,
                     exc,
                 )
-                profile_id = 1
 
         return await self._cp.set_charging_profile(
             connector_id=evse_id,

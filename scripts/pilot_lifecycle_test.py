@@ -65,9 +65,8 @@ logger = logging.getLogger("pilot")
 
 def _now_iso() -> str:
     """OCPP 1.6 timestamp: UTC, milliseconds, trailing Z."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 class PilotChargePoint(CP):
