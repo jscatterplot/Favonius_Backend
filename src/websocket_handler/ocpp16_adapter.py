@@ -44,7 +44,7 @@ def _new_profile_id_fallback_counter() -> count:
     seed_offset = (time.time_ns() + secrets.randbelow(_PROFILE_ID_FALLBACK_SPAN)) % (
         _PROFILE_ID_FALLBACK_SPAN
     )
-    return count(_PROFILE_ID_FALLBACK_START + seed_offset)
+    return count(seed_offset)
 
 
 _profile_id_fallback_counter = _new_profile_id_fallback_counter()
@@ -119,7 +119,9 @@ class OCPP16Session:
             try:
                 profile_id = await self._timescale.next_charging_profile_id()
             except Exception as exc:
-                profile_id = next(_profile_id_fallback_counter)
+                profile_id = _PROFILE_ID_FALLBACK_START + (
+                    next(_profile_id_fallback_counter) % _PROFILE_ID_FALLBACK_SPAN
+                )
                 logger.warning(
                     "next_charging_profile_id failed for station=%s; using local fallback id=%s: %s",
                     self._station_id,
