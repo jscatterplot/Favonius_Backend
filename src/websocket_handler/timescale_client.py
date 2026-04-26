@@ -1990,6 +1990,7 @@ class TimescaleClient:
                        acked_at = NOW(),
                        attempt_count = attempt_count + 1
                  WHERE queue_id = $1
+                   AND status = 'pending'
                 """,
                 queue_id,
             )
@@ -2004,6 +2005,7 @@ class TimescaleClient:
                        last_error = $2,
                        attempt_count = attempt_count + 1
                  WHERE queue_id = $1
+                   AND status = 'pending'
                 """,
                 queue_id,
                 error[:500],

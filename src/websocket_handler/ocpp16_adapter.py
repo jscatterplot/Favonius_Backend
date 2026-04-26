@@ -79,6 +79,7 @@ class OCPP16Session:
         # row alongside the generated tx_id. Safe because FleetChargePoint
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
+        self._replay_task: Optional[asyncio.Task[None]] = None
 
         self._cp = FleetChargePoint(
             id=station_id,
@@ -170,6 +171,14 @@ class OCPP16Session:
             if not allow_enqueue:
                 raise
             accepted = False
+            if self._is_connection_open():
+                logger.warning(
+                    "set_charging_profile raised for station=%s connector=%s while online: %s",
+                    self._station_id,
+                    evse_id,
+                    exc,
+                )
+                return False
             logger.warning(
                 "set_charging_profile push failed for station=%s connector=%s: %s — enqueuing",
                 self._station_id,
@@ -179,6 +188,13 @@ class OCPP16Session:
         if accepted:
             return True
         if not allow_enqueue:
+            return False
+        if self._is_connection_open():
+            logger.info(
+                "SetChargingProfile rejected by online charger station=%s connector=%s; not enqueuing",
+                self._station_id,
+                evse_id,
+            )
             return False
         try:
             await self._timescale.enqueue_charging_command(
@@ -278,9 +294,9 @@ class OCPP16Session:
         by the most recent ``_on_transaction_start`` so the boot-reload path
         can find the session if the handler restarts mid-transaction.
         """
-        tx_id = await self._timescale.next_transaction_id()
         pending = self._pending_start
         self._pending_start = None
+        tx_id = await self._timescale.next_transaction_id()
         if pending is not None:
             try:
                 await self._timescale.insert_open_session(
@@ -400,7 +416,9 @@ class OCPP16Session:
                 cp_id,
             )
 
-        asyncio.create_task(self._delayed_replay())
+        if self._replay_task is not None and not self._replay_task.done():
+            self._replay_task.cancel()
+        self._replay_task = asyncio.create_task(self._delayed_replay())
 
     async def _delayed_replay(self) -> None:
         """Run the queued-command replay shortly after BootNotification.
@@ -412,12 +430,52 @@ class OCPP16Session:
         try:
             await asyncio.sleep(REPLAY_BACKOFF_SECONDS)
             await self.replay_queued_commands()
+        except asyncio.CancelledError:
+            logger.debug("Queued-command replay cancelled for station=%s", self._station_id)
+            raise
         except Exception as exc:
             logger.error(
                 "Queued-command replay failed for station=%s: %s",
                 self._station_id,
                 exc,
             )
+        finally:
+            current = asyncio.current_task()
+            if current is not None and self._replay_task is current:
+                self._replay_task = None
+
+    def _is_connection_open(self) -> bool:
+        """Best-effort check whether the charger socket is still open."""
+        connection = getattr(self._cp, "_connection", None)
+        if connection is None:
+            connection = getattr(self._cp, "connection", None)
+        if connection is None:
+            return False
+        closed = getattr(connection, "closed", None)
+        if isinstance(closed, bool):
+            return not closed
+        state = getattr(connection, "state", None)
+        if state is not None:
+            state_name = getattr(state, "name", str(state)).upper()
+            if "OPEN" in state_name:
+                return True
+            if any(token in state_name for token in ("CLOSED", "CLOSING")):
+                return False
+        client_state = getattr(connection, "client_state", None)
+        if client_state is not None:
+            state_name = getattr(client_state, "name", str(client_state)).upper()
+            if state_name == "CONNECTED":
+                return True
+            if state_name in {"DISCONNECTED", "CLOSED"}:
+                return False
+        application_state = getattr(connection, "application_state", None)
+        if application_state is not None:
+            state_name = getattr(application_state, "name", str(application_state)).upper()
+            if state_name == "CONNECTED":
+                return True
+            if state_name in {"DISCONNECTED", "CLOSED"}:
+                return False
+        return True
 
     async def _on_meter_values(
         self,

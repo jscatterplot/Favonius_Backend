@@ -406,6 +406,30 @@ class TestOCPP16SessionRecovery:
         assert kwargs["connector_id"] == 1
 
     @pytest.mark.asyncio
+    async def test_send_charging_profile_does_not_enqueue_rejected_online_charger(
+        self, session, mock_timescale
+    ) -> None:
+        """Explicit rejection from an online charger must not be queued."""
+        session._cp.set_charging_profile = AsyncMock(return_value=False)
+        mock_timescale.enqueue_charging_command = AsyncMock()
+        with patch.object(session, "_is_connection_open", return_value=True):
+            ok = await session.send_charging_profile(
+                1,
+                {
+                    "chargingProfileId": 1,
+                    "stackLevel": 0,
+                    "chargingProfilePurpose": "TxDefaultProfile",
+                    "chargingProfileKind": "Absolute",
+                    "chargingSchedule": {
+                        "chargingRateUnit": "W",
+                        "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 1000}],
+                    },
+                },
+            )
+        assert ok is False
+        mock_timescale.enqueue_charging_command.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_send_charging_profile_no_enqueue_when_disabled(
         self, session, mock_timescale
     ) -> None:
@@ -549,6 +573,30 @@ class TestOCPP16SessionRecovery:
         assert session._cp.transactions[2] == 556
 
     @pytest.mark.asyncio
+    async def test_on_boot_cancels_previous_delayed_replay(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.fetch_open_sessions = AsyncMock(return_value=[])
+        previous = MagicMock()
+        previous.done.return_value = False
+        previous.cancel = MagicMock()
+        session._replay_task = previous
+
+        await session._on_boot(
+            cp_id="test_station_001",
+            vendor="V",
+            model="M",
+            serial_number="S",
+            firmware_version="F",
+        )
+        await asyncio.sleep(0)
+
+        previous.cancel.assert_called_once()
+        assert session._replay_task is not None
+        if session._replay_task is not None:
+            session._replay_task.cancel()
+
+    @pytest.mark.asyncio
     async def test_on_boot_keeps_newest_transaction_for_connector(
         self, session, mock_timescale
     ) -> None:
@@ -670,6 +718,22 @@ class TestOCPP16SessionRecovery:
         assert session._pending_start is None
 
     @pytest.mark.asyncio
+    async def test_next_transaction_id_clears_pending_when_sequence_fails(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.next_transaction_id = AsyncMock(side_effect=RuntimeError("db down"))
+        session._pending_start = {
+            "connector_id": 1,
+            "evse_id": 1,
+            "id_tag": "TAG_Y",
+            "start_time": datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc),
+        }
+
+        with pytest.raises(RuntimeError):
+            await session._next_transaction_id()
+        assert session._pending_start is None
+
+    @pytest.mark.asyncio
     async def test_next_transaction_id_skips_insert_without_pending(
         self, session, mock_timescale
     ) -> None:
@@ -681,3 +745,4 @@ class TestOCPP16SessionRecovery:
 
         assert tx_id == 1
         mock_timescale.insert_open_session.assert_not_called()
+
