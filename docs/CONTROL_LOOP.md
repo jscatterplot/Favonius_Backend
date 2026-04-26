@@ -102,6 +102,12 @@ After optimization completes:
 4. Dispatch via OCPP SetChargingProfile with retry logic
 5. Store dispatch results in database
 
+If a charger is offline at dispatch time, the legacy WS handler enqueues
+the profile to ``charging_command_queue`` (migration 013). On the next
+BootNotification, ``OCPP16Session._on_boot`` triggers
+``replay_queued_commands`` to flush pending rows for that charger within
+the configured ``REPLAY_BACKOFF_SECONDS`` window.
+
 ## Error Handling and Resilience
 
 ### Retry Logic

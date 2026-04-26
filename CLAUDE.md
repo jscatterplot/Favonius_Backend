@@ -151,11 +151,13 @@ Favonius_Backend/
 │
 ├── src/websocket_handler/       # Legacy OCPP WebSocket service (standalone)
 │   ├── main.py                  # Application entry point + orchestrator
-│   ├── server.py                # OCPPWebSocketServer
+│   ├── server.py                # OCPPWebSocketServer (close hook persists Unavailable + last_seen_at)
 │   ├── config.py                # Config dataclass from env vars
 │   ├── message_handler.py       # OCPP message dispatch
 │   ├── connection_manager.py    # Active session tracking
-│   ├── timescale_client.py      # TimescaleDB async client
+│   ├── timescale_client.py      # TimescaleDB async client (incl. OCPP recovery helpers)
+│   ├── ocpp_handler.py          # OCPP 2.0.1 EnhancedOCPPChargePoint
+│   ├── ocpp16_adapter.py        # OCPP 1.6 OCPP16Session (wraps FleetChargePoint, reload-on-boot + queue replay)
 │   ├── optimization_engine.py   # Heuristic scheduler (legacy)
 │   ├── price_feeder.py          # CAISO price ingestion (legacy)
 │   ├── analytics_service.py     # Aggregated metrics for REST API
@@ -166,7 +168,9 @@ Favonius_Backend/
 │   ├── 001_initial_schema.sql   # Core schema + seed data
 │   ├── 003_vdv463_schema.sql
 │   ├── 004_connector_status.sql
-│   └── 005_telemetry_primary_key.sql
+│   ├── 005_telemetry_primary_key.sql
+│   ├── 012_ocpp_pilot_hardening.sql  # OCPP 1.6 sequences + station_credentials
+│   └── 013_recovery.sql         # charging_command_queue + cross-restart recovery
 │
 ├── tests/
 │   ├── unit/                    # Unit tests (mock everything)
@@ -307,15 +311,19 @@ These come directly from the PRD and are non-negotiable:
 ### Operational tables
 - `schedules` — Vehicle route schedules (departure/return times)
 - `optimization_runs` — Solver results, schedule JSON, status, solver_used
-- `charging_commands` — OCPP SetChargingProfile records and acknowledgment status
+- `charging_commands` — OCPP SetChargingProfile records and acknowledgment status (per-run audit, FK to `chargers`)
+- `charging_command_queue` — Durable buffer for SetChargingProfile pushes that arrived while a charger was offline; replayed by the legacy WS handler on next BootNotification (migration 013)
+- `charging_sessions` — OCPP 1.6 transaction lifecycle. `transaction_id` (BIGINT, from `ocpp_transaction_id` sequence), `last_seen_at` stamped by the WS close hook
 - `interdepot_messages` — Cross-depot vehicle handoff messages
 - `trigger_log` — Audit trail of re-optimization triggers
-- `connector_status` — OCPP StatusNotification records per connector
+- `connector_status` — OCPP StatusNotification records per connector. Append-only; the latest row per `(station_id, connector_id)` is the current state. The legacy WS handler appends an `Unavailable`/`ConnectionLost` row when the WebSocket drops.
 
 ### Key columns
 - All UUIDs use `gen_random_uuid()` as default
 - `solver_used` values: `'gurobi'` | `'highs'`
 - `optimization_runs.status` values: `'optimal'` | `'feasible'` | `'degraded'` | `'infeasible'` | `'timeout'`
+- `charging_command_queue.status` values: `'pending'` | `'sent'` | `'acked'` | `'failed'` | `'expired'`
+- `ocpp_transaction_id` / `ocpp_charging_profile_id` sequences (migration 012) provide restart-safe OCPP 1.6 integer IDs
 
 ### Migrations
 Migrations in `migrations/` run automatically on `docker-compose up` (mounted to `/docker-entrypoint-initdb.d`). To run manually: `python scripts/run_migrations.py`.
@@ -358,10 +366,16 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 Full coverage of all 28 OCPP 1.6 actions including: BootNotification, Heartbeat, Authorize, StartTransaction, StopTransaction, MeterValues, StatusNotification, ChangeAvailability, ChangeConfiguration, ClearCache, DataTransfer, GetConfiguration, RemoteStartTransaction, RemoteStopTransaction, Reset, SetChargingProfile, ClearChargingProfile, GetCompositeSchedule, UnlockConnector, GetDiagnostics, UpdateFirmware, and more.
 
 ### Key OCPP data flows
-- `idTag` in Authorize/StartTransaction → mapped to `vehicle_id` (via `vehicles.id_tag`)
+- `idTag` in Authorize/StartTransaction → looked up against `vehicles.id_tag`; unknown tags get `Invalid`
 - `MeterValues` → `telemetry` table (SoC, charging_kw, max_charge_kw updated)
-- `StatusNotification` → `connector_status` table
-- `SetChargingProfile` → sent after each optimization run
+- `StatusNotification` → `connector_status` table (both the new adapter and the legacy `OCPP16Session` write here)
+- `StartTransaction` → `transactionId` from `ocpp_transaction_id` sequence; an open `charging_sessions` row is inserted so a handler restart can rehydrate it
+- `StopTransaction` → closes the `charging_sessions` row (`end_time`)
+- `SetChargingProfile` → sent after each optimization run; if the charger is offline, the legacy handler enqueues the profile to `charging_command_queue` and replays it on the next BootNotification
+
+### Cross-restart recovery (legacy handler, migrations 012 + 013)
+- BootNotification: `OCPP16Session._on_boot` reloads open sessions into `FleetChargePoint.transactions` and triggers `replay_queued_commands` so any pending profiles are pushed within ~1s
+- WebSocket close: `OCPPWebSocketServer._cleanup_connection` appends an `Unavailable`/`ConnectionLost` row to `connector_status` and stamps `last_seen_at` on every still-open session at the station
 
 ### Connector path routing
 ```

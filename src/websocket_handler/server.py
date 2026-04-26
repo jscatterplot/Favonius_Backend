@@ -622,6 +622,27 @@ class OCPPWebSocketServer:
             self.charge_points.pop(station_id, None)
             if self.connection_manager:
                 await self.connection_manager.unregister_connection(station_id)
+            # Persist that the charger is gone so reads (alerts, state) and
+            # the boot-replay path can distinguish a stale-but-open session
+            # from a live one. Both calls are best-effort; the connection is
+            # already torn down.
+            if self.timescale_client is not None:
+                try:
+                    await self.timescale_client.mark_connectors_unavailable(station_id)
+                except Exception as exc:
+                    self.logger.warning(
+                        "mark_connectors_unavailable failed for station=%s: %s",
+                        station_id,
+                        exc,
+                    )
+                try:
+                    await self.timescale_client.mark_sessions_seen(station_id)
+                except Exception as exc:
+                    self.logger.warning(
+                        "mark_sessions_seen failed for station=%s: %s",
+                        station_id,
+                        exc,
+                    )
 
         # Clean rate limit data - handled by RateLimiter class cleanup
         # self.rate_limits.pop(connection_id, None)  # Removed - using RateLimiter class
