@@ -335,7 +335,7 @@ class DepotController:
         Args:
             result: Optimization result with charging schedule
         """
-        from ..adapters.ocpp.dispatch import _enqueue
+        from ..adapters.ocpp.dispatch import dispatch_charging_profiles
 
         logger.info(
             "Enqueuing charging commands for depot %s (%d vehicles)",
@@ -358,103 +358,30 @@ class DepotController:
         if vehicle_to_ocpp is None:
             vehicle_to_ocpp = {}
 
-        dispatch_results: dict[str, dict] = {}
-        dispatch_window_hours = 4
-        dispatch_periods = int(dispatch_window_hours / self.config.delta_t)
+        vehicle_to_charger_map: dict[str, tuple[str, int]] = {}
+        for vehicle_id, cp_value in vehicle_to_ocpp.items():
+            if isinstance(cp_value, tuple) and len(cp_value) == 2:
+                vehicle_to_charger_map[vehicle_id] = (str(cp_value[0]), int(cp_value[1]))
+            elif cp_value:
+                vehicle_to_charger_map[vehicle_id] = (str(cp_value), 1)
 
-        for vehicle_id, schedule in result.schedule.items():
-            charge_point_id = vehicle_to_ocpp.get(vehicle_id, vehicle_id)
-
-            # Build charging schedule periods in OCPP form (start_period in
-            # seconds, limit in watts) for the next dispatch window.
-            charging_schedule = []
-            for t in range(min(dispatch_periods, len(schedule["charging_power"]))):
-                power = schedule["charging_power"][t]
-                if power > 0.1:
-                    charging_schedule.append(
-                        {
-                            "start_period": t * int(self.config.delta_t * 3600),
-                            "limit": int(power * 1000),
-                            "number_phases": 3,
-                        }
-                    )
-
-            if not charging_schedule:
-                logger.debug(f"No charging required for vehicle {vehicle_id}")
-                dispatch_results[vehicle_id] = {
-                    "success": True,
-                    "message": "no_charging_required",
-                }
-                continue
-
-            if not self._validate_charging_profile(charging_schedule):
-                logger.warning(
-                    "Invalid charging profile for %s — not enqueued", vehicle_id
-                )
-                dispatch_results[vehicle_id] = {"success": False, "error": "invalid_profile"}
-                OCPP_DISPATCH_FAILURES.labels(
-                    depot_id=self.depot_id, error_type="invalid_profile"
-                ).inc()
-                continue
-
-            # Build the full SetChargingProfile dict the consumer will hand
-            # to ``send_charging_profile``. We wrap the periods in the
-            # standard OCPP envelope so OCPP16Session.send_charging_profile
-            # can read ``chargingSchedule`` directly.
-            payload = {
-                "chargingProfilePurpose": "TxDefaultProfile",
-                "chargingProfileKind": "Absolute",
-                "stackLevel": 0,
-                "chargingSchedule": {
-                    "chargingRateUnit": "W",
-                    "chargingSchedulePeriod": charging_schedule,
-                },
-            }
-
-            try:
-                queue_id = await _enqueue(
-                    self.pools.ts,
-                    charge_point_id=charge_point_id,
-                    connector_id=1,
-                    payload=payload,
-                    expires_in_min=60,
-                )
-                dispatch_results[vehicle_id] = {
-                    "success": True,
-                    "queue_id": queue_id,
-                    "periods": len(charging_schedule),
-                }
-                OCPP_DISPATCH_SUCCESS.labels(depot_id=self.depot_id).inc()
-                logger.info(
-                    "Enqueued profile queue_id=%s vehicle=%s cp=%s periods=%d",
-                    queue_id,
-                    vehicle_id,
-                    charge_point_id,
-                    len(charging_schedule),
-                )
-            except Exception as exc:
-                logger.error(
-                    "Failed to enqueue profile for vehicle %s (cp=%s): %s",
-                    vehicle_id,
-                    charge_point_id,
-                    exc,
-                )
-                dispatch_results[vehicle_id] = {
-                    "success": False,
-                    "error": str(exc),
-                }
-                OCPP_DISPATCH_FAILURES.labels(
-                    depot_id=self.depot_id, error_type="enqueue_failed"
-                ).inc()
-
-        # Per-run audit ledger. Best-effort: queue is the source of truth.
-        try:
-            await self._store_dispatch_results(result.run_id, dispatch_results)
-        except Exception as exc:
-            logger.warning("Failed to write charging_commands audit row: %s", exc)
-
-        successful = sum(1 for r in dispatch_results.values() if r.get("success"))
-        total = len(dispatch_results)
+        enqueue_results = await dispatch_charging_profiles(
+            result,
+            pools=self.pools,
+            depot_id=self.depot_id,
+            vehicle_to_charger_map=vehicle_to_charger_map,
+            delta_t=self.config.delta_t,
+            expires_in_min=60,
+        )
+        successful = sum(1 for dispatched in enqueue_results.values() if dispatched)
+        total = len(enqueue_results)
+        failed = total - successful
+        if successful:
+            OCPP_DISPATCH_SUCCESS.labels(depot_id=self.depot_id).inc(successful)
+        if failed:
+            OCPP_DISPATCH_FAILURES.labels(depot_id=self.depot_id, error_type="enqueue_failed").inc(
+                failed
+            )
         logger.info(
             "Enqueue complete: %d/%d enqueued for depot %s",
             successful,
