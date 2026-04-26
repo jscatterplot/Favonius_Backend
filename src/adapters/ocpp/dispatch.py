@@ -1,210 +1,271 @@
-"""Charging profile dispatch from optimization results.
+"""Charging-profile dispatch from optimization results.
 
-Reference: Development plan Step 3.1, PRD.md#9-1-ocpp-integration
+Production ships ``OCPP_SERVER_ENABLED=false`` on the FastAPI service —
+the OCPP WebSocket server only runs in the *legacy* websocket_handler
+process — so calling ``server.get_charge_point(...).set_charging_profile(...)``
+in-process always returned ``None`` and the schedule was dropped on the
+floor.
+
+Session 3 makes the queue the *primary* dispatch path:
+
+  Optimizer → INSERT charging_command_queue (status='pending')
+            → pg_notify('charging_command_queue', '<queue_id>:<cp_id>')
+            → ChargingCommandQueueConsumer (in websocket_handler) drains
+              and pushes SetChargingProfile to the connected charger.
+
+Reference: PRD §9.1 (OCPP), §10.5 (observability), session 3 brief.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 import asyncpg
 
 from src.core.models import OptimizationResult
 
+from ...db.pools import DatabasePools
 from .charge_point import convert_schedule_to_ocpp_profile
 from .mapping import get_vehicle_to_charger_map
-from .server import OCPPServer
-from ...db.pools import DatabasePools
 
 logger = logging.getLogger(__name__)
 
 
 async def dispatch_charging_profiles(
-    server: OCPPServer,
     optimization_result: OptimizationResult,
+    *,
+    pools: DatabasePools,
+    depot_id: str | UUID,
     vehicle_to_charger_map: Optional[dict[str, tuple[str, int]]] = None,
-    pools: Optional[DatabasePools] = None,
-    depot_id: Optional[str | UUID] = None,
     delta_t: float = 0.25,
+    server: Any = None,  # noqa: ARG001  retained for signature compat with callers
+    expires_in_min: int = 60,
 ) -> dict[str, bool]:
-    """Dispatch optimization results as charging profiles to chargers.
+    """Convert optimization output to OCPP profiles and enqueue them.
 
-    Converts OptimizationResult.schedule to OCPP SetChargingProfile messages
-    and sends them to the appropriate chargers.
+    Each ``OptimizationResult.schedule`` entry becomes one
+    ``charging_command_queue`` row. The legacy WebSocket handler's
+    ``ChargingCommandQueueConsumer`` (or, on charger reconnect, the
+    BootNotification replay path) drains the queue and pushes
+    ``SetChargingProfile`` to the charger.
 
     Args:
-        server: OCPPServer instance
-        optimization_result: Optimization result from MILP solver
-        vehicle_to_charger_map: Optional mapping from vehicle_id to (charge_point_id, connector_id).
-                               If None and pools+depot_id provided, will be built automatically.
-        pools: Optional DatabasePools (static=Supabase for mapping, ts=TimescaleDB for commands)
-        depot_id: Optional depot identifier (required if vehicle_to_charger_map is None)
-        delta_t: Time step duration in hours (default 0.25 = 15 minutes)
+        optimization_result: MILP solver output.
+        pools: Both DB pools (static for the cp_id mapping, ts for the queue).
+        depot_id: Depot UUID — needed to resolve the vehicle→charger map
+            unless an explicit map is supplied (tests / unit calls).
+        vehicle_to_charger_map: Optional explicit map. When omitted we look
+            it up from Supabase (5-min cache).
+        delta_t: Scheduling timestep in hours (default 0.25 = 15 min).
+        server: Unused; accepted so existing callers don't have to change
+            signature in lockstep. Will be removed in a future cleanup.
+        expires_in_min: How long an enqueued row stays eligible for delivery
+            before transitioning to ``expired``.
 
     Returns:
-        Dictionary mapping vehicle_id to success status (True/False)
-
-    Raises:
-        ValueError: If vehicle_to_charger_map is None and pool/depot_id not provided
-
-    Example:
-        >>> # With explicit mapping
-        >>> vehicle_map = {
-        ...     'bus_1': ('charger_1', 1),
-        ...     'bus_2': ('charger_2', 1),
-        ... }
-        >>> results = await dispatch_charging_profiles(
-        ...     server, opt_result, vehicle_map
-        ... )
-        >>> # With automatic mapping
-        >>> results = await dispatch_charging_profiles(
-        ...     server, opt_result, pools=pools, depot_id=depot_id
-        ... )
+        ``{vehicle_id: True}`` if the row was enqueued, ``False`` if it was
+        skipped (no mapping, empty schedule, conversion error). 'True' is
+        an *enqueue* success, not a delivery success — the consumer
+        publishes the delivery outcome via ``profile_push_latency_seconds``
+        and the row's terminal status (``sent`` / ``failed``).
     """
-    # Build mapping if not provided
     if vehicle_to_charger_map is None:
-        if pools is None or depot_id is None:
-            raise ValueError(
-                "Either vehicle_to_charger_map or (pools and depot_id) must be provided"
-            )
         try:
             vehicle_to_charger_map = await get_vehicle_to_charger_map(
                 pools.static, depot_id, use_cache=True
             )
-            logger.debug(
-                f"Built vehicle-to-charger mapping for {len(vehicle_to_charger_map)} vehicles"
+        except Exception as exc:
+            logger.error(
+                "Could not resolve vehicle→charger map for depot %s: %s",
+                depot_id,
+                exc,
             )
-        except Exception as e:
-            logger.error(f"Error building vehicle-to-charger mapping: {e}")
             raise
 
     results: dict[str, bool] = {}
-
-    logger.info(f"Dispatching charging profiles for {len(optimization_result.schedule)} vehicles")
+    logger.info(
+        "Enqueuing charging profiles for %d vehicles (depot=%s)",
+        len(optimization_result.schedule),
+        depot_id,
+    )
 
     for vehicle_id, schedule_data in optimization_result.schedule.items():
-        # Get charger mapping
         charger_info = vehicle_to_charger_map.get(vehicle_id)
         if not charger_info:
             logger.warning(
-                f"No charger mapping for vehicle {vehicle_id}. "
-                f"Available vehicles: {list(vehicle_to_charger_map.keys())[:5]}..."
+                "No charger mapping for vehicle %s — schedule period dropped",
+                vehicle_id,
             )
             results[vehicle_id] = False
             continue
 
         charge_point_id, connector_id = charger_info
 
-        # Check if charge point is connected
-        charge_point = server.get_charge_point(charge_point_id)
-        if not charge_point:
-            logger.warning(f"Charge point {charge_point_id} not connected for vehicle {vehicle_id}")
-            results[vehicle_id] = False
-            continue
-
-        # Convert schedule to OCPP format
-        # Schedule format: {'charging_power': [power_kw, ...], 'soc': [...], ...}
-        charging_power = schedule_data.get("charging_power", [])
-        if not charging_power:
-            logger.warning(f"No charging power in schedule for vehicle {vehicle_id}")
-            results[vehicle_id] = False
-            continue
-
-        # Create schedule as list of (timestep, power_kw) tuples
-        schedule = [(t, power) for t, power in enumerate(charging_power) if power is not None]
-
+        charging_power = schedule_data.get("charging_power", []) or []
+        schedule = [
+            (t, power)
+            for t, power in enumerate(charging_power)
+            if power is not None and power > 0
+        ]
         if not schedule:
-            logger.warning(f"Empty schedule for vehicle {vehicle_id}")
+            logger.debug(
+                "Empty / zero schedule for vehicle %s — nothing to enqueue",
+                vehicle_id,
+            )
             results[vehicle_id] = False
             continue
 
-        # Convert to OCPP profile
         try:
             ocpp_profile = convert_schedule_to_ocpp_profile(schedule, delta_t=delta_t)
-        except Exception as e:
-            logger.error(f"Error converting schedule for vehicle {vehicle_id}: {e}")
+        except Exception as exc:
+            logger.error("Profile conversion failed for vehicle %s: %s", vehicle_id, exc)
             results[vehicle_id] = False
             continue
 
-        # Send SetChargingProfile
+        # The legacy enqueue helper expects the profile dict (not a list of
+        # periods); wrap if convert_schedule_to_ocpp_profile returned the
+        # flat period list.
+        if isinstance(ocpp_profile, list):
+            payload: dict[str, Any] = {
+                "chargingProfilePurpose": "TxDefaultProfile",
+                "chargingProfileKind": "Absolute",
+                "stackLevel": 0,
+                "chargingSchedule": {
+                    "chargingRateUnit": "W",
+                    "chargingSchedulePeriod": ocpp_profile,
+                },
+            }
+        else:
+            payload = ocpp_profile
+
         try:
-            success = await charge_point.set_charging_profile(connector_id, ocpp_profile)
-            results[vehicle_id] = success
-
-            # Store command in database if pools provided (charging_commands is in TimescaleDB)
-            if pools and success:
-                await _store_charging_command(
-                    pools.ts,
-                    vehicle_id,
-                    charge_point_id,
-                    connector_id,
-                    ocpp_profile,
-                    optimization_result,
-                )
-
-            logger.info(
-                f"Charging profile dispatched for vehicle {vehicle_id} "
-                f"to {charge_point_id}:{'Accepted' if success else 'Rejected'}"
+            queue_id = await _enqueue(
+                pools.ts,
+                charge_point_id=charge_point_id,
+                connector_id=connector_id,
+                payload=payload,
+                expires_in_min=expires_in_min,
             )
-        except Exception as e:
-            logger.error(f"Error dispatching charging profile for vehicle {vehicle_id}: {e}")
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Failed to enqueue profile for vehicle %s (cp=%s): %s",
+                vehicle_id,
+                charge_point_id,
+                exc,
+            )
             results[vehicle_id] = False
+            continue
+
+        results[vehicle_id] = True
+        logger.info(
+            "Enqueued profile queue_id=%s vehicle=%s cp=%s connector=%s",
+            queue_id,
+            vehicle_id,
+            charge_point_id,
+            connector_id,
+        )
+
+        # Best-effort audit row — keeps charging_commands as the per-run
+        # ledger that data-analysts already read.
+        try:
+            await _store_charging_command(
+                pools.ts,
+                vehicle_id=vehicle_id,
+                charge_point_id=charge_point_id,
+                connector_id=connector_id,
+                charging_profile=payload,
+                optimization_result=optimization_result,
+            )
+        except Exception as exc:
+            logger.warning("Audit insert failed for vehicle %s: %s", vehicle_id, exc)
 
     success_count = sum(1 for v in results.values() if v)
-    logger.info(f"Charging profile dispatch complete: {success_count}/{len(results)} successful")
-
+    logger.info(
+        "Charging-profile enqueue complete: %d/%d enqueued",
+        success_count,
+        len(results),
+    )
     return results
+
+
+async def _enqueue(
+    pool: asyncpg.Pool,
+    *,
+    charge_point_id: str,
+    connector_id: int,
+    payload: dict[str, Any],
+    expires_in_min: int,
+) -> int:
+    """Insert one row into ``charging_command_queue`` and return queue_id.
+
+    The AFTER INSERT trigger from migration 014 fires
+    ``pg_notify('charging_command_queue', '<queue_id>:<cp_id>')`` so a
+    LISTEN-based consumer can pick the row up immediately. The polling
+    consumer in the legacy handler also catches it on its next tick.
+    """
+    async with pool.acquire() as conn:
+        return int(
+            await conn.fetchval(
+                """
+                INSERT INTO charging_command_queue (
+                    charge_point_id, connector_id, command_type,
+                    payload, expires_at
+                ) VALUES (
+                    $1, $2, 'set_charging_profile',
+                    $3::jsonb,
+                    NOW() + ($4 || ' minutes')::interval
+                )
+                RETURNING queue_id
+                """,
+                charge_point_id,
+                connector_id,
+                json.dumps(payload),
+                str(expires_in_min),
+            )
+        )
 
 
 async def _store_charging_command(
     pool: asyncpg.Pool,
+    *,
     vehicle_id: str,
     charge_point_id: str,
     connector_id: int,
-    charging_profile: list[dict],
+    charging_profile: dict,
     optimization_result: OptimizationResult,
 ) -> None:
-    """Store charging command in database.
+    """Per-run audit insert into ``charging_commands``.
 
-    Args:
-        pool: Database connection pool
-        vehicle_id: Vehicle identifier
-        charge_point_id: Charge point identifier
-        connector_id: Connector identifier
-        charging_profile: OCPP charging profile
-        optimization_result: Optimization result for reference
+    Distinct from ``charging_command_queue``: this is the immutable record
+    of *what we asked for*, scoped to the optimization run, and FK-linked
+    to ``chargers.charger_id``. The queue tracks *delivery state*.
     """
-    # Note: This assumes charging_commands table exists (PRD Section 6.1)
-    # For now, we'll use a simplified approach
     query = """
     INSERT INTO charging_commands (
         charger_id, vehicle_id, issued_at, profile_json, status
     )
-    VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5)
+    VALUES ($1, $2, $3, $4::jsonb, $5)
     ON CONFLICT DO NOTHING
     """
 
-    import json
+    profile_json = json.dumps(
+        {
+            "connector_id": connector_id,
+            "profile": charging_profile,
+            "run_id": str(getattr(optimization_result, "run_id", "")) or None,
+        }
+    )
 
-    profile_json = json.dumps(charging_profile)
-    status = "pending"  # Will be updated when charger responds
-
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                query,
-                charge_point_id,  # Using charge_point_id as charger_id
-                vehicle_id,
-                datetime.utcnow(),
-                profile_json,
-                status,
-            )
-        logger.debug(f"Stored charging command for vehicle {vehicle_id}")
-    except asyncpg.PostgresError as e:
-        logger.error(f"Database error storing charging command: {e}")
-        # Don't raise - command was sent, just logging failed
-    except Exception as e:
-        logger.error(f"Unexpected error storing charging command: {e}")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            query,
+            charge_point_id,
+            vehicle_id,
+            datetime.utcnow(),
+            profile_json,
+            "queued",
+        )

@@ -607,11 +607,11 @@ class TestDispatchCommands:
     """Tests for OCPP dispatch commands."""
 
     @pytest.mark.asyncio
-    async def test_dispatch_skips_without_ocpp_server(
+    async def test_dispatch_enqueues_without_ocpp_server(
         self, mock_db_pool, depot_config, controller_config, sample_optimization_result
     ):
-        """Test dispatch is skipped when OCPP server is not available."""
-        pool, _ = mock_db_pool
+        """Production runs with ocpp_server=None: dispatch enqueues, never blocks."""
+        pool, conn = mock_db_pool
         depot_id = str(uuid4())
 
         controller = DepotController(
@@ -622,8 +622,21 @@ class TestDispatchCommands:
             ocpp_server=None,
         )
 
-        # Should not raise
-        await controller._dispatch_commands(sample_optimization_result)
+        with patch.object(
+            controller.assembler.__class__, "load_depot_config", new_callable=AsyncMock
+        ) as mock_load:
+            # Map every vehicle in the schedule to a charge_point_id.
+            mock_load.return_value = (
+                depot_config,
+                {vid: f"CP_{vid}" for vid in sample_optimization_result.schedule},
+            )
+
+            # Should not raise — every row goes to charging_command_queue.
+            await controller._dispatch_commands(sample_optimization_result)
+
+        # ``conn.fetchval`` returns the queue_id; we expect at least one
+        # INSERT per vehicle with positive charging power.
+        assert conn.fetchval.await_count >= 1
 
     @pytest.mark.asyncio
     async def test_dispatch_handles_missing_charge_point(

@@ -8,7 +8,22 @@ Tests the complete flow:
 5. End-to-end flow: State Assembly → Optimization → Charger Allocation → OCPP Dispatch
 
 Reference: PRD_v2.md#9-1-ocpp-integration
+
+Session 3 note: the in-process ``dispatch_charging_profiles`` push test
+suite has been superseded by the queue-mediated tests
+(tests/integration/test_dispatch_queue.py, tests/unit/test_ocpp_dispatch.py).
+The legacy tests in this file that exercise the in-process push are
+skipped; the conversion / allocation tests remain in scope.
 """
+
+import pytest as _pytest
+
+# Apply skip to every test class in this module that exercises the legacy
+# in-process dispatch path. Conversion / allocation tests are unaffected.
+_LEGACY_DISPATCH_REASON = (
+    "Session 3: in-process OCPP dispatch removed; covered by "
+    "tests/integration/test_dispatch_queue.py."
+)
 
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -112,9 +127,10 @@ class TestOptimizationResultToOCPP:
             assert isinstance(charge_point_id, str), "Charge point ID should be string"
             assert isinstance(connector_id, int), "Connector ID should be integer"
 
+    @pytest.mark.skip(reason=_LEGACY_DISPATCH_REASON)
     @pytest.mark.asyncio
     async def test_commands_dispatched_to_correct_chargers(self, optimization_result):
-        """Test commands dispatched to correct chargers."""
+        """Legacy in-process dispatch — see test_dispatch_queue.py."""
         # Mock OCPP server
         mock_server = MagicMock(spec=OCPPServer)
         mock_charge_point = MagicMock(spec=FleetChargePoint)
@@ -145,9 +161,10 @@ class TestOptimizationResultToOCPP:
         # Verify set_charging_profile called for each vehicle
         assert mock_charge_point.set_charging_profile.call_count == 2
 
+    @pytest.mark.skip(reason=_LEGACY_DISPATCH_REASON)
     @pytest.mark.asyncio
     async def test_command_dispatch_retry_logic(self, optimization_result):
-        """Test command dispatch retry logic."""
+        """Legacy in-process dispatch — see test_dispatch_queue.py."""
         # Mock OCPP server with failures
         mock_server = MagicMock(spec=OCPPServer)
         mock_charge_point = MagicMock(spec=FleetChargePoint)
@@ -211,9 +228,10 @@ class TestEndToEndOptimizerToOCPPFlow:
             building_power=[50.0] * n_t,
         )
 
+    @pytest.mark.skip(reason=_LEGACY_DISPATCH_REASON)
     @pytest.mark.asyncio
     async def test_full_flow_state_to_ocpp_dispatch(self, depot_config, depot_state):
-        """Test full flow: State Assembly → Optimization → Charger Allocation → OCPP Dispatch."""
+        """Legacy in-process dispatch — see test_dispatch_queue.py."""
         # Step 1: Run optimization
         result = optimize(depot_state, depot_config, time_limit=30.0)
 
@@ -277,9 +295,10 @@ class TestEndToEndOptimizerToOCPPFlow:
                 for sched in result.schedule.values()
             )
 
+    @pytest.mark.skip(reason=_LEGACY_DISPATCH_REASON)
     @pytest.mark.asyncio
     async def test_ocpp_dispatch_failure_retry_circuit_breaker(self, depot_config, depot_state):
-        """Test OCPP dispatch failure → Retry → Circuit breaker."""
+        """Legacy in-process dispatch — see test_dispatch_queue.py."""
         # Run optimization
         result = optimize(depot_state, depot_config, time_limit=30.0)
         assert result.status == "completed"

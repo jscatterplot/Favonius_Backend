@@ -220,6 +220,11 @@ class FleetChargePoint(CP16):
         # Connector state cache
         self.connector_status: dict[int, str] = {}
 
+        # Liveness timestamps used by /admin/ocpp/{cp_id}/state.
+        # Populated on BootNotification / Heartbeat handling.
+        self.last_boot_at: Optional[datetime] = None
+        self.last_heartbeat_at: Optional[datetime] = None
+
         logger.info(f"Initialized FleetChargePoint: {id}")
 
     # ===================================================================
@@ -238,6 +243,7 @@ class FleetChargePoint(CP16):
         self.model = charge_point_model
         self.serial_number = kwargs.get("charge_point_serial_number")
         self.firmware_version = kwargs.get("firmware_version")
+        self.last_boot_at = datetime.now(timezone.utc)
 
         logger.info(
             f"BootNotification from {self.id}: {charge_point_vendor} "
@@ -270,6 +276,7 @@ class FleetChargePoint(CP16):
     @on("Heartbeat")
     async def on_heartbeat(self, **kwargs):
         """Handle Heartbeat from charger. Returns current server time."""
+        self.last_heartbeat_at = datetime.now(timezone.utc)
         return call_result.Heartbeat(current_time=_now_iso_z())
 
     @on("StatusNotification")

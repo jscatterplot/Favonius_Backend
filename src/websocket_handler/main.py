@@ -11,6 +11,7 @@ import uvloop
 from .analytics_service import AnalyticsService
 from .api_server import APIServer
 from .auth_manager import AuthManager
+from .charging_profile_manager import ChargingCommandQueueConsumer
 from .config import Config
 from .config_validator import ConfigValidator
 from .connection_monitor import ConnectionMonitor
@@ -18,7 +19,12 @@ from .data_sync import DataSyncService
 from .database_schema import create_schema_from_config
 from .health import HealthCheckServer
 from .health_checks import create_health_checks, notify_websocket_ready
-from .monitoring import get_logger, setup_logging, setup_monitoring
+from .monitoring import (
+    ACTIVE_TRANSACTIONS,
+    get_logger,
+    setup_logging,
+    setup_monitoring,
+)
 from .optimization_engine import OptimizationEngine
 from .price_feeder import PriceFeederService
 from .resilience_manager import resilience_manager
@@ -54,6 +60,11 @@ class Application:
 
         # Connection monitoring
         self.connection_monitor: Optional[ConnectionMonitor] = None
+
+        # Queue-mediated dispatch consumer (session 3) — drains
+        # charging_command_queue rows that the FastAPI optimizer enqueues.
+        self.queue_consumer: Optional[ChargingCommandQueueConsumer] = None
+        self._active_tx_reconciler_task: Optional[asyncio.Task] = None
 
         # State
         self.running = False
@@ -97,9 +108,16 @@ class Application:
             # Create health check server
             self.health_server = HealthCheckServer(self.config.monitoring.health_check_port)
 
-            # Create API server
+            # Create API server. The OCPP debug endpoint needs the
+            # TimescaleDB client (for the queue/connector rollup) and a
+            # late-bound reference to the WebSocket server (for the
+            # in-memory FleetChargePoint snapshot).
             self.api_server = APIServer(
-                self.config.supabase, self.supabase_client, self.auth_manager
+                self.config.supabase,
+                self.supabase_client,
+                self.auth_manager,
+                timescale_client=self.timescale_client,
+                websocket_server=self.websocket_server,
             )
 
             # Validate no port conflicts before starting listeners
@@ -119,6 +137,23 @@ class Application:
                 check_interval=30,
             )
             await self.connection_monitor.start_monitoring()
+
+            # Queue-mediated dispatch consumer. Picks up SetChargingProfile
+            # rows enqueued by the FastAPI optimizer and pushes them to the
+            # connected charger. Started before websocket_server.start()
+            # blocks so the polling loop is alive immediately.
+            self.queue_consumer = ChargingCommandQueueConsumer(
+                timescale_client=self.timescale_client,
+                cp_lookup=self._cp_lookup,
+            )
+            await self.queue_consumer.start()
+
+            # Periodically reconcile per-station active_transactions gauge
+            # from DB so a metrics consumer sees the truth even after a
+            # mid-transaction handler restart.
+            self._active_tx_reconciler_task = asyncio.create_task(
+                self._active_tx_reconciler(), name="active_tx_reconciler"
+            )
 
             # Start WebSocket server
             self.running = True
@@ -268,6 +303,48 @@ class Application:
             if hc.name in resilience_manager.health_checks:
                 resilience_manager.health_checks[hc.name].check_func = hc.check_func
 
+    def _cp_lookup(self, cp_id: str):
+        """Resolve a connected charger handler for the queue consumer.
+
+        Returns ``None`` when the charger is not currently connected; the
+        consumer leaves the row pending in that case (boot replay path
+        will retry on reconnect).
+        """
+        if not self.websocket_server:
+            return None
+        return self.websocket_server.get_charge_point(cp_id)
+
+    async def _active_tx_reconciler(self) -> None:
+        """Refresh the ``active_transactions`` gauge from DB every 30 s.
+
+        Increments / decrements happen inline in the OCPP handler on
+        Start/StopTransaction; this loop is the safety net for restarts
+        and dropped events.
+        """
+        # Track which stations had a non-zero gauge so we can zero them
+        # out when their open count drops to 0 (Prometheus does not emit
+        # series we never touch).
+        seen_stations: set[str] = set()
+        while self.running:
+            try:
+                counts = await self.timescale_client.count_active_transactions_by_station()
+            except Exception as exc:
+                self.logger.debug("active_tx reconcile failed: %s", exc)
+                counts = {}
+
+            for station_id, n in counts.items():
+                ACTIVE_TRANSACTIONS.labels(station_id=station_id).set(n)
+                seen_stations.add(station_id)
+
+            for station_id in list(seen_stations):
+                if station_id not in counts:
+                    ACTIVE_TRANSACTIONS.labels(station_id=station_id).set(0)
+
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+
     async def stop(self) -> None:
         """Stop all application components gracefully."""
         self.logger.info("Shutting down application...")
@@ -276,6 +353,13 @@ class Application:
 
         # Stop components in reverse order
         stop_tasks = []
+
+        # Stop queue consumer first so we don't push profiles to a charger
+        # that is about to be disconnected.
+        if self.queue_consumer:
+            stop_tasks.append(self.queue_consumer.stop())
+        if self._active_tx_reconciler_task:
+            self._active_tx_reconciler_task.cancel()
 
         # Stop connection monitoring
         if self.connection_monitor:

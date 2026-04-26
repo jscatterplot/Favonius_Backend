@@ -170,7 +170,8 @@ Favonius_Backend/
 │   ├── 004_connector_status.sql
 │   ├── 005_telemetry_primary_key.sql
 │   ├── 012_ocpp_pilot_hardening.sql  # OCPP 1.6 sequences + station_credentials
-│   └── 013_recovery.sql         # charging_command_queue + cross-restart recovery
+│   ├── 013_recovery.sql         # charging_command_queue + cross-restart recovery
+│   └── 014_dispatch_queue_notify.sql # queue 'sent' status + pg_notify trigger
 │
 ├── tests/
 │   ├── unit/                    # Unit tests (mock everything)
@@ -346,6 +347,7 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `GET` | `/metrics` | Prometheus metrics (text format) |
 | `GET` | `/admin/controllers` | List active depot controllers |
 | `GET` | `/admin/controllers/{id}/health` | Controller health |
+| `GET` | `/admin/ocpp/{cp_id}/state` | (Legacy WS handler, port 8080) Per-charger debug dump: connection state, vendor/model, last_boot_at, last_heartbeat_at, latest connector_status, open transactions, charging_command_queue rollup. Owner role required. |
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)
@@ -371,9 +373,9 @@ Full coverage of all 28 OCPP 1.6 actions including: BootNotification, Heartbeat,
 - `StatusNotification` → `connector_status` table (both the new adapter and the legacy `OCPP16Session` write here)
 - `StartTransaction` → `transactionId` from `ocpp_transaction_id` sequence; an open `charging_sessions` row is inserted so a handler restart can rehydrate it
 - `StopTransaction` → closes the `charging_sessions` row (`end_time`)
-- `SetChargingProfile` → sent after each optimization run; if the charger is offline, the legacy handler enqueues the profile to `charging_command_queue` and replays it on the next BootNotification
+- `SetChargingProfile` → after each optimization run the FastAPI service writes one row per scheduled vehicle to `charging_command_queue` (it does NOT push in-process — production runs with `OCPP_SERVER_ENABLED=false`). The legacy WS handler's `ChargingCommandQueueConsumer` (`src/websocket_handler/charging_profile_manager.py::ChargingCommandQueueConsumer`) drains the queue every ~2 s (or on `pg_notify` from migration 014), pushes via the in-memory `OCPP16Session`, and marks rows `sent`/`failed`. Rows whose charger is offline stay `pending`; the BootNotification replay path flushes them on reconnect.
 
-### Cross-restart recovery (legacy handler, migrations 012 + 013)
+### Cross-restart recovery (legacy handler, migrations 012 + 013 + 014)
 - BootNotification: `OCPP16Session._on_boot` reloads open sessions into `FleetChargePoint.transactions` and triggers `replay_queued_commands` so any pending profiles are pushed within ~1s
 - WebSocket close: `OCPPWebSocketServer._cleanup_connection` appends an `Unavailable`/`ConnectionLost` row to `connector_status` and stamps `last_seen_at` on every still-open session at the station
 

@@ -442,11 +442,16 @@ class TestGracefulDegradation:
 
         assert result.status == "completed"
 
+    @pytest.mark.skip(
+        reason="Session 3: in-process dispatch removed; partial-success "
+        "behavior is now per-row queue state (sent vs failed). See "
+        "tests/integration/test_dispatch_queue.py."
+    )
     @pytest.mark.asyncio
     async def test_partial_dispatch_success(
         self, mock_db_pool, depot_config, fast_controller_config, sample_optimization_result
     ):
-        """Test optimization reports partial dispatch success."""
+        """Legacy in-process dispatch — superseded by the queue path."""
         pool, conn = mock_db_pool
         depot_id = str(uuid4())
 
@@ -682,11 +687,16 @@ class TestStateRecovery:
 class TestDispatchRetryLogic:
     """Tests for OCPP dispatch retry logic."""
 
+    @pytest.mark.skip(
+        reason="Session 3: dispatch retry now happens in the WS handler's "
+        "BootNotification replay path, not in the controller. See "
+        "src/websocket_handler/ocpp16_adapter.py::replay_queued_commands."
+    )
     @pytest.mark.asyncio
     async def test_dispatch_retries_on_rejection(
         self, mock_db_pool, depot_config, fast_controller_config, sample_optimization_result
     ):
-        """Test dispatch retries when charger rejects profile."""
+        """Legacy in-process dispatch retry — moved to WS handler replay."""
         pool, _ = mock_db_pool
         depot_id = str(uuid4())
         fast_controller_config.dispatch_retry_attempts = 2
@@ -727,11 +737,16 @@ class TestDispatchRetryLogic:
         # Should have retried
         assert mock_cp.set_charging_profile.call_count == 3
 
+    @pytest.mark.skip(
+        reason="Session 3: dispatch retry now happens in the WS handler's "
+        "BootNotification replay path, not in the controller. See "
+        "src/websocket_handler/ocpp16_adapter.py::replay_queued_commands."
+    )
     @pytest.mark.asyncio
     async def test_dispatch_retries_on_exception(
         self, mock_db_pool, depot_config, fast_controller_config, sample_optimization_result
     ):
-        """Test dispatch retries on exception."""
+        """Legacy in-process dispatch retry — moved to WS handler replay."""
         pool, _ = mock_db_pool
         depot_id = str(uuid4())
         fast_controller_config.dispatch_retry_attempts = 2

@@ -2,6 +2,7 @@
 
 import json
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +11,41 @@ from ocpp.v201 import ChargePoint as OCPPChargePoint
 from ocpp.v201 import call_result
 from ocpp.v201.datatypes import ChargingStationType, IdTokenType, StatusInfoType
 from ocpp.v201.enums import Action, ConnectorStatusEnumType, TransactionEventEnumType
+
+# Per-call OCPP CALL message correlation id, bound for the duration of one
+# inbound message dispatch. The OCPP framing assigns a unique_id to every
+# CALL/CALL_RESULT/CALL_ERROR triple; surfacing it on every log line is what
+# makes a chargeflow tractable when a charger sends 200 messages a minute.
+_ocpp_unique_id: ContextVar[str] = ContextVar("ocpp_unique_id", default="-")
+
+
+def get_ocpp_unique_id() -> str:
+    """Return the current OCPP CALL unique_id, or '-' if outside a call."""
+    return _ocpp_unique_id.get()
+
+
+def _bind_unique_id_to_structlog(unique_id: str, station_id: str) -> None:
+    """Bind ``ocpp_unique_id`` (and station_id) into structlog contextvars.
+
+    Falls back silently when structlog is configured without contextvars
+    support (older tests or shimmed loggers).
+    """
+    try:
+        from structlog.contextvars import bind_contextvars
+
+        bind_contextvars(ocpp_unique_id=unique_id, station_id=station_id)
+    except Exception:
+        pass
+
+
+def _clear_ocpp_log_context() -> None:
+    """Tear down per-call structlog context after dispatch finishes."""
+    try:
+        from structlog.contextvars import unbind_contextvars
+
+        unbind_contextvars("ocpp_unique_id", "station_id")
+    except Exception:
+        pass
 
 from .certificate_manager import CertificateManager, CertificateType
 from .charging_profile_manager import ChargingProfileManager
@@ -109,6 +145,35 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
 
         # Task supervisor for fire-and-forget tasks with error handling
         self._task_supervisor = TaskSupervisor(f"ocpp:{station_id}", max_concurrent=50)
+
+    async def route_message(self, raw_msg: str) -> Any:  # type: ignore[override]
+        """Bind ``ocpp_unique_id`` for the duration of one CALL dispatch.
+
+        The OCPP wire protocol assigns a UUID to every CALL message; that
+        id is what lets a debugger trace a request → response → error
+        triple end-to-end. We extract it from the raw frame *before*
+        delegating to the upstream router so every log line emitted by
+        the handler chain (including third-party libs) carries the id.
+        """
+        unique_id = "-"
+        try:
+            # Frame is JSON: [MessageTypeId, UniqueId, Action, Payload]
+            decoded = json.loads(raw_msg) if isinstance(raw_msg, str) else raw_msg
+            if isinstance(decoded, list) and len(decoded) >= 2:
+                unique_id = str(decoded[1])[:64] or "-"
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # Malformed frame: upstream handler will reject with
+            # ProtocolError; we still want to bind a placeholder so logs
+            # below carry a consistent shape.
+            unique_id = "-"
+
+        token = _ocpp_unique_id.set(unique_id)
+        _bind_unique_id_to_structlog(unique_id, getattr(self, "id", "-"))
+        try:
+            return await super().route_message(raw_msg)
+        finally:
+            _ocpp_unique_id.reset(token)
+            _clear_ocpp_log_context()
 
     @on(Action.boot_notification)
     def on_boot_notification(self, charging_station: ChargingStationType, reason: str, **kwargs):

@@ -1,6 +1,7 @@
 """TimescaleDB client for time-series data operations."""
 
 import asyncio
+import time
 import base64
 import hashlib
 import hmac
@@ -528,6 +529,11 @@ class TimescaleClient:
 
     async def insert_connector_status(self, status_data: Dict[str, Any]) -> None:
         """Insert connector status."""
+        # Local import keeps this module importable in environments without
+        # prometheus_client installed (e.g. some CI shards).
+        from .monitoring import DB_WRITE_LATENCY
+
+        start = time.perf_counter()
         try:
             async with self.pg_pool.acquire() as conn:
                 await conn.execute(
@@ -545,6 +551,10 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to insert connector status: {e}")
             raise
+        finally:
+            DB_WRITE_LATENCY.labels(table="connector_status").observe(
+                max(time.perf_counter() - start, 1e-6)
+            )
 
     async def insert_transaction_event(self, transaction_data: Dict[str, Any]) -> None:
         """Insert transaction event."""
@@ -2010,6 +2020,161 @@ class TimescaleClient:
                 queue_id,
                 error[:500],
             )
+
+    async def mark_command_sent(self, queue_id: int) -> None:
+        """Mark a queued command as successfully pushed to the charger.
+
+        Distinct from ``mark_command_acked``: 'sent' is what the new
+        queue-mediated dispatch path (session 3) uses when the WebSocket
+        push returns Accepted. 'acked' is reserved for an OCPP-conf level
+        ack we may surface later. Both are terminal success states.
+        """
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charging_command_queue
+                   SET status = 'sent',
+                       sent_at = NOW(),
+                       attempt_count = attempt_count + 1
+                 WHERE queue_id = $1
+                   AND status = 'pending'
+                """,
+                queue_id,
+            )
+
+    async def fetch_pending_commands_all(
+        self, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """Return non-expired pending commands across every charger, oldest first.
+
+        Used by the dispatch queue consumer to drain newly enqueued
+        SetChargingProfile rows for *any* connected station (the per-station
+        ``fetch_pending_commands`` is for the boot-time replay path).
+        """
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT queue_id, charge_point_id, connector_id,
+                       command_type, payload, attempt_count
+                  FROM charging_command_queue
+                 WHERE status = 'pending'
+                   AND expires_at > NOW()
+                 ORDER BY enqueued_at ASC
+                 LIMIT $1
+                """,
+                limit,
+            )
+            return [dict(r) for r in rows]
+
+    async def expire_overdue_commands(self) -> int:
+        """Move expired ``pending`` rows to ``expired``. Returns rowcount."""
+        async with self.pg_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE charging_command_queue
+                   SET status = 'expired'
+                 WHERE status = 'pending'
+                   AND expires_at <= NOW()
+                """
+            )
+            # asyncpg returns "UPDATE n"
+            try:
+                return int(result.split()[-1])
+            except (ValueError, IndexError):
+                return 0
+
+    async def queue_depth_by_status(self) -> Dict[str, int]:
+        """Sample ``charging_command_queue`` depth grouped by status.
+
+        Used by the metrics sampler to publish ``charging_command_queue_depth``.
+        Returns a dict like ``{'pending': 3, 'sent': 17, 'failed': 0, ...}``.
+        """
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT status, COUNT(*)::bigint AS n
+                  FROM charging_command_queue
+                 GROUP BY status
+                """
+            )
+        return {r["status"]: int(r["n"]) for r in rows}
+
+    async def fetch_admin_state(
+        self, charge_point_id: str
+    ) -> Dict[str, Any]:
+        """Aggregate state for ``/admin/ocpp/{cp_id}/state``.
+
+        Reads:
+          - latest connector_status row per connector
+          - open ``charging_sessions`` rows (transaction_id, connector, id_token)
+          - charging_command_queue rollup + most-recent row
+
+        Connection / boot metadata (vendor, model, last_boot_at, last_heartbeat_at)
+        is layered on by the API handler from the in-memory FleetChargePoint.
+        """
+        async with self.pg_pool.acquire() as conn:
+            connectors = await conn.fetch(
+                """
+                SELECT DISTINCT ON (connector_id)
+                       connector_id, status, error_code, timestamp AS updated_at
+                  FROM connector_status
+                 WHERE station_id = $1
+                 ORDER BY connector_id, timestamp DESC
+                """,
+                charge_point_id,
+            )
+            txns = await conn.fetch(
+                """
+                SELECT transaction_id, connector_id, id_token, start_time
+                  FROM charging_sessions
+                 WHERE station_id = $1
+                   AND end_time IS NULL
+                   AND transaction_id IS NOT NULL
+                 ORDER BY start_time ASC
+                """,
+                charge_point_id,
+            )
+            queue_counts = await conn.fetch(
+                """
+                SELECT status, COUNT(*)::bigint AS n
+                  FROM charging_command_queue
+                 WHERE charge_point_id = $1
+                 GROUP BY status
+                """,
+                charge_point_id,
+            )
+            last_command = await conn.fetchrow(
+                """
+                SELECT queue_id, status, sent_at, acked_at,
+                       enqueued_at, last_error
+                  FROM charging_command_queue
+                 WHERE charge_point_id = $1
+                 ORDER BY enqueued_at DESC
+                 LIMIT 1
+                """,
+                charge_point_id,
+            )
+
+        return {
+            "connectors": [dict(r) for r in connectors],
+            "active_transactions": [dict(r) for r in txns],
+            "queue_counts": {r["status"]: int(r["n"]) for r in queue_counts},
+            "last_command": dict(last_command) if last_command else None,
+        }
+
+    async def count_active_transactions_by_station(self) -> Dict[str, int]:
+        """Return open-transaction counts grouped by station (for metrics)."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT station_id, COUNT(*)::bigint AS n
+                  FROM charging_sessions
+                 WHERE end_time IS NULL
+                   AND transaction_id IS NOT NULL
+                 GROUP BY station_id
+                """
+            )
+        return {r["station_id"]: int(r["n"]) for r in rows}
 
     # ===== PLUG & CHARGE METHODS =====
 
