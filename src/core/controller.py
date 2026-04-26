@@ -10,7 +10,6 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
-from uuid import UUID
 
 from .controller_config import ControllerConfig
 from .models import DepotConfig, OptimizationResult
@@ -366,79 +365,6 @@ class DepotController:
             total,
             self.depot_id,
         )
-
-    def _validate_charging_profile(self, charging_schedule: list[dict]) -> bool:
-        """Validate charging profile before dispatch.
-
-        Args:
-            charging_schedule: List of charging schedule periods
-
-        Returns:
-            True if valid, False otherwise
-        """
-        if not charging_schedule:
-            return False
-
-        # Check that periods are in order
-        last_period = -1
-        for period in charging_schedule:
-            start = period.get("start_period", -1)
-            if start <= last_period:
-                logger.warning(f"Invalid period order: {start} <= {last_period}")
-                return False
-            last_period = start
-
-            # Check power limits are reasonable
-            limit = period.get("limit", 0)
-            if limit < 0 or limit > 200000:  # 200kW max
-                logger.warning(f"Invalid power limit: {limit}W")
-                return False
-
-        return True
-
-    async def _store_dispatch_results(
-        self, run_id: UUID, dispatch_results: dict[str, dict]
-    ) -> None:
-        """Store OCPP dispatch results in database.
-
-        Args:
-            run_id: Optimization run ID
-            dispatch_results: Dictionary of vehicle_id -> dispatch result
-        """
-        import json
-
-        query = """
-        INSERT INTO charging_commands 
-            (run_id, charger_id, vehicle_id, issued_at, profile_json, status)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT DO NOTHING
-        """
-
-        now = datetime.utcnow()
-
-        for vehicle_id, result in dispatch_results.items():
-            try:
-                # Get charger_id from vehicle (would need to query vehicles table)
-                # For now, use vehicle_id as placeholder
-                charger_id = None  # TODO: Query from vehicles table
-
-                status = "accepted" if result.get("success") else "rejected"
-                profile_json = json.dumps(result)
-
-                async with self.pools.ts.acquire() as conn:
-                    await conn.execute(
-                        query,
-                        run_id,
-                        charger_id,
-                        vehicle_id,
-                        now,
-                        profile_json,
-                        status,
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Failed to store dispatch result for {vehicle_id}: {e}", exc_info=True
-                )
 
     async def _store_result(self, result: OptimizationResult, trigger_reason: str) -> None:
         """Store optimization result in database.
