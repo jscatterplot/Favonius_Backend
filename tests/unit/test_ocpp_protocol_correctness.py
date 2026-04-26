@@ -399,4 +399,4 @@ class TestOcpp16SessionAuthorize:
         monkeypatch.setattr(adapter.secrets, "randbelow", lambda _: 456)
 
         counter = adapter._new_profile_id_fallback_counter()
-        assert next(counter) == adapter._PROFILE_ID_FALLBACK_START + 579
+        assert next(counter) == 579
