@@ -75,6 +75,7 @@ def mock_websocket() -> MagicMock:
 def mock_timescale() -> MagicMock:
     tc = MagicMock()
     tc.insert_telemetry_batch = AsyncMock()
+    tc.next_charging_profile_id = AsyncMock(return_value=123456)
     return tc
 
 
@@ -265,6 +266,7 @@ class TestOCPP16SessionChargingProfile:
         call_kwargs = session._cp.set_charging_profile.call_args.kwargs
         assert call_kwargs["charging_schedule"] == [{"startPeriod": 0, "limit": 50000}]
         assert call_kwargs["charging_rate_unit"] == "A"
+        assert call_kwargs["profile_id"] == 123456
 
 
 # ---------------------------------------------------------------------------
