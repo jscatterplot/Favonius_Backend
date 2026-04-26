@@ -1979,8 +1979,8 @@ class TimescaleClient:
             )
             return [dict(r) for r in rows]
 
-    async def mark_command_sent(self, queue_id: int) -> None:
-        """Charger Accepted the SetChargingProfile during replay."""
+    async def mark_command_acked(self, queue_id: int) -> None:
+        """Mark queued command as acknowledged by the charger."""
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """

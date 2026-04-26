@@ -422,7 +422,7 @@ class TestOCPP16SessionRecovery:
         mock_timescale.enqueue_charging_command.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_replay_queued_commands_marks_sent_on_success(
+    async def test_replay_queued_commands_marks_acked_on_success(
         self, session, mock_timescale
     ) -> None:
         mock_timescale.fetch_pending_commands = AsyncMock(
@@ -447,14 +447,14 @@ class TestOCPP16SessionRecovery:
                 }
             ]
         )
-        mock_timescale.mark_command_sent = AsyncMock()
+        mock_timescale.mark_command_acked = AsyncMock()
         mock_timescale.mark_command_failed = AsyncMock()
         session._cp.set_charging_profile = AsyncMock(return_value=True)
 
         sent = await session.replay_queued_commands()
 
         assert sent == 1
-        mock_timescale.mark_command_sent.assert_awaited_once_with(1)
+        mock_timescale.mark_command_acked.assert_awaited_once_with(1)
         mock_timescale.mark_command_failed.assert_not_called()
 
     @pytest.mark.asyncio
@@ -472,7 +472,7 @@ class TestOCPP16SessionRecovery:
                 }
             ]
         )
-        mock_timescale.mark_command_sent = AsyncMock()
+        mock_timescale.mark_command_acked = AsyncMock()
         mock_timescale.mark_command_failed = AsyncMock()
         session._cp.set_charging_profile = AsyncMock(return_value=False)
 
@@ -480,6 +480,39 @@ class TestOCPP16SessionRecovery:
 
         assert sent == 0
         mock_timescale.mark_command_failed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_replay_queued_commands_continues_when_mark_failed_update_raises(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.fetch_pending_commands = AsyncMock(
+            return_value=[
+                {
+                    "queue_id": 9,
+                    "connector_id": 1,
+                    "command_type": "set_charging_profile",
+                    "payload": {"chargingSchedulePeriod": []},
+                    "attempt_count": 0,
+                },
+                {
+                    "queue_id": 10,
+                    "connector_id": 2,
+                    "command_type": "set_charging_profile",
+                    "payload": {"chargingSchedulePeriod": []},
+                    "attempt_count": 0,
+                },
+            ]
+        )
+        mock_timescale.mark_command_acked = AsyncMock()
+        mock_timescale.mark_command_failed = AsyncMock(
+            side_effect=[RuntimeError("db hiccup"), None]
+        )
+        session._cp.set_charging_profile = AsyncMock(return_value=False)
+
+        sent = await session.replay_queued_commands()
+
+        assert sent == 0
+        assert mock_timescale.mark_command_failed.await_count == 2
 
     @pytest.mark.asyncio
     async def test_replay_queued_commands_tolerates_fetch_failure(

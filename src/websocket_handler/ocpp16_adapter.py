@@ -227,15 +227,40 @@ class OCPP16Session:
                     connector_id, payload, allow_enqueue=False
                 )
             except Exception as exc:
-                await self._timescale.mark_command_failed(queue_id, str(exc))
+                try:
+                    await self._timescale.mark_command_failed(queue_id, str(exc))
+                except Exception as mark_exc:
+                    logger.error(
+                        "mark_command_failed raised for station=%s queue_id=%s: %s",
+                        self._station_id,
+                        queue_id,
+                        mark_exc,
+                    )
                 continue
             if ok:
-                await self._timescale.mark_command_sent(queue_id)
+                try:
+                    await self._timescale.mark_command_acked(queue_id)
+                except Exception as exc:
+                    logger.error(
+                        "mark_command_acked raised for station=%s queue_id=%s: %s",
+                        self._station_id,
+                        queue_id,
+                        exc,
+                    )
+                    continue
                 sent += 1
             else:
-                await self._timescale.mark_command_failed(
-                    queue_id, "charger rejected SetChargingProfile"
-                )
+                try:
+                    await self._timescale.mark_command_failed(
+                        queue_id, "charger rejected SetChargingProfile"
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "mark_command_failed raised for station=%s queue_id=%s: %s",
+                        self._station_id,
+                        queue_id,
+                        exc,
+                    )
         if sent:
             logger.info(
                 "Replayed %d queued command(s) to station=%s", sent, self._station_id
