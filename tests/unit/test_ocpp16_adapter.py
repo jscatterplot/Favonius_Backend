@@ -75,6 +75,10 @@ def mock_websocket() -> MagicMock:
 def mock_timescale() -> MagicMock:
     tc = MagicMock()
     tc.insert_telemetry_batch = AsyncMock()
+    tc.lookup_id_tag = AsyncMock(
+        return_value={"vehicle_id": "vehicle-1", "depot_id": "depot-1"}
+    )
+    tc.next_transaction_id = AsyncMock(return_value=4242)
     tc.next_charging_profile_id = AsyncMock(return_value=123456)
     return tc
 
@@ -189,9 +193,9 @@ class TestOCPP16SessionCallbacks:
 
     @pytest.mark.asyncio
     async def test_on_transaction_start_pushes_event(
-        self, session, mock_message_handler
+        self, session, mock_timescale, mock_message_handler
     ) -> None:
-        await session._on_transaction_start(
+        result = await session._on_transaction_start(
             cp_id="test_station_001",
             connector_id=1,
             id_tag="TAG-001",
@@ -199,7 +203,57 @@ class TestOCPP16SessionCallbacks:
             timestamp="2026-01-01T00:00:00Z",
         )
         await asyncio.sleep(0)
+        assert result.value == "Accepted"
+        mock_timescale.lookup_id_tag.assert_awaited_once_with("TAG-001")
         mock_message_handler._push_to_main_api.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_rejects_unknown_id_tag(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        mock_timescale.lookup_id_tag.return_value = None
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="UNKNOWN-TAG",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        await asyncio.sleep(0)
+        assert result.value == "Invalid"
+        mock_message_handler._push_to_main_api.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_transaction_path_rejects_unknown_id_tag(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        mock_timescale.lookup_id_tag.return_value = None
+        result = await session._cp.on_start_transaction(
+            connector_id=1,
+            id_tag="UNKNOWN-TAG",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        assert result.id_tag_info["status"].value == "Invalid"
+        assert result.transaction_id == 0
+        assert 1 not in session._cp.transactions
+        mock_timescale.next_transaction_id.assert_not_awaited()
+        mock_message_handler._push_to_main_api.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_transaction_path_fails_closed_on_lookup_error(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.lookup_id_tag.side_effect = RuntimeError("DB down")
+        result = await session._cp.on_start_transaction(
+            connector_id=1,
+            id_tag="ANY-TAG",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        assert result.id_tag_info["status"].value == "Invalid"
+        assert result.transaction_id == 0
+        mock_timescale.next_transaction_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_on_transaction_stop_pushes_event(

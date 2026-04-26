@@ -153,8 +153,8 @@ class OCPP16Session:
         """Provide a restart-safe transactionId from the DB sequence."""
         return await self._timescale.next_transaction_id()
 
-    async def _on_authorize(self, cp_id: str, id_tag: str) -> AuthorizationStatus:
-        """Authorize lookup against ``vehicles.id_tag`` (migration 012 index).
+    async def _validate_id_tag(self, cp_id: str, id_tag: str, source: str) -> AuthorizationStatus:
+        """Validate an OCPP idTag against ``vehicles.id_tag``.
 
         Returns ``Accepted`` for tags registered in the fleet, ``Invalid``
         for unknown tags. We deliberately do not use ``Blocked`` /
@@ -165,13 +165,18 @@ class OCPP16Session:
             row = await self._timescale.lookup_id_tag(id_tag)
         except Exception as exc:
             logger.error(
-                "Authorize lookup failed for station=%s id_tag=%s: %s",
+                "%s lookup failed for station=%s id_tag=%s: %s",
+                source,
                 cp_id,
                 id_tag,
                 exc,
             )
             return AuthorizationStatus.invalid
         return AuthorizationStatus.accepted if row else AuthorizationStatus.invalid
+
+    async def _on_authorize(self, cp_id: str, id_tag: str) -> AuthorizationStatus:
+        """Handle Authorize by failing closed on unknown fleet idTags."""
+        return await self._validate_id_tag(cp_id, id_tag, "Authorize")
 
     async def send_der_control(self, der_control: Dict) -> bool:  # noqa: ARG002
         """DER control is an OCPP 2.x feature; no-op for OCPP 1.6 chargers."""
@@ -273,7 +278,11 @@ class OCPP16Session:
         id_tag: str,
         meter_start: int,
         timestamp: str,
-    ) -> None:
+    ) -> AuthorizationStatus:
+        auth_status = await self._validate_id_tag(cp_id, id_tag, "StartTransaction")
+        if auth_status != AuthorizationStatus.accepted:
+            return auth_status
+
         asyncio.create_task(
             self._message_handler._push_to_main_api(
                 cp_id,
@@ -286,6 +295,7 @@ class OCPP16Session:
                 },
             )
         )
+        return auth_status
 
     async def _on_transaction_stop(
         self,
