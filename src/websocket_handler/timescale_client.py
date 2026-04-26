@@ -1794,13 +1794,21 @@ class TimescaleClient:
         return ``Accepted`` for known tags and ``Invalid`` for unknown ones.
         """
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
+            rows = await conn.fetch(
                 "SELECT vehicle_id::text AS vehicle_id, depot_id::text AS depot_id "
-                "FROM vehicles WHERE id_tag = $1",
+                "FROM vehicles WHERE id_tag = $1 "
+                "LIMIT 2",
                 id_tag,
             )
-            if not row:
+            if not rows:
                 return None
+            if len(rows) > 1:
+                logger.error(
+                    "Rejecting id_tag lookup for %r: multiple vehicles share the same id_tag.",
+                    id_tag,
+                )
+                return None
+            row = rows[0]
             return {"vehicle_id": row["vehicle_id"], "depot_id": row["depot_id"]}
 
     # ===== PLUG & CHARGE METHODS =====

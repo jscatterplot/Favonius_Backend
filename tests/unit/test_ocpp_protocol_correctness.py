@@ -10,8 +10,8 @@ Covers the fixes from session 1 of the pilot-hardening plan:
     allowlist.
   * ChangeConfiguration refuses to push ``MeterValuesSampledData`` /
     ``MeterValuesAlignedData`` with measurands outside the ABB-safe set.
-  * SendLocalList caps at 16 entries and returns ``NotSupported`` past
-    that, so callers fall back to central authorization.
+  * SendLocalList caps at 16 entries for ABB chargers and returns
+    ``NotSupported`` past that, so callers fall back to central authorization.
   * OCPP16Session.``_on_authorize`` returns ``Accepted`` for known
     ``vehicles.id_tag`` rows and ``Invalid`` otherwise.
 
@@ -230,26 +230,26 @@ class TestChangeConfigurationAbbGuard:
         assert result == "Accepted"
 
     @pytest.mark.asyncio
-    async def test_unsafe_measurand_raises_value_error(self, cp) -> None:
+    async def test_unsafe_measurand_returns_not_supported(self, cp) -> None:
         # call() should never be invoked when the guard fires.
         cp.vendor = "ABB"
         cp.call = AsyncMock()
-        with pytest.raises(ValueError, match="ABB-safe set"):
-            await cp.change_configuration(
-                "MeterValuesSampledData",
-                "Energy.Active.Import.Register,Frequency,Temperature",
-            )
+        result = await cp.change_configuration(
+            "MeterValuesSampledData",
+            "Energy.Active.Import.Register,Frequency,Temperature",
+        )
+        assert result == "NotSupported"
         cp.call.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unsafe_measurand_raises_before_boot_vendor_known(self, cp) -> None:
+    async def test_unsafe_measurand_rejected_before_boot_vendor_known(self, cp) -> None:
         cp.vendor = None
         cp.call = AsyncMock()
-        with pytest.raises(ValueError, match="ABB-safe set"):
-            await cp.change_configuration(
-                "MeterValuesSampledData",
-                "Energy.Active.Import.Register,Frequency",
-            )
+        result = await cp.change_configuration(
+            "MeterValuesSampledData",
+            "Energy.Active.Import.Register,Frequency",
+        )
+        assert result == "NotSupported"
         cp.call.assert_not_awaited()
 
     @pytest.mark.parametrize(
@@ -266,11 +266,11 @@ class TestChangeConfigurationAbbGuard:
     async def test_aligned_data_also_guarded(self, cp) -> None:
         cp.vendor = "ABB"
         cp.call = AsyncMock()
-        with pytest.raises(ValueError):
-            await cp.change_configuration(
-                "MeterValuesAlignedData",
-                "Energy.Active.Import.Register,RPM",
-            )
+        result = await cp.change_configuration(
+            "MeterValuesAlignedData",
+            "Energy.Active.Import.Register,RPM",
+        )
+        assert result == "NotSupported"
         cp.call.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -303,6 +303,7 @@ class TestSendLocalListCap:
 
     @pytest.mark.asyncio
     async def test_over_cap_returns_not_supported(self, cp, caplog) -> None:
+        cp.vendor = "ABB"
         cp.call = AsyncMock()
         entries = [
             {"id_tag": f"TAG{i:03d}", "id_tag_info": {"status": "Accepted"}}
@@ -316,6 +317,22 @@ class TestSendLocalListCap:
         assert result == "NotSupported"
         cp.call.assert_not_awaited()
         assert "exceeds" in caplog.text.lower() or "cap" in caplog.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_non_abb_over_cap_is_allowed(self, cp) -> None:
+        cp.vendor = "Etrel"
+        cp.call = AsyncMock(return_value=MagicMock(status="Accepted"))
+        entries = [
+            {"id_tag": f"TAG{i:03d}", "id_tag_info": {"status": "Accepted"}}
+            for i in range(_LOCAL_LIST_MAX_ENTRIES + 1)
+        ]
+        result = await cp.send_local_list(
+            list_version=1,
+            update_type="Full",
+            local_authorization_list=entries,
+        )
+        assert result == "Accepted"
+        cp.call.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_empty_list_passes_through(self, cp) -> None:

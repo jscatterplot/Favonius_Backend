@@ -103,6 +103,14 @@ _ABB_SAFE_MEASURANDS: frozenset[str] = frozenset(
 _LOCAL_LIST_MAX_ENTRIES = 16
 
 
+def _is_abb_vendor(vendor: Optional[str]) -> bool:
+    """Return whether charger vendor metadata identifies ABB."""
+    if not vendor or not vendor.strip():
+        return False
+    vendor_tokens = re.split(r"[^a-z0-9]+", vendor.strip().lower())
+    return "abb" in vendor_tokens
+
+
 def _requires_abb_safe_measurands(vendor: Optional[str]) -> bool:
     """Return whether meter measurands should be restricted to the ABB-safe set.
 
@@ -112,8 +120,7 @@ def _requires_abb_safe_measurands(vendor: Optional[str]) -> bool:
     """
     if not vendor or not vendor.strip():
         return True
-    vendor_tokens = re.split(r"[^a-z0-9]+", vendor.strip().lower())
-    return "abb" in vendor_tokens
+    return _is_abb_vendor(vendor)
 
 
 # ---------------------------------------------------------------------------
@@ -885,10 +892,10 @@ class FleetChargePoint(CP16):
 
         Returns 'Accepted', 'Rejected', 'RebootRequired', or 'NotSupported'.
 
-        Raises ValueError if the caller asks to push measurands outside the
-        ABB-safe set on ``MeterValuesSampledData`` / ``MeterValuesAlignedData``.
-        ABB Terra AC firmware ≤1.8.21 reboot-loops when the sampled-data list
-        contains unsupported measurands.
+        If the caller pushes measurands outside the ABB-safe set on
+        ``MeterValuesSampledData`` / ``MeterValuesAlignedData`` for ABB (or
+        unknown-vendor-before-boot) chargers, the call is refused with
+        ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
         if (
             _requires_abb_safe_measurands(self.vendor)
@@ -897,19 +904,21 @@ class FleetChargePoint(CP16):
             requested = {m.strip() for m in value.split(",") if m.strip()}
             unsupported = requested - _ABB_SAFE_MEASURANDS
             if unsupported:
-                raise ValueError(
-                    f"Refusing ChangeConfiguration({key}) to {self.id}: "
-                    f"measurands outside ABB-safe set: {sorted(unsupported)}. "
-                    f"Allowed: {sorted(_ABB_SAFE_MEASURANDS)}"
+                logger.warning(
+                    "Refusing ChangeConfiguration(%s) to %s: measurands outside "
+                    "ABB-safe set: %s. Allowed: %s",
+                    key,
+                    self.id,
+                    sorted(unsupported),
+                    sorted(_ABB_SAFE_MEASURANDS),
                 )
+                return "NotSupported"
 
         try:
             payload = call.ChangeConfiguration(key=key, value=value)
             response = await self.call(payload)
             logger.info(f"ChangeConfiguration to {self.id}: {key}={value} -> {response.status}")
             return response.status
-        except ValueError:
-            raise
         except Exception as e:
             logger.error(f"Error ChangeConfiguration to {self.id}: {e}")
             return "Rejected"
@@ -960,17 +969,31 @@ class FleetChargePoint(CP16):
         would create a security gap (some idTags would never authorize).
         """
         if (
-            local_authorization_list is not None
+            _is_abb_vendor(self.vendor)
+            and local_authorization_list is not None
             and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
         ):
             logger.warning(
-                "SendLocalList to %s: %d entries exceeds %d-entry cap; "
+                "SendLocalList to %s: ABB charger with %d entries exceeds %d-entry cap; "
                 "refusing — caller should fall back to central Authorize.",
                 self.id,
                 len(local_authorization_list),
                 _LOCAL_LIST_MAX_ENTRIES,
             )
             return "NotSupported"
+
+        if (
+            local_authorization_list is not None
+            and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
+        ):
+            logger.warning(
+                "SendLocalList to %s: %d entries exceeds ABB-specific %d-entry cap, "
+                "but charger vendor is %r so request is allowed.",
+                self.id,
+                len(local_authorization_list),
+                _LOCAL_LIST_MAX_ENTRIES,
+                self.vendor,
+            )
 
         try:
             kwargs: dict[str, Any] = {
