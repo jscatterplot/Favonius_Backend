@@ -85,7 +85,7 @@ async def test_heartbeat_returns_time(cp):
     resp = await cp.on_heartbeat()
     assert isinstance(resp, call_result.Heartbeat)
     # current_time should be parseable ISO format
-    datetime.fromisoformat(resp.current_time)
+    datetime.fromisoformat(resp.current_time.replace("Z", "+00:00"))
 
 
 # ============ Incoming: StatusNotification ============
@@ -136,7 +136,7 @@ async def test_authorize_callback_can_reject(mock_ws):
 @pytest.mark.asyncio
 async def test_data_transfer_default_accepts(cp):
     resp = await cp.on_data_transfer_request(
-        "VendorX",
+        "ABB",
         message_id="msg1",
         data="hello",
     )

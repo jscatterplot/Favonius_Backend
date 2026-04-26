@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
-from datetime import datetime
-from typing import Any, Callable, Optional
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Optional
 
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as CP16
@@ -59,6 +60,90 @@ _tx_id_gen = TransactionIdGenerator()
 
 
 # ---------------------------------------------------------------------------
+# OCPP 1.6 spec helpers
+# ---------------------------------------------------------------------------
+
+
+def _now_iso_z() -> str:
+    """OCPP 1.6 timestamp: UTC, milliseconds, trailing Z.
+
+    Some chargers (notably ABB Terra AC firmware ≤1.8.21) reject naive
+    ISO-8601 strings. Always emit ``2026-04-26T12:34:56.789Z`` style.
+    """
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+# DataTransfer vendor allowlist. Vendor IDs outside this set get
+# ``UnknownVendorId`` per OCPP 1.6-J Section 6.4. Adding a vendor here is
+# how we acknowledge we know how to interpret their proprietary payloads.
+_KNOWN_VENDORS: frozenset[str] = frozenset(
+    {
+        "FavoniusEnergy",
+        "ABB",
+        "Etrel",
+    }
+)
+_NORMALIZED_KNOWN_VENDORS: frozenset[str] = frozenset(
+    re.sub(r"[^a-z0-9]+", "", vendor.lower()) for vendor in _KNOWN_VENDORS
+)
+
+
+# Measurands safe to push to ABB Terra AC chargers via
+# ChangeConfiguration("MeterValuesSampledData"). Pushing any measurand
+# outside this set on firmware ≤1.8.21 puts the charger into a reboot loop.
+_ABB_SAFE_MEASURANDS: frozenset[str] = frozenset(
+    {
+        "Energy.Active.Import.Register",
+        "Current.Import",
+        "Voltage",
+        "Power.Active.Import",
+        "Current.Offered",
+    }
+)
+
+# OCPP 1.6 spec: SendLocalList max entries per ABB integration guide is 16.
+_LOCAL_LIST_MAX_ENTRIES = 16
+
+
+def _is_abb_vendor(vendor: Optional[str]) -> bool:
+    """Return whether charger vendor metadata identifies ABB."""
+    if not vendor or not vendor.strip():
+        return False
+    vendor_tokens = re.split(r"[^a-z0-9]+", vendor.strip().lower())
+    return "abb" in vendor_tokens
+
+
+def _requires_abb_safe_measurands(vendor: Optional[str]) -> bool:
+    """Return whether meter measurands should be restricted to the ABB-safe set.
+
+    When the charger has not booted yet, fail closed: provisioning/reconnect
+    races must not be able to push ABB-unsafe measurands before vendor metadata
+    is available.
+    """
+    return _is_abb_or_unknown_vendor(vendor)
+
+
+def _is_abb_or_unknown_vendor(vendor: Optional[str]) -> bool:
+    """Return whether ABB-specific safety constraints should be applied."""
+    if not vendor or not vendor.strip():
+        return True
+    return _is_abb_vendor(vendor)
+
+
+def _is_known_data_transfer_vendor(vendor_id: str) -> bool:
+    """Return whether DataTransfer vendorId is in the allowlist.
+
+    Accepts cosmetic variants (case/spacing/punctuation) and ABB token
+    variants so behavior matches the ABB guard path.
+    """
+    if not vendor_id or not vendor_id.strip():
+        return False
+    normalized_vendor_id = re.sub(r"[^a-z0-9]+", "", vendor_id.lower())
+    return normalized_vendor_id in _NORMALIZED_KNOWN_VENDORS or _is_abb_vendor(vendor_id)
+
+
+# ---------------------------------------------------------------------------
 # FleetChargePoint
 # ---------------------------------------------------------------------------
 
@@ -85,6 +170,7 @@ class FleetChargePoint(CP16):
         on_diagnostics_status: Optional[Callable] = None,
         on_firmware_status: Optional[Callable] = None,
         on_data_transfer: Optional[Callable] = None,
+        tx_id_provider: Optional[Callable[[], Awaitable[int]]] = None,
     ):
         """Initialize FleetChargePoint.
 
@@ -100,6 +186,9 @@ class FleetChargePoint(CP16):
             on_diagnostics_status: Callback for diagnostics status
             on_firmware_status: Callback for firmware status
             on_data_transfer: Callback for data transfer messages
+            tx_id_provider: Async callable returning the next transactionId
+                (back this with a DB sequence in production so IDs survive
+                restarts). Falls back to an in-memory monotonic counter.
         """
         super().__init__(id, connection)
         self._cb_status_change = on_status_change
@@ -111,6 +200,7 @@ class FleetChargePoint(CP16):
         self._cb_diagnostics = on_diagnostics_status
         self._cb_firmware = on_firmware_status
         self._cb_data_transfer = on_data_transfer
+        self._tx_id_provider = tx_id_provider
 
         # Backward-compatible attribute names (used by OCPPServer)
         self.on_status_change_callback = on_status_change
@@ -172,7 +262,7 @@ class FleetChargePoint(CP16):
                 logger.error(f"Error in boot callback: {e}")
 
         return call_result.BootNotification(
-            current_time=datetime.utcnow().isoformat(),
+            current_time=_now_iso_z(),
             interval=300,
             status=status,
         )
@@ -180,7 +270,7 @@ class FleetChargePoint(CP16):
     @on("Heartbeat")
     async def on_heartbeat(self, **kwargs):
         """Handle Heartbeat from charger. Returns current server time."""
-        return call_result.Heartbeat(current_time=datetime.utcnow().isoformat())
+        return call_result.Heartbeat(current_time=_now_iso_z())
 
     @on("StatusNotification")
     async def on_status_notification(
@@ -379,7 +469,19 @@ class FleetChargePoint(CP16):
                 logger.error(f"Error in transaction start callback: {e}")
 
         if auth_status == AuthorizationStatus.accepted:
-            tx_id = _tx_id_gen.next_id()
+            if self._tx_id_provider is not None:
+                try:
+                    tx_id = await self._tx_id_provider()
+                except Exception as e:
+                    # Fall back to in-memory counter rather than rejecting a
+                    # session that the charger has already physically begun.
+                    logger.error(
+                        f"tx_id_provider failed for {self.id}; "
+                        f"falling back to in-memory counter: {e}"
+                    )
+                    tx_id = _tx_id_gen.next_id()
+            else:
+                tx_id = _tx_id_gen.next_id()
             self.transactions[connector_id] = tx_id
             self.current_transaction_id = tx_id
         else:
@@ -451,6 +553,7 @@ class FleetChargePoint(CP16):
                 if result is not None:
                     auth_status = result
             except Exception as e:
+                auth_status = AuthorizationStatus.invalid
                 logger.error(f"Error in authorize callback: {e}")
 
         logger.info(f"Authorize from {self.id}: id_tag={id_tag}, status={auth_status}")
@@ -458,7 +561,13 @@ class FleetChargePoint(CP16):
 
     @on("DataTransfer")
     async def on_data_transfer_request(self, vendor_id: str, **kwargs):
-        """Handle DataTransfer from charger — vendor-specific messages."""
+        """Handle DataTransfer from charger — vendor-specific messages.
+
+        Returns ``UnknownVendorId`` when ``vendor_id`` is not in the
+        allowlist (OCPP 1.6-J Section 6.4). The callback can override the
+        decision when a vendor's payload should be processed even when not
+        listed.
+        """
         message_id = kwargs.get("message_id", "")
         data = kwargs.get("data", "")
 
@@ -467,7 +576,7 @@ class FleetChargePoint(CP16):
             f"msg_id={message_id}, data_len={len(str(data))}"
         )
 
-        status = "Accepted"
+        status = "Accepted" if _is_known_data_transfer_vendor(vendor_id) else "UnknownVendorId"
         response_data = None
 
         if self._cb_data_transfer:
@@ -803,7 +912,29 @@ class FleetChargePoint(CP16):
         """Change a configuration key on the charger.
 
         Returns 'Accepted', 'Rejected', 'RebootRequired', or 'NotSupported'.
+
+        If the caller pushes measurands outside the ABB-safe set on
+        ``MeterValuesSampledData`` / ``MeterValuesAlignedData`` for ABB (or
+        unknown-vendor-before-boot) chargers, the call is refused with
+        ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
+        if (
+            _requires_abb_safe_measurands(self.vendor)
+            and key in {"MeterValuesSampledData", "MeterValuesAlignedData"}
+        ):
+            requested = {m.strip() for m in value.split(",") if m.strip()}
+            unsupported = requested - _ABB_SAFE_MEASURANDS
+            if unsupported:
+                logger.warning(
+                    "Refusing ChangeConfiguration(%s) to %s: measurands outside "
+                    "ABB-safe set: %s. Allowed: %s",
+                    key,
+                    self.id,
+                    sorted(unsupported),
+                    sorted(_ABB_SAFE_MEASURANDS),
+                )
+                return "NotSupported"
+
         try:
             payload = call.ChangeConfiguration(key=key, value=value)
             response = await self.call(payload)
@@ -852,13 +983,45 @@ class FleetChargePoint(CP16):
         """Send/update local authorization list.
 
         Returns 'Accepted', 'Failed', 'NotSupported', or 'VersionMismatch'.
+
+        ABB Terra AC chargers cap LocalAuthList at 16 entries. If the caller
+        passes more, we refuse the push and return ``NotSupported`` so the
+        operator falls back to central authorization. Truncating silently
+        would create a security gap (some idTags would never authorize).
         """
+        if (
+            _is_abb_or_unknown_vendor(self.vendor)
+            and local_authorization_list is not None
+            and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
+        ):
+            logger.warning(
+                "SendLocalList to %s: ABB/unknown vendor with %d entries exceeds "
+                "%d-entry cap; refusing — caller should fall back to central Authorize.",
+                self.id,
+                len(local_authorization_list),
+                _LOCAL_LIST_MAX_ENTRIES,
+            )
+            return "NotSupported"
+
+        if (
+            local_authorization_list is not None
+            and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
+        ):
+            logger.warning(
+                "SendLocalList to %s: %d entries exceeds ABB-specific %d-entry cap, "
+                "but charger vendor is %r so request is allowed.",
+                self.id,
+                len(local_authorization_list),
+                _LOCAL_LIST_MAX_ENTRIES,
+                self.vendor,
+            )
+
         try:
             kwargs: dict[str, Any] = {
                 "list_version": list_version,
                 "update_type": update_type,
             }
-            if local_authorization_list:
+            if local_authorization_list is not None:
                 kwargs["local_authorization_list"] = local_authorization_list
             payload = call.SendLocalList(**kwargs)
             response = await self.call(payload)
