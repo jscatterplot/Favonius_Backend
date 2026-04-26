@@ -121,6 +121,11 @@ def _requires_abb_safe_measurands(vendor: Optional[str]) -> bool:
     races must not be able to push ABB-unsafe measurands before vendor metadata
     is available.
     """
+    return _is_abb_or_unknown_vendor(vendor)
+
+
+def _is_abb_or_unknown_vendor(vendor: Optional[str]) -> bool:
+    """Return whether ABB-specific safety constraints should be applied."""
     if not vendor or not vendor.strip():
         return True
     return _is_abb_vendor(vendor)
@@ -548,6 +553,7 @@ class FleetChargePoint(CP16):
                 if result is not None:
                     auth_status = result
             except Exception as e:
+                auth_status = AuthorizationStatus.invalid
                 logger.error(f"Error in authorize callback: {e}")
 
         logger.info(f"Authorize from {self.id}: id_tag={id_tag}, status={auth_status}")
@@ -984,7 +990,7 @@ class FleetChargePoint(CP16):
         would create a security gap (some idTags would never authorize).
         """
         if (
-            _requires_abb_safe_measurands(self.vendor)
+            _is_abb_or_unknown_vendor(self.vendor)
             and local_authorization_list is not None
             and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
         ):
@@ -1015,7 +1021,7 @@ class FleetChargePoint(CP16):
                 "list_version": list_version,
                 "update_type": update_type,
             }
-            if local_authorization_list:
+            if local_authorization_list is not None:
                 kwargs["local_authorization_list"] = local_authorization_list
             payload = call.SendLocalList(**kwargs)
             response = await self.call(payload)

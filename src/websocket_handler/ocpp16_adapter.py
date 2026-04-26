@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from .timescale_client import TimescaleClient
 
 logger = logging.getLogger(__name__)
-_PROFILE_ID_FALLBACK_START = 2_000_000_000
+_PROFILE_ID_FALLBACK_START = 9_000_000_000_000_000_000
 _PROFILE_ID_FALLBACK_SPAN = 100_000_000
 
 
@@ -129,7 +129,7 @@ class OCPP16Session:
                     exc,
                 )
 
-        charging_rate_unit = cp_schedule.get(
+        charging_rate_unit = (cp_schedule or {}).get(
             "chargingRateUnit", charging_profile.get("chargingRateUnit", "W")
         )
 
@@ -176,7 +176,16 @@ class OCPP16Session:
 
     async def _on_authorize(self, cp_id: str, id_tag: str) -> AuthorizationStatus:
         """Handle Authorize by failing closed on unknown fleet idTags."""
-        return await self._validate_id_tag(cp_id, id_tag, "Authorize")
+        try:
+            return await self._validate_id_tag(cp_id, id_tag, "Authorize")
+        except Exception as exc:
+            logger.error(
+                "Authorize validation raised unexpectedly for station=%s id_tag=%s: %s",
+                cp_id,
+                id_tag,
+                exc,
+            )
+            return AuthorizationStatus.invalid
 
     async def send_der_control(self, der_control: Dict) -> bool:  # noqa: ARG002
         """DER control is an OCPP 2.x feature; no-op for OCPP 1.6 chargers."""
