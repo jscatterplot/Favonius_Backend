@@ -18,6 +18,8 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from ocpp.v16.enums import AuthorizationStatus
+
 from src.adapters.ocpp.charge_point import FleetChargePoint
 
 if TYPE_CHECKING:
@@ -56,6 +58,8 @@ class OCPP16Session:
             on_status_change=self._on_status_change,
             on_transaction_start=self._on_transaction_start,
             on_transaction_stop=self._on_transaction_stop,
+            on_authorize=self._on_authorize,
+            tx_id_provider=self._next_transaction_id,
         )
 
     # ------------------------------------------------------------------
@@ -76,6 +80,10 @@ class OCPP16Session:
         ``evse_id`` is treated as OCPP 1.6 ``connector_id`` (equivalent concept).
         The ``charging_profile`` dict is expected to carry the standard OCPP
         fields; the schedule periods are forwarded verbatim.
+
+        If the caller does not pass ``chargingProfileId``, we draw a unique
+        id from the ``ocpp_charging_profile_id`` sequence so concurrent
+        pushes do not stack-collide on the charger.
         """
         schedule_periods: List[Dict] = []
         cp_schedule = charging_profile.get("chargingSchedule", {})
@@ -84,6 +92,18 @@ class OCPP16Session:
         else:
             # Flat format: list of period dicts at top level
             schedule_periods = charging_profile.get("chargingSchedulePeriod", [])
+
+        profile_id = charging_profile.get("chargingProfileId")
+        if profile_id is None:
+            try:
+                profile_id = await self._timescale.next_charging_profile_id()
+            except Exception as exc:
+                logger.warning(
+                    "next_charging_profile_id failed for station=%s; falling back to 1: %s",
+                    self._station_id,
+                    exc,
+                )
+                profile_id = 1
 
         return await self._cp.set_charging_profile(
             connector_id=evse_id,
@@ -94,8 +114,36 @@ class OCPP16Session:
             profile_kind=charging_profile.get("chargingProfileKind", "Absolute"),
             charging_rate_unit=cp_schedule.get("chargingRateUnit", "W"),
             stack_level=charging_profile.get("stackLevel", 0),
-            profile_id=charging_profile.get("chargingProfileId", 1),
+            profile_id=profile_id,
         )
+
+    # ------------------------------------------------------------------
+    # Database-backed providers wired into FleetChargePoint
+    # ------------------------------------------------------------------
+
+    async def _next_transaction_id(self) -> int:
+        """Provide a restart-safe transactionId from the DB sequence."""
+        return await self._timescale.next_transaction_id()
+
+    async def _on_authorize(self, cp_id: str, id_tag: str) -> AuthorizationStatus:
+        """Authorize lookup against ``vehicles.id_tag`` (migration 012 index).
+
+        Returns ``Accepted`` for tags registered in the fleet, ``Invalid``
+        for unknown tags. We deliberately do not use ``Blocked`` /
+        ``Expired`` here — those require richer tag metadata which is out
+        of scope for the pilot.
+        """
+        try:
+            row = await self._timescale.lookup_id_tag(id_tag)
+        except Exception as exc:
+            logger.error(
+                "Authorize lookup failed for station=%s id_tag=%s: %s",
+                cp_id,
+                id_tag,
+                exc,
+            )
+            return AuthorizationStatus.invalid
+        return AuthorizationStatus.accepted if row else AuthorizationStatus.invalid
 
     async def send_der_control(self, der_control: Dict) -> bool:  # noqa: ARG002
         """DER control is an OCPP 2.x feature; no-op for OCPP 1.6 chargers."""
