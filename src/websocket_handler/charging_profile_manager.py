@@ -1114,13 +1114,7 @@ class ChargingCommandQueueConsumer:
                     counts.get(status, 0)
                 )
 
-            try:
-                await asyncio.wait_for(
-                    self._wake_event.wait(),
-                    timeout=self.DEPTH_SAMPLE_INTERVAL_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                pass
+            await asyncio.sleep(self.DEPTH_SAMPLE_INTERVAL_SECONDS)
 
     # ------------------------------------------------------------------
     # Row handling

@@ -336,7 +336,6 @@ class DepotController:
             result: Optimization result with charging schedule
         """
         from ..adapters.ocpp.dispatch import _enqueue
-        from ..adapters.ocpp.charge_point import convert_schedule_to_ocpp_profile
 
         logger.info(
             "Enqueuing charging commands for depot %s (%d vehicles)",
@@ -399,10 +398,9 @@ class DepotController:
                 continue
 
             # Build the full SetChargingProfile dict the consumer will hand
-            # to ``send_charging_profile``. ``convert_schedule_to_ocpp_profile``
-            # returns a flat list of periods; we wrap it in the standard
-            # OCPP envelope so OCPP16Session.send_charging_profile can read
-            # ``chargingSchedule`` directly.
+            # to ``send_charging_profile``. We wrap the periods in the
+            # standard OCPP envelope so OCPP16Session.send_charging_profile
+            # can read ``chargingSchedule`` directly.
             payload = {
                 "chargingProfilePurpose": "TxDefaultProfile",
                 "chargingProfileKind": "Absolute",

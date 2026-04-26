@@ -280,14 +280,14 @@ async def test_audit_insert_failure_does_not_break_dispatch(fake_pools, vehicle_
 
 @pytest.mark.asyncio
 async def test_store_charging_command_swallows_db_error():
-    """`_store_charging_command` is best-effort and never raises."""
+    """`_store_charging_command` propagates DB errors to callers."""
     conn = AsyncMock()
     conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("DB error"))
     pool = MagicMock(spec=asyncpg.Pool)
     pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
     pool.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
 
-    # Should NOT raise.
+    # Should raise; caller-level path handles best-effort behavior.
     with pytest.raises(asyncpg.PostgresError):
         await _store_charging_command(
             pool,
