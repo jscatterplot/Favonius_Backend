@@ -362,3 +362,266 @@ class TestServerRoutesOCPP16Correctly:
         )
         # Confirm OCPP16Session itself is the right type (not NoneType)
         assert OCPP16Session is not None
+
+
+# ---------------------------------------------------------------------------
+# Cross-restart recovery (migration 013) — unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestOCPP16SessionRecovery:
+    """Cover the recovery paths that live in ``OCPP16Session``.
+
+    The integration tests in ``tests/integration/test_websocket_recovery.py``
+    drive these against a real database; these unit tests cover the in-memory
+    branches and error handling that don't need DB.
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_charging_profile_falls_back_to_enqueue(
+        self, session, mock_timescale
+    ) -> None:
+        """When the WS push raises, the profile must hit charging_command_queue."""
+        session._cp.set_charging_profile = AsyncMock(
+            side_effect=ConnectionError("not connected")
+        )
+        mock_timescale.enqueue_charging_command = AsyncMock(return_value=99)
+
+        ok = await session.send_charging_profile(
+            1,
+            {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxDefaultProfile",
+                "chargingProfileKind": "Absolute",
+                "chargingSchedule": {
+                    "chargingRateUnit": "W",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 1000}],
+                },
+            },
+        )
+
+        assert ok is False
+        mock_timescale.enqueue_charging_command.assert_awaited_once()
+        kwargs = mock_timescale.enqueue_charging_command.call_args.kwargs
+        assert kwargs["charge_point_id"] == "test_station_001"
+        assert kwargs["connector_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_send_charging_profile_no_enqueue_when_disabled(
+        self, session, mock_timescale
+    ) -> None:
+        """``allow_enqueue=False`` (the replay path) must propagate exceptions."""
+        session._cp.set_charging_profile = AsyncMock(
+            side_effect=RuntimeError("ws closed")
+        )
+        mock_timescale.enqueue_charging_command = AsyncMock()
+
+        with pytest.raises(RuntimeError):
+            await session.send_charging_profile(
+                1, {"chargingSchedulePeriod": []}, allow_enqueue=False
+            )
+        mock_timescale.enqueue_charging_command.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_replay_queued_commands_marks_sent_on_success(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.fetch_pending_commands = AsyncMock(
+            return_value=[
+                {
+                    "queue_id": 1,
+                    "connector_id": 2,
+                    "command_type": "set_charging_profile",
+                    "payload": {
+                        "chargingProfileId": 7,
+                        "stackLevel": 0,
+                        "chargingProfilePurpose": "TxDefaultProfile",
+                        "chargingProfileKind": "Absolute",
+                        "chargingSchedule": {
+                            "chargingRateUnit": "W",
+                            "chargingSchedulePeriod": [
+                                {"startPeriod": 0, "limit": 1000}
+                            ],
+                        },
+                    },
+                    "attempt_count": 0,
+                }
+            ]
+        )
+        mock_timescale.mark_command_sent = AsyncMock()
+        mock_timescale.mark_command_failed = AsyncMock()
+        session._cp.set_charging_profile = AsyncMock(return_value=True)
+
+        sent = await session.replay_queued_commands()
+
+        assert sent == 1
+        mock_timescale.mark_command_sent.assert_awaited_once_with(1)
+        mock_timescale.mark_command_failed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_replay_queued_commands_marks_failed_on_rejection(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.fetch_pending_commands = AsyncMock(
+            return_value=[
+                {
+                    "queue_id": 9,
+                    "connector_id": 1,
+                    "command_type": "set_charging_profile",
+                    "payload": {"chargingSchedulePeriod": []},
+                    "attempt_count": 0,
+                }
+            ]
+        )
+        mock_timescale.mark_command_sent = AsyncMock()
+        mock_timescale.mark_command_failed = AsyncMock()
+        session._cp.set_charging_profile = AsyncMock(return_value=False)
+
+        sent = await session.replay_queued_commands()
+
+        assert sent == 0
+        mock_timescale.mark_command_failed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_replay_queued_commands_tolerates_fetch_failure(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.fetch_pending_commands = AsyncMock(
+            side_effect=RuntimeError("db down")
+        )
+        sent = await session.replay_queued_commands()
+        assert sent == 0
+
+    @pytest.mark.asyncio
+    async def test_on_boot_reloads_transactions_from_db(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.fetch_open_sessions = AsyncMock(
+            return_value=[
+                {"transaction_id": 555, "connector_id": 1},
+                {"transaction_id": 556, "connector_id": 2},
+            ]
+        )
+        await session._on_boot(
+            cp_id="test_station_001",
+            vendor="V",
+            model="M",
+            serial_number="S",
+            firmware_version="F",
+        )
+        # Background _delayed_replay schedules a task; let it run so the
+        # event loop doesn't carry it into the next test.
+        await asyncio.sleep(0)
+
+        assert session._cp.transactions[1] == 555
+        assert session._cp.transactions[2] == 556
+
+    @pytest.mark.asyncio
+    async def test_on_boot_tolerates_fetch_failure(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.fetch_open_sessions = AsyncMock(
+            side_effect=RuntimeError("db down")
+        )
+        # Should not raise — failures are best-effort.
+        await session._on_boot(
+            cp_id="test_station_001",
+            vendor="V",
+            model="M",
+            serial_number=None,
+            firmware_version=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_status_change_persists_to_connector_status(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.insert_connector_status = AsyncMock()
+
+        await session._on_status_change(
+            cp_id="test_station_001",
+            connector_id=1,
+            status="Charging",
+            error_code="NoError",
+            timestamp="2026-04-26T12:00:00Z",
+        )
+
+        mock_timescale.insert_connector_status.assert_awaited_once()
+        payload = mock_timescale.insert_connector_status.call_args.args[0]
+        assert payload["status"] == "Charging"
+        assert payload["error_code"] == "NoError"
+
+    @pytest.mark.asyncio
+    async def test_on_status_change_tolerates_db_failure(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.insert_connector_status = AsyncMock(
+            side_effect=RuntimeError("db down")
+        )
+        # Must not raise; status pushes still continue downstream.
+        await session._on_status_change(
+            cp_id="test_station_001",
+            connector_id=1,
+            status="Faulted",
+            error_code="GroundFailure",
+            timestamp=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_closes_session_row(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.close_open_session = AsyncMock()
+
+        await session._on_transaction_stop(
+            cp_id="test_station_001",
+            transaction_id=4242,
+            id_tag="TAG_X",
+            meter_stop=12345,
+            timestamp="2026-04-26T13:00:00Z",
+            reason="Local",
+        )
+
+        mock_timescale.close_open_session.assert_awaited_once()
+        args = mock_timescale.close_open_session.call_args.args
+        assert args[0] == "test_station_001"
+        assert args[1] == 4242
+        # args[2] is the parsed end_time
+        assert args[2].year == 2026
+
+    @pytest.mark.asyncio
+    async def test_next_transaction_id_persists_when_pending_set(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.next_transaction_id = AsyncMock(return_value=999)
+        mock_timescale.insert_open_session = AsyncMock()
+        session._pending_start = {
+            "connector_id": 1,
+            "evse_id": 1,
+            "id_tag": "TAG_Y",
+            "start_time": datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc),
+        }
+
+        tx_id = await session._next_transaction_id()
+
+        assert tx_id == 999
+        mock_timescale.insert_open_session.assert_awaited_once()
+        kwargs = mock_timescale.insert_open_session.call_args.kwargs
+        assert kwargs["transaction_id"] == 999
+        assert kwargs["station_id"] == "test_station_001"
+        # Stash must be cleared so a stray call cannot double-insert.
+        assert session._pending_start is None
+
+    @pytest.mark.asyncio
+    async def test_next_transaction_id_skips_insert_without_pending(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.next_transaction_id = AsyncMock(return_value=1)
+        mock_timescale.insert_open_session = AsyncMock()
+        session._pending_start = None
+
+        tx_id = await session._next_transaction_id()
+
+        assert tx_id == 1
+        mock_timescale.insert_open_session.assert_not_called()

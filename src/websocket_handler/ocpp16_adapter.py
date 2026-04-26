@@ -25,6 +25,10 @@ from ocpp.v16.enums import AuthorizationStatus
 
 from src.adapters.ocpp.charge_point import FleetChargePoint
 
+# Replay window after a charger reconnects: pending commands enqueued while
+# the charger was offline are flushed within this many seconds of boot.
+REPLAY_BACKOFF_SECONDS = 1.0
+
 if TYPE_CHECKING:
     from .message_handler import MessageHandler
     from .timescale_client import TimescaleClient
@@ -70,6 +74,11 @@ class OCPP16Session:
         self._station_id = station_id
         self._timescale = timescale_client
         self._message_handler = message_handler
+        # Single-slot stash for the most recent accepted StartTransaction so
+        # ``_next_transaction_id`` can persist the open ``charging_sessions``
+        # row alongside the generated tx_id. Safe because FleetChargePoint
+        # serialises message handling per charger socket.
+        self._pending_start: Optional[Dict[str, Any]] = None
 
         self._cp = FleetChargePoint(
             id=station_id,
@@ -95,7 +104,13 @@ class OCPP16Session:
     # Outgoing commands (matches EnhancedOCPPChargePoint's interface)
     # ------------------------------------------------------------------
 
-    async def send_charging_profile(self, evse_id: int, charging_profile: Dict) -> bool:
+    async def send_charging_profile(
+        self,
+        evse_id: int,
+        charging_profile: Dict,
+        *,
+        allow_enqueue: bool = True,
+    ) -> bool:
         """Send SetChargingProfile to the charger using OCPP 1.6 semantics.
 
         ``evse_id`` is treated as OCPP 1.6 ``connector_id`` (equivalent concept).
@@ -105,6 +120,12 @@ class OCPP16Session:
         If the caller does not pass ``chargingProfileId``, we draw a unique
         id from the ``ocpp_charging_profile_id`` sequence so concurrent
         pushes do not stack-collide on the charger.
+
+        When the underlying WebSocket is closed (the charger went offline
+        between the optimizer dispatch and this call), we persist the profile
+        to ``charging_command_queue`` and return ``False`` so the caller can
+        record the deferred state. ``allow_enqueue=False`` disables this
+        fallback — used by the replay path itself to avoid loops.
         """
         schedule_periods: List[Dict] = []
         cp_schedule = charging_profile.get("chargingSchedule", {})
@@ -133,25 +154,121 @@ class OCPP16Session:
             "chargingRateUnit", charging_profile.get("chargingRateUnit", "W")
         )
 
-        return await self._cp.set_charging_profile(
-            connector_id=evse_id,
-            charging_schedule=schedule_periods,
-            profile_purpose=charging_profile.get(
-                "chargingProfilePurpose", "TxDefaultProfile"
-            ),
-            profile_kind=charging_profile.get("chargingProfileKind", "Absolute"),
-            charging_rate_unit=charging_rate_unit,
-            stack_level=charging_profile.get("stackLevel", 0),
-            profile_id=profile_id,
-        )
+        try:
+            return await self._cp.set_charging_profile(
+                connector_id=evse_id,
+                charging_schedule=schedule_periods,
+                profile_purpose=charging_profile.get(
+                    "chargingProfilePurpose", "TxDefaultProfile"
+                ),
+                profile_kind=charging_profile.get("chargingProfileKind", "Absolute"),
+                charging_rate_unit=charging_rate_unit,
+                stack_level=charging_profile.get("stackLevel", 0),
+                profile_id=profile_id,
+            )
+        except Exception as exc:
+            if not allow_enqueue:
+                raise
+            logger.warning(
+                "set_charging_profile push failed for station=%s connector=%s: %s — enqueuing",
+                self._station_id,
+                evse_id,
+                exc,
+            )
+            try:
+                await self._timescale.enqueue_charging_command(
+                    charge_point_id=self._station_id,
+                    connector_id=evse_id,
+                    payload=charging_profile,
+                )
+            except Exception as enq_exc:
+                logger.error(
+                    "Failed to enqueue charging profile for station=%s: %s",
+                    self._station_id,
+                    enq_exc,
+                )
+            return False
+
+    async def replay_queued_commands(self) -> int:
+        """Flush ``charging_command_queue`` rows for this station.
+
+        Called from ``_on_boot`` after BootNotification has been answered.
+        Each pending row is pushed via ``send_charging_profile`` with
+        ``allow_enqueue=False`` so a transient failure during replay does not
+        re-enqueue an already-queued row. Returns the number of rows that
+        were marked ``sent``.
+        """
+        try:
+            rows = await self._timescale.fetch_pending_commands(self._station_id)
+        except Exception as exc:
+            logger.error(
+                "fetch_pending_commands failed for station=%s: %s",
+                self._station_id,
+                exc,
+            )
+            return 0
+
+        sent = 0
+        for row in rows:
+            queue_id = row["queue_id"]
+            payload = row["payload"]
+            if isinstance(payload, str):
+                import json as _json
+
+                payload = _json.loads(payload)
+            connector_id = row["connector_id"]
+            try:
+                ok = await self.send_charging_profile(
+                    connector_id, payload, allow_enqueue=False
+                )
+            except Exception as exc:
+                await self._timescale.mark_command_failed(queue_id, str(exc))
+                continue
+            if ok:
+                await self._timescale.mark_command_sent(queue_id)
+                sent += 1
+            else:
+                await self._timescale.mark_command_failed(
+                    queue_id, "charger rejected SetChargingProfile"
+                )
+        if sent:
+            logger.info(
+                "Replayed %d queued command(s) to station=%s", sent, self._station_id
+            )
+        return sent
 
     # ------------------------------------------------------------------
     # Database-backed providers wired into FleetChargePoint
     # ------------------------------------------------------------------
 
     async def _next_transaction_id(self) -> int:
-        """Provide a restart-safe transactionId from the DB sequence."""
-        return await self._timescale.next_transaction_id()
+        """Provide a restart-safe transactionId from the DB sequence.
+
+        Also persists an open ``charging_sessions`` row using context stashed
+        by the most recent ``_on_transaction_start`` so the boot-reload path
+        can find the session if the handler restarts mid-transaction.
+        """
+        tx_id = await self._timescale.next_transaction_id()
+        pending = self._pending_start
+        self._pending_start = None
+        if pending is not None:
+            try:
+                await self._timescale.insert_open_session(
+                    station_id=self._station_id,
+                    transaction_id=tx_id,
+                    evse_id=pending["evse_id"],
+                    connector_id=pending["connector_id"],
+                    id_token=pending.get("id_tag"),
+                    start_time=pending["start_time"],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "insert_open_session failed for station=%s tx_id=%s: %s",
+                    self._station_id,
+                    tx_id,
+                    exc,
+                )
+        return tx_id
 
     async def _validate_id_tag(self, cp_id: str, id_tag: str, source: str) -> AuthorizationStatus:
         """Validate an OCPP idTag against ``vehicles.id_tag``.
@@ -218,6 +335,53 @@ class OCPP16Session:
             serial_number,
             firmware_version,
         )
+        # Cross-restart safety:
+        #   1. Reload still-open transactions into FleetChargePoint.transactions
+        #      so an incoming StopTransaction from the rebooted charger is
+        #      recognised instead of being treated as an unknown txn.
+        #   2. Schedule the queued-command replay to run shortly after we
+        #      return the BootNotification response. Doing it synchronously
+        #      here would delay the boot ack and could trip the charger's
+        #      response timeout.
+        try:
+            open_rows = await self._timescale.fetch_open_sessions(cp_id)
+        except Exception as exc:
+            open_rows = []
+            logger.error(
+                "fetch_open_sessions failed for station=%s: %s", cp_id, exc
+            )
+        for row in open_rows:
+            connector_id = row["connector_id"]
+            tx_id = row["transaction_id"]
+            if connector_id is None or tx_id is None:
+                continue
+            self._cp.transactions[connector_id] = int(tx_id)
+            self._cp.current_transaction_id = int(tx_id)
+        if open_rows:
+            logger.info(
+                "Reloaded %d open session(s) for station=%s on boot",
+                len(open_rows),
+                cp_id,
+            )
+
+        asyncio.create_task(self._delayed_replay())
+
+    async def _delayed_replay(self) -> None:
+        """Run the queued-command replay shortly after BootNotification.
+
+        Sleeps ``REPLAY_BACKOFF_SECONDS`` so the BootNotification reply is
+        flushed and the charger has accepted us before we start sending
+        SetChargingProfile messages on the same socket.
+        """
+        try:
+            await asyncio.sleep(REPLAY_BACKOFF_SECONDS)
+            await self.replay_queued_commands()
+        except Exception as exc:
+            logger.error(
+                "Queued-command replay failed for station=%s: %s",
+                self._station_id,
+                exc,
+            )
 
     async def _on_meter_values(
         self,
@@ -266,12 +430,45 @@ class OCPP16Session:
         cp_id: str,
         connector_id: int,
         status: str,
-        error_code: str,  # noqa: ARG002
-        timestamp: Optional[Any] = None,  # noqa: ARG002
+        error_code: str,
+        timestamp: Optional[Any] = None,
         vendor_id: Optional[str] = None,  # noqa: ARG002
         vendor_error_code: Optional[str] = None,  # noqa: ARG002
     ) -> None:
-        """Push a status_notification event to the main API."""
+        """Persist StatusNotification to ``connector_status`` and forward it.
+
+        The new (FastAPI-mounted) adapter writes status to DB inside
+        FleetChargePoint, but this legacy path does not — without this row
+        ``GET /depots/{id}/alerts`` returns nothing for OCPP 1.6 chargers
+        (PRD §7.1).
+        """
+        ts = timestamp
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                ts = datetime.now(timezone.utc)
+        elif not isinstance(ts, datetime):
+            ts = datetime.now(timezone.utc)
+
+        try:
+            await self._timescale.insert_connector_status(
+                {
+                    "station_id": cp_id,
+                    "connector_id": connector_id,
+                    "status": status,
+                    "error_code": error_code,
+                    "timestamp": ts,
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "insert_connector_status failed: station=%s connector=%s error=%s",
+                cp_id,
+                connector_id,
+                exc,
+            )
+
         asyncio.create_task(
             self._message_handler._push_to_main_api(
                 cp_id,
@@ -291,6 +488,20 @@ class OCPP16Session:
         auth_status = await self._validate_id_tag(cp_id, id_tag, "StartTransaction")
         if auth_status != AuthorizationStatus.accepted:
             return auth_status
+
+        try:
+            start_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            start_time = datetime.now(timezone.utc)
+        # Stash for ``_next_transaction_id`` (FleetChargePoint will call it
+        # next, only because we returned ``accepted``). evse_id == connector_id
+        # in OCPP 1.6.
+        self._pending_start = {
+            "connector_id": connector_id,
+            "evse_id": connector_id,
+            "id_tag": id_tag,
+            "start_time": start_time,
+        }
 
         asyncio.create_task(
             self._message_handler._push_to_main_api(
@@ -315,6 +526,20 @@ class OCPP16Session:
         timestamp: str,
         reason: str,
     ) -> None:
+        try:
+            end_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            end_time = datetime.now(timezone.utc)
+        try:
+            await self._timescale.close_open_session(cp_id, int(transaction_id), end_time)
+        except Exception as exc:
+            logger.warning(
+                "close_open_session failed for station=%s tx_id=%s: %s",
+                cp_id,
+                transaction_id,
+                exc,
+            )
+
         asyncio.create_task(
             self._message_handler._push_to_main_api(
                 cp_id,

@@ -1811,6 +1811,204 @@ class TimescaleClient:
             row = rows[0]
             return {"vehicle_id": row["vehicle_id"], "depot_id": row["depot_id"]}
 
+    # ===== OCPP 1.6 RECOVERY HELPERS (migration 013) =====
+
+    async def fetch_open_sessions(self, station_id: str) -> List[Dict[str, Any]]:
+        """Return rows for sessions that are still open at ``station_id``.
+
+        Used by ``OCPP16Session._on_boot`` to repopulate
+        ``FleetChargePoint.transactions`` after a handler restart so
+        StopTransaction does not orphan the row.
+        """
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT transaction_id, connector_id, evse_id, id_token, start_time
+                  FROM charging_sessions
+                 WHERE station_id = $1
+                   AND end_time IS NULL
+                   AND transaction_id IS NOT NULL
+                 ORDER BY start_time DESC
+                """,
+                station_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def insert_open_session(
+        self,
+        *,
+        station_id: str,
+        transaction_id: int,
+        evse_id: int,
+        connector_id: int,
+        id_token: Optional[str],
+        start_time: datetime,
+    ) -> None:
+        """Insert an open ``charging_sessions`` row at StartTransaction.
+
+        ``end_time`` is left NULL so ``fetch_open_sessions`` can find it on
+        boot. ``transaction_id`` is the OCPP 1.6 integer id from the
+        ``ocpp_transaction_id`` sequence.
+        """
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO charging_sessions (
+                    station_id, transaction_id, evse_id, connector_id,
+                    id_token, start_time
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                station_id,
+                transaction_id,
+                evse_id,
+                connector_id,
+                id_token,
+                start_time,
+            )
+
+    async def close_open_session(
+        self, station_id: str, transaction_id: int, end_time: datetime
+    ) -> None:
+        """Mark a ``charging_sessions`` row closed at StopTransaction."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charging_sessions
+                   SET end_time = $3, updated_at = NOW()
+                 WHERE station_id = $1
+                   AND transaction_id = $2
+                   AND end_time IS NULL
+                """,
+                station_id,
+                transaction_id,
+                end_time,
+            )
+
+    async def mark_sessions_seen(self, station_id: str) -> None:
+        """Stamp ``last_seen_at = NOW()`` on every open session at the station.
+
+        Called from the WebSocket close hook so we can tell a stale-but-open
+        session apart from a live one after a handler crash.
+        """
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charging_sessions
+                   SET last_seen_at = NOW()
+                 WHERE station_id = $1
+                   AND end_time IS NULL
+                """,
+                station_id,
+            )
+
+    async def mark_connectors_unavailable(self, station_id: str) -> None:
+        """Append an ``Unavailable`` row for every known connector at the station.
+
+        ``connector_status`` is append-only (the read query returns the latest
+        per (station_id, connector_id)), so we INSERT one row per connector
+        we have seen recently rather than UPDATE-in-place. If we have no prior
+        rows for the station (a station that never sent StatusNotification),
+        this is a no-op — there is nothing meaningful to mark Unavailable.
+        """
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO connector_status (
+                    station_id, connector_id, status, error_code, timestamp
+                )
+                SELECT DISTINCT ON (connector_id)
+                       station_id, connector_id, 'Unavailable', 'ConnectionLost', NOW()
+                  FROM connector_status
+                 WHERE station_id = $1
+                 ORDER BY connector_id, timestamp DESC
+                """,
+                station_id,
+            )
+
+    async def enqueue_charging_command(
+        self,
+        *,
+        charge_point_id: str,
+        connector_id: int,
+        payload: Dict[str, Any],
+        expires_in_min: int = 60,
+        command_type: str = "set_charging_profile",
+    ) -> int:
+        """Persist a SetChargingProfile that could not be delivered immediately.
+
+        Returns the new ``queue_id``. The replay path
+        (``replay_queued_commands_for``) re-reads any rows that are still
+        pending and not expired the next time the charger boots.
+        """
+        async with self.pg_pool.acquire() as conn:
+            queue_id = await conn.fetchval(
+                """
+                INSERT INTO charging_command_queue (
+                    charge_point_id, connector_id, command_type,
+                    payload, expires_at
+                ) VALUES (
+                    $1, $2, $3, $4::jsonb,
+                    NOW() + ($5 || ' minutes')::interval
+                )
+                RETURNING queue_id
+                """,
+                charge_point_id,
+                connector_id,
+                command_type,
+                json.dumps(payload),
+                str(expires_in_min),
+            )
+            return int(queue_id)
+
+    async def fetch_pending_commands(
+        self, charge_point_id: str
+    ) -> List[Dict[str, Any]]:
+        """Return non-expired pending commands for a cp_id, oldest first."""
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT queue_id, connector_id, command_type, payload,
+                       attempt_count
+                  FROM charging_command_queue
+                 WHERE charge_point_id = $1
+                   AND status = 'pending'
+                   AND expires_at > NOW()
+                 ORDER BY enqueued_at ASC
+                """,
+                charge_point_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def mark_command_sent(self, queue_id: int) -> None:
+        """Charger Accepted the SetChargingProfile during replay."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charging_command_queue
+                   SET status = 'sent',
+                       sent_at = NOW(),
+                       acked_at = NOW(),
+                       attempt_count = attempt_count + 1
+                 WHERE queue_id = $1
+                """,
+                queue_id,
+            )
+
+    async def mark_command_failed(self, queue_id: int, error: str) -> None:
+        """Charger Rejected, or the WS push raised. Increment attempts."""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charging_command_queue
+                   SET status = 'failed',
+                       last_error = $2,
+                       attempt_count = attempt_count + 1
+                 WHERE queue_id = $1
+                """,
+                queue_id,
+                error[:500],
+            )
+
     # ===== PLUG & CHARGE METHODS =====
 
     async def store_contract_info(self, contract_data: Dict[str, Any]) -> None:
