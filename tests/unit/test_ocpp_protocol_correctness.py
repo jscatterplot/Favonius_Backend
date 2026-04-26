@@ -221,6 +221,7 @@ class TestChangeConfigurationAbbGuard:
     async def test_safe_measurands_allowed(self, mock_websocket) -> None:
         # Build a CP whose self.call returns Accepted without hitting the WS.
         cp = FleetChargePoint(id="PILOT-01", connection=mock_websocket)
+        cp.vendor = "ABB"
         cp.call = AsyncMock(return_value=MagicMock(status="Accepted"))
 
         safe_value = ",".join(sorted(_ABB_SAFE_MEASURANDS))
@@ -230,6 +231,7 @@ class TestChangeConfigurationAbbGuard:
     @pytest.mark.asyncio
     async def test_unsafe_measurand_raises_value_error(self, cp) -> None:
         # call() should never be invoked when the guard fires.
+        cp.vendor = "ABB"
         cp.call = AsyncMock()
         with pytest.raises(ValueError, match="ABB-safe set"):
             await cp.change_configuration(
@@ -240,6 +242,7 @@ class TestChangeConfigurationAbbGuard:
 
     @pytest.mark.asyncio
     async def test_aligned_data_also_guarded(self, cp) -> None:
+        cp.vendor = "ABB"
         cp.call = AsyncMock()
         with pytest.raises(ValueError):
             await cp.change_configuration(
