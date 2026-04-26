@@ -328,8 +328,9 @@ async def test_queue_consumer_leaves_offline_rows_pending(
         fromlist=["ChargingCommandQueueConsumer"],
     ).ChargingCommandQueueConsumer(timescale, lambda _cp: None)
 
-    await consumer.drain_once()
+    processed = await consumer.drain_once()
 
+    assert processed == 0
     assert fake_queue.rows[0]["status"] == "pending"
 
 

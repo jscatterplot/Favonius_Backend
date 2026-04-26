@@ -989,10 +989,11 @@ class ChargingCommandQueueConsumer:
         self.logger.info("ChargingCommandQueueConsumer stopped")
 
     async def drain_once(self) -> int:
-        """Drain a single batch of pending rows. Returns rows processed.
+        """Drain one batch. Returns rows attempted against connected chargers.
 
         Public so the boot path or the admin endpoint can force an
-        immediate sweep without waiting for the next poll tick.
+        immediate sweep without waiting for the next poll tick. Offline
+        chargers are left ``pending`` and are not counted.
         """
         now = time.monotonic()
         offline_cp_ids = [
@@ -1018,8 +1019,8 @@ class ChargingCommandQueueConsumer:
         processed = 0
         for row in rows:
             try:
-                await self._handle_row(row)
-                processed += 1
+                if await self._handle_row(row):
+                    processed += 1
             except Exception as exc:
                 # _handle_row should not raise, but a defensive log keeps a
                 # single bad row from killing the whole batch.
@@ -1138,14 +1139,18 @@ class ChargingCommandQueueConsumer:
     # Row handling
     # ------------------------------------------------------------------
 
-    async def _handle_row(self, row: Dict[str, Any]) -> None:
+    async def _handle_row(self, row: Dict[str, Any]) -> bool:
         """Push a single queued command to its charger.
 
         Outcomes:
           * No connected session → leave row ``pending`` (BootNotification
-            replay will pick it up). Outcome metric: ``offline``.
+            replay will pick it up). Returns ``False``.
           * send_charging_profile returns True → mark ``sent``.
           * send_charging_profile returns False or raises → mark ``failed``.
+
+        Returns:
+            ``True`` if a connected charger was attempted, ``False`` if the
+            row stayed pending because the charger is offline.
         """
         queue_id = int(row["queue_id"])
         cp_id = row["charge_point_id"]
@@ -1157,7 +1162,7 @@ class ChargingCommandQueueConsumer:
         cp = self.cp_lookup(cp_id)
         if cp is None:
             self._offline_charge_points[cp_id] = time.monotonic()
-            return
+            return False
 
         # OCPP 1.6 (OCPP16Session) and OCPP 2.0.1 (EnhancedOCPPChargePoint)
         # both expose ``send_charging_profile(evse_id, payload)``. The
@@ -1193,7 +1198,7 @@ class ChargingCommandQueueConsumer:
             PROFILE_PUSH_LATENCY.labels(
                 station_id=cp_id, outcome="failed"
             ).observe(max(time.perf_counter() - start, 1e-6))
-            return
+            return True
 
         latency = max(time.perf_counter() - start, 1e-6)
         PROFILE_PUSH_LATENCY.labels(station_id=cp_id, outcome=outcome).observe(latency)
@@ -1212,6 +1217,7 @@ class ChargingCommandQueueConsumer:
                 outcome,
                 exc,
             )
+        return True
 
     @staticmethod
     def _accepts_allow_enqueue(fn: Callable[..., Awaitable[bool]]) -> bool:

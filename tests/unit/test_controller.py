@@ -611,7 +611,7 @@ class TestDispatchCommands:
         self, mock_db_pool, depot_config, controller_config, sample_optimization_result
     ):
         """Production runs with ocpp_server=None: dispatch enqueues, never blocks."""
-        pool, conn = mock_db_pool
+        pool, _ = mock_db_pool
         depot_id = str(uuid4())
 
         controller = DepotController(
@@ -622,21 +622,31 @@ class TestDispatchCommands:
             ocpp_server=None,
         )
 
-        with patch.object(
-            controller.assembler.__class__, "load_depot_config", new_callable=AsyncMock
-        ) as mock_load:
-            # Map every vehicle in the schedule to a charge_point_id.
+        with (
+            patch.object(
+                controller.assembler.__class__, "load_depot_config", new_callable=AsyncMock
+            ) as mock_load,
+            patch(
+                "src.adapters.ocpp.dispatch.dispatch_charging_profiles",
+                new_callable=AsyncMock,
+            ) as mock_dispatch,
+        ):
+            # load_depot_config returns vehicle id_tags, not charger ocpp_id
+            # values. The controller must let dispatch resolve chargers from
+            # charger_vehicle_access instead of reusing these RFID tags.
             mock_load.return_value = (
                 depot_config,
-                {vid: f"CP_{vid}" for vid in sample_optimization_result.schedule},
+                {vid: f"RFID_{vid}" for vid in sample_optimization_result.schedule},
             )
+            mock_dispatch.return_value = {
+                vid: True for vid in sample_optimization_result.schedule
+            }
 
-            # Should not raise — every row goes to charging_command_queue.
             await controller._dispatch_commands(sample_optimization_result)
 
-        # ``conn.fetchval`` returns the queue_id; we expect at least one
-        # INSERT per vehicle with positive charging power.
-        assert conn.fetchval.await_count >= 1
+        mock_load.assert_not_awaited()
+        mock_dispatch.assert_awaited_once()
+        assert mock_dispatch.await_args.kwargs["vehicle_to_charger_map"] is None
 
     @pytest.mark.asyncio
     async def test_dispatch_handles_missing_charge_point(
@@ -657,14 +667,17 @@ class TestDispatchCommands:
             ocpp_server=mock_ocpp,
         )
 
-        # Mock load_depot_config
-        with patch.object(
-            controller.assembler.__class__, "load_depot_config", new_callable=AsyncMock
-        ) as mock_load:
-            mock_load.return_value = (depot_config, {"bus_1": "charger_1"})
-
+        with patch(
+            "src.adapters.ocpp.dispatch.dispatch_charging_profiles",
+            new_callable=AsyncMock,
+        ) as mock_dispatch:
+            mock_dispatch.return_value = {
+                vid: True for vid in sample_optimization_result.schedule
+            }
             # Should not raise
             await controller._dispatch_commands(sample_optimization_result)
+            mock_dispatch.assert_awaited_once()
+            mock_ocpp.get_charge_point.assert_not_called()
 
 
 # ============ State Update Tests ============

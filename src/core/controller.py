@@ -343,33 +343,11 @@ class DepotController:
             len(result.schedule),
         )
 
-        # Get vehicle-to-charger mapping from database. Without it we cannot
-        # address the queue rows to a specific cp_id, so this is a hard fail
-        # for the dispatch — but we still log every vehicle we skipped.
-        try:
-            _, vehicle_to_ocpp = await StateAssembler.load_depot_config(self.pools, self.depot_id)
-        except Exception as e:
-            logger.error(
-                f"Failed to load vehicle-to-charger mapping: {e}",
-                exc_info=True,
-                extra={"depot_id": self.depot_id},
-            )
-            vehicle_to_ocpp = {}
-        if vehicle_to_ocpp is None:
-            vehicle_to_ocpp = {}
-
-        vehicle_to_charger_map: dict[str, tuple[str, int]] = {}
-        for vehicle_id, cp_value in vehicle_to_ocpp.items():
-            if isinstance(cp_value, tuple) and len(cp_value) == 2:
-                vehicle_to_charger_map[vehicle_id] = (str(cp_value[0]), int(cp_value[1]))
-            elif cp_value:
-                vehicle_to_charger_map[vehicle_id] = (str(cp_value), 1)
-
         enqueue_results = await dispatch_charging_profiles(
             result,
             pools=self.pools,
             depot_id=self.depot_id,
-            vehicle_to_charger_map=vehicle_to_charger_map,
+            vehicle_to_charger_map=None,
             delta_t=self.config.delta_t,
             expires_in_min=60,
         )
