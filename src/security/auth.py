@@ -146,8 +146,14 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
         user: Decoded JWT payload from verify_token.
         pool: Optional asyncpg pool for DB-backed authorization.
     """
-    # Fast path: check depot_ids claim in token
     metadata = user.get("user_metadata", {})
+
+    # Check favonius_role first — admins can access all depots
+    favonius_role = metadata.get("favonius_role", "")
+    if favonius_role == "admin":
+        return
+
+    # Fast path: check depot_ids claim in token
     depot_ids = metadata.get("depot_ids")
     if isinstance(depot_ids, list):
         if depot_id in depot_ids:
@@ -156,11 +162,6 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: you do not have permission for this depot",
         )
-
-    # Check favonius_role — admins can access all depots
-    favonius_role = metadata.get("favonius_role", "")
-    if favonius_role == "admin":
-        return
 
     # Fallback: DB-backed authorization check
     if pool is not None:
@@ -189,6 +190,19 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Access denied: you do not have permission for this depot",
     )
+
+
+def get_user_depot_ids(token: dict) -> list[str]:
+    """Return the list of depot UUIDs the user can access, from the JWT claim.
+
+    Returns an empty list when the claim is absent (e.g., admin users who use
+    the role-based bypass, or tokens issued before the Auth Hook was configured).
+    """
+    metadata = token.get("user_metadata", {})
+    depot_ids = metadata.get("depot_ids")
+    if isinstance(depot_ids, list):
+        return [str(d) for d in depot_ids]
+    return []
 
 
 def get_user_role(token: dict) -> str:

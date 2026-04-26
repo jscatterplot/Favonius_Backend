@@ -9,11 +9,11 @@ from uuid import uuid4
 
 import pytest
 from fastapi import status as http_status
-from fastapi.testclient import TestClient
 
 from src.api.main import (
     HandoffRequest,
     OptimizationRequest,
+    _require_depot_access,
     app,
     describe_database_target,
     resolve_database_url,
@@ -21,89 +21,21 @@ from src.api.main import (
     validate_horizon_hours,
     validate_uuid,
 )
-from src.core.models import DepotConfig, DepotState, OptimizationResult
+from src.security.auth import verify_token
 
 
-@pytest.fixture
-def client():
-    """Create test client."""
-    return TestClient(app)
+@pytest.fixture(autouse=True)
+def default_auth():
+    """Inject admin auth for all tests in this module.
 
-
-@pytest.fixture
-def mock_db_pool():
-    """Mock database connection pool.
-
-    Returns a (pool, conn) tuple where pool.ts and pool.static both delegate
-    to pool.acquire so tests that patch db_pools with this pool work correctly.
+    Uses app.dependency_overrides (not @patch) because FastAPI captures the
+    Depends() function object at module load time. The admin role bypasses
+    depot_ids checks so tests with arbitrary depot UUIDs all pass auth.
     """
-    pool = MagicMock()
-    conn = AsyncMock()
-    pool.acquire.return_value.__aenter__.return_value = conn
-    pool.acquire.return_value.__aexit__.return_value = None
-    # Make .ts and .static delegate to the same pool so db_pools.ts.acquire works
-    pool.ts = pool
-    pool.static = pool
-    return pool, conn
-
-
-@pytest.fixture
-def sample_depot_config():
-    """Sample depot configuration."""
-    vehicle_ids = ["bus_1", "bus_2"]
-    return DepotConfig(
-        vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
-        vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
-        charger_groups={80.0: 10},
-        charger_efficiency=0.95,
-        charger_vehicle_access={},
-        battery_capacity=500.0,
-        battery_power=100.0,
-        max_site_power=800.0,
-    )
-
-
-@pytest.fixture
-def sample_depot_state():
-    """Sample depot state."""
-    return DepotState(
-        vehicle_socs={"bus_1": 0.45, "bus_2": 0.82},
-        battery_soc=0.55,
-        prices=[0.10, 0.15, 0.12] * 32,  # 96 timesteps
-        demand_charge_rate=20.0,
-        current_month_peak=380.0,
-        vehicle_availability={
-            "bus_1": [True] * 96,
-            "bus_2": [True] * 96,
-        },
-        energy_requirements={"bus_1": 200.0, "bus_2": 150.0},
-        departure_times={"bus_1": 48, "bus_2": 60},
-        building_power=[50.0] * 96,
-    )
-
-
-@pytest.fixture
-def sample_optimization_result(sample_depot_config):
-    """Sample optimization result."""
-    return OptimizationResult(
-        run_id=uuid4(),
-        schedule={
-            "bus_1": {
-                "charging_power": [0, 0, 80, 80] * 24,
-                "soc": [0.3, 0.3, 0.35, 0.40] * 24,
-            },
-            "bus_2": {
-                "charging_power": [80, 80, 0, 0] * 24,
-                "soc": [0.5, 0.55, 0.55, 0.55] * 24,
-            },
-        },
-        battery_dispatch=[0.0] * 96,
-        grid_power=[100.0] * 96,
-        peak_demand=450.0,
-        objective_value=1234.56,
-        solve_time=12.3,
-        status="completed",
-    )
+    user = {"sub": "test-admin", "user_metadata": {"favonius_role": "admin"}}
+    app.dependency_overrides[verify_token] = lambda: user
+    yield
+    app.dependency_overrides.pop(verify_token, None)
 
 
 class TestValidationUtilities:
@@ -285,12 +217,10 @@ class TestDepotAlertsEndpoint:
     """Test GET /depots/{depot_id}/alerts (PRD §7.1, AT-16)."""
 
     @patch("src.api.main.db_pools")
-    @patch("src.api.main.verify_token")
     def test_get_alerts_success_with_last_optimization(
-        self, mock_verify, mock_pool, client, mock_db_pool
+        self, mock_pool, client, mock_db_pool
     ):
         """Alerts returns last_optimization and charger_faults."""
-        mock_verify.return_value = {"sub": "test"}
         pool, conn = mock_db_pool
         depot_id = str(uuid4())
         run_id = uuid4()
@@ -326,10 +256,8 @@ class TestDepotAlertsEndpoint:
         assert data["last_optimization"]["solve_time_s"] == 12.3
 
     @patch("src.api.main.db_pools")
-    @patch("src.api.main.verify_token")
-    def test_get_alerts_includes_charger_faults(self, mock_verify, mock_pool, client, mock_db_pool):
+    def test_get_alerts_includes_charger_faults(self, mock_pool, client, mock_db_pool):
         """When connector_status has Faulted, charger_faults list is populated."""
-        mock_verify.return_value = {"sub": "test"}
         pool, conn = mock_db_pool
         depot_id = str(uuid4())
         charger_id = uuid4()
@@ -377,10 +305,8 @@ class TestDepotAlertsEndpoint:
         assert data["charger_faults"][0]["connector_id"] == 1
 
     @patch("src.api.main.db_pools")
-    @patch("src.api.main.verify_token")
-    def test_get_alerts_depot_not_found(self, mock_verify, mock_pool, client, mock_db_pool):
+    def test_get_alerts_depot_not_found(self, mock_pool, client, mock_db_pool):
         """Alerts returns 404 when depot does not exist."""
-        mock_verify.return_value = {"sub": "test"}
         pool, conn = mock_db_pool
         depot_id = str(uuid4())
         conn.fetchval = AsyncMock(return_value=None)
@@ -393,10 +319,8 @@ class TestDepotAlertsEndpoint:
 
         assert response.status_code == http_status.HTTP_404_NOT_FOUND
 
-    @patch("src.api.main.verify_token")
-    def test_get_alerts_invalid_depot_id(self, mock_verify, client):
-        """Alerts returns 400 or 422 for invalid depot_id."""
-        mock_verify.return_value = {"sub": "test"}
+    def test_get_alerts_invalid_depot_id(self, client):
+        """Alerts returns 400 for invalid depot_id."""
         response = client.get(
             "/depots/not-a-uuid/alerts",
             headers={"Authorization": "Bearer test"},
@@ -614,13 +538,16 @@ class TestDatabaseConfiguration:
             resolve_database_url()
 
     def test_describe_database_target_masks_password(self):
-        """Log descriptor should include target details without exposing password."""
+        """Log descriptor exposes only port; user/host-prefix/db are masked."""
         description = describe_database_target(
             "postgresql://postgres:super_secret@db.example.com:5432/favonius"
         )
-
+        # Sensitive fields must not appear
         assert "super_secret" not in description
-        assert "user=postgres" in description
-        assert "host=db.example.com" in description
+        assert "postgres" not in description
+        assert "favonius" not in description
+        # Port is the only value exposed
         assert "port=5432" in description
-        assert "db=favonius" in description
+        # Domain suffix is partially shown; full hostname is not
+        assert "example.com" in description
+        assert "db.example.com" not in description

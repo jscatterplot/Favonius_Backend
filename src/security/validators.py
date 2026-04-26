@@ -10,14 +10,11 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 
-# Validation patterns
-UUID_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE
-)
+def validate_uuid(value: str, field_name: str = "id") -> str:
+    """Validate UUID format and return the canonical string.
 
-
-def validate_uuid(value: str, field_name: str) -> UUID:
-    """Validate UUID v4 format.
+    Accepts any UUID variant (not just v4) and enforces the canonical
+    hyphenated lowercase form to prevent encoding inconsistencies.
 
     Args:
         value: String to validate
@@ -26,12 +23,16 @@ def validate_uuid(value: str, field_name: str) -> UUID:
     Raises:
         HTTPException: If invalid UUID format
     """
-    if not UUID_PATTERN.match(value):
+    try:
+        parsed = UUID(value)
+        if str(parsed) != value:
+            raise ValueError("Non-canonical UUID format")
+        return value
+    except (ValueError, AttributeError):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid UUID format for {field_name}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {field_name}: must be valid UUID format, got: {value}",
         )
-    return UUID(value)
 
 
 def validate_soc(value: float, field_name: str) -> float:
@@ -74,6 +75,56 @@ def validate_power(value: float, field_name: str, max_site_power: float) -> floa
             detail=f"{field_name} exceeds max site power ({max_site_power} kW)",
         )
     return value
+
+
+def validate_depot_id(depot_id: str) -> str:
+    """Validate depot_id is a valid UUID.
+
+    Args:
+        depot_id: Depot identifier to validate
+
+    Returns:
+        Validated depot_id string
+
+    Raises:
+        HTTPException 400: If depot_id is not a valid UUID
+    """
+    return validate_uuid(depot_id, "depot_id")
+
+
+def validate_vehicle_id(vehicle_id: str) -> str:
+    """Validate vehicle_id is a valid UUID.
+
+    Args:
+        vehicle_id: Vehicle identifier to validate
+
+    Returns:
+        Validated vehicle_id string
+
+    Raises:
+        HTTPException 400: If vehicle_id is not a valid UUID
+    """
+    return validate_uuid(vehicle_id, "vehicle_id")
+
+
+def validate_horizon_hours(horizon_hours: int) -> int:
+    """Validate horizon_hours is in the range [1, 48].
+
+    Args:
+        horizon_hours: Optimization horizon in hours
+
+    Returns:
+        Validated horizon_hours
+
+    Raises:
+        HTTPException 400: If out of range
+    """
+    if not (1 <= horizon_hours <= 48):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"horizon_hours must be between 1 and 48, got: {horizon_hours}",
+        )
+    return horizon_hours
 
 
 def sanitize_sql_identifier(value: str) -> str:

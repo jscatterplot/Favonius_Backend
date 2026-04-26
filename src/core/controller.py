@@ -140,11 +140,14 @@ class DepotController:
         except Exception as e:
             logger.error(f"Triggered optimization failed: {e}", exc_info=True)
 
-    async def run_optimization(self, trigger_reason: str = "scheduled") -> OptimizationResult:
+    async def run_optimization(
+        self, trigger_reason: str = "scheduled", horizon_hours: int | None = None
+    ) -> OptimizationResult:
         """Run optimization and dispatch commands with retry logic.
 
         Args:
             trigger_reason: Reason for optimization run
+            horizon_hours: Optional override for optimization horizon in hours
 
         Returns:
             OptimizationResult with schedule and metrics
@@ -165,10 +168,13 @@ class DepotController:
         for attempt in range(max_retries + 1):
             try:
                 # Assemble state
+                effective_horizon = (
+                    horizon_hours
+                    if horizon_hours is not None
+                    else self.controller_config.optimization_horizon_hours
+                )
                 try:
-                    state = await self.assembler.get_current_state(
-                        self.controller_config.optimization_horizon_hours
-                    )
+                    state = await self.assembler.get_current_state(effective_horizon)
                 except Exception as e:
                     logger.error(
                         f"State assembly failed: {e}",
