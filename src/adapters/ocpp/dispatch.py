@@ -150,7 +150,7 @@ async def dispatch_charging_profiles(
                 payload=payload,
                 expires_in_min=expires_in_min,
             )
-        except asyncpg.PostgresError as exc:
+        except Exception as exc:
             logger.error(
                 "Failed to enqueue profile for vehicle %s (cp=%s): %s",
                 vehicle_id,

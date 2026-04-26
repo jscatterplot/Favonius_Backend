@@ -330,7 +330,11 @@ class Application:
                 counts = await self.timescale_client.count_active_transactions_by_station()
             except Exception as exc:
                 self.logger.debug("active_tx reconcile failed: %s", exc)
-                counts = {}
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    raise
+                continue
 
             for station_id, n in counts.items():
                 ACTIVE_TRANSACTIONS.labels(station_id=station_id).set(n)
