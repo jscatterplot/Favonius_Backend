@@ -9,18 +9,43 @@ from .auth_manager import AuthManager, RateLimiter
 from .config import SupabaseConfig
 from .monitoring import get_logger
 from .supabase_client import SupabaseClient
+from .timescale_client import TimescaleClient
+
+
+def _iso(value: Any) -> Optional[str]:
+    """Render a TIMESTAMPTZ / datetime / None as ISO-8601 (UTC) or None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 class APIServer:
     """REST API server for user-facing operations."""
 
     def __init__(
-        self, config: SupabaseConfig, supabase_client: SupabaseClient, auth_manager: AuthManager
+        self,
+        config: SupabaseConfig,
+        supabase_client: SupabaseClient,
+        auth_manager: AuthManager,
+        *,
+        timescale_client: Optional[TimescaleClient] = None,
+        websocket_server: Optional[Any] = None,
     ):
-        """Initialize API server."""
+        """Initialize API server.
+
+        Args:
+            timescale_client: Optional handle for the OCPP admin endpoint.
+            websocket_server: Optional ``OCPPWebSocketServer`` reference so
+                the admin endpoint can layer in-memory FleetChargePoint
+                metadata (vendor, last_heartbeat) on top of the DB rollup.
+        """
         self.config = config
         self.supabase_client = supabase_client
         self.auth_manager = auth_manager
+        self.timescale_client = timescale_client
+        self.websocket_server = websocket_server
         self.logger = get_logger(__name__)
         # Rate limiter
         self.rate_limiter = RateLimiter()
@@ -129,6 +154,11 @@ class APIServer:
         self.app.router.add_post(
             "/admin/sync",
             self._protected(self.force_sync, required_roles={"owner"}),
+        )
+        # Per-charger debug dump used to triage the pilot deployment.
+        self.app.router.add_get(
+            "/admin/ocpp/{cp_id}/state",
+            self._protected(self.get_ocpp_state, required_roles={"owner"}),
         )
 
     def _protected(
@@ -676,3 +706,142 @@ class APIServer:
         except Exception as e:
             self.logger.error(f"Force sync error: {e}")
             return web.json_response({"error": "Failed to force sync"}, status=500)
+
+    # ------------------------------------------------------------------
+    # OCPP debug endpoint (session 3) — single charger state dump for ops.
+    # ------------------------------------------------------------------
+    async def get_ocpp_state(
+        self, request: web.Request, user: Dict[str, Any]
+    ) -> web.Response:
+        """Aggregate live + DB state for one OCPP charge-point id.
+
+        404 if the charger has neither an in-memory session nor any prior
+        DB rows. Otherwise returns whatever we have: the in-memory part
+        is None when the charger is currently disconnected.
+        """
+        cp_id = request.match_info.get("cp_id", "").strip()
+        if not cp_id:
+            return web.json_response({"error": "cp_id required"}, status=400)
+        if len(cp_id) > 256:
+            return web.json_response({"error": "cp_id too long"}, status=400)
+
+        if self.timescale_client is None:
+            return web.json_response(
+                {"error": "TimescaleDB client not wired into APIServer"}, status=503
+            )
+
+        # 1. DB rollup (always queried — lets us 404 only when there is
+        # genuinely no record of this charger).
+        try:
+            db_state = await self.timescale_client.fetch_admin_state(cp_id)
+        except Exception as exc:
+            self.logger.error("fetch_admin_state failed for cp=%s: %s", cp_id, exc)
+            return web.json_response({"error": "DB query failed"}, status=500)
+
+        # 2. In-memory snapshot from the OCPPWebSocketServer.
+        cp = (
+            self.websocket_server.get_charge_point(cp_id)
+            if self.websocket_server is not None
+            else None
+        )
+
+        connected = cp is not None
+        subprotocol: Optional[str] = None
+        vendor: Optional[str] = None
+        model: Optional[str] = None
+        last_boot_at: Optional[str] = None
+        last_heartbeat_at: Optional[str] = None
+        if cp is not None:
+            # OCPP16Session wraps a FleetChargePoint in ``_cp``; the
+            # FastAPI 2.0.1 path uses EnhancedOCPPChargePoint directly.
+            inner = self._safe_attr(cp, "_cp") or cp
+            subprotocol = self._safe_attr(cp, "_subprotocol") or self._safe_attr(
+                inner, "subprotocol"
+            )
+            connection = self._safe_attr(inner, "_connection") or self._safe_attr(
+                inner, "connection"
+            )
+            if subprotocol is None and connection is not None:
+                subprotocol = self._safe_attr(connection, "subprotocol")
+            vendor = self._safe_attr(inner, "vendor") or self._safe_attr(
+                inner, "vendor_name"
+            )
+            model = self._safe_attr(inner, "model")
+            last_boot_at = _iso(self._safe_attr(inner, "last_boot_at"))
+            last_heartbeat_at = _iso(self._safe_attr(inner, "last_heartbeat_at"))
+            # Older 2.0.1 handler stores ``last_heartbeat`` as a unix ts.
+            if last_heartbeat_at is None:
+                hb = self._safe_attr(inner, "last_heartbeat")
+                if isinstance(hb, (int, float)) and hb > 0:
+                    last_heartbeat_at = datetime.fromtimestamp(
+                        hb, tz=timezone.utc
+                    ).isoformat()
+
+        # 404 only when DB has NO record AND no live session.
+        if (
+            not connected
+            and not db_state["connectors"]
+            and not db_state["active_transactions"]
+            and not db_state["queue_counts"]
+            and not db_state["last_command"]
+        ):
+            return web.json_response({"error": "Unknown charge_point_id"}, status=404)
+
+        # Normalise queue rollup so every status appears (zero or otherwise).
+        queue_counts = {
+            status: int(db_state["queue_counts"].get(status, 0))
+            for status in ("pending", "sent", "acked", "failed", "expired")
+        }
+
+        body: Dict[str, Any] = {
+            "charge_point_id": cp_id,
+            "connected": connected,
+            "subprotocol": subprotocol,
+            "vendor": vendor,
+            "model": model,
+            "last_boot_at": last_boot_at,
+            "last_heartbeat_at": last_heartbeat_at,
+            "connectors": [
+                {
+                    "id": int(c["connector_id"]),
+                    "status": c["status"],
+                    "error_code": c["error_code"],
+                    "updated_at": _iso(c.get("updated_at")),
+                }
+                for c in db_state["connectors"]
+            ],
+            "active_transactions": [
+                {
+                    "transaction_id": int(t["transaction_id"]),
+                    "connector_id": int(t["connector_id"])
+                    if t.get("connector_id") is not None
+                    else None,
+                    "id_tag": t.get("id_token"),
+                    "start_time": _iso(t.get("start_time")),
+                }
+                for t in db_state["active_transactions"]
+            ],
+            "queue": {
+                **queue_counts,
+                "last_command": (
+                    {
+                        "queue_id": int(db_state["last_command"]["queue_id"]),
+                        "status": db_state["last_command"]["status"],
+                        "enqueued_at": _iso(db_state["last_command"].get("enqueued_at")),
+                        "sent_at": _iso(db_state["last_command"].get("sent_at")),
+                        "acked_at": _iso(db_state["last_command"].get("acked_at")),
+                        "last_error": db_state["last_command"].get("last_error"),
+                    }
+                    if db_state["last_command"]
+                    else None
+                ),
+            },
+        }
+        return web.json_response(body)
+
+    @staticmethod
+    def _safe_attr(obj: Any, name: str) -> Any:
+        try:
+            return getattr(obj, name, None)
+        except Exception:
+            return None

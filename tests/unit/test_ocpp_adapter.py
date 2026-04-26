@@ -291,62 +291,32 @@ async def test_meter_values_storage():
     mock_conn.execute.assert_called_once()
 
 
+@pytest.mark.skip(
+    reason="Session 3: dispatch is now queue-mediated (not in-process). "
+    "See tests/unit/test_ocpp_dispatch.py and tests/integration/test_dispatch_queue.py."
+)
 @pytest.mark.asyncio
 async def test_charging_profile_dispatch(sample_optimization_result, mock_websocket):
-    """Test charging profile dispatch from optimization."""
-    server = OCPPServer()
-
-    # Create mock charge points
-    cp1 = FleetChargePoint("charger_1", mock_websocket)
-    cp2 = FleetChargePoint("charger_2", mock_websocket)
-
-    # Mock set_charging_profile
-    cp1.set_charging_profile = AsyncMock(return_value=True)
-    cp2.set_charging_profile = AsyncMock(return_value=True)
-
-    server.charge_points["charger_1"] = cp1
-    server.charge_points["charger_2"] = cp2
-
-    # Vehicle to charger mapping
-    vehicle_map = {
-        "bus_1": ("charger_1", 1),
-        "bus_2": ("charger_2", 1),
-    }
-
-    results = await dispatch_charging_profiles(server, sample_optimization_result, vehicle_map)
-
-    assert results["bus_1"] is True
-    assert results["bus_2"] is True
-    assert cp1.set_charging_profile.called
-    assert cp2.set_charging_profile.called
+    """Legacy in-process dispatch test — superseded by the queue path."""
 
 
+@pytest.mark.skip(
+    reason="Session 3: dispatch is now queue-mediated (not in-process). "
+    "See tests/unit/test_ocpp_dispatch.py and tests/integration/test_dispatch_queue.py."
+)
 @pytest.mark.asyncio
 async def test_charging_profile_dispatch_missing_charger(
     sample_optimization_result, mock_websocket
 ):
-    """Test dispatch when charger is not connected."""
-    server = OCPPServer()
-
-    vehicle_map = {
-        "bus_1": ("charger_1", 1),  # Not connected
-    }
-
-    results = await dispatch_charging_profiles(server, sample_optimization_result, vehicle_map)
-
-    assert results["bus_1"] is False
+    """Legacy in-process dispatch test — superseded by the queue path."""
 
 
+@pytest.mark.skip(
+    reason="Session 3: dispatch is now queue-mediated (not in-process). "
+    "See tests/unit/test_ocpp_dispatch.py and tests/integration/test_dispatch_queue.py."
+)
 @pytest.mark.asyncio
 async def test_charging_profile_dispatch_missing_vehicle(
     sample_optimization_result, mock_websocket
 ):
-    """Test dispatch when vehicle is not in mapping."""
-    server = OCPPServer()
-
-    vehicle_map = {}  # Empty mapping
-
-    results = await dispatch_charging_profiles(server, sample_optimization_result, vehicle_map)
-
-    # All vehicles should fail
-    assert all(not v for v in results.values())
+    """Legacy in-process dispatch test — superseded by the queue path."""

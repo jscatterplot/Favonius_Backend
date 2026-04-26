@@ -1,13 +1,19 @@
 """OCPP 2.0.1 Charging Profile Manager with validation and stacking logic."""
 
+import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .cache_manager import CacheManager
-from .monitoring import get_logger
+from .monitoring import (
+    CHARGING_COMMAND_QUEUE_DEPTH,
+    PROFILE_PUSH_LATENCY,
+    get_logger,
+)
 from .timescale_client import TimescaleClient
 
 
@@ -871,3 +877,391 @@ class ChargingProfileManager:
                 "status": "Rejected",
                 "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
             }
+
+
+# ===========================================================================
+# Queue-mediated dispatch consumer (session 3)
+# ===========================================================================
+
+# Type alias: lookup callable returning the connected charge-point handler
+# (FleetChargePoint / OCPP16Session / EnhancedOCPPChargePoint) for a given
+# OCPP charge-point id, or None if not connected.
+ChargePointLookup = Callable[[str], Optional[Any]]
+
+
+class ChargingCommandQueueConsumer:
+    """Drains ``charging_command_queue`` and pushes to connected chargers.
+
+    The FastAPI optimizer enqueues SetChargingProfile rows (migration 014).
+    This consumer runs inside the legacy WebSocket handler — the only
+    process that owns live charger sockets — and is responsible for:
+
+      * Picking up newly enqueued ``pending`` rows (LISTEN/NOTIFY when
+        possible, plus a 2 s polling fallback).
+      * Looking up the charger's in-memory session via ``cp_lookup``.
+      * Calling ``send_charging_profile`` on the session and recording
+        ``profile_push_latency_seconds`` with outcome ``sent`` / ``failed``
+        / ``offline``.
+      * Marking the queue row terminal (``sent`` / ``failed``) so the
+        next iteration does not re-attempt it.
+
+    Rows whose charger is offline are *left pending*. The boot replay path
+    in ``OCPP16Session._on_boot`` (session 2) flushes them on the next
+    BootNotification, so we don't need a separate retry loop here.
+    """
+
+    POLL_INTERVAL_SECONDS = 2.0
+    DEPTH_SAMPLE_INTERVAL_SECONDS = 10.0
+    EXPIRY_SCAN_INTERVAL_SECONDS = 60.0
+    EXCLUDED_OFFLINE_RETRY_SECONDS = 30.0
+    NOTIFY_CHANNEL = "charging_command_queue"
+
+    def __init__(
+        self,
+        timescale_client: TimescaleClient,
+        cp_lookup: ChargePointLookup,
+        *,
+        poll_interval_seconds: Optional[float] = None,
+    ) -> None:
+        """Initialise the consumer.
+
+        Args:
+            timescale_client: Async TimescaleDB client (owns the asyncpg pool
+                we'll use for both polling reads and the LISTEN connection).
+            cp_lookup: Callable returning the in-memory charger handler
+                for a given OCPP charge_point_id. Returns None when the
+                charger is not currently connected.
+            poll_interval_seconds: Override for the polling cadence. Tests
+                use a small value to keep wall time low.
+        """
+        self.timescale_client = timescale_client
+        self.cp_lookup = cp_lookup
+        self.logger = get_logger(__name__)
+        self.poll_interval = poll_interval_seconds or self.POLL_INTERVAL_SECONDS
+
+        self._running = False
+        self._wake_event = asyncio.Event()
+        self._tasks: List[asyncio.Task] = []
+        self._listen_conn = None  # asyncpg connection held for LISTEN
+        self._offline_charge_points: Dict[str, float] = {}
+
+    async def start(self) -> None:
+        """Spawn the consumer + LISTEN + depth-sampler tasks."""
+        if self._running:
+            return
+        self._running = True
+        self._wake_event = asyncio.Event()
+        self._tasks = [
+            asyncio.create_task(self._consume_loop(), name="queue_consumer"),
+            asyncio.create_task(self._depth_sampler(), name="queue_depth_sampler"),
+        ]
+        # LISTEN is best-effort — polling alone is sufficient for correctness.
+        listen_task = asyncio.create_task(self._listen_loop(), name="queue_listen")
+        listen_task.add_done_callback(self._handle_listen_task_done)
+        self._tasks.append(listen_task)
+        self.logger.info(
+            "ChargingCommandQueueConsumer started (poll=%.1fs)", self.poll_interval
+        )
+
+    def _handle_listen_task_done(self, task: asyncio.Task) -> None:
+        """Log LISTEN task crashes so polling-only fallback is explicit."""
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as callback_exc:
+            self.logger.warning("Could not inspect LISTEN task state: %s", callback_exc)
+            return
+        if exc is not None:
+            self.logger.warning("LISTEN task crashed; polling-only mode active: %s", exc)
+
+    async def stop(self) -> None:
+        """Cancel all background tasks and release the LISTEN connection."""
+        self._running = False
+        self._wake_event.set()
+
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._tasks.clear()
+
+        if self._listen_conn is not None:
+            try:
+                await self.timescale_client.pg_pool.release(self._listen_conn)
+            except Exception:
+                pass
+            self._listen_conn = None
+        self.logger.info("ChargingCommandQueueConsumer stopped")
+
+    async def drain_once(self) -> int:
+        """Drain one batch. Returns rows attempted against connected chargers.
+
+        Public so the boot path or the admin endpoint can force an
+        immediate sweep without waiting for the next poll tick. Offline
+        chargers are left ``pending`` and are not counted.
+        """
+        now = time.monotonic()
+        offline_cp_ids = [
+            cp_id
+            for cp_id, last_seen in self._offline_charge_points.items()
+            if now - last_seen < self.EXCLUDED_OFFLINE_RETRY_SECONDS
+        ]
+        # Drop stale entries so this map stays bounded and we periodically
+        # retry stations that may have reconnected without a DB NOTIFY.
+        self._offline_charge_points = {
+            cp_id: last_seen
+            for cp_id, last_seen in self._offline_charge_points.items()
+            if now - last_seen < self.EXCLUDED_OFFLINE_RETRY_SECONDS
+        }
+        try:
+            rows = await self.timescale_client.fetch_pending_commands_all(
+                limit=200, exclude_charge_point_ids=offline_cp_ids
+            )
+        except Exception as exc:
+            self.logger.error("fetch_pending_commands_all failed: %s", exc)
+            return 0
+
+        processed = 0
+        for row in rows:
+            try:
+                if await self._handle_row(row):
+                    processed += 1
+            except Exception as exc:
+                # _handle_row should not raise, but a defensive log keeps a
+                # single bad row from killing the whole batch.
+                self.logger.error(
+                    "handle_row raised for queue_id=%s: %s",
+                    row.get("queue_id"),
+                    exc,
+                )
+        return processed
+
+    # ------------------------------------------------------------------
+    # Background loops
+    # ------------------------------------------------------------------
+
+    async def _consume_loop(self) -> None:
+        last_expiry_scan = 0.0
+        while self._running:
+            try:
+                await self.drain_once()
+
+                # Periodically promote expired pending rows so they don't
+                # accumulate indefinitely if a charger never reconnects.
+                now = time.monotonic()
+                if now - last_expiry_scan >= self.EXPIRY_SCAN_INTERVAL_SECONDS:
+                    try:
+                        n = await self.timescale_client.expire_overdue_commands()
+                        if n:
+                            self.logger.info("Expired %d overdue queue row(s)", n)
+                    except Exception as exc:
+                        self.logger.warning("expire_overdue_commands failed: %s", exc)
+                    last_expiry_scan = now
+
+                # Wait for either a NOTIFY wakeup or the polling timeout.
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=self.poll_interval)
+                except asyncio.TimeoutError:
+                    pass
+                self._wake_event.clear()
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.error("consume_loop iteration failed: %s", exc)
+                await asyncio.sleep(self.poll_interval)
+
+    async def _listen_loop(self) -> None:
+        """Hold an asyncpg LISTEN connection so NOTIFYs wake the consumer.
+
+        Drops back to polling-only on any error — correctness does not
+        depend on this path, only latency.
+        """
+        try:
+            pool = self.timescale_client.pg_pool
+        except AttributeError:
+            self.logger.warning("No pg_pool exposed; LISTEN disabled")
+            return
+        if pool is None:
+            return
+
+        while self._running:
+            try:
+                conn = await pool.acquire()
+                self._listen_conn = conn
+                await conn.add_listener(self.NOTIFY_CHANNEL, self._on_notify)
+                self.logger.info(
+                    "Listening on PostgreSQL channel '%s'", self.NOTIFY_CHANNEL
+                )
+                # Hold the connection open until cancelled.
+                while self._running:
+                    await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "LISTEN connection failed; will retry in 5s: %s", exc
+                )
+                await asyncio.sleep(5)
+            finally:
+                if self._listen_conn is not None:
+                    try:
+                        await self._listen_conn.remove_listener(
+                            self.NOTIFY_CHANNEL, self._on_notify
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await pool.release(self._listen_conn)
+                    except Exception:
+                        pass
+                    self._listen_conn = None
+
+    def _on_notify(self, _conn, _pid, _channel, payload) -> None:
+        """asyncpg listener callback. Wakes the consumer immediately."""
+        # Payload format from migration trigger: "<queue_id>:<charge_point_id>".
+        # Only clear the single station so other offline exclusions remain.
+        if payload:
+            try:
+                _, cp_id = str(payload).split(":", 1)
+                cp_id = cp_id.strip()
+                if cp_id:
+                    self._offline_charge_points.pop(cp_id, None)
+            except ValueError:
+                self._offline_charge_points.clear()
+        else:
+            self._offline_charge_points.clear()
+        self._wake_event.set()
+
+    async def _depth_sampler(self) -> None:
+        """Publish ``charging_command_queue_depth`` every N seconds."""
+        while self._running:
+            try:
+                counts = await self.timescale_client.queue_depth_by_status()
+            except Exception as exc:
+                self.logger.debug("queue_depth_by_status failed: %s", exc)
+                counts = {}
+
+            # Re-publish all known statuses so a status that drops to 0
+            # actually shows 0 instead of a stale value.
+            for status in ("pending", "sent", "acked", "failed", "expired"):
+                CHARGING_COMMAND_QUEUE_DEPTH.labels(status=status).set(
+                    counts.get(status, 0)
+                )
+
+            await asyncio.sleep(self.DEPTH_SAMPLE_INTERVAL_SECONDS)
+
+    # ------------------------------------------------------------------
+    # Row handling
+    # ------------------------------------------------------------------
+
+    async def _handle_row(self, row: Dict[str, Any]) -> bool:
+        """Push a single queued command to its charger.
+
+        Outcomes:
+          * No connected session → leave row ``pending`` (BootNotification
+            replay will pick it up). Returns ``False``.
+          * send_charging_profile returns True → mark ``sent``.
+          * send_charging_profile returns False or raises → mark ``failed``.
+
+        Returns:
+            ``True`` if a connected charger was attempted, ``False`` if the
+            row stayed pending because the charger is offline.
+        """
+        queue_id = int(row["queue_id"])
+        cp_id = row["charge_point_id"]
+        connector_id = int(row["connector_id"])
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        cp = self.cp_lookup(cp_id)
+        if cp is None:
+            self._offline_charge_points[cp_id] = time.monotonic()
+            return False
+
+        # OCPP 1.6 (OCPP16Session) and OCPP 2.0.1 (EnhancedOCPPChargePoint)
+        # both expose ``send_charging_profile(evse_id, payload)``. The
+        # OCPP16Session variant accepts an ``allow_enqueue`` kwarg — pass
+        # False so a transient failure during a consumer cycle does not
+        # re-enqueue the row we are already trying to drain.
+        send = cp.send_charging_profile
+        accepts_allow_enqueue = self._accepts_allow_enqueue(send)
+        # OCPP16Session.send_charging_profile already records PROFILE_PUSH_LATENCY
+        # with sent/rejected/raised outcomes; avoid double-observing here.
+        should_record_latency = not accepts_allow_enqueue
+
+        start = time.perf_counter()
+        outcome = "failed"
+        try:
+            if accepts_allow_enqueue:
+                ok = await send(connector_id, payload, allow_enqueue=False)
+            else:
+                ok = await send(connector_id, payload)
+            outcome = "sent" if ok else "failed"
+        except Exception as exc:
+            self.logger.warning(
+                "send_charging_profile raised for cp=%s queue_id=%s: %s",
+                cp_id,
+                queue_id,
+                exc,
+            )
+            # Race: cp_lookup can return a connected session but the station may
+            # disconnect before push completes. Keep pending rows for boot replay.
+            if accepts_allow_enqueue and self.cp_lookup(cp_id) is None:
+                self._offline_charge_points[cp_id] = time.monotonic()
+                if should_record_latency:
+                    PROFILE_PUSH_LATENCY.labels(
+                        station_id=cp_id, outcome="failed"
+                    ).observe(max(time.perf_counter() - start, 1e-6))
+                return False
+            try:
+                await self.timescale_client.mark_command_failed(queue_id, str(exc))
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            if should_record_latency:
+                PROFILE_PUSH_LATENCY.labels(
+                    station_id=cp_id, outcome="failed"
+                ).observe(max(time.perf_counter() - start, 1e-6))
+            return True
+
+        latency = max(time.perf_counter() - start, 1e-6)
+        if should_record_latency:
+            PROFILE_PUSH_LATENCY.labels(station_id=cp_id, outcome=outcome).observe(latency)
+
+        try:
+            if outcome == "sent":
+                await self.timescale_client.mark_command_sent(queue_id)
+            else:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "charger Rejected SetChargingProfile"
+                )
+        except Exception as exc:
+            self.logger.error(
+                "Failed to update queue row queue_id=%s outcome=%s: %s",
+                queue_id,
+                outcome,
+                exc,
+            )
+        return True
+
+    @staticmethod
+    def _accepts_allow_enqueue(fn: Callable[..., Awaitable[bool]]) -> bool:
+        """Best-effort detection of OCPP16Session.send_charging_profile."""
+        try:
+            import inspect
+
+            sig = inspect.signature(fn)
+            return "allow_enqueue" in sig.parameters
+        except (TypeError, ValueError):
+            return False

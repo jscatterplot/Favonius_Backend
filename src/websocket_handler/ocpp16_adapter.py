@@ -25,6 +25,8 @@ from ocpp.v16.enums import AuthorizationStatus
 
 from src.adapters.ocpp.charge_point import FleetChargePoint
 
+from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
+
 # Replay window after a charger reconnects: pending commands enqueued while
 # the charger was offline are flushed within this many seconds of boot.
 REPLAY_BACKOFF_SECONDS = 1.0
@@ -155,6 +157,7 @@ class OCPP16Session:
             "chargingRateUnit", charging_profile.get("chargingRateUnit", "W")
         )
 
+        push_start = time.monotonic()
         try:
             accepted = await self._cp.set_charging_profile(
                 connector_id=evse_id,
@@ -168,6 +171,12 @@ class OCPP16Session:
                 profile_id=profile_id,
             )
         except Exception as exc:
+            try:
+                PROFILE_PUSH_LATENCY.labels(
+                    station_id=self._station_id, outcome="raised"
+                ).observe(max(time.monotonic() - push_start, 1e-6))
+            except Exception:
+                pass
             if not allow_enqueue:
                 raise
             accepted = False
@@ -185,6 +194,14 @@ class OCPP16Session:
                 evse_id,
                 exc,
             )
+        else:
+            try:
+                PROFILE_PUSH_LATENCY.labels(
+                    station_id=self._station_id,
+                    outcome="sent" if accepted else "rejected",
+                ).observe(max(time.monotonic() - push_start, 1e-6))
+            except Exception:
+                pass
         if accepted:
             return True
         if not allow_enqueue:
@@ -597,6 +614,12 @@ class OCPP16Session:
             "start_time": start_time,
         }
 
+        # Inline gauge bump; reconciler in main.py corrects drift every 30 s.
+        try:
+            ACTIVE_TRANSACTIONS.labels(station_id=cp_id).inc()
+        except Exception:
+            pass
+
         asyncio.create_task(
             self._message_handler._push_to_main_api(
                 cp_id,
@@ -633,6 +656,11 @@ class OCPP16Session:
                 transaction_id,
                 exc,
             )
+
+        try:
+            ACTIVE_TRANSACTIONS.labels(station_id=cp_id).dec()
+        except Exception:
+            pass
 
         asyncio.create_task(
             self._message_handler._push_to_main_api(

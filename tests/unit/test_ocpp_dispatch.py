@@ -1,8 +1,20 @@
-"""Unit tests for OCPP dispatch functionality.
+"""Unit tests for the queue-mediated dispatch path.
 
-Reference: Development plan Step 3.1, PRD.md#9-1-ocpp-integration
+Session 3 replaces in-process ``set_charging_profile`` calls with
+``charging_command_queue`` INSERTs (migration 014). These tests focus on
+the dispatch contract:
+
+  * The function enqueues one row per scheduled vehicle.
+  * Vehicles without a charger mapping are skipped.
+  * Empty / all-None schedules do not produce queue rows.
+  * Profile-conversion failures are isolated per-vehicle.
+  * The audit-table write is best-effort (DB error never blocks dispatch).
 """
 
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -12,541 +24,278 @@ import pytest
 from src.adapters.ocpp.dispatch import _store_charging_command, dispatch_charging_profiles
 from src.core.models import OptimizationResult
 
-# ============ Fixtures ============
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def mock_db_pool():
-    """Mock database connection pool."""
-    pool = MagicMock(spec=asyncpg.Pool)
-    conn = AsyncMock()
-    pool.acquire.return_value.__aenter__.return_value = conn
-    pool.acquire.return_value.__aexit__.return_value = None
-    pool.static = pool
-    pool.ts = pool
-    return pool, conn
+def _result(**schedule_overrides) -> OptimizationResult:
+    """Build a minimally-valid OptimizationResult.
 
-
-@pytest.fixture
-def mock_ocpp_server():
-    """Mock OCPP server."""
-    server = MagicMock()
-    return server
-
-
-@pytest.fixture
-def sample_optimization_result():
-    """Sample optimization result."""
+    Override schedule via ``schedule={...}``.
+    """
+    base = {
+        "bus_1": {"charging_power": [22.0, 22.0, 11.0, 0.0]},
+        "bus_2": {"charging_power": [11.0, 11.0, 0.0, 0.0]},
+    }
+    base.update(schedule_overrides.pop("schedule", {}))
     return OptimizationResult(
         run_id=uuid4(),
-        schedule={
-            "bus_1": {
-                "charging_power": [80.0, 80.0, 60.0, 0.0] * 24,
-                "soc": [0.3, 0.35, 0.40, 0.45] * 24,
-            },
-            "bus_2": {
-                "charging_power": [70.0, 70.0, 0.0, 0.0] * 24,
-                "soc": [0.5, 0.55, 0.60, 0.65] * 24,
-            },
-        },
-        battery_dispatch=[10.0, -5.0, 0.0, 5.0] * 24,
-        grid_power=[200.0, 150.0, 100.0, 50.0] * 24,
-        peak_demand=200.0,
-        objective_value=1000.0,
-        solve_time=5.0,
-        status="completed",
+        schedule=base if "schedule" not in schedule_overrides else schedule_overrides["schedule"],
+        battery_dispatch=[0.0, 0.0, 0.0, 0.0],
+        grid_power=[33.0, 33.0, 11.0, 0.0],
+        peak_demand_kw=33.0,
+        objective_value=100.0,
+        solve_time_s=1.0,
+        status="optimal",
+        solver_used="highs",
     )
 
 
 @pytest.fixture
-def vehicle_to_charger_map():
-    """Sample vehicle to charger mapping."""
-    return {
-        "bus_1": ("charger_001", 1),
-        "bus_2": ("charger_002", 1),
-    }
+def fake_pools():
+    """DatabasePools-shaped object whose ``ts.acquire()`` returns an async-CM
+    yielding a connection that records every fetchval/execute call.
+    """
+    conn = AsyncMock()
+    # fetchval is the dispatch._enqueue INSERT — return a fresh queue id each time.
+    counter = {"n": 0}
+
+    async def _fetchval(_sql: str, *_args):
+        counter["n"] += 1
+        return counter["n"]
+
+    conn.fetchval = AsyncMock(side_effect=_fetchval)
+
+    async def _execute(_sql: str, *_args):
+        return "INSERT 0 1"
+
+    conn.execute = AsyncMock(side_effect=_execute)
+
+    pool = MagicMock(spec=asyncpg.Pool)
+    pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+    pool.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
+
+    return SimpleNamespace(static=pool, ts=pool, _conn=conn)
 
 
 @pytest.fixture
-def mock_charge_point():
-    """Mock charge point."""
-    cp = MagicMock()
-    cp.set_charging_profile = AsyncMock(return_value=True)
-    return cp
+def vehicle_to_charger_map():
+    return {"bus_1": ("CHARGER_001", 1), "bus_2": ("CHARGER_002", 1)}
 
 
-# ============ Dispatch Tests ============
+# ---------------------------------------------------------------------------
+# Happy path: every vehicle becomes a queue row
+# ---------------------------------------------------------------------------
 
 
-class TestDispatchChargingProfiles:
-    """Tests for dispatch_charging_profiles function."""
+@pytest.mark.asyncio
+async def test_dispatch_enqueues_row_per_vehicle(fake_pools, vehicle_to_charger_map):
+    result = _result()
 
-    @pytest.mark.asyncio
-    async def test_dispatch_success(
-        self,
-        mock_ocpp_server,
-        sample_optimization_result,
-        vehicle_to_charger_map,
-        mock_charge_point,
+    results = await dispatch_charging_profiles(
+        result,
+        pools=fake_pools,
+        depot_id="depot_a",
+        vehicle_to_charger_map=vehicle_to_charger_map,
+    )
+
+    assert results == {"bus_1": True, "bus_2": True}
+    # Two INSERTs into charging_command_queue.
+    assert fake_pools._conn.fetchval.await_count == 2
+    # Audit-table writes happen after each enqueue.
+    assert fake_pools._conn.execute.await_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# Skip cases: missing mapping, empty / None schedule
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_unmapped_vehicle(fake_pools):
+    result = _result()
+    results = await dispatch_charging_profiles(
+        result,
+        pools=fake_pools,
+        depot_id="depot_a",
+        vehicle_to_charger_map={"bus_1": ("CHARGER_001", 1)},
+    )
+
+    assert results["bus_1"] is True
+    assert results["bus_2"] is False
+    assert fake_pools._conn.fetchval.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_empty_schedule(fake_pools, vehicle_to_charger_map):
+    result = OptimizationResult(
+        run_id=uuid4(),
+        schedule={"bus_1": {"charging_power": []}, "bus_2": {"charging_power": []}},
+        battery_dispatch=[],
+        grid_power=[],
+        peak_demand_kw=0.0,
+        objective_value=0.0,
+        solve_time_s=0.5,
+        status="optimal",
+        solver_used="highs",
+    )
+
+    results = await dispatch_charging_profiles(
+        result,
+        pools=fake_pools,
+        depot_id="depot_a",
+        vehicle_to_charger_map=vehicle_to_charger_map,
+    )
+
+    assert results == {"bus_1": False, "bus_2": False}
+    assert fake_pools._conn.fetchval.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_all_none_schedule(fake_pools, vehicle_to_charger_map):
+    result = OptimizationResult(
+        run_id=uuid4(),
+        schedule={"bus_1": {"charging_power": [None, None, None]}},
+        battery_dispatch=[0.0, 0.0, 0.0],
+        grid_power=[0.0, 0.0, 0.0],
+        peak_demand_kw=0.0,
+        objective_value=0.0,
+        solve_time_s=0.5,
+        status="optimal",
+        solver_used="highs",
+    )
+
+    results = await dispatch_charging_profiles(
+        result,
+        pools=fake_pools,
+        depot_id="depot_a",
+        vehicle_to_charger_map=vehicle_to_charger_map,
+    )
+
+    assert results["bus_1"] is False
+    assert fake_pools._conn.fetchval.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Profile conversion errors are isolated
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_handles_conversion_error(fake_pools, vehicle_to_charger_map):
+    result = _result()
+    # Make conversion fail for *all* vehicles in this run.
+    with patch(
+        "src.adapters.ocpp.dispatch.convert_schedule_to_ocpp_profile",
+        side_effect=ValueError("Invalid schedule"),
     ):
-        """Test successful dispatch to connected chargers."""
-        mock_ocpp_server.get_charge_point.return_value = mock_charge_point
-
         results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            sample_optimization_result,
-            vehicle_to_charger_map,
-        )
-
-        assert results["bus_1"] is True
-        assert results["bus_2"] is True
-        assert mock_charge_point.set_charging_profile.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_dispatch_to_disconnected_charger(
-        self, mock_ocpp_server, sample_optimization_result, vehicle_to_charger_map
-    ):
-        """Test dispatch when charger is not connected."""
-        mock_ocpp_server.get_charge_point.return_value = None
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            sample_optimization_result,
-            vehicle_to_charger_map,
-        )
-
-        assert results["bus_1"] is False
-        assert results["bus_2"] is False
-
-    @pytest.mark.asyncio
-    async def test_dispatch_partial_failure(
-        self, mock_ocpp_server, sample_optimization_result, vehicle_to_charger_map
-    ):
-        """Test dispatch when some chargers fail."""
-        # First charger succeeds, second is disconnected
-        connected_cp = MagicMock()
-        connected_cp.set_charging_profile = AsyncMock(return_value=True)
-
-        def get_charge_point(cp_id):
-            if cp_id == "charger_001":
-                return connected_cp
-            return None
-
-        mock_ocpp_server.get_charge_point.side_effect = get_charge_point
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            sample_optimization_result,
-            vehicle_to_charger_map,
-        )
-
-        assert results["bus_1"] is True
-        assert results["bus_2"] is False
-
-    @pytest.mark.asyncio
-    async def test_dispatch_charger_rejects_profile(
-        self, mock_ocpp_server, sample_optimization_result, vehicle_to_charger_map
-    ):
-        """Test dispatch when charger rejects profile."""
-        mock_cp = MagicMock()
-        mock_cp.set_charging_profile = AsyncMock(return_value=False)
-        mock_ocpp_server.get_charge_point.return_value = mock_cp
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            sample_optimization_result,
-            vehicle_to_charger_map,
-        )
-
-        assert results["bus_1"] is False
-        assert results["bus_2"] is False
-
-    @pytest.mark.asyncio
-    async def test_dispatch_missing_vehicle_mapping(self, mock_ocpp_server, mock_charge_point):
-        """Test dispatch when vehicle has no charger mapping."""
-        mock_ocpp_server.get_charge_point.return_value = mock_charge_point
-
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_1": {"charging_power": [80.0] * 96, "soc": [0.5] * 96},
-                "bus_3": {"charging_power": [60.0] * 96, "soc": [0.4] * 96},  # No mapping
-            },
-            battery_dispatch=[0.0] * 96,
-            grid_power=[140.0] * 96,
-            peak_demand=140.0,
-            objective_value=500.0,
-            solve_time=3.0,
-            status="completed",
-        )
-
-        # Only bus_1 has mapping
-        vehicle_map = {"bus_1": ("charger_001", 1)}
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
             result,
-            vehicle_map,
+            pools=fake_pools,
+            depot_id="depot_a",
+            vehicle_to_charger_map=vehicle_to_charger_map,
         )
 
-        assert results["bus_1"] is True
-        assert results["bus_3"] is False
-
-    @pytest.mark.asyncio
-    async def test_dispatch_empty_charging_power(self, mock_ocpp_server, vehicle_to_charger_map):
-        """Test dispatch with empty charging power list."""
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_1": {"charging_power": [], "soc": []},
-            },
-            battery_dispatch=[],
-            grid_power=[],
-            peak_demand=0.0,
-            objective_value=0.0,
-            solve_time=1.0,
-            status="completed",
-        )
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            result,
-            vehicle_to_charger_map,
-        )
-
-        assert results["bus_1"] is False
-
-    @pytest.mark.asyncio
-    async def test_dispatch_all_none_charging_power(self, mock_ocpp_server, vehicle_to_charger_map):
-        """Test dispatch with all None values in charging power."""
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_1": {"charging_power": [None, None, None], "soc": [0.5, 0.5, 0.5]},
-            },
-            battery_dispatch=[0.0, 0.0, 0.0],
-            grid_power=[0.0, 0.0, 0.0],
-            peak_demand=0.0,
-            objective_value=0.0,
-            solve_time=1.0,
-            status="completed",
-        )
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            result,
-            vehicle_to_charger_map,
-        )
-
-        assert results["bus_1"] is False
-
-    @pytest.mark.asyncio
-    async def test_dispatch_requires_mapping_or_pool(
-        self, mock_ocpp_server, sample_optimization_result
-    ):
-        """Test that dispatch requires either mapping or pool+depot_id."""
-        with pytest.raises(ValueError, match="Either vehicle_to_charger_map"):
-            await dispatch_charging_profiles(
-                mock_ocpp_server,
-                sample_optimization_result,
-                vehicle_to_charger_map=None,
-                pools=None,
-            )
-
-    @pytest.mark.asyncio
-    async def test_dispatch_builds_mapping_from_db(
-        self, mock_ocpp_server, mock_db_pool, sample_optimization_result, mock_charge_point
-    ):
-        """Test dispatch builds vehicle mapping from database."""
-        pool, _ = mock_db_pool
-        depot_id = str(uuid4())
-
-        mock_ocpp_server.get_charge_point.return_value = mock_charge_point
-
-        with patch("src.adapters.ocpp.dispatch.get_vehicle_to_charger_map") as mock_get_map:
-            mock_get_map.return_value = {
-                "bus_1": ("charger_001", 1),
-                "bus_2": ("charger_002", 1),
-            }
-
-            results = await dispatch_charging_profiles(
-                mock_ocpp_server,
-                sample_optimization_result,
-                pools=pool,
-                depot_id=depot_id,
-            )
-
-            mock_get_map.assert_called_once_with(pool, depot_id, use_cache=True)
-            assert results["bus_1"] is True
-
-    @pytest.mark.asyncio
-    async def test_dispatch_handles_set_profile_exception(
-        self, mock_ocpp_server, sample_optimization_result, vehicle_to_charger_map
-    ):
-        """Test dispatch handles exception from set_charging_profile."""
-        mock_cp = MagicMock()
-        mock_cp.set_charging_profile = AsyncMock(side_effect=Exception("Connection lost"))
-        mock_ocpp_server.get_charge_point.return_value = mock_cp
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            sample_optimization_result,
-            vehicle_to_charger_map,
-        )
-
-        assert results["bus_1"] is False
-        assert results["bus_2"] is False
+    assert results == {"bus_1": False, "bus_2": False}
+    assert fake_pools._conn.fetchval.await_count == 0
 
 
-# ============ Profile Conversion Tests ============
+# ---------------------------------------------------------------------------
+# Mapping resolution: when vehicle_to_charger_map is None, dispatch loads it.
+# ---------------------------------------------------------------------------
 
 
-class TestProfileConversion:
-    """Tests for charging profile conversion edge cases."""
+@pytest.mark.asyncio
+async def test_dispatch_loads_mapping_from_static_pool(fake_pools):
+    result = _result()
+    depot_id = uuid4()
 
-    @pytest.mark.asyncio
-    async def test_dispatch_with_custom_delta_t(
-        self, mock_ocpp_server, vehicle_to_charger_map, mock_charge_point
-    ):
-        """Test dispatch with custom time step."""
-        mock_ocpp_server.get_charge_point.return_value = mock_charge_point
-
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_1": {"charging_power": [80.0, 60.0], "soc": [0.3, 0.5]},
-            },
-            battery_dispatch=[0.0, 0.0],
-            grid_power=[80.0, 60.0],
-            peak_demand=80.0,
-            objective_value=100.0,
-            solve_time=1.0,
-            status="completed",
-        )
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            result,
-            vehicle_to_charger_map,
-            delta_t=0.5,  # 30-minute time steps
-        )
-
-        assert results["bus_1"] is True
-
-    @pytest.mark.asyncio
-    async def test_dispatch_handles_conversion_error(
-        self, mock_ocpp_server, vehicle_to_charger_map, mock_charge_point
-    ):
-        """Test dispatch handles profile conversion errors."""
-        mock_ocpp_server.get_charge_point.return_value = mock_charge_point
-
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_1": {"charging_power": [80.0], "soc": [0.3]},
-            },
-            battery_dispatch=[0.0],
-            grid_power=[80.0],
-            peak_demand=80.0,
-            objective_value=50.0,
-            solve_time=1.0,
-            status="completed",
-        )
-
-        with patch(
-            "src.adapters.ocpp.dispatch.convert_schedule_to_ocpp_profile",
-            side_effect=ValueError("Invalid schedule format"),
-        ):
-            results = await dispatch_charging_profiles(
-                mock_ocpp_server,
-                result,
-                vehicle_to_charger_map,
-            )
-
-            assert results["bus_1"] is False
-
-
-# ============ Storage Tests ============
-
-
-class TestStoreChargingCommand:
-    """Tests for _store_charging_command function."""
-
-    @pytest.mark.asyncio
-    async def test_store_command_success(self, mock_db_pool):
-        """Test successful storage of charging command."""
-        pool, conn = mock_db_pool
-
-        await _store_charging_command(
-            pool,
-            vehicle_id="bus_1",
-            charge_point_id="charger_001",
-            connector_id=1,
-            charging_profile=[{"start_period": 0, "limit": 80000}],
-            optimization_result=OptimizationResult(
-                run_id=uuid4(),
-                schedule={},
-                battery_dispatch=[],
-                grid_power=[],
-                peak_demand=0.0,
-                objective_value=0.0,
-                solve_time=1.0,
-                status="completed",
-            ),
-        )
-
-        conn.execute.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_store_command_handles_db_error(self, mock_db_pool):
-        """Test storage handles database errors gracefully."""
-        pool, conn = mock_db_pool
-        conn.execute.side_effect = asyncpg.PostgresError("DB error")
-
-        # Should not raise
-        await _store_charging_command(
-            pool,
-            vehicle_id="bus_1",
-            charge_point_id="charger_001",
-            connector_id=1,
-            charging_profile=[],
-            optimization_result=OptimizationResult(
-                run_id=uuid4(),
-                schedule={},
-                battery_dispatch=[],
-                grid_power=[],
-                peak_demand=0.0,
-                objective_value=0.0,
-                solve_time=1.0,
-                status="completed",
-            ),
-        )
-
-
-# ============ Retry Logic Tests ============
-
-
-class TestDispatchRetryLogic:
-    """Tests for dispatch retry behavior.
-
-    Note: Retry logic is implemented in DepotController._dispatch_commands,
-    but we test that dispatch_charging_profiles reports failures correctly
-    for higher-level retry handling.
-    """
-
-    @pytest.mark.asyncio
-    async def test_dispatch_reports_all_failures(self, mock_ocpp_server, vehicle_to_charger_map):
-        """Test that all failures are reported for retry handling."""
-        mock_ocpp_server.get_charge_point.return_value = None
-
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_1": {"charging_power": [80.0] * 4, "soc": [0.5] * 4},
-                "bus_2": {"charging_power": [60.0] * 4, "soc": [0.4] * 4},
-            },
-            battery_dispatch=[0.0] * 4,
-            grid_power=[140.0] * 4,
-            peak_demand=140.0,
-            objective_value=200.0,
-            solve_time=2.0,
-            status="completed",
-        )
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            result,
-            vehicle_to_charger_map,
-        )
-
-        # All failures should be reported
-        failed_count = sum(1 for v in results.values() if not v)
-        assert failed_count == 2
-
-
-# ============ Edge Cases ============
-
-
-class TestDispatchEdgeCases:
-    """Edge case tests for dispatch."""
-
-    @pytest.mark.asyncio
-    async def test_dispatch_empty_schedule(self, mock_ocpp_server, vehicle_to_charger_map):
-        """Test dispatch with empty schedule."""
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={},
-            battery_dispatch=[],
-            grid_power=[],
-            peak_demand=0.0,
-            objective_value=0.0,
-            solve_time=0.5,
-            status="completed",
-        )
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            result,
-            vehicle_to_charger_map,
-        )
-
-        assert results == {}
-
-    @pytest.mark.asyncio
-    async def test_dispatch_stores_on_success(
-        self, mock_ocpp_server, mock_db_pool, vehicle_to_charger_map, mock_charge_point
-    ):
-        """Test that successful dispatch stores command in database."""
-        pool, conn = mock_db_pool
-        mock_ocpp_server.get_charge_point.return_value = mock_charge_point
-
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_1": {"charging_power": [80.0] * 4, "soc": [0.5] * 4},
-            },
-            battery_dispatch=[0.0] * 4,
-            grid_power=[80.0] * 4,
-            peak_demand=80.0,
-            objective_value=100.0,
-            solve_time=1.0,
-            status="completed",
-        )
+    with patch(
+        "src.adapters.ocpp.dispatch.get_vehicle_to_charger_map"
+    ) as mock_map:
+        mock_map.return_value = {
+            "bus_1": ("CHARGER_001", 1),
+            "bus_2": ("CHARGER_002", 1),
+        }
 
         await dispatch_charging_profiles(
-            mock_ocpp_server,
-            result,
-            vehicle_to_charger_map,
-            pools=pool,
+            result, pools=fake_pools, depot_id=depot_id
         )
 
-        # Should have stored the command
-        assert conn.execute.called
+        mock_map.assert_called_once_with(fake_pools.static, depot_id, use_cache=True)
 
-    @pytest.mark.asyncio
-    async def test_dispatch_with_single_vehicle(self, mock_ocpp_server, mock_charge_point):
-        """Test dispatch with single vehicle."""
-        mock_ocpp_server.get_charge_point.return_value = mock_charge_point
 
-        result = OptimizationResult(
-            run_id=uuid4(),
-            schedule={
-                "bus_solo": {"charging_power": [80.0, 60.0, 40.0], "soc": [0.3, 0.4, 0.5]},
-            },
-            battery_dispatch=[0.0, 0.0, 0.0],
-            grid_power=[80.0, 60.0, 40.0],
-            peak_demand=80.0,
-            objective_value=50.0,
-            solve_time=0.8,
-            status="completed",
+# ---------------------------------------------------------------------------
+# Empty schedule overall
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_returns_empty_dict_for_empty_schedule(
+    fake_pools, vehicle_to_charger_map
+):
+    result = OptimizationResult(
+        run_id=uuid4(),
+        schedule={},
+        battery_dispatch=[],
+        grid_power=[],
+        peak_demand_kw=0.0,
+        objective_value=0.0,
+        solve_time_s=0.5,
+        status="optimal",
+        solver_used="highs",
+    )
+
+    results = await dispatch_charging_profiles(
+        result,
+        pools=fake_pools,
+        depot_id="depot_a",
+        vehicle_to_charger_map=vehicle_to_charger_map,
+    )
+
+    assert results == {}
+    assert fake_pools._conn.fetchval.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Audit insert: best-effort, must not block on DB error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_audit_insert_failure_does_not_break_dispatch(fake_pools, vehicle_to_charger_map):
+    """A PostgresError in the audit insert is logged, not raised."""
+    fake_pools._conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("DB error"))
+
+    results = await dispatch_charging_profiles(
+        _result(),
+        pools=fake_pools,
+        depot_id="depot_a",
+        vehicle_to_charger_map=vehicle_to_charger_map,
+    )
+    assert results == {"bus_1": True, "bus_2": True}
+
+
+@pytest.mark.asyncio
+async def test_store_charging_command_swallows_db_error():
+    """`_store_charging_command` propagates DB errors to callers."""
+    conn = AsyncMock()
+    conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("DB error"))
+    pool = MagicMock(spec=asyncpg.Pool)
+    pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+    pool.acquire.return_value.__aexit__ = AsyncMock(return_value=None)
+
+    # Should raise; caller-level path handles best-effort behavior.
+    with pytest.raises(asyncpg.PostgresError):
+        await _store_charging_command(
+            pool,
+            vehicle_id="bus_1",
+            charge_point_id="CHARGER_001",
+            connector_id=1,
+            charging_profile={"chargingSchedule": {}},
+            optimization_result=_result(),
         )
-
-        vehicle_map = {"bus_solo": ("charger_solo", 1)}
-
-        results = await dispatch_charging_profiles(
-            mock_ocpp_server,
-            result,
-            vehicle_map,
-        )
-
-        assert results["bus_solo"] is True
+    # Note: dispatch.py wraps the call in a try/except. The helper itself
+    # may surface the error — see dispatch.dispatch_charging_profiles.

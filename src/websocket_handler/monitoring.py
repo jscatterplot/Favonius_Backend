@@ -165,6 +165,43 @@ VDV463_VALIDATION_WARNINGS_TOTAL = _get_or_create_metric(
     ["depot_id", "presystem_id", "message_action"],
 )
 
+# ---------------------------------------------------------------------------
+# Pilot observability (session 3): debug Monday's first connected chargers
+# without spelunking through the DB. Buckets are tuned for the OCPP push
+# round-trip (~50 ms LAN, ~250 ms cellular) and for the telemetry batch
+# flush which spans single inserts to ~1k-row batches.
+# ---------------------------------------------------------------------------
+PROFILE_PUSH_LATENCY = _get_or_create_metric(
+    Histogram,
+    "profile_push_latency_seconds",
+    "Wall time from queue consumer pickup to charger SetChargingProfile.conf.",
+    ["station_id", "outcome"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+
+DB_WRITE_LATENCY = _get_or_create_metric(
+    Histogram,
+    "db_write_latency_seconds",
+    "TimescaleDB write latency for hot-path inserts (telemetry batches, "
+    "connector_status upserts, queue inserts).",
+    ["table"],
+)
+
+ACTIVE_TRANSACTIONS = _get_or_create_metric(
+    Gauge,
+    "active_transactions",
+    "Currently open OCPP transactions per station. Updated on "
+    "Start/StopTransaction and reconciled from the DB every 30 s.",
+    ["station_id"],
+)
+
+CHARGING_COMMAND_QUEUE_DEPTH = _get_or_create_metric(
+    Gauge,
+    "charging_command_queue_depth",
+    "Row count in charging_command_queue grouped by status. Sampled every 10 s.",
+    ["status"],
+)
+
 # Note: Other metrics are defined in server.py to avoid duplication
 
 # Redis metrics removed for simplification

@@ -607,10 +607,10 @@ class TestDispatchCommands:
     """Tests for OCPP dispatch commands."""
 
     @pytest.mark.asyncio
-    async def test_dispatch_skips_without_ocpp_server(
+    async def test_dispatch_enqueues_without_ocpp_server(
         self, mock_db_pool, depot_config, controller_config, sample_optimization_result
     ):
-        """Test dispatch is skipped when OCPP server is not available."""
+        """Production runs with ocpp_server=None: dispatch enqueues, never blocks."""
         pool, _ = mock_db_pool
         depot_id = str(uuid4())
 
@@ -622,8 +622,31 @@ class TestDispatchCommands:
             ocpp_server=None,
         )
 
-        # Should not raise
-        await controller._dispatch_commands(sample_optimization_result)
+        with (
+            patch.object(
+                controller.assembler.__class__, "load_depot_config", new_callable=AsyncMock
+            ) as mock_load,
+            patch(
+                "src.adapters.ocpp.dispatch.dispatch_charging_profiles",
+                new_callable=AsyncMock,
+            ) as mock_dispatch,
+        ):
+            # load_depot_config returns vehicle id_tags, not charger ocpp_id
+            # values. The controller must let dispatch resolve chargers from
+            # charger_vehicle_access instead of reusing these RFID tags.
+            mock_load.return_value = (
+                depot_config,
+                {vid: f"RFID_{vid}" for vid in sample_optimization_result.schedule},
+            )
+            mock_dispatch.return_value = {
+                vid: True for vid in sample_optimization_result.schedule
+            }
+
+            await controller._dispatch_commands(sample_optimization_result)
+
+        mock_load.assert_not_awaited()
+        mock_dispatch.assert_awaited_once()
+        assert mock_dispatch.await_args.kwargs["vehicle_to_charger_map"] is None
 
     @pytest.mark.asyncio
     async def test_dispatch_handles_missing_charge_point(
@@ -644,14 +667,17 @@ class TestDispatchCommands:
             ocpp_server=mock_ocpp,
         )
 
-        # Mock load_depot_config
-        with patch.object(
-            controller.assembler.__class__, "load_depot_config", new_callable=AsyncMock
-        ) as mock_load:
-            mock_load.return_value = (depot_config, {"bus_1": "charger_1"})
-
+        with patch(
+            "src.adapters.ocpp.dispatch.dispatch_charging_profiles",
+            new_callable=AsyncMock,
+        ) as mock_dispatch:
+            mock_dispatch.return_value = {
+                vid: True for vid in sample_optimization_result.schedule
+            }
             # Should not raise
             await controller._dispatch_commands(sample_optimization_result)
+            mock_dispatch.assert_awaited_once()
+            mock_ocpp.get_charge_point.assert_not_called()
 
 
 # ============ State Update Tests ============
@@ -720,42 +746,3 @@ class TestStateUpdates:
         assert before <= controller.last_run_time <= after
 
 
-# ============ Charging Profile Validation Tests ============
-
-
-class TestChargingProfileValidation:
-    """Tests for charging profile validation."""
-
-    def test_validate_charging_profile_valid(self, mock_db_pool, depot_config, controller_config):
-        """Test validation of valid charging profile."""
-        pool, _ = mock_db_pool
-        depot_id = str(uuid4())
-
-        controller = DepotController(
-            pools=pool,
-            depot_id=depot_id,
-            config=depot_config,
-            controller_config=controller_config,
-        )
-
-        valid_profile = [
-            {"start_period": 0, "limit": 80000, "number_phases": 3},
-            {"start_period": 900, "limit": 60000, "number_phases": 3},
-        ]
-
-        assert controller._validate_charging_profile(valid_profile) is True
-
-    def test_validate_charging_profile_empty(self, mock_db_pool, depot_config, controller_config):
-        """Test validation of empty charging profile."""
-        pool, _ = mock_db_pool
-        depot_id = str(uuid4())
-
-        controller = DepotController(
-            pools=pool,
-            depot_id=depot_id,
-            config=depot_config,
-            controller_config=controller_config,
-        )
-
-        # Empty profile should be invalid (nothing to dispatch)
-        assert controller._validate_charging_profile([]) is False

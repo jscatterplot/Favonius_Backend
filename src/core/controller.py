@@ -10,7 +10,6 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
-from uuid import UUID
 
 from .controller_config import ControllerConfig
 from .models import DepotConfig, OptimizationResult
@@ -226,17 +225,19 @@ class DepotController:
                     )
                     # Continue even if storage fails
 
-                # Dispatch commands to chargers (with retry)
-                if self.ocpp_server:
-                    try:
-                        await self._dispatch_commands(result)
-                    except Exception as e:
-                        logger.error(
-                            f"OCPP dispatch failed: {e}",
-                            exc_info=True,
-                            extra={"depot_id": self.depot_id},
-                        )
-                        # Continue even if dispatch fails (will retry later)
+                # Enqueue commands for the legacy WS handler to push.
+                # Production runs the FastAPI service with ocpp_server=None,
+                # so we always go through charging_command_queue (migration
+                # 013/014). The in-process server is only used in dev/test.
+                try:
+                    await self._dispatch_commands(result)
+                except Exception as e:
+                    logger.error(
+                        f"OCPP dispatch failed: {e}",
+                        exc_info=True,
+                        extra={"depot_id": self.depot_id},
+                    )
+                    # Continue even if dispatch fails (will retry later)
 
                 # Update trigger monitor expected state
                 expected_socs = {
@@ -320,216 +321,50 @@ class DepotController:
                     raise
 
     async def _dispatch_commands(self, result: OptimizationResult) -> None:
-        """Send charging commands via OCPP with improved mapping and retry.
+        """Enqueue charging profiles for the WebSocket handler to deliver.
+
+        Production runs the FastAPI service with ``OCPP_SERVER_ENABLED=false``
+        — chargers connect to the *legacy* websocket_handler service. We can
+        therefore not call ``set_charging_profile`` in-process. Instead we
+        write one row per scheduled vehicle to ``charging_command_queue``;
+        the legacy handler's ``ChargingCommandQueueConsumer`` (and the
+        BootNotification replay path) push the profile when the charger
+        is reachable.
 
         Args:
             result: Optimization result with charging schedule
         """
-        if not self.ocpp_server:
-            logger.warning("OCPP server not available, skipping command dispatch")
-            return
+        from ..adapters.ocpp.dispatch import dispatch_charging_profiles
 
-        logger.info("Dispatching charging commands to chargers")
-
-        # Get vehicle-to-charger mapping from database
-        try:
-            _, vehicle_to_ocpp = await StateAssembler.load_depot_config(self.pools, self.depot_id)
-        except Exception as e:
-            logger.error(
-                f"Failed to load vehicle-to-charger mapping: {e}",
-                exc_info=True,
-                extra={"depot_id": self.depot_id},
-            )
-            # Fallback: try using vehicle_id directly as charge_point_id
-            vehicle_to_ocpp = {}
-
-        # Dispatch commands for each vehicle
-        dispatch_results = {}
-        for vehicle_id, schedule in result.schedule.items():
-            # Get charge point ID from mapping
-            charge_point_id = vehicle_to_ocpp.get(vehicle_id, vehicle_id)
-
-            # Find charge point
-            cp = self.ocpp_server.get_charge_point(charge_point_id)
-            if cp is None:
-                logger.debug(
-                    f"No charge point found for vehicle {vehicle_id} "
-                    f"(charge_point_id: {charge_point_id})"
-                )
-                dispatch_results[vehicle_id] = {
-                    "success": False,
-                    "error": "charge_point_not_connected",
-                }
-                continue
-
-            # Build charging schedule for next 4 hours (16 x 15min periods)
-            # This provides better lookahead than just 1 hour
-            charging_schedule = []
-            dispatch_window_hours = 4
-            dispatch_periods = int(dispatch_window_hours / self.config.delta_t)
-
-            for t in range(min(dispatch_periods, len(schedule["charging_power"]))):
-                power = schedule["charging_power"][t]
-                if power > 0.1:  # Only include periods with meaningful power
-                    charging_schedule.append(
-                        {
-                            "start_period": t * int(self.config.delta_t * 3600),  # seconds
-                            "limit": int(power * 1000),  # Watts
-                            "number_phases": 3,
-                        }
-                    )
-
-            if not charging_schedule:
-                logger.debug(f"No charging required for vehicle {vehicle_id}")
-                dispatch_results[vehicle_id] = {"success": True, "message": "no_charging_required"}
-                continue
-
-            # Validate charging profile
-            if not self._validate_charging_profile(charging_schedule):
-                logger.warning(f"Invalid charging profile for {vehicle_id}, skipping")
-                dispatch_results[vehicle_id] = {"success": False, "error": "invalid_profile"}
-                continue
-
-            # Dispatch with retry logic
-            success = False
-            last_error = None
-            for attempt in range(self.controller_config.dispatch_retry_attempts + 1):
-                try:
-                    # Use OCPP SetChargingProfile
-                    success = await cp.set_charging_profile(1, charging_schedule)
-                    if success:
-                        logger.info(
-                            f"Set charging profile for {vehicle_id} "
-                            f"({len(charging_schedule)} periods, attempt {attempt + 1})"
-                        )
-                        dispatch_results[vehicle_id] = {
-                            "success": True,
-                            "periods": len(charging_schedule),
-                            "attempt": attempt + 1,
-                        }
-                        # Record success metric
-                        OCPP_DISPATCH_SUCCESS.labels(depot_id=self.depot_id).inc()
-                        break
-                    else:
-                        last_error = "SetChargingProfile rejected"
-                        logger.warning(
-                            f"SetChargingProfile rejected for {vehicle_id} "
-                            f"(attempt {attempt + 1})"
-                        )
-                except Exception as e:
-                    last_error = str(e)
-                    logger.error(
-                        f"Error setting charging profile for {vehicle_id} "
-                        f"(attempt {attempt + 1}): {e}",
-                        exc_info=(
-                            True
-                            if attempt == self.controller_config.dispatch_retry_attempts
-                            else False
-                        ),
-                    )
-
-                # Retry with exponential backoff
-                if attempt < self.controller_config.dispatch_retry_attempts:
-                    delay = self.controller_config.dispatch_retry_delay_seconds * (2**attempt)
-                    logger.debug(f"Retrying dispatch for {vehicle_id} in {delay:.1f}s...")
-                    await asyncio.sleep(delay)
-
-            if not success:
-                dispatch_results[vehicle_id] = {
-                    "success": False,
-                    "error": last_error or "unknown_error",
-                    "attempts": self.controller_config.dispatch_retry_attempts + 1,
-                }
-                # Record failure metric
-                error_type = "rejected" if "rejected" in str(last_error).lower() else "error"
-                OCPP_DISPATCH_FAILURES.labels(depot_id=self.depot_id, error_type=error_type).inc()
-                logger.error(
-                    f"Failed to dispatch charging profile for {vehicle_id} "
-                    f"after {self.controller_config.dispatch_retry_attempts + 1} attempts"
-                )
-
-        # Store dispatch results in database
-        await self._store_dispatch_results(result.run_id, dispatch_results)
-
-        # Log summary
-        successful = sum(1 for r in dispatch_results.values() if r.get("success"))
-        total = len(dispatch_results)
         logger.info(
-            f"Dispatch complete: {successful}/{total} successful " f"for depot {self.depot_id}"
+            "Enqueuing charging commands for depot %s (%d vehicles)",
+            self.depot_id,
+            len(result.schedule),
         )
 
-    def _validate_charging_profile(self, charging_schedule: list[dict]) -> bool:
-        """Validate charging profile before dispatch.
-
-        Args:
-            charging_schedule: List of charging schedule periods
-
-        Returns:
-            True if valid, False otherwise
-        """
-        if not charging_schedule:
-            return False
-
-        # Check that periods are in order
-        last_period = -1
-        for period in charging_schedule:
-            start = period.get("start_period", -1)
-            if start <= last_period:
-                logger.warning(f"Invalid period order: {start} <= {last_period}")
-                return False
-            last_period = start
-
-            # Check power limits are reasonable
-            limit = period.get("limit", 0)
-            if limit < 0 or limit > 200000:  # 200kW max
-                logger.warning(f"Invalid power limit: {limit}W")
-                return False
-
-        return True
-
-    async def _store_dispatch_results(
-        self, run_id: UUID, dispatch_results: dict[str, dict]
-    ) -> None:
-        """Store OCPP dispatch results in database.
-
-        Args:
-            run_id: Optimization run ID
-            dispatch_results: Dictionary of vehicle_id -> dispatch result
-        """
-        import json
-
-        query = """
-        INSERT INTO charging_commands 
-            (run_id, charger_id, vehicle_id, issued_at, profile_json, status)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT DO NOTHING
-        """
-
-        now = datetime.utcnow()
-
-        for vehicle_id, result in dispatch_results.items():
-            try:
-                # Get charger_id from vehicle (would need to query vehicles table)
-                # For now, use vehicle_id as placeholder
-                charger_id = None  # TODO: Query from vehicles table
-
-                status = "accepted" if result.get("success") else "rejected"
-                profile_json = json.dumps(result)
-
-                async with self.pools.ts.acquire() as conn:
-                    await conn.execute(
-                        query,
-                        run_id,
-                        charger_id,
-                        vehicle_id,
-                        now,
-                        profile_json,
-                        status,
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Failed to store dispatch result for {vehicle_id}: {e}", exc_info=True
-                )
+        enqueue_results = await dispatch_charging_profiles(
+            result,
+            pools=self.pools,
+            depot_id=self.depot_id,
+            vehicle_to_charger_map=None,
+            delta_t=self.config.delta_t,
+            expires_in_min=60,
+        )
+        successful = sum(1 for dispatched in enqueue_results.values() if dispatched)
+        total = len(enqueue_results)
+        failed = total - successful
+        if successful:
+            OCPP_DISPATCH_SUCCESS.labels(depot_id=self.depot_id).inc(successful)
+        if failed:
+            OCPP_DISPATCH_FAILURES.labels(depot_id=self.depot_id, error_type="enqueue_failed").inc(
+                failed
+            )
+        logger.info(
+            "Enqueue complete: %d/%d enqueued for depot %s",
+            successful,
+            total,
+            self.depot_id,
+        )
 
     async def _store_result(self, result: OptimizationResult, trigger_reason: str) -> None:
         """Store optimization result in database.

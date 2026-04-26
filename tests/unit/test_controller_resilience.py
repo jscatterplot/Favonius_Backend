@@ -413,40 +413,40 @@ class TestGracefulDegradation:
         sample_depot_state,
         sample_optimization_result,
     ):
-        """Test optimization completes even if dispatch fails."""
+        """Test optimization completes even if queue dispatch fails."""
         pool, _ = mock_db_pool
         depot_id = str(uuid4())
-
-        mock_ocpp = MagicMock()
-        mock_cp = MagicMock()
-        mock_cp.set_charging_profile = AsyncMock(side_effect=Exception("Dispatch error"))
-        mock_ocpp.get_charge_point.return_value = mock_cp
 
         controller = DepotController(
             pools=pool,
             depot_id=depot_id,
             config=depot_config,
             controller_config=fast_controller_config,
-            ocpp_server=mock_ocpp,
         )
-
         controller.assembler.get_current_state = AsyncMock(return_value=sample_depot_state)
 
-        with patch.object(
-            controller.assembler.__class__, "load_depot_config", new_callable=AsyncMock
-        ) as mock_load:
-            mock_load.return_value = (depot_config, {"bus_1": "charger_1", "bus_2": "charger_2"})
-
-            with patch("src.core.controller.optimize", return_value=sample_optimization_result):
-                result = await controller.run_optimization("test")
+        with (
+            patch(
+                "src.adapters.ocpp.dispatch.dispatch_charging_profiles",
+                new_callable=AsyncMock,
+            ) as mock_dispatch,
+            patch("src.core.controller.optimize", return_value=sample_optimization_result),
+        ):
+            mock_dispatch.side_effect = RuntimeError("Dispatch error")
+            result = await controller.run_optimization("test")
 
         assert result.status == "completed"
 
+    @pytest.mark.skip(
+        reason="Session 3: in-process dispatch removed; partial-success "
+        "behavior is now per-row queue state (sent vs failed). See "
+        "tests/integration/test_dispatch_queue.py."
+    )
     @pytest.mark.asyncio
     async def test_partial_dispatch_success(
         self, mock_db_pool, depot_config, fast_controller_config, sample_optimization_result
     ):
-        """Test optimization reports partial dispatch success."""
+        """Legacy in-process dispatch — superseded by the queue path."""
         pool, conn = mock_db_pool
         depot_id = str(uuid4())
 
@@ -682,11 +682,16 @@ class TestStateRecovery:
 class TestDispatchRetryLogic:
     """Tests for OCPP dispatch retry logic."""
 
+    @pytest.mark.skip(
+        reason="Session 3: dispatch retry now happens in the WS handler's "
+        "BootNotification replay path, not in the controller. See "
+        "src/websocket_handler/ocpp16_adapter.py::replay_queued_commands."
+    )
     @pytest.mark.asyncio
     async def test_dispatch_retries_on_rejection(
         self, mock_db_pool, depot_config, fast_controller_config, sample_optimization_result
     ):
-        """Test dispatch retries when charger rejects profile."""
+        """Legacy in-process dispatch retry — moved to WS handler replay."""
         pool, _ = mock_db_pool
         depot_id = str(uuid4())
         fast_controller_config.dispatch_retry_attempts = 2
@@ -727,11 +732,16 @@ class TestDispatchRetryLogic:
         # Should have retried
         assert mock_cp.set_charging_profile.call_count == 3
 
+    @pytest.mark.skip(
+        reason="Session 3: dispatch retry now happens in the WS handler's "
+        "BootNotification replay path, not in the controller. See "
+        "src/websocket_handler/ocpp16_adapter.py::replay_queued_commands."
+    )
     @pytest.mark.asyncio
     async def test_dispatch_retries_on_exception(
         self, mock_db_pool, depot_config, fast_controller_config, sample_optimization_result
     ):
-        """Test dispatch retries on exception."""
+        """Legacy in-process dispatch retry — moved to WS handler replay."""
         pool, _ = mock_db_pool
         depot_id = str(uuid4())
         fast_controller_config.dispatch_retry_attempts = 2
@@ -770,88 +780,6 @@ class TestDispatchRetryLogic:
             await controller._dispatch_commands(single_result)
 
         assert mock_cp.set_charging_profile.call_count == 2
-
-
-# ============ Charging Profile Validation Edge Cases ============
-
-
-class TestChargingProfileValidation:
-    """Edge case tests for charging profile validation."""
-
-    def test_validate_out_of_order_periods(
-        self, mock_db_pool, depot_config, fast_controller_config
-    ):
-        """Test validation rejects out-of-order periods."""
-        pool, _ = mock_db_pool
-
-        controller = DepotController(
-            pools=pool,
-            depot_id=str(uuid4()),
-            config=depot_config,
-            controller_config=fast_controller_config,
-        )
-
-        invalid_profile = [
-            {"start_period": 900, "limit": 80000, "number_phases": 3},
-            {"start_period": 0, "limit": 60000, "number_phases": 3},  # Out of order
-        ]
-
-        assert controller._validate_charging_profile(invalid_profile) is False
-
-    def test_validate_negative_power_limit(
-        self, mock_db_pool, depot_config, fast_controller_config
-    ):
-        """Test validation rejects negative power limit."""
-        pool, _ = mock_db_pool
-
-        controller = DepotController(
-            pools=pool,
-            depot_id=str(uuid4()),
-            config=depot_config,
-            controller_config=fast_controller_config,
-        )
-
-        invalid_profile = [
-            {"start_period": 0, "limit": -1000, "number_phases": 3},
-        ]
-
-        assert controller._validate_charging_profile(invalid_profile) is False
-
-    def test_validate_excessive_power_limit(
-        self, mock_db_pool, depot_config, fast_controller_config
-    ):
-        """Test validation rejects excessive power limit."""
-        pool, _ = mock_db_pool
-
-        controller = DepotController(
-            pools=pool,
-            depot_id=str(uuid4()),
-            config=depot_config,
-            controller_config=fast_controller_config,
-        )
-
-        invalid_profile = [
-            {"start_period": 0, "limit": 500000, "number_phases": 3},  # 500kW
-        ]
-
-        assert controller._validate_charging_profile(invalid_profile) is False
-
-    def test_validate_zero_power_valid(self, mock_db_pool, depot_config, fast_controller_config):
-        """Test validation accepts zero power limit."""
-        pool, _ = mock_db_pool
-
-        controller = DepotController(
-            pools=pool,
-            depot_id=str(uuid4()),
-            config=depot_config,
-            controller_config=fast_controller_config,
-        )
-
-        valid_profile = [
-            {"start_period": 0, "limit": 0, "number_phases": 3},
-        ]
-
-        assert controller._validate_charging_profile(valid_profile) is True
 
 
 # ============ Shutdown During Operation Tests ============

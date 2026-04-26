@@ -189,8 +189,53 @@ Use this when setting up from scratch in the Railway dashboard.
 4. Verify WebSocket handshake against WS domain with `ocpp1.6`.
 5. Verify telemetry rows arrive in Timescale after MeterValues.
 6. Verify no repeated `BootNotification` timeout/retry loops from simulator.
+7. Trigger an optimization (`POST /optimize` on the API service) and confirm:
+   * a row lands in `charging_command_queue` (status `pending`),
+   * the WebSocket handler's `ChargingCommandQueueConsumer` flips it to `sent`
+     within ~2 s if the matching charger is connected, and
+   * `GET /admin/ocpp/{cp_id}/state` (Bearer token w/ owner role) returns the
+     full dump for that charger.
 
-#### D) Common misconfigurations to avoid
+#### Queue-mediated SetChargingProfile dispatch (sessions 2–3)
+
+Production runs the API service with `OCPP_SERVER_ENABLED=false`, so the
+optimizer cannot push `SetChargingProfile` directly to a charger socket.
+Instead, after every optimization run the API enqueues one row per
+scheduled vehicle in `charging_command_queue` (migration 013, with the
+`pg_notify` trigger from migration 014). The WebSocket Handler service
+runs `ChargingCommandQueueConsumer`, which:
+
+* polls `charging_command_queue` every 2 s (and listens for `pg_notify`
+  on channel `charging_command_queue` for sub-second wake-up),
+* calls `send_charging_profile` on the in-memory `OCPP16Session` for the
+  target `charge_point_id`,
+* marks the row `sent` (charger Accepted), `failed` (charger Rejected /
+  push raised) or leaves it `pending` if the charger is offline, and
+* publishes `profile_push_latency_seconds{station_id, outcome}`.
+
+Rows that stay `pending` are flushed by the BootNotification replay path
+(`OCPP16Session._on_boot` → `replay_queued_commands`) when the charger
+reconnects. Expired rows (>60 min by default) move to `expired` so the
+backlog does not grow unbounded.
+
+#### D) Pilot-debug endpoints + metrics
+
+Both services expose `/metrics` (Prometheus text). Session 3 added:
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `profile_push_latency_seconds` | Histogram | `station_id`, `outcome` | queue consumer + `OCPP16Session.send_charging_profile` |
+| `db_write_latency_seconds` | Histogram | `table` | telemetry batch flush + `connector_status` writes |
+| `active_transactions` | Gauge | `station_id` | inline on Start/StopTransaction; reconciled from DB every 30 s |
+| `charging_command_queue_depth` | Gauge | `status` | sampled every 10 s |
+
+The WebSocket Handler also serves `GET /admin/ocpp/{cp_id}/state` on the
+API port (default 8080). Owner JWT required; returns connected/vendor/
+model/last\_boot\_at/last\_heartbeat\_at, latest `connector_status` per
+connector, open transactions, and a `charging_command_queue` rollup.
+Use it to triage individual chargers without spelunking through the DB.
+
+#### E) Common misconfigurations to avoid
 
 - Running only one Railway service with Dockerfile default command (API only) and expecting OCPP WS handler to be active.
 - Pointing chargers/simulator to API domain instead of WebSocket domain.

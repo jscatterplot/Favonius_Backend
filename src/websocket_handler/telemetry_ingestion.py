@@ -1,12 +1,13 @@
 """Telemetry data ingestion service for TimescaleDB."""
 
 import asyncio
+import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from .config import TimescaleConfig
-from .monitoring import get_logger
+from .monitoring import DB_WRITE_LATENCY, get_logger
 from .timescale_client import TimescaleClient
 
 
@@ -312,6 +313,7 @@ class TelemetryIngestionService:
 
     async def _process_station_batch(self, station_id: str) -> None:
         """Process batch for a specific station."""
+        batch_data: list = []
         try:
             buffer = self.batch_buffer[station_id]
             if not buffer:
@@ -321,8 +323,16 @@ class TelemetryIngestionService:
             batch_data = list(buffer)
             buffer.clear()
 
-            # Insert batch into TimescaleDB
-            await self.timescale_client.insert_telemetry_batch(batch_data)
+            # Insert batch into TimescaleDB. Wrapped in db_write_latency_seconds
+            # so /metrics surfaces hot-path write latency without touching
+            # every DB call site.
+            start = time.perf_counter()
+            try:
+                await self.timescale_client.insert_telemetry_batch(batch_data)
+            finally:
+                DB_WRITE_LATENCY.labels(table="telemetry").observe(
+                    max(time.perf_counter() - start, 1e-6)
+                )
 
             self.batches_inserted += 1
             self.logger.debug(
