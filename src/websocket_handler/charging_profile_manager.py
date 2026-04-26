@@ -956,15 +956,26 @@ class ChargingCommandQueueConsumer:
             asyncio.create_task(self._depth_sampler(), name="queue_depth_sampler"),
         ]
         # LISTEN is best-effort — polling alone is sufficient for correctness.
-        try:
-            self._tasks.append(
-                asyncio.create_task(self._listen_loop(), name="queue_listen")
-            )
-        except Exception as exc:
-            self.logger.warning("Could not start LISTEN task; polling only: %s", exc)
+        listen_task = asyncio.create_task(self._listen_loop(), name="queue_listen")
+        listen_task.add_done_callback(self._handle_listen_task_done)
+        self._tasks.append(listen_task)
         self.logger.info(
             "ChargingCommandQueueConsumer started (poll=%.1fs)", self.poll_interval
         )
+
+    def _handle_listen_task_done(self, task: asyncio.Task) -> None:
+        """Log LISTEN task crashes so polling-only fallback is explicit."""
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as callback_exc:
+            self.logger.warning("Could not inspect LISTEN task state: %s", callback_exc)
+            return
+        if exc is not None:
+            self.logger.warning("LISTEN task crashed; polling-only mode active: %s", exc)
 
     async def stop(self) -> None:
         """Cancel all background tasks and release the LISTEN connection."""

@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -357,6 +357,34 @@ async def test_queue_consumer_emits_profile_push_latency_metric(
 
     samples_after = _collect_profile_push_count("CHARGER_001", "sent")
     assert samples_after == samples_before + 1
+
+
+async def test_queue_consumer_logs_listen_task_failure(fake_queue: FakeQueue) -> None:
+    """LISTEN task exceptions are surfaced via explicit warning logs."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    async def parked_loop() -> None:
+        await asyncio.Event().wait()
+
+    async def broken_listen_loop() -> None:
+        raise RuntimeError("listen exploded")
+
+    consumer = ChargingCommandQueueConsumer(FakeTimescaleClient(fake_queue), lambda _cp: None)
+    consumer._consume_loop = parked_loop  # type: ignore[method-assign]
+    consumer._depth_sampler = parked_loop  # type: ignore[method-assign]
+    consumer._listen_loop = broken_listen_loop  # type: ignore[method-assign]
+    consumer.logger = MagicMock()
+
+    await consumer.start()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    consumer.logger.warning.assert_any_call(
+        "LISTEN task crashed; polling-only mode active: %s", ANY
+    )
+    await consumer.stop()
 
 
 def _collect_profile_push_count(station_id: str, outcome: str) -> int:
