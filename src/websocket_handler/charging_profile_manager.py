@@ -1171,6 +1171,9 @@ class ChargingCommandQueueConsumer:
         # re-enqueue the row we are already trying to drain.
         send = cp.send_charging_profile
         accepts_allow_enqueue = self._accepts_allow_enqueue(send)
+        # OCPP16Session.send_charging_profile already records PROFILE_PUSH_LATENCY
+        # with sent/rejected/raised outcomes; avoid double-observing here.
+        should_record_latency = not accepts_allow_enqueue
 
         start = time.perf_counter()
         outcome = "failed"
@@ -1195,13 +1198,15 @@ class ChargingCommandQueueConsumer:
                     queue_id,
                     mark_exc,
                 )
-            PROFILE_PUSH_LATENCY.labels(
-                station_id=cp_id, outcome="failed"
-            ).observe(max(time.perf_counter() - start, 1e-6))
+            if should_record_latency:
+                PROFILE_PUSH_LATENCY.labels(
+                    station_id=cp_id, outcome="failed"
+                ).observe(max(time.perf_counter() - start, 1e-6))
             return True
 
         latency = max(time.perf_counter() - start, 1e-6)
-        PROFILE_PUSH_LATENCY.labels(station_id=cp_id, outcome=outcome).observe(latency)
+        if should_record_latency:
+            PROFILE_PUSH_LATENCY.labels(station_id=cp_id, outcome=outcome).observe(latency)
 
         try:
             if outcome == "sent":
