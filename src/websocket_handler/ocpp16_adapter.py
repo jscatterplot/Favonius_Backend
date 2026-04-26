@@ -109,6 +109,10 @@ class OCPP16Session:
                     exc,
                 )
 
+        charging_rate_unit = cp_schedule.get(
+            "chargingRateUnit", charging_profile.get("chargingRateUnit", "W")
+        )
+
         return await self._cp.set_charging_profile(
             connector_id=evse_id,
             charging_schedule=schedule_periods,
@@ -116,7 +120,7 @@ class OCPP16Session:
                 "chargingProfilePurpose", "TxDefaultProfile"
             ),
             profile_kind=charging_profile.get("chargingProfileKind", "Absolute"),
-            charging_rate_unit=cp_schedule.get("chargingRateUnit", "W"),
+            charging_rate_unit=charging_rate_unit,
             stack_level=charging_profile.get("stackLevel", 0),
             profile_id=profile_id,
         )

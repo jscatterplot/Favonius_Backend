@@ -258,11 +258,13 @@ class TestOCPP16SessionChargingProfile:
 
         profile = {
             "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 50000}],
+            "chargingRateUnit": "A",
         }
         result = await session.send_charging_profile(evse_id=2, charging_profile=profile)
         assert result is True
         call_kwargs = session._cp.set_charging_profile.call_args.kwargs
         assert call_kwargs["charging_schedule"] == [{"startPeriod": 0, "limit": 50000}]
+        assert call_kwargs["charging_rate_unit"] == "A"
 
 
 # ---------------------------------------------------------------------------
