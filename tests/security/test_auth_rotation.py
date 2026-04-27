@@ -167,9 +167,9 @@ class TestUserHelpers:
             get_user_id({})
 
     def test_get_user_role_favonius(self):
-        """Extracts Favonius-specific role from user_metadata."""
-        token = {"user_metadata": {"favonius_role": "operator"}}
-        assert get_user_role(token) == "operator"
+        """Extracts Favonius-specific role from app_metadata."""
+        token = {"app_metadata": {"favonius_role": "customer_operator"}}
+        assert get_user_role(token) == "customer_operator"
 
     def test_get_user_role_default(self):
         """Falls back to Supabase role claim."""

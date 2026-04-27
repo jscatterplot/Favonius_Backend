@@ -91,7 +91,10 @@ def _override_auth_dependency():
         yield
         return
 
-    app.dependency_overrides[verify_token] = lambda: {"sub": "test-user"}
+    app.dependency_overrides[verify_token] = lambda: {
+        "sub": "test-user",
+        "app_metadata": {"favonius_role": "favonius_admin"},
+    }
     try:
         yield
     finally:

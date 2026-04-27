@@ -76,7 +76,8 @@ async def verify_token(
       - role: "authenticated" (Supabase default)
       - aud: "authenticated"
       - exp: expiration timestamp
-      - user_metadata: custom fields (e.g. is_demo)
+      - app_metadata: Favonius tenancy (organization_id, favonius_role) — trusted claims
+      - user_metadata: user-editable fields (e.g. is_demo) — not used for access control
 
     Raises HTTPException if the token is invalid or expired.
     """
@@ -134,88 +135,90 @@ def is_demo_user(token: dict) -> bool:
     return metadata.get("is_demo", False) is True
 
 
-async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> None:
-    """Verify the authenticated user is authorized to access a specific depot.
+def get_app_metadata(token: dict) -> dict:
+    """Return Supabase app_metadata dict (service-controlled), or empty dict."""
+    meta = token.get("app_metadata")
+    return meta if isinstance(meta, dict) else {}
 
-    Checks the JWT user_metadata.depot_ids claim first (fast path).
-    Falls back to a DB query against user_depot_access if the claim is absent
-    and a pool is provided. Raises 403 if access is denied.
+
+def get_user_organization_id(token: dict) -> Optional[str]:
+    """Return organization UUID string from app_metadata.organization_id, if set."""
+    org = get_app_metadata(token).get("organization_id")
+    if org is None or org == "":
+        return None
+    return str(org)
+
+
+def is_platform_admin(token: dict) -> bool:
+    """True if JWT carries Favonius platform admin (all tenants)."""
+    return get_user_role(token) == "favonius_admin"
+
+
+async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> None:
+    """Verify the authenticated user may access the depot (tenant + DB check).
+
+    - ``favonius_admin`` bypasses tenant checks.
+    - ``customer_admin`` / ``customer_operator`` require ``app_metadata.organization_id``
+      and a matching ``depots.organization_id`` row (via static DB pool).
+
+    ``user_metadata`` is not used for authorization.
 
     Args:
         depot_id: The depot being accessed.
         user: Decoded JWT payload from verify_token.
-        pool: Optional asyncpg pool for DB-backed authorization.
+        pool: asyncpg pool for static (Supabase) reference data.
     """
-    metadata = user.get("user_metadata", {})
-
-    # Check favonius_role first — admins can access all depots
-    favonius_role = metadata.get("favonius_role", "")
-    if favonius_role == "admin":
+    if is_platform_admin(user):
         return
 
-    # Fast path: check depot_ids claim in token
-    depot_ids = metadata.get("depot_ids")
-    if isinstance(depot_ids, list):
-        if depot_id in depot_ids:
-            return
+    role = get_user_role(user)
+    if role not in ("customer_admin", "customer_operator"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: you do not have permission for this depot",
         )
 
-    # Fallback: DB-backed authorization check
-    if pool is not None:
-        user_id = user.get("sub")
-        if user_id:
-            try:
-                async with pool.acquire() as conn:
-                    has_access = await conn.fetchval(
-                        "SELECT EXISTS(SELECT 1 FROM user_depot_access "
-                        "WHERE user_id = $1 AND depot_id = $2::uuid)",
-                        user_id,
-                        depot_id,
-                    )
-                if has_access:
-                    return
-            except Exception:
-                # Table may not exist yet — log and deny
-                logger.warning(
-                    "user_depot_access lookup failed for user=%s depot=%s",
-                    user_id,
-                    depot_id,
-                )
+    org_id = get_user_organization_id(user)
+    if not org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: missing organization_id in token app_metadata",
+        )
 
-    # No claim, not admin, no DB match → deny
+    if pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: you do not have permission for this depot",
+        )
+
+    try:
+        async with pool.acquire() as conn:
+            has_access = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM depots "
+                "WHERE depot_id = $1::uuid AND organization_id = $2::uuid)",
+                depot_id,
+                org_id,
+            )
+        if has_access:
+            return
+    except Exception:
+        logger.warning(
+            "depot organization access check failed for depot=%s org=%s",
+            depot_id,
+            org_id,
+            exc_info=True,
+        )
+
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Access denied: you do not have permission for this depot",
     )
 
 
-def get_user_depot_ids(token: dict) -> list[str]:
-    """Return the list of depot UUIDs the user can access, from the JWT claim.
-
-    Returns an empty list when the claim is absent (e.g., admin users who use
-    the role-based bypass, or tokens issued before the Auth Hook was configured).
-    """
-    metadata = token.get("user_metadata", {})
-    depot_ids = metadata.get("depot_ids")
-    if isinstance(depot_ids, list):
-        return [str(d) for d in depot_ids]
-    return []
-
-
 def get_user_role(token: dict) -> str:
-    """Extract the user role from a verified token payload.
-
-    Returns the Supabase role claim, or checks user_metadata for
-    Favonius-specific role assignments.
-    """
-    # Check Favonius-specific role in user_metadata first
-    metadata = token.get("user_metadata", {})
-    favonius_role = metadata.get("favonius_role")
+    """Extract Favonius role from ``app_metadata.favonius_role``, else Supabase ``role``."""
+    meta = get_app_metadata(token)
+    favonius_role = meta.get("favonius_role")
     if favonius_role:
-        return favonius_role
-
-    # Fall back to Supabase default role
+        return str(favonius_role)
     return token.get("role", "authenticated")

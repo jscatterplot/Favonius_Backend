@@ -592,6 +592,7 @@ async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
     """
     query = """
         SELECT depot_id::text AS depot_id,
+               organization_id::text AS organization_id,
                name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
         WHERE depot_id = $1::uuid
@@ -612,6 +613,7 @@ async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
     """
     query = """
         SELECT depot_id::text AS depot_id,
+               organization_id::text AS organization_id,
                name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
         WHERE depot_id = ANY($1::uuid[])
@@ -632,12 +634,40 @@ async def get_all_depots(db) -> list[dict]:
     """
     query = """
         SELECT depot_id::text AS depot_id,
+               organization_id::text AS organization_id,
                name, timezone, currency, max_grid_kw, demand_charge_rate_kw
         FROM depots
         ORDER BY name
     """
     rows = await db.fetch(query)
     return [dict(r) for r in rows]
+
+
+async def get_depots_for_organization(db, organization_id: str) -> list[dict]:
+    """Return depot metadata rows for a single organization."""
+    query = """
+        SELECT depot_id::text AS depot_id,
+               organization_id::text AS organization_id,
+               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+        FROM depots
+        WHERE organization_id = $1::uuid
+        ORDER BY name
+    """
+    rows = await db.fetch(query, organization_id)
+    return [dict(r) for r in rows]
+
+
+async def depot_belongs_to_organization(
+    db, depot_id: str, organization_id: str
+) -> bool:
+    """Return True if the depot exists and is assigned to the organization."""
+    q = """
+        SELECT EXISTS(
+            SELECT 1 FROM depots
+            WHERE depot_id = $1::uuid AND organization_id = $2::uuid
+        )
+    """
+    return bool(await db.fetchval(q, depot_id, organization_id))
 
 
 async def update_vehicle_max_charge_kw(

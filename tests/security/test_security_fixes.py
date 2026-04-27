@@ -37,62 +37,82 @@ class TestVerifyDepotAccess:
 
         return verify_depot_access
 
+    @staticmethod
+    def _mock_pool(fetchval_result: bool):
+        pool = MagicMock()
+        conn = AsyncMock()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        pool.acquire = MagicMock(return_value=ctx)
+        conn.fetchval = AsyncMock(return_value=fetchval_result)
+        return pool
+
     @pytest.mark.asyncio
-    async def test_access_allowed_by_depot_ids_claim(self, _import_verify):
-        """User with matching depot_ids claim should be allowed."""
+    async def test_access_allowed_when_depot_in_organization(self, _import_verify):
+        """Customer role allowed when static DB confirms depot organization."""
         verify = _import_verify
         user = {
             "sub": "user-123",
-            "user_metadata": {"depot_ids": ["depot-aaa", "depot-bbb"]},
+            "app_metadata": {
+                "favonius_role": "customer_operator",
+                "organization_id": "00000000-0000-4000-8000-0000000000aa",
+            },
         }
-        # Should not raise
-        await verify("depot-aaa", user, pool=None)
+        pool = self._mock_pool(True)
+        await verify("550e8400-e29b-41d4-a716-446655440001", user, pool=pool)
 
     @pytest.mark.asyncio
-    async def test_access_denied_wrong_depot(self, _import_verify):
-        """User without the requested depot in depot_ids should get 403."""
+    async def test_access_denied_wrong_organization(self, _import_verify):
+        """Depot not in caller organization → 403."""
         from fastapi import HTTPException
 
         verify = _import_verify
         user = {
             "sub": "user-123",
-            "user_metadata": {"depot_ids": ["depot-aaa"]},
+            "app_metadata": {
+                "favonius_role": "customer_operator",
+                "organization_id": "00000000-0000-4000-8000-0000000000bb",
+            },
         }
+        pool = self._mock_pool(False)
         with pytest.raises(HTTPException) as exc_info:
-            await verify("depot-zzz", user, pool=None)
+            await verify("550e8400-e29b-41d4-a716-446655440001", user, pool=pool)
         assert exc_info.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_admin_role_bypasses_check(self, _import_verify):
-        """Admin users should access any depot."""
+    async def test_favonius_admin_bypasses_org_check(self, _import_verify):
+        """Platform admin accesses any depot without DB lookup."""
         verify = _import_verify
-        user = {
-            "sub": "admin-1",
-            "user_metadata": {"favonius_role": "admin"},
-        }
-        # Should not raise — admin bypasses depot check
+        user = {"sub": "admin-1", "app_metadata": {"favonius_role": "favonius_admin"}}
         await verify("any-depot-id", user, pool=None)
 
     @pytest.mark.asyncio
-    async def test_admin_role_bypasses_empty_depot_ids(self, _import_verify):
-        """Admin users should bypass even when depot_ids is an empty list."""
-        verify = _import_verify
-        user = {
-            "sub": "admin-1",
-            "user_metadata": {"favonius_role": "admin", "depot_ids": []},
-        }
-        # Should not raise — admin bypasses depot_ids fast-path deny
-        await verify("any-depot-id", user, pool=None)
-
-    @pytest.mark.asyncio
-    async def test_no_claim_no_admin_no_pool_denied(self, _import_verify):
-        """User with no depot_ids claim, no admin role, and no DB pool gets 403."""
+    async def test_user_metadata_depot_ids_ignored(self, _import_verify):
+        """user_metadata must not grant depot access."""
         from fastapi import HTTPException
 
         verify = _import_verify
-        user = {"sub": "user-456", "user_metadata": {}}
+        user = {
+            "sub": "user-456",
+            "user_metadata": {"depot_ids": ["depot-aaa"], "favonius_role": "admin"},
+            "app_metadata": {"favonius_role": "customer_operator", "organization_id": "00000000-0000-4000-8000-0000000000cc"},
+        }
+        pool = self._mock_pool(False)
         with pytest.raises(HTTPException) as exc_info:
-            await verify("depot-aaa", user, pool=None)
+            await verify("depot-aaa", user, pool=pool)
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_no_org_id_customer_denied(self, _import_verify):
+        """Customer role without organization_id in app_metadata → 403."""
+        from fastapi import HTTPException
+
+        verify = _import_verify
+        user = {"sub": "user-456", "app_metadata": {"favonius_role": "customer_operator"}}
+        pool = self._mock_pool(True)
+        with pytest.raises(HTTPException) as exc_info:
+            await verify("depot-aaa", user, pool=pool)
         assert exc_info.value.status_code == 403
 
 

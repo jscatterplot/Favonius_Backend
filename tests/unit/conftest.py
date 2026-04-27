@@ -167,29 +167,35 @@ def sample_optimization_result(sample_depot_config):
 
 @pytest.fixture
 def admin_user():
-    """JWT payload for a user with admin role."""
-    return {"sub": str(uuid4()), "user_metadata": {"favonius_role": "admin"}}
+    """JWT payload for a user with platform admin role."""
+    return {"sub": str(uuid4()), "app_metadata": {"favonius_role": "favonius_admin"}}
 
 
 @pytest.fixture
 def operator_user():
-    """JWT payload for a user with operator role."""
-    return {"sub": str(uuid4()), "user_metadata": {"favonius_role": "operator"}}
+    """JWT payload for a user with customer operator role."""
+    return {"sub": str(uuid4()), "app_metadata": {"favonius_role": "customer_operator"}}
 
 
 @pytest.fixture
 def viewer_user():
-    """JWT payload for a user with viewer role."""
-    return {"sub": str(uuid4()), "user_metadata": {"favonius_role": "viewer"}}
+    """JWT payload for a read-only role (viewer)."""
+    return {"sub": str(uuid4()), "app_metadata": {"favonius_role": "viewer"}}
 
 
 @pytest.fixture
 def auditor_user():
-    """JWT payload for a user with auditor role."""
-    return {"sub": str(uuid4()), "user_metadata": {"favonius_role": "auditor"}}
+    """JWT payload for auditor-style role string (maps to least privilege in RBAC)."""
+    return {"sub": str(uuid4()), "app_metadata": {"favonius_role": "auditor"}}
 
 
 @pytest.fixture
 def user_with_depot_ids(sample_depot_id):
-    """JWT payload for a user whose access comes from the depot_ids JWT claim."""
-    return {"sub": str(uuid4()), "user_metadata": {"depot_ids": [sample_depot_id]}}
+    """JWT payload for a customer user in a fixed organization (depot access via DB)."""
+    return {
+        "sub": str(uuid4()),
+        "app_metadata": {
+            "favonius_role": "customer_operator",
+            "organization_id": str(uuid4()),
+        },
+    }

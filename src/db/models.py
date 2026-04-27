@@ -32,6 +32,60 @@ Base = declarative_base()
 # ============ REFERENCE DATA ============
 
 
+class Organization(Base):
+    """Customer / workspace tenant."""
+
+    __tablename__ = "organizations"
+
+    organization_id = Column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    depots = relationship("Depot", back_populates="organization")
+    members = relationship("OrganizationUser", back_populates="organization")
+    invitations = relationship("Invitation", back_populates="organization")
+
+
+class OrganizationUser(Base):
+    """Membership linking Supabase auth user UUID to one organization."""
+
+    __tablename__ = "organization_users"
+
+    user_id = Column(PGUUID(as_uuid=True), primary_key=True)
+    organization_id = Column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.organization_id"), nullable=False
+    )
+    role = Column(String(50), nullable=False, default="customer_operator")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    organization = relationship("Organization", back_populates="members")
+
+
+class Invitation(Base):
+    """Pending workspace invitation (token verified out-of-band)."""
+
+    __tablename__ = "invitations"
+
+    invitation_id = Column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    organization_id = Column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.organization_id"), nullable=False
+    )
+    email = Column(String(255), nullable=False)
+    invited_role = Column(String(50), nullable=False, default="customer_operator")
+    token_hash = Column(String(255), nullable=False)
+    invited_by = Column(PGUUID(as_uuid=True), nullable=True)
+    status = Column(String(20), nullable=False, default="pending")
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    organization = relationship("Organization", back_populates="invitations")
+
+
 class Depot(Base):
     """Depot (charging facility) reference data.
 
@@ -41,6 +95,11 @@ class Depot(Base):
     __tablename__ = "depots"
 
     depot_id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    organization_id = Column(
+        PGUUID(as_uuid=True),
+        ForeignKey("organizations.organization_id"),
+        nullable=False,
+    )
     name = Column(String(255), nullable=False)
     latitude = Column(Double, nullable=False)
     longitude = Column(Double, nullable=False)
@@ -54,6 +113,7 @@ class Depot(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relationships
+    organization = relationship("Organization", back_populates="depots")
     vehicles = relationship("Vehicle", back_populates="depot")
     chargers = relationship("Charger", back_populates="depot")
     battery_storage = relationship("BatteryStorage", back_populates="depot")

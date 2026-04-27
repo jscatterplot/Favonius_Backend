@@ -40,7 +40,7 @@ from ..security.auth import get_user_role, verify_depot_access, verify_token
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
-from ..security.rbac import Permission, Role, has_permission, require_permission, require_role
+from ..security.rbac import Permission, has_permission, require_favonius_admin, require_permission
 from ..security.validators import (
     validate_depot_id,
     validate_horizon_hours,
@@ -764,6 +764,7 @@ class DepotMetadata(BaseModel):
     """Static depot metadata returned by /me/depots and /depots/{depot_id}."""
 
     depot_id: str = Field(..., description="Depot identifier (UUID)")
+    organization_id: str = Field(..., description="Owning organization (workspace) UUID")
     name: str = Field(..., description="Human-readable depot name")
     timezone: str = Field(..., description="IANA timezone (e.g. 'America/Los_Angeles')")
     currency: str = Field(..., description="ISO 4217 currency code (e.g. 'EUR', 'USD', 'GBP')")
@@ -1025,8 +1026,8 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     description="""
     Returns all depots the authenticated user has access to.
 
-    Depot list is read from the `user_metadata.depot_ids` JWT claim (populated by the
-    Supabase Auth Hook — see docs/AUTH_HOOK_SETUP.md). Admin users receive all depots.
+    For ``favonius_admin``, all depots are returned. Customer roles receive depots whose
+    ``depots.organization_id`` matches ``app_metadata.organization_id`` on the JWT.
 
     **Authentication:** Requires JWT token in Authorization header.
     """,
@@ -1037,37 +1038,27 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
 )
 async def list_my_depots(user: dict = Depends(verify_token)):
     """List depots accessible to the authenticated user."""
-    from ..security.auth import get_user_depot_ids
-
-    role = get_user_role(user)
+    from ..security.auth import get_user_organization_id, is_platform_admin
 
     if not db_pools:
         raise DatabaseError("Database not available")
 
     try:
-        if role != "admin":
-            depot_ids = get_user_depot_ids(user)
-            if not depot_ids:
-                user_id = user.get("sub")
-                if user_id:
-                    async with db_pools.static.acquire() as conn:
-                        rows = await conn.fetch(
-                            """
-                            SELECT DISTINCT depot_id::text AS depot_id
-                            FROM user_depot_access
-                            WHERE user_id = $1
-                            """,
-                            user_id,
-                        )
-                    depot_ids = [row["depot_id"] for row in rows]
-            if not depot_ids:
-                return {"depots": []}
+        if is_platform_admin(user):
+            async with db_pools.static.acquire() as conn:
+                depots = await db_queries.get_all_depots(conn)
+            return {"depots": depots}
+
+        role = get_user_role(user)
+        if role not in ("customer_admin", "customer_operator"):
+            return {"depots": []}
+
+        org_id = get_user_organization_id(user)
+        if not org_id:
+            return {"depots": []}
 
         async with db_pools.static.acquire() as conn:
-            if role == "admin":
-                depots = await db_queries.get_all_depots(conn)
-            else:
-                depots = await db_queries.get_depots_by_ids(conn, depot_ids)
+            depots = await db_queries.get_depots_for_organization(conn, org_id)
         return {"depots": depots}
     except asyncpg.PostgresError as e:
         logger.error("Database error listing depots: %s", e, exc_info=True)
@@ -1101,7 +1092,6 @@ async def list_my_depots(user: dict = Depends(verify_token)):
 )
 async def get_depot_metadata(
     depot_id: str = Depends(_require_depot_access),
-    user: dict = Depends(verify_token),
 ):
     """Get depot metadata (name, timezone, currency, max_grid_kw)."""
     if not db_pools:
@@ -1909,6 +1899,8 @@ async def receive_handoff(
     validate_depot_id(request.origin_depot_id)
     validate_vehicle_id(request.vehicle_id)
 
+    await verify_depot_access(depot_id, user, db_pools.static)
+
     # Validate SoC range
     if not (0.0 <= request.expected_soc <= 1.0):
         raise HTTPException(
@@ -2289,7 +2281,7 @@ async def metrics():
     """,
     include_in_schema=True,
 )
-async def list_controllers(user: dict = Depends(verify_token)):
+async def list_controllers(_auth: None = Depends(require_favonius_admin())):
     """List active controllers."""
     if not controller_manager:
         raise HTTPException(status_code=503, detail="Controller manager not initialized")
@@ -2321,12 +2313,10 @@ async def list_controllers(user: dict = Depends(verify_token)):
     Reference: Development plan Step 5.2
     """,
 )
-async def get_controller_health(depot_id: str, user: dict = Depends(verify_token)):
+async def get_controller_health(depot_id: str = Depends(_require_depot_access)):
     """Get controller health status."""
     if not controller_manager:
         raise HTTPException(status_code=503, detail="Controller manager not initialized")
-
-    validate_depot_id(depot_id)
 
     health = await controller_manager.health_check()
 
@@ -2672,10 +2662,10 @@ async def get_openapi_schema(user: dict = Depends(verify_token)):
     invalidated on process restart (i.e., on deploy).
     """
     role = get_user_role(user)
-    if role != "admin":
+    if role != "favonius_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin role required to access the OpenAPI schema",
+            detail="Favonius platform admin role required to access the OpenAPI schema",
         )
     global _cached_openapi_schema
     if _cached_openapi_schema is _OPENAPI_NOT_CACHED:

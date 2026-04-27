@@ -32,7 +32,7 @@ def default_auth():
     Depends() function object at module load time. The admin role bypasses
     depot_ids checks so tests with arbitrary depot UUIDs all pass auth.
     """
-    user = {"sub": "test-admin", "user_metadata": {"favonius_role": "admin"}}
+    user = {"sub": "test-admin", "app_metadata": {"favonius_role": "favonius_admin"}}
     app.dependency_overrides[verify_token] = lambda: user
     yield
     app.dependency_overrides.pop(verify_token, None)
