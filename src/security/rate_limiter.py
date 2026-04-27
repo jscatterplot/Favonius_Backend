@@ -136,6 +136,13 @@ class RateLimiter:
             await self._flush_to_db()
         logger.info("Rate limiter stopped")
 
+    def reset_in_memory_buckets_for_tests(self) -> None:
+        """Clear sliding-window state (unit tests only; avoids cross-test 429s)."""
+        self._api_buckets.clear()
+        self._optimize_buckets.clear()
+        self._handoff_buckets.clear()
+        self._last_trigger_optimization.clear()
+
     # ── Rate Limit Checks (hot path, in-memory only) ─────────────────────
 
     def _clean_bucket(self, bucket: list[float], window_seconds: int) -> list[float]:

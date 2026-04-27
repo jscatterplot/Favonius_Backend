@@ -41,10 +41,10 @@ try:
     from src.api.main import app
     from src.core.models import DepotConfig, OptimizationResult
     from src.core.state.assembler import StateAssembler
-    from src.security.auth import verify_token
+    from src.security.tenant_mirror import ensure_tenant_mirrored
 except Exception:  # pragma: no cover - not all test runs import API
     app = None
-    verify_token = None
+    ensure_tenant_mirrored = None
     api_main = None
     StateAssembler = None
     DepotConfig = None
@@ -87,18 +87,18 @@ def sample_depot_id():
 @pytest.fixture(autouse=True)
 def _override_auth_dependency():
     """Override JWT auth for tests using FastAPI TestClient."""
-    if app is None or verify_token is None:
+    if app is None or ensure_tenant_mirrored is None:
         yield
         return
 
-    app.dependency_overrides[verify_token] = lambda: {
+    app.dependency_overrides[ensure_tenant_mirrored] = lambda: {
         "sub": "test-user",
         "app_metadata": {"favonius_role": "favonius_admin"},
     }
     try:
         yield
     finally:
-        app.dependency_overrides.pop(verify_token, None)
+        app.dependency_overrides.pop(ensure_tenant_mirrored, None)
 
 
 @pytest.fixture(autouse=True)

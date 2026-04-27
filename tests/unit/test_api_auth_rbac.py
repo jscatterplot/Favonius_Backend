@@ -20,6 +20,7 @@ from fastapi import HTTPException, status as http_status
 from src.api.main import CommandRequest, _require_depot_access, app
 from src.security.audit_log import AuditEvent
 from src.security.auth import verify_depot_access, verify_token
+from src.security.tenant_mirror import ensure_tenant_mirrored
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -97,7 +98,7 @@ class TestMissingJwtReturns401:
     @pytest.fixture(autouse=True)
     def _remove_global_auth_override(self):
         """Disable global test auth override for missing-token assertions."""
-        app.dependency_overrides.pop(verify_token, None)
+        app.dependency_overrides.pop(ensure_tenant_mirrored, None)
         yield
 
     def test_optimize_no_token(self, client):
@@ -160,12 +161,12 @@ class TestInvalidJwtReturns401:
     """Expired or malformed JWT raises 401.
 
     Uses app.dependency_overrides to inject the exception, because FastAPI
-    captures the `verify_token` function object in Depends() at module load
-    time — module-level @patch cannot reach it.
+    captures the ``ensure_tenant_mirrored`` function object in Depends() at
+    module load time — module-level @patch cannot reach it.
     """
 
     def test_optimize_expired_token(self, client):
-        app.dependency_overrides[verify_token] = _override_token_raises(401, "Token expired")
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token_raises(401, "Token expired")
         response = client.post(
             "/optimize",
             json={"depot_id": DEPOT_ID, "horizon_hours": 24},
@@ -174,17 +175,17 @@ class TestInvalidJwtReturns401:
         assert response.status_code == http_status.HTTP_401_UNAUTHORIZED
 
     def test_depot_state_invalid_token(self, client):
-        app.dependency_overrides[verify_token] = _override_token_raises(401, "Invalid token")
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token_raises(401, "Invalid token")
         response = client.get(f"/depots/{DEPOT_ID}/state", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_401_UNAUTHORIZED
 
     def test_me_depots_invalid_token(self, client):
-        app.dependency_overrides[verify_token] = _override_token_raises(401)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token_raises(401)
         response = client.get("/me/depots", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_401_UNAUTHORIZED
 
     def test_commands_execute_invalid_token(self, client):
-        app.dependency_overrides[verify_token] = _override_token_raises(401)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token_raises(401)
         response = client.post(
             "/commands/execute",
             json={"command": "optimization.run", "depot_id": DEPOT_ID},
@@ -193,7 +194,7 @@ class TestInvalidJwtReturns401:
         assert response.status_code == http_status.HTTP_401_UNAUTHORIZED
 
     def test_openapi_invalid_token(self, client):
-        app.dependency_overrides[verify_token] = _override_token_raises(401)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token_raises(401)
         response = client.get("/openapi.json", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_401_UNAUTHORIZED
 
@@ -209,25 +210,25 @@ class TestInsufficientDepotAccessReturns403:
     """
 
     def test_depot_state_no_access(self, client):
-        app.dependency_overrides[verify_token] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
         app.dependency_overrides[_require_depot_access] = _deny_depot_access
         response = client.get(f"/depots/{DEPOT_ID}/state", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
 
     def test_depot_schedule_no_access(self, client):
-        app.dependency_overrides[verify_token] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
         app.dependency_overrides[_require_depot_access] = _deny_depot_access
         response = client.get(f"/depots/{DEPOT_ID}/schedule", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
 
     def test_depot_alerts_no_access(self, client):
-        app.dependency_overrides[verify_token] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
         app.dependency_overrides[_require_depot_access] = _deny_depot_access
         response = client.get(f"/depots/{DEPOT_ID}/alerts", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
 
     def test_depot_metadata_no_access(self, client):
-        app.dependency_overrides[verify_token] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token({"sub": str(uuid4()), "app_metadata": {}})
         app.dependency_overrides[_require_depot_access] = _deny_depot_access
         response = client.get(f"/depots/{DEPOT_ID}", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -240,17 +241,17 @@ class TestOpenApiGating:
     """GET /openapi.json requires favonius_admin role."""
 
     def test_customer_operator_gets_403(self, client):
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="customer_operator"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_operator"))
         response = client.get("/openapi.json", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
 
     def test_viewer_gets_403(self, client):
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="viewer"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="viewer"))
         response = client.get("/openapi.json", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
 
     def test_favonius_admin_gets_200(self, client):
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="favonius_admin"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="favonius_admin"))
         response = client.get("/openapi.json", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_200_OK
         data = response.json()
@@ -267,7 +268,7 @@ class TestMyDepots:
     def test_returns_depots_for_organization(self, client, mock_db_pool):
         pool, conn = mock_db_pool
         org_id = str(uuid4())
-        app.dependency_overrides[verify_token] = _override_token(
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
             _valid_user(role="customer_operator", organization_id=org_id)
         )
         conn.fetch = AsyncMock(
@@ -293,7 +294,7 @@ class TestMyDepots:
 
     def test_returns_empty_when_no_organization_id(self, client, mock_db_pool):
         pool, conn = mock_db_pool
-        app.dependency_overrides[verify_token] = _override_token(
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
             _valid_user(role="customer_operator", omit_organization_id=True)
         )
         conn.fetch = AsyncMock(return_value=[])
@@ -304,23 +305,54 @@ class TestMyDepots:
 
     def test_favonius_admin_gets_all_depots(self, client, mock_db_pool):
         pool, conn = mock_db_pool
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="favonius_admin"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="favonius_admin"))
         conn.fetch = AsyncMock(return_value=[])
         with patch("src.api.main.db_pools", pool):
             response = client.get("/me/depots", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_200_OK
 
 
+class TestTenantMirrorOnAuthenticatedRequest:
+    """JIT mirror runs on real auth path (verify_token override, not ensure override)."""
+
+    def test_authenticated_endpoint_triggers_mirror_once(self, client, mock_db_pool):
+        app.dependency_overrides.pop(ensure_tenant_mirrored, None)
+        app.dependency_overrides[verify_token] = _override_token(
+            _valid_user(role="customer_operator", organization_id=DEFAULT_ORG_ID)
+        )
+        pool, conn = mock_db_pool
+        conn.fetch = AsyncMock(return_value=[])
+        with patch("src.security.tenant_mirror.mirror_user_tenant", new_callable=AsyncMock) as mock_mirror:
+            with patch("src.api.main.db_pools", pool):
+                client.get("/me/depots", headers=AUTH_HDR)
+        mock_mirror.assert_awaited_once()
+
+    def test_cross_org_denial_unaffected_by_mirror_failure(self, client, mock_db_pool):
+        """403 from verify_depot_access must not depend on tenant mirror succeeding."""
+        app.dependency_overrides.pop(ensure_tenant_mirrored, None)
+        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="customer_operator"))
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(return_value=False)
+        with patch(
+            "src.security.tenant_mirror.mirror_user_tenant",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("mirror boom"),
+        ):
+            with patch("src.api.main.db_pools", pool):
+                response = client.get(f"/depots/{DEPOT_ID}", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+
 class TestAdminControllersRbac:
     """GET /admin/controllers is restricted to favonius_admin."""
 
     def test_customer_operator_forbidden(self, client):
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="customer_operator"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_operator"))
         response = client.get("/admin/controllers", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
 
     def test_favonius_admin_ok(self, client):
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="favonius_admin"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="favonius_admin"))
         response = client.get("/admin/controllers", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_200_OK
 
@@ -367,7 +399,7 @@ class TestCommandRbac:
         mock_db_pool,
     ):
         user = _valid_user(role=role)
-        app.dependency_overrides[verify_token] = _override_token(user)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
 
         pool, conn = mock_db_pool
         conn.fetchval = AsyncMock(return_value=True)
@@ -401,7 +433,7 @@ class TestCommandAuditTrail:
         user_id = str(uuid4())
         user = _valid_user(role="customer_operator")
         user["sub"] = user_id
-        app.dependency_overrides[verify_token] = _override_token(user)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
 
         mock_audit = AsyncMock()
         mock_get_audit.return_value = mock_audit
@@ -441,7 +473,7 @@ class TestCommandAuditTrail:
                 "organization_id": DEFAULT_ORG_ID,
             },
         }
-        app.dependency_overrides[verify_token] = _override_token(user)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
 
         mock_controller = AsyncMock()
         mock_cm.get_or_create_controller = AsyncMock(return_value=mock_controller)
@@ -475,7 +507,7 @@ class TestCommandAuditTrail:
     @patch("src.api.main.get_audit_logger", return_value=None)
     def test_no_error_when_audit_logger_is_none(self, mock_get_audit, client, mock_db_pool):
         """Command executes successfully even if audit logger is not initialized."""
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="customer_operator"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_operator"))
         pool, conn = mock_db_pool
         conn.fetchval = AsyncMock(return_value=True)
         with patch("src.api.main.db_pools", pool):
@@ -499,7 +531,7 @@ class TestDepotMetadata:
 
     def test_returns_depot_fields(self, client, mock_db_pool):
         pool, conn = mock_db_pool
-        app.dependency_overrides[verify_token] = _override_token(_valid_user())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user())
         app.dependency_overrides[_require_depot_access] = _bypass_depot_access
         conn.fetchrow = AsyncMock(
             return_value={
@@ -522,7 +554,7 @@ class TestDepotMetadata:
 
     def test_returns_404_when_not_found(self, client, mock_db_pool):
         pool, conn = mock_db_pool
-        app.dependency_overrides[verify_token] = _override_token(_valid_user())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user())
         app.dependency_overrides[_require_depot_access] = _bypass_depot_access
         conn.fetchrow = AsyncMock(return_value=None)
         with patch("src.api.main.db_pools", pool):
@@ -534,7 +566,7 @@ class TestDepotMetadata:
         response = client.get("/depots/not-a-uuid", headers=AUTH_HDR)
         # Without auth override: JWT fails → 500 (no JWT_SECRET_KEY in test env)
         # With auth override: UUID validation fires → 400
-        app.dependency_overrides[verify_token] = _override_token(_valid_user())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user())
         response = client.get("/depots/not-a-uuid", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
 
@@ -557,7 +589,7 @@ class TestCrossOrganizationDepotAccessDenied:
     def test_get_depot_metadata_403_when_org_mismatch(self, client, mock_db_pool):
         pool, conn = mock_db_pool
         conn.fetchval = AsyncMock(return_value=False)
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="customer_operator"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_operator"))
         with patch("src.api.main.db_pools", pool):
             response = client.get(f"/depots/{DEPOT_ID}", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -574,7 +606,7 @@ class TestCrossOrganizationDepotAccessDenied:
                 "organization_id": DEFAULT_ORG_ID,
             },
         }
-        app.dependency_overrides[verify_token] = _override_token(user)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
         with patch("src.api.main.db_pools", pool):
             response = client.get(f"/depots/{DEPOT_ID}", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -582,7 +614,7 @@ class TestCrossOrganizationDepotAccessDenied:
     def test_user_metadata_only_legacy_admin_no_app_role_denied(self, client, mock_db_pool):
         pool, conn = mock_db_pool
         user = {"sub": str(uuid4()), "user_metadata": {"favonius_role": "admin"}, "app_metadata": {}}
-        app.dependency_overrides[verify_token] = _override_token(user)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
         with patch("src.api.main.db_pools", pool):
             response = client.get(f"/depots/{DEPOT_ID}", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -596,7 +628,7 @@ class TestCrossOrganizationDepotAccessDenied:
     ):
         """Sender should only be authorized for source depot, not destination depot."""
         pool, conn = mock_db_pool
-        app.dependency_overrides[verify_token] = _override_token(_valid_user(role="customer_operator"))
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_operator"))
         app.dependency_overrides[_require_depot_access] = _bypass_depot_access
 
         conn.fetchrow = AsyncMock(

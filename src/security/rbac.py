@@ -17,7 +17,8 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 
-from .auth import get_user_role, verify_token
+from .auth import get_user_role
+from .tenant_mirror import ensure_tenant_mirrored
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ def has_permission(role: str, permission: Permission) -> bool:
 def require_permission(permission: Permission):
     """FastAPI dependency that checks for a specific permission."""
 
-    async def _check(token: dict = Depends(verify_token)) -> None:
+    async def _check(token: dict = Depends(ensure_tenant_mirrored)) -> None:
         role = get_user_role(token)
         if not has_permission(role, permission):
             logger.warning(
@@ -117,7 +118,7 @@ def require_permission(permission: Permission):
 def require_role(required_role: Role):
     """FastAPI dependency that requires an exact role match."""
 
-    async def _check(token: dict = Depends(verify_token)) -> None:
+    async def _check(token: dict = Depends(ensure_tenant_mirrored)) -> None:
         role = get_user_role(token)
         try:
             user_role = Role(role)
@@ -139,7 +140,7 @@ def require_role(required_role: Role):
 def require_favonius_admin():
     """Require Supabase app_metadata.favonius_role == favonius_admin."""
 
-    async def _check(token: dict = Depends(verify_token)) -> None:
+    async def _check(token: dict = Depends(ensure_tenant_mirrored)) -> None:
         role = get_user_role(token)
         if role != Role.FAVONIUS_ADMIN.value:
             raise HTTPException(

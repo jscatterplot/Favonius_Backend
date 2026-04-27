@@ -14,24 +14,6 @@ CREATE TABLE IF NOT EXISTS organization_users (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS invitations (
-    invitation_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    organization_id UUID NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
-    email           VARCHAR(255) NOT NULL,
-    invited_role    VARCHAR(50) NOT NULL DEFAULT 'customer_operator',
-    token_hash      VARCHAR(255) NOT NULL,
-    invited_by      UUID,
-    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
-    expires_at      TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT invitations_status_chk CHECK (
-        status IN ('pending', 'accepted', 'expired', 'revoked')
-    )
-);
-
-CREATE INDEX IF NOT EXISTS idx_invitations_org_email
-    ON invitations (organization_id, lower(email));
-
 INSERT INTO organizations (organization_id, name)
 VALUES (
     '00000000-0000-4000-8000-000000000001'::uuid,

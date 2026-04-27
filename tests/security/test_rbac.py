@@ -80,7 +80,7 @@ class TestRequirePermission:
         token = {"sub": "user-1", "app_metadata": {"favonius_role": "favonius_admin"}}
         dep = require_permission(Permission.ADMIN_CONFIG)
 
-        with patch("src.security.rbac.verify_token", return_value=token):
+        with patch("src.security.rbac.ensure_tenant_mirrored", return_value=token):
             await dep(token=token)
 
     @pytest.mark.asyncio
@@ -101,7 +101,7 @@ class TestRequireRole:
         token = {"sub": "user-1", "app_metadata": {"favonius_role": "favonius_admin"}}
         dep = require_role(Role.FAVONIUS_ADMIN)
 
-        with patch("src.security.rbac.verify_token", return_value=token):
+        with patch("src.security.rbac.ensure_tenant_mirrored", return_value=token):
             await dep(token=token)
 
     @pytest.mark.asyncio

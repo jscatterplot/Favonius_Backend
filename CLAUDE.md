@@ -297,7 +297,9 @@ These come directly from the PRD and are non-negotiable:
 ## Database Schema (TimescaleDB / PostgreSQL 16)
 
 ### Reference (static) tables
-- `depots` — Physical locations; `max_grid_kw` is the hard site power limit
+- `organizations` — Customer / workspace tenant (`organization_id` UUID). Rows are **JIT-mirrored** from verified Supabase JWT `app_metadata` (see Tenant mirroring below); canonical org lifecycle lives in Supabase / frontend.
+- `organization_users` — At most one org per user (`user_id` PK → `organization_id`, `role`). JIT-mirrored from JWT `app_metadata` (`organization_id`, `favonius_role`). **Not** used for API authorization; access control compares JWT claims to `depots.organization_id`.
+- `depots` — Physical locations; `max_grid_kw` is the hard site power limit; `organization_id` FK to `organizations`
 - `vehicles` — Fleet vehicles; `max_charge_kw` updated from OCPP MeterValues
 - `chargers` — EVSE; `ocpp_id` links to OCPP protocol
 - `charger_vehicle_access` — Physical accessibility matrix
@@ -308,6 +310,11 @@ These come directly from the PRD and are non-negotiable:
 - `prices` — $/kWh by depot and time (CAISO DAM or utility TOU)
 - `weather_forecasts` — Temperature, precipitation, solar radiation
 - `building_load` — Non-EV site power draw (**required** for grid calc)
+
+### Tenant mirroring (JIT)
+- On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `organization_users` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.favonius_role`). **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `depots.organization_id`).
+- In-process TTL cache: `TENANT_MIRROR_TTL_S` (default `300`) seconds per `sub` to limit DB writes.
+- Workspace **invitations** are managed in Supabase only; there is no `invitations` table in this backend.
 
 ### Operational tables
 - `schedules` — Vehicle route schedules (departure/return times)
@@ -648,6 +655,11 @@ test(api): add coverage for handoff rate limiting
 | `DATABASE_URL` | PostgreSQL connection string (TimescaleDB) |
 | `JWT_SECRET_KEY` | Secret for JWT verification |
 | `ENVIRONMENT` | `development` / `staging` / `production` |
+
+### Tenant mirroring (optional)
+| Variable | Default | Description |
+|---|---|---|
+| `TENANT_MIRROR_TTL_S` | `300` | Seconds to cache successful mirror per `sub` (reduces static-DB UPSERTs) |
 
 ### OCPP server
 | Variable | Default | Description |

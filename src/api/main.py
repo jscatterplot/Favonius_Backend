@@ -36,7 +36,8 @@ from ..db import queries as db_queries
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
 from ..security.audit_log import AuditEvent, AuditLogger, audit_log_event, get_audit_logger, set_audit_logger
-from ..security.auth import get_user_role, verify_depot_access, verify_token
+from ..security.auth import get_user_role, verify_depot_access
+from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
@@ -74,7 +75,7 @@ def _create_background_task(coro) -> None:
 
 async def _require_depot_access(
     depot_id: str,
-    user: dict = Depends(verify_token),
+    user: dict = Depends(ensure_tenant_mirrored),
 ) -> str:
     """FastAPI Depends: validate depot_id UUID and verify authenticated user has access.
 
@@ -1036,7 +1037,7 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def list_my_depots(user: dict = Depends(verify_token)):
+async def list_my_depots(user: dict = Depends(ensure_tenant_mirrored)):
     """List depots accessible to the authenticated user."""
     from ..security.auth import get_user_organization_id, is_platform_admin
 
@@ -1156,7 +1157,7 @@ async def get_depot_metadata(
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def run_optimization(request: OptimizationRequest, user: dict = Depends(verify_token)):
+async def run_optimization(request: OptimizationRequest, user: dict = Depends(ensure_tenant_mirrored)):
     """Trigger depot charging optimization.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
@@ -1291,7 +1292,7 @@ async def run_optimization(request: OptimizationRequest, user: dict = Depends(ve
 )
 async def get_depot_state(
     depot_id: str = Depends(_require_depot_access),
-    user: dict = Depends(verify_token),
+    user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Get current depot state.
 
@@ -1383,7 +1384,7 @@ async def get_depot_state(
 )
 async def get_depot_schedule(
     depot_id: str = Depends(_require_depot_access),
-    user: dict = Depends(verify_token),
+    user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Get current charging schedule.
 
@@ -1486,7 +1487,7 @@ async def get_depot_schedule(
 )
 async def get_depot_alerts(
     depot_id: str = Depends(_require_depot_access),
-    user: dict = Depends(verify_token),
+    user: dict = Depends(ensure_tenant_mirrored),
 ):
     """GET /depots/{depot_id}/alerts — charger faults and last optimization (PRD §7.1)."""
     if not db_pools:
@@ -1627,7 +1628,7 @@ async def send_handoff(
     vehicle_id: str,
     request: HandoffRequest,
     depot_id: str = Depends(_require_depot_access),
-    user: dict = Depends(verify_token),
+    user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Send inter-depot handoff message.
 
@@ -1880,7 +1881,7 @@ class HandoffReceiveResponse(BaseModel):
     },
 )
 async def receive_handoff(
-    depot_id: str, request: HandoffReceiveRequest, user: dict = Depends(verify_token)
+    depot_id: str, request: HandoffReceiveRequest, user: dict = Depends(ensure_tenant_mirrored)
 ):
     """Receive inter-depot handoff message.
 
@@ -2589,7 +2590,7 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
 )
 async def execute_command(
     body: CommandRequest,
-    user: dict = Depends(verify_token),
+    user: dict = Depends(ensure_tenant_mirrored),
 ):
     """POST /commands/execute — RBAC-gated depot command dispatcher."""
     validate_depot_id(body.depot_id)
@@ -2655,7 +2656,7 @@ _cached_openapi_schema: object = _OPENAPI_NOT_CACHED
     include_in_schema=False,
     summary="OpenAPI schema (admin only)",
 )
-async def get_openapi_schema(user: dict = Depends(verify_token)):
+async def get_openapi_schema(user: dict = Depends(ensure_tenant_mirrored)):
     """Serve the OpenAPI schema; requires admin role.
 
     The schema is generated once and cached in-process. It is implicitly

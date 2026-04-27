@@ -21,7 +21,7 @@ from src.api.main import (
     validate_horizon_hours,
     validate_uuid,
 )
-from src.security.auth import verify_token
+from src.security.tenant_mirror import ensure_tenant_mirrored
 
 
 @pytest.fixture(autouse=True)
@@ -31,11 +31,19 @@ def default_auth():
     Uses app.dependency_overrides (not @patch) because FastAPI captures the
     Depends() function object at module load time. The admin role bypasses
     depot_ids checks so tests with arbitrary depot UUIDs all pass auth.
+
+    Restores any prior ``ensure_tenant_mirrored`` override (e.g. from
+    ``tests/conftest.py``) on teardown so other test modules are not left
+    without auth.
     """
     user = {"sub": "test-admin", "app_metadata": {"favonius_role": "favonius_admin"}}
-    app.dependency_overrides[verify_token] = lambda: user
+    prev = app.dependency_overrides.get(ensure_tenant_mirrored)
+    app.dependency_overrides[ensure_tenant_mirrored] = lambda: user
     yield
-    app.dependency_overrides.pop(verify_token, None)
+    if prev is not None:
+        app.dependency_overrides[ensure_tenant_mirrored] = prev
+    else:
+        app.dependency_overrides.pop(ensure_tenant_mirrored, None)
 
 
 class TestValidationUtilities:

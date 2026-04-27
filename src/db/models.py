@@ -46,7 +46,6 @@ class Organization(Base):
 
     depots = relationship("Depot", back_populates="organization")
     members = relationship("OrganizationUser", back_populates="organization")
-    invitations = relationship("Invitation", back_populates="organization")
 
 
 class OrganizationUser(Base):
@@ -62,28 +61,6 @@ class OrganizationUser(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     organization = relationship("Organization", back_populates="members")
-
-
-class Invitation(Base):
-    """Pending workspace invitation (token verified out-of-band)."""
-
-    __tablename__ = "invitations"
-
-    invitation_id = Column(
-        PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
-    )
-    organization_id = Column(
-        PGUUID(as_uuid=True), ForeignKey("organizations.organization_id"), nullable=False
-    )
-    email = Column(String(255), nullable=False)
-    invited_role = Column(String(50), nullable=False, default="customer_operator")
-    token_hash = Column(String(255), nullable=False)
-    invited_by = Column(PGUUID(as_uuid=True), nullable=True)
-    status = Column(String(20), nullable=False, default="pending")
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    organization = relationship("Organization", back_populates="invitations")
 
 
 class Depot(Base):

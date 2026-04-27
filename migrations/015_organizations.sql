@@ -1,4 +1,4 @@
--- Organizations, memberships, invitations, and depot tenancy.
+-- Organizations, memberships, and depot tenancy.
 -- Default org UUID is stable for seed/backfill across environments.
 
 CREATE TABLE IF NOT EXISTS organizations (
@@ -18,24 +18,6 @@ CREATE TABLE IF NOT EXISTS organization_users (
 );
 
 COMMENT ON TABLE organization_users IS 'At most one organization per user (enforced by UNIQUE user_id)';
-
-CREATE TABLE IF NOT EXISTS invitations (
-    invitation_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    organization_id UUID NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
-    email           VARCHAR(255) NOT NULL,
-    invited_role    VARCHAR(50) NOT NULL DEFAULT 'customer_operator',
-    token_hash      VARCHAR(255) NOT NULL,
-    invited_by      UUID,
-    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
-    expires_at      TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT invitations_status_chk CHECK (
-        status IN ('pending', 'accepted', 'expired', 'revoked')
-    )
-);
-
-CREATE INDEX IF NOT EXISTS idx_invitations_org_email
-    ON invitations (organization_id, lower(email));
 
 -- Stable default tenant for existing seed depots
 INSERT INTO organizations (organization_id, name)

@@ -22,8 +22,17 @@ from src.api.main import (
     app,
 )
 from src.core.models import DepotConfig, DepotState, OptimizationResult
+from src.security.rate_limiter import get_rate_limiter
 
 # ============ Fixtures ============
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limit_buckets():
+    """Many /optimize calls in this module exhaust the 10/min limit on one client."""
+    get_rate_limiter().reset_in_memory_buckets_for_tests()
+    yield
+    get_rate_limiter().reset_in_memory_buckets_for_tests()
 
 
 @pytest.fixture

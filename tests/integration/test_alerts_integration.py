@@ -43,12 +43,15 @@ class TestAlertsAT16:
     """AT-16: Alerts and Observability acceptance tests."""
 
     @patch("src.api.main.db_pool")
-    @patch("src.api.main.verify_token")
+    @patch("src.api.main.ensure_tenant_mirrored", new_callable=AsyncMock)
     def test_alerts_returns_last_optimization_and_charger_faults(
-        self, mock_verify, mock_pool, client, mock_db_pool, depot_id
+        self, mock_user_dep, mock_pool, client, mock_db_pool, depot_id
     ):
         """GIVEN a depot WITH at least one charger WHEN GET /depots/{id}/alerts THEN last_optimization and charger_faults present."""
-        mock_verify.return_value = {"sub": "test"}
+        mock_user_dep.return_value = {
+            "sub": "test",
+            "app_metadata": {"favonius_role": "favonius_admin"},
+        }
         pool, conn = mock_db_pool
         run_id = uuid4()
         now = datetime.utcnow()
@@ -85,12 +88,15 @@ class TestAlertsAT16:
         assert data["depot_id"] == depot_id
 
     @patch("src.api.main.db_pool")
-    @patch("src.api.main.verify_token")
+    @patch("src.api.main.ensure_tenant_mirrored", new_callable=AsyncMock)
     def test_alerts_charger_faults_when_status_faulted(
-        self, mock_verify, mock_pool, client, mock_db_pool, depot_id
+        self, mock_user_dep, mock_pool, client, mock_db_pool, depot_id
     ):
         """GIVEN StatusNotification Faulted with PowerMeterFailure WHEN GET alerts THEN charger_faults contains entry."""
-        mock_verify.return_value = {"sub": "test"}
+        mock_user_dep.return_value = {
+            "sub": "test",
+            "app_metadata": {"favonius_role": "favonius_admin"},
+        }
         pool, conn = mock_db_pool
         run_id = uuid4()
         charger_id = uuid4()

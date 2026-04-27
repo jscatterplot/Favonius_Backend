@@ -1,0 +1,108 @@
+"""Just-in-time mirror of Supabase JWT tenancy into static DB rows.
+
+``organizations`` / ``organization_users`` are write-side caches for FKs and
+joins. Authorization still uses ``app_metadata`` vs ``depots.organization_id``;
+this module never trusts ``user_metadata``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import TYPE_CHECKING, NamedTuple, Optional
+
+from fastapi import Depends
+
+from .auth import get_user_organization_id, get_user_role, verify_token
+
+if TYPE_CHECKING:
+    import asyncpg
+
+logger = logging.getLogger(__name__)
+
+
+class _TenantCacheEntry(NamedTuple):
+    org_id: Optional[str]
+    role: str
+    expires_at: float
+
+
+_cache: dict[str, _TenantCacheEntry] = {}
+_TTL_S = float(os.getenv("TENANT_MIRROR_TTL_S", "300"))
+
+
+def clear_tenant_mirror_cache() -> None:
+    """Clear in-process mirror cache (tests)."""
+    _cache.clear()
+
+
+async def mirror_user_tenant(user: dict, pool: Optional["asyncpg.Pool"]) -> None:
+    """Best-effort UPSERT of org + membership from verified JWT claims.
+
+    No-op for ``favonius_admin``, users without ``organization_id``, or when
+    ``pool`` is None. DB errors are logged and swallowed.
+
+    Args:
+        user: Decoded JWT from ``verify_token``.
+        pool: Static (reference) asyncpg pool, or None.
+    """
+    user_id = user.get("sub")
+    org_id = get_user_organization_id(user)
+    role = get_user_role(user)
+    if not user_id or not org_id or role == "favonius_admin":
+        return
+
+    key = str(user_id)
+    now = time.monotonic()
+    cached = _cache.get(key)
+    if (
+        cached
+        and cached.expires_at > now
+        and cached.org_id == org_id
+        and cached.role == role
+    ):
+        return
+
+    if pool is None:
+        return
+
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "INSERT INTO organizations (organization_id, name) "
+                "VALUES ($1::uuid, $2) ON CONFLICT (organization_id) DO NOTHING",
+                org_id,
+                f"org-{org_id[:8]}",
+            )
+            await conn.execute(
+                "INSERT INTO organization_users (user_id, organization_id, role) "
+                "VALUES ($1::uuid, $2::uuid, $3) "
+                "ON CONFLICT (user_id) DO UPDATE "
+                "SET organization_id = EXCLUDED.organization_id, role = EXCLUDED.role",
+                user_id,
+                org_id,
+                role,
+            )
+        _cache[key] = _TenantCacheEntry(org_id, role, now + _TTL_S)
+    except Exception:
+        logger.warning(
+            "tenant mirror failed user=%s org=%s",
+            user_id,
+            org_id,
+            exc_info=True,
+        )
+
+
+async def ensure_tenant_mirrored(user: dict = Depends(verify_token)) -> dict:
+    """FastAPI dependency: verify JWT then mirror org/membership (best-effort)."""
+    from ..api import main as api_main  # noqa: PLC0415 — avoid import cycle at startup
+
+    pool = api_main.db_pools.static if api_main.db_pools else None
+    try:
+        await mirror_user_tenant(user, pool)
+    except Exception:
+        # Defense in depth: ``mirror_user_tenant`` already swallows DB errors; this
+        # catches tests/patches and any unexpected failure so auth never breaks.
+        logger.warning("ensure_tenant_mirrored: mirror step failed", exc_info=True)
+    return user
