@@ -61,6 +61,8 @@ class WebSocketConfig(BaseModel):
         default=100, description="Maximum concurrent connections (simplified)"
     )
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
+    ping_interval: int = Field(default=45, description="Server ping interval in seconds")
+    ping_timeout: int = Field(default=30, description="Server ping timeout in seconds")
     message_timeout: int = Field(default=60, description="Message timeout in seconds")
     max_message_size: int = Field(
         default=1048576, description="Maximum message size in bytes (PRD: 1 MB)"
@@ -262,6 +264,8 @@ class Config(BaseModel):
                 host=os.getenv("WEBSOCKET_HOST", "0.0.0.0"),
                 max_connections=int(os.getenv("MAX_CONNECTIONS", "100")),
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),
+                ping_interval=int(os.getenv("WEBSOCKET_PING_INTERVAL", "45")),
+                ping_timeout=int(os.getenv("WEBSOCKET_PING_TIMEOUT", "30")),
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "1048576")),
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),

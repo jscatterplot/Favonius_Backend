@@ -14,6 +14,7 @@ and wires its callbacks to:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import time
@@ -82,6 +83,9 @@ class OCPP16Session:
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
         self._replay_task: Optional[asyncio.Task[None]] = None
+        self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
+        self._telemetry_flush_task: Optional[asyncio.Task[None]] = None
+        self._stop_telemetry_flush = asyncio.Event()
 
         self._cp = FleetChargePoint(
             id=station_id,
@@ -101,7 +105,15 @@ class OCPP16Session:
 
     async def start(self) -> None:
         """Start processing messages from the charger (blocks until disconnect)."""
-        await self._cp.start()
+        self._stop_telemetry_flush.clear()
+        self._telemetry_flush_task = asyncio.create_task(self._flush_telemetry_queue())
+        try:
+            await self._cp.start()
+        finally:
+            if self._telemetry_flush_task is not None:
+                self._stop_telemetry_flush.set()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._telemetry_flush_task
 
     # ------------------------------------------------------------------
     # Outgoing commands (matches EnhancedOCPPChargePoint's interface)
@@ -154,7 +166,7 @@ class OCPP16Session:
                 )
 
         charging_rate_unit = (cp_schedule or {}).get(
-            "chargingRateUnit", charging_profile.get("chargingRateUnit", "W")
+            "chargingRateUnit", charging_profile.get("chargingRateUnit", "A")
         )
 
         push_start = time.monotonic()
@@ -510,23 +522,22 @@ class OCPP16Session:
         # TimescaleClient expects soc_percent (0–100)
         soc_percent = soc * 100.0 if soc is not None else None
 
-        try:
-            await self._timescale.insert_telemetry_batch(
-                [
-                    {
-                        "time": timestamp,
-                        "station_id": cp_id,
-                        "connector_id": connector_id,
-                        "session_id": str(transaction_id) if transaction_id else None,
-                        "power_kw": power_kw,
-                        "energy_kwh": energy_kwh,
-                        "soc_percent": soc_percent,
-                        "max_charge_power_kw": max_charge_kw,
-                    }
-                ]
-            )
-        except Exception as exc:
-            logger.warning("Telemetry write failed: station=%s error=%s", cp_id, exc)
+        base_row = {
+            "time": timestamp,
+            "station_id": cp_id,
+            "connector_id": connector_id,
+            "session_id": str(transaction_id) if transaction_id else None,
+            "power_kw": power_kw,
+            "energy_kwh": energy_kwh,
+            "soc_percent": soc_percent,
+            "max_charge_power_kw": max_charge_kw,
+        }
+        for sample in raw_samples or []:
+            row = dict(base_row)
+            row["raw_sample"] = sample
+            self._enqueue_telemetry_row(row)
+        if not raw_samples:
+            self._enqueue_telemetry_row(base_row)
 
         asyncio.create_task(
             self._message_handler._push_to_main_api(
@@ -535,6 +546,62 @@ class OCPP16Session:
                 {"soc_percent": soc_percent, "power_kw": power_kw},
             )
         )
+
+    def _enqueue_telemetry_row(self, row: Dict[str, Any]) -> None:
+        """Push telemetry row into bounded queue; drop oldest on overflow."""
+        if self._stop_telemetry_flush.is_set():
+            logger.warning(
+                "Dropping telemetry row while session is shutting down: station=%s",
+                self._station_id,
+            )
+            return
+        try:
+            self._telemetry_queue.put_nowait(row)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._telemetry_queue.get_nowait()
+            try:
+                self._telemetry_queue.put_nowait(row)
+            except asyncio.QueueFull:
+                logger.warning("Telemetry queue overflow for station=%s", self._station_id)
+
+    async def _flush_telemetry_queue(self) -> None:
+        """Drain queued telemetry rows in short batches."""
+        stop_deadline: Optional[float] = None
+        while True:
+            if self._stop_telemetry_flush.is_set() and self._telemetry_queue.empty():
+                break
+            if self._stop_telemetry_flush.is_set() and stop_deadline is None:
+                stop_deadline = time.monotonic() + 5.0
+            if stop_deadline is not None and time.monotonic() >= stop_deadline:
+                dropped = self._telemetry_queue.qsize()
+                if dropped:
+                    logger.warning(
+                        "Telemetry flush timed out during shutdown: station=%s dropped=%s",
+                        self._station_id,
+                        dropped,
+                    )
+                break
+            try:
+                row = await asyncio.wait_for(self._telemetry_queue.get(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            batch = [row]
+            batch_started = time.monotonic()
+            while len(batch) < 50 and (time.monotonic() - batch_started) < 0.25:
+                try:
+                    batch.append(self._telemetry_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                await self._timescale.insert_telemetry_batch(batch)
+            except Exception as exc:
+                logger.warning(
+                    "Telemetry write failed: station=%s batch_size=%s error=%s",
+                    self._station_id,
+                    len(batch),
+                    exc,
+                )
 
     async def _on_status_change(
         self,
@@ -642,7 +709,22 @@ class OCPP16Session:
         meter_stop: int,
         timestamp: str,
         reason: str,
+        transaction_data: Optional[list] = None,
     ) -> None:
+        connector_id: Optional[int] = None
+        try:
+            connector_id = await self._timescale.lookup_session_connector(
+                station_id=cp_id,
+                transaction_id=int(transaction_id),
+            )
+        except Exception as exc:
+            logger.warning(
+                "lookup_session_connector failed for station=%s tx_id=%s: %s",
+                cp_id,
+                transaction_id,
+                exc,
+            )
+
         try:
             end_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
@@ -656,6 +738,64 @@ class OCPP16Session:
                 transaction_id,
                 exc,
             )
+
+        # Persist optional StopTransaction.transactionData samples using the
+        # same telemetry pipeline so vendors that only emit end-of-session
+        # samples still feed analytics/debug views.
+        if transaction_data and connector_id is None:
+            logger.warning(
+                "Skipping StopTransaction.transactionData persistence due to unknown connector: "
+                "station=%s tx_id=%s samples=%s",
+                cp_id,
+                transaction_id,
+                len(transaction_data),
+            )
+        elif transaction_data:
+            for meter_value in transaction_data:
+                ts = meter_value.get("timestamp", timestamp)
+                parsed_ts = datetime.now(timezone.utc)
+                try:
+                    parsed_ts = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                except (ValueError, AttributeError):
+                    pass
+                for sampled in meter_value.get("sampledValue", meter_value.get("sampled_value", [])):
+                    try:
+                        parsed_value = float(sampled.get("value", "0"))
+                    except (TypeError, ValueError):
+                        continue
+                    payload = {
+                        "measurand": sampled.get("measurand", "Energy.Active.Import.Register"),
+                        "value": parsed_value,
+                        "unit": sampled.get("unit", "Wh"),
+                        "context": sampled.get("context", "Transaction.End"),
+                        "phase": sampled.get("phase"),
+                        "location": sampled.get("location", "Outlet"),
+                        "format": sampled.get("format", "Raw"),
+                        "timestamp": parsed_ts,
+                    }
+                    try:
+                        await self._timescale.insert_telemetry_batch(
+                            [
+                                {
+                                    "time": parsed_ts,
+                                    "station_id": cp_id,
+                                    "connector_id": connector_id,
+                                    "session_id": str(transaction_id),
+                                    "power_kw": None,
+                                    "energy_kwh": None,
+                                    "soc_percent": None,
+                                    "max_charge_power_kw": None,
+                                    "raw_sample": payload,
+                                }
+                            ]
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "transactionData write failed for station=%s tx_id=%s: %s",
+                            cp_id,
+                            transaction_id,
+                            exc,
+                        )
 
         try:
             ACTIVE_TRANSACTIONS.labels(station_id=cp_id).dec()

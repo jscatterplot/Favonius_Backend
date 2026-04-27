@@ -100,6 +100,12 @@ CHARGER_CONNECTIONS_ACTIVE = _get_or_create_metric(
     "Number of connected OCPP charge points (stations)",
 )
 
+CONNECTED_CHARGERS_COUNT = _get_or_create_metric(
+    Gauge,
+    "connected_chargers_count",
+    "Number of connected OCPP charge points (legacy pilot metric name).",
+)
+
 MESSAGES_RECEIVED_TOTAL = _get_or_create_metric(
     Counter,
     "websocket_messages_received_total",
@@ -112,6 +118,13 @@ MESSAGES_SENT_TOTAL = _get_or_create_metric(
     "websocket_messages_sent_total",
     "Total number of WebSocket messages sent",
     ["station_id", "message_type"],
+)
+
+OCPP_MESSAGES_TOTAL = _get_or_create_metric(
+    Counter,
+    "ocpp_messages_total",
+    "Total OCPP messages by direction, action and outcome status.",
+    ["direction", "action", "status"],
 )
 
 REDIS_OPERATION_DURATION = _get_or_create_metric(

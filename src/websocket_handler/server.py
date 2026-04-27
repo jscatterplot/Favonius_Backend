@@ -1,9 +1,12 @@
 """OCPP 2.1 WebSocket server implementation."""
 
 import asyncio
+import base64
+import binascii
 import http
 import logging
 import os
+import secrets
 import ssl
 import uuid
 from collections import defaultdict
@@ -55,6 +58,7 @@ except ImportError:
 
 # Prometheus metrics - imported from monitoring module
 from .monitoring import ERRORS_TOTAL
+from .monitoring import CONNECTED_CHARGERS_COUNT
 from .monitoring import WEBSOCKET_CONNECTIONS as CONNECTIONS_TOTAL
 
 try:
@@ -180,8 +184,8 @@ class OCPPWebSocketServer:
                 ssl=ssl_context,
                 subprotocols=["ocpp1.6", "ocpp2.1"],
                 max_size=self.config.websocket.max_message_size,
-                ping_interval=self.config.websocket.heartbeat_interval,
-                ping_timeout=10,
+                ping_interval=self.config.websocket.ping_interval,
+                ping_timeout=self.config.websocket.ping_timeout,
                 compression=None,  # Disable compression for performance
                 process_request=self._process_request,
             )
@@ -514,13 +518,46 @@ class OCPPWebSocketServer:
                     if auth_header.startswith("Bearer "):
                         auth_data["bearer_token"] = auth_header[7:]
                     elif auth_header.startswith("Basic "):
-                        auth_data["basic_auth"] = auth_header[6:]
+                        encoded_credentials = auth_header[6:].strip()
+                        try:
+                            decoded = base64.b64decode(
+                                encoded_credentials.encode("ascii"),
+                                validate=True,
+                            ).decode("utf-8")
+                            username, separator, password = decoded.partition(":")
+                            if separator:
+                                # OCPP 1.6 basic auth payload uses username:password.
+                                auth_data["username"] = username
+                                auth_data["password"] = password
+                                if not secrets.compare_digest(username, station_id):
+                                    self.logger.warning(
+                                        "Basic auth username mismatch from %s: station=%s username=%s",
+                                        client_ip,
+                                        station_id,
+                                        username,
+                                    )
+                                    auth_data.pop("username", None)
+                                    auth_data.pop("password", None)
+                            else:
+                                self.logger.warning(
+                                    "Malformed basic auth payload from %s for station %s",
+                                    client_ip,
+                                    station_id,
+                                )
+                        except (binascii.Error, UnicodeDecodeError) as exc:
+                            self.logger.warning(
+                                "Failed to decode basic auth payload from %s for station %s: %s",
+                                client_ip,
+                                station_id,
+                                exc,
+                            )
                     api_key = headers.get("X-API-Key", "")
                     if api_key:
                         auth_data["api_key"] = api_key
                     # Password from OCPP Basic Auth (charge_point_id as username)
                     password = headers.get("X-OCPP-Password", "")
-                    if password:
+                    if password and "password" not in auth_data:
+                        # Backward compatible override path for simulator tooling.
                         auth_data["password"] = password
 
             auth_ok, auth_error = await self.security_manager.authenticate_station(
@@ -551,6 +588,7 @@ class OCPPWebSocketServer:
         self.connections[connection_id] = websocket
         self.station_connections[station_id] = connection_id
         CONNECTIONS_TOTAL.set(len(self.connections))
+        CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
 
         # Route to the correct OCPP library based on the negotiated subprotocol.
         # OCPP 1.6 chargers must use the v16 library; passing their messages
@@ -620,6 +658,7 @@ class OCPPWebSocketServer:
         if station_id:
             self.station_connections.pop(station_id, None)
             self.charge_points.pop(station_id, None)
+            CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
             if self.connection_manager:
                 await self.connection_manager.unregister_connection(station_id)
             # Persist that the charger is gone so reads (alerts, state) and

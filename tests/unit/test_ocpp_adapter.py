@@ -153,10 +153,42 @@ async def test_set_charging_profile(mock_websocket, sample_charge_point_id):
         {"startPeriod": 900, "limit": 60000, "numberPhases": 3},
     ]
 
-    result = await cp.set_charging_profile(1, schedule)
+    result = await cp.set_charging_profile(1, schedule, profile_id=123)
 
     assert result is True
     cp.call.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_set_charging_profile_default_profile_id_still_works(
+    mock_websocket, sample_charge_point_id
+):
+    """Keep backward-compatible default profile_id for existing callers."""
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
+    mock_response = MagicMock()
+    mock_response.status = "Accepted"
+    cp.call = AsyncMock(return_value=mock_response)
+    result = await cp.set_charging_profile(
+        1,
+        [{"startPeriod": 0, "limit": 10, "numberPhases": 1}],
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_set_charging_profile_rejects_relative_chargepointmaxprofile(
+    mock_websocket, sample_charge_point_id
+):
+    """Relative ChargePointMaxProfile is forbidden by OCPP 1.6."""
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
+    with pytest.raises(ValueError, match="forbidden"):
+        await cp.set_charging_profile(
+            1,
+            [{"startPeriod": 0, "limit": 10, "numberPhases": 1}],
+            profile_id=42,
+            profile_purpose="ChargePointMaxProfile",
+            profile_kind="Relative",
+        )
 
 
 @pytest.mark.asyncio

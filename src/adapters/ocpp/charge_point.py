@@ -19,12 +19,15 @@ Covers all 28 OCPP 1.6 CallActions, matching CitrineOS handler parity:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
+from dateutil import parser as dt_parser
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as CP16
 from ocpp.v16 import call, call_result
@@ -34,6 +37,16 @@ from ocpp.v16.enums import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    from src.websocket_handler.monitoring import OCPP_MESSAGES_TOTAL
+except Exception:  # pragma: no cover - adapter can run without monitoring module
+    OCPP_MESSAGES_TOTAL = None
+
+try:
+    import structlog
+except Exception:  # pragma: no cover
+    structlog = None
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +85,44 @@ def _now_iso_z() -> str:
     """
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def _parse_meter_timestamp(cp_id: str, raw_value: Any) -> datetime:
+    """Parse charger timestamps defensively and always return UTC datetime."""
+    if isinstance(raw_value, datetime):
+        return raw_value.astimezone(timezone.utc)
+    if isinstance(raw_value, str) and raw_value.strip():
+        try:
+            return dt_parser.parse(raw_value).astimezone(timezone.utc)
+        except (ValueError, TypeError, OverflowError) as exc:
+            logger.warning("Invalid timestamp from %s: %s (%s)", cp_id, raw_value, exc)
+    return datetime.now(timezone.utc)
+
+
+def _record_ocpp_metric(direction: str, action: str, status: str) -> None:
+    """Best-effort metric emission with zero runtime coupling."""
+    if OCPP_MESSAGES_TOTAL is None:
+        return
+    try:
+        OCPP_MESSAGES_TOTAL.labels(direction=direction, action=action, status=status).inc()
+    except Exception:
+        # Metrics should never break message handling.
+        return
+
+
+def _default_unit_for_measurand(measurand: str) -> str:
+    """Return spec-aligned fallback unit by measurand family."""
+    if measurand.startswith("Energy."):
+        return "Wh"
+    if measurand.startswith("Power."):
+        return "W"
+    if measurand.startswith("Current."):
+        return "A"
+    if measurand.startswith("Voltage."):
+        return "V"
+    if measurand == "SoC":
+        return "Percent"
+    return ""
 
 
 # DataTransfer vendor allowlist. Vendor IDs outside this set get
@@ -227,6 +278,31 @@ class FleetChargePoint(CP16):
 
         logger.info(f"Initialized FleetChargePoint: {id}")
 
+    async def route_message(self, message: str) -> None:
+        """Route incoming OCPP message with bound structured logging context."""
+        call_id = None
+        action = None
+        try:
+            parsed = json.loads(message)
+            if isinstance(parsed, list) and len(parsed) >= 2:
+                call_id = parsed[1]
+            if isinstance(parsed, list) and len(parsed) >= 3 and isinstance(parsed[2], str):
+                action = parsed[2]
+        except Exception:
+            pass
+
+        if structlog is not None:
+            try:
+                structlog.get_logger(__name__).bind(
+                    chargePointId=self.id,
+                    callId=call_id,
+                    action=action,
+                ).info("ocpp_message_received")
+            except Exception:
+                pass
+
+        await super().route_message(message)
+
     # ===================================================================
     # Incoming message handlers (CP → CSMS)
     # ===================================================================
@@ -267,6 +343,7 @@ class FleetChargePoint(CP16):
             except Exception as e:
                 logger.error(f"Error in boot callback: {e}")
 
+        _record_ocpp_metric("inbound", "BootNotification", str(status))
         return call_result.BootNotification(
             current_time=_now_iso_z(),
             interval=300,
@@ -277,6 +354,7 @@ class FleetChargePoint(CP16):
     async def on_heartbeat(self, **kwargs):
         """Handle Heartbeat from charger. Returns current server time."""
         self.last_heartbeat_at = datetime.now(timezone.utc)
+        _record_ocpp_metric("inbound", "Heartbeat", "Accepted")
         return call_result.Heartbeat(current_time=_now_iso_z())
 
     @on("StatusNotification")
@@ -314,6 +392,7 @@ class FleetChargePoint(CP16):
             except Exception as e:
                 logger.error(f"Error in status change callback: {e}")
 
+        _record_ocpp_metric("inbound", "StatusNotification", "Accepted")
         return call_result.StatusNotification()
 
     @on("MeterValues")
@@ -342,20 +421,16 @@ class FleetChargePoint(CP16):
         for mv in meter_value:
             ts_raw = mv.get("timestamp")
             if ts_raw:
-                if isinstance(ts_raw, str):
-                    try:
-                        timestamp = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                    except ValueError:
-                        logger.warning(f"Invalid timestamp from {self.id}: {ts_raw}")
-                elif isinstance(ts_raw, datetime):
-                    timestamp = ts_raw
+                timestamp = _parse_meter_timestamp(self.id, ts_raw)
 
             for sv in mv.get("sampledValue", mv.get("sampled_value", [])):
                 measurand = sv.get("measurand", "Energy.Active.Import.Register")
                 value_str = sv.get("value", "0")
-                unit = sv.get("unit", "")
-                context = sv.get("context", "")
+                unit = sv.get("unit", _default_unit_for_measurand(measurand))
+                context = sv.get("context", "Sample.Periodic")
                 phase = sv.get("phase")
+                location = sv.get("location", "Outlet")
+                data_format = sv.get("format", "Raw")
 
                 try:
                     value = float(value_str)
@@ -370,6 +445,9 @@ class FleetChargePoint(CP16):
                         "unit": unit,
                         "context": context,
                         "phase": phase,
+                        "location": location,
+                        "format": data_format,
+                        "timestamp": timestamp,
                     }
                 )
 
@@ -443,6 +521,7 @@ class FleetChargePoint(CP16):
                 except Exception as e:
                     logger.error(f"Error in meter values callback: {e}")
 
+        _record_ocpp_metric("inbound", "MeterValues", "Accepted")
         return call_result.MeterValues()
 
     @on("StartTransaction")
@@ -499,6 +578,7 @@ class FleetChargePoint(CP16):
             f"id_tag={id_tag}, tx_id={tx_id}, status={auth_status}"
         )
 
+        _record_ocpp_metric("inbound", "StartTransaction", str(auth_status))
         return call_result.StartTransaction(
             transaction_id=tx_id,
             id_tag_info={"status": auth_status},
@@ -518,6 +598,7 @@ class FleetChargePoint(CP16):
         """
         id_tag = kwargs.get("id_tag", "")
         reason = kwargs.get("reason", "Local")
+        transaction_data = kwargs.get("transaction_data", [])
 
         logger.info(
             f"StopTransaction from {self.id}, tx_id={transaction_id}, "
@@ -540,10 +621,26 @@ class FleetChargePoint(CP16):
                     meter_stop,
                     timestamp,
                     reason,
+                    transaction_data,
                 )
+            except TypeError:
+                # Backward-compat: older callbacks accept only the original
+                # 6 StopTransaction callback parameters.
+                try:
+                    await self._cb_tx_stop(
+                        self.id,
+                        transaction_id,
+                        id_tag,
+                        meter_stop,
+                        timestamp,
+                        reason,
+                    )
+                except Exception as e:
+                    logger.error(f"Error in transaction stop callback (legacy signature): {e}")
             except Exception as e:
                 logger.error(f"Error in transaction stop callback: {e}")
 
+        _record_ocpp_metric("inbound", "StopTransaction", "Accepted")
         return call_result.StopTransaction(id_tag_info={"status": AuthorizationStatus.accepted})
 
     @on("Authorize")
@@ -564,6 +661,7 @@ class FleetChargePoint(CP16):
                 logger.error(f"Error in authorize callback: {e}")
 
         logger.info(f"Authorize from {self.id}: id_tag={id_tag}, status={auth_status}")
+        _record_ocpp_metric("inbound", "Authorize", str(auth_status))
         return call_result.Authorize(id_tag_info={"status": auth_status})
 
     @on("DataTransfer")
@@ -599,6 +697,7 @@ class FleetChargePoint(CP16):
             except Exception as e:
                 logger.error(f"Error in data transfer callback: {e}")
 
+        _record_ocpp_metric("inbound", "DataTransfer", status)
         return call_result.DataTransfer(status=status, data=response_data)
 
     @on("DiagnosticsStatusNotification")
@@ -643,8 +742,7 @@ class FleetChargePoint(CP16):
     ) -> bool:
         """Send SetChargingProfile to charger with retry logic.
 
-        Supports all profile purposes (ChargePointMaxProfile, TxDefaultProfile,
-        TxProfile), all kinds (Absolute, Recurring, Relative), and both rate
+        Supports standard OCPP profile purpose/kind combinations and both rate
         units (W, A).
 
         Args:
@@ -663,6 +761,11 @@ class FleetChargePoint(CP16):
         Returns:
             True if accepted, False otherwise
         """
+        if profile_purpose == "ChargePointMaxProfile" and profile_kind == "Relative":
+            raise ValueError(
+                "ChargePointMaxProfile with chargingProfileKind=Relative is forbidden in OCPP 1.6"
+            )
+
         profile_dict: dict[str, Any] = {
             "charging_profile_id": profile_id,
             "stack_level": stack_level,
@@ -688,6 +791,7 @@ class FleetChargePoint(CP16):
                 )
                 response = await self.call(payload)
                 accepted = response.status == "Accepted"
+                _record_ocpp_metric("outbound", "SetChargingProfile", response.status)
 
                 if accepted:
                     logger.info(
@@ -744,6 +848,7 @@ class FleetChargePoint(CP16):
         try:
             payload = call.ClearChargingProfile(**kwargs)
             response = await self.call(payload)
+            _record_ocpp_metric("outbound", "ClearChargingProfile", response.status)
             logger.info(f"ClearChargingProfile to {self.id}: {response.status}")
             return response.status
         except Exception as e:
@@ -817,6 +922,7 @@ class FleetChargePoint(CP16):
 
             payload = call.RemoteStartTransaction(**kwargs)
             response = await self.call(payload)
+            _record_ocpp_metric("outbound", "RemoteStartTransaction", response.status)
             accepted = response.status == "Accepted"
             logger.info(
                 f"RemoteStartTransaction to {self.id}, connector {connector_id}: "
@@ -832,6 +938,7 @@ class FleetChargePoint(CP16):
         try:
             payload = call.RemoteStopTransaction(transaction_id=transaction_id)
             response = await self.call(payload)
+            _record_ocpp_metric("outbound", "RemoteStopTransaction", response.status)
             accepted = response.status == "Accepted"
             logger.info(
                 f"RemoteStopTransaction to {self.id}, tx={transaction_id}: "
@@ -847,6 +954,7 @@ class FleetChargePoint(CP16):
         try:
             payload = call.Reset(type=reset_type)
             response = await self.call(payload)
+            _record_ocpp_metric("outbound", "Reset", response.status)
             logger.info(f"Reset to {self.id} ({reset_type}): {response.status}")
             return response.status
         except Exception as e:
@@ -896,6 +1004,7 @@ class FleetChargePoint(CP16):
                 kwargs["connector_id"] = connector_id
             payload = call.TriggerMessage(**kwargs)
             response = await self.call(payload)
+            _record_ocpp_metric("outbound", "TriggerMessage", response.status)
             logger.info(f"TriggerMessage to {self.id} ({requested_message}): {response.status}")
             return response.status
         except Exception as e:
@@ -945,6 +1054,7 @@ class FleetChargePoint(CP16):
         try:
             payload = call.ChangeConfiguration(key=key, value=value)
             response = await self.call(payload)
+            _record_ocpp_metric("outbound", "ChangeConfiguration", response.status)
             logger.info(f"ChangeConfiguration to {self.id}: {key}={value} -> {response.status}")
             return response.status
         except Exception as e:
@@ -962,6 +1072,7 @@ class FleetChargePoint(CP16):
                 kwargs["key"] = keys
             payload = call.GetConfiguration(**kwargs)
             response = await self.call(payload)
+            _record_ocpp_metric("outbound", "GetConfiguration", "Accepted")
             return {
                 "configuration_key": getattr(response, "configuration_key", []) or [],
                 "unknown_key": getattr(response, "unknown_key", []) or [],
@@ -996,6 +1107,13 @@ class FleetChargePoint(CP16):
         operator falls back to central authorization. Truncating silently
         would create a security gap (some idTags would never authorize).
         """
+        if os.getenv("OCPP_DISABLE_LOCAL_AUTH_LIST", "false").lower() == "true":
+            logger.info(
+                "SendLocalList to %s suppressed by OCPP_DISABLE_LOCAL_AUTH_LIST=true; use central Authorize",
+                self.id,
+            )
+            return "NotSupported"
+
         if (
             _is_abb_or_unknown_vendor(self.vendor)
             and local_authorization_list is not None

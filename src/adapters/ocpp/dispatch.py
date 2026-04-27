@@ -120,7 +120,11 @@ async def dispatch_charging_profiles(
             continue
 
         try:
-            ocpp_profile = convert_schedule_to_ocpp_profile(schedule, delta_t=delta_t)
+            ocpp_profile = convert_schedule_to_ocpp_profile(
+                schedule,
+                delta_t=delta_t,
+                charging_rate_unit="A",
+            )
         except Exception as exc:
             logger.error("Profile conversion failed for vehicle %s: %s", vehicle_id, exc)
             results[vehicle_id] = False
@@ -135,12 +139,15 @@ async def dispatch_charging_profiles(
                 "chargingProfileKind": "Absolute",
                 "stackLevel": 0,
                 "chargingSchedule": {
-                    "chargingRateUnit": "W",
+                    "chargingRateUnit": "A",
                     "chargingSchedulePeriod": ocpp_profile,
                 },
             }
         else:
             payload = ocpp_profile
+            charging_schedule = payload.get("chargingSchedule")
+            if isinstance(charging_schedule, dict):
+                charging_schedule["chargingRateUnit"] = "A"
 
         try:
             queue_id = await _enqueue(

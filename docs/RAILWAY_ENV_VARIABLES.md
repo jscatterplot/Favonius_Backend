@@ -143,3 +143,19 @@ If **one** Postgres is used for both API and WebSocket (e.g. Supabase or TigerDB
 - [ ] `USE_KUBERNETES_SECRETS=false`, `FALLBACK_TO_ENV=true`
 - [ ] `ENVIRONMENT=production`
 - [ ] `WEBSOCKET_PORT` unset (so Railway `PORT` is used) or set to a number
+
+---
+
+## Monday pilot lock-in
+
+Set these explicitly before the Sunday-night cross-network test:
+
+**API service**
+- `OCPP_SERVER_ENABLED=false`
+- `OCPP_USE_SAME_PORT=false`
+
+**WebSocket Handler service**
+- `OCPP_REQUIRE_AUTH=true`
+- `WEBSOCKET_PING_INTERVAL=45`
+- `WEBSOCKET_PING_TIMEOUT=30`
+- `OCPP_DISABLE_LOCAL_AUTH_LIST=true`

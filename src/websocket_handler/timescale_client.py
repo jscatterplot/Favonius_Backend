@@ -171,6 +171,37 @@ class TimescaleClient:
             async with self.pg_pool.acquire() as conn:
                 inserted = 0
                 for data in telemetry_data:
+                    raw_sample = data.get("raw_sample")
+                    if raw_sample:
+                        await conn.execute(
+                            """
+                            INSERT INTO telemetry_samples (
+                                time,
+                                station_id,
+                                connector_id,
+                                transaction_id,
+                                measurand,
+                                phase,
+                                location,
+                                unit,
+                                context,
+                                format,
+                                value
+                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                            """,
+                            raw_sample.get("timestamp", data["time"]),
+                            data.get("station_id"),
+                            data.get("connector_id", 1),
+                            int(data["session_id"]) if data.get("session_id") else None,
+                            raw_sample.get("measurand"),
+                            raw_sample.get("phase"),
+                            raw_sample.get("location"),
+                            raw_sample.get("unit"),
+                            raw_sample.get("context"),
+                            raw_sample.get("format"),
+                            raw_sample.get("value"),
+                        )
+
                     vehicle_id = data.get("vehicle_id")
                     session_id = data.get("session_id")
                     station_id = data.get("station_id")
@@ -222,6 +253,26 @@ class TimescaleClient:
         except Exception as e:
             self.logger.error(f"Failed to insert telemetry batch: {e}")
             raise
+
+    async def lookup_session_connector(self, station_id: str, transaction_id: int) -> Optional[int]:
+        """Resolve connector_id for an open/closed charging session transaction."""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT connector_id
+                  FROM charging_sessions
+                 WHERE station_id = $1
+                   AND transaction_id = $2
+                 ORDER BY start_time DESC
+                 LIMIT 1
+                """,
+                station_id,
+                transaction_id,
+            )
+            if row is None:
+                return None
+            value = row.get("connector_id")
+            return int(value) if value is not None else None
 
     async def _resolve_vehicle_id_from_session(
         self, conn: asyncpg.Connection, session_id: Optional[str]
