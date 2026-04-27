@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import http
+import ipaddress
 import logging
 import os
 import secrets
@@ -152,6 +153,13 @@ class OCPPWebSocketServer:
         # Per-IP connection tracking (M8 — prevent single IP from exhausting all slots)
         self._ip_connection_count: dict[str, int] = defaultdict(int)
         self._max_connections_per_ip = int(os.getenv("MAX_CONNECTIONS_PER_IP", "10"))
+        self._connection_client_ips: dict[str, str] = {}
+        self._trusted_proxy_networks = self._parse_ip_networks(
+            os.getenv("OCPP_TRUSTED_PROXY_RANGES", "")
+        )
+        self._trust_private_proxy_headers = (
+            os.getenv("OCPP_TRUST_PRIVATE_PROXY_HEADERS", "true").lower() == "true"
+        )
 
         # Background task tracking
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -337,6 +345,114 @@ class OCPPWebSocketServer:
             return connection.respond(http.HTTPStatus.OK, "OK\n")
         return None
 
+    @staticmethod
+    def _parse_ip_networks(ranges: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        """Parse comma-separated IP/CIDR ranges, ignoring invalid entries."""
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for raw_range in ranges.split(","):
+            raw_range = raw_range.strip()
+            if not raw_range:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(raw_range, strict=False))
+            except ValueError:
+                logging.getLogger(__name__).warning(
+                    "Invalid OCPP_TRUSTED_PROXY_RANGES entry ignored: %s", raw_range
+                )
+        return networks
+
+    @staticmethod
+    def _normalize_forwarded_ip(raw_ip: str) -> Optional[str]:
+        """Normalize one forwarded IP candidate, stripping quotes, brackets, and ports."""
+        value = raw_ip.strip().strip('"')
+        if not value:
+            return None
+
+        if value.startswith("["):
+            host, separator, _port = value[1:].partition("]")
+            value = host if separator else value
+        elif value.count(":") == 1 and "." in value:
+            value = value.rsplit(":", 1)[0]
+
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _extract_forwarded_ip(cls, headers: Any) -> Optional[str]:
+        """Extract the original client IP from common reverse-proxy headers."""
+        if not hasattr(headers, "get"):
+            return None
+
+        forwarded = headers.get("Forwarded", "")
+        for proxy_hop in forwarded.split(","):
+            for item in proxy_hop.split(";"):
+                key, separator, value = item.strip().partition("=")
+                if separator and key.lower() == "for":
+                    parsed = cls._normalize_forwarded_ip(value)
+                    if parsed:
+                        return parsed
+
+        x_forwarded_for = headers.get("X-Forwarded-For", "")
+        for candidate in x_forwarded_for.split(","):
+            parsed = cls._normalize_forwarded_ip(candidate)
+            if parsed:
+                return parsed
+
+        x_real_ip = headers.get("X-Real-IP", "")
+        return cls._normalize_forwarded_ip(x_real_ip) if x_real_ip else None
+
+    @staticmethod
+    def _get_peer_ip(websocket: WebSocketServerProtocol) -> str:
+        """Return the direct TCP peer IP, or unknown when unavailable."""
+        remote_address = getattr(websocket, "remote_address", None)
+        if isinstance(remote_address, (tuple, list)) and remote_address:
+            return str(remote_address[0])
+        return "unknown"
+
+    def _is_trusted_proxy_ip(self, ip_str: str) -> bool:
+        """Return True when forwarded headers from this peer may be trusted."""
+        try:
+            ip_addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+
+        if self._trust_private_proxy_headers and (
+            ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local
+        ):
+            return True
+
+        return any(ip_addr in network for network in self._trusted_proxy_networks)
+
+    def _get_client_ip(self, websocket: WebSocketServerProtocol) -> str:
+        """Resolve the effective client IP for geo-blocking, auth logs, and limits."""
+        peer_ip = self._get_peer_ip(websocket)
+        if peer_ip == "unknown" or not self._is_trusted_proxy_ip(peer_ip):
+            return peer_ip
+
+        request = getattr(websocket, "request", None)
+        headers = getattr(request, "headers", {}) if request is not None else {}
+        forwarded_ip = self._extract_forwarded_ip(headers)
+        if forwarded_ip:
+            self.logger.info(
+                "Using forwarded OCPP client IP %s from trusted proxy %s",
+                forwarded_ip,
+                peer_ip,
+            )
+            return forwarded_ip
+
+        return peer_ip
+
+    def _release_client_ip(self, client_ip: str) -> None:
+        """Decrement per-IP connection accounting for a rejected or closed connection."""
+        if client_ip in self._ip_connection_count:
+            self._ip_connection_count[client_ip] = max(
+                0, self._ip_connection_count[client_ip] - 1
+            )
+            if self._ip_connection_count[client_ip] == 0:
+                del self._ip_connection_count[client_ip]
+
     async def _handle_connection(
         self, websocket: WebSocketServerProtocol, path: Optional[str] = None
     ) -> None:
@@ -349,7 +465,7 @@ class OCPPWebSocketServer:
             req = getattr(websocket, "request", None)
             path = getattr(req, "path", "") if req is not None else ""
         connection_id = str(uuid.uuid4())
-        client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+        client_ip = self._get_client_ip(websocket)
 
         # Geo-blocking check (Article 73-3) — must execute before any other logic
         if GEO_BLOCK_AVAILABLE and check_ip_blocked is not None:
@@ -410,6 +526,7 @@ class OCPPWebSocketServer:
             return
 
         self._ip_connection_count[client_ip] += 1
+        self._connection_client_ips[connection_id] = client_ip
 
         # Parse path for protocol routing
         path_parts = [p for p in path.strip("/").split("/") if p]
@@ -451,6 +568,8 @@ class OCPPWebSocketServer:
                         auth_error,
                     )
                     await websocket.close(1008, "Authentication failed")
+                    self._release_client_ip(client_ip)
+                    self._connection_client_ips.pop(connection_id, None)
                     return
 
             db_pool = self.timescale_client.pg_pool if self.timescale_client else None
@@ -477,12 +596,8 @@ class OCPPWebSocketServer:
                 ERRORS_TOTAL.labels(error_type="connection_error", station_id="unknown").inc()
             finally:
                 # Decrement per-IP counter
-                if client_ip in self._ip_connection_count:
-                    self._ip_connection_count[client_ip] = max(
-                        0, self._ip_connection_count[client_ip] - 1
-                    )
-                    if self._ip_connection_count[client_ip] == 0:
-                        del self._ip_connection_count[client_ip]
+                self._release_client_ip(client_ip)
+                self._connection_client_ips.pop(connection_id, None)
             return
 
         # Default to OCPP handling (legacy or /ocpp/{charge_point_id} paths)
@@ -494,6 +609,8 @@ class OCPPWebSocketServer:
             self.logger.warning(f"Invalid subprotocol from {client_ip}: {websocket.subprotocol}")
             await websocket.close(1002, "Invalid subprotocol")
             ERRORS_TOTAL.labels(error_type="invalid_subprotocol", station_id="unknown").inc()
+            self._release_client_ip(client_ip)
+            self._connection_client_ips.pop(connection_id, None)
             return
 
         # Extract station ID from path
@@ -572,6 +689,8 @@ class OCPPWebSocketServer:
                     error_type="auth_failed", station_id=station_id
                 ).inc()
                 await websocket.close(1008, "Authentication failed")
+                self._release_client_ip(client_ip)
+                self._connection_client_ips.pop(connection_id, None)
                 return
 
         # Check if station already connected and clean up old connection
@@ -644,6 +763,8 @@ class OCPPWebSocketServer:
         self, connection_id: str, websocket: WebSocketServerProtocol, station_id: str = None
     ) -> None:
         """Cleanup connection resources."""
+        client_ip = self._connection_client_ips.pop(connection_id, None)
+
         # Remove from connections
         self.connections.pop(connection_id, None)
         CONNECTIONS_TOTAL.set(len(self.connections))
@@ -687,15 +808,8 @@ class OCPPWebSocketServer:
         # self.rate_limits.pop(connection_id, None)  # Removed - using RateLimiter class
 
         # Decrement per-IP counter
-        client_ip = (
-            websocket.remote_address[0] if websocket.remote_address else "unknown"
-        )
-        if client_ip in self._ip_connection_count:
-            self._ip_connection_count[client_ip] = max(
-                0, self._ip_connection_count[client_ip] - 1
-            )
-            if self._ip_connection_count[client_ip] == 0:
-                del self._ip_connection_count[client_ip]
+        client_ip = client_ip or self._get_peer_ip(websocket)
+        self._release_client_ip(client_ip)
 
         self.logger.info(f"Cleaned up connection {connection_id} (station: {station_id})")
 

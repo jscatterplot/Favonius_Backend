@@ -81,6 +81,17 @@ class TestOCPPWebSocketServer:
         server._rate_limit_task = mock_task
         return server
 
+    def _make_websocket(self, remote_ip: str, headers: dict[str, str] | None = None):
+        """Build a minimal WebSocket mock with optional request headers."""
+        mock_websocket = Mock()
+        mock_websocket.remote_address = (remote_ip, 12345)
+        mock_websocket.close = AsyncMock()
+        mock_websocket.subprotocol = "ocpp1.6"
+        request = Mock()
+        request.headers = headers or {}
+        mock_websocket.request = request
+        return mock_websocket
+
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_server_initialization(self, server):
@@ -168,6 +179,78 @@ class TestOCPPWebSocketServer:
         except Exception:
             # Expected to handle errors gracefully
             assert True
+
+    def test_get_client_ip_uses_forwarded_header_from_trusted_proxy(self, server):
+        """Trusted proxy connections use the original charger IP from forwarding headers."""
+        websocket = self._make_websocket(
+            "10.0.0.5",
+            {"X-Forwarded-For": "198.51.100.42, 10.0.0.5"},
+        )
+
+        assert server._get_client_ip(websocket) == "198.51.100.42"
+
+    def test_get_client_ip_ignores_forwarded_header_from_untrusted_peer(self, server):
+        """Direct public peers cannot spoof geo-blocking with X-Forwarded-For."""
+        websocket = self._make_websocket(
+            "8.8.8.8",
+            {"X-Forwarded-For": "198.51.100.42"},
+        )
+
+        assert server._get_client_ip(websocket) == "8.8.8.8"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_geo_block_uses_forwarded_ip_from_trusted_proxy(self, server):
+        """Geo-blocking checks the charger IP, not the trusted proxy IP."""
+        websocket = self._make_websocket(
+            "10.0.0.5",
+            {"X-Forwarded-For": "198.51.100.42, 10.0.0.5"},
+        )
+        geo_result = Mock(blocked=True, country_code="CN", reason="blocked_country")
+
+        with patch("websocket_handler.server.check_ip_blocked", return_value=geo_result) as check:
+            await server._handle_connection(websocket, "/ocpp/ABB_TEST")
+
+        check.assert_called_once_with("198.51.100.42")
+        websocket.close.assert_awaited_once_with(1008, "Access denied")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_geo_block_ignores_forwarded_ip_from_untrusted_peer(self, server):
+        """Spoofed forwarding headers from direct public clients are ignored."""
+        websocket = self._make_websocket(
+            "8.8.8.8",
+            {"X-Forwarded-For": "198.51.100.42"},
+        )
+        geo_result = Mock(blocked=True, country_code="US", reason="blocked_country")
+
+        with patch("websocket_handler.server.check_ip_blocked", return_value=geo_result) as check:
+            await server._handle_connection(websocket, "/ocpp/ABB_TEST")
+
+        check.assert_called_once_with("8.8.8.8")
+        websocket.close.assert_awaited_once_with(1008, "Access denied")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_vdv_auth_failure_releases_ip_tracking(self, server):
+        """Rejected VDV auth attempts do not consume per-IP connection slots."""
+        websocket = self._make_websocket("10.0.0.5")
+        server.config.vdv463 = Mock()
+        server.config.vdv463.enabled = True
+        server.config.vdv463.validation_mode = "soft"
+        server.config.vdv463.default_depot_id = None
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        with patch("websocket_handler.server.VDV463_AVAILABLE", True):
+            await server._handle_connection(websocket, "/vdv463/pre1")
+
+        websocket.close.assert_awaited_once_with(1008, "Authentication failed")
+        assert "10.0.0.5" not in server._ip_connection_count
+        assert server._connection_client_ips == {}
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
