@@ -867,7 +867,6 @@ async def create_charger_with_credentials(
         VALUES ($1, $1, $2, TRUE)
     """
     async with db.transaction():
-    async with db.transaction():
         row = await db.fetchrow(
             charger_query,
             depot_id,

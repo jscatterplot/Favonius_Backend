@@ -139,7 +139,7 @@ class TestSecurityManager:
         assert error == "Basic Auth credentials required"
         failed.assert_called_once_with(station_id)
         log_event.assert_called_once()
-        assert log_event.call_args.args[4]["reason"] == "missing_basic_auth"
+        assert log_event.call_args.args[3]["reason"] == "missing_basic_auth"
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)

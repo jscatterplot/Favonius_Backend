@@ -518,6 +518,9 @@ class TestChargerOnboarding:
 
     def test_creates_charger_and_one_time_basic_auth_credentials(self, client, mock_db_pool):
         pool, conn = mock_db_pool
+        conn.transaction = MagicMock()
+        conn.transaction.return_value.__aenter__.return_value = None
+        conn.transaction.return_value.__aexit__.return_value = None
         user = _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
         context = {
@@ -642,7 +645,10 @@ class TestChargerOnboarding:
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
 
     def test_duplicate_generated_ocpp_id_returns_conflict(self, client, mock_db_pool):
-        pool, _ = mock_db_pool
+        pool, conn = mock_db_pool
+        conn.transaction = MagicMock()
+        conn.transaction.return_value.__aenter__.return_value = None
+        conn.transaction.return_value.__aexit__.return_value = None
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
             _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
         )
