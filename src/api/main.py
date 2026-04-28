@@ -1584,9 +1584,12 @@ async def create_charger_onboarding(
 ):
     """Create a production charger under an organization-owned depot."""
     org_id = _require_customer_admin_with_org(user)
-    user_id = str(user.get("sub", ""))
+    user_id = str(user.get("sub") or "")
     if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing 'sub' claim")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing 'sub' claim",
+        )
     validate_depot_id(depot_id)
     await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
 

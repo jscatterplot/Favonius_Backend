@@ -19,6 +19,7 @@ import pytest
 from fastapi import HTTPException, status as http_status
 
 from src.api.main import CommandRequest, _require_depot_access, app
+from src.db import queries as db_queries
 from src.security.audit_log import AuditEvent
 from src.security.auth import verify_depot_access, verify_token
 from src.security.tenant_mirror import ensure_tenant_mirrored
@@ -581,6 +582,41 @@ class TestChargerOnboarding:
         replay_payload = idem_store.await_args.kwargs["response_json"]
         assert replay_payload["credentials"]["password"] == data["credentials"]["password"]
         assert idem_store.await_args.kwargs["ttl_minutes"] == 30
+
+    def test_null_sub_claim_is_rejected_before_idempotency_write(self, client):
+        user = _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        user["sub"] = None
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
+
+        response = client.post(
+            f"/admin/depots/{DEPOT_ID}/chargers",
+            headers={**AUTH_HDR, "Idempotency-Key": str(uuid4())},
+            json=_charger_payload(),
+        )
+
+        assert response.status_code == http_status.HTTP_401_UNAUTHORIZED
+        assert response.json()["detail"] == "Token missing 'sub' claim"
+
+    @pytest.mark.asyncio
+    async def test_idempotency_ttl_uses_integer_interval_parameter(self):
+        db = AsyncMock()
+
+        await db_queries.store_charger_onboarding_idempotency(
+            db,
+            organization_id=DEFAULT_ORG_ID,
+            user_id=str(uuid4()),
+            endpoint=f"POST /admin/depots/{DEPOT_ID}/chargers",
+            idempotency_key="retry-key",
+            request_hash="hash",
+            response_json={"ok": True},
+            status_code=http_status.HTTP_201_CREATED,
+            ttl_minutes=30,
+        )
+
+        query = db.execute.await_args.args[0]
+        assert "$8::int * INTERVAL '1 minute'" in query
+        assert "::text || ' minutes'" not in query
+        assert db.execute.await_args.args[-1] == 30
 
     def test_idempotency_replays_same_response(self, client, mock_db_pool):
         pool, _ = mock_db_pool

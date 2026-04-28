@@ -947,7 +947,7 @@ async def store_charger_onboarding_idempotency(
             $5,
             $6::jsonb,
             $7,
-            NOW() + ($8::text || ' minutes')::interval
+            NOW() + ($8::int * INTERVAL '1 minute')
         )
         ON CONFLICT (organization_id, endpoint, idempotency_key) DO UPDATE
         SET response_json = EXCLUDED.response_json,
