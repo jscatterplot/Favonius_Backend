@@ -19,11 +19,13 @@ from typing import Any, Callable, Optional
 
 import asyncpg
 import websockets
+from ocpp.v16.enums import AuthorizationStatus
 from websockets.server import WebSocketServerProtocol
 
 from .asgi_adapter import StarletteOCPPAdapter
 from .charge_point import FleetChargePoint
 from .mapping import get_charger_id_from_ocpp_id
+from ...db import queries as db_queries
 from ...db.pools import DatabasePools
 
 logger = logging.getLogger(__name__)
@@ -70,14 +72,18 @@ class OCPPServer:
         self.on_status_change = on_status_change
         self.on_meter_values = on_meter_values
         self._on_boot = on_boot
-        self._on_tx_start = on_transaction_start
-        self._on_tx_stop = on_transaction_stop
-        self._on_authorize = on_authorize
+        self._on_tx_start = on_transaction_start or self._handle_transaction_start
+        self._tx_stop_callback = on_transaction_stop
+        self._on_tx_stop = self._handle_transaction_stop
+        self._on_authorize = on_authorize or self._handle_authorize
         self.server: Optional[websockets.WebSocketServer] = None
         self._running = False
 
         # Connector status cache: {charge_point_id: {connector_id: status}}
         self._connector_status_cache: dict[str, dict[int, str]] = {}
+        self._pending_starts: dict[str, dict[str, Any]] = {}
+        self._connector_identity_cache: dict[tuple[str, int], dict[str, Any]] = {}
+        self._transaction_connectors: dict[tuple[str, int], int] = {}
 
         logger.info(f"Initialized OCPPServer on {host}:{port}")
 
@@ -103,6 +109,7 @@ class OCPPServer:
             on_transaction_start=self._on_tx_start,
             on_transaction_stop=self._on_tx_stop,
             on_authorize=self._on_authorize,
+            tx_id_provider=lambda cp_id=charge_point_id: self._next_transaction_id(cp_id),
         )
 
         self.charge_points[charge_point_id] = cp
@@ -116,7 +123,7 @@ class OCPPServer:
         finally:
             if charge_point_id in self.charge_points:
                 del self.charge_points[charge_point_id]
-            self._connector_status_cache.pop(charge_point_id, None)
+            self._clear_charge_point_caches(charge_point_id)
             logger.info(f"Cleaned up connection for charge point: {charge_point_id}")
 
     async def handle_websocket(self, websocket: Any, charge_point_id: str) -> None:
@@ -134,6 +141,7 @@ class OCPPServer:
             on_transaction_start=self._on_tx_start,
             on_transaction_stop=self._on_tx_stop,
             on_authorize=self._on_authorize,
+            tx_id_provider=lambda cp_id=charge_point_id: self._next_transaction_id(cp_id),
         )
         self.charge_points[charge_point_id] = cp
         try:
@@ -142,7 +150,7 @@ class OCPPServer:
             logger.info(f"OCPP connection closed for {charge_point_id}: {e}")
         finally:
             self.charge_points.pop(charge_point_id, None)
-            self._connector_status_cache.pop(charge_point_id, None)
+            self._clear_charge_point_caches(charge_point_id)
             logger.info(f"Cleaned up OCPP connection for charge point: {charge_point_id}")
 
     # ------------------------------------------------------------------
@@ -245,6 +253,7 @@ class OCPPServer:
         # Store in database
         if self.pools and timestamp:
             try:
+                identity = self._connector_identity_cache.get((charge_point_id, connector_id), {})
                 await self._store_meter_values(
                     charge_point_id,
                     connector_id,
@@ -253,9 +262,151 @@ class OCPPServer:
                     energy_kwh,
                     timestamp,
                     max_charge_kw,
+                    vehicle_id=identity.get("vehicle_id"),
                 )
             except Exception as e:
                 logger.error(f"Error storing meter values: {e}")
+
+    async def _handle_authorize(self, charge_point_id: str, id_tag: str) -> AuthorizationStatus:
+        """Authorize an OCPP idTag against vehicle primary tags and active RFID cards."""
+        if not self.pools:
+            return AuthorizationStatus.invalid
+        try:
+            async with self.pools.static.acquire() as conn:
+                identity = await db_queries.resolve_id_tag_identity(
+                    conn,
+                    id_tag,
+                    station_id=charge_point_id,
+                )
+        except Exception as exc:
+            logger.error("Authorize lookup failed for %s id_tag=%s: %s", charge_point_id, id_tag, exc)
+            return AuthorizationStatus.invalid
+        return AuthorizationStatus.accepted if identity else AuthorizationStatus.invalid
+
+    async def _handle_transaction_start(
+        self,
+        charge_point_id: str,
+        connector_id: int,
+        id_tag: str,
+        meter_start: int,
+        timestamp: str,
+    ) -> AuthorizationStatus:
+        """Validate StartTransaction and stash identity for session persistence."""
+        if not self.pools:
+            return AuthorizationStatus.invalid
+        try:
+            async with self.pools.static.acquire() as conn:
+                identity = await db_queries.resolve_id_tag_identity(
+                    conn,
+                    id_tag,
+                    station_id=charge_point_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "StartTransaction lookup failed for %s id_tag=%s: %s",
+                charge_point_id,
+                id_tag,
+                exc,
+            )
+            return AuthorizationStatus.invalid
+        if not identity:
+            return AuthorizationStatus.invalid
+
+        self._connector_identity_cache[(charge_point_id, connector_id)] = identity
+        self._pending_starts[charge_point_id] = {
+            "connector_id": connector_id,
+            "evse_id": connector_id,
+            "id_tag": id_tag,
+            "timestamp": timestamp,
+            "vehicle_id": identity.get("vehicle_id"),
+            "driver_id": identity.get("driver_id"),
+            "card_id": identity.get("card_id"),
+        }
+        return AuthorizationStatus.accepted
+
+    async def _handle_transaction_stop(
+        self,
+        charge_point_id: str,
+        transaction_id: int,
+        id_tag: str,
+        meter_stop: int,
+        timestamp: str,
+        reason: str,
+        transaction_data: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        """Handle StopTransaction and clear connector-scoped identity cache."""
+        connector_id: Optional[int] = None
+        cp = self.charge_points.get(charge_point_id)
+        if cp:
+            for known_connector_id, known_transaction_id in cp.transactions.items():
+                if known_transaction_id == transaction_id:
+                    connector_id = known_connector_id
+                    break
+            if connector_id is None and cp.current_connector_id is not None:
+                connector_id = cp.current_connector_id
+        if connector_id is not None:
+            self._connector_identity_cache.pop((charge_point_id, connector_id), None)
+        else:
+            connector_id = self._transaction_connectors.get((charge_point_id, transaction_id))
+            if connector_id is not None:
+                self._connector_identity_cache.pop((charge_point_id, connector_id), None)
+        self._transaction_connectors.pop((charge_point_id, transaction_id), None)
+
+        if self._tx_stop_callback:
+            await self._tx_stop_callback(
+                charge_point_id,
+                transaction_id,
+                id_tag,
+                meter_stop,
+                timestamp,
+                reason,
+                transaction_data,
+            )
+
+    def _clear_charge_point_identity_cache(self, charge_point_id: str) -> None:
+        """Drop all connector identity entries for a charge point."""
+        stale_keys = [
+            key for key in self._connector_identity_cache if key[0] == charge_point_id
+        ]
+        for key in stale_keys:
+            self._connector_identity_cache.pop(key, None)
+
+    def _clear_charge_point_caches(self, charge_point_id: str) -> None:
+        """Drop all charge-point scoped caches on disconnect."""
+        self._connector_status_cache.pop(charge_point_id, None)
+        self._pending_starts.pop(charge_point_id, None)
+        self._clear_charge_point_identity_cache(charge_point_id)
+        stale_tx_keys = [key for key in self._transaction_connectors if key[0] == charge_point_id]
+        for key in stale_tx_keys:
+            self._transaction_connectors.pop(key, None)
+
+    async def _next_transaction_id(self, charge_point_id: str) -> int:
+        """Generate a DB-backed transactionId and persist open session identity."""
+        if not self.pools:
+            raise RuntimeError("Database pools unavailable for OCPP transaction id")
+        async with self.pools.static.acquire() as conn:
+            tx_id = int(await conn.fetchval("SELECT nextval('ocpp_transaction_id')"))
+            pending = self._pending_starts.pop(charge_point_id, None)
+            if pending:
+                self._transaction_connectors[(charge_point_id, tx_id)] = pending["connector_id"]
+                await conn.execute(
+                    """
+                    INSERT INTO charging_sessions (
+                        station_id, transaction_id, evse_id, connector_id,
+                        id_token, start_time, vehicle_id, driver_id, card_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7, $8::uuid, $9::uuid)
+                    """,
+                    charge_point_id,
+                    tx_id,
+                    pending["evse_id"],
+                    pending["connector_id"],
+                    pending["id_tag"],
+                    pending["timestamp"],
+                    pending.get("vehicle_id"),
+                    pending.get("driver_id"),
+                    pending.get("card_id"),
+                )
+            return tx_id
 
     async def _store_meter_values(
         self,
@@ -266,6 +417,7 @@ class OCPPServer:
         energy_kwh: Optional[float],
         timestamp: datetime,
         max_charge_kw: Optional[float] = None,
+        vehicle_id: Optional[str] = None,
     ) -> None:
         """Store meter values in database."""
         if not self.pools:
@@ -286,7 +438,7 @@ class OCPPServer:
             soc,
             power_kw,
             timestamp,
-            vehicle_id=None,
+            vehicle_id=vehicle_id,
             max_charge_kw=max_charge_kw,
             charger_id=charger_id,
             energy_kwh=energy_kwh,
@@ -407,6 +559,9 @@ class OCPPServer:
 
         self.charge_points.clear()
         self._connector_status_cache.clear()
+        self._pending_starts.clear()
+        self._connector_identity_cache.clear()
+        self._transaction_connectors.clear()
 
         if self.server:
             self.server.close()

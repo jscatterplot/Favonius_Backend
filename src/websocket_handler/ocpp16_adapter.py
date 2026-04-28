@@ -335,6 +335,9 @@ class OCPP16Session:
                     connector_id=pending["connector_id"],
                     id_token=pending.get("id_tag"),
                     start_time=pending["start_time"],
+                    vehicle_id=pending.get("vehicle_id"),
+                    driver_id=pending.get("driver_id"),
+                    card_id=pending.get("card_id"),
                 )
             except Exception as exc:
                 logger.warning(
@@ -354,7 +357,7 @@ class OCPP16Session:
         of scope for the pilot.
         """
         try:
-            row = await self._timescale.lookup_id_tag(id_tag)
+            row = await self._timescale.lookup_id_tag(id_tag, station_id=cp_id)
         except Exception as exc:
             logger.error(
                 "%s lookup failed for station=%s id_tag=%s: %s",
@@ -680,6 +683,18 @@ class OCPP16Session:
             "id_tag": id_tag,
             "start_time": start_time,
         }
+        try:
+            identity = await self._timescale.lookup_id_tag(id_tag, station_id=cp_id)
+        except Exception:
+            identity = None
+        if identity:
+            self._pending_start.update(
+                {
+                    "vehicle_id": identity.get("vehicle_id"),
+                    "driver_id": identity.get("driver_id"),
+                    "card_id": identity.get("card_id"),
+                }
+            )
 
         # Inline gauge bump; reconciler in main.py corrects drift every 30 s.
         try:
@@ -696,6 +711,9 @@ class OCPP16Session:
                     "id_tag": id_tag,
                     "meter_start": meter_start,
                     "timestamp": timestamp,
+                    "vehicle_id": self._pending_start.get("vehicle_id"),
+                    "driver_id": self._pending_start.get("driver_id"),
+                    "card_id": self._pending_start.get("card_id"),
                 },
             )
         )

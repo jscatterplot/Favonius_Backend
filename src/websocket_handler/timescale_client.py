@@ -1861,30 +1861,97 @@ class TimescaleClient:
         async with self.pg_pool.acquire() as conn:
             return int(await conn.fetchval("SELECT nextval('ocpp_charging_profile_id')"))
 
-    async def lookup_id_tag(self, id_tag: str) -> Optional[Dict[str, Any]]:
-        """Look up an OCPP idTag in the vehicles table.
+    async def lookup_id_tag(
+        self,
+        id_tag: str,
+        station_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve an OCPP idTag to known vehicle/card/driver identity.
 
-        Returns ``{"vehicle_id": str, "depot_id": str}`` if the tag is
-        registered, ``None`` otherwise. Used by the Authorize handler to
-        return ``Accepted`` for known tags and ``Invalid`` for unknown ones.
+        Vehicle primary idTags are authoritative. Active RFID cards are accepted
+        after vehicle lookup; lost/stolen/inactive cards do not match.
         """
         async with self.pg_pool.acquire() as conn:
+            station_filter = ""
+            params: list[Any] = [id_tag]
+            if station_id is not None:
+                station_filter = (
+                    "AND EXISTS (SELECT 1 FROM chargers c "
+                    "WHERE c.ocpp_id = $2 AND c.depot_id = v.depot_id)"
+                )
+                params.append(station_id)
             rows = await conn.fetch(
-                "SELECT vehicle_id::text AS vehicle_id, depot_id::text AS depot_id "
-                "FROM vehicles WHERE id_tag = $1 "
-                "LIMIT 2",
-                id_tag,
+                f"""
+                SELECT v.vehicle_id::text AS vehicle_id,
+                       v.depot_id::text AS depot_id,
+                       NULL::text AS driver_id,
+                       NULL::text AS card_id,
+                       'vehicle'::text AS source
+                FROM vehicles v
+                WHERE v.id_tag = $1
+                  AND COALESCE(v.status, 'active') = 'active'
+                  {station_filter}
+                LIMIT 2
+                """,
+                *params,
             )
-            if not rows:
-                return None
             if len(rows) > 1:
                 logger.error(
                     "Rejecting id_tag lookup for %r: multiple vehicles share the same id_tag.",
                     id_tag,
                 )
                 return None
-            row = rows[0]
-            return {"vehicle_id": row["vehicle_id"], "depot_id": row["depot_id"]}
+            if rows:
+                return dict(rows[0])
+
+            card_filter = ""
+            params = [id_tag]
+            if station_id is not None:
+                card_filter = (
+                    "AND EXISTS (SELECT 1 FROM chargers ch "
+                    "WHERE ch.ocpp_id = $2 AND ch.depot_id = c.depot_id)"
+                )
+                params.append(station_id)
+            rows = await conn.fetch(
+                f"""
+                SELECT c.card_id::text AS card_id,
+                       c.depot_id::text AS depot_id,
+                       (
+                           SELECT cva.vehicle_id::text
+                           FROM rfid_card_vehicle_assignments cva
+                           JOIN vehicles v ON v.vehicle_id = cva.vehicle_id
+                           WHERE cva.card_id = c.card_id
+                             AND v.depot_id = c.depot_id
+                             AND COALESCE(v.status, 'active') = 'active'
+                           ORDER BY v.external_id
+                           LIMIT 1
+                       ) AS vehicle_id,
+                       (
+                           SELECT cda.driver_id::text
+                           FROM rfid_card_driver_assignments cda
+                           JOIN drivers dr ON dr.driver_id = cda.driver_id
+                           WHERE cda.card_id = c.card_id
+                             AND dr.depot_id = c.depot_id
+                             AND dr.status = 'active'
+                           ORDER BY dr.display_name
+                           LIMIT 1
+                       ) AS driver_id,
+                       'rfid_card'::text AS source
+                FROM rfid_cards c
+                WHERE c.id_tag = $1
+                  AND c.status = 'active'
+                  {card_filter}
+                LIMIT 2
+                """,
+                *params,
+            )
+            if len(rows) > 1:
+                logger.error(
+                    "Rejecting id_tag lookup for %r: multiple active RFID cards share it.",
+                    id_tag,
+                )
+                return None
+            return dict(rows[0]) if rows else None
 
     # ===== OCPP 1.6 RECOVERY HELPERS (migration 013) =====
 
@@ -1918,6 +1985,9 @@ class TimescaleClient:
         connector_id: int,
         id_token: Optional[str],
         start_time: datetime,
+        vehicle_id: Optional[str] = None,
+        driver_id: Optional[str] = None,
+        card_id: Optional[str] = None,
     ) -> None:
         """Insert an open ``charging_sessions`` row at StartTransaction.
 
@@ -1930,8 +2000,8 @@ class TimescaleClient:
                 """
                 INSERT INTO charging_sessions (
                     station_id, transaction_id, evse_id, connector_id,
-                    id_token, start_time
-                ) VALUES ($1, $2, $3, $4, $5, $6)
+                    id_token, start_time, vehicle_id, driver_id, card_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
                 """,
                 station_id,
                 transaction_id,
@@ -1939,6 +2009,9 @@ class TimescaleClient:
                 connector_id,
                 id_token,
                 start_time,
+                vehicle_id,
+                driver_id,
+                card_id,
             )
 
     async def close_open_session(
