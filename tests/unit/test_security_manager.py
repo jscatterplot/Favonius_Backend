@@ -121,6 +121,28 @@ class TestSecurityManager:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_production_charger_requires_basic_auth(self, security_manager):
+        """Provisioned production chargers reject non-Basic Auth methods."""
+        station_id = "acme-berlin-001"
+        auth_data = {"bearer_token": "valid_token"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=True),
+            patch.object(security_manager, "_authenticate_bearer_token", return_value=True),
+            patch.object(security_manager, "_record_failed_attempt", return_value=None) as failed,
+            patch.object(security_manager, "_log_security_event", return_value=None) as log_event,
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is False
+        assert error == "Basic Auth credentials required"
+        failed.assert_called_once_with(station_id)
+        log_event.assert_called_once()
+        assert log_event.call_args.args[4]["reason"] == "missing_basic_auth"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_generate_station_token(self, security_manager):
         """Test generating a station authentication token."""
         station_id = "STATION_001"
