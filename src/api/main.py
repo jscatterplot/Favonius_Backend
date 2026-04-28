@@ -1060,8 +1060,8 @@ class VehicleIdentityResponse(BaseModel):
     vin: Optional[str] = None
     license_plate: Optional[str] = None
     status: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class DriverIdentityResponse(BaseModel):
@@ -1074,8 +1074,8 @@ class DriverIdentityResponse(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     status: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class RfidCardResponse(BaseModel):
@@ -1089,8 +1089,6 @@ class RfidCardResponse(BaseModel):
     notes: Optional[str] = None
     assigned_vehicle_ids: list[str] = Field(default_factory=list)
     assigned_driver_ids: list[str] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

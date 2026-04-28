@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -37,6 +38,7 @@ def _override_token(user: dict):
 
 
 def _vehicle_response(depot_id: str, vehicle_id: str, id_tag: str | None = "VEH-1") -> dict:
+    now = datetime.now(timezone.utc)
     return {
         "vehicle_id": vehicle_id,
         "depot_id": depot_id,
@@ -49,6 +51,8 @@ def _vehicle_response(depot_id: str, vehicle_id: str, id_tag: str | None = "VEH-
         "vin": None,
         "license_plate": None,
         "status": "active",
+        "created_at": now,
+        "updated_at": now,
     }
 
 
@@ -158,6 +162,8 @@ class TestFleetIdentityApi:
             "notes": None,
             "assigned_vehicle_ids": vehicle_ids,
             "assigned_driver_ids": driver_ids,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
         }
 
         with patch("src.api.main.db_pools", pool), patch(

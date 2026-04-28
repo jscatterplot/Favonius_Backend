@@ -152,8 +152,8 @@ class TestOCPP16SessionCallbacks:
             max_charge_kw=50.0,
             raw_samples=[],
         )
-        mock_timescale.insert_telemetry_batch.assert_awaited_once()
-        call_args = mock_timescale.insert_telemetry_batch.call_args[0][0][0]
+        assert session._telemetry_queue.qsize() == 1
+        call_args = session._telemetry_queue.get_nowait()
         assert abs(call_args["soc_percent"] - 75.0) < 0.01
         assert call_args["power_kw"] == 22.0
         assert call_args["station_id"] == "test_station_001"
