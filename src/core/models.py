@@ -14,12 +14,16 @@ class Depot:
     """Depot configuration data model."""
 
     depot_id: UUID
+    organization_id: UUID
     name: str
     latitude: float
     longitude: float
     timezone: str
+    currency: str
+    utility_id: Optional[str]
     max_grid_kw: float
     demand_charge_rate_kw: float
+    demand_charge_billing_period: str = "monthly"
 
 
 @dataclass

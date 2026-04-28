@@ -13,9 +13,10 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import httpx
@@ -25,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.controller_manager import ControllerManager
@@ -773,12 +774,117 @@ class DepotMetadata(BaseModel):
     demand_charge_rate_kw: Optional[float] = Field(
         None, description="Demand charge rate in $/kW per month"
     )
+    latitude: Optional[float] = Field(None, description="Depot latitude")
+    longitude: Optional[float] = Field(None, description="Depot longitude")
+    utility_id: Optional[str] = Field(None, description="Utility provider identifier")
+    demand_charge_billing_period: Optional[str] = Field(None, description="Demand charge billing period")
+    address: Optional[dict] = Field(None, description="Address metadata")
+    billing_metadata: Optional[dict] = Field(None, description="Billing metadata")
+    building_load_source: Optional[dict] = Field(None, description="Building load source metadata")
 
 
 class DepotListResponse(BaseModel):
     """Response from GET /me/depots."""
 
     depots: list[DepotMetadata] = Field(default_factory=list)
+
+
+class DepotAddressPayload(BaseModel):
+    """Depot address and geolocation."""
+
+    line1: str = Field(..., min_length=1, max_length=255)
+    line2: Optional[str] = Field(default=None, max_length=255)
+    city: str = Field(..., min_length=1, max_length=128)
+    postal_code: Optional[str] = Field(default=None, max_length=32)
+    country: str = Field(..., min_length=1, max_length=128)
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+
+
+class DepotDemandChargePayload(BaseModel):
+    """Demand-charge settings."""
+
+    rate_eur_per_kw: float = Field(..., gt=0)
+    billing_period: str = Field(..., min_length=1, max_length=32)
+
+
+class DepotBillingPayload(BaseModel):
+    """Customer billing metadata."""
+
+    account_number: Optional[str] = Field(default=None, max_length=128)
+    tariff_name: Optional[str] = Field(default=None, max_length=128)
+    meter_id: Optional[str] = Field(default=None, max_length=128)
+    billing_cycle_day: Optional[int] = Field(default=None, ge=1, le=31)
+    notes: Optional[str] = Field(default=None, max_length=1024)
+
+
+class BuildingLoadSourcePayload(BaseModel):
+    """Building load source configuration."""
+
+    type: Literal["meter", "api", "manual", "none"]
+    provider: Optional[str] = Field(default=None, max_length=128)
+    identifier: Optional[str] = Field(default=None, max_length=128)
+    interval_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    notes: Optional[str] = Field(default=None, max_length=1024)
+
+
+class StationaryBatteryPayload(BaseModel):
+    """Stationary battery settings."""
+
+    present: bool
+    name: Optional[str] = Field(default=None, max_length=128)
+    capacity_kwh: Optional[float] = Field(default=None, gt=0)
+    max_charge_kw: Optional[float] = Field(default=None, gt=0)
+    max_discharge_kw: Optional[float] = Field(default=None, gt=0)
+    min_soc_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    max_soc_pct: Optional[float] = Field(default=None, ge=0, le=100)
+
+
+class DepotSetupPayload(BaseModel):
+    """Top-level depot setup payload."""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    address: DepotAddressPayload
+    timezone: str = Field(..., min_length=1, max_length=64)
+    currency: str = Field(..., min_length=3, max_length=10)
+    utility_id: str = Field(..., min_length=1, max_length=100)
+    max_grid_kw: float = Field(..., gt=0, le=100_000)
+    demand_charge: DepotDemandChargePayload
+    billing: DepotBillingPayload = Field(default_factory=DepotBillingPayload)
+    building_load_source: BuildingLoadSourcePayload
+    stationary_battery: StationaryBatteryPayload = Field(default_factory=lambda: StationaryBatteryPayload(present=False))
+
+
+class FirstDepotSetupRequest(BaseModel):
+    """Request for initial depot creation."""
+
+    depot: DepotSetupPayload
+
+
+class ReadinessChecklistItem(BaseModel):
+    """Single readiness check item."""
+
+    id: str
+    label: str
+    status: Literal["ready", "warning", "blocked"]
+    detail: str
+
+
+class DepotSetupSummary(BaseModel):
+    """Depot summary returned by setup endpoints."""
+
+    id: str
+    name: str
+    timezone: str
+    currency: str
+    max_grid_kw: float
+
+
+class DepotSetupResponse(BaseModel):
+    """Response for create/update setup requests."""
+
+    depot: DepotSetupSummary
+    readiness_checklist: list[ReadinessChecklistItem]
 
 
 # ============ Command Dispatcher Models ============
@@ -997,6 +1103,229 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
             )
 
 
+def _format_depot_setup_validation_errors(exc: ValidationError) -> dict:
+    """Map pydantic validation errors into frontend-friendly shape."""
+    field_errors: dict[str, list[str]] = {}
+    validation_errors: list[dict[str, str]] = []
+    for err in exc.errors():
+        loc = err.get("loc", ())
+        path = ".".join(str(part) for part in loc if part != "body")
+        if not path:
+            path = "depot"
+        message = err.get("msg", "Invalid value")
+        field_errors.setdefault(path, []).append(message)
+        validation_errors.append({"path": path, "message": message})
+    return {
+        "detail": "Validation failed",
+        "error_code": "VALIDATION_ERROR",
+        "field_errors": field_errors,
+        "validation_errors": validation_errors,
+    }
+
+
+def _validate_depot_setup_payload(payload: DepotSetupPayload) -> None:
+    """Run semantic validation that is not covered by simple field constraints."""
+    try:
+        ZoneInfo(payload.timezone)
+    except Exception as exc:
+        raise ValueError("depot.timezone: Invalid IANA timezone") from exc
+
+    if not payload.currency.isalpha() or len(payload.currency) != 3:
+        raise ValueError("depot.currency: Invalid currency code")
+
+    battery = payload.stationary_battery
+    if battery.present:
+        required_fields = (
+            battery.capacity_kwh,
+            battery.max_charge_kw,
+            battery.max_discharge_kw,
+            battery.min_soc_pct,
+            battery.max_soc_pct,
+        )
+        if any(field is None for field in required_fields):
+            raise ValueError("depot.stationary_battery: Missing required battery fields")
+        if battery.min_soc_pct >= battery.max_soc_pct:
+            raise ValueError("depot.stationary_battery: min_soc_pct must be less than max_soc_pct")
+
+
+def _require_customer_admin_with_org(user: dict) -> str:
+    """Ensure caller is customer_admin and carries an organization_id claim."""
+    role = get_user_role(user)
+    if role != "customer_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: customer_admin role required",
+        )
+    org_id = user.get("app_metadata", {}).get("organization_id")
+    if not org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: missing organization_id in token app_metadata",
+        )
+    return str(org_id)
+
+
+async def _build_readiness_checklist(depot_id: str, payload: DepotSetupPayload) -> list[dict]:
+    """Build exact setup readiness checklist for optimization prerequisites."""
+    if not db_pools:
+        return []
+
+    async with db_pools.static.acquire() as conn:
+        has_vehicles = bool(
+            await conn.fetchval("SELECT EXISTS(SELECT 1 FROM vehicles WHERE depot_id = $1::uuid)", depot_id)
+        )
+        has_chargers = bool(
+            await conn.fetchval("SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id)
+        )
+        has_access = bool(
+            await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM charger_vehicle_access cva
+                    JOIN chargers c ON c.charger_id = cva.charger_id
+                    WHERE c.depot_id = $1::uuid AND cva.is_accessible = TRUE
+                )
+                """,
+                depot_id,
+            )
+        )
+        has_schedules = bool(
+            await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM schedules s
+                    JOIN vehicles v ON v.vehicle_id = s.vehicle_id
+                    WHERE v.depot_id = $1::uuid AND s.departure_time >= NOW() - INTERVAL '1 hour'
+                )
+                """,
+                depot_id,
+            )
+        )
+        has_battery = bool(
+            await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM battery_storage WHERE depot_id = $1::uuid)",
+                depot_id,
+            )
+        )
+
+    has_prices = False
+    has_building_load = False
+    if db_pools.ts is not None:
+        async with db_pools.ts.acquire() as conn:
+            has_prices = bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM prices
+                        WHERE depot_id = $1::uuid AND time >= NOW() - INTERVAL '24 hours'
+                    )
+                    """,
+                    depot_id,
+                )
+            )
+            has_building_load = bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM building_load
+                        WHERE depot_id = $1::uuid AND time >= NOW() - INTERVAL '24 hours'
+                    )
+                    """,
+                    depot_id,
+                )
+            )
+
+    checklist: list[dict] = []
+    checklist.append(
+        {
+            "id": "site",
+            "label": "Site geocoded",
+            "status": "ready",
+            "detail": "Coordinates present",
+        }
+    )
+    checklist.append(
+        {
+            "id": "grid_capacity",
+            "label": "Grid capacity configured",
+            "status": "ready",
+            "detail": "max_grid_kw configured",
+        }
+    )
+    checklist.append(
+        {
+            "id": "tariff",
+            "label": "Tariff configured",
+            "status": "ready",
+            "detail": "Demand charge present",
+        }
+    )
+    checklist.append(
+        {
+            "id": "vehicles",
+            "label": "Vehicles configured",
+            "status": "ready" if has_vehicles else "blocked",
+            "detail": "Vehicle fleet present" if has_vehicles else "No vehicles configured for depot",
+        }
+    )
+    checklist.append(
+        {
+            "id": "chargers",
+            "label": "Chargers configured",
+            "status": "ready" if has_chargers else "blocked",
+            "detail": "Chargers present" if has_chargers else "No chargers configured for depot",
+        }
+    )
+    checklist.append(
+        {
+            "id": "charger_access",
+            "label": "Charger access mapped",
+            "status": "ready" if has_access else "blocked",
+            "detail": "Charger/vehicle accessibility mapped"
+            if has_access
+            else "No charger_vehicle_access mappings found",
+        }
+    )
+    checklist.append(
+        {
+            "id": "schedules",
+            "label": "Schedules available",
+            "status": "ready" if has_schedules else "blocked",
+            "detail": "Upcoming schedules found" if has_schedules else "No upcoming schedules found",
+        }
+    )
+    checklist.append(
+        {
+            "id": "prices",
+            "label": "Price data available",
+            "status": "ready" if has_prices else "blocked",
+            "detail": "Recent price rows found" if has_prices else "Missing recent price data",
+        }
+    )
+    checklist.append(
+        {
+            "id": "building_load",
+            "label": "Building load available",
+            "status": "ready" if has_building_load else "blocked",
+            "detail": "Recent building load rows found"
+            if has_building_load
+            else "Missing building load data",
+        }
+    )
+    battery_status = "ready" if (not payload.stationary_battery.present or has_battery) else "blocked"
+    checklist.append(
+        {
+            "id": "battery",
+            "label": "Stationary battery configuration",
+            "status": battery_status,
+            "detail": "Battery configured" if battery_status == "ready" else "Battery marked present but not saved",
+        }
+    )
+    return checklist
+
+
 @app.websocket("/ocpp/{charge_point_id}")
 async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     """OCPP 1.6 WebSocket endpoint (same port as REST when OCPP_USE_SAME_PORT=true)."""
@@ -1114,6 +1443,182 @@ async def get_depot_metadata(
             extra={"depot_id": depot_id},
         )
         raise DatabaseError(f"Database error: {str(e)}")
+
+
+@app.post(
+    "/admin/first-depot-setup",
+    response_model=DepotSetupResponse,
+    tags=["admin"],
+    summary="Create initial depot setup",
+)
+async def create_first_depot_setup(
+    body: dict,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create a tenant-scoped depot and return readiness checklist."""
+    org_id = _require_customer_admin_with_org(user)
+    try:
+        request = FirstDepotSetupRequest.model_validate(body)
+        _validate_depot_setup_payload(request.depot)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_format_depot_setup_validation_errors(exc),
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "detail": "Validation failed",
+                "error_code": "VALIDATION_ERROR",
+                "field_errors": {"depot": [str(exc)]},
+                "validation_errors": [{"path": "depot", "message": str(exc)}],
+            },
+        )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    depot = request.depot
+    address = depot.address.model_dump(exclude_none=True)
+    billing_metadata = depot.billing.model_dump(exclude_none=True)
+    building_load_source = depot.building_load_source.model_dump(exclude_none=True)
+
+    async with db_pools.static.acquire() as conn:
+        async with conn.transaction():
+            created = await db_queries.create_depot_setup(
+                conn,
+                organization_id=org_id,
+                name=depot.name,
+                latitude=depot.address.latitude,
+                longitude=depot.address.longitude,
+                timezone=depot.timezone,
+                currency=depot.currency.upper(),
+                utility_id=depot.utility_id,
+                max_grid_kw=depot.max_grid_kw,
+                demand_charge_rate_kw=depot.demand_charge.rate_eur_per_kw,
+                demand_charge_billing_period=depot.demand_charge.billing_period,
+                address=address,
+                billing_metadata=billing_metadata,
+                building_load_source=building_load_source,
+            )
+            if depot.stationary_battery.present:
+                max_power_kw = min(
+                    float(depot.stationary_battery.max_charge_kw),
+                    float(depot.stationary_battery.max_discharge_kw),
+                )
+                await db_queries.upsert_battery_storage(
+                    conn,
+                    depot_id=created["depot_id"],
+                    capacity_kwh=float(depot.stationary_battery.capacity_kwh),
+                    max_power_kw=max_power_kw,
+                    soc_min=float(depot.stationary_battery.min_soc_pct) / 100.0,
+                    soc_max=float(depot.stationary_battery.max_soc_pct) / 100.0,
+                )
+            else:
+                await db_queries.delete_battery_storage(conn, depot_id=created["depot_id"])
+
+    readiness = await _build_readiness_checklist(created["depot_id"], depot)
+    return {
+        "depot": {
+            "id": created["depot_id"],
+            "name": created["name"],
+            "timezone": created["timezone"],
+            "currency": created["currency"],
+            "max_grid_kw": created["max_grid_kw"],
+        },
+        "readiness_checklist": readiness,
+    }
+
+
+@app.patch(
+    "/admin/depots/{depot_id}",
+    response_model=DepotSetupResponse,
+    tags=["admin"],
+    summary="Update depot setup",
+)
+async def update_depot_setup(
+    depot_id: str,
+    body: dict,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Update depot setup for an accessible depot."""
+    _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+
+    try:
+        request = FirstDepotSetupRequest.model_validate(body)
+        _validate_depot_setup_payload(request.depot)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_format_depot_setup_validation_errors(exc),
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "detail": "Validation failed",
+                "error_code": "VALIDATION_ERROR",
+                "field_errors": {"depot": [str(exc)]},
+                "validation_errors": [{"path": "depot", "message": str(exc)}],
+            },
+        )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    depot = request.depot
+    async with db_pools.static.acquire() as conn:
+        async with conn.transaction():
+            updated = await db_queries.update_depot_setup(
+                conn,
+                depot_id=depot_id,
+                name=depot.name,
+                latitude=depot.address.latitude,
+                longitude=depot.address.longitude,
+                timezone=depot.timezone,
+                currency=depot.currency.upper(),
+                utility_id=depot.utility_id,
+                max_grid_kw=depot.max_grid_kw,
+                demand_charge_rate_kw=depot.demand_charge.rate_eur_per_kw,
+                demand_charge_billing_period=depot.demand_charge.billing_period,
+                address=depot.address.model_dump(exclude_none=True),
+                billing_metadata=depot.billing.model_dump(exclude_none=True),
+                building_load_source=depot.building_load_source.model_dump(exclude_none=True),
+            )
+            if not updated:
+                raise DepotNotFoundError(f"Depot {depot_id} not found")
+
+            if depot.stationary_battery.present:
+                max_power_kw = min(
+                    float(depot.stationary_battery.max_charge_kw),
+                    float(depot.stationary_battery.max_discharge_kw),
+                )
+                await db_queries.upsert_battery_storage(
+                    conn,
+                    depot_id=depot_id,
+                    capacity_kwh=float(depot.stationary_battery.capacity_kwh),
+                    max_power_kw=max_power_kw,
+                    soc_min=float(depot.stationary_battery.min_soc_pct) / 100.0,
+                    soc_max=float(depot.stationary_battery.max_soc_pct) / 100.0,
+                )
+            else:
+                await db_queries.delete_battery_storage(conn, depot_id=depot_id)
+
+    _depot_config_cache.pop(depot_id, None)
+    readiness = await _build_readiness_checklist(depot_id, depot)
+    return {
+        "depot": {
+            "id": depot_id,
+            "name": updated["name"],
+            "timezone": updated["timezone"],
+            "currency": updated["currency"],
+            "max_grid_kw": updated["max_grid_kw"],
+        },
+        "readiness_checklist": readiness,
+    }
 
 
 @app.post(

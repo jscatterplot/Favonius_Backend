@@ -68,6 +68,52 @@ def _deny_depot_access(depot_id: str):
     raise HTTPException(status_code=403, detail="Access denied: you do not have permission for this depot")
 
 
+def _first_depot_payload(max_grid_kw: float = 1200.0) -> dict:
+    """Valid first depot setup payload."""
+    return {
+        "depot": {
+            "name": "TOKS Vilnius Depot",
+            "address": {
+                "line1": "Main street 1",
+                "line2": "optional",
+                "city": "Vilnius",
+                "postal_code": "optional",
+                "country": "Lithuania",
+                "latitude": 54.6872,
+                "longitude": 25.2797,
+            },
+            "timezone": "Europe/Vilnius",
+            "currency": "EUR",
+            "utility_id": "eso-main",
+            "max_grid_kw": max_grid_kw,
+            "demand_charge": {"rate_eur_per_kw": 8.5, "billing_period": "monthly"},
+            "billing": {
+                "account_number": "optional",
+                "tariff_name": "optional",
+                "meter_id": "optional",
+                "billing_cycle_day": 15,
+                "notes": "optional",
+            },
+            "building_load_source": {
+                "type": "meter",
+                "provider": "optional",
+                "identifier": "optional",
+                "interval_minutes": 15,
+                "notes": "optional",
+            },
+            "stationary_battery": {
+                "present": True,
+                "name": "optional",
+                "capacity_kwh": 500,
+                "max_charge_kw": 250,
+                "max_discharge_kw": 250,
+                "min_soc_pct": 10,
+                "max_soc_pct": 90,
+            },
+        }
+    }
+
+
 # ── Cleanup fixture ──────────────────────────────────────────────────────────
 
 
@@ -341,6 +387,113 @@ class TestTenantMirrorOnAuthenticatedRequest:
             with patch("src.api.main.db_pools", pool):
                 response = client.get(f"/depots/{DEPOT_ID}", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+
+class TestDepotSetupWrites:
+    """POST/PATCH depot setup auth, validation, and readiness behavior."""
+
+    def test_authorized_creation_with_tenant_mirror(self, client, mock_db_pool):
+        app.dependency_overrides.pop(ensure_tenant_mirrored, None)
+        app.dependency_overrides[verify_token] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(return_value=True)
+        payload = _first_depot_payload()
+
+        created_row = {
+            "depot_id": DEPOT_ID,
+            "organization_id": DEFAULT_ORG_ID,
+            "name": payload["depot"]["name"],
+            "timezone": payload["depot"]["timezone"],
+            "currency": payload["depot"]["currency"],
+            "max_grid_kw": payload["depot"]["max_grid_kw"],
+        }
+        readiness = [{"id": "tariff", "label": "Tariff configured", "status": "ready", "detail": "ok"}]
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.security.tenant_mirror.mirror_user_tenant", new_callable=AsyncMock
+        ) as mirror_mock, patch(
+            "src.api.main.db_queries.create_depot_setup", new_callable=AsyncMock, return_value=created_row
+        ) as create_mock, patch(
+            "src.api.main.db_queries.upsert_battery_storage", new_callable=AsyncMock
+        ), patch(
+            "src.api.main._build_readiness_checklist", new_callable=AsyncMock, return_value=readiness
+        ):
+            response = client.post("/admin/first-depot-setup", headers=AUTH_HDR, json=payload)
+
+        assert response.status_code == http_status.HTTP_200_OK
+        assert response.json()["depot"]["id"] == DEPOT_ID
+        assert response.json()["readiness_checklist"] == readiness
+        mirror_mock.assert_awaited_once()
+        assert create_mock.await_args.kwargs["organization_id"] == DEFAULT_ORG_ID
+
+    def test_cross_org_update_denied(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_admin"))
+        conn.fetchval = AsyncMock(return_value=False)
+
+        with patch("src.api.main.db_pools", pool):
+            response = client.patch(
+                f"/admin/depots/{DEPOT_ID}",
+                headers=AUTH_HDR,
+                json=_first_depot_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+    def test_missing_organization_id_denied(self, client):
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", omit_organization_id=True)
+        )
+        response = client.post("/admin/first-depot-setup", headers=AUTH_HDR, json=_first_depot_payload())
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+    def test_invalid_depot_data_returns_structured_validation(self, client):
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_admin"))
+        payload = _first_depot_payload(max_grid_kw=-1.0)
+        response = client.post("/admin/first-depot-setup", headers=AUTH_HDR, json=payload)
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        data = response.json()
+        assert data["error_code"] == "VALIDATION_ERROR"
+        assert "field_errors" in data
+        assert "validation_errors" in data
+
+    def test_favonius_admin_write_forbidden_visibility_unchanged(self, client):
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="favonius_admin"))
+        response = client.post("/admin/first-depot-setup", headers=AUTH_HDR, json=_first_depot_payload())
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+    def test_readiness_checklist_contains_exact_missing_inputs(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_admin"))
+        conn.fetchval = AsyncMock(side_effect=[False, False, False, False, False, False, False])
+        payload = _first_depot_payload()
+        created_row = {
+            "depot_id": DEPOT_ID,
+            "organization_id": DEFAULT_ORG_ID,
+            "name": payload["depot"]["name"],
+            "timezone": payload["depot"]["timezone"],
+            "currency": payload["depot"]["currency"],
+            "max_grid_kw": payload["depot"]["max_grid_kw"],
+        }
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.db_queries.create_depot_setup", new_callable=AsyncMock, return_value=created_row
+        ), patch(
+            "src.api.main.db_queries.upsert_battery_storage", new_callable=AsyncMock
+        ):
+            response = client.post("/admin/first-depot-setup", headers=AUTH_HDR, json=payload)
+
+        assert response.status_code == http_status.HTTP_200_OK
+        checklist = {item["id"]: item for item in response.json()["readiness_checklist"]}
+        assert checklist["vehicles"]["status"] == "blocked"
+        assert checklist["chargers"]["status"] == "blocked"
+        assert checklist["charger_access"]["status"] == "blocked"
+        assert checklist["schedules"]["status"] == "blocked"
+        assert checklist["prices"]["status"] == "blocked"
+        assert checklist["building_load"]["status"] == "blocked"
+        assert checklist["battery"]["status"] == "blocked"
 
 
 class TestAdminControllersRbac:

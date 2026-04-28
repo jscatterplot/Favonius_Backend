@@ -81,11 +81,16 @@ class Depot(Base):
     latitude = Column(Double, nullable=False)
     longitude = Column(Double, nullable=False)
     timezone = Column(String(50), default="America/Los_Angeles")
+    currency = Column(String(10), nullable=False, default="EUR")
     utility_id = Column(
         String(100), nullable=True, comment="Utility provider identifier (e.g., 'PG&E', 'SCE')"
     )
     max_grid_kw = Column(Double, nullable=False)
     demand_charge_rate_kw = Column(Double, default=20.0)
+    demand_charge_billing_period = Column(String(32), nullable=False, default="monthly")
+    address = Column(JSONB, nullable=False, default=dict)
+    billing_metadata = Column(JSONB, nullable=False, default=dict)
+    building_load_source = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

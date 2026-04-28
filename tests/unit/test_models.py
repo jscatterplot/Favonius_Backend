@@ -489,10 +489,13 @@ class TestDepot:
         """Test basic Depot creation."""
         depot = Depot(
             depot_id=uuid4(),
+            organization_id=uuid4(),
             name="Main Depot",
             latitude=37.7749,
             longitude=-122.4194,
             timezone="America/Los_Angeles",
+            currency="USD",
+            utility_id="pge-main",
             max_grid_kw=1000.0,
             demand_charge_rate_kw=20.0,
         )
@@ -581,10 +584,13 @@ class TestCrossModelConsistency:
 
         depot = Depot(
             depot_id=depot_id,
+            organization_id=uuid4(),
             name="Test Depot",
             latitude=37.0,
             longitude=-122.0,
             timezone="UTC",
+            currency="EUR",
+            utility_id="eso-main",
             max_grid_kw=1000.0,
             demand_charge_rate_kw=20.0,
         )

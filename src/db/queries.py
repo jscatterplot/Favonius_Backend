@@ -8,12 +8,29 @@ Reference: Development Plan Step 4.5.7
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_jsonb_dict(value: Any) -> dict[str, Any]:
+    """Return JSONB value as dict for response-model compatibility."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            logger.warning("Invalid JSONB string payload encountered")
+    return {}
 
 
 # ============ TELEMETRY QUERIES ============
@@ -593,12 +610,29 @@ async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
     query = """
         SELECT depot_id::text AS depot_id,
                organization_id::text AS organization_id,
-               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+               name,
+               latitude,
+               longitude,
+               timezone,
+               currency,
+               utility_id,
+               max_grid_kw,
+               demand_charge_rate_kw,
+               demand_charge_billing_period,
+               address,
+               billing_metadata,
+               building_load_source
         FROM depots
         WHERE depot_id = $1::uuid
     """
     row = await db.fetchrow(query, depot_id)
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    result["address"] = _coerce_jsonb_dict(result.get("address"))
+    result["billing_metadata"] = _coerce_jsonb_dict(result.get("billing_metadata"))
+    result["building_load_source"] = _coerce_jsonb_dict(result.get("building_load_source"))
+    return result
 
 
 async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
@@ -614,13 +648,31 @@ async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
     query = """
         SELECT depot_id::text AS depot_id,
                organization_id::text AS organization_id,
-               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+               name,
+               latitude,
+               longitude,
+               timezone,
+               currency,
+               utility_id,
+               max_grid_kw,
+               demand_charge_rate_kw,
+               demand_charge_billing_period,
+               address,
+               billing_metadata,
+               building_load_source
         FROM depots
         WHERE depot_id = ANY($1::uuid[])
         ORDER BY name
     """
     rows = await db.fetch(query, depot_ids)
-    return [dict(r) for r in rows]
+    depots: list[dict] = []
+    for row in rows:
+        result = dict(row)
+        result["address"] = _coerce_jsonb_dict(result.get("address"))
+        result["billing_metadata"] = _coerce_jsonb_dict(result.get("billing_metadata"))
+        result["building_load_source"] = _coerce_jsonb_dict(result.get("building_load_source"))
+        depots.append(result)
+    return depots
 
 
 async def get_all_depots(db) -> list[dict]:
@@ -635,12 +687,30 @@ async def get_all_depots(db) -> list[dict]:
     query = """
         SELECT depot_id::text AS depot_id,
                organization_id::text AS organization_id,
-               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+               name,
+               latitude,
+               longitude,
+               timezone,
+               currency,
+               utility_id,
+               max_grid_kw,
+               demand_charge_rate_kw,
+               demand_charge_billing_period,
+               address,
+               billing_metadata,
+               building_load_source
         FROM depots
         ORDER BY name
     """
     rows = await db.fetch(query)
-    return [dict(r) for r in rows]
+    depots: list[dict] = []
+    for row in rows:
+        result = dict(row)
+        result["address"] = _coerce_jsonb_dict(result.get("address"))
+        result["billing_metadata"] = _coerce_jsonb_dict(result.get("billing_metadata"))
+        result["building_load_source"] = _coerce_jsonb_dict(result.get("building_load_source"))
+        depots.append(result)
+    return depots
 
 
 async def get_depots_for_organization(db, organization_id: str) -> list[dict]:
@@ -648,13 +718,31 @@ async def get_depots_for_organization(db, organization_id: str) -> list[dict]:
     query = """
         SELECT depot_id::text AS depot_id,
                organization_id::text AS organization_id,
-               name, timezone, currency, max_grid_kw, demand_charge_rate_kw
+               name,
+               latitude,
+               longitude,
+               timezone,
+               currency,
+               utility_id,
+               max_grid_kw,
+               demand_charge_rate_kw,
+               demand_charge_billing_period,
+               address,
+               billing_metadata,
+               building_load_source
         FROM depots
         WHERE organization_id = $1::uuid
         ORDER BY name
     """
     rows = await db.fetch(query, organization_id)
-    return [dict(r) for r in rows]
+    depots: list[dict] = []
+    for row in rows:
+        result = dict(row)
+        result["address"] = _coerce_jsonb_dict(result.get("address"))
+        result["billing_metadata"] = _coerce_jsonb_dict(result.get("billing_metadata"))
+        result["building_load_source"] = _coerce_jsonb_dict(result.get("building_load_source"))
+        depots.append(result)
+    return depots
 
 
 async def depot_belongs_to_organization(
@@ -668,6 +756,182 @@ async def depot_belongs_to_organization(
         )
     """
     return bool(await db.fetchval(q, depot_id, organization_id))
+
+
+async def create_depot_setup(
+    db,
+    *,
+    organization_id: str,
+    name: str,
+    latitude: float,
+    longitude: float,
+    timezone: str,
+    currency: str,
+    utility_id: str,
+    max_grid_kw: float,
+    demand_charge_rate_kw: float,
+    demand_charge_billing_period: str,
+    address: dict[str, Any],
+    billing_metadata: dict[str, Any],
+    building_load_source: dict[str, Any],
+) -> dict:
+    """Create a depot row scoped to organization and return metadata."""
+    query = """
+        INSERT INTO depots (
+            organization_id,
+            name,
+            latitude,
+            longitude,
+            timezone,
+            currency,
+            utility_id,
+            max_grid_kw,
+            demand_charge_rate_kw,
+            demand_charge_billing_period,
+            address,
+            billing_metadata,
+            building_load_source
+        )
+        VALUES (
+            $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb
+        )
+        RETURNING depot_id::text AS depot_id,
+                  organization_id::text AS organization_id,
+                  name,
+                  latitude,
+                  longitude,
+                  timezone,
+                  currency,
+                  utility_id,
+                  max_grid_kw,
+                  demand_charge_rate_kw,
+                  demand_charge_billing_period,
+                  address,
+                  billing_metadata,
+                  building_load_source
+    """
+    row = await db.fetchrow(
+        query,
+        organization_id,
+        name,
+        latitude,
+        longitude,
+        timezone,
+        currency,
+        utility_id,
+        max_grid_kw,
+        demand_charge_rate_kw,
+        demand_charge_billing_period,
+        json.dumps(address),
+        json.dumps(billing_metadata),
+        json.dumps(building_load_source),
+    )
+    result = dict(row)
+    result["address"] = _coerce_jsonb_dict(result.get("address"))
+    result["billing_metadata"] = _coerce_jsonb_dict(result.get("billing_metadata"))
+    result["building_load_source"] = _coerce_jsonb_dict(result.get("building_load_source"))
+    return result
+
+
+async def update_depot_setup(
+    db,
+    *,
+    depot_id: str,
+    name: str,
+    latitude: float,
+    longitude: float,
+    timezone: str,
+    currency: str,
+    utility_id: str,
+    max_grid_kw: float,
+    demand_charge_rate_kw: float,
+    demand_charge_billing_period: str,
+    address: dict[str, Any],
+    billing_metadata: dict[str, Any],
+    building_load_source: dict[str, Any],
+) -> Optional[dict]:
+    """Update depot setup metadata and return updated row."""
+    query = """
+        UPDATE depots
+        SET name = $2,
+            latitude = $3,
+            longitude = $4,
+            timezone = $5,
+            currency = $6,
+            utility_id = $7,
+            max_grid_kw = $8,
+            demand_charge_rate_kw = $9,
+            demand_charge_billing_period = $10,
+            address = $11::jsonb,
+            billing_metadata = $12::jsonb,
+            building_load_source = $13::jsonb,
+            updated_at = NOW()
+        WHERE depot_id = $1::uuid
+        RETURNING depot_id::text AS depot_id,
+                  organization_id::text AS organization_id,
+                  name,
+                  latitude,
+                  longitude,
+                  timezone,
+                  currency,
+                  utility_id,
+                  max_grid_kw,
+                  demand_charge_rate_kw,
+                  demand_charge_billing_period,
+                  address,
+                  billing_metadata,
+                  building_load_source
+    """
+    row = await db.fetchrow(
+        query,
+        depot_id,
+        name,
+        latitude,
+        longitude,
+        timezone,
+        currency,
+        utility_id,
+        max_grid_kw,
+        demand_charge_rate_kw,
+        demand_charge_billing_period,
+        json.dumps(address),
+        json.dumps(billing_metadata),
+        json.dumps(building_load_source),
+    )
+    if not row:
+        return None
+    result = dict(row)
+    result["address"] = _coerce_jsonb_dict(result.get("address"))
+    result["billing_metadata"] = _coerce_jsonb_dict(result.get("billing_metadata"))
+    result["building_load_source"] = _coerce_jsonb_dict(result.get("building_load_source"))
+    return result
+
+
+async def upsert_battery_storage(
+    db,
+    *,
+    depot_id: str,
+    capacity_kwh: float,
+    max_power_kw: float,
+    soc_min: float,
+    soc_max: float,
+) -> None:
+    """Create/update depot battery row."""
+    query = """
+        INSERT INTO battery_storage (depot_id, capacity_kwh, max_power_kw, soc_min, soc_max)
+        VALUES ($1::uuid, $2, $3, $4, $5)
+        ON CONFLICT (depot_id) DO UPDATE
+        SET capacity_kwh = EXCLUDED.capacity_kwh,
+            max_power_kw = EXCLUDED.max_power_kw,
+            soc_min = EXCLUDED.soc_min,
+            soc_max = EXCLUDED.soc_max
+    """
+    await db.execute(query, depot_id, capacity_kwh, max_power_kw, soc_min, soc_max)
+
+
+async def delete_battery_storage(db, *, depot_id: str) -> None:
+    """Delete battery config for depot."""
+    await db.execute("DELETE FROM battery_storage WHERE depot_id = $1::uuid", depot_id)
 
 
 async def update_vehicle_max_charge_kw(
