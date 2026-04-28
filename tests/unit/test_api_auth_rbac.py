@@ -981,7 +981,11 @@ class TestManualScheduleAdmin:
             "src.api.main.db_queries.update_manual_schedule",
             new_callable=AsyncMock,
             return_value=updated,
-        ) as update_mock:
+        ) as update_mock, patch(
+            "src.api.main._build_depot_readiness_checklist",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
             response = client.patch(
                 f"/admin/depots/{DEPOT_ID}/schedule/manual/{schedule_id}",
                 headers=AUTH_HDR,
@@ -989,8 +993,38 @@ class TestManualScheduleAdmin:
             )
 
         assert response.status_code == http_status.HTTP_200_OK
-        assert response.json()["required_soc"] == 0.99
+        payload = response.json()
+        assert payload["updated"]["required_soc"] == 0.99
+        assert payload["readiness"]["depot_id"] == DEPOT_ID
         assert update_mock.await_args.kwargs["required_soc"] == 0.99
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["vehicle_id", "route_id", "departure_time", "return_time", "required_soc"],
+    )
+    def test_patch_manual_schedule_rejects_null_non_nullable_fields(
+        self,
+        client,
+        mock_db_pool,
+        field_name: str,
+    ):
+        pool, _ = mock_db_pool
+        schedule_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.patch(
+                f"/admin/depots/{DEPOT_ID}/schedule/manual/{schedule_id}",
+                headers=AUTH_HDR,
+                json={field_name: None},
+            )
+
+        assert response.status_code == http_status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert "cannot be null" in response.json()["detail"]
 
 
 class TestAdminControllersRbac:

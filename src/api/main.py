@@ -2451,7 +2451,7 @@ async def create_manual_schedules(
 
 @app.patch(
     "/admin/depots/{depot_id}/schedule/manual/{schedule_id}",
-    response_model=ManualScheduleItem,
+    response_model=ManualScheduleUpdateResponse,
     tags=["admin"],
     summary="Update a manually-entered vehicle schedule",
 )
@@ -2476,6 +2476,17 @@ async def patch_manual_schedule(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one schedule field is required",
+        )
+    non_nullable_patch_fields = {"vehicle_id", "route_id", "departure_time", "return_time", "required_soc"}
+    null_fields = sorted(
+        field_name
+        for field_name, field_value in patch_data.items()
+        if field_name in non_nullable_patch_fields and field_value is None
+    )
+    if null_fields:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{', '.join(null_fields)} cannot be null",
         )
 
     async with db_pools.static.acquire() as conn:
@@ -2518,7 +2529,11 @@ async def patch_manual_schedule(
         )
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
-    return _format_manual_schedule_row(updated)
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "updated": _format_manual_schedule_row(updated),
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
 
 
 @app.post(
