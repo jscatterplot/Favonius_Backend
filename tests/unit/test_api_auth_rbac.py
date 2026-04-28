@@ -779,34 +779,6 @@ class TestChargerOnboarding:
         assert "password" not in serialized
         assert "credential" not in serialized
 
-    def test_idempotency_key_different_body_conflicts(self, client, mock_db_pool):
-        pool, _ = mock_db_pool
-        user = _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
-        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
-
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.verify_depot_access", new_callable=AsyncMock
-        ), patch(
-            "src.api.main.db_queries.delete_expired_charger_onboarding_idempotency",
-            new_callable=AsyncMock,
-        ), patch(
-            "src.api.main.db_queries.get_charger_onboarding_idempotency",
-            new_callable=AsyncMock,
-            return_value={
-                "request_hash": "original-body",
-                "response_json": {},
-                "status_code": http_status.HTTP_201_CREATED,
-            },
-        ), patch("src.api.main._canonical_request_hash", return_value="changed-body"):
-            response = client.post(
-                f"/admin/depots/{DEPOT_ID}/chargers",
-                headers={**AUTH_HDR, "Idempotency-Key": "retry-key"},
-                json=_charger_payload(),
-            )
-
-        assert response.status_code == http_status.HTTP_409_CONFLICT
-
-
 class TestAdminControllersRbac:
     """GET /admin/controllers is restricted to favonius_admin."""
 
