@@ -10,20 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
-
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
-
-
-def slugify_identifier(value: str, *, fallback: str = "item") -> str:
-    """Return a lowercase URL-safe slug for generated external identifiers."""
-    slug = _SLUG_RE.sub("-", value.lower()).strip("-")
-    return slug or fallback
 
 
 def _coerce_jsonb_dict(value: Any) -> dict[str, Any]:
@@ -793,7 +784,7 @@ async def next_charger_ocpp_id(
     query = """
         SELECT ocpp_id
         FROM chargers
-        WHERE ocpp_id ~ ('^' || $1 || '-[0-9]{3}$')
+        WHERE ocpp_id ~ ('^' || $1 || '-[0-9]+$')
         ORDER BY ocpp_id DESC
         LIMIT 1
     """
