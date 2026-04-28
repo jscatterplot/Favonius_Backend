@@ -899,6 +899,22 @@ async def get_charger_onboarding_idempotency(
     return dict(row) if row else None
 
 
+async def acquire_charger_onboarding_idempotency_lock(
+    db,
+    *,
+    organization_id: str,
+    endpoint: str,
+    idempotency_key: str,
+) -> None:
+    """Acquire a transaction-scoped lock for charger onboarding idempotency key."""
+    lock_scope = f"{organization_id}:{endpoint}:{idempotency_key}"
+    await db.execute(
+        "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+        "charger_onboarding_idempotency",
+        lock_scope,
+    )
+
+
 async def store_charger_onboarding_idempotency(
     db,
     *,

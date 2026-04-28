@@ -477,7 +477,11 @@ class SecurityManager:
         """Return True when a provisioned production charger requires Basic Auth."""
         checker = getattr(self.timescale_client, "station_requires_basic_auth", None)
         if checker is None:
-            return False
+            self.logger.warning(
+                "Basic Auth requirement checker unavailable; enforcing Basic Auth for station %s",
+                station_id,
+            )
+            return True
         try:
             return bool(await checker(station_id))
         except Exception as exc:
@@ -486,7 +490,7 @@ class SecurityManager:
                 station_id,
                 exc,
             )
-            return False
+            return True
 
     async def _is_station_locked_out(self, station_id: str) -> bool:
         """Check if station is locked out due to failed attempts."""

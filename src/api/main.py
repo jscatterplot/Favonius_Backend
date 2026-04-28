@@ -1229,9 +1229,10 @@ def _generate_ocpp_basic_password() -> str:
     return secrets.token_urlsafe(32)
 
 
-def _hash_ocpp_basic_password(password: str) -> str:
+async def _hash_ocpp_basic_password(password: str) -> str:
     """Hash a Basic Auth password for station_credentials."""
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    hashed = await asyncio.to_thread(bcrypt.hashpw, password.encode("utf-8"), bcrypt.gensalt())
+    return hashed.decode("utf-8")
 
 
 def _connector_ids_for_request(payload: ChargerCreateRequest) -> list[int]:
@@ -1601,24 +1602,29 @@ async def create_charger_onboarding(
         connector_ids = _connector_ids_for_request(request)
         async with db_pools.static.acquire() as conn:
             await db_queries.delete_expired_charger_onboarding_idempotency(conn)
-            existing = await db_queries.get_charger_onboarding_idempotency(
-                conn,
-                organization_id=org_id,
-                endpoint=endpoint,
-                idempotency_key=idempotency_key,
-            )
-            if existing:
-                if not hmac.compare_digest(existing["request_hash"], request_hash):
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="Idempotency-Key was already used with a different request body",
-                    )
-                return JSONResponse(
-                    status_code=int(existing["status_code"] or status.HTTP_201_CREATED),
-                    content=_json_response_payload(existing["response_json"]),
-                )
-
             async with conn.transaction():
+                await db_queries.acquire_charger_onboarding_idempotency_lock(
+                    conn,
+                    organization_id=org_id,
+                    endpoint=endpoint,
+                    idempotency_key=idempotency_key,
+                )
+                existing = await db_queries.get_charger_onboarding_idempotency(
+                    conn,
+                    organization_id=org_id,
+                    endpoint=endpoint,
+                    idempotency_key=idempotency_key,
+                )
+                if existing:
+                    if not hmac.compare_digest(existing["request_hash"], request_hash):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="Idempotency-Key was already used with a different request body",
+                        )
+                    return JSONResponse(
+                        status_code=int(existing["status_code"] or status.HTTP_201_CREATED),
+                        content=_json_response_payload(existing["response_json"]),
+                    )
                 context = await db_queries.get_depot_org_slug_context(
                     conn,
                     depot_id=depot_id,
@@ -1632,7 +1638,7 @@ async def create_charger_onboarding(
                 org_slug = _slugify_ocpp_component(context["organization_name"], "org")
                 depot_slug = _slugify_ocpp_component(context["depot_name"], "depot")
                 password = _generate_ocpp_basic_password()
-                password_hash = _hash_ocpp_basic_password(password)
+                password_hash = await _hash_ocpp_basic_password(password)
 
                 # Retry only for generated OCPP ID collisions under concurrent provisioning.
                 charger: Optional[dict] = None
