@@ -278,6 +278,130 @@ async def get_depot_schedules(
     return await db.fetch(query, depot_id, start_time, end_time)
 
 
+async def get_vehicle_ids_for_depot(db, depot_id: UUID, vehicle_ids: list[UUID]) -> set[str]:
+    """Return vehicle ids from the requested set that belong to the depot."""
+    if not vehicle_ids:
+        return set()
+
+    query = """
+        SELECT vehicle_id::text AS vehicle_id
+        FROM vehicles
+        WHERE depot_id = $1
+          AND vehicle_id = ANY($2::uuid[])
+    """
+    rows = await db.fetch(query, depot_id, vehicle_ids)
+    return {row["vehicle_id"] for row in rows}
+
+
+async def create_manual_schedule(
+    db,
+    *,
+    vehicle_id: UUID,
+    route_id: str,
+    departure_time: datetime,
+    return_time: datetime,
+    required_soc: float,
+    energy_kwh: Optional[float],
+) -> dict:
+    """Create one manually-entered vehicle schedule row."""
+    query = """
+        INSERT INTO schedules (
+            vehicle_id,
+            route_id,
+            departure_time,
+            return_time,
+            required_soc,
+            energy_kwh
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING schedule_id::text AS schedule_id,
+                  vehicle_id::text AS vehicle_id,
+                  route_id,
+                  departure_time,
+                  return_time,
+                  required_soc,
+                  energy_kwh
+    """
+    row = await db.fetchrow(
+        query,
+        vehicle_id,
+        route_id,
+        departure_time,
+        return_time,
+        required_soc,
+        energy_kwh,
+    )
+    return dict(row)
+
+
+async def get_schedule_for_depot(db, *, depot_id: UUID, schedule_id: UUID) -> Optional[dict]:
+    """Fetch one schedule only if it belongs to a vehicle in the depot."""
+    query = """
+        SELECT s.schedule_id::text AS schedule_id,
+               s.vehicle_id::text AS vehicle_id,
+               s.route_id,
+               s.departure_time,
+               s.return_time,
+               s.required_soc,
+               s.energy_kwh
+        FROM schedules s
+        JOIN vehicles v ON v.vehicle_id = s.vehicle_id
+        WHERE s.schedule_id = $1
+          AND v.depot_id = $2
+    """
+    row = await db.fetchrow(query, schedule_id, depot_id)
+    return dict(row) if row else None
+
+
+async def update_manual_schedule(
+    db,
+    *,
+    depot_id: UUID,
+    schedule_id: UUID,
+    vehicle_id: UUID,
+    route_id: str,
+    departure_time: datetime,
+    return_time: datetime,
+    required_soc: float,
+    energy_kwh: Optional[float],
+) -> Optional[dict]:
+    """Update one manually-entered schedule while preserving depot scoping."""
+    query = """
+        UPDATE schedules s
+        SET vehicle_id = $3,
+            route_id = $4,
+            departure_time = $5,
+            return_time = $6,
+            required_soc = $7,
+            energy_kwh = $8
+        FROM vehicles old_v, vehicles new_v
+        WHERE s.schedule_id = $1
+          AND old_v.vehicle_id = s.vehicle_id
+          AND old_v.depot_id = $2
+          AND new_v.vehicle_id = $3
+          AND new_v.depot_id = $2
+        RETURNING s.schedule_id::text AS schedule_id,
+                  s.vehicle_id::text AS vehicle_id,
+                  s.route_id,
+                  s.departure_time,
+                  s.return_time,
+                  s.required_soc,
+                  s.energy_kwh
+    """
+    row = await db.fetchrow(
+        query,
+        schedule_id,
+        depot_id,
+        vehicle_id,
+        route_id,
+        departure_time,
+        return_time,
+        required_soc,
+        energy_kwh,
+    )
+    return dict(row) if row else None
+
+
 # ============ OPTIMIZATION RUN QUERIES ============
 
 
