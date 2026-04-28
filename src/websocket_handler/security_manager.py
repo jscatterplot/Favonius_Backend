@@ -478,10 +478,11 @@ class SecurityManager:
         checker = getattr(self.timescale_client, "station_requires_basic_auth", None)
         if checker is None:
             self.logger.warning(
-                "Basic Auth requirement checker unavailable; enforcing Basic Auth for station %s",
+                "Basic Auth requirement checker unavailable; allowing standard auth fallback for "
+                "station %s",
                 station_id,
             )
-            return True
+            return False
         try:
             return bool(await checker(station_id))
         except Exception as exc:
@@ -490,7 +491,7 @@ class SecurityManager:
                 station_id,
                 exc,
             )
-            return True
+            return False
 
     async def _is_station_locked_out(self, station_id: str) -> bool:
         """Check if station is locked out due to failed attempts."""

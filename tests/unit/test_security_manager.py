@@ -143,6 +143,28 @@ class TestSecurityManager:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_missing_basic_auth_checker_allows_other_methods(self, security_manager):
+        """Missing checker should not force Basic Auth-only authentication."""
+        station_id = "test-station-001"
+        auth_data = {"bearer_token": "valid_token"}
+        security_manager.timescale_client.station_requires_basic_auth.side_effect = RuntimeError(
+            "db unavailable"
+        )
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_authenticate_client_certificate", return_value=False),
+            patch.object(security_manager, "_authenticate_bearer_token", return_value=True),
+            patch.object(security_manager, "_clear_failed_attempts", return_value=None),
+            patch.object(security_manager, "_log_security_event", return_value=None),
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is True
+        assert error is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_generate_station_token(self, security_manager):
         """Test generating a station authentication token."""
         station_id = "STATION_001"
