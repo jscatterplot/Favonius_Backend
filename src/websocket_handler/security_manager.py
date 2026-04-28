@@ -139,17 +139,27 @@ class SecurityManager:
                 return False, "Station is temporarily locked out"
 
             basic_auth_required = await self._station_requires_basic_auth(station_id)
-            if basic_auth_required and not (
-                auth_data.get("username") and auth_data.get("password")
-            ):
-                await self._record_failed_attempt(station_id)
-                await self._log_security_event(
-                    station_id,
-                    SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
-                    f"Basic Auth credentials are required for station {station_id}",
-                    {"reason": "missing_basic_auth"},
-                )
-                return False, "Basic Auth credentials required"
+            if basic_auth_required:
+                username = auth_data.get("username")
+                password = auth_data.get("password")
+                if not (username and password):
+                    await self._record_failed_attempt(station_id)
+                    await self._log_security_event(
+                        station_id,
+                        SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
+                        f"Basic Auth credentials are required for station {station_id}",
+                        {"reason": "missing_basic_auth"},
+                    )
+                    return False, "Basic Auth credentials required"
+                if username != station_id:
+                    await self._record_failed_attempt(station_id)
+                    await self._log_security_event(
+                        station_id,
+                        SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
+                        f"Basic Auth username must match station id for station {station_id}",
+                        {"reason": "basic_auth_username_mismatch"},
+                    )
+                    return False, "Basic Auth username must match station id"
 
             # Production chargers provisioned through onboarding must use Basic Auth.
             auth_methods = (
@@ -466,8 +476,6 @@ class SecurityManager:
         password = auth_data.get("password")
 
         if not username or not password:
-            return False
-        if username != station_id:
             return False
 
         # Validate credentials against database
