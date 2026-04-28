@@ -184,6 +184,37 @@ class TestFleetIdentityApi:
         assert response.json()["assigned_driver_ids"] == driver_ids
         assert create_mock.await_args.kwargs["assigned_vehicle_ids"] == vehicle_ids
 
+    def test_create_rfid_card_cross_depot_assignment_returns_400(self, client, mock_db_pool):
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, conn = mock_db_pool
+        conn.transaction = MagicMock()
+        conn.transaction.return_value.__aenter__.return_value = None
+        conn.transaction.return_value.__aexit__.return_value = None
+        payload = {
+            "idTag": "CARD-1",
+            "label": "Shared depot card",
+            "status": "active",
+            "assignedVehicleIds": [str(uuid4())],
+        }
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.create_rfid_card",
+            new_callable=AsyncMock,
+            side_effect=ValueError("assigned_vehicle_ids must all belong to the card depot"),
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/rfid-cards",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert "assigned_vehicle_ids" in response.json()["detail"]
+
 
 class TestFleetIdentityQueries:
     """Pure query helper behavior with mocked asyncpg connections."""
@@ -316,3 +347,30 @@ class TestOCPPServerIdentityCallbacks:
             status = await server._handle_authorize("charger-1", "UNKNOWN")
 
         assert status == AuthorizationStatus.invalid
+
+    @pytest.mark.asyncio
+    async def test_stop_transaction_clears_connector_identity_cache(self):
+        server = OCPPServer()
+        server._connector_identity_cache[("charger-1", 1)] = {"vehicle_id": str(uuid4())}
+        await server._handle_transaction_stop(
+            "charger-1",
+            7,
+            "CARD-1",
+            0,
+            "2026-01-01T00:00:00Z",
+            "Local",
+            [],
+        )
+
+        assert ("charger-1", 1) not in server._connector_identity_cache
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cleanup_clears_pending_state(self):
+        server = OCPPServer()
+        server._connector_identity_cache[("charger-1", 1)] = {"vehicle_id": str(uuid4())}
+        server._pending_starts["charger-1"] = {"connector_id": 1}
+
+        server._clear_charge_point_caches("charger-1")
+
+        assert not any(key[0] == "charger-1" for key in server._connector_identity_cache)
+        assert "charger-1" not in server._pending_starts

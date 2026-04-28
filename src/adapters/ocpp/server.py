@@ -73,7 +73,8 @@ class OCPPServer:
         self.on_meter_values = on_meter_values
         self._on_boot = on_boot
         self._on_tx_start = on_transaction_start or self._handle_transaction_start
-        self._on_tx_stop = on_transaction_stop
+        self._tx_stop_callback = on_transaction_stop
+        self._on_tx_stop = self._handle_transaction_stop
         self._on_authorize = on_authorize or self._handle_authorize
         self.server: Optional[websockets.WebSocketServer] = None
         self._running = False
@@ -82,6 +83,7 @@ class OCPPServer:
         self._connector_status_cache: dict[str, dict[int, str]] = {}
         self._pending_starts: dict[str, dict[str, Any]] = {}
         self._connector_identity_cache: dict[tuple[str, int], dict[str, Any]] = {}
+        self._transaction_connectors: dict[tuple[str, int], int] = {}
 
         logger.info(f"Initialized OCPPServer on {host}:{port}")
 
@@ -121,7 +123,7 @@ class OCPPServer:
         finally:
             if charge_point_id in self.charge_points:
                 del self.charge_points[charge_point_id]
-            self._connector_status_cache.pop(charge_point_id, None)
+            self._clear_charge_point_caches(charge_point_id)
             logger.info(f"Cleaned up connection for charge point: {charge_point_id}")
 
     async def handle_websocket(self, websocket: Any, charge_point_id: str) -> None:
@@ -148,7 +150,7 @@ class OCPPServer:
             logger.info(f"OCPP connection closed for {charge_point_id}: {e}")
         finally:
             self.charge_points.pop(charge_point_id, None)
-            self._connector_status_cache.pop(charge_point_id, None)
+            self._clear_charge_point_caches(charge_point_id)
             logger.info(f"Cleaned up OCPP connection for charge point: {charge_point_id}")
 
     # ------------------------------------------------------------------
@@ -322,6 +324,62 @@ class OCPPServer:
         }
         return AuthorizationStatus.accepted
 
+    async def _handle_transaction_stop(
+        self,
+        charge_point_id: str,
+        transaction_id: int,
+        id_tag: str,
+        meter_stop: int,
+        timestamp: str,
+        reason: str,
+        transaction_data: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        """Handle StopTransaction and clear connector-scoped identity cache."""
+        connector_id: Optional[int] = None
+        cp = self.charge_points.get(charge_point_id)
+        if cp:
+            for known_connector_id, known_transaction_id in cp.transactions.items():
+                if known_transaction_id == transaction_id:
+                    connector_id = known_connector_id
+                    break
+            if connector_id is None and cp.current_connector_id is not None:
+                connector_id = cp.current_connector_id
+        if connector_id is not None:
+            self._connector_identity_cache.pop((charge_point_id, connector_id), None)
+        else:
+            connector_id = self._transaction_connectors.get((charge_point_id, transaction_id))
+            if connector_id is not None:
+                self._connector_identity_cache.pop((charge_point_id, connector_id), None)
+        self._transaction_connectors.pop((charge_point_id, transaction_id), None)
+
+        if self._tx_stop_callback:
+            await self._tx_stop_callback(
+                charge_point_id,
+                transaction_id,
+                id_tag,
+                meter_stop,
+                timestamp,
+                reason,
+                transaction_data,
+            )
+
+    def _clear_charge_point_identity_cache(self, charge_point_id: str) -> None:
+        """Drop all connector identity entries for a charge point."""
+        stale_keys = [
+            key for key in self._connector_identity_cache if key[0] == charge_point_id
+        ]
+        for key in stale_keys:
+            self._connector_identity_cache.pop(key, None)
+
+    def _clear_charge_point_caches(self, charge_point_id: str) -> None:
+        """Drop all charge-point scoped caches on disconnect."""
+        self._connector_status_cache.pop(charge_point_id, None)
+        self._pending_starts.pop(charge_point_id, None)
+        self._clear_charge_point_identity_cache(charge_point_id)
+        stale_tx_keys = [key for key in self._transaction_connectors if key[0] == charge_point_id]
+        for key in stale_tx_keys:
+            self._transaction_connectors.pop(key, None)
+
     async def _next_transaction_id(self, charge_point_id: str) -> int:
         """Generate a DB-backed transactionId and persist open session identity."""
         if not self.pools:
@@ -330,6 +388,7 @@ class OCPPServer:
             tx_id = int(await conn.fetchval("SELECT nextval('ocpp_transaction_id')"))
             pending = self._pending_starts.pop(charge_point_id, None)
             if pending:
+                self._transaction_connectors[(charge_point_id, tx_id)] = pending["connector_id"]
                 await conn.execute(
                     """
                     INSERT INTO charging_sessions (
@@ -500,6 +559,9 @@ class OCPPServer:
 
         self.charge_points.clear()
         self._connector_status_cache.clear()
+        self._pending_starts.clear()
+        self._connector_identity_cache.clear()
+        self._transaction_connectors.clear()
 
         if self.server:
             self.server.close()

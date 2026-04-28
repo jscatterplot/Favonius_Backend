@@ -1445,6 +1445,8 @@ def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTP
     constraint = getattr(exc, "constraint_name", "") or ""
     if "id_tag" in constraint:
         detail = "idTag is already registered"
+    elif "vehicles_external_id" in constraint:
+        detail = "External identifier is already registered"
     elif "external" in constraint:
         detail = "External identifier is already registered for this depot"
     else:
@@ -2034,6 +2036,8 @@ async def create_rfid_card(
         return card
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @app.patch(
@@ -2077,6 +2081,8 @@ async def update_rfid_card(
         return card
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @app.post(
