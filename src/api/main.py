@@ -1603,6 +1603,8 @@ async def create_charger_onboarding(
 
     try:
         connector_ids = _connector_ids_for_request(request)
+        password = _generate_ocpp_basic_password()
+        password_hash = await _hash_ocpp_basic_password(password)
         async with db_pools.static.acquire() as conn:
             await db_queries.delete_expired_charger_onboarding_idempotency(conn)
             async with conn.transaction():
@@ -1640,8 +1642,6 @@ async def create_charger_onboarding(
                     )
                 org_slug = _slugify_ocpp_component(context["organization_name"], "org")
                 depot_slug = _slugify_ocpp_component(context["depot_name"], "depot")
-                password = _generate_ocpp_basic_password()
-                password_hash = await _hash_ocpp_basic_password(password)
 
                 # Retry only for generated OCPP ID collisions under concurrent provisioning.
                 charger: Optional[dict] = None
