@@ -171,7 +171,8 @@ Favonius_Backend/
 │   ├── 005_telemetry_primary_key.sql
 │   ├── 012_ocpp_pilot_hardening.sql  # OCPP 1.6 sequences + station_credentials
 │   ├── 013_recovery.sql         # charging_command_queue + cross-restart recovery
-│   └── 014_dispatch_queue_notify.sql # queue 'sent' status + pg_notify trigger
+│   ├── 014_dispatch_queue_notify.sql # queue 'sent' status + pg_notify trigger
+│   └── 016_depot_setup_metadata.sql  # depot setup metadata + depot_id indexes
 │
 ├── tests/
 │   ├── unit/                    # Unit tests (mock everything)
@@ -299,7 +300,7 @@ These come directly from the PRD and are non-negotiable:
 ### Reference (static) tables
 - `organizations` — Customer / workspace tenant (`organization_id` UUID). Rows are **JIT-mirrored** from verified Supabase JWT `app_metadata` (see Tenant mirroring below); canonical org lifecycle lives in Supabase / frontend.
 - `organization_users` — At most one org per user (`user_id` PK → `organization_id`, `role`). JIT-mirrored from JWT `app_metadata` (`organization_id`, `favonius_role`). **Not** used for API authorization; access control compares JWT claims to `depots.organization_id`.
-- `depots` — Physical locations; `max_grid_kw` is the hard site power limit; `organization_id` FK to `organizations`
+- `depots` — Physical locations; `max_grid_kw` is the hard site power limit; `organization_id` FK to `organizations`; includes setup metadata fields (`address`, `billing_metadata`, `building_load_source`, `demand_charge_billing_period`, `timezone`, `currency`, `utility_id`)
 - `vehicles` — Fleet vehicles; `max_charge_kw` updated from OCPP MeterValues
 - `chargers` — EVSE; `ocpp_id` links to OCPP protocol
 - `charger_vehicle_access` — Physical accessibility matrix
@@ -354,6 +355,8 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `GET` | `/metrics` | Prometheus metrics (text format) |
 | `GET` | `/admin/controllers` | List active depot controllers |
 | `GET` | `/admin/controllers/{id}/health` | Controller health |
+| `POST` | `/admin/first-depot-setup` | Create initial tenant-scoped depot setup (customer_admin, JWT `app_metadata.organization_id` required) |
+| `PATCH` | `/admin/depots/{id}` | Update tenant-scoped depot setup (customer_admin + depot access required) |
 | `GET` | `/admin/ocpp/{cp_id}/state` | (Legacy WS handler, port 8080) Per-charger debug dump: connection state, vendor/model, last_boot_at, last_heartbeat_at, latest connector_status, open transactions, charging_command_queue rollup. Owner role required. |
 
 ### WebSocket endpoints
