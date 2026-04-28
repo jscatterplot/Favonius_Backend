@@ -313,7 +313,7 @@ These come directly from the PRD and are non-negotiable:
 - `building_load` — Non-EV site power draw (**required** for grid calc)
 
 ### Tenant mirroring (JIT)
-- On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `organization_users` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.favonius_role`). **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `depots.organization_id`).
+- On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `organization_users` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.organization_name`, `app_metadata.favonius_role`). If `organization_name` is absent, a deterministic placeholder (`org-<org_uuid_prefix>`) is used for bootstrap rows. **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `depots.organization_id`).
 - In-process TTL cache: `TENANT_MIRROR_TTL_S` (default `300`) seconds per `sub` to limit DB writes.
 - Workspace **invitations** are managed in Supabase only; there is no `invitations` table in this backend.
 

@@ -50,6 +50,10 @@ async def mirror_user_tenant(user: dict, pool: Optional["asyncpg.Pool"]) -> None
     user_id = user.get("sub")
     org_id = get_user_organization_id(user)
     role = get_user_role(user)
+    app_metadata = user.get("app_metadata") if isinstance(user.get("app_metadata"), dict) else {}
+    organization_name = app_metadata.get("organization_name")
+    if not isinstance(organization_name, str) or not organization_name.strip():
+        organization_name = f"org-{org_id[:8]}" if org_id else None
     if not user_id or not org_id or role == "favonius_admin":
         return
 
@@ -73,7 +77,7 @@ async def mirror_user_tenant(user: dict, pool: Optional["asyncpg.Pool"]) -> None
                 "INSERT INTO organizations (organization_id, name) "
                 "VALUES ($1::uuid, $2) ON CONFLICT (organization_id) DO NOTHING",
                 org_id,
-                f"org-{org_id[:8]}",
+                organization_name,
             )
             await conn.execute(
                 "INSERT INTO organization_users (user_id, organization_id, role) "

@@ -65,10 +65,12 @@ def _clear_mirror_cache():
     tm.clear_tenant_mirror_cache()
 
 
-def _user(sub: str, org: str | None, role: str) -> dict:
+def _user(sub: str, org: str | None, role: str, organization_name: str | None = None) -> dict:
     u: dict = {"sub": sub, "role": "authenticated"}
     if org is not None:
         u["app_metadata"] = {"organization_id": org, "favonius_role": role}
+        if organization_name is not None:
+            u["app_metadata"]["organization_name"] = organization_name
     else:
         u["app_metadata"] = {"favonius_role": role} if role else {}
     return u
@@ -81,11 +83,27 @@ async def test_mirror_inserts_org_and_membership_for_new_user():
         "11111111-1111-4111-8111-111111111111",
         "22222222-2222-4222-8222-222222222222",
         "customer_operator",
+        "Acme Transit",
     )
     await tm.mirror_user_tenant(user, pool)
     assert len(pool.conn.executes) == 2
     assert "INSERT INTO organizations" in pool.conn.executes[0][0]
+    assert pool.conn.executes[0][1][1] == "Acme Transit"
     assert "INSERT INTO organization_users" in pool.conn.executes[1][0]
+
+
+@pytest.mark.asyncio
+async def test_mirror_uses_placeholder_name_when_org_name_missing():
+    pool = _FakePool()
+    org_id = "22222222-2222-4222-8222-222222222222"
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        org_id,
+        "customer_operator",
+    )
+    await tm.mirror_user_tenant(user, pool)
+    assert len(pool.conn.executes) == 2
+    assert pool.conn.executes[0][1][1] == "org-22222222"
 
 
 @pytest.mark.asyncio
