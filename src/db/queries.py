@@ -785,7 +785,7 @@ async def next_charger_ocpp_id(
         SELECT ocpp_id
         FROM chargers
         WHERE ocpp_id ~ ('^' || $1 || '-[0-9]+$')
-        ORDER BY ocpp_id DESC
+        ORDER BY substring(ocpp_id FROM '([0-9]+)$')::integer DESC
         LIMIT 1
     """
     latest = await db.fetchval(query, prefix)
