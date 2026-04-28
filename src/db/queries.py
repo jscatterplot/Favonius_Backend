@@ -780,7 +780,8 @@ async def next_charger_ocpp_id(
     depot_slug: str,
 ) -> str:
     """Generate the next depot-scoped immutable OCPP charge point id."""
-    prefix = f"{organization_slug}-{depot_slug}"
+    # Use a separator that slugification never emits to keep org/depot boundaries unambiguous.
+    prefix = f"{organization_slug}_{depot_slug}"
     query = """
         SELECT ocpp_id
         FROM chargers
