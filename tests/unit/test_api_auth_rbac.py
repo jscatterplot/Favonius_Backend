@@ -18,7 +18,7 @@ import asyncpg
 import pytest
 from fastapi import HTTPException, status as http_status
 
-from src.api.main import CommandRequest, _require_depot_access, app
+from src.api.main import _require_depot_access, app
 from src.db import queries as db_queries
 from src.security.audit_log import AuditEvent
 from src.security.auth import verify_depot_access, verify_token
@@ -908,15 +908,17 @@ class TestManualScheduleAdmin:
         )
         conn.fetchval = AsyncMock(
             side_effect=[
-                False,
-                False,
-                True,
-                True,
                 True,
                 True,
                 True,
                 False,
-                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
                 True,
                 True,
                 True,
@@ -927,10 +929,6 @@ class TestManualScheduleAdmin:
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
-        ), patch(
-            "src.api.main._depot_battery_marked_present",
-            new_callable=AsyncMock,
-            return_value=False,
         ):
             blocked = client.get(
                 f"/admin/depots/{DEPOT_ID}/schedule/readiness",

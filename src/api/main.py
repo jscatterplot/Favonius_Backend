@@ -4,7 +4,6 @@ Reference: PRD_v2.md#7-api-specifications
 """
 
 import asyncio
-from copy import copy
 import hashlib
 import hmac
 import json
@@ -39,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.controller_manager import ControllerManager
@@ -49,13 +48,13 @@ from ..core.state.assembler import StateAssembler
 from ..db import queries as db_queries
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
-from ..security.audit_log import AuditEvent, AuditLogger, audit_log_event, get_audit_logger, set_audit_logger
+from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import get_user_role, verify_depot_access
 from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
-from ..security.rbac import Permission, has_permission, require_favonius_admin, require_permission
+from ..security.rbac import Permission, has_permission, require_favonius_admin
 from ..security.validators import (
     validate_depot_id,
     validate_horizon_hours,
@@ -822,7 +821,7 @@ class ScheduleReadinessResponse(BaseModel):
 
     depot_id: str
     ready: bool
-    checks: list[ReadinessChecklistItem]
+    checks: list["ReadinessChecklistItem"]
 
 
 class ManualScheduleCreateResponse(BaseModel):
