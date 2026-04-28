@@ -950,6 +950,159 @@ class ChargerOnboardingResponse(BaseModel):
     credentials: ChargerOnboardingCredentials
 
 
+# ============ Fleet Identity Models ============
+
+
+class VehicleIdentityBase(BaseModel):
+    """Vehicle identity metadata managed by customer admins."""
+
+    externalId: str = Field(..., min_length=1, max_length=100)
+    displayName: Optional[str] = Field(default=None, max_length=255)
+    vehicleType: str = Field(..., min_length=1, max_length=50)
+    batteryKwh: float = Field(..., gt=0)
+    maxChargeKw: float = Field(..., gt=0)
+    idTag: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    vin: Optional[str] = Field(default=None, max_length=64)
+    licensePlate: Optional[str] = Field(default=None, max_length=64)
+    status: Literal["active", "inactive", "retired"] = "active"
+
+
+class VehicleIdentityUpdate(BaseModel):
+    """Patch vehicle identity metadata except the primary idTag."""
+
+    externalId: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    displayName: Optional[str] = Field(default=None, max_length=255)
+    vehicleType: Optional[str] = Field(default=None, min_length=1, max_length=50)
+    batteryKwh: Optional[float] = Field(default=None, gt=0)
+    maxChargeKw: Optional[float] = Field(default=None, gt=0)
+    vin: Optional[str] = Field(default=None, max_length=64)
+    licensePlate: Optional[str] = Field(default=None, max_length=64)
+    status: Optional[Literal["active", "inactive", "retired"]] = None
+
+
+class PrimaryIdTagRequest(BaseModel):
+    """Set or clear a vehicle's primary OCPP idTag."""
+
+    idTag: Optional[str] = Field(default=None, min_length=1, max_length=100)
+
+
+class DriverIdentityCreate(BaseModel):
+    """Driver identity metadata managed by customer admins."""
+
+    externalDriverId: Optional[str] = Field(default=None, max_length=100)
+    displayName: str = Field(..., min_length=1, max_length=255)
+    email: Optional[str] = Field(default=None, max_length=255)
+    phone: Optional[str] = Field(default=None, max_length=64)
+    status: Literal["active", "inactive"] = "active"
+
+
+class DriverIdentityUpdate(BaseModel):
+    """Patch driver identity metadata."""
+
+    externalDriverId: Optional[str] = Field(default=None, max_length=100)
+    displayName: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    email: Optional[str] = Field(default=None, max_length=255)
+    phone: Optional[str] = Field(default=None, max_length=64)
+    status: Optional[Literal["active", "inactive"]] = None
+
+
+class RfidCardCreate(BaseModel):
+    """RFID card metadata and current assignments."""
+
+    idTag: str = Field(..., min_length=1, max_length=100)
+    label: Optional[str] = Field(default=None, max_length=255)
+    status: Literal["active", "inactive", "lost", "stolen"] = "active"
+    notes: Optional[str] = Field(default=None, max_length=2048)
+    assignedVehicleIds: list[str] = Field(default_factory=list)
+    assignedDriverIds: list[str] = Field(default_factory=list)
+
+    @field_validator("assignedVehicleIds", "assignedDriverIds")
+    @classmethod
+    def validate_assignment_ids(cls, value: list[str]) -> list[str]:
+        """Ensure supplied relationship ids are valid UUIDs."""
+        for item in value:
+            UUID(item)
+        return value
+
+
+class RfidCardUpdate(BaseModel):
+    """Patch RFID card metadata and optionally replace current assignments."""
+
+    idTag: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    label: Optional[str] = Field(default=None, max_length=255)
+    status: Optional[Literal["active", "inactive", "lost", "stolen"]] = None
+    notes: Optional[str] = Field(default=None, max_length=2048)
+    assignedVehicleIds: Optional[list[str]] = None
+    assignedDriverIds: Optional[list[str]] = None
+
+    @field_validator("assignedVehicleIds", "assignedDriverIds")
+    @classmethod
+    def validate_optional_assignment_ids(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        """Ensure supplied relationship ids are valid UUIDs."""
+        if value is None:
+            return value
+        for item in value:
+            UUID(item)
+        return value
+
+
+class VehicleIdentityResponse(BaseModel):
+    """Vehicle identity response."""
+
+    vehicle_id: str
+    depot_id: str
+    external_id: str
+    display_name: Optional[str] = None
+    vehicle_type: str
+    battery_kwh: float
+    max_charge_kw: float
+    id_tag: Optional[str] = None
+    vin: Optional[str] = None
+    license_plate: Optional[str] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class DriverIdentityResponse(BaseModel):
+    """Driver identity response."""
+
+    driver_id: str
+    depot_id: str
+    external_driver_id: Optional[str] = None
+    display_name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class RfidCardResponse(BaseModel):
+    """RFID card identity response."""
+
+    card_id: str
+    depot_id: str
+    id_tag: str
+    label: Optional[str] = None
+    status: str
+    notes: Optional[str] = None
+    assigned_vehicle_ids: list[str] = Field(default_factory=list)
+    assigned_driver_ids: list[str] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class FleetIdentityResponse(BaseModel):
+    """Fleet identity tab response."""
+
+    vehicles: list[VehicleIdentityResponse] = Field(default_factory=list)
+    drivers: list[DriverIdentityResponse] = Field(default_factory=list)
+    rfid_cards: list[RfidCardResponse] = Field(default_factory=list)
+
+
 # ============ Command Dispatcher Models ============
 
 
@@ -1289,6 +1442,33 @@ def _require_customer_admin_with_org(user: dict) -> str:
     return str(org_id)
 
 
+def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTPException:
+    """Map identity uniqueness conflicts to frontend-stable 409 responses."""
+    constraint = getattr(exc, "constraint_name", "") or ""
+    if "id_tag" in constraint:
+        detail = "idTag is already registered"
+    elif "external" in constraint:
+        detail = "External identifier is already registered for this depot"
+    else:
+        detail = "Identity record already exists"
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+async def _audit_identity_write(user: dict, depot_id: str, action: str, resource_id: str) -> None:
+    """Best-effort audit trail for customer-admin identity writes."""
+    audit = get_audit_logger()
+    if audit is None:
+        return
+    await audit.log(
+        AuditEvent(
+            event_type="IDENTITY_WRITE",
+            user_id=user.get("sub"),
+            resource=f"/admin/depots/{depot_id}/identity",
+            details={"action": action, "depot_id": depot_id, "resource_id": resource_id},
+        )
+    )
+
+
 async def _build_readiness_checklist(depot_id: str, payload: DepotSetupPayload) -> list[dict]:
     """Build exact setup readiness checklist for optimization prerequisites."""
     if not db_pools:
@@ -1567,6 +1747,338 @@ async def get_depot_metadata(
             extra={"depot_id": depot_id},
         )
         raise DatabaseError(f"Database error: {str(e)}")
+
+
+@app.get(
+    "/admin/depots/{depot_id}/identity",
+    response_model=FleetIdentityResponse,
+    tags=["admin"],
+    summary="List fleet identity records for a depot",
+)
+async def get_fleet_identity(
+    depot_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return vehicles, drivers, RFID cards, and current card assignments."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        result = await db_queries.list_fleet_identity(
+            conn, depot_id=depot_id, organization_id=org_id
+        )
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: you do not have permission for this depot",
+        )
+    return result
+
+
+@app.post(
+    "/admin/depots/{depot_id}/vehicles",
+    response_model=VehicleIdentityResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Create a vehicle identity record",
+)
+async def create_vehicle_identity(
+    depot_id: str,
+    request: VehicleIdentityBase,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create a vehicle under an organization-owned depot."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            vehicle = await db_queries.create_vehicle_identity(
+                conn,
+                depot_id=depot_id,
+                organization_id=org_id,
+                external_id=request.externalId,
+                vehicle_type=request.vehicleType,
+                battery_kwh=request.batteryKwh,
+                max_charge_kw=request.maxChargeKw,
+                display_name=request.displayName,
+                id_tag=request.idTag,
+                vin=request.vin,
+                license_plate=request.licensePlate,
+                vehicle_status=request.status,
+            )
+        if vehicle is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: you do not have permission for this depot",
+            )
+        await _audit_identity_write(user, depot_id, "vehicle.create", vehicle["vehicle_id"])
+        _depot_config_cache.pop(depot_id, None)
+        return vehicle
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.patch(
+    "/admin/depots/{depot_id}/vehicles/{vehicle_id}",
+    response_model=VehicleIdentityResponse,
+    tags=["admin"],
+    summary="Update vehicle identity fields",
+)
+async def update_vehicle_identity(
+    depot_id: str,
+    vehicle_id: str,
+    request: VehicleIdentityUpdate,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Patch vehicle identity metadata except primary idTag."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    validate_vehicle_id(vehicle_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            vehicle = await db_queries.update_vehicle_identity(
+                conn,
+                depot_id=depot_id,
+                organization_id=org_id,
+                vehicle_id=vehicle_id,
+                display_name=request.displayName,
+                external_id=request.externalId,
+                vehicle_type=request.vehicleType,
+                battery_kwh=request.batteryKwh,
+                max_charge_kw=request.maxChargeKw,
+                vin=request.vin,
+                license_plate=request.licensePlate,
+                vehicle_status=request.status,
+            )
+        if vehicle is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
+        await _audit_identity_write(user, depot_id, "vehicle.update", vehicle_id)
+        _depot_config_cache.pop(depot_id, None)
+        return vehicle
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.put(
+    "/admin/depots/{depot_id}/vehicles/{vehicle_id}/primary-id-tag",
+    response_model=VehicleIdentityResponse,
+    tags=["admin"],
+    summary="Set or clear a vehicle primary idTag",
+)
+async def set_vehicle_primary_id_tag(
+    depot_id: str,
+    vehicle_id: str,
+    request: PrimaryIdTagRequest,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Set/clear vehicles.id_tag, the primary OCPP vehicle idTag."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    validate_vehicle_id(vehicle_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            vehicle = await db_queries.set_vehicle_primary_id_tag(
+                conn,
+                depot_id=depot_id,
+                organization_id=org_id,
+                vehicle_id=vehicle_id,
+                id_tag=request.idTag,
+            )
+        if vehicle is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
+        await _audit_identity_write(user, depot_id, "vehicle.primary_id_tag", vehicle_id)
+        return vehicle
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+
+
+@app.post(
+    "/admin/depots/{depot_id}/drivers",
+    response_model=DriverIdentityResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Create a driver identity record",
+)
+async def create_driver_identity(
+    depot_id: str,
+    request: DriverIdentityCreate,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create a driver under an organization-owned depot."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            driver = await db_queries.create_driver_identity(
+                conn,
+                depot_id=depot_id,
+                organization_id=org_id,
+                external_driver_id=request.externalDriverId,
+                display_name=request.displayName,
+                email=request.email,
+                phone=request.phone,
+                driver_status=request.status,
+            )
+        if driver is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: you do not have permission for this depot",
+            )
+        await _audit_identity_write(user, depot_id, "driver.create", driver["driver_id"])
+        return driver
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+
+
+@app.patch(
+    "/admin/depots/{depot_id}/drivers/{driver_id}",
+    response_model=DriverIdentityResponse,
+    tags=["admin"],
+    summary="Update driver identity fields",
+)
+async def update_driver_identity(
+    depot_id: str,
+    driver_id: str,
+    request: DriverIdentityUpdate,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Patch driver identity metadata."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    validate_uuid(driver_id, "driver_id")
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            driver = await db_queries.update_driver_identity(
+                conn,
+                depot_id=depot_id,
+                organization_id=org_id,
+                driver_id=driver_id,
+                external_driver_id=request.externalDriverId,
+                display_name=request.displayName,
+                email=request.email,
+                phone=request.phone,
+                driver_status=request.status,
+            )
+        if driver is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Driver not found")
+        await _audit_identity_write(user, depot_id, "driver.update", driver_id)
+        return driver
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+
+
+@app.post(
+    "/admin/depots/{depot_id}/rfid-cards",
+    response_model=RfidCardResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Register an RFID card",
+)
+async def create_rfid_card(
+    depot_id: str,
+    request: RfidCardCreate,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create an RFID card and current vehicle/driver assignments."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            async with conn.transaction():
+                card = await db_queries.create_rfid_card(
+                    conn,
+                    depot_id=depot_id,
+                    organization_id=org_id,
+                    id_tag=request.idTag,
+                    label=request.label,
+                    card_status=request.status,
+                    notes=request.notes,
+                    assigned_vehicle_ids=request.assignedVehicleIds,
+                    assigned_driver_ids=request.assignedDriverIds,
+                )
+        if card is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: you do not have permission for this depot",
+            )
+        await _audit_identity_write(user, depot_id, "rfid_card.create", card["card_id"])
+        return card
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+
+
+@app.patch(
+    "/admin/depots/{depot_id}/rfid-cards/{card_id}",
+    response_model=RfidCardResponse,
+    tags=["admin"],
+    summary="Update RFID card metadata and assignments",
+)
+async def update_rfid_card(
+    depot_id: str,
+    card_id: str,
+    request: RfidCardUpdate,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Patch RFID card metadata and optionally replace current assignments."""
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    validate_uuid(card_id, "card_id")
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        async with db_pools.static.acquire() as conn:
+            async with conn.transaction():
+                card = await db_queries.update_rfid_card(
+                    conn,
+                    depot_id=depot_id,
+                    organization_id=org_id,
+                    card_id=card_id,
+                    id_tag=request.idTag,
+                    label=request.label,
+                    card_status=request.status,
+                    notes=request.notes,
+                    assigned_vehicle_ids=request.assignedVehicleIds,
+                    assigned_driver_ids=request.assignedDriverIds,
+                )
+        if card is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RFID card not found")
+        await _audit_identity_write(user, depot_id, "rfid_card.update", card_id)
+        return card
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
 
 
 @app.post(
