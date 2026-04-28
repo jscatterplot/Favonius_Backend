@@ -1647,28 +1647,29 @@ async def create_charger_onboarding(
                 charger: Optional[dict] = None
                 last_unique_error: Optional[asyncpg.UniqueViolationError] = None
                 for _ in range(3):
-                    ocpp_id = await db_queries.next_charger_ocpp_id(
-                        conn,
-                        organization_slug=org_slug,
-                        depot_slug=depot_slug,
-                    )
                     try:
-                        charger = await db_queries.create_charger_with_credentials(
-                            conn,
-                            depot_id=depot_id,
-                            ocpp_id=ocpp_id,
-                            display_name=request.displayName,
-                            vendor=request.vendor,
-                            model=request.model,
-                            serial_number=request.serialNumber,
-                            firmware=request.firmware,
-                            rated_kw=request.ratedKw,
-                            connector_type=request.connectorType,
-                            connector_count=request.connectorCount,
-                            connector_ids=connector_ids,
-                            network_notes=request.networkNotes,
-                            password_hash=password_hash,
-                        )
+                        async with conn.transaction():
+                            ocpp_id = await db_queries.next_charger_ocpp_id(
+                                conn,
+                                organization_slug=org_slug,
+                                depot_slug=depot_slug,
+                            )
+                            charger = await db_queries.create_charger_with_credentials(
+                                conn,
+                                depot_id=depot_id,
+                                ocpp_id=ocpp_id,
+                                display_name=request.displayName,
+                                vendor=request.vendor,
+                                model=request.model,
+                                serial_number=request.serialNumber,
+                                firmware=request.firmware,
+                                rated_kw=request.ratedKw,
+                                connector_type=request.connectorType,
+                                connector_count=request.connectorCount,
+                                connector_ids=connector_ids,
+                                network_notes=request.networkNotes,
+                                password_hash=password_hash,
+                            )
                         break
                     except asyncpg.UniqueViolationError as exc:
                         last_unique_error = exc
