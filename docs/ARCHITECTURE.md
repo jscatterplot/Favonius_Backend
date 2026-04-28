@@ -254,9 +254,9 @@ modules are the primary deprecation candidates:
 ### 4. DISPATCH (immediately after optimization - Main API)
 
 **Charger Allocation:**
-- Allocate: Aggregated charger power to individual chargers
-- Respect: Physical accessibility constraints (`charger_vehicle_access`)
-- Prioritize: Vehicles by departure time and SoC deficit
+- Allocate: Aggregated charger power to individual chargers (one bus ↔ one charger per timestep; power capped at charger capacity)
+- Sticky assignment: Same bus keeps same charger across timesteps; reassignment (charger→different bus) respects `charger_switch_gap_timesteps` and optional `charger_reassignment_allowed_windows` (see PRD §8.3)
+- Respect: Physical accessibility (`charger_vehicle_access`), prioritise by departure time and SoC deficit
 
 **Command Dispatch:**
 - OCPP: `SetChargingProfile` to each charger (currently via Main API's OCPP server; Phase 4: via WebSocket Handler)

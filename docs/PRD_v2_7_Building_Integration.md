@@ -981,6 +981,10 @@ class DepotConfig:
     max_site_power: float = 1000.0            # kW
     delta_t: float = 0.25                     # hours (15 min)
     n_timesteps: int = 96                     # 24 hours
+    # Allocator: min idle timesteps between same charger serving a different bus (unplug/move/plug).
+    charger_switch_gap_timesteps: int = 1
+    # Allocator: if set, charger reassignment (same charger, different bus) allowed only in these [start_t, end_t] ranges.
+    charger_reassignment_allowed_windows: Optional[list[tuple[int, int]]] = None
 
 
 @dataclass
@@ -1691,25 +1695,20 @@ To reduce optimization complexity, chargers are aggregated by `rated_kw` before 
    - `Σ_b y_charge[b,t] ≤ Σ_g n_chargers[g]` where g indexes charger groups
 
 3. **Post-optimization**: Allocate power to individual chargers
-   - For each timestep and charger group:
-     - Sort vehicles by priority (departure time, SoC deficit)
-     - Check physical accessibility (charger_vehicle_access)
-     - Allocate power to chargers within group using fair allocation
-     - Respect individual charger `rated_kw` limits
-     - Handle charger status (Available/Unavailable)
+   - One bus ↔ one charger per timestep (power capped at that charger's capacity; no splitting a bus across multiple chargers).
+   - Sticky assignment: same bus keeps same charger across timesteps (no bus→charger switching through the night).
+   - When a charger switches to a different bus, enforce `charger_switch_gap_timesteps` idle period and optional `charger_reassignment_allowed_windows` (Section 6.2).
 
 **Post-optimization Allocation Algorithm:**
-For each timestep t and charger group g:
-1. Get vehicles assigned to group g by optimizer (where P_charge[b,t] > 0)
-2. Sort vehicles by priority: (departure_time ASC, SoC_deficit DESC)
-3. For each vehicle in priority order:
-   - Find accessible chargers in group g (via charger_vehicle_access table)
-   - Allocate power to first available charger up to min(vehicle_max_kw, charger_rated_kw)
-   - If vehicle needs more power, allocate to next accessible charger
-   - Continue until vehicle power is fully allocated or no accessible chargers remain
-4. Respect individual charger `rated_kw` limits
-5. Skip chargers with status != 'Available'
-6. If allocation fails (no accessible chargers), log warning and use fallback allocation
+For each timestep t:
+1. Get vehicles with P_charge[b,t] > 0; sort by priority (departure_time ASC, SoC_deficit DESC).
+2. For each vehicle in priority order:
+   - **Sticky**: If the vehicle used a charger at t−1 and that charger is free and accessible, assign it (one charger only; cap power at charger rated_kw).
+   - **Fallback**: Else, choose one accessible charger that satisfies reassignment rules (min gap since last use by another bus; if `charger_reassignment_allowed_windows` is set, timestep must lie in a window). Allocate min(requested_power, charger_rated_kw). Do not assign the same bus to multiple chargers in the same timestep.
+   - If requested power exceeds that charger's capacity, allocate up to capacity and log under-allocation.
+3. At end of timestep, record per charger the last used timestep and vehicle for gap/window checks.
+4. Skip chargers with status != 'Available' (MVP: assume Available).
+5. If no valid charger found, log warning.
 
 **Benefits:**
 - Reduces MILP variables from O(n_chargers × n_vehicles × n_timesteps) to O(n_groups × n_vehicles × n_timesteps)
@@ -2997,6 +2996,7 @@ Follow the existing patterns in src/api/main.py.
 | 2.6 | 2025-01-19 | Claude + Joris | **VDV Protocol Integration (MVP):** Added VDV 463 transit operations integration and VDV 261 preconditioning support to MVP scope. Added US-07 (Transit Operations Integration) and US-08 (Bus Preconditioning) user stories. Added Section 9.6 with complete VDV 463 technical specification including message formats, ChargingRequest/ChargingInformation objects, preconditioning mechanisms, and database schema. Added AT-08 through AT-11 acceptance tests. Updated glossary with VDV terms. Preconditioning implemented via VDV 463 manualPreconditioning/automaticPreconditioning fields; full VDV 261 ISO 15118 stack deferred to post-MVP. |
 | 2.7 | 2025-01-19 | Claude + Joris | **Critical Fixes & BACnet Integration:** (1) **OCPP Protocol Correction**: Fixed incorrect claim that OCPP 2.0.1 is wire-compatible with 1.6J—clarified that chargers MUST be configured to use 1.6J subprotocol; (2) **HVAC Setpoint Offset Formula**: Added Constraint 15b with explicit `Offset = T_optimal - T_baseline` calculation and safety clamping; (3) **VDV 463 Vehicle ID Resolution**: Added explicit `vehicleId → external_id → vehicle_id` mapping logic with InvalidVehicleId error handling; (4) **BACnet Device-to-Zone Mapping**: Added device_id + object_id → zone_id resolution with unique constraint; (5) **Preconditioning Soft Constraint**: Changed Constraint 16 from hard to soft constraint with M_precond=1000 penalty to prevent infeasibility under site limit conflicts; (6) **Battery Efficiency Clarification**: Documented split round-trip efficiency model (√η for each direction) to prevent "free energy" loops; (7) **Dispatch Validation**: Added Section 8.7 with pre-dispatch charger/BACnet status checks to handle telemetry race conditions; (8) **Schema Fixes**: Corrected FK references in VDV 463 schema (charger_id, vehicle_id, depot_id); (9) **BuildingZone Dataclass**: Added missing max_hvac_power_kw and active_setpoint_oid fields; (10) **Acceptance Tests**: Added AT-12 (Solver Fallback) and AT-13 (Preconditioning Curtailment). |
 | 2.8 | 2025-02-04 | Claude + Joris | **MVP checklist alignment:** (1) **OCPP §7.2**: Added Heartbeat, Authorize to supported messages; added CS-initiated operations (Reset, UnlockConnector, ChangeAvailability, TriggerMessage, GetVariables, SetVariables, UpdateFirmware) and requirement to expose faults via alerts API; (2) **§7.1**: New GET /depots/{id}/alerts (charger_faults, last_optimization); (3) **§10.5**: New Observability (metrics for connectivity, session success, optimization runs, solver_used; faults via alerts API); (4) **AT-16**: Alerts and Observability acceptance test; (5) Integration test row for Alerts API. |
+| 2.9 | 2025-03-02 | Claude + Joris | **Charger allocator and DepotConfig (§8.3, §6.2):** (1) One bus ↔ one charger per timestep; power capped at charger capacity (no splitting a bus across multiple chargers). (2) Sticky assignment: same bus keeps same charger across timesteps. (3) Reassignment rules: when a charger serves a different bus, min idle gap (`charger_switch_gap_timesteps`) and optional `charger_reassignment_allowed_windows` (timestep ranges). (4) DepotConfig: added `charger_switch_gap_timesteps`, `charger_reassignment_allowed_windows`; updated Post-optimization Allocation Algorithm. |
 
 ---
 

@@ -52,12 +52,10 @@ def allocate_chargers(
         List of ChargerAssignment objects for each timestep
 
     Note:
-        Per PRD Section 8.3, the allocation algorithm:
-        1. Sorts vehicles by priority (departure time, SoC deficit)
-        2. Checks physical accessibility (charger_vehicle_access)
-        3. Allocates power to chargers within group using fair allocation
-        4. Respects individual charger rated_kw limits
-        5. Handles charger status (Available/Unavailable) - assumes all Available for MVP
+        - One bus ↔ one charger per timestep; power capped at that charger's capacity.
+        - Sticky assignment: same bus keeps same charger across timesteps (no bus→charger switch).
+        - When a charger switches to a different bus, config.charger_switch_gap_timesteps idle
+          period and optional charger_reassignment_allowed_windows are enforced.
     """
     assignments = []
     n_timesteps = len(result.grid_power)
@@ -76,6 +74,28 @@ def allocate_chargers(
             )
             vehicle_priorities[vid] = float(first_charge_t)
 
+    # Sticky assignment: same bus stays on same charger for the night (no bus→charger switching).
+    vehicle_charger: dict[str, str] = {}
+    # Reassignment rules: when one charger serves a different bus, enforce min gap and optional windows.
+    charger_last_used_t: dict[str, int] = {}
+    charger_last_vehicle_id: dict[str, str] = {}
+    gap = getattr(config, "charger_switch_gap_timesteps", 1)
+    allowed_windows = getattr(config, "charger_reassignment_allowed_windows", None)
+
+    def _reassignment_allowed(charger_id: str, vehicle_id: str, timestep: int) -> bool:
+        """True if charger can be assigned to this vehicle at this timestep (reassignment rules)."""
+        t_last = charger_last_used_t.get(charger_id)
+        if t_last is None:
+            return True
+        if charger_last_vehicle_id.get(charger_id) == vehicle_id:
+            return True  # same bus continuing on same charger
+        # Reassignment: different bus. Require min idle gap.
+        if timestep < t_last + 1 + gap:
+            return False
+        if allowed_windows is None:
+            return True
+        return any(start <= timestep <= end for (start, end) in allowed_windows)
+
     for t in range(n_timesteps):
         # Get vehicles that need charging this timestep
         charging_vehicles = [
@@ -85,6 +105,7 @@ def allocate_chargers(
         ]
 
         if not charging_vehicles:
+            vehicle_charger = {}  # all vehicles stopped — clear sticky state
             continue
 
         # Sort by priority (lower priority value = higher priority)
@@ -98,63 +119,85 @@ def allocate_chargers(
             for charger_id in charger_ids:
                 charger_capacity[charger_id] = rated_kw
 
+        # Track which charger each vehicle actually used this timestep (for next-timestep sticky)
+        t_vehicle_charger: dict[str, str] = {}
+
         for vehicle_id, power_kw in charging_vehicles:
             remaining_power = power_kw
 
-            # Try to allocate to accessible chargers
-            # Sort charger groups by power rating (higher first for better matching)
-            sorted_groups = sorted(charger_ids_by_rating.items(), key=lambda x: x[0], reverse=True)
-
-            for rated_kw, charger_ids in sorted_groups:
-                if remaining_power <= 0:
-                    break
-
-                # Filter to accessible, available chargers
-                accessible_chargers = []
-                for charger_id in charger_ids:
-                    if charger_id in used_chargers:
-                        continue
-
-                    # Check physical accessibility
-                    accessible_vehicles = config.charger_vehicle_access.get(charger_id, set())
-                    if accessible_vehicles and vehicle_id not in accessible_vehicles:
-                        continue
-
-                    accessible_chargers.append(charger_id)
-
-                # Allocate power to accessible chargers
-                for charger_id in accessible_chargers:
-                    if remaining_power <= 0:
-                        break
-
-                    available_capacity = charger_capacity.get(charger_id, 0.0)
-                    if available_capacity <= 0:
-                        continue
-
-                    # Allocate up to available capacity
+            # --- Sticky assignment: try to reuse the charger from the previous timestep ---
+            prev_charger = vehicle_charger.get(vehicle_id)
+            if prev_charger is not None and prev_charger not in used_chargers:
+                available_capacity = charger_capacity.get(prev_charger, 0.0)
+                accessible_vehicles = config.charger_vehicle_access.get(prev_charger, set())
+                accessible = not accessible_vehicles or vehicle_id in accessible_vehicles
+                if accessible and available_capacity >= 0.1:
+                    # One charger per bus: allocate up to this charger's capacity only
                     allocated_power = min(remaining_power, available_capacity)
                     assignments.append(
                         ChargerAssignment(
-                            charger_id=charger_id,
+                            charger_id=prev_charger,
                             vehicle_id=vehicle_id,
                             timestep=t,
                             power_kw=allocated_power,
                         )
                     )
-
-                    # Update capacity and mark as used if fully allocated
-                    charger_capacity[charger_id] -= allocated_power
-                    if charger_capacity[charger_id] < 0.1:
-                        used_chargers.add(charger_id)
-
+                    charger_capacity[prev_charger] -= allocated_power
+                    if charger_capacity[prev_charger] < 0.1:
+                        used_chargers.add(prev_charger)
                     remaining_power -= allocated_power
+                    t_vehicle_charger[vehicle_id] = prev_charger
+
+            # --- Greedy fallback: at most one charger per bus per timestep ---
+            if remaining_power > 0.1:
+                sorted_groups = sorted(
+                    charger_ids_by_rating.items(), key=lambda x: x[0], reverse=True
+                )
+                assigned = False
+                for rated_kw, charger_ids in sorted_groups:
+                    if assigned:
+                        break
+                    for charger_id in charger_ids:
+                        if charger_id in used_chargers:
+                            continue
+                        accessible_vehicles = config.charger_vehicle_access.get(
+                            charger_id, set()
+                        )
+                        if accessible_vehicles and vehicle_id not in accessible_vehicles:
+                            continue
+                        if not _reassignment_allowed(charger_id, vehicle_id, t):
+                            continue
+                        available_capacity = charger_capacity.get(charger_id, 0.0)
+                        if available_capacity < 0.1:
+                            continue
+                        allocated_power = min(remaining_power, available_capacity)
+                        assignments.append(
+                            ChargerAssignment(
+                                charger_id=charger_id,
+                                vehicle_id=vehicle_id,
+                                timestep=t,
+                                power_kw=allocated_power,
+                            )
+                        )
+                        charger_capacity[charger_id] -= allocated_power
+                        if charger_capacity[charger_id] < 0.1:
+                            used_chargers.add(charger_id)
+                        remaining_power -= allocated_power
+                        t_vehicle_charger[vehicle_id] = charger_id
+                        assigned = True
+                        break
 
             if remaining_power > 0.1:
                 logger.warning(
                     f"Could not fully allocate {remaining_power:.1f}kW for vehicle "
-                    f"{vehicle_id} at timestep {t}. This may indicate an optimization "
-                    "constraint violation or missing charger accessibility."
+                    f"{vehicle_id} at timestep {t} (one charger per bus; cap at charger capacity)."
                 )
+
+        # Carry forward sticky assignment and charger reassignment state
+        vehicle_charger = t_vehicle_charger
+        for vid, cid in t_vehicle_charger.items():
+            charger_last_used_t[cid] = t
+            charger_last_vehicle_id[cid] = vid
 
     logger.info(f"Allocated {len(assignments)} charger assignments across {n_timesteps} timesteps")
     return assignments

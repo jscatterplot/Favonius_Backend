@@ -758,6 +758,9 @@ P_grid[t] ≤ max_grid_kw  (hard constraint)
 ```
 Building load (`building_load` table) is **mandatory** in this equation.
 
+### Charger allocator (one bus ↔ one charger, sticky, reassignment rules)
+After the MILP, `allocate_chargers()` assigns power to physical chargers: **one bus per charger per timestep** (and one charger per bus); power is capped at that charger's capacity. **Sticky assignment**: the same bus keeps the same charger across timesteps (no bus→charger switching). When a charger switches to a different bus, `charger_switch_gap_timesteps` (min idle period) and optional `charger_reassignment_allowed_windows` (timestep ranges when reassignment is allowed) are enforced. See PRD Section 8.3 and `DepotConfig` in Section 6.2.
+
 ### Depot config caching
 `_get_depot_config()` in `src/api/main.py` caches `DepotConfig` for 5 minutes (TTL=300s) to reduce DB queries. Invalidate by restarting the API or waiting for TTL expiry.
 

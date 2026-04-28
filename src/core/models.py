@@ -119,6 +119,10 @@ class DepotConfig:
     max_site_power: float = 1000.0
     delta_t: float = 0.25  # hours (15 min)
     n_timesteps: int = 96  # 24 hours
+    # Allocator: min idle timesteps between same charger serving a different bus (unplug/move/plug).
+    charger_switch_gap_timesteps: int = 1
+    # Allocator: if set, charger reassignment (same charger, different bus) allowed only in these [start_t, end_t] ranges.
+    charger_reassignment_allowed_windows: Optional[list[tuple[int, int]]] = None
 
     # Property aliases for backwards compatibility
     @property

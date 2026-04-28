@@ -6,7 +6,7 @@
 - **`src/core/optimizer/milp_model.py`** - MILP formulation, model building, constraints
 - **`src/core/optimizer/solver.py`** - Solver wrapper (Gurobi/HiGHS), solve execution
 - **`src/core/optimizer/optimize()`** - High-level optimization function (in `milp_model.py`)
-- **`src/core/optimizer/allocator.py`** - Post-optimization charger allocation
+- **`src/core/optimizer/allocator.py`** - Post-optimization charger allocation (one bus ↔ one charger per timestep, sticky assignment, reassignment gap/windows; see PRD §8.3)
 - **`src/core/optimizer/warm_start.py`** - Warm-starting from previous solutions
 - **`src/core/optimizer/exceptions.py`** - Error types
 
@@ -97,6 +97,8 @@
 - `vehicle_capacities` - Battery capacity per vehicle (kWh)
 - `vehicle_max_charge_kw` - Max charge rate per vehicle (kW)
 - `charger_groups` - `{rated_kw: count}` - Charger aggregation
+- `charger_switch_gap_timesteps` - Min idle timesteps before same charger can serve a different bus (allocator; default 1)
+- `charger_reassignment_allowed_windows` - Optional list of `(start_t, end_t)`; if set, charger reassignment allowed only in these timestep ranges (allocator)
 - `battery_capacity` - Stationary battery capacity (kWh)
 - `battery_power` - Stationary battery power (kW)
 - `max_site_power` - Site power limit (kW)
