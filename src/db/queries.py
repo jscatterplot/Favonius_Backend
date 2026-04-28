@@ -858,23 +858,22 @@ async def create_charger_with_credentials(
         INSERT INTO station_credentials (station_id, username, password_hash, active)
         VALUES ($1, $1, $2, TRUE)
     """
-    async with db.transaction():
-        row = await db.fetchrow(
-            charger_query,
-            depot_id,
-            ocpp_id,
-            rated_kw,
-            connector_type,
-            display_name,
-            vendor,
-            model,
-            serial_number,
-            firmware,
-            connector_count,
-            json.dumps(connector_ids),
-            network_notes,
-        )
-        await db.execute(credential_query, ocpp_id, password_hash)
+    row = await db.fetchrow(
+        charger_query,
+        depot_id,
+        ocpp_id,
+        rated_kw,
+        connector_type,
+        display_name,
+        vendor,
+        model,
+        serial_number,
+        firmware,
+        connector_count,
+        json.dumps(connector_ids),
+        network_notes,
+    )
+    await db.execute(credential_query, ocpp_id, password_hash)
     result = dict(row)
     result["connector_ids"] = result.get("connector_ids") or connector_ids
     return result
