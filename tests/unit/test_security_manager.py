@@ -3,7 +3,7 @@ Unit tests for SecurityManager - OCPP Security Profile 3 implementation.
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import jwt
 import pytest
@@ -27,6 +27,7 @@ class TestSecurityManager:
     def mock_timescale_client(self):
         """Mock TimescaleDB client."""
         mock_client = Mock(spec=TimescaleClient)
+        mock_client.station_requires_basic_auth.return_value = False
         return mock_client
 
     @pytest.fixture
@@ -118,6 +119,113 @@ class TestSecurityManager:
 
             assert success is False
             assert error is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_production_charger_requires_basic_auth(self, security_manager):
+        """Provisioned production chargers reject non-Basic Auth methods."""
+        station_id = "acme-berlin-001"
+        auth_data = {"bearer_token": "valid_token"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=True),
+            patch.object(security_manager, "_authenticate_bearer_token", return_value=True),
+            patch.object(security_manager, "_record_failed_attempt", return_value=None) as failed,
+            patch.object(security_manager, "_log_security_event", return_value=None) as log_event,
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is False
+        assert error == "Basic Auth credentials required"
+        failed.assert_called_once_with(station_id)
+        log_event.assert_called_once()
+        assert log_event.call_args.args[3]["reason"] == "missing_basic_auth"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_legacy_basic_auth_allows_username_distinct_from_station_id(
+        self, security_manager
+    ):
+        """Legacy Basic Auth stations may use any active username for that station."""
+        station_id = "legacy-station-001"
+        auth_data = {"username": "operator-user", "password": "valid_password"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=False),
+            patch.object(
+                security_manager,
+                "_validate_basic_auth",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as validate_basic_auth,
+            patch.object(security_manager, "_clear_failed_attempts", return_value=None),
+            patch.object(security_manager, "_log_security_event", return_value=None),
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is True
+        assert error is None
+        validate_basic_auth.assert_awaited_once_with(
+            station_id, "operator-user", "valid_password"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_production_basic_auth_requires_username_to_match_station_id(
+        self, security_manager
+    ):
+        """Onboarded production chargers must use the generated station id username."""
+        station_id = "acme-berlin-001"
+        auth_data = {"username": "operator-user", "password": "valid_password"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=True),
+            patch.object(
+                security_manager,
+                "_validate_basic_auth",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as validate_basic_auth,
+            patch.object(
+                security_manager, "_record_failed_attempt", new_callable=AsyncMock
+            ) as failed,
+            patch.object(
+                security_manager, "_log_security_event", new_callable=AsyncMock
+            ) as log_event,
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is False
+        assert error == "Basic Auth username must match station id"
+        validate_basic_auth.assert_not_awaited()
+        failed.assert_awaited_once_with(station_id)
+        log_event.assert_awaited_once()
+        assert log_event.await_args.args[3]["reason"] == "basic_auth_username_mismatch"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_missing_basic_auth_checker_allows_other_methods(self, security_manager):
+        """Missing checker should not force Basic Auth-only authentication."""
+        station_id = "test-station-001"
+        auth_data = {"bearer_token": "valid_token"}
+        security_manager.timescale_client.station_requires_basic_auth.side_effect = RuntimeError(
+            "db unavailable"
+        )
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_authenticate_client_certificate", return_value=False),
+            patch.object(security_manager, "_authenticate_bearer_token", return_value=True),
+            patch.object(security_manager, "_clear_failed_attempts", return_value=None),
+            patch.object(security_manager, "_log_security_event", return_value=None),
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is True
+        assert error is None
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)

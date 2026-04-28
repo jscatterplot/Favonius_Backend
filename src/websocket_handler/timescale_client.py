@@ -1831,6 +1831,20 @@ class TimescaleClient:
 
             return bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8"))
 
+    async def station_requires_basic_auth(self, station_id: str) -> bool:
+        """Return True when a provisioned production charger requires Basic Auth."""
+        async with self.pg_pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT COALESCE(auth_required, FALSE)
+                    FROM chargers
+                    WHERE ocpp_id = $1
+                    """,
+                    station_id,
+                )
+            )
+
     # ===== OCPP 1.6 PILOT HELPERS (migration 012) =====
 
     async def next_transaction_id(self) -> int:

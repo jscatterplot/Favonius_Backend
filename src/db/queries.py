@@ -758,6 +758,222 @@ async def depot_belongs_to_organization(
     return bool(await db.fetchval(q, depot_id, organization_id))
 
 
+async def get_depot_org_slug_context(db, *, depot_id: str, organization_id: str) -> Optional[dict]:
+    """Return organization/depot names for an organization-owned depot."""
+    query = """
+        SELECT d.depot_id::text AS depot_id,
+               d.name AS depot_name,
+               d.organization_id::text AS organization_id,
+               o.name AS organization_name
+        FROM depots d
+        JOIN organizations o ON o.organization_id = d.organization_id
+        WHERE d.depot_id = $1::uuid AND d.organization_id = $2::uuid
+    """
+    row = await db.fetchrow(query, depot_id, organization_id)
+    return dict(row) if row else None
+
+
+async def next_charger_ocpp_id(
+    db,
+    *,
+    organization_slug: str,
+    depot_slug: str,
+) -> str:
+    """Generate the next depot-scoped immutable OCPP charge point id."""
+    # Use a separator that slugification never emits to keep org/depot boundaries unambiguous.
+    prefix = f"{organization_slug}_{depot_slug}"
+    query = """
+        SELECT ocpp_id
+        FROM chargers
+        WHERE ocpp_id ~ ('^' || $1 || '-[0-9]+$')
+        ORDER BY substring(ocpp_id FROM '([0-9]+)$')::integer DESC
+        LIMIT 1
+    """
+    latest = await db.fetchval(query, prefix)
+    next_sequence = 1
+    if latest:
+        try:
+            next_sequence = int(str(latest).rsplit("-", 1)[1]) + 1
+        except (IndexError, ValueError):
+            logger.warning("Unexpected generated ocpp_id format: %s", latest)
+    return f"{prefix}-{next_sequence:03d}"
+
+
+async def create_charger_with_credentials(
+    db,
+    *,
+    depot_id: str,
+    ocpp_id: str,
+    display_name: str,
+    vendor: Optional[str],
+    model: Optional[str],
+    serial_number: Optional[str],
+    firmware: Optional[str],
+    rated_kw: float,
+    connector_type: str,
+    connector_count: int,
+    connector_ids: list[int],
+    network_notes: Optional[str],
+    password_hash: str,
+) -> dict:
+    """Create a charger and its Basic Auth credential in one transaction."""
+    charger_query = """
+        INSERT INTO chargers (
+            depot_id,
+            ocpp_id,
+            rated_kw,
+            connector_type,
+            display_name,
+            vendor,
+            model,
+            serial_number,
+            firmware,
+            connector_count,
+            connector_ids,
+            network_notes,
+            auth_required
+        )
+        VALUES (
+            $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, TRUE
+        )
+        RETURNING charger_id::text AS id,
+                  depot_id::text AS depot_id,
+                  ocpp_id,
+                  display_name,
+                  vendor,
+                  model,
+                  serial_number,
+                  firmware,
+                  rated_kw,
+                  efficiency,
+                  connector_type,
+                  connector_count,
+                  connector_ids,
+                  network_notes,
+                  status,
+                  auth_required,
+                  created_at
+    """
+    credential_query = """
+        INSERT INTO station_credentials (station_id, username, password_hash, active)
+        VALUES ($1, $1, $2, TRUE)
+    """
+    row = await db.fetchrow(
+        charger_query,
+        depot_id,
+        ocpp_id,
+        rated_kw,
+        connector_type,
+        display_name,
+        vendor,
+        model,
+        serial_number,
+        firmware,
+        connector_count,
+        json.dumps(connector_ids),
+        network_notes,
+    )
+    await db.execute(credential_query, ocpp_id, password_hash)
+    result = dict(row)
+    result["connector_ids"] = result.get("connector_ids") or connector_ids
+    return result
+
+
+async def get_charger_onboarding_idempotency(
+    db,
+    *,
+    organization_id: str,
+    endpoint: str,
+    idempotency_key: str,
+) -> Optional[dict]:
+    """Return an unexpired idempotency replay row, if present."""
+    query = """
+        SELECT request_hash, response_json, status_code
+        FROM charger_onboarding_idempotency
+        WHERE organization_id = $1::uuid
+          AND endpoint = $2
+          AND idempotency_key = $3
+          AND expires_at > NOW()
+    """
+    row = await db.fetchrow(query, organization_id, endpoint, idempotency_key)
+    return dict(row) if row else None
+
+
+async def acquire_charger_onboarding_idempotency_lock(
+    db,
+    *,
+    organization_id: str,
+    endpoint: str,
+    idempotency_key: str,
+) -> None:
+    """Acquire a transaction-scoped lock for charger onboarding idempotency key."""
+    lock_scope = f"{organization_id}:{endpoint}:{idempotency_key}"
+    await db.execute(
+        "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+        "charger_onboarding_idempotency",
+        lock_scope,
+    )
+
+
+async def store_charger_onboarding_idempotency(
+    db,
+    *,
+    organization_id: str,
+    user_id: str,
+    endpoint: str,
+    idempotency_key: str,
+    request_hash: str,
+    response_json: dict,
+    status_code: int,
+    ttl_minutes: int = 30,
+) -> None:
+    """Store the short-lived one-time credential replay payload."""
+    query = """
+        INSERT INTO charger_onboarding_idempotency (
+            organization_id,
+            user_id,
+            endpoint,
+            idempotency_key,
+            request_hash,
+            response_json,
+            status_code,
+            expires_at
+        )
+        VALUES (
+            $1::uuid,
+            $2::uuid,
+            $3,
+            $4,
+            $5,
+            $6::jsonb,
+            $7,
+            NOW() + ($8::int * INTERVAL '1 minute')
+        )
+        ON CONFLICT (organization_id, endpoint, idempotency_key) DO UPDATE
+        SET response_json = EXCLUDED.response_json,
+            status_code = EXCLUDED.status_code,
+            expires_at = EXCLUDED.expires_at,
+            request_hash = EXCLUDED.request_hash
+        WHERE charger_onboarding_idempotency.request_hash = EXCLUDED.request_hash
+    """
+    await db.execute(
+        query,
+        organization_id,
+        user_id,
+        endpoint,
+        idempotency_key,
+        request_hash,
+        json.dumps(response_json),
+        status_code,
+        ttl_minutes,
+    )
+
+
+async def delete_expired_charger_onboarding_idempotency(db) -> None:
+    """Remove expired onboarding replay payloads that may contain one-time secrets."""
+    await db.execute("DELETE FROM charger_onboarding_idempotency WHERE expires_at <= NOW()")
+
+
 async def create_depot_setup(
     db,
     *,

@@ -14,10 +14,12 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from fastapi import HTTPException, status as http_status
 
 from src.api.main import CommandRequest, _require_depot_access, app
+from src.db import queries as db_queries
 from src.security.audit_log import AuditEvent
 from src.security.auth import verify_depot_access, verify_token
 from src.security.tenant_mirror import ensure_tenant_mirrored
@@ -111,6 +113,22 @@ def _first_depot_payload(max_grid_kw: float = 1200.0) -> dict:
                 "max_soc_pct": 90,
             },
         }
+    }
+
+
+def _charger_payload() -> dict:
+    """Valid charger onboarding payload."""
+    return {
+        "displayName": "ABB charger by gate 1",
+        "vendor": "ABB",
+        "model": "Terra 184",
+        "serialNumber": "ABB-001",
+        "firmware": "1.2.3",
+        "ratedKw": 150.0,
+        "connectorType": "CCS",
+        "connectorCount": 2,
+        "connectorIds": [1, 2],
+        "networkNotes": "Static IP reserved",
     }
 
 
@@ -495,6 +513,271 @@ class TestDepotSetupWrites:
         assert checklist["building_load"]["status"] == "blocked"
         assert checklist["battery"]["status"] == "blocked"
 
+
+class TestChargerOnboarding:
+    """POST /admin/depots/{depot_id}/chargers provisioning behavior."""
+
+    def test_creates_charger_and_one_time_basic_auth_credentials(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        conn.transaction = MagicMock()
+        conn.transaction.return_value.__aenter__.return_value = None
+        conn.transaction.return_value.__aexit__.return_value = None
+        user = _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
+        context = {
+            "depot_id": DEPOT_ID,
+            "depot_name": "Berlin Depot",
+            "organization_id": DEFAULT_ORG_ID,
+            "organization_name": "Acme Transit",
+        }
+        charger = {
+            "id": str(uuid4()),
+            "depot_id": DEPOT_ID,
+            "ocpp_id": "acme-transit-berlin-depot-001",
+            "display_name": "ABB charger by gate 1",
+        }
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ) as access_mock, patch(
+            "src.api.main.db_queries.delete_expired_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+        ), patch(
+            "src.api.main.db_queries.get_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "src.api.main.db_queries.get_depot_org_slug_context",
+            new_callable=AsyncMock,
+            return_value=context,
+        ), patch(
+            "src.api.main.db_queries.next_charger_ocpp_id",
+            new_callable=AsyncMock,
+            return_value="acme-transit-berlin-depot-001",
+        ), patch(
+            "src.api.main.db_queries.create_charger_with_credentials",
+            new_callable=AsyncMock,
+            return_value=charger,
+        ) as create_mock, patch(
+            "src.api.main.db_queries.store_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+        ) as idem_store:
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/chargers",
+                headers={**AUTH_HDR, "Idempotency-Key": str(uuid4())},
+                json=_charger_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        data = response.json()
+        assert data["charger"]["ocppId"] == "acme-transit-berlin-depot-001"
+        assert data["credentials"]["username"] == "acme-transit-berlin-depot-001"
+        assert data["credentials"]["password"]
+        assert data["credentials"]["shownOnce"] is True
+        assert create_mock.await_args.kwargs["connector_ids"] == [1, 2]
+        access_mock.assert_awaited_once()
+        password_hash = create_mock.await_args.kwargs["password_hash"]
+        assert data["credentials"]["password"] not in password_hash
+        assert password_hash.startswith("$2")
+        replay_payload = idem_store.await_args.kwargs["response_json"]
+        assert replay_payload["credentials"]["password"] == data["credentials"]["password"]
+        assert idem_store.await_args.kwargs["ttl_minutes"] == 30
+
+    def test_null_sub_claim_is_rejected_before_idempotency_write(self, client):
+        user = _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        user["sub"] = None
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
+
+        response = client.post(
+            f"/admin/depots/{DEPOT_ID}/chargers",
+            headers={**AUTH_HDR, "Idempotency-Key": str(uuid4())},
+            json=_charger_payload(),
+        )
+
+        assert response.status_code == http_status.HTTP_401_UNAUTHORIZED
+        assert response.json()["detail"] == "Token missing 'sub' claim"
+
+    @pytest.mark.asyncio
+    async def test_idempotency_ttl_uses_integer_interval_parameter(self):
+        db = AsyncMock()
+
+        await db_queries.store_charger_onboarding_idempotency(
+            db,
+            organization_id=DEFAULT_ORG_ID,
+            user_id=str(uuid4()),
+            endpoint=f"POST /admin/depots/{DEPOT_ID}/chargers",
+            idempotency_key="retry-key",
+            request_hash="hash",
+            response_json={"ok": True},
+            status_code=http_status.HTTP_201_CREATED,
+            ttl_minutes=30,
+        )
+
+        query = db.execute.await_args.args[0]
+        assert "$8::int * INTERVAL '1 minute'" in query
+        assert "::text || ' minutes'" not in query
+        assert db.execute.await_args.args[-1] == 30
+
+    def test_idempotency_replays_same_response(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        user = _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
+        payload = _charger_payload()
+        replay = {
+            "charger": {
+                "id": str(uuid4()),
+                "displayName": payload["displayName"],
+                "depotId": DEPOT_ID,
+                "ocppId": "acme-berlin-001",
+            },
+            "credentials": {
+                "username": "acme-berlin-001",
+                "password": "plaintext-replay",
+                "scheme": "basic",
+                "shownOnce": True,
+            },
+        }
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.delete_expired_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+        ), patch(
+            "src.api.main.db_queries.get_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+            return_value={
+                "request_hash": "unused",
+                "response_json": replay,
+                "status_code": http_status.HTTP_201_CREATED,
+            },
+        ), patch("src.api.main._canonical_request_hash", return_value="unused"):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/chargers",
+                headers={**AUTH_HDR, "Idempotency-Key": "retry-key"},
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        assert response.json() == replay
+
+    def test_cross_org_creation_denied(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=403, detail="Access denied"),
+        ):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/chargers",
+                headers={**AUTH_HDR, "Idempotency-Key": str(uuid4())},
+                json=_charger_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+    def test_duplicate_generated_ocpp_id_returns_conflict(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        conn.transaction = MagicMock()
+        conn.transaction.return_value.__aenter__.return_value = None
+        conn.transaction.return_value.__aexit__.return_value = None
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+        context = {
+            "depot_id": DEPOT_ID,
+            "depot_name": "Berlin Depot",
+            "organization_id": DEFAULT_ORG_ID,
+            "organization_name": "Acme Transit",
+        }
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.delete_expired_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+        ), patch(
+            "src.api.main.db_queries.get_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "src.api.main.db_queries.get_depot_org_slug_context",
+            new_callable=AsyncMock,
+            return_value=context,
+        ), patch(
+            "src.api.main.db_queries.next_charger_ocpp_id",
+            new_callable=AsyncMock,
+            return_value="acme-transit-berlin-depot-001",
+        ), patch(
+            "src.api.main.db_queries.create_charger_with_credentials",
+            new_callable=AsyncMock,
+            side_effect=asyncpg.UniqueViolationError("duplicate key"),
+        ):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/chargers",
+                headers={**AUTH_HDR, "Idempotency-Key": str(uuid4())},
+                json=_charger_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_409_CONFLICT
+
+    def test_idempotency_key_with_different_body_returns_conflict(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.delete_expired_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+        ), patch(
+            "src.api.main.db_queries.get_charger_onboarding_idempotency",
+            new_callable=AsyncMock,
+            return_value={
+                "request_hash": "old-hash",
+                "response_json": {},
+                "status_code": http_status.HTTP_201_CREATED,
+            },
+        ), patch("src.api.main._canonical_request_hash", return_value="new-hash"):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/chargers",
+                headers={**AUTH_HDR, "Idempotency-Key": "retry-key"},
+                json=_charger_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_409_CONFLICT
+
+    def test_plaintext_not_retrievable_from_charger_metadata(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "depot_id": DEPOT_ID,
+                "organization_id": DEFAULT_ORG_ID,
+                "name": "Berlin Depot",
+                "timezone": "Europe/Berlin",
+                "currency": "EUR",
+                "max_grid_kw": 800.0,
+            }
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{DEPOT_ID}", headers=AUTH_HDR)
+
+        assert response.status_code == http_status.HTTP_200_OK
+        serialized = response.text.lower()
+        assert "password" not in serialized
+        assert "credential" not in serialized
 
 class TestAdminControllersRbac:
     """GET /admin/controllers is restricted to favonius_admin."""

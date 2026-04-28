@@ -6,9 +6,11 @@ Reference: PRD_v2.md#7-api-specifications
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import math
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -19,8 +21,18 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import asyncpg
+import bcrypt
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -887,6 +899,57 @@ class DepotSetupResponse(BaseModel):
     readiness_checklist: list[ReadinessChecklistItem]
 
 
+class ChargerCreateRequest(BaseModel):
+    """Request to provision a production OCPP charger."""
+
+    displayName: str = Field(..., min_length=1, max_length=255)
+    vendor: Optional[str] = Field(default=None, max_length=128)
+    model: Optional[str] = Field(default=None, max_length=128)
+    serialNumber: Optional[str] = Field(default=None, max_length=128)
+    firmware: Optional[str] = Field(default=None, max_length=128)
+    ratedKw: float = Field(..., gt=0, le=1000)
+    connectorType: Literal["CCS"] = "CCS"
+    connectorCount: int = Field(..., ge=1, le=20)
+    connectorIds: Optional[list[int]] = None
+    networkNotes: Optional[str] = Field(default=None, max_length=2048)
+
+    @field_validator("connectorIds")
+    @classmethod
+    def validate_connector_ids(cls, value: Optional[list[int]]) -> Optional[list[int]]:
+        """Ensure connector ids are positive and unique when supplied."""
+        if value is None:
+            return value
+        if any(connector_id < 1 for connector_id in value):
+            raise ValueError("connectorIds must contain positive integers")
+        if len(set(value)) != len(value):
+            raise ValueError("connectorIds must be unique")
+        return value
+
+class ChargerOnboardingMetadata(BaseModel):
+    """Provisioned charger metadata."""
+
+    id: str
+    displayName: str
+    depotId: str
+    ocppId: str
+
+
+class ChargerOnboardingCredentials(BaseModel):
+    """One-time OCPP Basic Auth credential response."""
+
+    username: str
+    password: str
+    scheme: Literal["basic"] = "basic"
+    shownOnce: bool = True
+
+
+class ChargerOnboardingResponse(BaseModel):
+    """Response from charger onboarding."""
+
+    charger: ChargerOnboardingMetadata
+    credentials: ChargerOnboardingCredentials
+
+
 # ============ Command Dispatcher Models ============
 
 
@@ -1146,6 +1209,67 @@ def _validate_depot_setup_payload(payload: DepotSetupPayload) -> None:
             raise ValueError("depot.stationary_battery: Missing required battery fields")
         if battery.min_soc_pct >= battery.max_soc_pct:
             raise ValueError("depot.stationary_battery: min_soc_pct must be less than max_soc_pct")
+
+
+def _slugify_ocpp_component(value: str, fallback: str) -> str:
+    """Return a URL-safe slug component for generated OCPP IDs."""
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug[:32] or fallback
+
+
+def _canonical_request_hash(payload: BaseModel) -> str:
+    """Hash a request model using stable JSON serialization."""
+    body = payload.model_dump(mode="json", by_alias=True, exclude_none=True)
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _generate_ocpp_basic_password() -> str:
+    """Generate a high-entropy URL-safe one-time Basic Auth password."""
+    return secrets.token_urlsafe(32)
+
+
+async def _hash_ocpp_basic_password(password: str) -> str:
+    """Hash a Basic Auth password for station_credentials."""
+    hashed = await asyncio.to_thread(bcrypt.hashpw, password.encode("utf-8"), bcrypt.gensalt())
+    return hashed.decode("utf-8")
+
+
+def _connector_ids_for_request(payload: ChargerCreateRequest) -> list[int]:
+    """Return connector ids, enforcing consistency with connector_count."""
+    if payload.connectorIds is None:
+        return list(range(1, payload.connectorCount + 1))
+    if len(payload.connectorIds) != payload.connectorCount:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="connectorIds length must equal connectorCount",
+        )
+    return payload.connectorIds
+
+
+def _json_response_payload(value: object) -> object:
+    """Normalize asyncpg JSONB values returned as either JSON strings or Python objects."""
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _format_charger_onboarding_response(charger: dict, password: str) -> dict:
+    """Build the public response shape, including one-time plaintext credential."""
+    return {
+        "charger": {
+            "id": charger["id"],
+            "displayName": charger["display_name"],
+            "depotId": charger["depot_id"],
+            "ocppId": charger["ocpp_id"],
+        },
+        "credentials": {
+            "username": charger["ocpp_id"],
+            "password": password,
+            "scheme": "basic",
+            "shownOnce": True,
+        },
+    }
 
 
 def _require_customer_admin_with_org(user: dict) -> str:
@@ -1443,6 +1567,142 @@ async def get_depot_metadata(
             extra={"depot_id": depot_id},
         )
         raise DatabaseError(f"Database error: {str(e)}")
+
+
+@app.post(
+    "/admin/depots/{depot_id}/chargers",
+    response_model=ChargerOnboardingResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Provision a charger and one-time Basic Auth credential",
+)
+async def create_charger_onboarding(
+    depot_id: str,
+    request: ChargerCreateRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create a production charger under an organization-owned depot."""
+    org_id = _require_customer_admin_with_org(user)
+    user_id = str(user.get("sub") or "")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing 'sub' claim",
+        )
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    if not idempotency_key.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Idempotency-Key is required")
+
+    endpoint = f"POST /admin/depots/{depot_id}/chargers"
+    request_hash = _canonical_request_hash(request)
+
+    try:
+        connector_ids = _connector_ids_for_request(request)
+        password = _generate_ocpp_basic_password()
+        password_hash = await _hash_ocpp_basic_password(password)
+        async with db_pools.static.acquire() as conn:
+            await db_queries.delete_expired_charger_onboarding_idempotency(conn)
+            async with conn.transaction():
+                await db_queries.acquire_charger_onboarding_idempotency_lock(
+                    conn,
+                    organization_id=org_id,
+                    endpoint=endpoint,
+                    idempotency_key=idempotency_key,
+                )
+                existing = await db_queries.get_charger_onboarding_idempotency(
+                    conn,
+                    organization_id=org_id,
+                    endpoint=endpoint,
+                    idempotency_key=idempotency_key,
+                )
+                if existing:
+                    if not hmac.compare_digest(existing["request_hash"], request_hash):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="Idempotency-Key was already used with a different request body",
+                        )
+                    return JSONResponse(
+                        status_code=int(existing["status_code"] or status.HTTP_201_CREATED),
+                        content=_json_response_payload(existing["response_json"]),
+                    )
+                context = await db_queries.get_depot_org_slug_context(
+                    conn,
+                    depot_id=depot_id,
+                    organization_id=org_id,
+                )
+                if not context:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access denied: you do not have permission for this depot",
+                    )
+                org_slug = _slugify_ocpp_component(context["organization_name"], "org")
+                depot_slug = _slugify_ocpp_component(context["depot_name"], "depot")
+
+                # Retry only for generated OCPP ID collisions under concurrent provisioning.
+                charger: Optional[dict] = None
+                last_unique_error: Optional[asyncpg.UniqueViolationError] = None
+                for _ in range(3):
+                    try:
+                        async with conn.transaction():
+                            ocpp_id = await db_queries.next_charger_ocpp_id(
+                                conn,
+                                organization_slug=org_slug,
+                                depot_slug=depot_slug,
+                            )
+                            charger = await db_queries.create_charger_with_credentials(
+                                conn,
+                                depot_id=depot_id,
+                                ocpp_id=ocpp_id,
+                                display_name=request.displayName,
+                                vendor=request.vendor,
+                                model=request.model,
+                                serial_number=request.serialNumber,
+                                firmware=request.firmware,
+                                rated_kw=request.ratedKw,
+                                connector_type=request.connectorType,
+                                connector_count=request.connectorCount,
+                                connector_ids=connector_ids,
+                                network_notes=request.networkNotes,
+                                password_hash=password_hash,
+                            )
+                        break
+                    except asyncpg.UniqueViolationError as exc:
+                        last_unique_error = exc
+                else:
+                    raise last_unique_error or RuntimeError("Could not generate unique ocpp_id")
+                if charger is None:
+                    raise RuntimeError("Could not create charger")
+
+                response_payload = _format_charger_onboarding_response(charger, password)
+                await db_queries.store_charger_onboarding_idempotency(
+                    conn,
+                    organization_id=org_id,
+                    user_id=user_id,
+                    endpoint=endpoint,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    response_json=response_payload,
+                    status_code=status.HTTP_201_CREATED,
+                    ttl_minutes=30,
+                )
+
+        _depot_config_cache.pop(depot_id, None)
+        return JSONResponse(status_code=status.HTTP_201_CREATED, content=response_payload)
+    except HTTPException:
+        raise
+    except asyncpg.UniqueViolationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Generated ocpp_id or station credential already exists",
+        ) from exc
+    except asyncpg.PostgresError as exc:
+        logger.error("Database error onboarding charger: %s", exc, exc_info=True)
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
 
 
 @app.post(

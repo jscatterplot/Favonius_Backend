@@ -138,13 +138,40 @@ class SecurityManager:
                 )
                 return False, "Station is temporarily locked out"
 
-            # Try different authentication methods
-            auth_methods = [
-                (AuthenticationMethod.CLIENT_CERTIFICATE, self._authenticate_client_certificate),
-                (AuthenticationMethod.BEARER_TOKEN, self._authenticate_bearer_token),
-                (AuthenticationMethod.API_KEY, self._authenticate_api_key),
-                (AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth),
-            ]
+            basic_auth_required = await self._station_requires_basic_auth(station_id)
+            if basic_auth_required:
+                username = auth_data.get("username")
+                password = auth_data.get("password")
+                if not (username and password):
+                    await self._record_failed_attempt(station_id)
+                    await self._log_security_event(
+                        station_id,
+                        SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
+                        f"Basic Auth credentials are required for station {station_id}",
+                        {"reason": "missing_basic_auth"},
+                    )
+                    return False, "Basic Auth credentials required"
+                if username != station_id:
+                    await self._record_failed_attempt(station_id)
+                    await self._log_security_event(
+                        station_id,
+                        SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
+                        f"Basic Auth username must match station id for station {station_id}",
+                        {"reason": "basic_auth_username_mismatch"},
+                    )
+                    return False, "Basic Auth username must match station id"
+
+            # Production chargers provisioned through onboarding must use Basic Auth.
+            auth_methods = (
+                [(AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth)]
+                if basic_auth_required
+                else [
+                    (AuthenticationMethod.CLIENT_CERTIFICATE, self._authenticate_client_certificate),
+                    (AuthenticationMethod.BEARER_TOKEN, self._authenticate_bearer_token),
+                    (AuthenticationMethod.API_KEY, self._authenticate_api_key),
+                    (AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth),
+                ]
+            )
 
             for method, auth_func in auth_methods:
                 if await auth_func(station_id, auth_data, client_cert):
@@ -163,6 +190,7 @@ class SecurityManager:
                 station_id,
                 SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
                 f"All authentication methods failed for station {station_id}",
+                {"reason": "invalid_credentials"},
             )
             return False, "Authentication failed"
 
@@ -452,6 +480,26 @@ class SecurityManager:
 
         # Validate credentials against database
         return await self._validate_basic_auth(station_id, username, password)
+
+    async def _station_requires_basic_auth(self, station_id: str) -> bool:
+        """Return True when a provisioned production charger requires Basic Auth."""
+        checker = getattr(self.timescale_client, "station_requires_basic_auth", None)
+        if checker is None:
+            self.logger.warning(
+                "Basic Auth requirement checker unavailable; allowing standard auth fallback for "
+                "station %s",
+                station_id,
+            )
+            return False
+        try:
+            return bool(await checker(station_id))
+        except Exception as exc:
+            self.logger.warning(
+                "Could not check Basic Auth requirement for station %s: %s",
+                station_id,
+                exc,
+            )
+            return False
 
     async def _is_station_locked_out(self, station_id: str) -> bool:
         """Check if station is locked out due to failed attempts."""
