@@ -76,7 +76,7 @@ def mock_timescale() -> MagicMock:
     tc = MagicMock()
     tc.insert_telemetry_batch = AsyncMock()
     tc.lookup_id_tag = AsyncMock(
-        return_value={"vehicle_id": "vehicle-1", "depot_id": "depot-1"}
+        return_value={"vehicle_id": "vehicle-1", "depot_id": "depot-1", "driver_id": None, "card_id": None}
     )
     tc.next_transaction_id = AsyncMock(return_value=4242)
     tc.next_charging_profile_id = AsyncMock(return_value=123456)
@@ -152,8 +152,8 @@ class TestOCPP16SessionCallbacks:
             max_charge_kw=50.0,
             raw_samples=[],
         )
-        mock_timescale.insert_telemetry_batch.assert_awaited_once()
-        call_args = mock_timescale.insert_telemetry_batch.call_args[0][0][0]
+        assert session._telemetry_queue.qsize() == 1
+        call_args = session._telemetry_queue.get_nowait()
         assert abs(call_args["soc_percent"] - 75.0) < 0.01
         assert call_args["power_kw"] == 22.0
         assert call_args["station_id"] == "test_station_001"
@@ -204,8 +204,40 @@ class TestOCPP16SessionCallbacks:
         )
         await asyncio.sleep(0)
         assert result.value == "Accepted"
-        mock_timescale.lookup_id_tag.assert_awaited_once_with("TAG-001")
+        mock_timescale.lookup_id_tag.assert_any_await("TAG-001", station_id="test_station_001")
+        payload = mock_message_handler._push_to_main_api.await_args.args[2]
+        assert payload["vehicle_id"] == "vehicle-1"
+        assert payload["driver_id"] is None
+        assert payload["card_id"] is None
         mock_message_handler._push_to_main_api.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_preserves_driver_card_identity(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        mock_timescale.lookup_id_tag.return_value = {
+            "vehicle_id": "vehicle-2",
+            "depot_id": "depot-1",
+            "driver_id": "driver-1",
+            "card_id": "card-1",
+        }
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="CARD-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert result.value == "Accepted"
+        assert session._pending_start["vehicle_id"] == "vehicle-2"
+        assert session._pending_start["driver_id"] == "driver-1"
+        assert session._pending_start["card_id"] == "card-1"
+        payload = mock_message_handler._push_to_main_api.await_args.args[2]
+        assert payload["driver_id"] == "driver-1"
+        assert payload["card_id"] == "card-1"
 
     @pytest.mark.asyncio
     async def test_on_transaction_start_rejects_unknown_id_tag(
@@ -705,6 +737,9 @@ class TestOCPP16SessionRecovery:
             "evse_id": 1,
             "id_tag": "TAG_Y",
             "start_time": datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc),
+            "vehicle_id": "660e8400-e29b-41d4-a716-446655440001",
+            "driver_id": "770e8400-e29b-41d4-a716-446655440001",
+            "card_id": "880e8400-e29b-41d4-a716-446655440001",
         }
 
         tx_id = await session._next_transaction_id()
@@ -714,6 +749,9 @@ class TestOCPP16SessionRecovery:
         kwargs = mock_timescale.insert_open_session.call_args.kwargs
         assert kwargs["transaction_id"] == 999
         assert kwargs["station_id"] == "test_station_001"
+        assert kwargs["vehicle_id"] == "660e8400-e29b-41d4-a716-446655440001"
+        assert kwargs["driver_id"] == "770e8400-e29b-41d4-a716-446655440001"
+        assert kwargs["card_id"] == "880e8400-e29b-41d4-a716-446655440001"
         # Stash must be cleared so a stray call cannot double-insert.
         assert session._pending_start is None
 

@@ -721,6 +721,647 @@ async def get_vehicle_by_id_tag(
     return await db.fetchrow(query, id_tag)
 
 
+def _identity_record(row: Any) -> Optional[dict]:
+    """Convert an asyncpg row to a plain dict with list relationship fields."""
+    if not row:
+        return None
+    result = dict(row)
+    for key in ("assigned_vehicle_ids", "assigned_driver_ids"):
+        if key in result and result[key] is None:
+            result[key] = []
+    return result
+
+
+async def list_fleet_identity(db, *, depot_id: str, organization_id: str) -> Optional[dict]:
+    """Return vehicles, drivers, and RFID cards for an organization-owned depot."""
+    depot_exists = await db.fetchval(
+        """
+        SELECT EXISTS(
+            SELECT 1
+            FROM depots
+            WHERE depot_id = $1::uuid
+              AND organization_id = $2::uuid
+        )
+        """,
+        depot_id,
+        organization_id,
+    )
+    if not depot_exists:
+        return None
+
+    vehicles = await db.fetch(
+        """
+        SELECT vehicle_id::text AS vehicle_id,
+               depot_id::text AS depot_id,
+               external_id,
+               display_name,
+               vehicle_type,
+               battery_kwh,
+               max_charge_kw,
+               id_tag,
+               vin,
+               license_plate,
+               status,
+               created_at,
+               updated_at
+        FROM vehicles
+        WHERE depot_id = $1::uuid
+        ORDER BY external_id
+        """,
+        depot_id,
+    )
+    drivers = await db.fetch(
+        """
+        SELECT driver_id::text AS driver_id,
+               depot_id::text AS depot_id,
+               external_driver_id,
+               display_name,
+               email,
+               phone,
+               status,
+               created_at,
+               updated_at
+        FROM drivers
+        WHERE depot_id = $1::uuid
+        ORDER BY display_name
+        """,
+        depot_id,
+    )
+    cards = await db.fetch(
+        """
+        SELECT c.card_id::text AS card_id,
+               c.depot_id::text AS depot_id,
+               c.id_tag,
+               c.label,
+               c.status,
+               c.notes,
+               COALESCE(
+                   ARRAY_AGG(DISTINCT cva.vehicle_id::text)
+                       FILTER (WHERE cva.vehicle_id IS NOT NULL),
+                   ARRAY[]::text[]
+               ) AS assigned_vehicle_ids,
+               COALESCE(
+                   ARRAY_AGG(DISTINCT cda.driver_id::text)
+                       FILTER (WHERE cda.driver_id IS NOT NULL),
+                   ARRAY[]::text[]
+               ) AS assigned_driver_ids,
+               c.created_at,
+               c.updated_at
+        FROM rfid_cards c
+        LEFT JOIN rfid_card_vehicle_assignments cva ON cva.card_id = c.card_id
+        LEFT JOIN rfid_card_driver_assignments cda ON cda.card_id = c.card_id
+        WHERE c.depot_id = $1::uuid
+        GROUP BY c.card_id
+        ORDER BY c.label NULLS LAST, c.id_tag
+        """,
+        depot_id,
+    )
+    return {
+        "vehicles": [dict(row) for row in vehicles],
+        "drivers": [dict(row) for row in drivers],
+        "rfid_cards": [_identity_record(row) for row in cards],
+    }
+
+
+async def create_vehicle_identity(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    external_id: str,
+    vehicle_type: str,
+    battery_kwh: float,
+    max_charge_kw: float,
+    display_name: Optional[str],
+    id_tag: Optional[str],
+    vin: Optional[str],
+    license_plate: Optional[str],
+    vehicle_status: str,
+) -> Optional[dict]:
+    """Create a vehicle under an organization-owned depot."""
+    query = """
+        INSERT INTO vehicles (
+            depot_id, external_id, vehicle_type, battery_kwh, max_charge_kw,
+            display_name, id_tag, vin, license_plate, status
+        )
+        SELECT d.depot_id, $3, $4, $5, $6, $7, $8, $9, $10, $11
+        FROM depots d
+        WHERE d.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+        RETURNING vehicle_id::text AS vehicle_id,
+                  depot_id::text AS depot_id,
+                  external_id,
+                  display_name,
+                  vehicle_type,
+                  battery_kwh,
+                  max_charge_kw,
+                  id_tag,
+                  vin,
+                  license_plate,
+                  status,
+                  created_at,
+                  updated_at
+    """
+    row = await db.fetchrow(
+        query,
+        depot_id,
+        organization_id,
+        external_id,
+        vehicle_type,
+        battery_kwh,
+        max_charge_kw,
+        display_name,
+        id_tag,
+        vin,
+        license_plate,
+        vehicle_status,
+    )
+    return dict(row) if row else None
+
+
+async def update_vehicle_identity(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    vehicle_id: str,
+    display_name: Optional[str],
+    external_id: Optional[str],
+    vehicle_type: Optional[str],
+    battery_kwh: Optional[float],
+    max_charge_kw: Optional[float],
+    vin: Optional[str],
+    license_plate: Optional[str],
+    vehicle_status: Optional[str],
+) -> Optional[dict]:
+    """Patch vehicle identity fields under an organization-owned depot."""
+    query = """
+        UPDATE vehicles v
+        SET display_name = COALESCE($4, display_name),
+            external_id = COALESCE($5, external_id),
+            vehicle_type = COALESCE($6, vehicle_type),
+            battery_kwh = COALESCE($7, battery_kwh),
+            max_charge_kw = COALESCE($8, max_charge_kw),
+            vin = COALESCE($9, vin),
+            license_plate = COALESCE($10, license_plate),
+            status = COALESCE($11, status),
+            updated_at = NOW()
+        FROM depots d
+        WHERE v.depot_id = d.depot_id
+          AND v.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+          AND v.vehicle_id = $3::uuid
+        RETURNING v.vehicle_id::text AS vehicle_id,
+                  v.depot_id::text AS depot_id,
+                  v.external_id,
+                  v.display_name,
+                  v.vehicle_type,
+                  v.battery_kwh,
+                  v.max_charge_kw,
+                  v.id_tag,
+                  v.vin,
+                  v.license_plate,
+                  v.status,
+                  v.created_at,
+                  v.updated_at
+    """
+    row = await db.fetchrow(
+        query,
+        depot_id,
+        organization_id,
+        vehicle_id,
+        display_name,
+        external_id,
+        vehicle_type,
+        battery_kwh,
+        max_charge_kw,
+        vin,
+        license_plate,
+        vehicle_status,
+    )
+    return dict(row) if row else None
+
+
+async def set_vehicle_primary_id_tag(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    vehicle_id: str,
+    id_tag: Optional[str],
+) -> Optional[dict]:
+    """Set or clear the OCPP primary idTag on an organization-owned vehicle."""
+    query = """
+        UPDATE vehicles v
+        SET id_tag = $4,
+            updated_at = NOW()
+        FROM depots d
+        WHERE v.depot_id = d.depot_id
+          AND v.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+          AND v.vehicle_id = $3::uuid
+        RETURNING v.vehicle_id::text AS vehicle_id,
+                  v.depot_id::text AS depot_id,
+                  v.external_id,
+                  v.display_name,
+                  v.vehicle_type,
+                  v.battery_kwh,
+                  v.max_charge_kw,
+                  v.id_tag,
+                  v.vin,
+                  v.license_plate,
+                  v.status,
+                  v.created_at,
+                  v.updated_at
+    """
+    row = await db.fetchrow(query, depot_id, organization_id, vehicle_id, id_tag)
+    return dict(row) if row else None
+
+
+async def create_driver_identity(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    external_driver_id: Optional[str],
+    display_name: str,
+    email: Optional[str],
+    phone: Optional[str],
+    driver_status: str,
+) -> Optional[dict]:
+    """Create a driver under an organization-owned depot."""
+    query = """
+        INSERT INTO drivers (depot_id, external_driver_id, display_name, email, phone, status)
+        SELECT d.depot_id, $3, $4, $5, $6, $7
+        FROM depots d
+        WHERE d.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+        RETURNING driver_id::text AS driver_id,
+                  depot_id::text AS depot_id,
+                  external_driver_id,
+                  display_name,
+                  email,
+                  phone,
+                  status,
+                  created_at,
+                  updated_at
+    """
+    row = await db.fetchrow(
+        query,
+        depot_id,
+        organization_id,
+        external_driver_id,
+        display_name,
+        email,
+        phone,
+        driver_status,
+    )
+    return dict(row) if row else None
+
+
+async def update_driver_identity(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    driver_id: str,
+    external_driver_id: Optional[str],
+    display_name: Optional[str],
+    email: Optional[str],
+    phone: Optional[str],
+    driver_status: Optional[str],
+) -> Optional[dict]:
+    """Patch driver identity fields under an organization-owned depot."""
+    query = """
+        UPDATE drivers dr
+        SET external_driver_id = COALESCE($4, external_driver_id),
+            display_name = COALESCE($5, display_name),
+            email = COALESCE($6, email),
+            phone = COALESCE($7, phone),
+            status = COALESCE($8, status),
+            updated_at = NOW()
+        FROM depots d
+        WHERE dr.depot_id = d.depot_id
+          AND dr.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+          AND dr.driver_id = $3::uuid
+        RETURNING dr.driver_id::text AS driver_id,
+                  dr.depot_id::text AS depot_id,
+                  dr.external_driver_id,
+                  dr.display_name,
+                  dr.email,
+                  dr.phone,
+                  dr.status,
+                  dr.created_at,
+                  dr.updated_at
+    """
+    row = await db.fetchrow(
+        query,
+        depot_id,
+        organization_id,
+        driver_id,
+        external_driver_id,
+        display_name,
+        email,
+        phone,
+        driver_status,
+    )
+    return dict(row) if row else None
+
+
+async def create_rfid_card(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    id_tag: str,
+    label: Optional[str],
+    card_status: str,
+    notes: Optional[str],
+    assigned_vehicle_ids: list[str],
+    assigned_driver_ids: list[str],
+) -> Optional[dict]:
+    """Create an RFID card and current assignments under an org-owned depot."""
+    row = await db.fetchrow(
+        """
+        INSERT INTO rfid_cards (depot_id, id_tag, label, status, notes)
+        SELECT d.depot_id, $3, $4, $5, $6
+        FROM depots d
+        WHERE d.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+        RETURNING card_id::text AS card_id,
+                  depot_id::text AS depot_id,
+                  id_tag,
+                  label,
+                  status,
+                  notes,
+                  created_at,
+                  updated_at
+        """,
+        depot_id,
+        organization_id,
+        id_tag,
+        label,
+        card_status,
+        notes,
+    )
+    if not row:
+        return None
+    card_id = row["card_id"]
+    await replace_rfid_card_assignments(
+        db,
+        depot_id=depot_id,
+        card_id=card_id,
+        assigned_vehicle_ids=assigned_vehicle_ids,
+        assigned_driver_ids=assigned_driver_ids,
+    )
+    return await get_rfid_card(db, depot_id=depot_id, organization_id=organization_id, card_id=card_id)
+
+
+async def update_rfid_card(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    card_id: str,
+    id_tag: Optional[str],
+    label: Optional[str],
+    card_status: Optional[str],
+    notes: Optional[str],
+    assigned_vehicle_ids: Optional[list[str]],
+    assigned_driver_ids: Optional[list[str]],
+) -> Optional[dict]:
+    """Patch RFID card metadata and optionally replace assignments."""
+    row = await db.fetchrow(
+        """
+        UPDATE rfid_cards c
+        SET id_tag = COALESCE($4, id_tag),
+            label = COALESCE($5, label),
+            status = COALESCE($6, status),
+            notes = COALESCE($7, notes),
+            updated_at = NOW()
+        FROM depots d
+        WHERE c.depot_id = d.depot_id
+          AND c.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+          AND c.card_id = $3::uuid
+        RETURNING c.card_id::text AS card_id
+        """,
+        depot_id,
+        organization_id,
+        card_id,
+        id_tag,
+        label,
+        card_status,
+        notes,
+    )
+    if not row:
+        return None
+    if assigned_vehicle_ids is not None or assigned_driver_ids is not None:
+        await replace_rfid_card_assignments(
+            db,
+            depot_id=depot_id,
+            card_id=card_id,
+            assigned_vehicle_ids=assigned_vehicle_ids,
+            assigned_driver_ids=assigned_driver_ids,
+        )
+    return await get_rfid_card(db, depot_id=depot_id, organization_id=organization_id, card_id=card_id)
+
+
+async def replace_rfid_card_assignments(
+    db,
+    *,
+    depot_id: str,
+    card_id: str,
+    assigned_vehicle_ids: Optional[list[str]],
+    assigned_driver_ids: Optional[list[str]],
+) -> None:
+    """Replace current RFID card vehicle/driver assignments."""
+    if assigned_vehicle_ids is not None:
+        vehicle_ids = list(dict.fromkeys(assigned_vehicle_ids))
+        if vehicle_ids:
+            valid_vehicle_count = await db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM vehicles
+                WHERE depot_id = $1::uuid
+                  AND vehicle_id = ANY($2::uuid[])
+                """,
+                depot_id,
+                vehicle_ids,
+            )
+            if valid_vehicle_count != len(vehicle_ids):
+                raise ValueError("assigned_vehicle_ids must all belong to the card depot")
+        await db.execute(
+            "DELETE FROM rfid_card_vehicle_assignments WHERE card_id = $1::uuid",
+            card_id,
+        )
+        if vehicle_ids:
+            await db.executemany(
+                """
+                INSERT INTO rfid_card_vehicle_assignments (card_id, vehicle_id)
+                VALUES ($1::uuid, $2::uuid)
+                """,
+                [(card_id, vehicle_id) for vehicle_id in vehicle_ids],
+            )
+    if assigned_driver_ids is not None:
+        driver_ids = list(dict.fromkeys(assigned_driver_ids))
+        if driver_ids:
+            valid_driver_count = await db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM drivers
+                WHERE depot_id = $1::uuid
+                  AND driver_id = ANY($2::uuid[])
+                """,
+                depot_id,
+                driver_ids,
+            )
+            if valid_driver_count != len(driver_ids):
+                raise ValueError("assigned_driver_ids must all belong to the card depot")
+        await db.execute(
+            "DELETE FROM rfid_card_driver_assignments WHERE card_id = $1::uuid",
+            card_id,
+        )
+        if driver_ids:
+            await db.executemany(
+                """
+                INSERT INTO rfid_card_driver_assignments (card_id, driver_id)
+                VALUES ($1::uuid, $2::uuid)
+                """,
+                [(card_id, driver_id) for driver_id in driver_ids],
+            )
+
+
+async def get_rfid_card(
+    db,
+    *,
+    depot_id: str,
+    organization_id: str,
+    card_id: str,
+) -> Optional[dict]:
+    """Return one RFID card with current assignments."""
+    row = await db.fetchrow(
+        """
+        SELECT c.card_id::text AS card_id,
+               c.depot_id::text AS depot_id,
+               c.id_tag,
+               c.label,
+               c.status,
+               c.notes,
+               COALESCE(
+                   ARRAY_AGG(DISTINCT cva.vehicle_id::text)
+                       FILTER (WHERE cva.vehicle_id IS NOT NULL),
+                   ARRAY[]::text[]
+               ) AS assigned_vehicle_ids,
+               COALESCE(
+                   ARRAY_AGG(DISTINCT cda.driver_id::text)
+                       FILTER (WHERE cda.driver_id IS NOT NULL),
+                   ARRAY[]::text[]
+               ) AS assigned_driver_ids,
+               c.created_at,
+               c.updated_at
+        FROM rfid_cards c
+        JOIN depots d ON d.depot_id = c.depot_id
+        LEFT JOIN rfid_card_vehicle_assignments cva ON cva.card_id = c.card_id
+        LEFT JOIN rfid_card_driver_assignments cda ON cda.card_id = c.card_id
+        WHERE c.depot_id = $1::uuid
+          AND d.organization_id = $2::uuid
+          AND c.card_id = $3::uuid
+        GROUP BY c.card_id
+        """,
+        depot_id,
+        organization_id,
+        card_id,
+    )
+    return _identity_record(row)
+
+
+async def resolve_id_tag_identity(
+    db,
+    id_tag: str,
+    *,
+    station_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Resolve an OCPP idTag to vehicle, driver, and card identity.
+
+    Vehicle primary idTags are authoritative. Active RFID cards are accepted
+    after vehicle lookup; inactive/lost/stolen cards deliberately do not match.
+    If station_id is provided, the lookup is scoped to that charger's depot.
+    """
+    depot_filter = ""
+    params: list[Any] = [id_tag]
+    if station_id is not None:
+        depot_filter = " AND EXISTS (SELECT 1 FROM chargers c WHERE c.ocpp_id = $2 AND c.depot_id = v.depot_id)"
+        params.append(station_id)
+
+    vehicle_rows = await db.fetch(
+        f"""
+        SELECT v.vehicle_id::text AS vehicle_id,
+               v.depot_id::text AS depot_id,
+               NULL::text AS driver_id,
+               NULL::text AS card_id,
+               'vehicle'::text AS source
+        FROM vehicles v
+        WHERE v.id_tag = $1
+          AND v.status = 'active'
+          {depot_filter}
+        LIMIT 2
+        """,
+        *params,
+    )
+    if len(vehicle_rows) > 1:
+        logger.error("Rejecting idTag %r: multiple active vehicles share it", id_tag)
+        return None
+    if vehicle_rows:
+        return dict(vehicle_rows[0])
+
+    card_depot_filter = ""
+    params = [id_tag]
+    if station_id is not None:
+        card_depot_filter = (
+            " AND EXISTS (SELECT 1 FROM chargers ch WHERE ch.ocpp_id = $2 AND ch.depot_id = c.depot_id)"
+        )
+        params.append(station_id)
+    card_rows = await db.fetch(
+        f"""
+        SELECT c.card_id::text AS card_id,
+               c.depot_id::text AS depot_id,
+               (
+                   SELECT cva.vehicle_id::text
+                   FROM rfid_card_vehicle_assignments cva
+                   JOIN vehicles v ON v.vehicle_id = cva.vehicle_id
+                   WHERE cva.card_id = c.card_id
+                     AND v.depot_id = c.depot_id
+                     AND v.status = 'active'
+                   ORDER BY v.external_id
+                   LIMIT 1
+               ) AS vehicle_id,
+               (
+                   SELECT cda.driver_id::text
+                   FROM rfid_card_driver_assignments cda
+                   JOIN drivers dr ON dr.driver_id = cda.driver_id
+                   WHERE cda.card_id = c.card_id
+                     AND dr.depot_id = c.depot_id
+                     AND dr.status = 'active'
+                   ORDER BY dr.display_name
+                   LIMIT 1
+               ) AS driver_id,
+               'rfid_card'::text AS source
+        FROM rfid_cards c
+        WHERE c.id_tag = $1
+          AND c.status = 'active'
+          {card_depot_filter}
+        LIMIT 2
+        """,
+        *params,
+    )
+    if len(card_rows) > 1:
+        logger.error("Rejecting idTag %r: multiple active RFID cards share it", id_tag)
+        return None
+    return dict(card_rows[0]) if card_rows else None
+
+
 async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
     """Get depot metadata by depot_id.
 
