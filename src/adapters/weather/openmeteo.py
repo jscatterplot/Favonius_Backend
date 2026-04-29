@@ -429,8 +429,7 @@ class OpenMeteoAdapter:
                         fetched_at,
                         depot_id,
                     )
-                    if forecasts:
-                        return forecasts
+                    return forecasts
             except Exception as e:
                 logger.warning(
                     f"Error reading latest forecast bundle: {e}, fetching new"
