@@ -73,7 +73,8 @@ def get_solver_version() -> Optional[str]:
     try:
         import gurobipy
 
-        return f"gurobi-{gurobipy.gurobi.version()}"  # type: ignore[attr-defined]
+        version_parts = gurobipy.gurobi.version()  # type: ignore[attr-defined]
+        return "gurobi-" + ".".join(str(part) for part in version_parts)
     except (ImportError, AttributeError, Exception) as exc:  # noqa: BLE001
         logger.debug("Gurobi version lookup skipped: %s", exc)
 

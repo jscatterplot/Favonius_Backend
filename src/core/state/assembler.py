@@ -749,14 +749,6 @@ class StateAssembler:
             ``max_grid_kw`` by ``building_load_assumption_kw`` so the
             site-power constraint is still respected.
         """
-        # Static-assumption mode: depot has chosen the derate path. We
-        # return a zero series; the optimizer applies the depot-level
-        # constant in grid_balance_rule. Tagging the source here lets
-        # readiness mark the run as 'degraded'.
-        if self.config.building_load_assumption_kw > 0.0:
-            self._last_building_load_source = "static_assumption"
-            return [0.0] * n_steps
-
         query = """
         SELECT time, power_kw
         FROM building_load
@@ -769,8 +761,11 @@ class StateAssembler:
         except asyncpg.PostgresError as e:
             logger.warning(
                 f"Database error fetching building load for depot {self.depot_id}: {e}. "
-                "Using forecast model fallback."
+                "Using fallback source."
             )
+            if self.config.building_load_assumption_kw > 0.0:
+                self._last_building_load_source = "static_assumption"
+                return [0.0] * n_steps
             # Explicit degraded mode (PRD 9.4): meter unavailable, fall back
             # to the deterministic business-hours pattern. Readiness will
             # downgrade the run to 'degraded'.
@@ -780,8 +775,11 @@ class StateAssembler:
         if not rows:
             logger.warning(
                 f"No building load data found for depot {self.depot_id} "
-                f"between {start} and {end}, using forecast model"
+                f"between {start} and {end}, using fallback source"
             )
+            if self.config.building_load_assumption_kw > 0.0:
+                self._last_building_load_source = "static_assumption"
+                return [0.0] * n_steps
             self._last_building_load_source = "forecast_fallback"
             return self._get_building_power_forecast(start, end, n_steps)
 
