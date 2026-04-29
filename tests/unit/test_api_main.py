@@ -3,7 +3,7 @@
 Reference: PRD.md#11-2-unit-test-requirements
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -191,7 +191,7 @@ class TestOptimizationReadinessEndpoint:
     ):
         """Regression: readiness persist path must keep telemetry replay data."""
         depot_id = str(uuid4())
-        horizon = (datetime.utcnow(), datetime.utcnow() + timedelta(hours=24))
+        horizon = (datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(hours=24))
         recent_telemetry = [
             {
                 "vehicle_id": "bus_1",
