@@ -22,6 +22,28 @@ from src.db.pools import DatabasePools
 # ============ Fixtures ============
 
 
+@pytest.fixture(autouse=True)
+def _bypass_snapshot_capture():
+    """Retry/resilience tests don't exercise readiness; bypass the
+    snapshot capture introduced by migration 019. See
+    test_controller_snapshot_integration.py for snapshot coverage.
+    """
+    from src.core.controller import _stub_snapshot
+
+    async def _noop(self, state, horizon_hours):
+        now = datetime.utcnow()
+        return _stub_snapshot(self.depot_id, now, now + timedelta(hours=horizon_hours))
+
+    with patch(
+        "src.core.controller.DepotController._capture_snapshot",
+        autospec=True,
+        side_effect=_noop,
+    ), patch(
+        "src.core.controller.link_snapshot_to_run", new=AsyncMock()
+    ):
+        yield
+
+
 @pytest.fixture
 def mock_db_pool():
     """Mock database connection pool wrapped in DatabasePools."""

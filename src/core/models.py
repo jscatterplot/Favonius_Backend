@@ -181,6 +181,70 @@ class DepotState:
 
 
 @dataclass
+class ReadinessReport:
+    """Pre-flight readiness report for an optimization run.
+
+    Reference: Snapshot/readiness flow added by migration 019.
+    `status` values:
+        - 'ready'     — every required input present
+        - 'degraded'  — at least one input substituted by an explicit assumption
+                        (e.g. building load fallback to forecast)
+        - 'not_ready' — a hard prerequisite is missing (no vehicles, no chargers,
+                        no schedules, etc.); the caller should refuse to solve.
+    """
+
+    status: str  # 'ready' | 'degraded' | 'not_ready'
+    missing_inputs: list[str] = field(default_factory=list)
+    degraded_reasons: list[str] = field(default_factory=list)
+    assumptions: dict[str, object] = field(default_factory=dict)
+    building_load_source: str = "meter"  # 'meter' | 'forecast_fallback' | 'absent'
+
+    @property
+    def is_ready(self) -> bool:
+        return self.status == "ready"
+
+    @property
+    def is_degraded(self) -> bool:
+        return self.status == "degraded"
+
+    @property
+    def is_blocking(self) -> bool:
+        """True if the optimization should be refused outright."""
+        return self.status == "not_ready"
+
+
+@dataclass
+class OptimizationInputSnapshot:
+    """Full, replayable input bundle for an optimization run.
+
+    Persisted to ``optimization_input_snapshots`` before the solver runs, so
+    that post-mortem analysis and replay still work even when the solver
+    crashes or times out. ``run_id`` is back-filled once the run record is
+    written.
+    """
+
+    snapshot_id: UUID
+    depot_id: UUID
+    organization_id: Optional[UUID]
+    captured_at: datetime
+    horizon_start: datetime
+    horizon_end: datetime
+    readiness: ReadinessReport
+    depot: dict[str, object]
+    vehicles: list[dict[str, object]]
+    chargers: dict[str, object]
+    charger_vehicle_access: dict[str, list[str]]
+    schedules: list[dict[str, object]]
+    prices: list[float]
+    telemetry: dict[str, float]
+    building_load: dict[str, object]
+    weather_features: list[dict[str, object]] = field(default_factory=list)
+    incoming_vehicles: list[dict[str, object]] = field(default_factory=list)
+    run_id: Optional[UUID] = None
+    payload_schema: str = "v1"
+
+
+@dataclass
 class OptimizationResult:
     """Output from optimization.
 
