@@ -3261,6 +3261,11 @@ def _coerce_under_cap_rate(billing_metadata: Optional[dict]) -> Optional[float]:
         return None
 
 
+def _optional_text(value: object) -> Optional[str]:
+    """Normalize nullable report dimension values from asyncpg records."""
+    return str(value) if value else None
+
+
 async def _load_report_context(
     depot_id: str,
 ) -> tuple[str, str, Optional[float], list[str], dict[str, str]]:
@@ -3320,7 +3325,7 @@ async def _fetch_session_rows(
             cs.end_time,
             cs.energy_delivered_kwh,
             cs.cost_total,
-            cs.vehicle_id,
+            cs.vehicle_id::text AS vehicle_id,
             cs.station_id AS charger_id,
             cs.driver_id::text AS driver_id,
             cs.card_id::text AS card_id
@@ -3344,10 +3349,10 @@ async def _fetch_session_rows(
                 end_time=r["end_time"],
                 energy_kwh=float(energy) if energy is not None else None,
                 cost_total=float(cost) if cost is not None else None,
-                vehicle_id=r["vehicle_id"] or None,
+                vehicle_id=_optional_text(r["vehicle_id"]),
                 charger_id=charger_id_by_ocpp_id.get(r["charger_id"]),
-                driver_id=r["driver_id"],
-                card_id=r["card_id"],
+                driver_id=_optional_text(r["driver_id"]),
+                card_id=_optional_text(r["card_id"]),
             )
         )
     return rows

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import io
+import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -519,6 +520,64 @@ class TestEnergyReportMonthlyEndpoint:
         assert len(rows) == 1
         assert rows[0]["driver_id"] == "unassigned"
         assert rows[0]["session_count"] == 2
+
+    def test_report_dimensions_are_normalized_before_aggregation(self, client):
+        depot_id = str(uuid4())
+        ocpp_id = "ocpp_a"
+        charger_uuid = str(uuid4())
+        vehicle_uuid = uuid4()
+        tz = "America/Los_Angeles"
+
+        ts_records = [
+            {
+                "start_time": _utc(datetime(2024, 1, 5, 9, 0), tz),
+                "end_time": _utc(datetime(2024, 1, 5, 11, 0), tz),
+                "energy_delivered_kwh": 60.0,
+                "cost_total": 12.0,
+                "vehicle_id": vehicle_uuid,
+                "charger_id": ocpp_id,
+                "driver_id": "",
+                "card_id": "",
+            },
+            {
+                "start_time": _utc(datetime(2024, 1, 6, 9, 0), tz),
+                "end_time": _utc(datetime(2024, 1, 6, 11, 0), tz),
+                "energy_delivered_kwh": 40.0,
+                "cost_total": 8.0,
+                "vehicle_id": vehicle_uuid,
+                "charger_id": ocpp_id,
+                "driver_id": None,
+                "card_id": None,
+            },
+        ]
+        pools = _make_pool(
+            static_records={
+                "depot_row": _depot_row(timezone=tz),
+                "charger_rows": [{"charger_id": charger_uuid, "ocpp_id": ocpp_id}],
+            },
+            ts_records=ts_records,
+        )
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            vehicle_response = client.get(
+                f"/reports/depots/{depot_id}/energy/monthly",
+                params={"from": "2024-01-01", "to": "2024-01-31", "group_by": "vehicle"},
+            )
+            driver_response = client.get(
+                f"/reports/depots/{depot_id}/energy/monthly",
+                params={"from": "2024-01-01", "to": "2024-01-31", "group_by": "driver"},
+            )
+
+        assert vehicle_response.status_code == status.HTTP_200_OK
+        vehicle_rows = vehicle_response.json()["rows"]
+        assert len(vehicle_rows) == 1
+        assert vehicle_rows[0]["vehicle_id"] == str(vehicle_uuid)
+
+        assert driver_response.status_code == status.HTTP_200_OK
+        driver_rows = driver_response.json()["rows"]
+        assert len(driver_rows) == 1
+        assert driver_rows[0]["driver_id"] == "unassigned"
 
     def test_session_at_2330_local_does_not_bleed_into_next_month(self, client):
         depot_id = str(uuid4())
