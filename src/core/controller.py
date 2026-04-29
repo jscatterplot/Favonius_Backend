@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
 from .controller_config import ControllerConfig
-from .models import DepotConfig, OptimizationInputSnapshot, OptimizationResult
+from .models import (
+    DepotConfig,
+    OptimizationInputSnapshot,
+    OptimizationResult,
+    ReadinessReport,
+)
 from .optimizer import optimize
 from .state.assembler import StateAssembler
 from .state.readiness import build_snapshot, evaluate_readiness
@@ -41,18 +46,20 @@ class _ReadinessBlockedError(RuntimeError):
 
 
 def _stub_snapshot(
-    depot_id: str, horizon_start: datetime, horizon_end: datetime
+    depot_id: str,
+    horizon_start: datetime,
+    horizon_end: datetime,
+    readiness: Optional["ReadinessReport"] = None,
 ) -> "OptimizationInputSnapshot":
     """Fallback snapshot used when real construction fails.
 
-    Returns a conservative ``degraded`` snapshot so snapshot-construction
-    failures never abort an otherwise-runnable optimization. The stub IS
-    persisted by ``_capture_snapshot`` so the audit trail has no gap
-    even when ``build_snapshot`` raises.
+    Returns a conservative ``degraded`` snapshot for otherwise-runnable
+    optimizations. If readiness was already evaluated as ``not_ready``,
+    preserve that hard veto so snapshot-construction failures cannot mask
+    missing prerequisites.
     """
     from uuid import UUID, uuid4
 
-    from .models import OptimizationInputSnapshot, ReadinessReport
     from .version_info import (
         get_code_version,
         get_solver_version,
@@ -63,6 +70,30 @@ def _stub_snapshot(
         depot_uuid = UUID(depot_id)
     except (ValueError, TypeError):
         depot_uuid = uuid4()
+
+    if readiness is None:
+        stub_readiness = ReadinessReport(
+            status="degraded",
+            degraded_reasons=["snapshot_construction_failed"],
+            assumptions={"snapshot_construction_failed": True},
+            building_load_source="absent",
+        )
+    else:
+        status = "not_ready" if readiness.is_blocking else "degraded"
+        stub_readiness = ReadinessReport(
+            status=status,
+            missing_inputs=list(readiness.missing_inputs),
+            degraded_reasons=[
+                *readiness.degraded_reasons,
+                "snapshot_construction_failed",
+            ],
+            assumptions={
+                **readiness.assumptions,
+                "snapshot_construction_failed": True,
+            },
+            building_load_source=readiness.building_load_source,
+        )
+
     return OptimizationInputSnapshot(
         snapshot_id=uuid4(),
         depot_id=depot_uuid,
@@ -70,12 +101,7 @@ def _stub_snapshot(
         captured_at=datetime.now(timezone.utc),
         horizon_start=horizon_start,
         horizon_end=horizon_end,
-        readiness=ReadinessReport(
-            status="degraded",
-            degraded_reasons=["snapshot_construction_failed"],
-            assumptions={"snapshot_construction_failed": True},
-            building_load_source="absent",
-        ),
+        readiness=stub_readiness,
         depot={"n_timesteps": 0},
         vehicles=[],
         chargers={},
@@ -445,6 +471,7 @@ class DepotController:
                 e,
             )
 
+        readiness: Optional[ReadinessReport] = None
         snapshot: OptimizationInputSnapshot
         try:
             readiness = evaluate_readiness(
@@ -453,26 +480,36 @@ class DepotController:
                 building_load_source=self.assembler.last_building_load_source,
                 schedules_present=self.assembler.last_schedules_present,
             )
-            snapshot = build_snapshot(
-                depot_id=self.depot_id,
-                organization_id=self.assembler.last_organization_id,
-                config=self.config,
-                state=state,
-                horizon_start=horizon[0],
-                horizon_end=horizon[1],
-                schedules=self.assembler.last_schedules,
-                weather_features=self.assembler.last_weather_features,
-                recent_telemetry=self.assembler.last_recent_telemetry,
-                readiness=readiness,
-            )
         except Exception as e:
             logger.error(
-                "Failed to build optimization input snapshot for depot %s: %s",
+                "Failed to evaluate optimization readiness for depot %s: %s",
                 self.depot_id,
                 e,
                 exc_info=True,
             )
             snapshot = _stub_snapshot(self.depot_id, horizon[0], horizon[1])
+        else:
+            try:
+                snapshot = build_snapshot(
+                    depot_id=self.depot_id,
+                    organization_id=self.assembler.last_organization_id,
+                    config=self.config,
+                    state=state,
+                    horizon_start=horizon[0],
+                    horizon_end=horizon[1],
+                    schedules=self.assembler.last_schedules,
+                    weather_features=self.assembler.last_weather_features,
+                    recent_telemetry=self.assembler.last_recent_telemetry,
+                    readiness=readiness,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to build optimization input snapshot for depot %s: %s",
+                    self.depot_id,
+                    e,
+                    exc_info=True,
+                )
+                snapshot = _stub_snapshot(self.depot_id, horizon[0], horizon[1], readiness)
 
         try:
             await persist_snapshot(self.pools, snapshot)

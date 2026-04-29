@@ -304,6 +304,50 @@ async def test_stub_snapshot_persisted_on_construction_failure(
 
 
 @pytest.mark.asyncio
+async def test_build_snapshot_failure_preserves_not_ready_block(
+    pool_pair, full_depot_config, controller_config
+):
+    """A fallback snapshot must not turn a hard readiness miss into degraded."""
+    pool, _ = pool_pair
+    controller = DepotController(
+        pools=pool,
+        depot_id=str(uuid4()),
+        config=full_depot_config,
+        controller_config=controller_config,
+    )
+    controller.assembler.get_current_state = AsyncMock(return_value=_real_state())
+    _prime_assembler(controller, building_source="meter")
+    controller.assembler._last_schedules_present = False
+    controller.assembler._last_schedules = []
+    controller.assembler.fetch_snapshot_extras = AsyncMock()
+
+    captured: list = []
+
+    async def fake_persist(_pools, snapshot):
+        captured.append(snapshot)
+        return snapshot.snapshot_id
+
+    optimize_mock = MagicMock(return_value=_opt_result())
+    with (
+        patch("src.core.controller.build_snapshot", side_effect=RuntimeError("boom")),
+        patch("src.core.controller.persist_snapshot", side_effect=fake_persist),
+        patch("src.core.controller.link_snapshot_to_run", new=AsyncMock()),
+        patch("src.core.controller.optimize", optimize_mock),
+        patch.object(controller, "_store_result", new=AsyncMock()),
+        patch.object(controller, "_dispatch_commands", new=AsyncMock()),
+    ):
+        with pytest.raises(Exception, match="not ready"):
+            await controller.run_optimization("test")
+
+    assert len(captured) == 1
+    stub = captured[0]
+    assert stub.readiness.status == "not_ready"
+    assert "schedules" in stub.readiness.missing_inputs
+    assert "snapshot_construction_failed" in stub.readiness.degraded_reasons
+    optimize_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_static_assumption_marks_run_degraded(
     pool_pair, full_depot_config, controller_config
 ):
