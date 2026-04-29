@@ -113,7 +113,10 @@ def _prime_assembler(controller: DepotController, *, building_source: str) -> No
             "estimated_energy_kwh": 200.0,
         }
     ]
-    controller.assembler._last_weather_features = []
+    controller.assembler._last_weather_features = [
+        {"time": now.isoformat(), "temp_f": 70.0}
+    ]
+    controller.assembler._last_weather_forecast_id = uuid4()
     controller.assembler._last_organization_id = str(uuid4())
 
 
@@ -156,6 +159,7 @@ async def test_run_persists_snapshot_and_links_to_run(
     assert len(persisted) == 1
     snap = persisted[0]
     assert snap.readiness.status == "ready"
+    assert snap.weather_forecast_id is not None
     # Linked to the run row that _store_result wrote.
     assert linked == [(snap.snapshot_id, result.run_id)]
     # Result status untouched in the ready path.

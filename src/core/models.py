@@ -245,6 +245,10 @@ class OptimizationInputSnapshot:
     telemetry: dict[str, float]
     building_load: dict[str, object]
     weather_features: list[dict[str, object]] = field(default_factory=list)
+    # FK target on ``optimization_input_snapshots.weather_forecast_id``.
+    # Populated when ``weather_features`` is non-empty so the snapshot
+    # can later be replayed against the exact forecast bundle it saw.
+    weather_forecast_id: Optional[UUID] = None
     incoming_vehicles: list[dict[str, object]] = field(default_factory=list)
     # Telemetry rows (last hour by default) that drove this optimization.
     # Captured for replay so we can reconstruct e.g. SoC-deviation triggers.

@@ -499,6 +499,7 @@ class DepotController:
                     horizon_end=horizon[1],
                     schedules=self.assembler.last_schedules,
                     weather_features=self.assembler.last_weather_features,
+                    weather_forecast_id=self.assembler.last_weather_forecast_id,
                     recent_telemetry=self.assembler.last_recent_telemetry,
                     readiness=readiness,
                 )

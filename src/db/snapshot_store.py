@@ -36,6 +36,7 @@ INSERT INTO optimization_input_snapshots (
     assumptions,
     payload,
     payload_schema,
+    weather_forecast_id,
     recent_telemetry,
     code_version,
     solver_version,
@@ -43,7 +44,7 @@ INSERT INTO optimization_input_snapshots (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8,
     $9::jsonb, $10::jsonb, $11::jsonb, $12,
-    $13::jsonb, $14, $15, $16
+    $13, $14::jsonb, $15, $16, $17
 )
 """
 
@@ -82,6 +83,7 @@ async def persist_snapshot(pools: "DatabasePools", snapshot: "OptimizationInputS
             assumptions_json,
             payload_json,
             snapshot.payload_schema,
+            snapshot.weather_forecast_id,
             telemetry_json,
             snapshot.code_version,
             snapshot.solver_version,

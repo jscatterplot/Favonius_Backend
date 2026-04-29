@@ -12,6 +12,7 @@ from uuid import UUID
 
 import asyncpg
 
+from ...adapters.weather.storage import DEFAULT_WEATHER_SOURCE
 from ..models import DepotConfig, DepotState, IncomingVehicle
 from ...db.pools import DatabasePools
 
@@ -73,6 +74,11 @@ class StateAssembler:
         self._last_schedules: list[dict] = []
         self._last_schedules_present: bool = False
         self._last_weather_features: list[dict] = []
+        # forecast_id of the bundle the weather_features were drawn from.
+        # None when no bundle was visible at horizon_start (and so
+        # weather_features is the empty list). Used by the controller to
+        # populate optimization_input_snapshots.weather_forecast_id.
+        self._last_weather_forecast_id: UUID | None = None
         self._last_horizon: tuple[datetime, datetime] | None = None
         self._last_organization_id: str | None = None
         self._last_recent_telemetry: list[dict] = []
@@ -93,6 +99,17 @@ class StateAssembler:
     @property
     def last_weather_features(self) -> list[dict]:
         return list(self._last_weather_features)
+
+    @property
+    def last_weather_forecast_id(self) -> UUID | None:
+        """forecast_id of the bundle backing ``last_weather_features``.
+
+        ``None`` when no bundle was visible at ``horizon_start``. The
+        controller writes this onto ``optimization_input_snapshots``
+        only when ``last_weather_features`` is non-empty so the FK
+        always points to the captured bundle.
+        """
+        return self._last_weather_forecast_id
 
     @property
     def last_horizon(self) -> tuple[datetime, datetime] | None:
@@ -863,7 +880,11 @@ class StateAssembler:
         ``get_current_state`` so the extra DB roundtrips don't show up
         for callers that only need the optimization state.
         """
-        self._last_weather_features = await self._get_weather_features(horizon_start, horizon_end)
+        features, forecast_id = await self._get_weather_features(
+            horizon_start, horizon_end
+        )
+        self._last_weather_features = features
+        self._last_weather_forecast_id = forecast_id
         self._last_organization_id = await self._get_organization_id()
         self._last_recent_telemetry = await self._get_recent_telemetry(horizon_start)
 
@@ -923,42 +944,107 @@ class StateAssembler:
             for row in rows
         ]
 
-    async def _get_weather_features(self, start: datetime, end: datetime) -> list[dict]:
+    async def _get_weather_features(self, start: datetime, end: datetime) -> tuple[list[dict], UUID | None]:
         """Fetch weather features for the horizon (snapshot context only).
 
-        Used for input-snapshot replay. Failures are non-fatal: we return an
-        empty list and the readiness layer simply records that no weather
-        data was available.
+        After migration 021 ``weather_forecasts`` is an insert-only
+        history of forecast bundles, each tagged with ``fetched_at``
+        (when we asked) and ``forecast_for`` (the timestamp the
+        forecast is for). We pin the snapshot to the **forecast bundle
+        that was current at horizon_start** by filtering:
+
+            fetched_at = (
+                SELECT MAX(fetched_at) FROM weather_forecasts
+                WHERE depot_id = $1 AND source = $2 AND fetched_at <= $start
+            )
+
+        That guarantees:
+
+        * the optimizer and the snapshot share the exact same bundle
+          (no race against a fresh fetch landing mid-assembly), and
+        * surrogate training can replay the bundle a historical run
+          actually saw by re-running the same query with the run's
+          ``horizon_start`` as the upper bound.
+
+        Returns:
+            ``(features, forecast_id)`` where ``forecast_id`` is the
+            UUID of *one* row from the bundle (any row works — every
+            row in a bundle shares fetched_at and depot_id, and the
+            FK target is just used to load the bundle later). Returns
+            ``([], None)`` if no bundle is visible at ``horizon_start``
+            or the table is unavailable.
         """
         try:
             async with self.pools.ts.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT time, temp_f, temp_max_f, temp_min_f,
+                    SELECT forecast_id, forecast_for, fetched_at,
+                           temp_f, temp_max_f, temp_min_f,
                            precip_in, solar_rad
                     FROM weather_forecasts
                     WHERE depot_id = $1::uuid
-                      AND time >= $2 AND time < $3
-                    ORDER BY time
+                      AND source = $2
+                      AND fetched_at = (
+                          SELECT MAX(fetched_at)
+                          FROM weather_forecasts
+                          WHERE depot_id = $1::uuid
+                            AND source = $2
+                            AND fetched_at <= $3
+                      )
+                      AND forecast_for >= $3
+                      AND forecast_for <  $4
+                    ORDER BY forecast_for
                     """,
                     self.depot_id,
+                    DEFAULT_WEATHER_SOURCE,
                     start,
                     end,
                 )
         except asyncpg.PostgresError as e:
-            logger.debug(f"weather_forecasts unavailable for depot {self.depot_id}: {e}")
-            return []
-        return [
+            logger.debug(
+                f"weather_forecasts unavailable for depot {self.depot_id}: {e}"
+            )
+            return [], None
+        if not rows:
+            return [], None
+
+        forecast_id: UUID = rows[0]["forecast_id"]
+        features = [
             {
-                "time": row["time"].isoformat() if row["time"] else None,
-                "temp_f": (float(row["temp_f"]) if row["temp_f"] is not None else None),
-                "temp_max_f": (float(row["temp_max_f"]) if row["temp_max_f"] is not None else None),
-                "temp_min_f": (float(row["temp_min_f"]) if row["temp_min_f"] is not None else None),
-                "precip_in": (float(row["precip_in"]) if row["precip_in"] is not None else None),
-                "solar_rad": (float(row["solar_rad"]) if row["solar_rad"] is not None else None),
+                # ``time`` is preserved as the public payload key for
+                # backwards compatibility with the snapshot schema.
+                "time": (
+                    row["forecast_for"].isoformat()
+                    if row["forecast_for"]
+                    else None
+                ),
+                "temp_f": (
+                    float(row["temp_f"]) if row["temp_f"] is not None else None
+                ),
+                "temp_max_f": (
+                    float(row["temp_max_f"])
+                    if row["temp_max_f"] is not None
+                    else None
+                ),
+                "temp_min_f": (
+                    float(row["temp_min_f"])
+                    if row["temp_min_f"] is not None
+                    else None
+                ),
+                "precip_in": (
+                    float(row["precip_in"])
+                    if row["precip_in"] is not None
+                    else None
+                ),
+                "solar_rad": (
+                    float(row["solar_rad"])
+                    if row["solar_rad"] is not None
+                    else None
+                ),
             }
             for row in rows
         ]
+        return features, forecast_id
 
     async def _get_organization_id(self) -> str | None:
         """Look up the depot's organization_id (Supabase). None if unset."""

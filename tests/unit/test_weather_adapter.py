@@ -20,12 +20,14 @@ import asyncpg
 import numpy as np
 
 from src.adapters.weather import (
+    DEFAULT_WEATHER_SOURCE,
     OpenMeteoAdapter,
     WeatherData,
     convert_solar_radiation_wm2_to_calcm2,
     get_cached_forecasts,
     get_depot_location,
     get_latest_forecast,
+    get_latest_forecast_bundle,
     store_weather_forecasts,
 )
 
@@ -314,55 +316,128 @@ async def test_store_forecasts_to_db_no_pool(sample_weather_data, tmp_path):
 
 @pytest.mark.asyncio
 async def test_get_forecasts_for_depot_with_cache(weather_adapter, sample_weather_data, mock_pool):
-    """Test getting forecasts with cache hit."""
+    """When use_cache=True, the adapter reads the latest bundle
+    instead of hitting the external API."""
     depot_id = uuid4()
 
-    # Mock cached forecasts
-    cached_rows = [
+    now = datetime.now(timezone.utc)
+    bundle_fetched_at = now - timedelta(hours=1)
+    bundle_rows = [
         {
-            "time": w.timestamp,
+            "forecast_id": uuid4(),
+            "forecast_for": now + timedelta(days=day),
+            "fetched_at": bundle_fetched_at,
             "temp_f": w.temperature_f,
             "temp_max_f": w.temperature_max_f,
             "temp_min_f": w.temperature_min_f,
             "precip_in": w.precipitation_inches,
             "solar_rad": convert_solar_radiation_wm2_to_calcm2(w.solar_radiation),
         }
-        for w in sample_weather_data[:5]
+        for day, w in enumerate(sample_weather_data[:5])
     ]
-    mock_pool._mock_conn.fetch = AsyncMock(return_value=cached_rows)
-
-    # Mock depot location
+    # First fetchrow returns the depot location (used by the adapter).
+    # Once latitude/longitude are populated on the adapter the location
+    # lookup is skipped, so subsequent fetchrow calls are the
+    # MAX(fetched_at) lookup inside get_latest_forecast_bundle.
     mock_pool._mock_conn.fetchrow = AsyncMock(
-        return_value={"latitude": 37.7749, "longitude": -122.4194}
+        return_value={"max_fetched_at": bundle_fetched_at}
     )
+    mock_pool._mock_conn.fetch = AsyncMock(return_value=bundle_rows)
 
     forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=7, use_cache=True)
 
     assert len(forecasts) == 5
-    # Verify forecasts were converted from cache
     assert all(f.temperature_f > 0 for f in forecasts)
+
+
+@pytest.mark.asyncio
+async def test_get_forecasts_for_depot_with_cache_respects_days(
+    weather_adapter, sample_weather_data, mock_pool
+):
+    """use_cache=True should still honor the requested day window."""
+    depot_id = uuid4()
+
+    now = datetime.now(timezone.utc)
+    bundle_fetched_at = now - timedelta(hours=1)
+    bundle_rows = [
+        {
+            "forecast_id": uuid4(),
+            "forecast_for": now + timedelta(days=day),
+            "fetched_at": bundle_fetched_at,
+            "temp_f": weather.temperature_f,
+            "temp_max_f": weather.temperature_max_f,
+            "temp_min_f": weather.temperature_min_f,
+            "precip_in": weather.precipitation_inches,
+            "solar_rad": convert_solar_radiation_wm2_to_calcm2(weather.solar_radiation),
+        }
+        for day, weather in enumerate(sample_weather_data)
+    ]
+    mock_pool._mock_conn.fetchrow = AsyncMock(
+        return_value={"max_fetched_at": bundle_fetched_at}
+    )
+    mock_pool._mock_conn.fetch = AsyncMock(return_value=bundle_rows)
+
+    forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=3, use_cache=True)
+
+    assert len(forecasts) == 3
+    assert all(f.timestamp < now + timedelta(days=3) for f in forecasts)
+
+
+@pytest.mark.asyncio
+async def test_get_forecasts_for_depot_with_cache_includes_today_midnight_forecast(
+    weather_adapter, sample_weather_data, mock_pool
+):
+    """Daily bundle rows use midnight timestamps; today's row must not be dropped."""
+    depot_id = uuid4()
+    now = datetime.now(timezone.utc)
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    bundle_fetched_at = now - timedelta(hours=1)
+    bundle_rows = [
+        {
+            "forecast_id": uuid4(),
+            "forecast_for": today_midnight + timedelta(days=day),
+            "fetched_at": bundle_fetched_at,
+            "temp_f": weather.temperature_f,
+            "temp_max_f": weather.temperature_max_f,
+            "temp_min_f": weather.temperature_min_f,
+            "precip_in": weather.precipitation_inches,
+            "solar_rad": convert_solar_radiation_wm2_to_calcm2(weather.solar_radiation),
+        }
+        for day, weather in enumerate(sample_weather_data[:2])
+    ]
+    mock_pool._mock_conn.fetchrow = AsyncMock(
+        return_value={"max_fetched_at": bundle_fetched_at}
+    )
+    mock_pool._mock_conn.fetch = AsyncMock(return_value=bundle_rows)
+
+    forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=2, use_cache=True)
+
+    assert len(forecasts) == 2
+    assert forecasts[0].timestamp == today_midnight
 
 
 @pytest.mark.asyncio
 async def test_get_forecasts_for_depot_no_cache(
     weather_adapter, mock_pool, mock_flatbuffers_response
 ):
-    """Test getting forecasts without cache (fresh fetch)."""
+    """Test getting forecasts without cache (fresh fetch + insert)."""
     depot_id = uuid4()
 
-    # Mock no cached forecasts
+    # use_cache=False path skips the bundle read entirely. We still
+    # need fetchrow / fetch to be safe defaults in case the adapter's
+    # location lookup runs.
     mock_pool._mock_conn.fetch = AsyncMock(return_value=[])
     mock_pool._mock_conn.fetchrow = AsyncMock(
         return_value={"latitude": 37.7749, "longitude": -122.4194}
     )
-
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
     weather_adapter._client.weather_api.return_value = [mock_flatbuffers_response]
 
     forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=7, use_cache=False)
 
     assert len(forecasts) == 3
-    # Verify forecasts were stored
-    assert mock_pool._mock_conn.execute.call_count > 0
+    # Every forecast inserts a row — never UPDATE.
+    assert mock_pool._mock_conn.execute.call_count == 3
 
 
 @pytest.mark.asyncio
@@ -443,6 +518,8 @@ def test_adapter_initialization_creates_cache_dir(tmp_path):
 async def test_store_weather_forecasts(mock_pool, sample_weather_data):
     """Test store_weather_forecasts function."""
     depot_id = uuid4()
+    # asyncpg returns 'INSERT 0 1' for a successful single-row insert.
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
     stored_count = await store_weather_forecasts(mock_pool, sample_weather_data[:7], depot_id)
 
     assert stored_count == 7
@@ -461,25 +538,158 @@ async def test_store_weather_forecasts_empty_list(mock_pool):
 async def test_store_weather_forecasts_solar_conversion(mock_pool, sample_weather_data):
     """Test that solar radiation is converted when storing."""
     depot_id = uuid4()
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
     await store_weather_forecasts(mock_pool, sample_weather_data[:1], depot_id)
 
-    # Verify conversion was applied in execute call
-    # call_args[0] is positional args: (query, timestamp, depot_id, temp_f, temp_max_f, temp_min_f, precip, solar_rad)
+    # New parameter order:
+    # 0=query, 1=depot_id, 2=source, 3=fetched_at, 4=forecast_for,
+    # 5=temp_f, 6=temp_max_f, 7=temp_min_f, 8=precip, 9=solar_rad
     call_args = mock_pool._mock_conn.execute.call_args[0]
-    # solar_rad is at index 7 (0=query, 1=timestamp, 2=depot_id, 3=temp_f, 4=temp_max, 5=temp_min, 6=precip, 7=solar)
-    assert call_args[7] == pytest.approx(1032.0, rel=0.01)
+    assert call_args[9] == pytest.approx(1032.0, rel=0.01)
+
+
+@pytest.mark.asyncio
+async def test_store_weather_forecasts_uses_default_source(mock_pool, sample_weather_data):
+    """Default source tag is 'open_meteo'."""
+    depot_id = uuid4()
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+    await store_weather_forecasts(mock_pool, sample_weather_data[:1], depot_id)
+    call_args = mock_pool._mock_conn.execute.call_args[0]
+    # 0=query, 1=depot_id, 2=source
+    assert call_args[2] == DEFAULT_WEATHER_SOURCE
+
+
+@pytest.mark.asyncio
+async def test_store_weather_forecasts_pins_one_fetched_at(mock_pool, sample_weather_data):
+    """All rows in a single store call must share fetched_at — that's
+    the bundle invariant the assembler relies on."""
+    depot_id = uuid4()
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+    await store_weather_forecasts(mock_pool, sample_weather_data[:5], depot_id)
+
+    fetched_ats = {
+        call_args[0][3]  # 0=query, 1=depot, 2=source, 3=fetched_at
+        for call_args in mock_pool._mock_conn.execute.call_args_list
+    }
+    assert len(fetched_ats) == 1, fetched_ats
+    bundle_fetched_at = next(iter(fetched_ats))
+    assert bundle_fetched_at.tzinfo is timezone.utc
+
+
+@pytest.mark.asyncio
+async def test_store_weather_forecasts_does_not_overwrite_on_repeat_fetch(
+    mock_pool, sample_weather_data
+):
+    """Two back-to-back fetches must produce distinct fetched_at
+    values — no UPDATE, two bundles in the table."""
+    depot_id = uuid4()
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+    await store_weather_forecasts(mock_pool, sample_weather_data[:3], depot_id)
+    first_fetched = mock_pool._mock_conn.execute.call_args_list[0][0][3]
+
+    # Force a measurable gap so the default UTC timestamp differs.
+    import asyncio
+
+    await asyncio.sleep(0.01)
+    await store_weather_forecasts(mock_pool, sample_weather_data[:3], depot_id)
+    second_fetched = mock_pool._mock_conn.execute.call_args_list[-1][0][3]
+
+    assert first_fetched.tzinfo is timezone.utc
+    assert second_fetched.tzinfo is timezone.utc
+    assert second_fetched > first_fetched
+
+    # And the SQL is INSERT ... ON CONFLICT DO NOTHING, never UPDATE.
+    sql = mock_pool._mock_conn.execute.call_args_list[-1][0][0]
+    assert "INSERT INTO weather_forecasts" in sql
+    assert "ON CONFLICT" in sql
+    assert "DO NOTHING" in sql
+    assert "UPDATE" not in sql
+
+
+@pytest.mark.asyncio
+async def test_store_weather_forecasts_dedup_collapses_duplicate(
+    mock_pool, sample_weather_data
+):
+    """If the caller pins fetched_at and the same tuple already exists,
+    the unique constraint collapses the duplicate (asyncpg returns
+    'INSERT 0 0' on conflict)."""
+    depot_id = uuid4()
+    pinned = datetime(2025, 12, 4, 12, 0, 0, tzinfo=timezone.utc)
+
+    # First call: all rows insert.
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+    inserted = await store_weather_forecasts(
+        mock_pool, sample_weather_data[:3], depot_id, fetched_at=pinned
+    )
+    assert inserted == 3
+
+    # Second call: identical (depot, source, fetched_at, forecast_for)
+    # tuple — the DB returns 'INSERT 0 0' for every row.
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 0")
+    inserted = await store_weather_forecasts(
+        mock_pool, sample_weather_data[:3], depot_id, fetched_at=pinned
+    )
+    assert inserted == 0
+
+
+@pytest.mark.asyncio
+async def test_get_latest_forecast_bundle_returns_max_fetched_at(mock_pool):
+    """The bundle helper must return rows from MAX(fetched_at)
+    visible at the as_of cutoff."""
+    depot_id = uuid4()
+    bundle_fetched_at = datetime(2025, 12, 4, 8, 0, 0, tzinfo=timezone.utc)
+
+    mock_pool._mock_conn.fetchrow = AsyncMock(
+        return_value={"max_fetched_at": bundle_fetched_at}
+    )
+    bundle_rows = [
+        {
+            "forecast_id": uuid4(),
+            "forecast_for": bundle_fetched_at + timedelta(days=d),
+            "fetched_at": bundle_fetched_at,
+            "temp_f": 70.0 + d,
+            "temp_max_f": 75.0 + d,
+            "temp_min_f": 65.0 + d,
+            "precip_in": 0.1 * d,
+            "solar_rad": 1000.0 + d * 10,
+        }
+        for d in range(3)
+    ]
+    mock_pool._mock_conn.fetch = AsyncMock(return_value=bundle_rows)
+
+    fetched_at, rows = await get_latest_forecast_bundle(mock_pool, depot_id)
+
+    assert fetched_at == bundle_fetched_at
+    assert len(rows) == 3
+    assert all(r["fetched_at"] == bundle_fetched_at for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_get_latest_forecast_bundle_empty(mock_pool):
+    depot_id = uuid4()
+    mock_pool._mock_conn.fetchrow = AsyncMock(return_value={"max_fetched_at": None})
+    fetched_at, rows = await get_latest_forecast_bundle(mock_pool, depot_id)
+    assert fetched_at is None
+    assert rows == []
 
 
 @pytest.mark.asyncio
 async def test_get_cached_forecasts(mock_pool):
-    """Test get_cached_forecasts function."""
+    """Test get_cached_forecasts function (reads latest bundle + filters)."""
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0, tzinfo=timezone.utc)
     end = datetime(2025, 12, 11, 0, 0, 0, tzinfo=timezone.utc)
 
-    cached_rows = [
+    bundle_fetched_at = datetime(2025, 12, 3, 23, 0, 0, tzinfo=timezone.utc)
+    mock_pool._mock_conn.fetchrow = AsyncMock(
+        return_value={"max_fetched_at": bundle_fetched_at}
+    )
+    bundle_rows = [
         {
-            "time": datetime(2025, 12, 4, 0, 0, 0, tzinfo=timezone.utc) + timedelta(days=d),
+            "forecast_id": uuid4(),
+            "forecast_for": start + timedelta(days=d),
+            "fetched_at": bundle_fetched_at,
             "temp_f": 70.0 + d,
             "temp_max_f": 75.0 + d,
             "temp_min_f": 65.0 + d,
@@ -488,12 +698,14 @@ async def test_get_cached_forecasts(mock_pool):
         }
         for d in range(7)
     ]
-    mock_pool._mock_conn.fetch = AsyncMock(return_value=cached_rows)
+    mock_pool._mock_conn.fetch = AsyncMock(return_value=bundle_rows)
 
     forecasts = await get_cached_forecasts(mock_pool, depot_id, start, end)
 
     assert len(forecasts) == 7
     assert all(f["temp_f"] > 0 for f in forecasts)
+    # The legacy 'time' key is preserved for back-compat consumers.
+    assert all("time" in f for f in forecasts)
 
 
 @pytest.mark.asyncio
@@ -503,6 +715,7 @@ async def test_get_cached_forecasts_empty(mock_pool):
     start = datetime(2025, 12, 4, 0, 0, 0, tzinfo=timezone.utc)
     end = datetime(2025, 12, 11, 0, 0, 0, tzinfo=timezone.utc)
 
+    mock_pool._mock_conn.fetchrow = AsyncMock(return_value={"max_fetched_at": None})
     mock_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
     forecasts = await get_cached_forecasts(mock_pool, depot_id, start, end)
@@ -598,12 +811,19 @@ async def test_store_weather_forecasts_database_error(mock_pool, sample_weather_
 
 @pytest.mark.asyncio
 async def test_get_cached_forecasts_database_error(mock_pool):
-    """Test get_cached_forecasts handles database errors."""
+    """Test get_cached_forecasts surfaces database errors.
+
+    After migration 021 the helper does a MAX(fetched_at) lookup
+    before fetching the bundle rows. The DB-error path is therefore
+    asserted on ``fetchrow``.
+    """
     depot_id = uuid4()
     start = datetime(2025, 12, 4, 0, 0, 0, tzinfo=timezone.utc)
     end = datetime(2025, 12, 11, 0, 0, 0, tzinfo=timezone.utc)
 
-    mock_pool._mock_conn.fetch = AsyncMock(side_effect=asyncpg.PostgresError("Database error"))
+    mock_pool._mock_conn.fetchrow = AsyncMock(
+        side_effect=asyncpg.PostgresError("Database error")
+    )
 
     with pytest.raises(asyncpg.PostgresError):
         await get_cached_forecasts(mock_pool, depot_id, start, end)
@@ -645,47 +865,55 @@ async def test_close_adapter(weather_adapter):
 
 @pytest.mark.asyncio
 async def test_full_forecast_workflow(weather_adapter, mock_pool, mock_flatbuffers_response):
-    """Test complete workflow: fetch -> store -> retrieve from cache."""
+    """Fetch → insert (new bundle) → read latest bundle.
+
+    Mirrors production: ingestion always inserts; readers see the
+    latest bundle.
+    """
     depot_id = uuid4()
 
-    # Setup mocks
     weather_adapter._client.weather_api.return_value = [mock_flatbuffers_response]
     mock_pool._mock_conn.fetch = AsyncMock(return_value=[])
     mock_pool._mock_conn.fetchrow = AsyncMock(
         return_value={"latitude": 37.7749, "longitude": -122.4194}
     )
+    mock_pool._mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
-    # First call: should fetch from API
+    # First call: ingestion path (fresh fetch, inserts a new bundle).
     forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=3, use_cache=False)
 
     assert len(forecasts) == 3
     assert weather_adapter._client.weather_api.called
-    # Verify storage was called
     assert mock_pool._mock_conn.execute.call_count == 3
 
-    # Reset mock
+    # Reset for the read path.
     mock_pool._mock_conn.execute.reset_mock()
     weather_adapter._client.weather_api.reset_mock()
 
-    # Setup cache return
-    cached_rows = [
+    now = datetime.now(timezone.utc)
+    bundle_fetched_at = now - timedelta(hours=1)
+    bundle_rows = [
         {
-            "time": f.timestamp,
+            "forecast_id": uuid4(),
+            "forecast_for": now + timedelta(days=day),
+            "fetched_at": bundle_fetched_at,
             "temp_f": f.temperature_f,
             "temp_max_f": f.temperature_max_f,
             "temp_min_f": f.temperature_min_f,
             "precip_in": f.precipitation_inches,
             "solar_rad": convert_solar_radiation_wm2_to_calcm2(f.solar_radiation),
         }
-        for f in forecasts
+        for day, f in enumerate(forecasts)
     ]
-    mock_pool._mock_conn.fetch = AsyncMock(return_value=cached_rows)
+    mock_pool._mock_conn.fetchrow = AsyncMock(
+        return_value={"max_fetched_at": bundle_fetched_at}
+    )
+    mock_pool._mock_conn.fetch = AsyncMock(return_value=bundle_rows)
 
-    # Second call: should use cache
+    # Second call: read path (latest bundle, no API call).
     cached_forecasts = await weather_adapter.get_forecasts_for_depot(
         depot_id, days=3, use_cache=True
     )
 
     assert len(cached_forecasts) == 3
-    # API should not have been called again
     assert not weather_adapter._client.weather_api.called

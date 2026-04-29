@@ -170,6 +170,7 @@ def build_snapshot(
     horizon_end: datetime,
     schedules: list[dict],
     weather_features: Optional[list[dict]] = None,
+    weather_forecast_id: Optional[UUID] = None,
     recent_telemetry: Optional[list[dict]] = None,
     readiness: ReadinessReport,
     depot_metadata: Optional[dict] = None,
@@ -249,6 +250,12 @@ def build_snapshot(
         "assumption_kw": config.building_load_assumption_kw,
     }
 
+    weather_payload = list(weather_features or [])
+    # weather_forecast_id is meaningful only when we actually captured
+    # features. The DB column has ON DELETE SET NULL so an empty
+    # feature set + NULL FK is the canonical "no weather" state.
+    forecast_id = weather_forecast_id if weather_payload else None
+
     return OptimizationInputSnapshot(
         snapshot_id=uuid4(),
         depot_id=depot_uuid,
@@ -265,7 +272,8 @@ def build_snapshot(
         prices=list(state.prices),
         telemetry=dict(state.vehicle_socs),
         building_load=building_payload,
-        weather_features=list(weather_features or []),
+        weather_features=weather_payload,
+        weather_forecast_id=forecast_id,
         incoming_vehicles=incoming_payload,
         recent_telemetry=list(recent_telemetry or []),
         code_version=get_code_version(),
@@ -303,6 +311,11 @@ def snapshot_to_payload(snapshot: OptimizationInputSnapshot) -> dict[str, object
         "telemetry": snapshot.telemetry,
         "building_load": snapshot.building_load,
         "weather_features": snapshot.weather_features,
+        "weather_forecast_id": (
+            str(snapshot.weather_forecast_id)
+            if snapshot.weather_forecast_id
+            else None
+        ),
         "incoming_vehicles": snapshot.incoming_vehicles,
         "recent_telemetry": snapshot.recent_telemetry,
         "versions": {

@@ -13,6 +13,7 @@ from uuid import UUID
 
 import asyncpg
 
+from ...adapters.weather.storage import DEFAULT_WEATHER_SOURCE
 from .energy_model import EnergySurrogateModel, PredictionInput
 
 if TYPE_CHECKING:
@@ -69,22 +70,44 @@ async def fetch_training_data(
         f"Fetching training data for depot {depot_id_str}, " f"lookback_days={lookback_days}"
     )
 
+    # The ``LATERAL`` subquery picks the forecast bundle that was
+    # visible at schedule-capture time (MAX(fetched_at) WHERE
+    # fetched_at <= s.created_at) and then the row from that bundle
+    # whose forecast_for matches the departure date.
+    #
+    # Why not ``<= s.departure_time``? Departure is inside/after the
+    # optimization horizon, so using it can pull a newer bundle fetched
+    # *after* the run. Pinning to ``created_at`` prevents that leakage
+    # and keeps training aligned with run-time-available inputs.
     query = """
-    SELECT 
+    SELECT
         v.vehicle_type,
         s.route_id,
         s.departure_time,
         s.energy_kwh,
-        w.temp_f as temp_avg_f,
+        w.temp_f          AS temp_avg_f,
         w.temp_max_f,
         w.temp_min_f,
-        w.precip_in as rain_inches,
-        w.solar_rad as solar_radiation
+        w.precip_in       AS rain_inches,
+        w.solar_rad       AS solar_radiation
     FROM schedules s
     JOIN vehicles v ON s.vehicle_id = v.vehicle_id
-    LEFT JOIN weather_forecasts w ON 
-        w.depot_id = v.depot_id AND
-        DATE(w.time) = DATE(s.departure_time)
+    LEFT JOIN LATERAL (
+        SELECT temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
+        FROM weather_forecasts wf
+        WHERE wf.depot_id = v.depot_id
+          AND wf.source = $2
+          AND wf.fetched_at = (
+              SELECT MAX(fetched_at)
+              FROM weather_forecasts
+              WHERE depot_id   = v.depot_id
+                AND source     = $2
+                AND fetched_at <= COALESCE(s.created_at, s.departure_time)
+          )
+          AND DATE(wf.forecast_for) = DATE(s.departure_time)
+        ORDER BY wf.forecast_for
+        LIMIT 1
+    ) w ON TRUE
     WHERE v.depot_id = $1::uuid
       AND s.departure_time > NOW() - INTERVAL '%s days'
       AND s.energy_kwh IS NOT NULL
@@ -96,7 +119,7 @@ async def fetch_training_data(
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(query, depot_id_str)
+            rows = await conn.fetch(query, depot_id_str, DEFAULT_WEATHER_SOURCE)
 
         logger.debug(f"Fetched {len(rows)} rows from database")
 
