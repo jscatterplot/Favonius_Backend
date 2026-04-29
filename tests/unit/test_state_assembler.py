@@ -1349,3 +1349,27 @@ class TestLoadDepotConfigAccessMode:
         # Last fetch must be the access matrix query.
         last_sql = mock_conn.fetch.call_args_list[-1].args[0]
         assert "FROM charger_vehicle_access" in last_sql
+
+
+class TestCumulativeKwhPeriod:
+    """Tests for cumulative billing-period energy integration."""
+
+    @pytest.mark.asyncio
+    async def test_stale_last_sample_is_capped_to_30_minutes(self, assembler, mock_db_pools):
+        """Last non-zero sample should not extrapolate all the way to now."""
+        static_conn = AsyncMock()
+        ts_conn = AsyncMock()
+        mock_db_pools.static.acquire.return_value.__aenter__.return_value = static_conn
+        mock_db_pools.ts.acquire.return_value.__aenter__.return_value = ts_conn
+
+        static_conn.fetch.return_value = [{"charger_id": uuid4()}]
+        ts_conn.fetchrow.return_value = {"sum_kwh": 12.5}
+
+        now = datetime.utcnow()
+        sum_kwh = await assembler._get_cumulative_kwh_period(now)
+
+        assert sum_kwh == 12.5
+        assert ts_conn.fetchrow.call_count == 1
+        args = ts_conn.fetchrow.call_args.args
+        assert len(args) == 5
+        assert args[4] == "30 minutes"

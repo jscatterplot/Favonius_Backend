@@ -299,6 +299,7 @@ async def test_stub_snapshot_persisted_on_construction_failure(
     stub = persisted[0]
     assert stub.readiness.status == "degraded"
     assert "snapshot_construction_failed" in stub.readiness.degraded_reasons
+    assert stub.charger_vehicle_access == {"mode": "all_to_all", "matrix": {}}
     # The run still proceeds even though build_snapshot failed.
     assert result.status == "degraded"
 

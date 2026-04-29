@@ -789,7 +789,8 @@ class StateAssembler:
 
         # telemetry stores instantaneous charging_kw samples at charger-defined
         # intervals. Convert to energy by integrating each sample across the
-        # elapsed time until the next sample (or "now" for the last point).
+        # elapsed time until the next sample, capped so stale final rows don't
+        # extrapolate non-zero power all the way to "now".
         query = """
         WITH depot_telemetry AS (
             SELECT
@@ -812,7 +813,11 @@ class StateAssembler:
                 dt.charging_kw * GREATEST(
                     EXTRACT(
                         EPOCH FROM (
-                            LEAST(COALESCE(dt.next_time, $3), $3) - dt.time
+                            LEAST(
+                                COALESCE(dt.next_time, $3),
+                                dt.time + $4::interval,
+                                $3
+                            ) - dt.time
                         )
                     ) / 3600.0,
                     0.0
@@ -824,7 +829,13 @@ class StateAssembler:
         """
         try:
             async with self.pools.ts.acquire() as conn:
-                row = await conn.fetchrow(query, charger_ids, period_start, now)
+                row = await conn.fetchrow(
+                    query,
+                    charger_ids,
+                    period_start,
+                    now,
+                    "30 minutes",
+                )
             sum_kwh = float(row["sum_kwh"]) if row and row["sum_kwh"] is not None else 0.0
         except Exception as exc:
             logger.warning(

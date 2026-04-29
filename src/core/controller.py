@@ -105,7 +105,7 @@ def _stub_snapshot(
         depot={"n_timesteps": 0},
         vehicles=[],
         chargers={},
-        charger_vehicle_access={},
+        charger_vehicle_access={"mode": "all_to_all", "matrix": {}},
         schedules=[],
         prices=[],
         telemetry={},
