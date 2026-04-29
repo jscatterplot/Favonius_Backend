@@ -12,6 +12,7 @@ from uuid import UUID
 
 import asyncpg
 
+from ...adapters.weather.storage import DEFAULT_WEATHER_SOURCE
 from ..models import DepotConfig, DepotState, IncomingVehicle
 from ...db.pools import DatabasePools
 
@@ -876,7 +877,7 @@ class StateAssembler:
 
             fetched_at = (
                 SELECT MAX(fetched_at) FROM weather_forecasts
-                WHERE depot_id = $1 AND fetched_at <= $start
+                WHERE depot_id = $1 AND source = $2 AND fetched_at <= $start
             )
 
         That guarantees:
@@ -904,17 +905,20 @@ class StateAssembler:
                            precip_in, solar_rad
                     FROM weather_forecasts
                     WHERE depot_id = $1::uuid
+                      AND source = $2
                       AND fetched_at = (
                           SELECT MAX(fetched_at)
                           FROM weather_forecasts
                           WHERE depot_id = $1::uuid
-                            AND fetched_at <= $2
+                            AND source = $2
+                            AND fetched_at <= $3
                       )
-                      AND forecast_for >= $2
-                      AND forecast_for <  $3
+                      AND forecast_for >= $3
+                      AND forecast_for <  $4
                     ORDER BY forecast_for
                     """,
                     self.depot_id,
+                    DEFAULT_WEATHER_SOURCE,
                     start,
                     end,
                 )

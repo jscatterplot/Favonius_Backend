@@ -13,6 +13,7 @@ from uuid import UUID
 
 import asyncpg
 
+from ...adapters.weather.storage import DEFAULT_WEATHER_SOURCE
 from .energy_model import EnergySurrogateModel, PredictionInput
 
 if TYPE_CHECKING:
@@ -93,10 +94,12 @@ async def fetch_training_data(
         SELECT temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
         FROM weather_forecasts wf
         WHERE wf.depot_id = v.depot_id
+          AND wf.source = $2
           AND wf.fetched_at = (
               SELECT MAX(fetched_at)
               FROM weather_forecasts
               WHERE depot_id   = v.depot_id
+                AND source     = $2
                 AND fetched_at <= s.departure_time
           )
           AND DATE(wf.forecast_for) = DATE(s.departure_time)
@@ -113,7 +116,7 @@ async def fetch_training_data(
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(query, depot_id_str)
+            rows = await conn.fetch(query, depot_id_str, DEFAULT_WEATHER_SOURCE)
 
         logger.debug(f"Fetched {len(rows)} rows from database")
 
