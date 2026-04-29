@@ -103,6 +103,7 @@ async def fetch_training_data(
                 AND fetched_at <= s.departure_time
           )
           AND DATE(wf.forecast_for) = DATE(s.departure_time)
+        ORDER BY wf.forecast_for
         LIMIT 1
     ) w ON TRUE
     WHERE v.depot_id = $1::uuid
