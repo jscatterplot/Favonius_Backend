@@ -3183,6 +3183,7 @@ async def get_optimization_readiness(
             horizon_end=horizon[1],
             schedules=assembler.last_schedules,
             weather_features=assembler.last_weather_features,
+            recent_telemetry=assembler.last_recent_telemetry,
             readiness=readiness,
         )
         try:
