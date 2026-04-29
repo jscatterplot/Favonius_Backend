@@ -71,12 +71,14 @@ async def fetch_training_data(
     )
 
     # The ``LATERAL`` subquery picks the forecast bundle that was
-    # *current* at each schedule's departure_time (MAX(fetched_at)
-    # WHERE fetched_at <= s.departure_time) and then the row from
-    # that bundle whose forecast_for matches the departure date.
-    # This mirrors the assembler's filter exactly so historical
-    # training data sees the same features the optimization saw at
-    # run time — i.e. surrogate training and snapshot replay agree.
+    # visible at schedule-capture time (MAX(fetched_at) WHERE
+    # fetched_at <= s.created_at) and then the row from that bundle
+    # whose forecast_for matches the departure date.
+    #
+    # Why not ``<= s.departure_time``? Departure is inside/after the
+    # optimization horizon, so using it can pull a newer bundle fetched
+    # *after* the run. Pinning to ``created_at`` prevents that leakage
+    # and keeps training aligned with run-time-available inputs.
     query = """
     SELECT
         v.vehicle_type,
@@ -100,7 +102,7 @@ async def fetch_training_data(
               FROM weather_forecasts
               WHERE depot_id   = v.depot_id
                 AND source     = $2
-                AND fetched_at <= s.departure_time
+                AND fetched_at <= COALESCE(s.created_at, s.departure_time)
           )
           AND DATE(wf.forecast_for) = DATE(s.departure_time)
         ORDER BY wf.forecast_for

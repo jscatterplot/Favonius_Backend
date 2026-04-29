@@ -440,7 +440,8 @@ class TestSnapshotWeatherForecastIdLinkage:
 
 class TestSurrogateReplayParity:
     """The surrogate training query must filter to MAX(fetched_at) <=
-    departure_time, matching the assembler. If the training query
+    schedule-capture time (created_at), rather than departure_time.
+    If the training query
     drifts away from that contract, training will see a different
     feature set than the optimization saw — silently breaking model
     accuracy."""
@@ -455,11 +456,12 @@ class TestSurrogateReplayParity:
         # training and the assembler can disagree.
         assert "weather_forecasts" in source
         assert "MAX(fetched_at)" in source
-        # The pin must be ``fetched_at <= s.departure_time`` — pinning
-        # to NOW() would re-introduce the drift this migration fixes.
+        # The pin must be schedule-capture time (created_at), not the
+        # future departure timestamp.
         assert re.search(
-            r"fetched_at\s*<=\s*s\.departure_time", source
-        ), "training must pin bundle to the schedule's departure_time"
+            r"fetched_at\s*<=\s*COALESCE\(s\.created_at,\s*s\.departure_time\)",
+            source,
+        ), "training must pin bundle to schedule creation time"
 
     @pytest.mark.asyncio
     async def test_storage_helper_returns_same_bundle_view(
