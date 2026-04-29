@@ -3263,7 +3263,10 @@ def _coerce_under_cap_rate(billing_metadata: Optional[dict]) -> Optional[float]:
 
 def _optional_text(value: object) -> Optional[str]:
     """Normalize nullable report dimension values from asyncpg records."""
-    return str(value) if value is not None else None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 async def _load_report_context(
