@@ -23,7 +23,7 @@ optimization run status to ``degraded``.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -319,13 +319,3 @@ def replay_payload(payload: dict[str, object]) -> dict[str, object]:
             "snapshot payload 'readiness.building_load_source' is required"
         )
     return payload
-
-
-def horizon_bounds(now: datetime, horizon_hours: int, delta_t: float) -> tuple[
-    datetime, datetime, int
-]:
-    """Compute (start, end, n_steps) for the optimization horizon."""
-    start = now
-    end = now + timedelta(hours=horizon_hours)
-    n_steps = int(horizon_hours / delta_t) if delta_t > 0 else 0
-    return start, end, n_steps

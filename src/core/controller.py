@@ -40,8 +40,9 @@ def _stub_snapshot(
 ) -> "OptimizationInputSnapshot":
     """Fallback snapshot used when real construction fails.
 
-    Returns a ``ready`` snapshot so the controller continues; the failure
-    is already logged. The stub is *not* persisted.
+    Returns a conservative ``not_ready`` snapshot so failed readiness/snapshot
+    construction never bypasses the hard preflight gate. The failure is
+    already logged. The stub is *not* persisted.
     """
     from uuid import UUID, uuid4
 
@@ -58,7 +59,11 @@ def _stub_snapshot(
         captured_at=datetime.utcnow(),
         horizon_start=horizon_start,
         horizon_end=horizon_end,
-        readiness=ReadinessReport(status="ready", building_load_source="absent"),
+        readiness=ReadinessReport(
+            status="not_ready",
+            missing_inputs=["snapshot_construction_failed"],
+            building_load_source="absent",
+        ),
         depot={},
         vehicles=[],
         chargers={},
@@ -402,7 +407,7 @@ class DepotController:
 
         Snapshot construction failures must never break optimization, so
         the whole body is wrapped: on error we fall back to a stub
-        ``ready`` snapshot and log loudly.
+        ``not_ready`` snapshot and log loudly.
         """
         horizon = self.assembler.last_horizon
         if horizon is None:
