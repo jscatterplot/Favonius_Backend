@@ -271,7 +271,7 @@ class TestAssemblerPinsLatestBundle:
         # The query must pin the bundle by MAX(fetched_at) <= start.
         sent_sql = mock_pools.ts._mock_conn.fetch.call_args[0][0]
         assert "MAX(fetched_at)" in sent_sql
-        assert "fetched_at <= $2" in sent_sql
+        assert "fetched_at <= $3" in sent_sql
 
     @pytest.mark.asyncio
     async def test_no_bundle_returns_empty_features_and_null_id(
