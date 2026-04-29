@@ -108,6 +108,42 @@ BootNotification, ``OCPP16Session._on_boot`` triggers
 ``replay_queued_commands`` to flush pending rows for that charger within
 the configured ``REPLAY_BACKOFF_SECONDS`` window.
 
+## Optimization Readiness and Input Snapshots
+
+Before the solver runs, `DepotController._capture_snapshot` evaluates
+readiness against the assembled `DepotState` and writes a row to
+`optimization_input_snapshots` (migrations 019, 020). The snapshot is
+captured **once per logical run** — not per retry attempt — and the
+`run_id` is back-filled after `optimization_runs` is persisted.
+
+### Readiness verdicts
+
+| Status | Meaning | Solver behaviour |
+|---|---|---|
+| `ready` | Every required input present | Run as-is |
+| `degraded` | An input was substituted with an explicit assumption (e.g. building load forecast / static derate, defaulted telemetry) | Run with `optimization_runs.status='degraded'` |
+| `not_ready` | A hard prerequisite is missing | `_ReadinessBlockedError` raised; no solve |
+
+### Schedules-present check (VDV463 caveat)
+
+`schedules_present` is evaluated against **raw DB schedules from the
+`schedules` table BEFORE the VDV463 merge.** A depot that drives
+optimization purely via VDV463 ProvideChargingRequests (no rows in the
+`schedules` table) will be marked `not_ready` even though the merged
+schedule list is non-empty. This is intentional: VDV463-only depots
+should be flagged as a setup gap until proper route schedules are
+imported. See `src/core/state/assembler.py` (presence captured before
+`_merge_vdv463_into_schedules`) and `src/core/state/readiness.py`.
+
+### Building-load source values
+
+| Source | Triggered when | Effect |
+|---|---|---|
+| `meter` | `building_load` table has rows for the horizon | `ready` |
+| `forecast_fallback` | Live source configured but data missing/stale | `degraded` (substitutes a deterministic business-hours pattern) |
+| `static_assumption` | Depot configured `building_load_assumption_kw > 0` (HRX day-one) | `degraded`; MILP grid-balance adds a constant baseline equal to `building_load_assumption_kw` so `max_grid_kw` is still respected |
+| `absent` | Source could not be resolved at all (e.g. n_steps=0) | `not_ready` |
+
 ## Error Handling and Resilience
 
 ### Retry Logic

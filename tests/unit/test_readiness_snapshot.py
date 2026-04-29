@@ -25,23 +25,19 @@ from src.core.models import DepotConfig, DepotState, OptimizationInputSnapshot
 from src.core.state.readiness import (
     BUILDING_LOAD_FORECAST,
     BUILDING_LOAD_METER,
+    BUILDING_LOAD_STATIC,
     build_snapshot,
     evaluate_readiness,
     replay_payload,
     snapshot_to_payload,
 )
 
-
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 
 def _full_config(*, with_access: bool = True) -> DepotConfig:
     vehicle_ids = ["bus_1", "bus_2"]
-    access = (
-        {"charger_a": {"bus_1", "bus_2"}, "charger_b": {"bus_1"}}
-        if with_access
-        else {}
-    )
+    access = {"charger_a": {"bus_1", "bus_2"}, "charger_b": {"bus_1"}} if with_access else {}
     return DepotConfig(
         vehicle_capacities={vid: 324.0 for vid in vehicle_ids},
         vehicle_max_charge_kw={vid: 80.0 for vid in vehicle_ids},
@@ -114,9 +110,7 @@ def _build_full_snapshot(
         horizon_start=start,
         horizon_end=end,
         schedules=schedules,
-        weather_features=[
-            {"time": "2026-04-29T12:00:00", "temp_f": 65.0, "solar_rad": 800.0}
-        ],
+        weather_features=[{"time": "2026-04-29T12:00:00", "temp_f": 65.0, "solar_rad": 800.0}],
         readiness=readiness,
     )
 
@@ -206,9 +200,7 @@ class TestMissingSchedules:
         assert "schedules" in readiness.missing_inputs
 
     def test_blocked_snapshot_still_serialises(self):
-        snap = _build_full_snapshot(
-            schedules=[], schedules_present=False
-        )
+        snap = _build_full_snapshot(schedules=[], schedules_present=False)
         payload = snapshot_to_payload(snap)
         # not_ready snapshots must still round-trip — they're the most
         # useful artefact for debugging "why didn't we run?".
@@ -306,3 +298,142 @@ class TestSnapshotReplayPayloadIntegrity:
         json.dumps(payload)  # must not raise
         assert all(isinstance(k, str) for k in payload["chargers"]["groups"].keys())
         assert payload["chargers"]["total"] == 4
+
+
+# ── 6. Static-assumption building load (HRX day-one) ────────────────────────
+
+
+class TestStaticAssumptionBuildingLoad:
+    def test_static_assumption_marks_degraded_with_recorded_value(self):
+        config = _full_config()
+        config.building_load_assumption_kw = 30.0
+        readiness = evaluate_readiness(
+            config,
+            _full_state(),
+            building_load_source=BUILDING_LOAD_STATIC,
+            schedules_present=True,
+        )
+        assert readiness.status == "degraded"
+        assert "building_load_static_assumption" in readiness.degraded_reasons
+        assumption = readiness.assumptions["building_load"]
+        assert assumption["source"] == BUILDING_LOAD_STATIC
+        assert assumption["value_kw"] == 30.0
+        assert "max_grid_kw" in assumption["note"]
+
+    def test_static_assumption_payload_records_assumption_kw(self):
+        config = _full_config()
+        config.building_load_assumption_kw = 30.0
+        snap = _build_full_snapshot(config=config, building_source=BUILDING_LOAD_STATIC)
+        payload = snapshot_to_payload(snap)
+        assert payload["readiness"]["status"] == "degraded"
+        assert payload["building_load"]["source"] == BUILDING_LOAD_STATIC
+        assert payload["building_load"]["assumption_kw"] == 30.0
+        # Depot section also exposes the assumption for replay tools.
+        assert payload["depot"]["building_load_assumption_kw"] == 30.0
+
+
+# ── 7. Replay length-consistency validation (issue 9) ───────────────────────
+
+
+class TestReplayLengthValidation:
+    def test_prices_length_mismatch_raises(self):
+        snap = _build_full_snapshot()
+        payload = snapshot_to_payload(snap)
+        payload["prices"] = payload["prices"][:10]  # truncate
+        with pytest.raises(ValueError, match="prices"):
+            replay_payload(payload)
+
+    def test_building_load_values_kw_length_mismatch_raises(self):
+        snap = _build_full_snapshot()
+        payload = snapshot_to_payload(snap)
+        payload["building_load"]["values_kw"] = [0.0, 1.0]
+        with pytest.raises(ValueError, match="building_load"):
+            replay_payload(payload)
+
+    def test_versions_section_required(self):
+        snap = _build_full_snapshot()
+        payload = snapshot_to_payload(snap)
+        del payload["versions"]
+        with pytest.raises(ValueError, match="missing required keys"):
+            replay_payload(payload)
+
+    def test_individual_version_field_required(self):
+        snap = _build_full_snapshot()
+        payload = snapshot_to_payload(snap)
+        del payload["versions"]["solver"]
+        with pytest.raises(ValueError, match="versions.solver"):
+            replay_payload(payload)
+
+
+# ── 8. Version metadata + recent telemetry (migration 020) ──────────────────
+
+
+class TestVersionMetadataAndTelemetry:
+    def test_snapshot_carries_version_fields(self):
+        snap = _build_full_snapshot()
+        # code/solver may be None in the test sandbox (no git, no solver
+        # installed) but surrogate is a hard-coded constant.
+        assert snap.surrogate_model_version is not None
+        # Code version is always at least the package version.
+        # We don't assert format — only that the field is populated.
+
+    def test_payload_versions_section(self):
+        snap = _build_full_snapshot()
+        payload = snapshot_to_payload(snap)
+        versions = payload["versions"]
+        assert "code" in versions
+        assert "solver" in versions
+        assert "surrogate_model" in versions
+        assert versions["surrogate_model"] == snap.surrogate_model_version
+
+    def test_recent_telemetry_round_trips(self):
+        config = _full_config()
+        state = _full_state()
+        readiness = evaluate_readiness(
+            config,
+            state,
+            building_load_source=BUILDING_LOAD_METER,
+            schedules_present=True,
+        )
+        start, end = _horizon()
+        recent = [
+            {
+                "time": "2026-04-29T11:30:00",
+                "vehicle_id": "bus_1",
+                "soc": 0.42,
+                "charging_kw": 64.0,
+                "is_plugged": True,
+            }
+        ]
+        snap = build_snapshot(
+            depot_id=uuid4(),
+            organization_id=uuid4(),
+            config=config,
+            state=state,
+            horizon_start=start,
+            horizon_end=end,
+            schedules=[
+                {
+                    "vehicle_id": "bus_1",
+                    "departure_time": datetime(2026, 4, 29, 18, 0, 0),
+                    "return_time": datetime(2026, 4, 30, 6, 0, 0),
+                    "estimated_energy_kwh": 200.0,
+                }
+            ],
+            recent_telemetry=recent,
+            readiness=readiness,
+        )
+        payload = snapshot_to_payload(snap)
+        round_tripped = json.loads(json.dumps(payload, default=str))
+        assert replay_payload(round_tripped) is round_tripped
+        assert round_tripped["recent_telemetry"][0]["vehicle_id"] == "bus_1"
+        assert round_tripped["recent_telemetry"][0]["charging_kw"] == 64.0
+
+
+# ── 9. TZ-aware captured_at (issue 3) ───────────────────────────────────────
+
+
+class TestTimezoneAwareCapturedAt:
+    def test_captured_at_is_tz_aware(self):
+        snap = _build_full_snapshot()
+        assert snap.captured_at.tzinfo is not None

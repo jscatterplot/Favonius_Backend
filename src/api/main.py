@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.controller_manager import ControllerManager
@@ -134,9 +134,7 @@ def resolve_database_url() -> tuple[str, str]:
         return url, "DATABASE_URL"
     if url := os.getenv("TIMESCALE_SERVICE_URL"):
         return url, "TIMESCALE_SERVICE_URL"
-    raise RuntimeError(
-        "No database URL configured. Set DATABASE_URL or TIMESCALE_SERVICE_URL."
-    )
+    raise RuntimeError("No database URL configured. Set DATABASE_URL or TIMESCALE_SERVICE_URL.")
 
 
 async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
@@ -198,13 +196,11 @@ async def _heartbeat_loop(ts_pool: asyncpg.Pool) -> None:
     while True:
         try:
             async with ts_pool.acquire() as conn:
-                await conn.execute(
-                    """
+                await conn.execute("""
                     INSERT INTO service_heartbeat (service, last_seen)
                     VALUES ('optimizer', NOW())
                     ON CONFLICT (service) DO UPDATE SET last_seen = NOW()
-                    """
-                )
+                    """)
         except Exception as e:
             logger.warning("Heartbeat write failed: %s", e)
         await asyncio.sleep(30)
@@ -729,9 +725,7 @@ class ReadinessResponse(BaseModel):
     horizon_hours: int = Field(
         ..., ge=1, description="Horizon length used for the readiness check (hours)"
     )
-    captured_at: str = Field(
-        ..., description="Timestamp when readiness was evaluated (ISO 8601)"
-    )
+    captured_at: str = Field(..., description="Timestamp when readiness was evaluated (ISO 8601)")
     snapshot_id: Optional[str] = Field(
         None,
         description=(
@@ -985,7 +979,9 @@ class DepotMetadata(BaseModel):
     latitude: Optional[float] = Field(None, description="Depot latitude")
     longitude: Optional[float] = Field(None, description="Depot longitude")
     utility_id: Optional[str] = Field(None, description="Utility provider identifier")
-    demand_charge_billing_period: Optional[str] = Field(None, description="Demand charge billing period")
+    demand_charge_billing_period: Optional[str] = Field(
+        None, description="Demand charge billing period"
+    )
     address: Optional[dict] = Field(None, description="Address metadata")
     billing_metadata: Optional[dict] = Field(None, description="Billing metadata")
     building_load_source: Optional[dict] = Field(None, description="Building load source metadata")
@@ -1027,13 +1023,44 @@ class DepotBillingPayload(BaseModel):
 
 
 class BuildingLoadSourcePayload(BaseModel):
-    """Building load source configuration."""
+    """Building load source configuration.
 
-    type: Literal["meter", "api", "manual", "none"]
+    Per PRD §9.4 (post-HRX revision), building load is OPTIONAL for
+    initial onboarding. When ``type == 'static_assumption'``, the depot
+    supplies a single ``assumption_kw`` value that the optimizer applies
+    as a constant baseline load on the grid (so the site-power
+    constraint stays respected without a meter integration).
+
+    ``type`` values:
+        - ``meter`` — live Modbus/SCADA meter
+        - ``api`` — building management system API
+        - ``manual`` — manually entered baseline schedule
+        - ``static_assumption`` — single-scalar derate (HRX day-one)
+        - ``none`` — no source configured (read-only flag, never used
+          to drive optimization)
+    """
+
+    type: Literal["meter", "api", "manual", "static_assumption", "none"]
     provider: Optional[str] = Field(default=None, max_length=128)
     identifier: Optional[str] = Field(default=None, max_length=128)
     interval_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    assumption_kw: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Constant baseline kW applied as a derate when type='static_assumption'. "
+            "Required when type='static_assumption'; ignored otherwise."
+        ),
+    )
     notes: Optional[str] = Field(default=None, max_length=1024)
+
+    @model_validator(mode="after")
+    def _validate_assumption_required(self) -> "BuildingLoadSourcePayload":
+        """``assumption_kw`` must be set (>0) iff type=='static_assumption'."""
+        if self.type == "static_assumption":
+            if self.assumption_kw is None or self.assumption_kw <= 0:
+                raise ValueError("assumption_kw must be > 0 when type='static_assumption'")
+        return self
 
 
 class StationaryBatteryPayload(BaseModel):
@@ -1060,7 +1087,9 @@ class DepotSetupPayload(BaseModel):
     demand_charge: DepotDemandChargePayload
     billing: DepotBillingPayload = Field(default_factory=DepotBillingPayload)
     building_load_source: BuildingLoadSourcePayload
-    stationary_battery: StationaryBatteryPayload = Field(default_factory=lambda: StationaryBatteryPayload(present=False))
+    stationary_battery: StationaryBatteryPayload = Field(
+        default_factory=lambda: StationaryBatteryPayload(present=False)
+    )
 
 
 class FirstDepotSetupRequest(BaseModel):
@@ -1120,6 +1149,7 @@ class ChargerCreateRequest(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("connectorIds must be unique")
         return value
+
 
 class ChargerOnboardingMetadata(BaseModel):
     """Provisioned charger metadata."""
@@ -1501,9 +1531,7 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
                 logger.warning(f"Depot not found: {depot_id}")
                 raise HTTPException(status_code=404, detail=error_msg)
             logger.error(f"Invalid depot configuration: {error_msg}")
-            raise HTTPException(
-                status_code=500, detail=f"Invalid depot configuration: {error_msg}"
-            )
+            raise HTTPException(status_code=500, detail=f"Invalid depot configuration: {error_msg}")
         except HTTPException:
             raise
         except Exception as e:
@@ -1709,10 +1737,14 @@ async def _build_depot_readiness_checklist(
 
     async with db_pools.static.acquire() as conn:
         has_vehicles = bool(
-            await conn.fetchval("SELECT EXISTS(SELECT 1 FROM vehicles WHERE depot_id = $1::uuid)", depot_id)
+            await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vehicles WHERE depot_id = $1::uuid)", depot_id
+            )
         )
         has_chargers = bool(
-            await conn.fetchval("SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id)
+            await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id
+            )
         )
         has_access = bool(
             await conn.fetchval(
@@ -1804,7 +1836,9 @@ async def _build_depot_readiness_checklist(
             "id": "vehicles",
             "label": "Vehicles configured",
             "status": "ready" if has_vehicles else "blocked",
-            "detail": "Vehicle fleet present" if has_vehicles else "No vehicles configured for depot",
+            "detail": (
+                "Vehicle fleet present" if has_vehicles else "No vehicles configured for depot"
+            ),
         }
     )
     checklist.append(
@@ -1820,9 +1854,11 @@ async def _build_depot_readiness_checklist(
             "id": "charger_access",
             "label": "Charger access mapped",
             "status": "ready" if has_access else "blocked",
-            "detail": "Charger/vehicle accessibility mapped"
-            if has_access
-            else "No charger_vehicle_access mappings found",
+            "detail": (
+                "Charger/vehicle accessibility mapped"
+                if has_access
+                else "No charger_vehicle_access mappings found"
+            ),
         }
     )
     checklist.append(
@@ -1830,7 +1866,9 @@ async def _build_depot_readiness_checklist(
             "id": "schedules",
             "label": "Schedules available",
             "status": "ready" if has_schedules else "blocked",
-            "detail": "Upcoming schedules found" if has_schedules else "No upcoming schedules found",
+            "detail": (
+                "Upcoming schedules found" if has_schedules else "No upcoming schedules found"
+            ),
         }
     )
     checklist.append(
@@ -1846,9 +1884,11 @@ async def _build_depot_readiness_checklist(
             "id": "building_load",
             "label": "Building load available",
             "status": "ready" if has_building_load else "blocked",
-            "detail": "Recent building load rows found"
-            if has_building_load
-            else "Missing building load data",
+            "detail": (
+                "Recent building load rows found"
+                if has_building_load
+                else "Missing building load data"
+            ),
         }
     )
     battery_status = "ready" if (not battery_present or has_battery) else "blocked"
@@ -1857,7 +1897,11 @@ async def _build_depot_readiness_checklist(
             "id": "battery",
             "label": "Stationary battery configuration",
             "status": battery_status,
-            "detail": "Battery configured" if battery_status == "ready" else "Battery marked present but not saved",
+            "detail": (
+                "Battery configured"
+                if battery_status == "ready"
+                else "Battery marked present but not saved"
+            ),
         }
     )
     return checklist
@@ -1976,7 +2020,9 @@ async def get_depot_metadata(
         raise
     except asyncpg.PostgresError as e:
         logger.error(
-            "Database error getting depot metadata: %s", e, exc_info=True,
+            "Database error getting depot metadata: %s",
+            e,
+            exc_info=True,
             extra={"depot_id": depot_id},
         )
         raise DatabaseError(f"Database error: {str(e)}")
@@ -2345,7 +2391,9 @@ async def create_charger_onboarding(
     if not db_pools:
         raise DatabaseError("Database not available")
     if not idempotency_key.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Idempotency-Key is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Idempotency-Key is required"
+        )
 
     endpoint = f"POST /admin/depots/{depot_id}/chargers"
     request_hash = _canonical_request_hash(request)
@@ -2494,7 +2542,9 @@ async def create_manual_schedules(
     depot_uuid = UUID(depot_id)
     vehicle_ids = [UUID(entry.vehicle_id) for entry in request.entries]
     async with db_pools.static.acquire() as conn:
-        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(conn, depot_uuid, vehicle_ids)
+        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(
+            conn, depot_uuid, vehicle_ids
+        )
         invalid_vehicle_ids = sorted(
             {str(vehicle_id) for vehicle_id in vehicle_ids} - valid_vehicle_ids
         )
@@ -2556,7 +2606,13 @@ async def patch_manual_schedule(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one schedule field is required",
         )
-    non_nullable_patch_fields = {"vehicle_id", "route_id", "departure_time", "return_time", "required_soc"}
+    non_nullable_patch_fields = {
+        "vehicle_id",
+        "route_id",
+        "departure_time",
+        "return_time",
+        "required_soc",
+    }
     null_fields = sorted(
         field_name
         for field_name, field_value in patch_data.items()
@@ -2585,7 +2641,9 @@ async def patch_manual_schedule(
             )
 
         vehicle_uuid = UUID(str(merged["vehicle_id"]))
-        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(conn, depot_uuid, [vehicle_uuid])
+        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(
+            conn, depot_uuid, [vehicle_uuid]
+        )
         if str(vehicle_uuid) not in valid_vehicle_ids:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -2653,6 +2711,7 @@ async def create_first_depot_setup(
     address = depot.address.model_dump(exclude_none=True)
     billing_metadata = depot.billing.model_dump(exclude_none=True)
     building_load_source = depot.building_load_source.model_dump(exclude_none=True)
+    building_load_assumption_kw = float(depot.building_load_source.assumption_kw or 0.0)
 
     async with db_pools.static.acquire() as conn:
         async with conn.transaction():
@@ -2671,6 +2730,7 @@ async def create_first_depot_setup(
                 address=address,
                 billing_metadata=billing_metadata,
                 building_load_source=building_load_source,
+                building_load_assumption_kw=building_load_assumption_kw,
             )
             if depot.stationary_battery.present:
                 max_power_kw = min(
@@ -2757,6 +2817,7 @@ async def update_depot_setup(
                 address=depot.address.model_dump(exclude_none=True),
                 billing_metadata=depot.billing.model_dump(exclude_none=True),
                 building_load_source=depot.building_load_source.model_dump(exclude_none=True),
+                building_load_assumption_kw=float(depot.building_load_source.assumption_kw or 0.0),
             )
             if not updated:
                 raise DepotNotFoundError(f"Depot {depot_id} not found")
@@ -2832,7 +2893,9 @@ async def update_depot_setup(
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def run_optimization(request: OptimizationRequest, user: dict = Depends(ensure_tenant_mirrored)):
+async def run_optimization(
+    request: OptimizationRequest, user: dict = Depends(ensure_tenant_mirrored)
+):
     """Trigger depot charging optimization.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
@@ -3070,14 +3133,10 @@ async def get_depot_state(
 )
 async def get_optimization_readiness(
     depot_id: str = Depends(_require_depot_access),
-    horizon_hours: int = Query(
-        24, ge=1, le=48, description="Optimization horizon (hours)"
-    ),
+    horizon_hours: int = Query(24, ge=1, le=48, description="Optimization horizon (hours)"),
     persist: bool = Query(
         False,
-        description=(
-            "If true, write a row to optimization_input_snapshots (no run_id)."
-        ),
+        description=("If true, write a row to optimization_input_snapshots (no run_id)."),
     ),
     user: dict = Depends(ensure_tenant_mirrored),
 ):
@@ -3098,9 +3157,7 @@ async def get_optimization_readiness(
             state = await assembler.get_current_state(horizon_hours)
             await assembler.fetch_snapshot_extras(*assembler.last_horizon)
     except TimeoutError:
-        raise HTTPException(
-            status_code=503, detail="Readiness check timed out after 30s"
-        )
+        raise HTTPException(status_code=503, detail="Readiness check timed out after 30s")
 
     readiness = evaluate_readiness(
         config,
@@ -3324,16 +3381,20 @@ async def get_depot_alerts(
                 """,
                 depot_id,
             )
-            fault_rows = await conn.fetch(
-                """
+            fault_rows = (
+                await conn.fetch(
+                    """
                 SELECT DISTINCT ON (station_id, connector_id)
                     station_id, connector_id, status, error_code, timestamp
                 FROM connector_status
                 WHERE station_id = ANY($1) AND status = 'Faulted'
                 ORDER BY station_id, connector_id, timestamp DESC
                 """,
-                depot_ocpp_ids,
-            ) if depot_ocpp_ids else []
+                    depot_ocpp_ids,
+                )
+                if depot_ocpp_ids
+                else []
+            )
 
         last_optimization: Optional[LastOptimizationItem] = None
         if last_row:
@@ -3536,12 +3597,8 @@ async def send_handoff(
                 if signing_key:
                     import json as _json
 
-                    payload_bytes = _json.dumps(
-                        receive_payload, sort_keys=True
-                    ).encode()
-                    sig = hmac.new(
-                        signing_key.encode(), payload_bytes, hashlib.sha256
-                    ).hexdigest()
+                    payload_bytes = _json.dumps(receive_payload, sort_keys=True).encode()
+                    sig = hmac.new(signing_key.encode(), payload_bytes, hashlib.sha256).hexdigest()
                     receive_payload["signature"] = sig
 
                 response = await client.post(receive_url, json=receive_payload)
@@ -4191,7 +4248,9 @@ async def _handle_schedule_adjust(
     try:
         by_time_dt = datetime.fromisoformat(str(by_time).replace("Z", "+00:00"))
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail="by_time must be a valid ISO 8601 datetime") from exc
+        raise HTTPException(
+            status_code=422, detail="by_time must be a valid ISO 8601 datetime"
+        ) from exc
 
     if dry_run:
         return {
@@ -4401,8 +4460,9 @@ async def execute_command(
     spec = _COMMAND_REGISTRY.get(body.command)
     if spec is None:
         raise HTTPException(
-            status_code=400, detail=f"Unknown command '{body.command}'. "
-            f"Valid commands: {sorted(_COMMAND_REGISTRY)}"
+            status_code=400,
+            detail=f"Unknown command '{body.command}'. "
+            f"Valid commands: {sorted(_COMMAND_REGISTRY)}",
         )
 
     user_role = get_user_role(user)

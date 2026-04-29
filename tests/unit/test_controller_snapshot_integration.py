@@ -144,11 +144,13 @@ async def test_run_persists_snapshot_and_links_to_run(
         linked.append((snapshot_id, run_id))
 
     controller.assembler.fetch_snapshot_extras = AsyncMock()
-    with patch("src.core.controller.persist_snapshot", side_effect=fake_persist), patch(
-        "src.core.controller.link_snapshot_to_run", side_effect=fake_link
-    ), patch("src.core.controller.optimize", return_value=_opt_result()), patch.object(
-        controller, "_store_result", new=AsyncMock()
-    ), patch.object(controller, "_dispatch_commands", new=AsyncMock()):
+    with (
+        patch("src.core.controller.persist_snapshot", side_effect=fake_persist),
+        patch("src.core.controller.link_snapshot_to_run", side_effect=fake_link),
+        patch("src.core.controller.optimize", return_value=_opt_result()),
+        patch.object(controller, "_store_result", new=AsyncMock()),
+        patch.object(controller, "_dispatch_commands", new=AsyncMock()),
+    ):
         result = await controller.run_optimization("test")
 
     assert len(persisted) == 1
@@ -183,17 +185,161 @@ async def test_forecast_fallback_marks_run_degraded(
         return snapshot.snapshot_id
 
     controller.assembler.fetch_snapshot_extras = AsyncMock()
-    with patch("src.core.controller.persist_snapshot", side_effect=fake_persist), patch(
-        "src.core.controller.link_snapshot_to_run", new=AsyncMock()
-    ), patch("src.core.controller.optimize", return_value=_opt_result()), patch.object(
-        controller, "_store_result", new=AsyncMock()
-    ), patch.object(controller, "_dispatch_commands", new=AsyncMock()):
+    with (
+        patch("src.core.controller.persist_snapshot", side_effect=fake_persist),
+        patch("src.core.controller.link_snapshot_to_run", new=AsyncMock()),
+        patch("src.core.controller.optimize", return_value=_opt_result()),
+        patch.object(controller, "_store_result", new=AsyncMock()),
+        patch.object(controller, "_dispatch_commands", new=AsyncMock()),
+    ):
         result = await controller.run_optimization("test")
 
     assert len(captured) == 1
     assert captured[0].readiness.status == "degraded"
     assert "building_load_meter_unavailable" in captured[0].readiness.degraded_reasons
     # Solver returned 'optimal' but readiness downgrades to 'degraded'.
+    assert result.status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_persisted_once_across_solver_retries(
+    pool_pair, full_depot_config, controller_config
+):
+    """Snapshot capture must NOT live inside the solver retry loop.
+
+    Two solver failures followed by a success → exactly one snapshot row,
+    one ``link_snapshot_to_run`` call.
+    """
+    pool, _ = pool_pair
+    controller = DepotController(
+        pools=pool,
+        depot_id=str(uuid4()),
+        config=full_depot_config,
+        controller_config=controller_config,
+    )
+
+    state = _real_state()
+    controller.assembler.get_current_state = AsyncMock(return_value=state)
+    _prime_assembler(controller, building_source="meter")
+
+    persisted: list = []
+    linked: list = []
+
+    async def fake_persist(_pools, snapshot):
+        persisted.append(snapshot)
+        return snapshot.snapshot_id
+
+    async def fake_link(_pools, snapshot_id, run_id):
+        linked.append((snapshot_id, run_id))
+
+    success = _opt_result()
+    optimize_mock = MagicMock(
+        side_effect=[
+            RuntimeError("solver timeout"),
+            RuntimeError("solver crashed"),
+            success,
+        ]
+    )
+
+    controller.assembler.fetch_snapshot_extras = AsyncMock()
+    with (
+        patch("src.core.controller.persist_snapshot", side_effect=fake_persist),
+        patch("src.core.controller.link_snapshot_to_run", side_effect=fake_link),
+        patch("src.core.controller.optimize", optimize_mock),
+        patch.object(controller, "_store_result", new=AsyncMock()),
+        patch.object(controller, "_dispatch_commands", new=AsyncMock()),
+        patch("src.core.controller.asyncio.sleep", new=AsyncMock()),
+    ):
+        result = await controller.run_optimization("test")
+
+    assert len(persisted) == 1
+    snap = persisted[0]
+    assert linked == [(snap.snapshot_id, result.run_id)]
+    assert optimize_mock.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_stub_snapshot_persisted_on_construction_failure(
+    pool_pair, full_depot_config, controller_config
+):
+    """When ``build_snapshot`` raises, the stub row MUST hit the DB.
+
+    The stub is marked ``degraded`` (run proceeds) so a transient
+    snapshot-construction bug never blocks optimization, but the audit
+    trail row is preserved.
+    """
+    pool, _ = pool_pair
+    controller = DepotController(
+        pools=pool,
+        depot_id=str(uuid4()),
+        config=full_depot_config,
+        controller_config=controller_config,
+    )
+    controller.assembler.get_current_state = AsyncMock(return_value=_real_state())
+    _prime_assembler(controller, building_source="meter")
+    controller.assembler.fetch_snapshot_extras = AsyncMock()
+
+    persisted: list = []
+
+    async def fake_persist(_pools, snapshot):
+        persisted.append(snapshot)
+        return snapshot.snapshot_id
+
+    with (
+        patch("src.core.controller.build_snapshot", side_effect=RuntimeError("boom")),
+        patch("src.core.controller.persist_snapshot", side_effect=fake_persist),
+        patch("src.core.controller.link_snapshot_to_run", new=AsyncMock()),
+        patch("src.core.controller.optimize", return_value=_opt_result()),
+        patch.object(controller, "_store_result", new=AsyncMock()),
+        patch.object(controller, "_dispatch_commands", new=AsyncMock()),
+    ):
+        result = await controller.run_optimization("test")
+
+    assert len(persisted) == 1
+    stub = persisted[0]
+    assert stub.readiness.status == "degraded"
+    assert "snapshot_construction_failed" in stub.readiness.degraded_reasons
+    # The run still proceeds even though build_snapshot failed.
+    assert result.status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_static_assumption_marks_run_degraded(
+    pool_pair, full_depot_config, controller_config
+):
+    """Building load source 'static_assumption' → degraded status."""
+    pool, _ = pool_pair
+    full_depot_config.building_load_assumption_kw = 30.0
+    controller = DepotController(
+        pools=pool,
+        depot_id=str(uuid4()),
+        config=full_depot_config,
+        controller_config=controller_config,
+    )
+    controller.assembler.get_current_state = AsyncMock(return_value=_real_state())
+    _prime_assembler(controller, building_source="static_assumption")
+    controller.assembler.fetch_snapshot_extras = AsyncMock()
+
+    captured: list = []
+
+    async def fake_persist(_pools, snapshot):
+        captured.append(snapshot)
+        return snapshot.snapshot_id
+
+    with (
+        patch("src.core.controller.persist_snapshot", side_effect=fake_persist),
+        patch("src.core.controller.link_snapshot_to_run", new=AsyncMock()),
+        patch("src.core.controller.optimize", return_value=_opt_result()),
+        patch.object(controller, "_store_result", new=AsyncMock()),
+        patch.object(controller, "_dispatch_commands", new=AsyncMock()),
+    ):
+        result = await controller.run_optimization("test")
+
+    assert len(captured) == 1
+    snap = captured[0]
+    assert snap.readiness.status == "degraded"
+    assert snap.readiness.building_load_source == "static_assumption"
+    assert snap.readiness.assumptions["building_load"]["value_kw"] == 30.0
     assert result.status == "degraded"
 
 
@@ -224,18 +370,21 @@ async def test_not_ready_aborts_with_persisted_snapshot(
 
     optimize_mock = MagicMock(return_value=_opt_result())
     controller.assembler.fetch_snapshot_extras = AsyncMock()
-    with patch("src.core.controller.persist_snapshot", side_effect=fake_persist), patch(
-        "src.core.controller.link_snapshot_to_run", new=AsyncMock()
-    ), patch("src.core.controller.optimize", optimize_mock), patch.object(
-        controller, "_store_result", new=AsyncMock()
-    ), patch.object(controller, "_dispatch_commands", new=AsyncMock()):
+    with (
+        patch("src.core.controller.persist_snapshot", side_effect=fake_persist),
+        patch("src.core.controller.link_snapshot_to_run", new=AsyncMock()),
+        patch("src.core.controller.optimize", optimize_mock),
+        patch.object(controller, "_store_result", new=AsyncMock()),
+        patch.object(controller, "_dispatch_commands", new=AsyncMock()),
+    ):
         with pytest.raises(Exception, match="not ready"):
             await controller.run_optimization("test")
 
-    # Snapshot was persisted on every retry attempt, even though the
-    # solver was never called.
-    assert len(captured) >= 1
-    for snap in captured:
-        assert snap.readiness.status == "not_ready"
-        assert "schedules" in snap.readiness.missing_inputs
+    # Exactly one snapshot per logical run, even on hard veto: the
+    # capture happens once before the retry loop and the readiness gate
+    # raises before any solver attempt.
+    assert len(captured) == 1
+    snap = captured[0]
+    assert snap.readiness.status == "not_ready"
+    assert "schedules" in snap.readiness.missing_inputs
     optimize_mock.assert_not_called()

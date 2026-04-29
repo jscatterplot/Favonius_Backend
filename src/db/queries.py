@@ -1115,7 +1115,9 @@ async def create_rfid_card(
         assigned_vehicle_ids=assigned_vehicle_ids,
         assigned_driver_ids=assigned_driver_ids,
     )
-    return await get_rfid_card(db, depot_id=depot_id, organization_id=organization_id, card_id=card_id)
+    return await get_rfid_card(
+        db, depot_id=depot_id, organization_id=organization_id, card_id=card_id
+    )
 
 
 async def update_rfid_card(
@@ -1165,7 +1167,9 @@ async def update_rfid_card(
             assigned_vehicle_ids=assigned_vehicle_ids,
             assigned_driver_ids=assigned_driver_ids,
         )
-    return await get_rfid_card(db, depot_id=depot_id, organization_id=organization_id, card_id=card_id)
+    return await get_rfid_card(
+        db, depot_id=depot_id, organization_id=organization_id, card_id=card_id
+    )
 
 
 async def replace_rfid_card_assignments(
@@ -1319,9 +1323,7 @@ async def resolve_id_tag_identity(
     card_depot_filter = ""
     params = [id_tag]
     if station_id is not None:
-        card_depot_filter = (
-            " AND EXISTS (SELECT 1 FROM chargers ch WHERE ch.ocpp_id = $2 AND ch.depot_id = c.depot_id)"
-        )
+        card_depot_filter = " AND EXISTS (SELECT 1 FROM chargers ch WHERE ch.ocpp_id = $2 AND ch.depot_id = c.depot_id)"
         params.append(station_id)
     card_rows = await db.fetch(
         f"""
@@ -1510,9 +1512,7 @@ async def get_depots_for_organization(db, organization_id: str) -> list[dict]:
     return depots
 
 
-async def depot_belongs_to_organization(
-    db, depot_id: str, organization_id: str
-) -> bool:
+async def depot_belongs_to_organization(db, depot_id: str, organization_id: str) -> bool:
     """Return True if the depot exists and is assigned to the organization."""
     q = """
         SELECT EXISTS(
@@ -1755,6 +1755,7 @@ async def create_depot_setup(
     address: dict[str, Any],
     billing_metadata: dict[str, Any],
     building_load_source: dict[str, Any],
+    building_load_assumption_kw: float = 0.0,
 ) -> dict:
     """Create a depot row scoped to organization and return metadata."""
     query = """
@@ -1771,10 +1772,11 @@ async def create_depot_setup(
             demand_charge_billing_period,
             address,
             billing_metadata,
-            building_load_source
+            building_load_source,
+            building_load_assumption_kw
         )
         VALUES (
-            $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb
+            $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14
         )
         RETURNING depot_id::text AS depot_id,
                   organization_id::text AS organization_id,
@@ -1789,7 +1791,8 @@ async def create_depot_setup(
                   demand_charge_billing_period,
                   address,
                   billing_metadata,
-                  building_load_source
+                  building_load_source,
+                  building_load_assumption_kw
     """
     row = await db.fetchrow(
         query,
@@ -1806,6 +1809,7 @@ async def create_depot_setup(
         json.dumps(address),
         json.dumps(billing_metadata),
         json.dumps(building_load_source),
+        building_load_assumption_kw,
     )
     result = dict(row)
     result["address"] = _coerce_jsonb_dict(result.get("address"))
@@ -1830,6 +1834,7 @@ async def update_depot_setup(
     address: dict[str, Any],
     billing_metadata: dict[str, Any],
     building_load_source: dict[str, Any],
+    building_load_assumption_kw: float = 0.0,
 ) -> Optional[dict]:
     """Update depot setup metadata and return updated row."""
     query = """
@@ -1846,6 +1851,7 @@ async def update_depot_setup(
             address = $11::jsonb,
             billing_metadata = $12::jsonb,
             building_load_source = $13::jsonb,
+            building_load_assumption_kw = $14,
             updated_at = NOW()
         WHERE depot_id = $1::uuid
         RETURNING depot_id::text AS depot_id,
@@ -1861,7 +1867,8 @@ async def update_depot_setup(
                   demand_charge_billing_period,
                   address,
                   billing_metadata,
-                  building_load_source
+                  building_load_source,
+                  building_load_assumption_kw
     """
     row = await db.fetchrow(
         query,
@@ -1878,6 +1885,7 @@ async def update_depot_setup(
         json.dumps(address),
         json.dumps(billing_metadata),
         json.dumps(building_load_source),
+        building_load_assumption_kw,
     )
     if not row:
         return None
