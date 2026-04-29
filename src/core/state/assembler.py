@@ -767,10 +767,29 @@ class StateAssembler:
                 day=1, hour=0, minute=0, second=0, microsecond=0
             )
 
+        # Resolve depot charger IDs from static DB, then query telemetry from
+        # TimescaleDB to avoid cross-database references.
+        try:
+            async with self.pools.static.acquire() as static_conn:
+                charger_rows = await static_conn.fetch(
+                    "SELECT charger_id FROM chargers WHERE depot_id = $1",
+                    self.depot_id,
+                )
+            charger_ids = [row["charger_id"] for row in charger_rows]
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch chargers for depot %s: %s; defaulting to 0",
+                self.depot_id,
+                exc,
+            )
+            return 0.0
+
+        if not charger_ids:
+            return 0.0
+
         # telemetry stores instantaneous charging_kw samples at charger-defined
         # intervals. Convert to energy by integrating each sample across the
         # elapsed time until the next sample (or "now" for the last point).
-        # Telemetry rows belong to a depot via the charger.
         query = """
         WITH depot_telemetry AS (
             SELECT
@@ -783,9 +802,7 @@ class StateAssembler:
                     ORDER BY t.time
                 ) AS next_time
             FROM telemetry t
-            WHERE t.charger_id IN (
-                SELECT charger_id FROM chargers WHERE depot_id = $1
-            )
+            WHERE t.charger_id = ANY($1::uuid[])
               AND t.time >= $2
               AND t.time <= $3
               AND t.charging_kw IS NOT NULL
@@ -807,7 +824,7 @@ class StateAssembler:
         """
         try:
             async with self.pools.ts.acquire() as conn:
-                row = await conn.fetchrow(query, self.depot_id, period_start, now)
+                row = await conn.fetchrow(query, charger_ids, period_start, now)
             sum_kwh = float(row["sum_kwh"]) if row and row["sum_kwh"] is not None else 0.0
         except Exception as exc:
             logger.warning(
