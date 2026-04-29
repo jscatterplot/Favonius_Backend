@@ -12,11 +12,13 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
 from .controller_config import ControllerConfig
-from .models import DepotConfig, OptimizationResult
+from .models import DepotConfig, OptimizationInputSnapshot, OptimizationResult
 from .optimizer import optimize
 from .state.assembler import StateAssembler
+from .state.readiness import build_snapshot, evaluate_readiness
 from .state.triggers import TriggerConfig, TriggerMonitor
 from ..db.pools import DatabasePools
+from ..db.snapshot_store import link_snapshot_to_run, persist_snapshot
 from ..monitoring.metrics import (
     CONTROL_LOOP_UPTIME,
     CONTROLLER_STATE,
@@ -31,6 +33,51 @@ if TYPE_CHECKING:
     from ..adapters.ocpp.server import OCPPServer
 
 logger = logging.getLogger(__name__)
+
+
+class _ReadinessBlockedError(RuntimeError):
+    """Raised when readiness reports a non-transient hard block."""
+
+
+def _stub_snapshot(
+    depot_id: str, horizon_start: datetime, horizon_end: datetime
+) -> "OptimizationInputSnapshot":
+    """Fallback snapshot used when real construction fails.
+
+    Returns a conservative ``degraded`` snapshot so snapshot-construction
+    failures never abort an otherwise-runnable optimization. The failure is
+    already logged. The stub is *not* persisted.
+    """
+    from uuid import UUID, uuid4
+
+    from .models import OptimizationInputSnapshot, ReadinessReport
+
+    try:
+        depot_uuid = UUID(depot_id)
+    except (ValueError, TypeError):
+        depot_uuid = uuid4()
+    return OptimizationInputSnapshot(
+        snapshot_id=uuid4(),
+        depot_id=depot_uuid,
+        organization_id=None,
+        captured_at=datetime.utcnow(),
+        horizon_start=horizon_start,
+        horizon_end=horizon_end,
+        readiness=ReadinessReport(
+            status="degraded",
+            degraded_reasons=["snapshot_construction_failed"],
+            assumptions={"snapshot_construction_failed": True},
+            building_load_source="absent",
+        ),
+        depot={},
+        vehicles=[],
+        chargers={},
+        charger_vehicle_access={},
+        schedules=[],
+        prices=[],
+        telemetry={},
+        building_load={},
+    )
 
 
 class DepotController:
@@ -185,6 +232,15 @@ class DepotController:
                         continue
                     raise
 
+                # Persist a full input snapshot before solving so post-mortem
+                # replay works even when the solver crashes/times out.
+                snapshot = await self._capture_snapshot(state, effective_horizon)
+                if snapshot.readiness.is_blocking:
+                    raise _ReadinessBlockedError(
+                        "Optimization inputs not ready: "
+                        f"missing={snapshot.readiness.missing_inputs}"
+                    )
+
                 # Build and solve
                 try:
                     result = optimize(
@@ -209,6 +265,15 @@ class DepotController:
                         continue
                     raise
 
+                # If readiness flagged a degraded run (e.g. building load
+                # forecast fallback), record that on the result so the
+                # downstream optimization_runs row reflects reality.
+                if snapshot.readiness.is_degraded and result.status in (
+                    "optimal",
+                    "feasible",
+                ):
+                    result.status = "degraded"
+
                 # Store result
                 self.last_schedule = result.schedule
                 self.last_result = result
@@ -224,6 +289,19 @@ class DepotController:
                         extra={"depot_id": self.depot_id},
                     )
                     # Continue even if storage fails
+
+                # Link snapshot to the optimization run row.
+                try:
+                    await link_snapshot_to_run(
+                        self.pools, snapshot.snapshot_id, result.run_id
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to link snapshot %s to run %s: %s",
+                        snapshot.snapshot_id,
+                        result.run_id,
+                        e,
+                    )
 
                 # Enqueue commands for the legacy WS handler to push.
                 # Production runs the FastAPI service with ocpp_server=None,
@@ -272,6 +350,10 @@ class DepotController:
                 )
                 return result
 
+            except _ReadinessBlockedError:
+                # Hard readiness vetoes are non-transient and should not be retried
+                # or counted toward circuit-breaker failure tracking.
+                raise
             except Exception as e:
                 self._optimization_failures += 1
 
@@ -319,6 +401,78 @@ class DepotController:
                 else:
                     # All retries exhausted
                     raise
+
+    async def _capture_snapshot(
+        self, state, horizon_hours: int
+    ) -> OptimizationInputSnapshot:
+        """Build, persist, and return the input snapshot for one optimization.
+
+        Readiness is evaluated against ``self.config`` plus the freshly
+        assembled ``DepotState`` and the metadata recorded on the assembler
+        (building-load source, schedule presence, weather features). The
+        snapshot is written to ``optimization_input_snapshots`` immediately
+        — even when readiness is ``not_ready`` — so we always have an
+        artefact for replay/diagnostics. ``run_id`` is back-filled later.
+
+        Snapshot construction failures must never break optimization, so
+        the whole body is wrapped: on error we fall back to a stub
+        ``degraded`` snapshot and log loudly.
+        """
+        horizon = self.assembler.last_horizon
+        if horizon is None:
+            now = datetime.utcnow()
+            horizon = (now, now + timedelta(hours=horizon_hours))
+
+        # Best-effort: fetch weather + organization_id for the snapshot.
+        # Failures here must not derail the run.
+        try:
+            await self.assembler.fetch_snapshot_extras(horizon[0], horizon[1])
+        except Exception as e:
+            logger.debug(
+                "fetch_snapshot_extras failed for depot %s: %s",
+                self.depot_id,
+                e,
+            )
+
+        try:
+            readiness = evaluate_readiness(
+                self.config,
+                state,
+                building_load_source=self.assembler.last_building_load_source,
+                schedules_present=self.assembler.last_schedules_present,
+            )
+            snapshot = build_snapshot(
+                depot_id=self.depot_id,
+                organization_id=self.assembler.last_organization_id,
+                config=self.config,
+                state=state,
+                horizon_start=horizon[0],
+                horizon_end=horizon[1],
+                schedules=self.assembler.last_schedules,
+                weather_features=self.assembler.last_weather_features,
+                readiness=readiness,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to build optimization input snapshot for depot %s: %s",
+                self.depot_id,
+                e,
+                exc_info=True,
+            )
+            return _stub_snapshot(self.depot_id, horizon[0], horizon[1])
+
+        try:
+            await persist_snapshot(self.pools, snapshot)
+        except Exception as e:
+            # Snapshot persistence must never abort an otherwise-runnable
+            # optimization — log loudly and continue.
+            logger.error(
+                "Failed to persist optimization input snapshot for depot %s: %s",
+                self.depot_id,
+                e,
+                exc_info=True,
+            )
+        return snapshot
 
     async def _dispatch_commands(self, result: OptimizationResult) -> None:
         """Enqueue charging profiles for the WebSocket handler to deliver.

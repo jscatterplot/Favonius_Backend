@@ -67,7 +67,39 @@ class StateAssembler:
         self.pools = pools
         self.depot_id = str(depot_id)
         self.config = config
+        # Snapshot metadata captured during the most recent assembly. Read
+        # by DepotController to build OptimizationInputSnapshot rows.
+        self._last_building_load_source: str = "absent"
+        self._last_schedules: list[dict] = []
+        self._last_schedules_present: bool = False
+        self._last_weather_features: list[dict] = []
+        self._last_horizon: tuple[datetime, datetime] | None = None
+        self._last_organization_id: str | None = None
         logger.info(f"Initialized StateAssembler for depot {self.depot_id}")
+
+    @property
+    def last_building_load_source(self) -> str:
+        return self._last_building_load_source
+
+    @property
+    def last_schedules(self) -> list[dict]:
+        return list(self._last_schedules)
+
+    @property
+    def last_schedules_present(self) -> bool:
+        return self._last_schedules_present
+
+    @property
+    def last_weather_features(self) -> list[dict]:
+        return list(self._last_weather_features)
+
+    @property
+    def last_horizon(self) -> tuple[datetime, datetime] | None:
+        return self._last_horizon
+
+    @property
+    def last_organization_id(self) -> str | None:
+        return self._last_organization_id
 
     async def get_current_state(
         self,
@@ -130,6 +162,10 @@ class StateAssembler:
 
         # Fetch schedules and VDV 463 charging requests; merge (VDV 463 overrides for same vehicle)
         schedules = await self._get_schedules(now, horizon_end)
+        # Capture presence for snapshot/readiness *before* VDV 463 merge —
+        # a VDV 463 request alone shouldn't make the system claim a route
+        # schedule was loaded.
+        self._last_schedules_present = bool(schedules)
         vdv463_requests = await self._get_vdv463_charging_requests(now, horizon_end)
         (
             schedules,
@@ -150,6 +186,16 @@ class StateAssembler:
 
         # Get building power (REQUIRED per PRD Section 9.4)
         building_power = await self._get_building_power(now, horizon_end, n_steps)
+
+        # Snapshot metadata: only the cheap in-memory bits here. Weather
+        # features and organization_id are fetched separately by the
+        # controller (see ``fetch_snapshot_extras``) so existing callers
+        # of get_current_state see no additional DB traffic.
+        self._last_horizon = (now, horizon_end)
+        # Schedules used downstream may have been merged with VDV 463
+        # entries; snapshot the merged list since that's what the MILP
+        # actually consumed.
+        self._last_schedules = list(schedules)
 
         # Get incoming vehicles from inter-depot handoffs (per PRD Section 5.3)
         incoming_vehicles = await self._get_incoming_vehicles(now, horizon_end)
@@ -699,7 +745,10 @@ class StateAssembler:
                 f"Database error fetching building load for depot {self.depot_id}: {e}. "
                 "Using forecast model fallback."
             )
-            # Fallback to forecast model (simplified: use average pattern)
+            # Explicit degraded mode (PRD 9.4): meter unavailable, fall back
+            # to the deterministic business-hours pattern. Readiness will
+            # downgrade the run to 'degraded'.
+            self._last_building_load_source = "forecast_fallback"
             return self._get_building_power_forecast(start, end, n_steps)
 
         if not rows:
@@ -707,7 +756,10 @@ class StateAssembler:
                 f"No building load data found for depot {self.depot_id} "
                 f"between {start} and {end}, using forecast model"
             )
+            self._last_building_load_source = "forecast_fallback"
             return self._get_building_power_forecast(start, end, n_steps)
+
+        self._last_building_load_source = "meter"
 
         # Build time-indexed power map
         power_map = {row["time"]: float(row["power_kw"]) for row in rows}
@@ -778,6 +830,97 @@ class StateAssembler:
             f"avg={sum(building_power)/len(building_power):.1f}kW"
         )
         return building_power
+
+    async def fetch_snapshot_extras(
+        self, horizon_start: datetime, horizon_end: datetime
+    ) -> None:
+        """Populate snapshot-only metadata (weather + organization_id).
+
+        Called by ``DepotController._capture_snapshot`` after
+        ``get_current_state`` so the extra DB roundtrips don't show up
+        for callers that only need the optimization state.
+        """
+        self._last_weather_features = await self._get_weather_features(
+            horizon_start, horizon_end
+        )
+        self._last_organization_id = await self._get_organization_id()
+
+    async def _get_weather_features(
+        self, start: datetime, end: datetime
+    ) -> list[dict]:
+        """Fetch weather features for the horizon (snapshot context only).
+
+        Used for input-snapshot replay. Failures are non-fatal: we return an
+        empty list and the readiness layer simply records that no weather
+        data was available.
+        """
+        try:
+            async with self.pools.ts.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT time, temp_f, temp_max_f, temp_min_f,
+                           precip_in, solar_rad
+                    FROM weather_forecasts
+                    WHERE depot_id = $1::uuid
+                      AND time >= $2 AND time < $3
+                    ORDER BY time
+                    """,
+                    self.depot_id,
+                    start,
+                    end,
+                )
+        except asyncpg.PostgresError as e:
+            logger.debug(
+                f"weather_forecasts unavailable for depot {self.depot_id}: {e}"
+            )
+            return []
+        return [
+            {
+                "time": row["time"].isoformat() if row["time"] else None,
+                "temp_f": (
+                    float(row["temp_f"]) if row["temp_f"] is not None else None
+                ),
+                "temp_max_f": (
+                    float(row["temp_max_f"])
+                    if row["temp_max_f"] is not None
+                    else None
+                ),
+                "temp_min_f": (
+                    float(row["temp_min_f"])
+                    if row["temp_min_f"] is not None
+                    else None
+                ),
+                "precip_in": (
+                    float(row["precip_in"])
+                    if row["precip_in"] is not None
+                    else None
+                ),
+                "solar_rad": (
+                    float(row["solar_rad"])
+                    if row["solar_rad"] is not None
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+
+    async def _get_organization_id(self) -> str | None:
+        """Look up the depot's organization_id (Supabase). None if unset."""
+        try:
+            async with self.pools.static.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT organization_id::text AS organization_id "
+                    "FROM depots WHERE depot_id = $1",
+                    self.depot_id,
+                )
+        except asyncpg.PostgresError as e:
+            logger.debug(
+                f"organization_id lookup failed for depot {self.depot_id}: {e}"
+            )
+            return None
+        if not row:
+            return None
+        return row["organization_id"]
 
     async def _get_incoming_vehicles(self, start: datetime, end: datetime) -> list[IncomingVehicle]:
         """Get incoming vehicles from inter-depot handoffs.
