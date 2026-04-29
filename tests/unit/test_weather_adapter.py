@@ -350,6 +350,39 @@ async def test_get_forecasts_for_depot_with_cache(weather_adapter, sample_weathe
 
 
 @pytest.mark.asyncio
+async def test_get_forecasts_for_depot_with_cache_respects_days(
+    weather_adapter, sample_weather_data, mock_pool
+):
+    """use_cache=True should still honor the requested day window."""
+    depot_id = uuid4()
+
+    now = datetime.now(timezone.utc)
+    bundle_fetched_at = now - timedelta(hours=1)
+    bundle_rows = [
+        {
+            "forecast_id": uuid4(),
+            "forecast_for": now + timedelta(days=day),
+            "fetched_at": bundle_fetched_at,
+            "temp_f": weather.temperature_f,
+            "temp_max_f": weather.temperature_max_f,
+            "temp_min_f": weather.temperature_min_f,
+            "precip_in": weather.precipitation_inches,
+            "solar_rad": convert_solar_radiation_wm2_to_calcm2(weather.solar_radiation),
+        }
+        for day, weather in enumerate(sample_weather_data)
+    ]
+    mock_pool._mock_conn.fetchrow = AsyncMock(
+        return_value={"max_fetched_at": bundle_fetched_at}
+    )
+    mock_pool._mock_conn.fetch = AsyncMock(return_value=bundle_rows)
+
+    forecasts = await weather_adapter.get_forecasts_for_depot(depot_id, days=3, use_cache=True)
+
+    assert len(forecasts) == 3
+    assert all(f.timestamp < now + timedelta(days=3) for f in forecasts)
+
+
+@pytest.mark.asyncio
 async def test_get_forecasts_for_depot_no_cache(
     weather_adapter, mock_pool, mock_flatbuffers_response
 ):

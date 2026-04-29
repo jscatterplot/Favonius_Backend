@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import UUID
@@ -399,14 +399,19 @@ class OpenMeteoAdapter:
                     self.pool, depot_id
                 )
                 if rows:
+                    now = datetime.now(timezone.utc)
+                    end_time = now + timedelta(days=days)
                     forecasts: list[WeatherData] = []
                     for row in rows:
+                        forecast_for = row["forecast_for"]
+                        if forecast_for < now or forecast_for >= end_time:
+                            continue
                         # Convert solar_rad from cal/cm² back to W/m² for
                         # the in-memory WeatherData type.
                         solar_wm2 = (row["solar_rad"] or 0.0) / 2.064
                         forecasts.append(
                             WeatherData(
-                                timestamp=row["forecast_for"],
+                                timestamp=forecast_for,
                                 temperature_f=row["temp_f"],
                                 temperature_max_f=row["temp_max_f"],
                                 temperature_min_f=row["temp_min_f"],
