@@ -1947,3 +1947,102 @@ async def update_vehicle_max_charge_kw(
     """
     result = await db.execute(query, vehicle_id, max_charge_kw)
     return result != "UPDATE 0"
+
+
+# ── Admin cross-org queries ─────────────────────────────────────────────────
+
+
+async def list_all_organizations(db) -> list[dict]:
+    """Return all organizations (favonius_admin only)."""
+    query = """
+        SELECT organization_id::text AS organization_id,
+               name,
+               created_at,
+               updated_at
+        FROM organizations
+        ORDER BY name
+    """
+    rows = await db.fetch(query)
+    return [dict(row) for row in rows]
+
+
+async def get_organization_by_id(db, organization_id: str) -> Optional[dict]:
+    """Return a single organization row, or None if not found."""
+    query = """
+        SELECT organization_id::text AS organization_id,
+               name,
+               created_at,
+               updated_at
+        FROM organizations
+        WHERE organization_id = $1::uuid
+    """
+    row = await db.fetchrow(query, organization_id)
+    return dict(row) if row else None
+
+
+async def get_charger_credentials_status(
+    db, *, depot_id: str, charger_id: str
+) -> Optional[dict]:
+    """Return credential status (configured / created_at / last_rotated_at).
+
+    Joins ``chargers`` to ``station_credentials`` by ocpp_id. Returns None if the
+    charger does not exist (caller must distinguish 403 vs 404 themselves).
+    NEVER returns the password_hash.
+    """
+    query = """
+        SELECT c.charger_id::text AS charger_id,
+               c.depot_id::text AS depot_id,
+               c.ocpp_id,
+               sc.created_at AS credentials_created_at,
+               sc.last_rotated_at AS credentials_last_rotated_at,
+               sc.active AS credentials_active
+        FROM chargers c
+        LEFT JOIN station_credentials sc
+            ON sc.station_id = c.ocpp_id AND sc.username = c.ocpp_id
+        WHERE c.charger_id = $1::uuid AND c.depot_id = $2::uuid
+    """
+    row = await db.fetchrow(query, charger_id, depot_id)
+    return dict(row) if row else None
+
+
+async def rotate_charger_credentials(
+    db, *, depot_id: str, charger_id: str, new_password_hash: str
+) -> Optional[dict]:
+    """Replace ``station_credentials.password_hash`` for a charger.
+
+    Returns ocpp_id and last_rotated_at, or None if the charger / credential
+    does not exist. Never reads or returns the previous hash.
+    """
+    fetch_query = """
+        SELECT ocpp_id
+        FROM chargers
+        WHERE charger_id = $1::uuid AND depot_id = $2::uuid
+    """
+    row = await db.fetchrow(fetch_query, charger_id, depot_id)
+    if row is None:
+        return None
+    ocpp_id = row["ocpp_id"]
+
+    update_query = """
+        UPDATE station_credentials
+        SET password_hash = $2,
+            last_rotated_at = NOW(),
+            active = TRUE
+        WHERE station_id = $1 AND username = $1
+        RETURNING last_rotated_at, created_at
+    """
+    updated = await db.fetchrow(update_query, ocpp_id, new_password_hash)
+    if updated is None:
+        # Charger exists but credential row missing (e.g. legacy provisioning).
+        # Insert a new row so rotation is idempotent.
+        insert_query = """
+            INSERT INTO station_credentials (station_id, username, password_hash, active, last_rotated_at)
+            VALUES ($1, $1, $2, TRUE, NOW())
+            RETURNING last_rotated_at, created_at
+        """
+        updated = await db.fetchrow(insert_query, ocpp_id, new_password_hash)
+    return {
+        "ocpp_id": ocpp_id,
+        "last_rotated_at": updated["last_rotated_at"],
+        "created_at": updated["created_at"],
+    }
