@@ -1060,6 +1060,8 @@ class BuildingLoadSourcePayload(BaseModel):
         if self.type == "static_assumption":
             if self.assumption_kw is None or self.assumption_kw <= 0:
                 raise ValueError("assumption_kw must be > 0 when type='static_assumption'")
+        elif self.assumption_kw not in (None, 0):
+            raise ValueError("assumption_kw must be omitted unless type='static_assumption'")
         return self
 
 

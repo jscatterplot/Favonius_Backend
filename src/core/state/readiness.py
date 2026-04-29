@@ -188,12 +188,13 @@ def build_snapshot(
     else:
         org_uuid = UUID(str(organization_id))
 
+    n_steps = len(state.building_power)
     depot_payload: dict[str, object] = {
         "depot_id": str(depot_uuid),
         "max_site_power_kw": config.max_site_power,
         "building_load_assumption_kw": config.building_load_assumption_kw,
         "delta_t_hours": config.delta_t,
-        "n_timesteps": config.n_timesteps,
+        "n_timesteps": n_steps,
     }
     if depot_metadata:
         depot_payload.update(depot_metadata)
@@ -239,7 +240,6 @@ def build_snapshot(
         for iv in state.incoming_vehicles
     ]
 
-    n_steps = len(state.building_power)
     avg_load = sum(state.building_power) / n_steps if n_steps else 0.0
     building_payload = {
         "source": readiness.building_load_source,

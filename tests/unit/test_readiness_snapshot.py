@@ -336,6 +336,14 @@ class TestStaticAssumptionBuildingLoad:
 
 
 class TestReplayLengthValidation:
+    def test_payload_uses_state_timestep_count_when_horizon_varies(self):
+        state = _full_state(building_power_n=48)
+        state.prices = [0.10, 0.15, 0.12] * 16
+        snap = _build_full_snapshot(state=state)
+        payload = snapshot_to_payload(snap)
+        assert payload["depot"]["n_timesteps"] == 48
+        assert replay_payload(payload) is payload
+
     def test_prices_length_mismatch_raises(self):
         snap = _build_full_snapshot()
         payload = snapshot_to_payload(snap)
