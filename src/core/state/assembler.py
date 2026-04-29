@@ -783,6 +783,11 @@ class StateAssembler:
             self._last_building_load_source = "forecast_fallback"
             return self._get_building_power_forecast(start, end, n_steps)
 
+        if self.config.building_load_assumption_kw > 0.0:
+            # Prevent double-counting when static derate is still enabled.
+            self._last_building_load_source = "static_assumption"
+            return [0.0] * n_steps
+
         self._last_building_load_source = "meter"
 
         # Build time-indexed power map

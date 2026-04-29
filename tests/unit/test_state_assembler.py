@@ -688,6 +688,27 @@ class TestGetBuildingPower:
         assert len(power) == 96
         assert all(p == 0.0 for p in power)  # MVP returns zeros
 
+    @pytest.mark.asyncio
+    async def test_get_building_power_uses_static_assumption_when_configured(
+        self, assembler, mock_db_pool
+    ):
+        """Rows from meter should be ignored when static derate is enabled."""
+        assembler.config.building_load_assumption_kw = 30.0
+        start = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        end = start + timedelta(hours=24)
+        n_steps = 96
+
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        meter_row = MagicMock()
+        meter_row.__getitem__.side_effect = lambda k: {"time": start, "power_kw": 50.0}[k]
+        mock_conn.fetch.return_value = [meter_row]
+
+        power = await assembler._get_building_power(start, end, n_steps)
+
+        assert all(p == 0.0 for p in power)
+        assert assembler.last_building_load_source == "static_assumption"
+
 
 class TestGetCurrentState:
     """Test get_current_state integration method."""
