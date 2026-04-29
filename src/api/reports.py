@@ -14,10 +14,8 @@ import csv
 import io
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Iterable, Iterator, Literal, Optional
+from typing import Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
-
-GroupBy = Literal["vehicle", "charger", "driver", "card"]
 
 REPORT_GROUP_BY_VALUES: tuple[str, ...] = ("vehicle", "charger", "driver", "card")
 
