@@ -400,11 +400,14 @@ class OpenMeteoAdapter:
                 )
                 if rows:
                     now = datetime.now(timezone.utc)
-                    end_time = now + timedelta(days=days)
+                    window_start = now.replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+                    end_time = window_start + timedelta(days=days)
                     forecasts: list[WeatherData] = []
                     for row in rows:
                         forecast_for = row["forecast_for"]
-                        if forecast_for < now or forecast_for >= end_time:
+                        if forecast_for < window_start or forecast_for >= end_time:
                             continue
                         # Convert solar_rad from cal/cm² back to W/m² for
                         # the in-memory WeatherData type.
