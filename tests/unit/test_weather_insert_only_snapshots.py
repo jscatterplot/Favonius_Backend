@@ -141,7 +141,7 @@ class TestInsertOnlyIngestion:
 
         # Pin a later fetched_at explicitly so the assertion is robust
         # against clock granularity on fast hosts.
-        later = datetime.utcnow() + timedelta(seconds=1)
+        later = datetime.now(timezone.utc) + timedelta(seconds=1)
         mock_pool._mock_conn.execute.reset_mock()
         await store_weather_forecasts(
             mock_pool, sample_forecasts, depot_id, fetched_at=later
@@ -154,6 +154,8 @@ class TestInsertOnlyIngestion:
         # Each fetch is one bundle, so each call set has one fetched_at.
         assert len(first_fetched) == 1
         assert len(second_fetched) == 1
+        assert next(iter(first_fetched)).tzinfo is timezone.utc
+        assert next(iter(second_fetched)).tzinfo is timezone.utc
         # The two bundles are distinct → no overwrite.
         assert first_fetched != second_fetched
 
@@ -181,6 +183,7 @@ class TestInsertOnlyIngestion:
             for call in mock_pool._mock_conn.execute.call_args_list
         }
         assert len(fetched_ats) == 1
+        assert next(iter(fetched_ats)).tzinfo is timezone.utc
 
 
 # ─────────────────────────────────────────────────────────────────────

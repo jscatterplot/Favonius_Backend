@@ -505,6 +505,8 @@ async def test_store_weather_forecasts_pins_one_fetched_at(mock_pool, sample_wea
         for call_args in mock_pool._mock_conn.execute.call_args_list
     }
     assert len(fetched_ats) == 1, fetched_ats
+    bundle_fetched_at = next(iter(fetched_ats))
+    assert bundle_fetched_at.tzinfo is timezone.utc
 
 
 @pytest.mark.asyncio
@@ -519,13 +521,15 @@ async def test_store_weather_forecasts_does_not_overwrite_on_repeat_fetch(
     await store_weather_forecasts(mock_pool, sample_weather_data[:3], depot_id)
     first_fetched = mock_pool._mock_conn.execute.call_args_list[0][0][3]
 
-    # Force a measurable gap so the default datetime.utcnow() differs.
+    # Force a measurable gap so the default UTC timestamp differs.
     import asyncio
 
     await asyncio.sleep(0.01)
     await store_weather_forecasts(mock_pool, sample_weather_data[:3], depot_id)
     second_fetched = mock_pool._mock_conn.execute.call_args_list[-1][0][3]
 
+    assert first_fetched.tzinfo is timezone.utc
+    assert second_fetched.tzinfo is timezone.utc
     assert second_fetched > first_fetched
 
     # And the SQL is INSERT ... ON CONFLICT DO NOTHING, never UPDATE.

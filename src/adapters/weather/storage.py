@@ -14,7 +14,7 @@ migrations/021_weather_insert_only_snapshots.sql
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
@@ -64,8 +64,9 @@ async def store_weather_forecasts(
 
     Behaviour:
 
-    * A fresh fetch produces a fresh ``fetched_at`` timestamp (default
-      ``datetime.utcnow()``), so every row in this batch inserts.
+    * A fresh fetch produces a fresh UTC-aware ``fetched_at`` timestamp
+      (default ``datetime.now(timezone.utc)``), so every row in this
+      batch inserts.
     * If the caller passes an explicit ``fetched_at`` and the same
       tuple ``(depot_id, source, fetched_at, forecast_for)`` already
       exists, the unique constraint collapses the duplicate (we use
@@ -78,7 +79,7 @@ async def store_weather_forecasts(
         depot_id: Depot identifier
         source: Weather provider tag (default ``'open_meteo'``)
         fetched_at: When this batch was fetched. Defaults to
-            ``datetime.utcnow()`` so each call gets a unique tuple.
+            ``datetime.now(timezone.utc)`` so each call gets a unique tuple.
 
     Returns:
         Number of rows actually inserted (excludes rows skipped via
@@ -95,7 +96,9 @@ async def store_weather_forecasts(
     # Pin the bundle timestamp once so every row in this batch shares
     # it. This is the invariant the assembler relies on — "one bundle
     # = one fetched_at."
-    bundle_fetched_at = fetched_at if fetched_at is not None else datetime.utcnow()
+    bundle_fetched_at = (
+        fetched_at if fetched_at is not None else datetime.now(timezone.utc)
+    )
 
     query = """
     INSERT INTO weather_forecasts (
