@@ -749,6 +749,12 @@ class StateAssembler:
             ``max_grid_kw`` by ``building_load_assumption_kw`` so the
             site-power constraint is still respected.
         """
+        if self.config.building_load_assumption_kw > 0.0:
+            # Prevent double-counting when static derate is enabled, and avoid
+            # querying TimescaleDB for data the optimizer intentionally ignores.
+            self._last_building_load_source = "static_assumption"
+            return [0.0] * n_steps
+
         query = """
         SELECT time, power_kw
         FROM building_load
@@ -763,9 +769,6 @@ class StateAssembler:
                 f"Database error fetching building load for depot {self.depot_id}: {e}. "
                 "Using fallback source."
             )
-            if self.config.building_load_assumption_kw > 0.0:
-                self._last_building_load_source = "static_assumption"
-                return [0.0] * n_steps
             # Explicit degraded mode (PRD 9.4): meter unavailable, fall back
             # to the deterministic business-hours pattern. Readiness will
             # downgrade the run to 'degraded'.
@@ -777,16 +780,8 @@ class StateAssembler:
                 f"No building load data found for depot {self.depot_id} "
                 f"between {start} and {end}, using fallback source"
             )
-            if self.config.building_load_assumption_kw > 0.0:
-                self._last_building_load_source = "static_assumption"
-                return [0.0] * n_steps
             self._last_building_load_source = "forecast_fallback"
             return self._get_building_power_forecast(start, end, n_steps)
-
-        if self.config.building_load_assumption_kw > 0.0:
-            # Prevent double-counting when static derate is still enabled.
-            self._last_building_load_source = "static_assumption"
-            return [0.0] * n_steps
 
         self._last_building_load_source = "meter"
 
