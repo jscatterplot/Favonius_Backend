@@ -115,6 +115,7 @@ def aggregate_energy_rows(
             key,
             {
                 "energy_kwh": 0.0,
+                "energy_kwh_with_duration": 0.0,
                 "session_count": 0,
                 "duration_hours": 0.0,
                 "cost_total_sum": 0.0,
@@ -129,6 +130,7 @@ def aggregate_energy_rows(
         if row.end_time is not None:
             duration_h = max((row.end_time - row.start_time).total_seconds() / 3600.0, 0.0)
             agg["duration_hours"] += duration_h
+            agg["energy_kwh_with_duration"] += energy
         if row.cost_total is None:
             agg["cost_missing_count"] += 1
             agg["energy_kwh_missing_cost"] += energy
@@ -152,7 +154,7 @@ def aggregate_energy_rows(
             cost_amount = agg["cost_total_sum"]
 
         avg_kw = (
-            agg["energy_kwh"] / agg["duration_hours"]
+            agg["energy_kwh_with_duration"] / agg["duration_hours"]
             if agg["duration_hours"] > 0
             else 0.0
         )

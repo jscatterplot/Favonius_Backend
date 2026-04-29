@@ -297,6 +297,45 @@ class TestAggregateEnergyRows:
         assert rows[0]["cost"]["estimated"] is True
         assert rows[0]["cost"]["amount"] == pytest.approx(0.0)
 
+    def test_avg_kw_uses_only_sessions_with_duration(self):
+        """avg_kw must use the same subset as duration_hours."""
+        sessions = [
+            SessionRow(
+                start_time=_utc(datetime(2024, 3, 5, 9, 0), "America/Los_Angeles"),
+                end_time=_utc(datetime(2024, 3, 5, 11, 0), "America/Los_Angeles"),
+                energy_kwh=100.0,
+                cost_total=20.0,
+                vehicle_id="bus_1",
+                charger_id="charger_a",
+                driver_id=None,
+                card_id=None,
+            ),
+            SessionRow(
+                start_time=_utc(datetime(2024, 3, 6, 9, 0), "America/Los_Angeles"),
+                end_time=None,
+                energy_kwh=80.0,
+                cost_total=16.0,
+                vehicle_id="bus_1",
+                charger_id="charger_a",
+                driver_id=None,
+                card_id=None,
+            ),
+        ]
+        rows = aggregate_energy_rows(
+            sessions,
+            timezone="America/Los_Angeles",
+            group_by=None,
+            under_cap_rate=0.20,
+            currency="USD",
+            from_date=date(2024, 3, 1),
+            to_date=date(2024, 3, 31),
+        )
+        assert len(rows) == 1
+        # Only the 100 kWh session has a duration (2h), so avg_kw is 50.
+        assert rows[0]["avg_kw"] == pytest.approx(50.0)
+        # Total energy remains across all sessions for the energy rollup.
+        assert rows[0]["energy_kwh"] == pytest.approx(180.0)
+
     def test_invalid_group_by_raises(self):
         with pytest.raises(ValueError):
             aggregate_energy_rows(
