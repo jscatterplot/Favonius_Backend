@@ -47,6 +47,7 @@ from ..core.models import DepotConfig
 from ..core.optimizer.exceptions import InfeasibleModelError, SolverError, SolverTimeoutError
 from ..core.state.assembler import StateAssembler
 from .reports import (
+    REPORT_GROUP_BY_VALUES,
     SessionRow,
     aggregate_energy_rows,
     stream_rows_as_csv,
@@ -3158,9 +3159,6 @@ async def get_optimization_readiness(
 
 # ============ Energy Reporting Endpoints ============
 
-_REPORT_GROUP_BY_VALUES = ("vehicle", "charger", "driver", "card")
-
-
 class EnergyReportCost(BaseModel):
     """Cost breakdown for a single report row."""
 
@@ -3216,12 +3214,12 @@ def _validate_report_group_by(group_by: Optional[str]) -> Optional[str]:
     """Validate the optional group_by query parameter."""
     if group_by is None:
         return None
-    if group_by not in _REPORT_GROUP_BY_VALUES:
+    if group_by not in REPORT_GROUP_BY_VALUES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 f"Invalid group_by '{group_by}': must be one of "
-                f"{', '.join(_REPORT_GROUP_BY_VALUES)}"
+                f"{', '.join(REPORT_GROUP_BY_VALUES)}"
             ),
         )
     return group_by

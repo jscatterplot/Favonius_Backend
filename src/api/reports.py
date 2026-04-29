@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 GroupBy = Literal["vehicle", "charger", "driver", "card"]
 
-_GROUP_BY_VALUES: tuple[str, ...] = ("vehicle", "charger", "driver", "card")
+REPORT_GROUP_BY_VALUES: tuple[str, ...] = ("vehicle", "charger", "driver", "card")
 
 _UNASSIGNED = "unassigned"
 
@@ -92,7 +92,7 @@ def aggregate_energy_rows(
     configured the missing portion contributes zero and the row is still
     flagged as estimated.
     """
-    if group_by is not None and group_by not in _GROUP_BY_VALUES:
+    if group_by is not None and group_by not in REPORT_GROUP_BY_VALUES:
         raise ValueError(f"Unsupported group_by: {group_by!r}")
 
     tz = ZoneInfo(timezone)
