@@ -35,6 +35,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _ReadinessBlockedError(RuntimeError):
+    """Raised when readiness reports a non-transient hard block."""
+
+
 def _stub_snapshot(
     depot_id: str, horizon_start: datetime, horizon_end: datetime
 ) -> "OptimizationInputSnapshot":
@@ -232,7 +236,7 @@ class DepotController:
                 # replay works even when the solver crashes/times out.
                 snapshot = await self._capture_snapshot(state, effective_horizon)
                 if snapshot.readiness.is_blocking:
-                    raise RuntimeError(
+                    raise _ReadinessBlockedError(
                         "Optimization inputs not ready: "
                         f"missing={snapshot.readiness.missing_inputs}"
                     )
@@ -346,6 +350,10 @@ class DepotController:
                 )
                 return result
 
+            except _ReadinessBlockedError:
+                # Hard readiness vetoes are non-transient and should not be retried
+                # or counted toward circuit-breaker failure tracking.
+                raise
             except Exception as e:
                 self._optimization_failures += 1
 
