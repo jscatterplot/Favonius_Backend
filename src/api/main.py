@@ -1871,19 +1871,21 @@ async def _build_depot_readiness_checklist(
                 depot_id,
             )
         ) or "explicit_matrix"
-        has_access = bool(
-            await conn.fetchval(
-                """
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM charger_vehicle_access cva
-                    JOIN chargers c ON c.charger_id = cva.charger_id
-                    WHERE c.depot_id = $1::uuid AND cva.is_accessible = TRUE
+        has_access = False
+        if access_default != "all_to_all":
+            has_access = bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM charger_vehicle_access cva
+                        JOIN chargers c ON c.charger_id = cva.charger_id
+                        WHERE c.depot_id = $1::uuid AND cva.is_accessible = TRUE
+                    )
+                    """,
+                    depot_id,
                 )
-                """,
-                depot_id,
             )
-        )
         has_schedules = bool(
             await conn.fetchval(
                 """
