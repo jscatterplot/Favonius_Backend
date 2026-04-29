@@ -410,10 +410,16 @@ def build_optimization_model(
     def grid_balance_rule(m, t):
         # P_batt_effective = discharge * η - charge / η
         P_batt_effective = m.P_batt_discharge[t] * eta_batt - m.P_batt_charge[t] / eta_batt
+        # building_load_assumption_kw is the depot-level static derate
+        # applied when no live meter/forecast source is configured (PRD
+        # §9.4). When a live source is configured this is 0 and the
+        # actual load lives in m.building_power[t]. Either way the site
+        # power constraint below remains the hard limit.
         return (
             m.P_grid[t]
             == sum(m.P_charge[b, t] for b in m.B)
             + m.building_power[t]
+            + config.building_load_assumption_kw
             + m.P_precond[t]
             - P_batt_effective
         )

@@ -278,8 +278,10 @@ These come directly from the PRD and are non-negotiable:
 | Vehicle departure SoC | ≥ 99% | Section 8.1 |
 | Optimization solve time | < 60 seconds | Section 8.3 |
 | Primary OCPP protocol | OCPP 1.6 (2.0.1 future-ready) | Section 9.1 |
-| Building load in grid power calculation | REQUIRED | Section 9.4 |
+| Site grid power constraint (`max_grid_kw`) | NEVER violated | Section 9.4 |
 | MVP connector type | CCS only | Section 3.2 |
+
+**Building load is OPTIONAL for initial customer onboarding (e.g. HRX pilot)** — deferred until a meter/BMS integration is delivered. When no live source is configured, the optimizer runs in `degraded` mode and applies a depot-level static `building_load_assumption_kw` as a derate on `max_grid_kw` so the site-power constraint is still respected. The run's `status='degraded'` and the snapshot records the assumption used. Re-introduce as required once meter/BMS lands. (PRD Section 9.4)
 
 ---
 

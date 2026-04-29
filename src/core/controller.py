@@ -8,11 +8,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Optional
+from uuid import UUID
 
 from .controller_config import ControllerConfig
-from .models import DepotConfig, OptimizationInputSnapshot, OptimizationResult
+from .models import (
+    DepotConfig,
+    OptimizationInputSnapshot,
+    OptimizationResult,
+    ReadinessReport,
+)
 from .optimizer import optimize
 from .state.assembler import StateAssembler
 from .state.readiness import build_snapshot, evaluate_readiness
@@ -40,43 +46,73 @@ class _ReadinessBlockedError(RuntimeError):
 
 
 def _stub_snapshot(
-    depot_id: str, horizon_start: datetime, horizon_end: datetime
+    depot_id: str,
+    horizon_start: datetime,
+    horizon_end: datetime,
+    readiness: Optional["ReadinessReport"] = None,
 ) -> "OptimizationInputSnapshot":
     """Fallback snapshot used when real construction fails.
 
-    Returns a conservative ``degraded`` snapshot so snapshot-construction
-    failures never abort an otherwise-runnable optimization. The failure is
-    already logged. The stub is *not* persisted.
+    Returns a conservative ``degraded`` snapshot for otherwise-runnable
+    optimizations. If readiness was already evaluated as ``not_ready``,
+    preserve that hard veto so snapshot-construction failures cannot mask
+    missing prerequisites.
     """
     from uuid import UUID, uuid4
 
-    from .models import OptimizationInputSnapshot, ReadinessReport
+    from .version_info import (
+        get_code_version,
+        get_solver_version,
+        get_surrogate_model_version,
+    )
 
     try:
         depot_uuid = UUID(depot_id)
     except (ValueError, TypeError):
         depot_uuid = uuid4()
-    return OptimizationInputSnapshot(
-        snapshot_id=uuid4(),
-        depot_id=depot_uuid,
-        organization_id=None,
-        captured_at=datetime.utcnow(),
-        horizon_start=horizon_start,
-        horizon_end=horizon_end,
-        readiness=ReadinessReport(
+
+    if readiness is None:
+        stub_readiness = ReadinessReport(
             status="degraded",
             degraded_reasons=["snapshot_construction_failed"],
             assumptions={"snapshot_construction_failed": True},
             building_load_source="absent",
-        ),
-        depot={},
+        )
+    else:
+        status = "not_ready" if readiness.is_blocking else "degraded"
+        stub_readiness = ReadinessReport(
+            status=status,
+            missing_inputs=list(readiness.missing_inputs),
+            degraded_reasons=[
+                *readiness.degraded_reasons,
+                "snapshot_construction_failed",
+            ],
+            assumptions={
+                **readiness.assumptions,
+                "snapshot_construction_failed": True,
+            },
+            building_load_source=readiness.building_load_source,
+        )
+
+    return OptimizationInputSnapshot(
+        snapshot_id=uuid4(),
+        depot_id=depot_uuid,
+        organization_id=None,
+        captured_at=datetime.now(timezone.utc),
+        horizon_start=horizon_start,
+        horizon_end=horizon_end,
+        readiness=stub_readiness,
+        depot={"n_timesteps": 0},
         vehicles=[],
         chargers={},
         charger_vehicle_access={},
         schedules=[],
         prices=[],
         telemetry={},
-        building_load={},
+        building_load={"source": "absent", "values_kw": [], "n_timesteps": 0},
+        code_version=get_code_version(),
+        solver_version=get_solver_version(),
+        surrogate_model_version=get_surrogate_model_version(),
     )
 
 
@@ -211,36 +247,41 @@ class DepotController:
         max_retries = 2  # Initial attempt + 2 retries
         retry_delay = 1.0  # Start with 1 second delay
 
+        effective_horizon = (
+            horizon_hours
+            if horizon_hours is not None
+            else self.controller_config.optimization_horizon_hours
+        )
+
+        # Assemble state with retries (transient DB errors). State assembly
+        # is the only step that should retry independently of the solve.
+        state = None
+        for assembly_attempt in range(max_retries + 1):
+            try:
+                state = await self.assembler.get_current_state(effective_horizon)
+                break
+            except Exception as e:
+                logger.error(
+                    f"State assembly failed: {e}",
+                    exc_info=True,
+                    extra={"depot_id": self.depot_id, "attempt": assembly_attempt + 1},
+                )
+                if assembly_attempt < max_retries:
+                    await asyncio.sleep(retry_delay * (2**assembly_attempt))
+                    continue
+                raise
+
+        # Persist the input snapshot once, BEFORE the solve retry loop, so
+        # post-mortem replay survives crashes/timeouts and we don't write
+        # multiple orphan rows for one logical run.
+        snapshot = await self._capture_snapshot(state, effective_horizon)
+        if snapshot.readiness.is_blocking:
+            raise _ReadinessBlockedError(
+                "Optimization inputs not ready: " f"missing={snapshot.readiness.missing_inputs}"
+            )
+
         for attempt in range(max_retries + 1):
             try:
-                # Assemble state
-                effective_horizon = (
-                    horizon_hours
-                    if horizon_hours is not None
-                    else self.controller_config.optimization_horizon_hours
-                )
-                try:
-                    state = await self.assembler.get_current_state(effective_horizon)
-                except Exception as e:
-                    logger.error(
-                        f"State assembly failed: {e}",
-                        exc_info=True,
-                        extra={"depot_id": self.depot_id, "attempt": attempt + 1},
-                    )
-                    if attempt < max_retries:
-                        await asyncio.sleep(retry_delay * (2**attempt))
-                        continue
-                    raise
-
-                # Persist a full input snapshot before solving so post-mortem
-                # replay works even when the solver crashes/times out.
-                snapshot = await self._capture_snapshot(state, effective_horizon)
-                if snapshot.readiness.is_blocking:
-                    raise _ReadinessBlockedError(
-                        "Optimization inputs not ready: "
-                        f"missing={snapshot.readiness.missing_inputs}"
-                    )
-
                 # Build and solve
                 try:
                     result = optimize(
@@ -292,9 +333,7 @@ class DepotController:
 
                 # Link snapshot to the optimization run row.
                 try:
-                    await link_snapshot_to_run(
-                        self.pools, snapshot.snapshot_id, result.run_id
-                    )
+                    await link_snapshot_to_run(self.pools, snapshot.snapshot_id, result.run_id)
                 except Exception as e:
                     logger.warning(
                         "Failed to link snapshot %s to run %s: %s",
@@ -402,9 +441,7 @@ class DepotController:
                     # All retries exhausted
                     raise
 
-    async def _capture_snapshot(
-        self, state, horizon_hours: int
-    ) -> OptimizationInputSnapshot:
+    async def _capture_snapshot(self, state, horizon_hours: int) -> OptimizationInputSnapshot:
         """Build, persist, and return the input snapshot for one optimization.
 
         Readiness is evaluated against ``self.config`` plus the freshly
@@ -414,17 +451,17 @@ class DepotController:
         — even when readiness is ``not_ready`` — so we always have an
         artefact for replay/diagnostics. ``run_id`` is back-filled later.
 
-        Snapshot construction failures must never break optimization, so
-        the whole body is wrapped: on error we fall back to a stub
-        ``degraded`` snapshot and log loudly.
+        Called exactly once per logical optimization run (NOT once per
+        retry attempt). On stub fallback we still persist a minimal row
+        so the audit trail has no gaps.
         """
         horizon = self.assembler.last_horizon
         if horizon is None:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             horizon = (now, now + timedelta(hours=horizon_hours))
 
-        # Best-effort: fetch weather + organization_id for the snapshot.
-        # Failures here must not derail the run.
+        # Best-effort: fetch weather + organization_id + recent telemetry
+        # for the snapshot. Failures here must not derail the run.
         try:
             await self.assembler.fetch_snapshot_extras(horizon[0], horizon[1])
         except Exception as e:
@@ -434,6 +471,8 @@ class DepotController:
                 e,
             )
 
+        readiness: Optional[ReadinessReport] = None
+        snapshot: OptimizationInputSnapshot
         try:
             readiness = evaluate_readiness(
                 self.config,
@@ -441,25 +480,36 @@ class DepotController:
                 building_load_source=self.assembler.last_building_load_source,
                 schedules_present=self.assembler.last_schedules_present,
             )
-            snapshot = build_snapshot(
-                depot_id=self.depot_id,
-                organization_id=self.assembler.last_organization_id,
-                config=self.config,
-                state=state,
-                horizon_start=horizon[0],
-                horizon_end=horizon[1],
-                schedules=self.assembler.last_schedules,
-                weather_features=self.assembler.last_weather_features,
-                readiness=readiness,
-            )
         except Exception as e:
             logger.error(
-                "Failed to build optimization input snapshot for depot %s: %s",
+                "Failed to evaluate optimization readiness for depot %s: %s",
                 self.depot_id,
                 e,
                 exc_info=True,
             )
-            return _stub_snapshot(self.depot_id, horizon[0], horizon[1])
+            snapshot = _stub_snapshot(self.depot_id, horizon[0], horizon[1])
+        else:
+            try:
+                snapshot = build_snapshot(
+                    depot_id=self.depot_id,
+                    organization_id=self.assembler.last_organization_id,
+                    config=self.config,
+                    state=state,
+                    horizon_start=horizon[0],
+                    horizon_end=horizon[1],
+                    schedules=self.assembler.last_schedules,
+                    weather_features=self.assembler.last_weather_features,
+                    recent_telemetry=self.assembler.last_recent_telemetry,
+                    readiness=readiness,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to build optimization input snapshot for depot %s: %s",
+                    self.depot_id,
+                    e,
+                    exc_info=True,
+                )
+                snapshot = _stub_snapshot(self.depot_id, horizon[0], horizon[1], readiness)
 
         try:
             await persist_snapshot(self.pools, snapshot)

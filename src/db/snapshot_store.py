@@ -1,4 +1,5 @@
-"""Persistence helpers for ``optimization_input_snapshots`` (migration 019).
+"""Persistence helpers for ``optimization_input_snapshots`` (migrations
+019, 020).
 
 The snapshot row is written *before* the solver runs. ``run_id`` is updated
 afterwards to link the snapshot to its ``optimization_runs`` row. Snapshots
@@ -34,8 +35,16 @@ INSERT INTO optimization_input_snapshots (
     missing_inputs,
     assumptions,
     payload,
-    payload_schema
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12)
+    payload_schema,
+    recent_telemetry,
+    code_version,
+    solver_version,
+    surrogate_model_version
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8,
+    $9::jsonb, $10::jsonb, $11::jsonb, $12,
+    $13::jsonb, $14, $15, $16
+)
 """
 
 _LINK_RUN_SQL = """
@@ -45,9 +54,7 @@ WHERE snapshot_id = $2
 """
 
 
-async def persist_snapshot(
-    pools: "DatabasePools", snapshot: "OptimizationInputSnapshot"
-) -> UUID:
+async def persist_snapshot(pools: "DatabasePools", snapshot: "OptimizationInputSnapshot") -> UUID:
     """Insert a snapshot row and return its snapshot_id.
 
     The payload is JSON-encoded once and passed through asyncpg's JSONB
@@ -58,6 +65,7 @@ async def persist_snapshot(
     payload_json = json.dumps(payload, default=str)
     missing_json = json.dumps(snapshot.readiness.missing_inputs)
     assumptions_json = json.dumps(snapshot.readiness.assumptions, default=str)
+    telemetry_json = json.dumps(snapshot.recent_telemetry, default=str)
 
     async with pools.ts.acquire() as conn:
         await conn.execute(
@@ -74,21 +82,24 @@ async def persist_snapshot(
             assumptions_json,
             payload_json,
             snapshot.payload_schema,
+            telemetry_json,
+            snapshot.code_version,
+            snapshot.solver_version,
+            snapshot.surrogate_model_version,
         )
     logger.info(
         "Persisted optimization input snapshot %s for depot %s (status=%s, "
-        "building_load_source=%s)",
+        "building_load_source=%s, code_version=%s)",
         snapshot.snapshot_id,
         snapshot.depot_id,
         snapshot.readiness.status,
         snapshot.readiness.building_load_source,
+        snapshot.code_version,
     )
     return snapshot.snapshot_id
 
 
-async def link_snapshot_to_run(
-    pools: "DatabasePools", snapshot_id: UUID, run_id: UUID
-) -> None:
+async def link_snapshot_to_run(pools: "DatabasePools", snapshot_id: UUID, run_id: UUID) -> None:
     """Backfill ``run_id`` on an existing snapshot row."""
     async with pools.ts.acquire() as conn:
         await conn.execute(_LINK_RUN_SQL, run_id, snapshot_id)
