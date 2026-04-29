@@ -14,7 +14,7 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, Optional
 from urllib.parse import urlparse
 from uuid import UUID
@@ -28,6 +28,7 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -45,6 +46,12 @@ from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.optimizer.exceptions import InfeasibleModelError, SolverError, SolverTimeoutError
 from ..core.state.assembler import StateAssembler
+from ..core.state.readiness import (
+    build_snapshot,
+    evaluate_readiness,
+    snapshot_to_payload,
+)
+from ..db.snapshot_store import persist_snapshot
 from ..db import queries as db_queries
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
@@ -660,6 +667,79 @@ class DepotStateResponse(BaseModel):
     )
     current_month_peak_kw: float = Field(..., ge=0.0, description="Current month peak demand (kW)")
     current_price_kwh: float = Field(..., ge=0.0, description="Current electricity price ($/kWh)")
+
+
+class ReadinessResponse(BaseModel):
+    """Optimization readiness response (PRD §9.4 building load + migration 019).
+
+    Returned by ``GET /depots/{id}/optimization/readiness``. Tells the
+    frontend whether a solve would run, run with documented assumptions,
+    or be refused outright.
+
+    `status` values:
+        - ``ready``     — every required input is present.
+        - ``degraded``  — at least one input substituted by an explicit
+                          assumption (e.g. building load forecast fallback).
+                          The optimization will still run, and its
+                          ``optimization_runs.status`` will be ``degraded``.
+        - ``not_ready`` — a hard prerequisite is missing; ``POST /optimize``
+                          will refuse the run.
+    """
+
+    depot_id: str = Field(..., description="Depot identifier (UUID)")
+    status: str = Field(
+        ...,
+        description="Overall readiness verdict: 'ready' | 'degraded' | 'not_ready'",
+    )
+    missing_inputs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Hard misses that block the run. Possible values: "
+            "'vehicles', 'chargers', 'prices', 'schedules', "
+            "'charger_vehicle_access', 'building_load'."
+        ),
+    )
+    degraded_reasons: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Reasons the run is degraded but still safe to execute. "
+            "Possible values: 'building_load_meter_unavailable', "
+            "'telemetry_all_defaulted'."
+        ),
+    )
+    assumptions: dict = Field(
+        default_factory=dict,
+        description=(
+            "Explicit assumptions applied to fill in missing data. "
+            "Keys are input names ('building_load', 'telemetry'); "
+            "values include {source, note} or input-specific detail."
+        ),
+        examples=[
+            {
+                "building_load": {
+                    "source": "forecast_fallback",
+                    "note": "meter data missing; substituted business-hours forecast pattern",
+                }
+            }
+        ],
+    )
+    building_load_source: str = Field(
+        ...,
+        description="'meter' | 'forecast_fallback' | 'absent'",
+    )
+    horizon_hours: int = Field(
+        ..., ge=1, description="Horizon length used for the readiness check (hours)"
+    )
+    captured_at: str = Field(
+        ..., description="Timestamp when readiness was evaluated (ISO 8601)"
+    )
+    snapshot_id: Optional[str] = Field(
+        None,
+        description=(
+            "ID of the persisted snapshot if one was written. Absent on "
+            "preview-only checks (none today; reserved for future use)."
+        ),
+    )
 
 
 class ChargerFaultItem(BaseModel):
@@ -2943,6 +3023,135 @@ async def get_depot_state(
     except Exception as e:
         logger.error(f"Failed to get depot state: {e}", exc_info=True, extra={"depot_id": depot_id})
         raise HTTPException(status_code=500, detail=f"Failed to get depot state: {str(e)}")
+
+
+@app.get(
+    "/depots/{depot_id}/optimization/readiness",
+    response_model=ReadinessResponse,
+    tags=["depots"],
+    summary="Check optimization readiness",
+    description="""
+    Evaluate whether a depot has every input the MILP solver needs.
+
+    Use this BEFORE calling `POST /optimize` to render an inputs-checklist
+    UI. The response tells the user exactly which inputs are missing and
+    whether the run would proceed in degraded mode (e.g. building-load
+    forecast fallback).
+
+    The endpoint runs the same state assembler and readiness checker the
+    real optimization run uses, with `persist=false` by default so it does
+    NOT write to `optimization_input_snapshots`. Pass `persist=true` to
+    capture an audit trail (useful when the frontend wants to record a
+    pre-flight check for later replay).
+
+    **Authentication:** Requires JWT token in Authorization header. The
+    user must have access to the depot.
+
+    **Status values:**
+    - `ready` — every required input present; safe to call `/optimize`
+    - `degraded` — run will proceed with documented assumptions; resulting
+      `optimization_runs.status` will be `degraded`
+    - `not_ready` — `/optimize` will refuse; resolve `missing_inputs` first
+
+    **Missing input vocabulary:** `vehicles`, `chargers`, `prices`,
+    `schedules`, `charger_vehicle_access`, `building_load`.
+
+    **Degraded reason vocabulary:** `building_load_meter_unavailable`,
+    `telemetry_all_defaulted`.
+
+    Reference: migration 019, PRD §9.4
+    """,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid depot_id"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Forbidden"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_optimization_readiness(
+    depot_id: str = Depends(_require_depot_access),
+    horizon_hours: int = Query(
+        24, ge=1, le=48, description="Optimization horizon (hours)"
+    ),
+    persist: bool = Query(
+        False,
+        description=(
+            "If true, write a row to optimization_input_snapshots (no run_id)."
+        ),
+    ),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Pre-flight readiness check for the MILP optimizer."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        config = await _get_depot_config(depot_id)
+    except ValueError as e:
+        if "not found" in str(e).lower():
+            raise DepotNotFoundError(str(e))
+        raise
+
+    assembler = StateAssembler(db_pools, depot_id, config)
+    try:
+        async with asyncio.timeout(30):
+            state = await assembler.get_current_state(horizon_hours)
+            await assembler.fetch_snapshot_extras(*assembler.last_horizon)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=503, detail="Readiness check timed out after 30s"
+        )
+
+    readiness = evaluate_readiness(
+        config,
+        state,
+        building_load_source=assembler.last_building_load_source,
+        schedules_present=assembler.last_schedules_present,
+    )
+
+    snapshot_id: Optional[str] = None
+    if persist:
+        horizon = assembler.last_horizon or (
+            datetime.utcnow(),
+            datetime.utcnow() + timedelta(hours=horizon_hours),
+        )
+        snapshot = build_snapshot(
+            depot_id=depot_id,
+            organization_id=assembler.last_organization_id,
+            config=config,
+            state=state,
+            horizon_start=horizon[0],
+            horizon_end=horizon[1],
+            schedules=assembler.last_schedules,
+            weather_features=assembler.last_weather_features,
+            readiness=readiness,
+        )
+        try:
+            await persist_snapshot(db_pools, snapshot)
+            snapshot_id = str(snapshot.snapshot_id)
+        except Exception as e:
+            # Pre-flight persistence is best-effort — do not fail the
+            # readiness response if the write fails.
+            logger.warning(
+                "Pre-flight snapshot persist failed for depot %s: %s",
+                depot_id,
+                e,
+            )
+        # Make sure replay payload is well-formed even when not persisted.
+        snapshot_to_payload(snapshot)
+
+    return ReadinessResponse(
+        depot_id=depot_id,
+        status=readiness.status,
+        missing_inputs=readiness.missing_inputs,
+        degraded_reasons=readiness.degraded_reasons,
+        assumptions=readiness.assumptions,
+        building_load_source=readiness.building_load_source,
+        horizon_hours=horizon_hours,
+        captured_at=datetime.utcnow().isoformat(),
+        snapshot_id=snapshot_id,
+    )
 
 
 @app.get(
