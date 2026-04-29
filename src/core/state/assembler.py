@@ -767,24 +767,48 @@ class StateAssembler:
                 day=1, hour=0, minute=0, second=0, microsecond=0
             )
 
-        # telemetry stores instantaneous charging_kw per (vehicle, charger,
-        # timestamp). Multiplying by self.config.delta_t (hours) and
-        # summing approximates kWh delivered. Telemetry rows belong to a
-        # depot via the charger; we restrict to chargers in this depot.
+        # telemetry stores instantaneous charging_kw samples at charger-defined
+        # intervals. Convert to energy by integrating each sample across the
+        # elapsed time until the next sample (or "now" for the last point).
+        # Telemetry rows belong to a depot via the charger.
         query = """
-        SELECT COALESCE(SUM(t.charging_kw), 0.0) AS sum_kw
-        FROM telemetry t
-        WHERE t.charger_id IN (
-            SELECT charger_id FROM chargers WHERE depot_id = $1
+        WITH depot_telemetry AS (
+            SELECT
+                t.charger_id,
+                t.vehicle_id,
+                t.time,
+                t.charging_kw,
+                LEAD(t.time) OVER (
+                    PARTITION BY t.charger_id, t.vehicle_id
+                    ORDER BY t.time
+                ) AS next_time
+            FROM telemetry t
+            WHERE t.charger_id IN (
+                SELECT charger_id FROM chargers WHERE depot_id = $1
+            )
+              AND t.time >= $2
+              AND t.time <= $3
+              AND t.charging_kw IS NOT NULL
         )
-          AND t.time >= $2
-          AND t.time <= $3
-          AND t.charging_kw IS NOT NULL
+        SELECT COALESCE(
+            SUM(
+                dt.charging_kw * GREATEST(
+                    EXTRACT(
+                        EPOCH FROM (
+                            LEAST(COALESCE(dt.next_time, $3), $3) - dt.time
+                        )
+                    ) / 3600.0,
+                    0.0
+                )
+            ),
+            0.0
+        ) AS sum_kwh
+        FROM depot_telemetry dt
         """
         try:
             async with self.pools.ts.acquire() as conn:
                 row = await conn.fetchrow(query, self.depot_id, period_start, now)
-            sum_kw = float(row["sum_kw"]) if row and row["sum_kw"] is not None else 0.0
+            sum_kwh = float(row["sum_kwh"]) if row and row["sum_kwh"] is not None else 0.0
         except Exception as exc:
             logger.warning(
                 "Failed to compute cumulative kWh for depot %s: %s; defaulting to 0",
@@ -792,7 +816,7 @@ class StateAssembler:
                 exc,
             )
             return 0.0
-        return sum_kw * float(self.config.delta_t)
+        return sum_kwh
 
     async def _get_building_power(
         self, start: datetime, end: datetime, n_steps: int
