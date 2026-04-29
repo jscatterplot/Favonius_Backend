@@ -49,7 +49,6 @@ from ..core.state.assembler import StateAssembler
 from ..core.state.readiness import (
     build_snapshot,
     evaluate_readiness,
-    snapshot_to_payload,
 )
 from ..db.snapshot_store import persist_snapshot
 from ..db import queries as db_queries
@@ -3138,8 +3137,6 @@ async def get_optimization_readiness(
                 depot_id,
                 e,
             )
-        # Make sure replay payload is well-formed even when not persisted.
-        snapshot_to_payload(snapshot)
 
     return ReadinessResponse(
         depot_id=depot_id,

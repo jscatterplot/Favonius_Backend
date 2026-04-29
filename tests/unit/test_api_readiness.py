@@ -251,6 +251,38 @@ class TestReadinessEndpoint:
     @patch("src.api.main.StateAssembler")
     @patch("src.api.main._get_depot_config")
     @patch("src.api.main.db_pools")
+    def test_persist_true_does_not_run_dead_payload_validation(
+        self,
+        mock_pool,
+        mock_get_config,
+        mock_assembler_cls,
+        mock_persist,
+        client,
+    ):
+        mock_pool_value = MagicMock()
+        mock_get_config.return_value = _full_config()
+        mock_assembler_cls.return_value = _stub_assembler(
+            building_source="meter", schedules_present=True
+        )
+        mock_persist.return_value = uuid4()
+        payload_validator = MagicMock(side_effect=RuntimeError("payload failed"))
+
+        depot_id = str(uuid4())
+        with patch("src.api.main.db_pools", mock_pool_value), patch(
+            "src.api.main.snapshot_to_payload", payload_validator, create=True
+        ):
+            response = client.get(
+                f"/depots/{depot_id}/optimization/readiness?persist=true"
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK
+        assert response.json()["status"] == "ready"
+        payload_validator.assert_not_called()
+
+    @patch("src.api.main.persist_snapshot")
+    @patch("src.api.main.StateAssembler")
+    @patch("src.api.main._get_depot_config")
+    @patch("src.api.main.db_pools")
     def test_persist_failure_does_not_break_response(
         self,
         mock_pool,
