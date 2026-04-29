@@ -480,18 +480,6 @@ class DepotController:
                 building_load_source=self.assembler.last_building_load_source,
                 schedules_present=self.assembler.last_schedules_present,
             )
-            snapshot = build_snapshot(
-                depot_id=self.depot_id,
-                organization_id=self.assembler.last_organization_id,
-                config=self.config,
-                state=state,
-                horizon_start=horizon[0],
-                horizon_end=horizon[1],
-                schedules=self.assembler.last_schedules,
-                weather_features=self.assembler.last_weather_features,
-                weather_forecast_id=self.assembler.last_weather_forecast_id,
-                readiness=readiness,
-            )
         except Exception as e:
             logger.error(
                 "Failed to evaluate optimization readiness for depot %s: %s",
@@ -511,6 +499,7 @@ class DepotController:
                     horizon_end=horizon[1],
                     schedules=self.assembler.last_schedules,
                     weather_features=self.assembler.last_weather_features,
+                    weather_forecast_id=self.assembler.last_weather_forecast_id,
                     recent_telemetry=self.assembler.last_recent_telemetry,
                     readiness=readiness,
                 )
