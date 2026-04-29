@@ -14,8 +14,8 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
-from typing import Literal, Optional
+from datetime import date, datetime, timedelta
+from typing import Iterator, Literal, Optional
 from urllib.parse import urlparse
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -37,7 +37,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -46,6 +46,12 @@ from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.optimizer.exceptions import InfeasibleModelError, SolverError, SolverTimeoutError
 from ..core.state.assembler import StateAssembler
+from .reports import (
+    REPORT_GROUP_BY_VALUES,
+    SessionRow,
+    aggregate_energy_rows,
+    stream_rows_as_csv,
+)
 from ..core.state.readiness import (
     build_snapshot,
     evaluate_readiness,
@@ -3209,6 +3215,407 @@ async def get_optimization_readiness(
         captured_at=datetime.utcnow().isoformat(),
         snapshot_id=snapshot_id,
     )
+
+
+# ============ Energy Reporting Endpoints ============
+
+class EnergyReportCost(BaseModel):
+    """Cost breakdown for a single report row."""
+
+    amount: float = Field(..., description="Total cost for the bucket")
+    currency: str = Field(..., description="ISO 4217 currency code")
+    estimated: bool = Field(
+        False,
+        description=(
+            "True when any session in the bucket lacked cost_total and was "
+            "estimated using the depot tariff under_cap_rate."
+        ),
+    )
+
+
+class EnergyReportRow(BaseModel):
+    """Single row of an energy report."""
+
+    bucket: str = Field(..., description="Calendar bucket key in depot timezone (YYYY-MM)")
+    vehicle_id: Optional[str] = Field(None, description="Vehicle UUID or 'unassigned'")
+    charger_id: Optional[str] = Field(None, description="Charger UUID or 'unassigned'")
+    driver_id: Optional[str] = Field(None, description="Driver UUID or 'unassigned'")
+    card_id: Optional[str] = Field(None, description="RFID card UUID or 'unassigned'")
+    energy_kwh: float = Field(..., description="Total energy delivered in the bucket (kWh)")
+    session_count: int = Field(..., description="Number of charging sessions in the bucket")
+    avg_kw: float = Field(..., description="Average charging power across sessions (kWh / hours)")
+    cost: EnergyReportCost = Field(..., description="Bucketed cost (sum or estimate)")
+
+
+class EnergyReportResponse(BaseModel):
+    """Response from /reports/depots/{depot_id}/energy/monthly."""
+
+    depot_id: str
+    currency: str
+    from_: str = Field(..., alias="from")
+    to: str
+    rows: list[EnergyReportRow]
+
+    model_config = {"populate_by_name": True}
+
+
+def _parse_report_date(value: str, field_name: str) -> date:
+    """Parse an ISO 8601 calendar date for the from/to query parameters."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {field_name} date '{value}': expected ISO 8601 (YYYY-MM-DD)",
+        ) from exc
+
+
+def _validate_report_group_by(group_by: Optional[str]) -> Optional[str]:
+    """Validate the optional group_by query parameter."""
+    if group_by is None:
+        return None
+    if group_by not in REPORT_GROUP_BY_VALUES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid group_by '{group_by}': must be one of "
+                f"{', '.join(REPORT_GROUP_BY_VALUES)}"
+            ),
+        )
+    return group_by
+
+
+async def _verify_depot_access_for_report(depot_id: str, user: dict) -> None:
+    """Run verify_depot_access and re-raise 403s with error_code=CROSS_ORG_DENIED."""
+    try:
+        await verify_depot_access(
+            depot_id, user, db_pools.static if db_pools else None
+        )
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error_code": "CROSS_ORG_DENIED",
+                    "message": exc.detail
+                    if isinstance(exc.detail, str)
+                    else "Access denied: cross-organization access is not permitted",
+                },
+            ) from exc
+        raise
+
+
+def _coerce_under_cap_rate(billing_metadata: Optional[dict]) -> Optional[float]:
+    """Pull the depot tariff under_cap_rate out of billing_metadata."""
+    if not isinstance(billing_metadata, dict):
+        return None
+    raw = billing_metadata.get("under_cap_rate")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring non-numeric under_cap_rate in billing_metadata: %r", raw
+        )
+        return None
+
+
+def _optional_text(value: object) -> Optional[str]:
+    """Normalize nullable report dimension values from asyncpg records."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+async def _load_report_context(
+    depot_id: str,
+) -> tuple[str, str, Optional[float], list[str], dict[str, str]]:
+    """Fetch depot reporting context and charger mappings from static DB."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        depot_row = await conn.fetchrow(
+            """
+            SELECT timezone, currency, billing_metadata
+            FROM depots
+            WHERE depot_id = $1::uuid
+            """,
+            depot_id,
+        )
+        if not depot_row:
+            raise DepotNotFoundError(f"Depot {depot_id} not found")
+
+        charger_rows = await conn.fetch(
+            "SELECT charger_id::text AS charger_id, ocpp_id FROM chargers WHERE depot_id = $1::uuid",
+            depot_id,
+        )
+
+    timezone_name = depot_row["timezone"] or "America/Los_Angeles"
+    currency = depot_row["currency"] or "USD"
+    billing_metadata = depot_row["billing_metadata"]
+    if isinstance(billing_metadata, str):
+        try:
+            billing_metadata = json.loads(billing_metadata)
+        except (TypeError, ValueError):
+            billing_metadata = {}
+    under_cap_rate = _coerce_under_cap_rate(billing_metadata)
+
+    ocpp_ids = [r["ocpp_id"] for r in charger_rows]
+    charger_id_by_ocpp_id = {r["ocpp_id"]: r["charger_id"] for r in charger_rows}
+    return timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id
+
+
+async def _fetch_session_rows(
+    depot_id: str,
+    timezone_name: str,
+    ocpp_ids: list[str],
+    charger_id_by_ocpp_id: dict[str, str],
+    from_date: date,
+    to_date: date,
+) -> list[SessionRow]:
+    """Fetch charging_sessions rows in [from, to] (inclusive) in depot TZ."""
+    if not db_pools or db_pools.ts is None:
+        raise DatabaseError("Database not available")
+    if not ocpp_ids:
+        return []
+
+    query = """
+        SELECT
+            cs.start_time,
+            cs.end_time,
+            cs.energy_delivered_kwh,
+            cs.cost_total,
+            cs.vehicle_id::text AS vehicle_id,
+            cs.station_id AS charger_id,
+            cs.driver_id::text AS driver_id,
+            cs.card_id::text AS card_id
+        FROM charging_sessions cs
+        WHERE cs.station_id = ANY($1::text[])
+          AND cs.start_time >= ($2::date)::timestamp AT TIME ZONE $4
+          AND cs.start_time < (($3::date) + INTERVAL '1 day')::timestamp AT TIME ZONE $4
+        ORDER BY cs.start_time
+        """
+
+    async with db_pools.ts.acquire() as conn:
+        records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name)
+
+    rows: list[SessionRow] = []
+    for r in records:
+        energy = r["energy_delivered_kwh"]
+        cost = r["cost_total"]
+        rows.append(
+            SessionRow(
+                start_time=r["start_time"],
+                end_time=r["end_time"],
+                energy_kwh=float(energy) if energy is not None else None,
+                cost_total=float(cost) if cost is not None else None,
+                vehicle_id=_optional_text(r["vehicle_id"]),
+                charger_id=charger_id_by_ocpp_id.get(r["charger_id"]),
+                driver_id=_optional_text(r["driver_id"]),
+                card_id=_optional_text(r["card_id"]),
+            )
+        )
+    return rows
+
+
+async def _build_energy_report(
+    depot_id: str,
+    from_str: str,
+    to_str: str,
+    group_by: Optional[str],
+) -> tuple[dict, list[dict], str]:
+    """Run the full report pipeline and return (metadata, rows, currency)."""
+    from_date = _parse_report_date(from_str, "from")
+    to_date = _parse_report_date(to_str, "to")
+    if to_date < from_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'to' must be on or after 'from'",
+        )
+
+    timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
+        await _load_report_context(depot_id)
+    )
+    sessions = await _fetch_session_rows(
+        depot_id, timezone_name, ocpp_ids, charger_id_by_ocpp_id, from_date, to_date
+    )
+    rows = aggregate_energy_rows(
+        sessions,
+        timezone=timezone_name,
+        group_by=group_by,
+        under_cap_rate=under_cap_rate,
+        currency=currency,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    metadata = {
+        "depot_id": depot_id,
+        "currency": currency,
+        "from": from_str,
+        "to": to_str,
+    }
+    return metadata, rows, currency
+
+
+@app.get(
+    "/reports/depots/{depot_id}/energy/monthly",
+    response_model=EnergyReportResponse,
+    tags=["depots"],
+    summary="Energy report aggregated by month",
+    description=(
+        "Aggregate ``charging_sessions.energy_delivered_kwh`` into monthly "
+        "buckets in the depot's local timezone. Optional ``group_by`` "
+        "splits each bucket by vehicle, charger, driver, or card. NULL "
+        "identity columns collapse into an 'unassigned' bucket."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Cross-organization access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_energy_report_monthly(
+    depot_id: str,
+    from_: str = Query(..., alias="from", description="Start date (YYYY-MM-DD, inclusive, depot TZ)"),
+    to: str = Query(..., description="End date (YYYY-MM-DD, inclusive, depot TZ)"),
+    group_by: Optional[str] = Query(
+        None,
+        description="Optional grouping dimension: vehicle | charger | driver | card",
+    ),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Monthly energy + cost rollup for a depot."""
+    validate_depot_id(depot_id)
+    await _verify_depot_access_for_report(depot_id, user)
+    grouping = _validate_report_group_by(group_by)
+
+    try:
+        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+    except DepotNotFoundError:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error generating energy report: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+    return {**metadata, "rows": rows}
+
+
+@app.get(
+    "/reports/depots/{depot_id}/energy/sessions",
+    response_model=EnergyReportResponse,
+    tags=["depots"],
+    summary="Energy report broken out per session-derived row",
+    description=(
+        "Same shape as ``/energy/monthly`` but always grouped by session "
+        "identity dimensions (vehicle/charger/driver/card). The default "
+        "grouping is ``vehicle`` so a sessions roll-up still answers "
+        "'who/what charged when'. Supports the same ``group_by`` enum as "
+        "the monthly endpoint."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Cross-organization access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_energy_report_sessions(
+    depot_id: str,
+    from_: str = Query(..., alias="from"),
+    to: str = Query(...),
+    group_by: Optional[str] = Query(
+        "vehicle",
+        description="Grouping dimension: vehicle | charger | driver | card",
+    ),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Sessions-grained energy + cost rollup."""
+    validate_depot_id(depot_id)
+    await _verify_depot_access_for_report(depot_id, user)
+    grouping = _validate_report_group_by(group_by)
+    if grouping is None:
+        grouping = "vehicle"
+
+    try:
+        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+    except DepotNotFoundError:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error generating sessions report: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+    return {**metadata, "rows": rows}
+
+
+@app.get(
+    "/reports/depots/{depot_id}/energy/monthly.csv",
+    tags=["depots"],
+    summary="Energy report (CSV stream)",
+    description=(
+        "CSV equivalent of ``/reports/depots/{depot_id}/energy/monthly``. "
+        "Body is streamed via ``StreamingResponse``; rows match the JSON "
+        "endpoint one-for-one."
+    ),
+    responses={
+        200: {"content": {"text/csv": {}}, "description": "CSV report stream"},
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Cross-organization access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_energy_report_monthly_csv(
+    depot_id: str,
+    from_: str = Query(..., alias="from"),
+    to: str = Query(...),
+    group_by: Optional[str] = Query(None),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Stream the monthly energy report as CSV."""
+    validate_depot_id(depot_id)
+    await _verify_depot_access_for_report(depot_id, user)
+    grouping = _validate_report_group_by(group_by)
+
+    try:
+        _, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+    except DepotNotFoundError:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error generating energy CSV: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+    filename = f"depot_{depot_id}_energy_{from_}_{to}.csv"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+
+    # Bind to a local so the generator captures a stable reference.
+    rows_for_stream = rows
+
+    def _generate() -> Iterator[str]:
+        yield from stream_rows_as_csv(rows_for_stream, group_by=grouping)
+
+    return StreamingResponse(_generate(), media_type="text/csv", headers=headers)
 
 
 @app.get(
