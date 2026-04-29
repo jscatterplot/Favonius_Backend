@@ -3263,8 +3263,10 @@ def _coerce_under_cap_rate(billing_metadata: Optional[dict]) -> Optional[float]:
         return None
 
 
-async def _load_report_context(depot_id: str) -> tuple[str, str, Optional[float], list[str]]:
-    """Fetch the depot timezone, currency, tariff rate, and ocpp_id list."""
+async def _load_report_context(
+    depot_id: str,
+) -> tuple[str, str, Optional[float], list[str], dict[str, str]]:
+    """Fetch depot reporting context and charger mappings from static DB."""
     if not db_pools:
         raise DatabaseError("Database not available")
 
@@ -3296,13 +3298,15 @@ async def _load_report_context(depot_id: str) -> tuple[str, str, Optional[float]
     under_cap_rate = _coerce_under_cap_rate(billing_metadata)
 
     ocpp_ids = [r["ocpp_id"] for r in charger_rows]
-    return timezone_name, currency, under_cap_rate, ocpp_ids
+    charger_id_by_ocpp_id = {r["ocpp_id"]: r["charger_id"] for r in charger_rows}
+    return timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id
 
 
 async def _fetch_session_rows(
     depot_id: str,
     timezone_name: str,
     ocpp_ids: list[str],
+    charger_id_by_ocpp_id: dict[str, str],
     from_date: date,
     to_date: date,
 ) -> list[SessionRow]:
@@ -3319,11 +3323,10 @@ async def _fetch_session_rows(
             cs.energy_delivered_kwh,
             cs.cost_total,
             cs.vehicle_id,
-            c.charger_id::text AS charger_id,
+            cs.station_id AS charger_id,
             cs.driver_id::text AS driver_id,
             cs.card_id::text AS card_id
         FROM charging_sessions cs
-        LEFT JOIN chargers c ON c.ocpp_id = cs.station_id
         WHERE cs.station_id = ANY($1::text[])
           AND cs.start_time >= ($2::date)::timestamp AT TIME ZONE $4
           AND cs.start_time < (($3::date) + INTERVAL '1 day')::timestamp AT TIME ZONE $4
@@ -3344,7 +3347,7 @@ async def _fetch_session_rows(
                 energy_kwh=float(energy) if energy is not None else None,
                 cost_total=float(cost) if cost is not None else None,
                 vehicle_id=r["vehicle_id"] or None,
-                charger_id=r["charger_id"],
+                charger_id=charger_id_by_ocpp_id.get(r["charger_id"]),
                 driver_id=r["driver_id"],
                 card_id=r["card_id"],
             )
@@ -3367,9 +3370,11 @@ async def _build_energy_report(
             detail="'to' must be on or after 'from'",
         )
 
-    timezone_name, currency, under_cap_rate, ocpp_ids = await _load_report_context(depot_id)
+    timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
+        await _load_report_context(depot_id)
+    )
     sessions = await _fetch_session_rows(
-        depot_id, timezone_name, ocpp_ids, from_date, to_date
+        depot_id, timezone_name, ocpp_ids, charger_id_by_ocpp_id, from_date, to_date
     )
     rows = aggregate_energy_rows(
         sessions,
