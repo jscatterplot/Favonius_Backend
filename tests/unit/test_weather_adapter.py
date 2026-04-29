@@ -320,11 +320,12 @@ async def test_get_forecasts_for_depot_with_cache(weather_adapter, sample_weathe
     instead of hitting the external API."""
     depot_id = uuid4()
 
-    bundle_fetched_at = datetime(2025, 12, 4, 8, 0, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    bundle_fetched_at = now - timedelta(hours=1)
     bundle_rows = [
         {
             "forecast_id": uuid4(),
-            "forecast_for": w.timestamp,
+            "forecast_for": now + timedelta(days=day),
             "fetched_at": bundle_fetched_at,
             "temp_f": w.temperature_f,
             "temp_max_f": w.temperature_max_f,
@@ -332,7 +333,7 @@ async def test_get_forecasts_for_depot_with_cache(weather_adapter, sample_weathe
             "precip_in": w.precipitation_inches,
             "solar_rad": convert_solar_radiation_wm2_to_calcm2(w.solar_radiation),
         }
-        for w in sample_weather_data[:5]
+        for day, w in enumerate(sample_weather_data[:5])
     ]
     # First fetchrow returns the depot location (used by the adapter).
     # Once latitude/longitude are populated on the adapter the location
@@ -856,11 +857,12 @@ async def test_full_forecast_workflow(weather_adapter, mock_pool, mock_flatbuffe
     mock_pool._mock_conn.execute.reset_mock()
     weather_adapter._client.weather_api.reset_mock()
 
-    bundle_fetched_at = datetime(2025, 12, 4, 8, 0, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    bundle_fetched_at = now - timedelta(hours=1)
     bundle_rows = [
         {
             "forecast_id": uuid4(),
-            "forecast_for": f.timestamp,
+            "forecast_for": now + timedelta(days=day),
             "fetched_at": bundle_fetched_at,
             "temp_f": f.temperature_f,
             "temp_max_f": f.temperature_max_f,
@@ -868,7 +870,7 @@ async def test_full_forecast_workflow(weather_adapter, mock_pool, mock_flatbuffe
             "precip_in": f.precipitation_inches,
             "solar_rad": convert_solar_radiation_wm2_to_calcm2(f.solar_radiation),
         }
-        for f in forecasts
+        for day, f in enumerate(forecasts)
     ]
     mock_pool._mock_conn.fetchrow = AsyncMock(
         return_value={"max_fetched_at": bundle_fetched_at}
