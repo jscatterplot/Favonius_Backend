@@ -488,7 +488,9 @@ def build_optimization_model(
         model.kwh_over = pyo.Var(domain=pyo.NonNegativeReals)
 
         def total_kwh_rule(m):
-            horizon_kwh = sum(m.P_grid[t] * config.delta_t for t in m.T)
+            horizon_kwh = sum(
+                m.P_charge[b, t] * config.delta_t for b in m.B for t in m.T
+            )
             return m.total_kwh_period == state.cumulative_kwh_period + horizon_kwh
 
         model.total_kwh_def = pyo.Constraint(rule=total_kwh_rule)
