@@ -96,6 +96,9 @@ def mock_db_pool():
     """
     pool = MagicMock()
     conn = AsyncMock()
+    conn.transaction = MagicMock()
+    conn.transaction.return_value.__aenter__.return_value = None
+    conn.transaction.return_value.__aexit__.return_value = None
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
     pool.ts = pool

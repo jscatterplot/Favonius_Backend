@@ -48,13 +48,13 @@ from ..core.state.assembler import StateAssembler
 from ..db import queries as db_queries
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
-from ..security.audit_log import AuditEvent, AuditLogger, audit_log_event, get_audit_logger, set_audit_logger
+from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import get_user_role, verify_depot_access
 from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
-from ..security.rbac import Permission, has_permission, require_favonius_admin, require_permission
+from ..security.rbac import Permission, has_permission, require_favonius_admin
 from ..security.validators import (
     validate_depot_id,
     validate_horizon_hours,
@@ -580,7 +580,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if _cors_is_wildcard else cors_origins,
     allow_credentials=not _cors_is_wildcard,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
 )
@@ -719,6 +719,123 @@ class ScheduleResponse(BaseModel):
         ..., description="Optimization horizon end (ISO 8601)", examples=["2025-12-05T09:00:00Z"]
     )
     schedule: dict = Field(..., description="Charging schedule per vehicle")
+
+
+class ManualScheduleEntry(BaseModel):
+    """Manually-entered route schedule for one vehicle."""
+
+    vehicle_id: str = Field(..., description="Vehicle UUID")
+    route_id: str = Field(..., min_length=1, max_length=100)
+    departure_time: datetime = Field(..., description="Timezone-aware ISO 8601 departure time")
+    return_time: datetime = Field(..., description="Timezone-aware ISO 8601 return time")
+    required_soc: float = Field(default=1.0, ge=0.99, le=1.0)
+    energy_kwh: Optional[float] = Field(default=None, gt=0)
+
+    @field_validator("vehicle_id")
+    @classmethod
+    def validate_vehicle_uuid(cls, value: str) -> str:
+        """Validate vehicle_id is a valid UUID."""
+        try:
+            UUID(value)
+            return value
+        except ValueError:
+            raise ValueError(f"vehicle_id must be a valid UUID, got: {value}")
+
+    @field_validator("departure_time", "return_time")
+    @classmethod
+    def validate_timezone_aware(cls, value: datetime) -> datetime:
+        """Require timezone-aware datetimes so depot schedules are unambiguous."""
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("datetime must include timezone information")
+        return value
+
+    @field_validator("return_time")
+    @classmethod
+    def validate_return_after_departure(cls, value: datetime, info) -> datetime:
+        """Require return_time to be after departure_time."""
+        departure_time = info.data.get("departure_time")
+        if departure_time is not None and value <= departure_time:
+            raise ValueError("return_time must be after departure_time")
+        return value
+
+
+class ManualScheduleCreateRequest(BaseModel):
+    """Batch request for manually-entered schedules."""
+
+    entries: list[ManualScheduleEntry] = Field(..., min_length=1, max_length=500)
+
+
+class ManualSchedulePatchRequest(BaseModel):
+    """Partial manual schedule update."""
+
+    vehicle_id: Optional[str] = Field(default=None, description="Vehicle UUID")
+    route_id: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    departure_time: Optional[datetime] = Field(default=None)
+    return_time: Optional[datetime] = Field(default=None)
+    required_soc: Optional[float] = Field(default=None, ge=0.99, le=1.0)
+    energy_kwh: Optional[float] = Field(default=None)
+
+    @field_validator("vehicle_id")
+    @classmethod
+    def validate_vehicle_uuid(cls, value: Optional[str]) -> Optional[str]:
+        """Validate vehicle_id is a valid UUID when supplied."""
+        if value is None:
+            return value
+        try:
+            UUID(value)
+            return value
+        except ValueError:
+            raise ValueError(f"vehicle_id must be a valid UUID, got: {value}")
+
+    @field_validator("departure_time", "return_time")
+    @classmethod
+    def validate_timezone_aware(cls, value: Optional[datetime]) -> Optional[datetime]:
+        """Require timezone-aware datetimes when supplied."""
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("datetime must include timezone information")
+        return value
+
+    @field_validator("energy_kwh")
+    @classmethod
+    def validate_energy_kwh(cls, value: Optional[float]) -> Optional[float]:
+        """Allow clearing energy_kwh with null, but reject non-positive values."""
+        if value is not None and value <= 0:
+            raise ValueError("energy_kwh must be greater than 0")
+        return value
+
+
+class ManualScheduleItem(BaseModel):
+    """Manual schedule row returned to admin clients."""
+
+    schedule_id: str
+    vehicle_id: str
+    route_id: str
+    departure_time: datetime
+    return_time: datetime
+    required_soc: float
+    energy_kwh: Optional[float] = None
+
+
+class ScheduleReadinessResponse(BaseModel):
+    """Readiness checks for schedule setup and optimization prerequisites."""
+
+    depot_id: str
+    ready: bool
+    checks: list["ReadinessChecklistItem"]
+
+
+class ManualScheduleCreateResponse(BaseModel):
+    """Response from manual schedule creation."""
+
+    created: list[ManualScheduleItem]
+    readiness: ScheduleReadinessResponse
+
+
+class ManualScheduleUpdateResponse(BaseModel):
+    """Response from manual schedule update."""
+
+    updated: ManualScheduleItem
+    readiness: ScheduleReadinessResponse
 
 
 class HandoffRequest(BaseModel):
@@ -1423,6 +1540,28 @@ def _format_charger_onboarding_response(charger: dict, password: str) -> dict:
     }
 
 
+def _format_manual_schedule_row(row: dict) -> dict:
+    """Normalize a schedule DB row for API responses."""
+    return {
+        "schedule_id": str(row["schedule_id"]),
+        "vehicle_id": str(row["vehicle_id"]),
+        "route_id": row["route_id"],
+        "departure_time": row["departure_time"],
+        "return_time": row["return_time"],
+        "required_soc": row["required_soc"],
+        "energy_kwh": row["energy_kwh"],
+    }
+
+
+def _readiness_response_payload(depot_id: str, checks: list[dict]) -> dict:
+    """Build readiness response including aggregate readiness."""
+    return {
+        "depot_id": depot_id,
+        "ready": all(check["status"] == "ready" for check in checks),
+        "checks": checks,
+    }
+
+
 def _require_customer_admin_with_org(user: dict) -> str:
     """Ensure caller is customer_admin and carries an organization_id claim."""
     role = get_user_role(user)
@@ -1471,8 +1610,23 @@ async def _audit_identity_write(user: dict, depot_id: str, action: str, resource
 
 async def _build_readiness_checklist(depot_id: str, payload: DepotSetupPayload) -> list[dict]:
     """Build exact setup readiness checklist for optimization prerequisites."""
+    return await _build_depot_readiness_checklist(
+        depot_id,
+        battery_present=payload.stationary_battery.present,
+    )
+
+
+async def _build_depot_readiness_checklist(
+    depot_id: str,
+    *,
+    battery_present: Optional[bool] = None,
+) -> list[dict]:
+    """Build persisted depot readiness checklist for setup and schedule screens."""
     if not db_pools:
         return []
+
+    if battery_present is None:
+        battery_present = False
 
     async with db_pools.static.acquire() as conn:
         has_vehicles = bool(
@@ -1618,7 +1772,7 @@ async def _build_readiness_checklist(depot_id: str, payload: DepotSetupPayload) 
             else "Missing building load data",
         }
     )
-    battery_status = "ready" if (not payload.stationary_battery.present or has_battery) else "blocked"
+    battery_status = "ready" if (not battery_present or has_battery) else "blocked"
     checklist.append(
         {
             "id": "battery",
@@ -2219,6 +2373,167 @@ async def create_charger_onboarding(
     except asyncpg.PostgresError as exc:
         logger.error("Database error onboarding charger: %s", exc, exc_info=True)
         raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+
+@app.get(
+    "/admin/depots/{depot_id}/schedule/readiness",
+    response_model=ScheduleReadinessResponse,
+    tags=["admin"],
+    summary="Get schedule setup readiness",
+)
+async def get_schedule_readiness(
+    depot_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return persisted readiness checks for manual schedule setup."""
+    _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return _readiness_response_payload(depot_id, checks)
+
+
+@app.post(
+    "/admin/depots/{depot_id}/schedule/manual",
+    response_model=ManualScheduleCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Create manually-entered vehicle schedules",
+)
+async def create_manual_schedules(
+    depot_id: str,
+    request: ManualScheduleCreateRequest,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create tenant-scoped manual schedules for vehicles in a depot."""
+    _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    depot_uuid = UUID(depot_id)
+    vehicle_ids = [UUID(entry.vehicle_id) for entry in request.entries]
+    async with db_pools.static.acquire() as conn:
+        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(conn, depot_uuid, vehicle_ids)
+        invalid_vehicle_ids = sorted(
+            {str(vehicle_id) for vehicle_id in vehicle_ids} - valid_vehicle_ids
+        )
+        if invalid_vehicle_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error_code": "VEHICLE_DEPOT_MISMATCH",
+                    "vehicle_ids": invalid_vehicle_ids,
+                },
+            )
+
+        created = []
+        async with conn.transaction():
+            for entry in request.entries:
+                row = await db_queries.create_manual_schedule(
+                    conn,
+                    vehicle_id=UUID(entry.vehicle_id),
+                    route_id=entry.route_id,
+                    departure_time=entry.departure_time,
+                    return_time=entry.return_time,
+                    required_soc=float(entry.required_soc),
+                    energy_kwh=entry.energy_kwh,
+                )
+                created.append(_format_manual_schedule_row(row))
+
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "created": created,
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
+
+
+@app.patch(
+    "/admin/depots/{depot_id}/schedule/manual/{schedule_id}",
+    response_model=ManualScheduleUpdateResponse,
+    tags=["admin"],
+    summary="Update a manually-entered vehicle schedule",
+)
+async def patch_manual_schedule(
+    depot_id: str,
+    schedule_id: str,
+    request: ManualSchedulePatchRequest,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Partially update a tenant-scoped manual schedule."""
+    _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    validate_uuid(schedule_id, "schedule_id")
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    depot_uuid = UUID(depot_id)
+    schedule_uuid = UUID(schedule_id)
+    patch_data = request.model_dump(exclude_unset=True)
+    if not patch_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one schedule field is required",
+        )
+    non_nullable_patch_fields = {"vehicle_id", "route_id", "departure_time", "return_time", "required_soc"}
+    null_fields = sorted(
+        field_name
+        for field_name, field_value in patch_data.items()
+        if field_name in non_nullable_patch_fields and field_value is None
+    )
+    if null_fields:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{', '.join(null_fields)} cannot be null",
+        )
+
+    async with db_pools.static.acquire() as conn:
+        existing = await db_queries.get_schedule_for_depot(
+            conn,
+            depot_id=depot_uuid,
+            schedule_id=schedule_uuid,
+        )
+        if not existing:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+        merged = {**existing, **patch_data}
+        if merged["return_time"] <= merged["departure_time"]:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="return_time must be after departure_time",
+            )
+
+        vehicle_uuid = UUID(str(merged["vehicle_id"]))
+        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(conn, depot_uuid, [vehicle_uuid])
+        if str(vehicle_uuid) not in valid_vehicle_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error_code": "VEHICLE_DEPOT_MISMATCH",
+                    "vehicle_ids": [str(vehicle_uuid)],
+                },
+            )
+
+        updated = await db_queries.update_manual_schedule(
+            conn,
+            depot_id=depot_uuid,
+            schedule_id=schedule_uuid,
+            vehicle_id=vehicle_uuid,
+            route_id=merged["route_id"],
+            departure_time=merged["departure_time"],
+            return_time=merged["return_time"],
+            required_soc=float(merged["required_soc"]),
+            energy_kwh=merged.get("energy_kwh"),
+        )
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "updated": _format_manual_schedule_row(updated),
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
 
 
 @app.post(

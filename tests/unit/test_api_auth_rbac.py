@@ -18,7 +18,7 @@ import asyncpg
 import pytest
 from fastapi import HTTPException, status as http_status
 
-from src.api.main import CommandRequest, _require_depot_access, app
+from src.api.main import _require_depot_access, app
 from src.db import queries as db_queries
 from src.security.audit_log import AuditEvent
 from src.security.auth import verify_depot_access, verify_token
@@ -130,6 +130,24 @@ def _charger_payload() -> dict:
         "connectorIds": [1, 2],
         "networkNotes": "Static IP reserved",
     }
+
+
+def _manual_schedule_payload(
+    *,
+    vehicle_id: str = VEHICLE_ID,
+    required_soc: float | None = None,
+) -> dict:
+    """Valid manual schedule payload."""
+    entry = {
+        "vehicle_id": vehicle_id,
+        "route_id": "route-12",
+        "departure_time": "2026-04-29T08:00:00+00:00",
+        "return_time": "2026-04-29T17:00:00+00:00",
+        "energy_kwh": 120.5,
+    }
+    if required_soc is not None:
+        entry["required_soc"] = required_soc
+    return {"entries": [entry]}
 
 
 # ── Cleanup fixture ──────────────────────────────────────────────────────────
@@ -778,6 +796,236 @@ class TestChargerOnboarding:
         serialized = response.text.lower()
         assert "password" not in serialized
         assert "credential" not in serialized
+
+
+class TestManualScheduleAdmin:
+    """Admin manual schedule setup endpoints."""
+
+    def test_creates_manual_schedule_and_defaults_required_soc(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        schedule_id = str(uuid4())
+        created_row = {
+            "schedule_id": schedule_id,
+            "vehicle_id": VEHICLE_ID,
+            "route_id": "route-12",
+            "departure_time": datetime.fromisoformat("2026-04-29T08:00:00+00:00"),
+            "return_time": datetime.fromisoformat("2026-04-29T17:00:00+00:00"),
+            "required_soc": 1.0,
+            "energy_kwh": 120.5,
+        }
+        conn.transaction = MagicMock()
+        conn.transaction.return_value.__aenter__.return_value = None
+        conn.transaction.return_value.__aexit__.return_value = None
+
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.get_vehicle_ids_for_depot",
+            new_callable=AsyncMock,
+            return_value={VEHICLE_ID},
+        ), patch(
+            "src.api.main.db_queries.create_manual_schedule",
+            new_callable=AsyncMock,
+            return_value=created_row,
+        ) as create_mock, patch(
+            "src.api.main._build_depot_readiness_checklist",
+            new_callable=AsyncMock,
+            return_value=[
+                {
+                    "id": "schedules",
+                    "label": "Schedules available",
+                    "status": "ready",
+                    "detail": "Upcoming schedules found",
+                }
+            ],
+        ):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/schedule/manual",
+                headers=AUTH_HDR,
+                json=_manual_schedule_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        data = response.json()
+        assert data["created"][0]["schedule_id"] == schedule_id
+        assert data["created"][0]["required_soc"] == 1.0
+        assert data["readiness"]["ready"] is True
+        assert create_mock.await_args.kwargs["required_soc"] == 1.0
+
+    def test_invalid_vehicle_depot_mismatch_rejected(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        other_vehicle_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.get_vehicle_ids_for_depot",
+            new_callable=AsyncMock,
+            return_value=set(),
+        ), patch(
+            "src.api.main.db_queries.create_manual_schedule",
+            new_callable=AsyncMock,
+        ) as create_mock:
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/schedule/manual",
+                headers=AUTH_HDR,
+                json=_manual_schedule_payload(vehicle_id=other_vehicle_id),
+            )
+
+        assert response.status_code == http_status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert response.json()["detail"]["error_code"] == "VEHICLE_DEPOT_MISMATCH"
+        create_mock.assert_not_awaited()
+
+    def test_cross_org_schedule_creation_denied(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=403, detail="Access denied"),
+        ):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/schedule/manual",
+                headers=AUTH_HDR,
+                json=_manual_schedule_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+    def test_readiness_integration_reports_schedule_gap_then_ready(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+        conn.fetchval = AsyncMock(
+            side_effect=[
+                True,
+                True,
+                True,
+                False,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+            ]
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            blocked = client.get(
+                f"/admin/depots/{DEPOT_ID}/schedule/readiness",
+                headers=AUTH_HDR,
+            )
+            ready = client.get(
+                f"/admin/depots/{DEPOT_ID}/schedule/readiness",
+                headers=AUTH_HDR,
+            )
+
+        assert blocked.status_code == http_status.HTTP_200_OK
+        blocked_checks = {item["id"]: item for item in blocked.json()["checks"]}
+        assert blocked_checks["schedules"]["status"] == "blocked"
+        assert ready.status_code == http_status.HTTP_200_OK
+        ready_checks = {item["id"]: item for item in ready.json()["checks"]}
+        assert ready_checks["schedules"]["status"] == "ready"
+
+    def test_patch_manual_schedule_updates_scoped_row(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        schedule_id = str(uuid4())
+        existing = {
+            "schedule_id": schedule_id,
+            "vehicle_id": VEHICLE_ID,
+            "route_id": "route-12",
+            "departure_time": datetime.fromisoformat("2026-04-29T08:00:00+00:00"),
+            "return_time": datetime.fromisoformat("2026-04-29T17:00:00+00:00"),
+            "required_soc": 1.0,
+            "energy_kwh": 120.5,
+        }
+        updated = {
+            **existing,
+            "required_soc": 0.99,
+            "energy_kwh": 110.0,
+        }
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.get_schedule_for_depot",
+            new_callable=AsyncMock,
+            return_value=existing,
+        ), patch(
+            "src.api.main.db_queries.get_vehicle_ids_for_depot",
+            new_callable=AsyncMock,
+            return_value={VEHICLE_ID},
+        ), patch(
+            "src.api.main.db_queries.update_manual_schedule",
+            new_callable=AsyncMock,
+            return_value=updated,
+        ) as update_mock, patch(
+            "src.api.main._build_depot_readiness_checklist",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = client.patch(
+                f"/admin/depots/{DEPOT_ID}/schedule/manual/{schedule_id}",
+                headers=AUTH_HDR,
+                json={"required_soc": 0.99, "energy_kwh": 110.0},
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK
+        payload = response.json()
+        assert payload["updated"]["required_soc"] == 0.99
+        assert payload["readiness"]["depot_id"] == DEPOT_ID
+        assert update_mock.await_args.kwargs["required_soc"] == 0.99
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["vehicle_id", "route_id", "departure_time", "return_time", "required_soc"],
+    )
+    def test_patch_manual_schedule_rejects_null_non_nullable_fields(
+        self,
+        client,
+        mock_db_pool,
+        field_name: str,
+    ):
+        pool, _ = mock_db_pool
+        schedule_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.patch(
+                f"/admin/depots/{DEPOT_ID}/schedule/manual/{schedule_id}",
+                headers=AUTH_HDR,
+                json={field_name: None},
+            )
+
+        assert response.status_code == http_status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert "cannot be null" in response.json()["detail"]
+
 
 class TestAdminControllersRbac:
     """GET /admin/controllers is restricted to favonius_admin."""
