@@ -1756,6 +1756,12 @@ async def create_depot_setup(
     billing_metadata: dict[str, Any],
     building_load_source: dict[str, Any],
     building_load_assumption_kw: float = 0.0,
+    charger_vehicle_access_default: str = "explicit_matrix",
+    tariff_type: str = "simple_demand",
+    energy_cap_kwh: Optional[float] = None,
+    under_cap_rate_per_kwh: Optional[float] = None,
+    over_cap_penalty_per_kwh: Optional[float] = None,
+    cap_billing_period: str = "monthly",
 ) -> dict:
     """Create a depot row scoped to organization and return metadata."""
     query = """
@@ -1773,10 +1779,18 @@ async def create_depot_setup(
             address,
             billing_metadata,
             building_load_source,
-            building_load_assumption_kw
+            building_load_assumption_kw,
+            charger_vehicle_access_default,
+            tariff_type,
+            energy_cap_kwh,
+            under_cap_rate_per_kwh,
+            over_cap_penalty_per_kwh,
+            cap_billing_period
         )
         VALUES (
-            $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14
+            $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11::jsonb, $12::jsonb, $13::jsonb, $14,
+            $15, $16, $17, $18, $19, $20
         )
         RETURNING depot_id::text AS depot_id,
                   organization_id::text AS organization_id,
@@ -1792,7 +1806,13 @@ async def create_depot_setup(
                   address,
                   billing_metadata,
                   building_load_source,
-                  building_load_assumption_kw
+                  building_load_assumption_kw,
+                  charger_vehicle_access_default,
+                  tariff_type,
+                  energy_cap_kwh,
+                  under_cap_rate_per_kwh,
+                  over_cap_penalty_per_kwh,
+                  cap_billing_period
     """
     row = await db.fetchrow(
         query,
@@ -1810,6 +1830,12 @@ async def create_depot_setup(
         json.dumps(billing_metadata),
         json.dumps(building_load_source),
         building_load_assumption_kw,
+        charger_vehicle_access_default,
+        tariff_type,
+        energy_cap_kwh,
+        under_cap_rate_per_kwh,
+        over_cap_penalty_per_kwh,
+        cap_billing_period,
     )
     result = dict(row)
     result["address"] = _coerce_jsonb_dict(result.get("address"))
@@ -1835,6 +1861,12 @@ async def update_depot_setup(
     billing_metadata: dict[str, Any],
     building_load_source: dict[str, Any],
     building_load_assumption_kw: float = 0.0,
+    charger_vehicle_access_default: str = "explicit_matrix",
+    tariff_type: str = "simple_demand",
+    energy_cap_kwh: Optional[float] = None,
+    under_cap_rate_per_kwh: Optional[float] = None,
+    over_cap_penalty_per_kwh: Optional[float] = None,
+    cap_billing_period: str = "monthly",
 ) -> Optional[dict]:
     """Update depot setup metadata and return updated row."""
     query = """
@@ -1852,6 +1884,12 @@ async def update_depot_setup(
             billing_metadata = $12::jsonb,
             building_load_source = $13::jsonb,
             building_load_assumption_kw = $14,
+            charger_vehicle_access_default = $15,
+            tariff_type = $16,
+            energy_cap_kwh = $17,
+            under_cap_rate_per_kwh = $18,
+            over_cap_penalty_per_kwh = $19,
+            cap_billing_period = $20,
             updated_at = NOW()
         WHERE depot_id = $1::uuid
         RETURNING depot_id::text AS depot_id,
@@ -1868,7 +1906,13 @@ async def update_depot_setup(
                   address,
                   billing_metadata,
                   building_load_source,
-                  building_load_assumption_kw
+                  building_load_assumption_kw,
+                  charger_vehicle_access_default,
+                  tariff_type,
+                  energy_cap_kwh,
+                  under_cap_rate_per_kwh,
+                  over_cap_penalty_per_kwh,
+                  cap_billing_period
     """
     row = await db.fetchrow(
         query,
@@ -1886,6 +1930,12 @@ async def update_depot_setup(
         json.dumps(billing_metadata),
         json.dumps(building_load_source),
         building_load_assumption_kw,
+        charger_vehicle_access_default,
+        tariff_type,
+        energy_cap_kwh,
+        under_cap_rate_per_kwh,
+        over_cap_penalty_per_kwh,
+        cap_billing_period,
     )
     if not row:
         return None
@@ -1894,6 +1944,65 @@ async def update_depot_setup(
     result["billing_metadata"] = _coerce_jsonb_dict(result.get("billing_metadata"))
     result["building_load_source"] = _coerce_jsonb_dict(result.get("building_load_source"))
     return result
+
+
+async def upsert_charger_vehicle_access(
+    db,
+    *,
+    depot_id: str,
+    entries: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Per-row upsert into ``charger_vehicle_access`` for a depot.
+
+    Each entry must have ``charger_id``, ``vehicle_id``, ``is_accessible``.
+    Validates that every charger and vehicle belongs to ``depot_id``;
+    returns ``{"invalid_chargers": [...], "invalid_vehicles": [...]}`` for
+    any IDs that don't, and writes nothing in that case so the caller can
+    return a 400 without partial state.
+    """
+    charger_ids = {entry["charger_id"] for entry in entries}
+    vehicle_ids = {entry["vehicle_id"] for entry in entries}
+
+    valid_chargers = {
+        row["charger_id"]
+        for row in await db.fetch(
+            "SELECT charger_id::text AS charger_id FROM chargers "
+            "WHERE depot_id = $1::uuid AND charger_id = ANY($2::uuid[])",
+            depot_id,
+            list(charger_ids),
+        )
+    }
+    valid_vehicles = {
+        row["vehicle_id"]
+        for row in await db.fetch(
+            "SELECT vehicle_id::text AS vehicle_id FROM vehicles "
+            "WHERE depot_id = $1::uuid AND vehicle_id = ANY($2::uuid[])",
+            depot_id,
+            list(vehicle_ids),
+        )
+    }
+    invalid_chargers = sorted(charger_ids - valid_chargers)
+    invalid_vehicles = sorted(vehicle_ids - valid_vehicles)
+    if invalid_chargers or invalid_vehicles:
+        return {
+            "invalid_chargers": invalid_chargers,
+            "invalid_vehicles": invalid_vehicles,
+        }
+
+    upsert_query = """
+        INSERT INTO charger_vehicle_access (charger_id, vehicle_id, is_accessible)
+        VALUES ($1::uuid, $2::uuid, $3)
+        ON CONFLICT (charger_id, vehicle_id) DO UPDATE
+        SET is_accessible = EXCLUDED.is_accessible
+    """
+    for entry in entries:
+        await db.execute(
+            upsert_query,
+            entry["charger_id"],
+            entry["vehicle_id"],
+            bool(entry["is_accessible"]),
+        )
+    return {"invalid_chargers": [], "invalid_vehicles": []}
 
 
 async def upsert_battery_storage(

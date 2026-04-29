@@ -124,6 +124,21 @@ class DepotConfig:
     building_load_assumption_kw: float = 0.0
     delta_t: float = 0.25  # hours (15 min)
     n_timesteps: int = 96  # 24 hours
+    # Charger-vehicle access mode (migration 021).
+    #   'all_to_all'      => every charger reaches every vehicle, charger_vehicle_access
+    #                        is synthesized in StateAssembler and the readiness
+    #                        check skips the matrix prerequisite.
+    #   'explicit_matrix' => use rows from the charger_vehicle_access table.
+    charger_vehicle_access_default: str = "explicit_matrix"
+    # Tariff configuration (migration 021). When tariff_type='energy_cap',
+    # the MILP objective replaces demand_charge_rate × P_peak with a
+    # piecewise-linear under_cap × kwh_under + over_cap_penalty × kwh_over
+    # term. See src/core/optimizer/milp_model.py.
+    tariff_type: str = "simple_demand"
+    energy_cap_kwh: Optional[float] = None
+    under_cap_rate_per_kwh: Optional[float] = None
+    over_cap_penalty_per_kwh: Optional[float] = None
+    cap_billing_period: str = "monthly"
 
     # Property aliases for backwards compatibility
     @property
@@ -183,6 +198,10 @@ class DepotState:
     )  # vehicle_id -> priority (higher = more important)
     # Preconditioning: list of {vehicle_id, start_time, end_time, power_kw} (manual or automatic)
     preconditioning_requests: list[dict] = field(default_factory=list)
+    # Cumulative kWh consumed in the current billing period (used by the
+    # energy_cap tariff to figure out remaining headroom). Default 0 keeps
+    # every existing fixture and simple_demand caller working unchanged.
+    cumulative_kwh_period: float = 0.0
 
 
 @dataclass
@@ -239,7 +258,11 @@ class OptimizationInputSnapshot:
     depot: dict[str, object]
     vehicles: list[dict[str, object]]
     chargers: dict[str, object]
-    charger_vehicle_access: dict[str, list[str]]
+    # {"mode": "all_to_all"|"explicit_matrix",
+    #  "matrix": {charger_id: [vehicle_ids]}}.
+    # In all_to_all mode the matrix is empty in the snapshot — the mode is
+    # the source of truth and the assembler synthesizes the matrix per run.
+    charger_vehicle_access: dict[str, object]
     schedules: list[dict[str, object]]
     prices: list[float]
     telemetry: dict[str, float]

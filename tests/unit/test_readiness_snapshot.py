@@ -224,13 +224,59 @@ class TestMissingChargerAccess:
         assert readiness.status == "not_ready"
         assert "charger_vehicle_access" in readiness.missing_inputs
 
+    def test_all_to_all_mode_ready_with_empty_matrix(self):
+        """Migration 021: depots in all_to_all mode skip the matrix
+        prerequisite — readiness must NOT flag charger_vehicle_access as
+        missing even when the stored matrix is empty.
+        """
+        config = _full_config(with_access=False)
+        config.charger_vehicle_access_default = "all_to_all"
+        readiness = evaluate_readiness(
+            config,
+            _full_state(),
+            building_load_source=BUILDING_LOAD_METER,
+            schedules_present=True,
+        )
+        assert "charger_vehicle_access" not in readiness.missing_inputs
+        assert readiness.status == "ready"
+
+    def test_explicit_matrix_with_empty_matrix_is_not_ready(self):
+        """Inverse of the above: explicit_matrix mode with no rows still
+        blocks (default behaviour, regression guard for migration 021).
+        """
+        config = _full_config(with_access=False)
+        config.charger_vehicle_access_default = "explicit_matrix"
+        readiness = evaluate_readiness(
+            config,
+            _full_state(),
+            building_load_source=BUILDING_LOAD_METER,
+            schedules_present=True,
+        )
+        assert readiness.status == "not_ready"
+        assert "charger_vehicle_access" in readiness.missing_inputs
+
     def test_snapshot_records_access_matrix_when_present(self):
         snap = _build_full_snapshot()
         payload = snapshot_to_payload(snap)
         access = payload["charger_vehicle_access"]
-        # Sets serialised as sorted lists for deterministic replay.
-        assert access["charger_a"] == ["bus_1", "bus_2"]
-        assert access["charger_b"] == ["bus_1"]
+        # Snapshot envelope (migration 021): {"mode", "matrix"} so the
+        # mode flag is preserved through replay.
+        assert access["mode"] == "explicit_matrix"
+        assert access["matrix"]["charger_a"] == ["bus_1", "bus_2"]
+        assert access["matrix"]["charger_b"] == ["bus_1"]
+
+    def test_snapshot_records_all_to_all_mode_with_empty_matrix(self):
+        """In all_to_all mode the snapshot persists only the mode flag —
+        the matrix is synthesized at solve time so freezing the current
+        roster into the snapshot would be misleading on replay.
+        """
+        config = _full_config()
+        config.charger_vehicle_access_default = "all_to_all"
+        snap = _build_full_snapshot(config=config)
+        payload = snapshot_to_payload(snap)
+        access = payload["charger_vehicle_access"]
+        assert access["mode"] == "all_to_all"
+        assert access["matrix"] == {}
 
     def test_no_chargers_at_all_blocks(self):
         config = _full_config()

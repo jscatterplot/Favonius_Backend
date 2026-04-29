@@ -194,6 +194,14 @@ class StateAssembler:
         # Get demand charge rate
         demand_charge_rate = await self._get_demand_charge_rate()
 
+        # Cumulative kWh consumed in the current billing period — only
+        # meaningful for the energy_cap tariff. For simple_demand depots we
+        # skip the query entirely and leave the value at 0.
+        if self.config.tariff_type == "energy_cap":
+            cumulative_kwh_period = await self._get_cumulative_kwh_period(now)
+        else:
+            cumulative_kwh_period = 0.0
+
         # Get building power (REQUIRED per PRD Section 9.4)
         building_power = await self._get_building_power(now, horizon_end, n_steps)
 
@@ -251,6 +259,7 @@ class StateAssembler:
             vehicle_departure_soc_max=vehicle_departure_soc_max,
             vehicle_priorities=vehicle_priorities,
             preconditioning_requests=preconditioning_requests,
+            cumulative_kwh_period=cumulative_kwh_period,
         )
 
         assembly_time = time.time() - start_time
@@ -726,6 +735,65 @@ class StateAssembler:
         logger.warning(f"Depot {self.depot_id} not found or rate is NULL, using default $20/kW")
         return 20.0  # Default PG&E E-19 rate
 
+    async def _get_cumulative_kwh_period(self, now: datetime) -> float:
+        """Sum kWh delivered to this depot's chargers since the start of the
+        current cap_billing_period.
+
+        Used by the energy_cap tariff to compute remaining headroom against
+        :attr:`DepotConfig.energy_cap_kwh`. Returns 0.0 if no telemetry is
+        available — that gives a conservative "full headroom" view on day
+        one, which the optimizer will then bound by the cap.
+
+        Args:
+            now: current wall-clock time (UTC; horizon start)
+
+        Returns:
+            Cumulative kWh delivered in the current billing period.
+        """
+        # cap_billing_period semantics: 'monthly' resets on the first of
+        # each calendar month in UTC. We don't yet support week / quarterly
+        # cycles — treat anything else as monthly so this stays safe.
+        period = (self.config.cap_billing_period or "monthly").lower()
+        if period == "monthly":
+            period_start = now.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+        else:
+            logger.warning(
+                f"Unknown cap_billing_period '{period}' for depot {self.depot_id}, "
+                "treating as monthly"
+            )
+            period_start = now.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+
+        # telemetry stores instantaneous charging_kw per (vehicle, charger,
+        # timestamp). Multiplying by self.config.delta_t (hours) and
+        # summing approximates kWh delivered. Telemetry rows belong to a
+        # depot via the charger; we restrict to chargers in this depot.
+        query = """
+        SELECT COALESCE(SUM(t.charging_kw), 0.0) AS sum_kw
+        FROM telemetry t
+        WHERE t.charger_id IN (
+            SELECT charger_id FROM chargers WHERE depot_id = $1
+        )
+          AND t.time >= $2
+          AND t.time <= $3
+          AND t.charging_kw IS NOT NULL
+        """
+        try:
+            async with self.pools.ts.acquire() as conn:
+                row = await conn.fetchrow(query, self.depot_id, period_start, now)
+            sum_kw = float(row["sum_kw"]) if row and row["sum_kw"] is not None else 0.0
+        except Exception as exc:
+            logger.warning(
+                "Failed to compute cumulative kWh for depot %s: %s; defaulting to 0",
+                self.depot_id,
+                exc,
+            )
+            return 0.0
+        return sum_kw * float(self.config.delta_t)
+
     async def _get_building_power(
         self, start: datetime, end: datetime, n_steps: int
     ) -> list[float]:
@@ -1078,7 +1146,14 @@ class StateAssembler:
         depot_query = """
         SELECT max_grid_kw,
                demand_charge_rate_kw,
-               COALESCE(building_load_assumption_kw, 0.0) AS building_load_assumption_kw
+               COALESCE(building_load_assumption_kw, 0.0) AS building_load_assumption_kw,
+               COALESCE(charger_vehicle_access_default, 'explicit_matrix')
+                   AS charger_vehicle_access_default,
+               COALESCE(tariff_type, 'simple_demand') AS tariff_type,
+               energy_cap_kwh,
+               under_cap_rate_per_kwh,
+               over_cap_penalty_per_kwh,
+               COALESCE(cap_billing_period, 'monthly') AS cap_billing_period
         FROM depots
         WHERE depot_id = $1
         """
@@ -1090,6 +1165,24 @@ class StateAssembler:
 
         max_site_power = float(depot_row["max_grid_kw"])
         building_load_assumption_kw = float(depot_row["building_load_assumption_kw"])
+        access_default = str(depot_row["charger_vehicle_access_default"])
+        tariff_type = str(depot_row["tariff_type"])
+        energy_cap_kwh = (
+            float(depot_row["energy_cap_kwh"])
+            if depot_row["energy_cap_kwh"] is not None
+            else None
+        )
+        under_cap_rate = (
+            float(depot_row["under_cap_rate_per_kwh"])
+            if depot_row["under_cap_rate_per_kwh"] is not None
+            else None
+        )
+        over_cap_penalty = (
+            float(depot_row["over_cap_penalty_per_kwh"])
+            if depot_row["over_cap_penalty_per_kwh"] is not None
+            else None
+        )
+        cap_billing_period = str(depot_row["cap_billing_period"])
 
         # Query vehicles
         vehicles_query = """
@@ -1166,26 +1259,38 @@ class StateAssembler:
             battery_soc_min = 0.2
             battery_soc_max = 0.8
 
-        # Query charger-vehicle accessibility (per PRD Section 6.1)
-        access_query = """
-        SELECT charger_id::text, vehicle_id::text
-        FROM charger_vehicle_access
-        WHERE charger_id IN (
-            SELECT charger_id FROM chargers WHERE depot_id = $1
-        )
-        AND is_accessible = TRUE
-        """
-        async with pool.acquire() as conn:
-            access_rows = await conn.fetch(access_query, depot_id_str)
-
-        # Build charger_vehicle_access dict: charger_id -> set of vehicle_ids
-        charger_vehicle_access = {}
-        for row in access_rows:
-            charger_id = row["charger_id"]
-            vehicle_id = row["vehicle_id"]
-            if charger_id not in charger_vehicle_access:
-                charger_vehicle_access[charger_id] = set()
-            charger_vehicle_access[charger_id].add(vehicle_id)
+        # Charger-vehicle accessibility (per PRD Section 6.1).
+        # In 'all_to_all' mode the depot has opted out of an explicit
+        # matrix — every charger reaches every vehicle in the depot, so we
+        # synthesize the dict in-memory and skip the DB lookup. Otherwise
+        # we use the explicit rows from charger_vehicle_access.
+        charger_vehicle_access: dict[str, set[str]] = {}
+        if access_default == "all_to_all":
+            charger_id_query = """
+            SELECT charger_id::text FROM chargers WHERE depot_id = $1
+            """
+            async with pool.acquire() as conn:
+                charger_id_rows = await conn.fetch(charger_id_query, depot_id_str)
+            all_vehicle_ids = set(vehicle_capacities.keys())
+            for row in charger_id_rows:
+                charger_vehicle_access[row["charger_id"]] = set(all_vehicle_ids)
+        else:
+            access_query = """
+            SELECT charger_id::text, vehicle_id::text
+            FROM charger_vehicle_access
+            WHERE charger_id IN (
+                SELECT charger_id FROM chargers WHERE depot_id = $1
+            )
+            AND is_accessible = TRUE
+            """
+            async with pool.acquire() as conn:
+                access_rows = await conn.fetch(access_query, depot_id_str)
+            for row in access_rows:
+                charger_id = row["charger_id"]
+                vehicle_id = row["vehicle_id"]
+                if charger_id not in charger_vehicle_access:
+                    charger_vehicle_access[charger_id] = set()
+                charger_vehicle_access[charger_id].add(vehicle_id)
 
         # Build vehicle_max_charge_kw dict
         vehicle_max_charge_kw = {}
@@ -1208,6 +1313,12 @@ class StateAssembler:
             building_load_assumption_kw=building_load_assumption_kw,
             delta_t=0.25,  # 15 minutes per PRD
             n_timesteps=96,  # 24 hours
+            charger_vehicle_access_default=access_default,
+            tariff_type=tariff_type,
+            energy_cap_kwh=energy_cap_kwh,
+            under_cap_rate_per_kwh=under_cap_rate,
+            over_cap_penalty_per_kwh=over_cap_penalty,
+            cap_billing_period=cap_billing_period,
         )
 
         total_chargers = sum(charger_groups.values())

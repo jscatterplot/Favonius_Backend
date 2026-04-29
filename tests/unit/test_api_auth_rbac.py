@@ -511,7 +511,12 @@ class TestDepotSetupWrites:
     def test_readiness_checklist_contains_exact_missing_inputs(self, client, mock_db_pool):
         pool, conn = mock_db_pool
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_admin"))
-        conn.fetchval = AsyncMock(side_effect=[False, False, False, False, False, False, False])
+        # Order matches _build_depot_readiness_checklist:
+        # has_vehicles, has_chargers, access_default, has_access,
+        # has_schedules, has_battery, has_prices, has_building_load.
+        conn.fetchval = AsyncMock(
+            side_effect=[False, False, "explicit_matrix", False, False, False, False, False]
+        )
         payload = _first_depot_payload()
         created_row = {
             "depot_id": DEPOT_ID,
@@ -538,6 +543,298 @@ class TestDepotSetupWrites:
         assert checklist["prices"]["status"] == "blocked"
         assert checklist["building_load"]["status"] == "blocked"
         assert checklist["battery"]["status"] == "blocked"
+
+    # ── Migration 021: charger_vehicle_access_default + energy_cap tariff ──
+
+    def test_first_depot_setup_accepts_all_to_all_mode(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        payload = _first_depot_payload()
+        payload["depot"]["charger_vehicle_access_default"] = "all_to_all"
+        created_row = {
+            "depot_id": DEPOT_ID,
+            "organization_id": DEFAULT_ORG_ID,
+            "name": payload["depot"]["name"],
+            "timezone": payload["depot"]["timezone"],
+            "currency": payload["depot"]["currency"],
+            "max_grid_kw": payload["depot"]["max_grid_kw"],
+        }
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.db_queries.create_depot_setup",
+            new_callable=AsyncMock,
+            return_value=created_row,
+        ) as create_mock, patch(
+            "src.api.main.db_queries.upsert_battery_storage", new_callable=AsyncMock
+        ), patch(
+            "src.api.main._build_readiness_checklist",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = client.post(
+                "/admin/first-depot-setup", headers=AUTH_HDR, json=payload
+            )
+        assert response.status_code == http_status.HTTP_200_OK
+        assert (
+            create_mock.await_args.kwargs["charger_vehicle_access_default"] == "all_to_all"
+        )
+        assert create_mock.await_args.kwargs["tariff_type"] == "simple_demand"
+
+    def test_first_depot_setup_accepts_energy_cap_tariff(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        payload = _first_depot_payload()
+        payload["depot"]["demand_charge"] = {
+            "tariff_type": "energy_cap",
+            "energy_cap_kwh": 400.0,
+            "under_cap_rate_per_kwh": 0.10,
+            "over_cap_penalty_per_kwh": 2.00,
+            "cap_billing_period": "monthly",
+        }
+        created_row = {
+            "depot_id": DEPOT_ID,
+            "organization_id": DEFAULT_ORG_ID,
+            "name": payload["depot"]["name"],
+            "timezone": payload["depot"]["timezone"],
+            "currency": payload["depot"]["currency"],
+            "max_grid_kw": payload["depot"]["max_grid_kw"],
+        }
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.db_queries.create_depot_setup",
+            new_callable=AsyncMock,
+            return_value=created_row,
+        ) as create_mock, patch(
+            "src.api.main.db_queries.upsert_battery_storage", new_callable=AsyncMock
+        ), patch(
+            "src.api.main._build_readiness_checklist",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = client.post(
+                "/admin/first-depot-setup", headers=AUTH_HDR, json=payload
+            )
+        assert response.status_code == http_status.HTTP_200_OK
+        kwargs = create_mock.await_args.kwargs
+        assert kwargs["tariff_type"] == "energy_cap"
+        assert kwargs["energy_cap_kwh"] == 400.0
+        assert kwargs["under_cap_rate_per_kwh"] == 0.10
+        assert kwargs["over_cap_penalty_per_kwh"] == 2.00
+
+    def test_energy_cap_rejects_rate_eur_per_kw(self, client):
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        payload = _first_depot_payload()
+        # rate_eur_per_kw is forbidden by EnergyCapTariffPayload (extra='forbid').
+        payload["depot"]["demand_charge"] = {
+            "tariff_type": "energy_cap",
+            "rate_eur_per_kw": 8.5,
+            "energy_cap_kwh": 400.0,
+            "under_cap_rate_per_kwh": 0.10,
+            "over_cap_penalty_per_kwh": 2.00,
+        }
+        response = client.post(
+            "/admin/first-depot-setup", headers=AUTH_HDR, json=payload
+        )
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert response.json()["error_code"] == "VALIDATION_ERROR"
+
+    def test_energy_cap_rejects_penalty_below_under_rate(self, client):
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        payload = _first_depot_payload()
+        payload["depot"]["demand_charge"] = {
+            "tariff_type": "energy_cap",
+            "energy_cap_kwh": 400.0,
+            "under_cap_rate_per_kwh": 1.00,
+            "over_cap_penalty_per_kwh": 0.50,  # ← below under_cap_rate
+        }
+        response = client.post(
+            "/admin/first-depot-setup", headers=AUTH_HDR, json=payload
+        )
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert response.json()["error_code"] == "VALIDATION_ERROR"
+
+    def test_patch_depot_setup_invalidates_config_cache(self, client, mock_db_pool):
+        from src.api import main as api_main
+
+        pool, conn = mock_db_pool
+        # Pre-populate the cache so we can verify eviction.
+        api_main._depot_config_cache[DEPOT_ID] = (object(), 0.0)
+        assert DEPOT_ID in api_main._depot_config_cache
+
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        # verify_depot_access reads fetchval → True for org match.
+        conn.fetchval = AsyncMock(return_value=True)
+        updated_row = {
+            "depot_id": DEPOT_ID,
+            "name": "Renamed",
+            "timezone": "Europe/Vilnius",
+            "currency": "EUR",
+            "max_grid_kw": 1500.0,
+        }
+        payload = _first_depot_payload()
+        payload["depot"]["charger_vehicle_access_default"] = "all_to_all"
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.db_queries.update_depot_setup",
+            new_callable=AsyncMock,
+            return_value=updated_row,
+        ), patch(
+            "src.api.main.db_queries.upsert_battery_storage", new_callable=AsyncMock
+        ), patch(
+            "src.api.main._build_readiness_checklist",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = client.patch(
+                f"/admin/depots/{DEPOT_ID}", headers=AUTH_HDR, json=payload
+            )
+        assert response.status_code == http_status.HTTP_200_OK
+        # Cache must be invalidated so the next solve picks up the new mode.
+        assert DEPOT_ID not in api_main._depot_config_cache
+
+
+class TestChargerVehicleAccessEndpoint:
+    """POST /admin/depots/{id}/charger-vehicle-access (migration 021)."""
+
+    def _payload(self, *, accessible: bool = True) -> dict:
+        return {
+            "entries": [
+                {
+                    "charger_id": str(uuid4()),
+                    "vehicle_id": str(uuid4()),
+                    "is_accessible": accessible,
+                }
+            ]
+        }
+
+    def test_rejects_all_to_all_mode_with_409(self, client, mock_db_pool):
+        from src.api import main as api_main
+
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        # First fetchval = verify_depot_access (org match) = True
+        # Second fetchval = charger_vehicle_access_default = 'all_to_all'
+        conn.fetchval = AsyncMock(side_effect=[True, "all_to_all"])
+        with patch("src.api.main.db_pools", pool):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/charger-vehicle-access",
+                headers=AUTH_HDR,
+                json=self._payload(),
+            )
+        assert response.status_code == http_status.HTTP_409_CONFLICT
+        assert "all_to_all" in response.json()["detail"]
+        # Cache must NOT be evicted on a rejected request.
+        assert DEPOT_ID not in api_main._depot_config_cache
+
+    def test_explicit_matrix_upserts_and_invalidates_cache(self, client, mock_db_pool):
+        from src.api import main as api_main
+
+        pool, conn = mock_db_pool
+        api_main._depot_config_cache[DEPOT_ID] = (object(), 0.0)
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        conn.fetchval = AsyncMock(side_effect=[True, "explicit_matrix"])
+        depot_row = {
+            "name": "TOKS Vilnius Depot",
+            "timezone": "Europe/Vilnius",
+            "currency": "EUR",
+            "max_grid_kw": 1200.0,
+        }
+        conn.fetchrow = AsyncMock(return_value=depot_row)
+        upsert_result = {"invalid_chargers": [], "invalid_vehicles": []}
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.db_queries.upsert_charger_vehicle_access",
+            new_callable=AsyncMock,
+            return_value=upsert_result,
+        ) as upsert_mock, patch(
+            "src.api.main._build_depot_readiness_checklist",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/charger-vehicle-access",
+                headers=AUTH_HDR,
+                json=self._payload(),
+            )
+        assert response.status_code == http_status.HTTP_200_OK
+        assert response.json()["depot"]["id"] == DEPOT_ID
+        upsert_mock.assert_awaited_once()
+        # Cache evicted so the next solve sees the new rows.
+        assert DEPOT_ID not in api_main._depot_config_cache
+
+    def test_invalid_membership_returns_400(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        conn.fetchval = AsyncMock(side_effect=[True, "explicit_matrix"])
+        bad_charger = str(uuid4())
+        bad_vehicle = str(uuid4())
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.db_queries.upsert_charger_vehicle_access",
+            new_callable=AsyncMock,
+            return_value={
+                "invalid_chargers": [bad_charger],
+                "invalid_vehicles": [bad_vehicle],
+            },
+        ):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/charger-vehicle-access",
+                headers=AUTH_HDR,
+                json=self._payload(),
+            )
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        body = response.json()
+        assert body["error_code"] == "INVALID_DEPOT_MEMBERSHIP"
+        assert bad_charger in body["invalid_chargers"]
+        assert bad_vehicle in body["invalid_vehicles"]
+
+    def test_cross_org_request_denied(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        # verify_depot_access fetchval returns False -> 403
+        conn.fetchval = AsyncMock(return_value=False)
+        with patch("src.api.main.db_pools", pool):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/charger-vehicle-access",
+                headers=AUTH_HDR,
+                json=self._payload(),
+            )
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+    def test_invalid_uuid_in_entry_returns_400(self, client, mock_db_pool):
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        with patch("src.api.main.db_pools", pool):
+            response = client.post(
+                f"/admin/depots/{DEPOT_ID}/charger-vehicle-access",
+                headers=AUTH_HDR,
+                json={
+                    "entries": [
+                        {
+                            "charger_id": "not-a-uuid",
+                            "vehicle_id": str(uuid4()),
+                            "is_accessible": True,
+                        }
+                    ]
+                },
+            )
+        # Project-wide Pydantic ValidationError handler converts to 400.
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
 
 
 class TestChargerOnboarding:
@@ -914,24 +1211,30 @@ class TestManualScheduleAdmin:
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
             _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
         )
+        # Order per call (migration 021 inserts charger_vehicle_access_default
+        # between has_chargers and has_access):
+        #   has_vehicles, has_chargers, access_default, has_access,
+        #   has_schedules, has_battery, has_prices, has_building_load.
+        # First call simulates a "schedule gap" (has_schedules=False); second
+        # call simulates a fully ready depot.
         conn.fetchval = AsyncMock(
             side_effect=[
-                True,
-                True,
-                True,
-                False,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
+                True,                # has_vehicles (call 1)
+                True,                # has_chargers
+                "explicit_matrix",   # access_default
+                True,                # has_access
+                False,               # has_schedules ← the "gap"
+                True,                # has_battery
+                True,                # has_prices
+                True,                # has_building_load
+                True,                # has_vehicles (call 2)
+                True,                # has_chargers
+                "explicit_matrix",   # access_default
+                True,                # has_access
+                True,                # has_schedules (now ready)
+                True,                # has_battery
+                True,                # has_prices
+                True,                # has_building_load
             ]
         )
 
