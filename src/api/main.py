@@ -3124,6 +3124,7 @@ async def get_optimization_readiness(
             horizon_end=horizon[1],
             schedules=assembler.last_schedules,
             weather_features=assembler.last_weather_features,
+            weather_forecast_id=assembler.last_weather_forecast_id,
             readiness=readiness,
         )
         try:

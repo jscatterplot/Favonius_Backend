@@ -69,22 +69,39 @@ async def fetch_training_data(
         f"Fetching training data for depot {depot_id_str}, " f"lookback_days={lookback_days}"
     )
 
+    # The ``LATERAL`` subquery picks the forecast bundle that was
+    # *current* at each schedule's departure_time (MAX(fetched_at)
+    # WHERE fetched_at <= s.departure_time) and then the row from
+    # that bundle whose forecast_for matches the departure date.
+    # This mirrors the assembler's filter exactly so historical
+    # training data sees the same features the optimization saw at
+    # run time — i.e. surrogate training and snapshot replay agree.
     query = """
-    SELECT 
+    SELECT
         v.vehicle_type,
         s.route_id,
         s.departure_time,
         s.energy_kwh,
-        w.temp_f as temp_avg_f,
+        w.temp_f          AS temp_avg_f,
         w.temp_max_f,
         w.temp_min_f,
-        w.precip_in as rain_inches,
-        w.solar_rad as solar_radiation
+        w.precip_in       AS rain_inches,
+        w.solar_rad       AS solar_radiation
     FROM schedules s
     JOIN vehicles v ON s.vehicle_id = v.vehicle_id
-    LEFT JOIN weather_forecasts w ON 
-        w.depot_id = v.depot_id AND
-        DATE(w.time) = DATE(s.departure_time)
+    LEFT JOIN LATERAL (
+        SELECT temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
+        FROM weather_forecasts wf
+        WHERE wf.depot_id = v.depot_id
+          AND wf.fetched_at = (
+              SELECT MAX(fetched_at)
+              FROM weather_forecasts
+              WHERE depot_id   = v.depot_id
+                AND fetched_at <= s.departure_time
+          )
+          AND DATE(wf.forecast_for) = DATE(s.departure_time)
+        LIMIT 1
+    ) w ON TRUE
     WHERE v.depot_id = $1::uuid
       AND s.departure_time > NOW() - INTERVAL '%s days'
       AND s.energy_kwh IS NOT NULL

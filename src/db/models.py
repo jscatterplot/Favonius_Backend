@@ -262,20 +262,39 @@ class Price(Base):
 class WeatherForecast(Base):
     """Weather forecast time-series data.
 
-    Reference: PRD_v2.md Section 6.1
-    Note: This is a TimescaleDB hypertable
+    After migration 021 this is an *insert-only* history of forecast
+    bundles. Each row is identified by ``forecast_id`` (UUID) and tagged
+    with ``fetched_at`` (when we asked the provider) and ``forecast_for``
+    (the timestamp the forecast is for). Duplicate fetches collapse
+    via the ``UNIQUE (depot_id, source, fetched_at, forecast_for)``
+    constraint; every fresh fetch inserts a new bundle.
+
+    Reference: PRD_v2.md Section 6.1, migrations/021_*
+    Note: TimescaleDB hypertable partitioned on ``fetched_at``.
     """
 
     __tablename__ = "weather_forecasts"
 
-    time = Column(DateTime(timezone=True), primary_key=True, nullable=False)
-    depot_id = Column(PGUUID(as_uuid=True), primary_key=True, nullable=False)
+    forecast_id = Column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        nullable=False,
+        server_default=func.gen_random_uuid(),
+    )
+    depot_id = Column(PGUUID(as_uuid=True), nullable=False)
+    source = Column(String(32), nullable=False, server_default="open_meteo")
+    fetched_at = Column(
+        DateTime(timezone=True),
+        primary_key=True,
+        nullable=False,
+        server_default=func.now(),
+    )
+    forecast_for = Column(DateTime(timezone=True), nullable=False)
     temp_f = Column(Double, nullable=True)
     temp_max_f = Column(Double, nullable=True)
     temp_min_f = Column(Double, nullable=True)
     precip_in = Column(Double, nullable=True)
     solar_rad = Column(Double, nullable=True)
-    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class BuildingLoad(Base):

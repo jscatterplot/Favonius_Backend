@@ -34,8 +34,9 @@ INSERT INTO optimization_input_snapshots (
     missing_inputs,
     assumptions,
     payload,
-    payload_schema
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12)
+    payload_schema,
+    weather_forecast_id
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13)
 """
 
 _LINK_RUN_SQL = """
@@ -74,6 +75,7 @@ async def persist_snapshot(
             assumptions_json,
             payload_json,
             snapshot.payload_schema,
+            snapshot.weather_forecast_id,
         )
     logger.info(
         "Persisted optimization input snapshot %s for depot %s (status=%s, "

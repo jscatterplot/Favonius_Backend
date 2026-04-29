@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from uuid import UUID
@@ -37,8 +37,8 @@ except ImportError:  # pragma: no cover - optional dependency for runtime API ca
     retry = None  # type: ignore[assignment]
 
 from .storage import (
-    get_cached_forecasts,
     get_depot_location,
+    get_latest_forecast_bundle,
     store_weather_forecasts,
 )
 
@@ -349,21 +349,36 @@ class OpenMeteoAdapter:
         days: int = 7,
         use_cache: bool = True,
     ) -> list[WeatherData]:
-        """Get weather forecasts for a specific depot, with caching support.
+        """Fetch (or read) a forecast bundle for a depot.
 
-        First tries to get cached forecasts from database. If not available
-        or use_cache=False, fetches new forecasts and stores them.
+        Behaviour after migration 021 is **insert-only**: a fresh fetch
+        always writes a new bundle to ``weather_forecasts`` (one row per
+        forecast_for, all sharing a single fetched_at). The DB is no
+        longer used as a *cache* — every fetch is a new historical
+        observation.
+
+        ``use_cache`` is retained for read-only callers (e.g. dashboards)
+        that just want the latest stored bundle without hitting the
+        external API:
+
+        * ``use_cache=True``  → return the latest bundle from the DB
+          (read path; no API call). Falls through to a fresh fetch if
+          the DB has no bundle yet.
+        * ``use_cache=False`` → always fetch fresh and insert a new
+          bundle. This is the **canonical ingestion path**.
 
         Args:
             depot_id: Depot identifier
             days: Number of forecast days (default: 7, max: 16)
-            use_cache: Whether to use cached forecasts (default True)
+            use_cache: If True, prefer the latest stored bundle. If
+                False, always fetch fresh and insert a new bundle.
 
         Returns:
             List of WeatherData objects
 
         Raises:
-            RuntimeError: If database pool not configured or depot location not found
+            RuntimeError: If database pool not configured or depot
+                location not found
         """
         if not self.pool:
             raise RuntimeError("Database pool not configured for OpenMeteoAdapter")
@@ -375,26 +390,23 @@ class OpenMeteoAdapter:
                 raise RuntimeError(f"Could not find location for depot {depot_id}")
             self.latitude, self.longitude = location
             logger.info(
-                f"Loaded location for depot {depot_id}: " f"({self.latitude}, {self.longitude})"
+                f"Loaded location for depot {depot_id}: ({self.latitude}, {self.longitude})"
             )
 
-        # Calculate time window
-        now = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_time = now + timedelta(days=days)
-
-        # Try to get cached forecasts first
         if use_cache:
             try:
-                cached = await get_cached_forecasts(self.pool, depot_id, now, end_time)
-                if cached:
-                    # Convert cached forecasts back to WeatherData objects
-                    forecasts = []
-                    for row in cached:
-                        # Convert solar_rad from cal/cm² back to W/m² for WeatherData
-                        solar_wm2 = row["solar_rad"] / 2.064
+                fetched_at, rows = await get_latest_forecast_bundle(
+                    self.pool, depot_id
+                )
+                if rows:
+                    forecasts: list[WeatherData] = []
+                    for row in rows:
+                        # Convert solar_rad from cal/cm² back to W/m² for
+                        # the in-memory WeatherData type.
+                        solar_wm2 = (row["solar_rad"] or 0.0) / 2.064
                         forecasts.append(
                             WeatherData(
-                                timestamp=row["time"],
+                                timestamp=row["forecast_for"],
                                 temperature_f=row["temp_f"],
                                 temperature_max_f=row["temp_max_f"],
                                 temperature_min_f=row["temp_min_f"],
@@ -402,15 +414,22 @@ class OpenMeteoAdapter:
                                 solar_radiation=solar_wm2,
                             )
                         )
-                    logger.debug(f"Using {len(forecasts)} cached forecasts for depot {depot_id}")
+                    logger.debug(
+                        "Using %d forecasts from latest bundle "
+                        "(fetched_at=%s) for depot %s",
+                        len(forecasts),
+                        fetched_at,
+                        depot_id,
+                    )
                     return forecasts
             except Exception as e:
-                logger.warning(f"Error getting cached forecasts: {e}, fetching new")
+                logger.warning(
+                    f"Error reading latest forecast bundle: {e}, fetching new"
+                )
 
-        # Fetch new forecasts
+        # Canonical ingestion path: fetch fresh and insert a new bundle.
         forecasts = await self.get_forecast(days=days)
 
-        # Store to database if pool available
         if self.pool and forecasts:
             try:
                 await self.store_forecasts_to_db(forecasts, depot_id)
