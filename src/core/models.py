@@ -117,6 +117,11 @@ class DepotConfig:
     battery_soc_min: float = 0.2
     battery_soc_max: float = 0.8
     max_site_power: float = 1000.0
+    # Constant baseline load applied when the depot has no live building-load
+    # source (HRX-style onboarding). Optimizer treats it as additional grid
+    # demand so max_site_power is still respected. Zero when a meter or
+    # forecast source is configured. See migration 020 + PRD §9.4.
+    building_load_assumption_kw: float = 0.0
     delta_t: float = 0.25  # hours (15 min)
     n_timesteps: int = 96  # 24 hours
 
@@ -197,7 +202,8 @@ class ReadinessReport:
     missing_inputs: list[str] = field(default_factory=list)
     degraded_reasons: list[str] = field(default_factory=list)
     assumptions: dict[str, object] = field(default_factory=dict)
-    building_load_source: str = "meter"  # 'meter' | 'forecast_fallback' | 'absent'
+    # 'meter' | 'forecast_fallback' | 'static_assumption' | 'absent'
+    building_load_source: str = "meter"
 
     @property
     def is_ready(self) -> bool:
@@ -244,6 +250,13 @@ class OptimizationInputSnapshot:
     # can later be replayed against the exact forecast bundle it saw.
     weather_forecast_id: Optional[UUID] = None
     incoming_vehicles: list[dict[str, object]] = field(default_factory=list)
+    # Telemetry rows (last hour by default) that drove this optimization.
+    # Captured for replay so we can reconstruct e.g. SoC-deviation triggers.
+    recent_telemetry: list[dict[str, object]] = field(default_factory=list)
+    # Version metadata (migration 020). Populated via src/core/version_info.py.
+    code_version: Optional[str] = None
+    solver_version: Optional[str] = None
+    surrogate_model_version: Optional[str] = None
     run_id: Optional[UUID] = None
     payload_schema: str = "v1"
 

@@ -3,7 +3,7 @@
 Reference: PRD.md#11-2-unit-test-requirements
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -172,6 +172,55 @@ class TestDepotStateEndpoint:
         """Test depot state with invalid depot_id."""
         response = client.get("/depots/not-a-uuid/state")
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+
+
+class TestOptimizationReadinessEndpoint:
+    """Test /depots/{id}/optimization/readiness endpoint."""
+
+    @patch("src.api.main.persist_snapshot", new_callable=AsyncMock)
+    @patch("src.api.main.StateAssembler")
+    @patch("src.api.main._get_depot_config", new_callable=AsyncMock)
+    def test_persisted_snapshot_includes_recent_telemetry(
+        self,
+        mock_get_config,
+        mock_assembler_class,
+        mock_persist_snapshot,
+        client,
+        sample_depot_config,
+        sample_depot_state,
+    ):
+        """Regression: readiness persist path must keep telemetry replay data."""
+        depot_id = str(uuid4())
+        horizon = (datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(hours=24))
+        recent_telemetry = [
+            {
+                "vehicle_id": "bus_1",
+                "timestamp": horizon[0].isoformat(),
+                "soc": 0.45,
+                "charging_kw": 64.0,
+                "is_plugged": True,
+            }
+        ]
+
+        assembler = MagicMock()
+        assembler.get_current_state = AsyncMock(return_value=sample_depot_state)
+        assembler.fetch_snapshot_extras = AsyncMock()
+        assembler.last_horizon = horizon
+        assembler.last_building_load_source = "meter"
+        assembler.last_schedules_present = True
+        assembler.last_organization_id = str(uuid4())
+        assembler.last_schedules = []
+        assembler.last_weather_features = []
+        assembler.last_recent_telemetry = recent_telemetry
+        mock_assembler_class.return_value = assembler
+        mock_get_config.return_value = sample_depot_config
+
+        with patch("src.api.main.db_pools", MagicMock()):
+            response = client.get(f"/depots/{depot_id}/optimization/readiness?persist=true")
+
+        assert response.status_code == http_status.HTTP_200_OK
+        persisted_snapshot = mock_persist_snapshot.await_args.args[1]
+        assert persisted_snapshot.recent_telemetry == recent_telemetry
 
 
 class TestDepotScheduleEndpoint:

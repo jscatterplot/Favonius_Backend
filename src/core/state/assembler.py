@@ -81,6 +81,7 @@ class StateAssembler:
         self._last_weather_forecast_id: UUID | None = None
         self._last_horizon: tuple[datetime, datetime] | None = None
         self._last_organization_id: str | None = None
+        self._last_recent_telemetry: list[dict] = []
         logger.info(f"Initialized StateAssembler for depot {self.depot_id}")
 
     @property
@@ -117,6 +118,15 @@ class StateAssembler:
     @property
     def last_organization_id(self) -> str | None:
         return self._last_organization_id
+
+    @property
+    def last_recent_telemetry(self) -> list[dict]:
+        """Telemetry rows captured for the most recent snapshot context.
+
+        See :meth:`_get_recent_telemetry`. Empty until ``fetch_snapshot_extras``
+        runs.
+        """
+        return list(self._last_recent_telemetry)
 
     async def get_current_state(
         self,
@@ -312,7 +322,9 @@ class StateAssembler:
                     vehicle_ids,
                 )
 
-            result = {str(row["vehicle_id"]): float(row["soc"]) for row in rows if row["soc"] is not None}
+            result = {
+                str(row["vehicle_id"]): float(row["soc"]) for row in rows if row["soc"] is not None
+            }
             logger.debug(f"Retrieved SoC for {len(result)} vehicles")
             return result
         except asyncpg.PostgresError as e:
@@ -742,12 +754,24 @@ class StateAssembler:
             n_steps: Number of timesteps
 
         Returns:
-            List of building power in kW, one per timestep
+            List of building power in kW, one per timestep. When the depot
+            uses a static-assumption derate (no live meter/forecast), the
+            returned series is all zeros and the depot-level
+            ``building_load_assumption_kw`` field on ``DepotConfig`` is
+            applied as a constant by the MILP grid-balance constraint.
 
         Note:
-            Per PRD Section 9.4, building load is REQUIRED for accurate grid power calculation.
-            Queries building_load table with fallback to forecast model if meter unavailable.
+            PRD §9.4: building load is OPTIONAL for initial onboarding.
+            When no live source is configured the optimizer derates
+            ``max_grid_kw`` by ``building_load_assumption_kw`` so the
+            site-power constraint is still respected.
         """
+        if self.config.building_load_assumption_kw > 0.0:
+            # Prevent double-counting when static derate is enabled, and avoid
+            # querying TimescaleDB for data the optimizer intentionally ignores.
+            self._last_building_load_source = "static_assumption"
+            return [0.0] * n_steps
+
         query = """
         SELECT time, power_kw
         FROM building_load
@@ -760,7 +784,7 @@ class StateAssembler:
         except asyncpg.PostgresError as e:
             logger.warning(
                 f"Database error fetching building load for depot {self.depot_id}: {e}. "
-                "Using forecast model fallback."
+                "Using fallback source."
             )
             # Explicit degraded mode (PRD 9.4): meter unavailable, fall back
             # to the deterministic business-hours pattern. Readiness will
@@ -771,7 +795,7 @@ class StateAssembler:
         if not rows:
             logger.warning(
                 f"No building load data found for depot {self.depot_id} "
-                f"between {start} and {end}, using forecast model"
+                f"between {start} and {end}, using fallback source"
             )
             self._last_building_load_source = "forecast_fallback"
             return self._get_building_power_forecast(start, end, n_steps)
@@ -848,10 +872,9 @@ class StateAssembler:
         )
         return building_power
 
-    async def fetch_snapshot_extras(
-        self, horizon_start: datetime, horizon_end: datetime
-    ) -> None:
-        """Populate snapshot-only metadata (weather + organization_id).
+    async def fetch_snapshot_extras(self, horizon_start: datetime, horizon_end: datetime) -> None:
+        """Populate snapshot-only metadata (weather + organization_id +
+        recent telemetry).
 
         Called by ``DepotController._capture_snapshot`` after
         ``get_current_state`` so the extra DB roundtrips don't show up
@@ -863,10 +886,65 @@ class StateAssembler:
         self._last_weather_features = features
         self._last_weather_forecast_id = forecast_id
         self._last_organization_id = await self._get_organization_id()
+        self._last_recent_telemetry = await self._get_recent_telemetry(horizon_start)
 
-    async def _get_weather_features(
-        self, start: datetime, end: datetime
-    ) -> tuple[list[dict], UUID | None]:
+    async def _get_recent_telemetry(
+        self, now: datetime, lookback_seconds: int = 3600
+    ) -> list[dict]:
+        """Fetch recent telemetry rows for the snapshot.
+
+        Replay-friendly: captures the (vehicle_id, time, soc, charging_kw,
+        is_plugged) rows that drove this optimization, so SoC-deviation
+        triggers and other dynamics can be reconstructed months later.
+
+        Args:
+            now: Reference time. Returns rows with ``time >= now - lookback``.
+            lookback_seconds: Lookback window in seconds (default 1 hour).
+
+        Returns:
+            List of dicts (possibly empty). Failures are non-fatal —
+            snapshot construction must never break optimization.
+        """
+        cutoff = now - timedelta(seconds=lookback_seconds)
+        try:
+            async with self.pools.static.acquire() as conn:
+                vehicle_rows = await conn.fetch(
+                    "SELECT vehicle_id::text FROM vehicles WHERE depot_id = $1",
+                    self.depot_id,
+                )
+            vehicle_ids = [row["vehicle_id"] for row in vehicle_rows]
+            if not vehicle_ids:
+                return []
+
+            async with self.pools.ts.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT time, vehicle_id::text AS vehicle_id,
+                           soc, charging_kw, is_plugged
+                    FROM telemetry
+                    WHERE vehicle_id = ANY($1::uuid[]) AND time >= $2
+                    ORDER BY time
+                    """,
+                    vehicle_ids,
+                    cutoff,
+                )
+        except asyncpg.PostgresError as e:
+            logger.debug(f"recent_telemetry unavailable for depot {self.depot_id}: {e}")
+            return []
+        return [
+            {
+                "time": row["time"].isoformat() if row["time"] else None,
+                "vehicle_id": row["vehicle_id"],
+                "soc": float(row["soc"]) if row["soc"] is not None else None,
+                "charging_kw": (
+                    float(row["charging_kw"]) if row["charging_kw"] is not None else None
+                ),
+                "is_plugged": (bool(row["is_plugged"]) if row["is_plugged"] is not None else None),
+            }
+            for row in rows
+        ]
+
+    async def _get_weather_features(self, start: datetime, end: datetime) -> tuple[list[dict], UUID | None]:
         """Fetch weather features for the horizon (snapshot context only).
 
         After migration 021 ``weather_forecasts`` is an insert-only
@@ -978,9 +1056,7 @@ class StateAssembler:
                     self.depot_id,
                 )
         except asyncpg.PostgresError as e:
-            logger.debug(
-                f"organization_id lookup failed for depot {self.depot_id}: {e}"
-            )
+            logger.debug(f"organization_id lookup failed for depot {self.depot_id}: {e}")
             return None
         if not row:
             return None
@@ -1082,9 +1158,13 @@ class StateAssembler:
         depot_id_str = str(depot_id)
         pool = pools.static  # All config tables are in Supabase
 
-        # Query depot configuration
+        # Query depot configuration. building_load_assumption_kw was added
+        # by migration 020 — COALESCE handles the brief window after that
+        # migration runs on a depot row inserted before it.
         depot_query = """
-        SELECT max_grid_kw, demand_charge_rate_kw
+        SELECT max_grid_kw,
+               demand_charge_rate_kw,
+               COALESCE(building_load_assumption_kw, 0.0) AS building_load_assumption_kw
         FROM depots
         WHERE depot_id = $1
         """
@@ -1095,6 +1175,7 @@ class StateAssembler:
             raise ValueError(f"Depot {depot_id_str} not found")
 
         max_site_power = float(depot_row["max_grid_kw"])
+        building_load_assumption_kw = float(depot_row["building_load_assumption_kw"])
 
         # Query vehicles
         vehicles_query = """
@@ -1210,6 +1291,7 @@ class StateAssembler:
             battery_soc_min=battery_soc_min,
             battery_soc_max=battery_soc_max,
             max_site_power=max_site_power,
+            building_load_assumption_kw=building_load_assumption_kw,
             delta_t=0.25,  # 15 minutes per PRD
             n_timesteps=96,  # 24 hours
         )

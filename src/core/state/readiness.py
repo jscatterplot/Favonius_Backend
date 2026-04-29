@@ -1,7 +1,7 @@
 """Optimization readiness validation and input snapshot construction.
 
-Reference: migration 019_optimization_input_snapshots.sql, PRD Section 9.4
-(building load required for grid power calc).
+Reference: migrations 019_optimization_input_snapshots.sql,
+020_snapshot_hardening.sql, PRD Section 9.4.
 
 The readiness checker inspects the depot configuration plus the assembled
 ``DepotState`` and produces:
@@ -12,18 +12,18 @@ The readiness checker inspects the depot configuration plus the assembled
     2. A :class:`OptimizationInputSnapshot` that captures the full input
        bundle for persistence and replay.
 
-Building load is the canonical "degrade" trigger: per PRD 9.4 it is required
-for the grid-power calculation, but historic deployments still need to keep
-running when meter data drops out. Rather than silently substituting the
-forecast pattern (the previous behaviour of ``StateAssembler``), the checker
-now records the substitution as an explicit assumption and downgrades the
-optimization run status to ``degraded``.
+Building load is the canonical "degrade" trigger. Per the post-HRX PRD
+update (§9.4) building load is OPTIONAL for initial onboarding: when no
+live source is configured the depot supplies a static
+``building_load_assumption_kw`` and the optimizer treats it as a constant
+baseline load on the grid. Either way the site-power constraint is
+respected — see ``src/core/optimizer/milp_model.py``.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -33,6 +33,11 @@ from ..models import (
     OptimizationInputSnapshot,
     ReadinessReport,
 )
+from ..version_info import (
+    get_code_version,
+    get_solver_version,
+    get_surrogate_model_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,7 @@ logger = logging.getLogger(__name__)
 # Sources for the building_load column in the snapshot table.
 BUILDING_LOAD_METER = "meter"
 BUILDING_LOAD_FORECAST = "forecast_fallback"
+BUILDING_LOAD_STATIC = "static_assumption"
 BUILDING_LOAD_ABSENT = "absent"
 
 
@@ -56,12 +62,14 @@ def evaluate_readiness(
         config: Depot configuration loaded from the static DB.
         state: Assembled depot state (post any in-memory fallbacks).
         building_load_source: One of ``meter`` / ``forecast_fallback`` /
-            ``absent`` — describes where the values in
-            ``state.building_power`` came from.
+            ``static_assumption`` / ``absent`` — describes where the
+            values in ``state.building_power`` came from.
         schedules_present: True if at least one route schedule was loaded
             from the database for the horizon. The state assembler
             collapses missing schedules into "always available", so this
-            cannot be inferred from ``state`` alone.
+            cannot be inferred from ``state`` alone. NB: evaluated on
+            raw DB schedules BEFORE the VDV463 merge — see
+            docs/CONTROL_LOOP.md.
 
     Returns:
         A :class:`ReadinessReport`. ``status='not_ready'`` is a hard
@@ -94,6 +102,19 @@ def evaluate_readiness(
             "source": BUILDING_LOAD_FORECAST,
             "note": "meter data missing; substituted business-hours forecast pattern",
         }
+    elif building_load_source == BUILDING_LOAD_STATIC:
+        # Depot opted into the static-derate path (e.g. HRX day-one with
+        # no meter integration). max_grid_kw is derated by
+        # config.building_load_assumption_kw inside the MILP.
+        degraded.append("building_load_static_assumption")
+        assumptions["building_load"] = {
+            "source": BUILDING_LOAD_STATIC,
+            "value_kw": config.building_load_assumption_kw,
+            "note": (
+                "no live meter/forecast source configured; depot-level "
+                "static derate applied to max_grid_kw"
+            ),
+        }
     elif building_load_source == BUILDING_LOAD_ABSENT:
         # Forecast was not even applied (e.g. n_steps=0). Building load is
         # required per PRD 9.4 — refuse.
@@ -104,11 +125,7 @@ def evaluate_readiness(
     # vehicle has telemetry" by checking whether all SoCs are exactly 0.5
     # — that's a heuristic so we just record the count.
     if state.vehicle_socs:
-        defaulted = [
-            vid
-            for vid, soc in state.vehicle_socs.items()
-            if soc == 0.5
-        ]
+        defaulted = [vid for vid, soc in state.vehicle_socs.items() if soc == 0.5]
         if defaulted and len(defaulted) == len(state.vehicle_socs):
             degraded.append("telemetry_all_defaulted")
             assumptions["telemetry"] = {
@@ -154,6 +171,7 @@ def build_snapshot(
     schedules: list[dict],
     weather_features: Optional[list[dict]] = None,
     weather_forecast_id: Optional[UUID] = None,
+    recent_telemetry: Optional[list[dict]] = None,
     readiness: ReadinessReport,
     depot_metadata: Optional[dict] = None,
 ) -> OptimizationInputSnapshot:
@@ -171,11 +189,13 @@ def build_snapshot(
     else:
         org_uuid = UUID(str(organization_id))
 
+    n_steps = len(state.building_power)
     depot_payload: dict[str, object] = {
         "depot_id": str(depot_uuid),
         "max_site_power_kw": config.max_site_power,
+        "building_load_assumption_kw": config.building_load_assumption_kw,
         "delta_t_hours": config.delta_t,
-        "n_timesteps": config.n_timesteps,
+        "n_timesteps": n_steps,
     }
     if depot_metadata:
         depot_payload.update(depot_metadata)
@@ -221,15 +241,13 @@ def build_snapshot(
         for iv in state.incoming_vehicles
     ]
 
-    n_steps = len(state.building_power)
-    avg_load = (
-        sum(state.building_power) / n_steps if n_steps else 0.0
-    )
+    avg_load = sum(state.building_power) / n_steps if n_steps else 0.0
     building_payload = {
         "source": readiness.building_load_source,
         "values_kw": list(state.building_power),
         "average_kw": avg_load,
         "n_timesteps": n_steps,
+        "assumption_kw": config.building_load_assumption_kw,
     }
 
     weather_payload = list(weather_features or [])
@@ -242,7 +260,7 @@ def build_snapshot(
         snapshot_id=uuid4(),
         depot_id=depot_uuid,
         organization_id=org_uuid,
-        captured_at=datetime.utcnow(),
+        captured_at=datetime.now(timezone.utc),
         horizon_start=horizon_start,
         horizon_end=horizon_end,
         readiness=readiness,
@@ -257,6 +275,10 @@ def build_snapshot(
         weather_features=weather_payload,
         weather_forecast_id=forecast_id,
         incoming_vehicles=incoming_payload,
+        recent_telemetry=list(recent_telemetry or []),
+        code_version=get_code_version(),
+        solver_version=get_solver_version(),
+        surrogate_model_version=get_surrogate_model_version(),
     )
 
 
@@ -269,9 +291,7 @@ def snapshot_to_payload(snapshot: OptimizationInputSnapshot) -> dict[str, object
     return {
         "schema": snapshot.payload_schema,
         "depot": snapshot.depot,
-        "organization_id": (
-            str(snapshot.organization_id) if snapshot.organization_id else None
-        ),
+        "organization_id": (str(snapshot.organization_id) if snapshot.organization_id else None),
         "horizon": {
             "start": snapshot.horizon_start.isoformat(),
             "end": snapshot.horizon_end.isoformat(),
@@ -297,6 +317,12 @@ def snapshot_to_payload(snapshot: OptimizationInputSnapshot) -> dict[str, object
             else None
         ),
         "incoming_vehicles": snapshot.incoming_vehicles,
+        "recent_telemetry": snapshot.recent_telemetry,
+        "versions": {
+            "code": snapshot.code_version,
+            "solver": snapshot.solver_version,
+            "surrogate_model": snapshot.surrogate_model_version,
+        },
     }
 
 
@@ -305,8 +331,9 @@ def replay_payload(payload: dict[str, object]) -> dict[str, object]:
     field needed to reconstruct an optimization input.
 
     Returns the payload unchanged on success; raises ``ValueError`` listing
-    missing keys otherwise. The set of required keys is the contract that
-    persistence + tests both enforce.
+    missing keys or inconsistent lengths otherwise. The set of required
+    keys (and length invariants) is the contract that persistence and
+    tests both enforce.
     """
     required = {
         "schema",
@@ -320,15 +347,46 @@ def replay_payload(payload: dict[str, object]) -> dict[str, object]:
         "prices",
         "telemetry",
         "building_load",
+        "versions",
     }
     missing = sorted(required - set(payload.keys()))
     if missing:
         raise ValueError(f"snapshot payload missing required keys: {missing}")
+
     readiness = payload["readiness"]
     if not isinstance(readiness, dict):
         raise ValueError("snapshot payload 'readiness' must be a dict")
     if "building_load_source" not in readiness:
+        raise ValueError("snapshot payload 'readiness.building_load_source' is required")
+
+    depot = payload["depot"]
+    if not isinstance(depot, dict):
+        raise ValueError("snapshot payload 'depot' must be a dict")
+    n_timesteps = depot.get("n_timesteps")
+    if not isinstance(n_timesteps, int) or n_timesteps < 0:
+        raise ValueError("snapshot payload 'depot.n_timesteps' must be a non-negative int")
+
+    prices = payload.get("prices") or []
+    if not isinstance(prices, list) or len(prices) != n_timesteps:
         raise ValueError(
-            "snapshot payload 'readiness.building_load_source' is required"
+            f"snapshot payload 'prices' length {len(prices) if isinstance(prices, list) else 'NA'} "
+            f"!= depot.n_timesteps {n_timesteps}"
         )
+
+    building_load = payload.get("building_load") or {}
+    bl_values = building_load.get("values_kw", []) if isinstance(building_load, dict) else []
+    if not isinstance(bl_values, list) or len(bl_values) != n_timesteps:
+        raise ValueError(
+            f"snapshot payload 'building_load.values_kw' length "
+            f"{len(bl_values) if isinstance(bl_values, list) else 'NA'} != depot.n_timesteps "
+            f"{n_timesteps}"
+        )
+
+    versions = payload.get("versions") or {}
+    if not isinstance(versions, dict):
+        raise ValueError("snapshot payload 'versions' must be a dict")
+    for v_key in ("code", "solver", "surrogate_model"):
+        if v_key not in versions:
+            raise ValueError(f"snapshot payload 'versions.{v_key}' missing")
+
     return payload

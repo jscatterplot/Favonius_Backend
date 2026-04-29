@@ -495,6 +495,14 @@ class TestDepotSetupWrites:
         assert "field_errors" in data
         assert "validation_errors" in data
 
+    def test_non_static_building_source_rejects_assumption_kw(self, client):
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_admin"))
+        payload = _first_depot_payload()
+        payload["depot"]["building_load_source"]["assumption_kw"] = 50.0
+        response = client.post("/admin/first-depot-setup", headers=AUTH_HDR, json=payload)
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert response.json()["error_code"] == "VALIDATION_ERROR"
+
     def test_favonius_admin_write_forbidden_visibility_unchanged(self, client):
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="favonius_admin"))
         response = client.post("/admin/first-depot-setup", headers=AUTH_HDR, json=_first_depot_payload())

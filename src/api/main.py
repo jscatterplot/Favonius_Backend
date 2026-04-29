@@ -14,8 +14,8 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
-from typing import Literal, Optional
+from datetime import date, datetime, timedelta
+from typing import Iterator, Literal, Optional
 from urllib.parse import urlparse
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -37,15 +37,21 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.optimizer.exceptions import InfeasibleModelError, SolverError, SolverTimeoutError
 from ..core.state.assembler import StateAssembler
+from .reports import (
+    REPORT_GROUP_BY_VALUES,
+    SessionRow,
+    aggregate_energy_rows,
+    stream_rows_as_csv,
+)
 from ..core.state.readiness import (
     build_snapshot,
     evaluate_readiness,
@@ -134,9 +140,7 @@ def resolve_database_url() -> tuple[str, str]:
         return url, "DATABASE_URL"
     if url := os.getenv("TIMESCALE_SERVICE_URL"):
         return url, "TIMESCALE_SERVICE_URL"
-    raise RuntimeError(
-        "No database URL configured. Set DATABASE_URL or TIMESCALE_SERVICE_URL."
-    )
+    raise RuntimeError("No database URL configured. Set DATABASE_URL or TIMESCALE_SERVICE_URL.")
 
 
 async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
@@ -198,13 +202,11 @@ async def _heartbeat_loop(ts_pool: asyncpg.Pool) -> None:
     while True:
         try:
             async with ts_pool.acquire() as conn:
-                await conn.execute(
-                    """
+                await conn.execute("""
                     INSERT INTO service_heartbeat (service, last_seen)
                     VALUES ('optimizer', NOW())
                     ON CONFLICT (service) DO UPDATE SET last_seen = NOW()
-                    """
-                )
+                    """)
         except Exception as e:
             logger.warning("Heartbeat write failed: %s", e)
         await asyncio.sleep(30)
@@ -729,9 +731,7 @@ class ReadinessResponse(BaseModel):
     horizon_hours: int = Field(
         ..., ge=1, description="Horizon length used for the readiness check (hours)"
     )
-    captured_at: str = Field(
-        ..., description="Timestamp when readiness was evaluated (ISO 8601)"
-    )
+    captured_at: str = Field(..., description="Timestamp when readiness was evaluated (ISO 8601)")
     snapshot_id: Optional[str] = Field(
         None,
         description=(
@@ -985,7 +985,9 @@ class DepotMetadata(BaseModel):
     latitude: Optional[float] = Field(None, description="Depot latitude")
     longitude: Optional[float] = Field(None, description="Depot longitude")
     utility_id: Optional[str] = Field(None, description="Utility provider identifier")
-    demand_charge_billing_period: Optional[str] = Field(None, description="Demand charge billing period")
+    demand_charge_billing_period: Optional[str] = Field(
+        None, description="Demand charge billing period"
+    )
     address: Optional[dict] = Field(None, description="Address metadata")
     billing_metadata: Optional[dict] = Field(None, description="Billing metadata")
     building_load_source: Optional[dict] = Field(None, description="Building load source metadata")
@@ -1027,13 +1029,46 @@ class DepotBillingPayload(BaseModel):
 
 
 class BuildingLoadSourcePayload(BaseModel):
-    """Building load source configuration."""
+    """Building load source configuration.
 
-    type: Literal["meter", "api", "manual", "none"]
+    Per PRD §9.4 (post-HRX revision), building load is OPTIONAL for
+    initial onboarding. When ``type == 'static_assumption'``, the depot
+    supplies a single ``assumption_kw`` value that the optimizer applies
+    as a constant baseline load on the grid (so the site-power
+    constraint stays respected without a meter integration).
+
+    ``type`` values:
+        - ``meter`` — live Modbus/SCADA meter
+        - ``api`` — building management system API
+        - ``manual`` — manually entered baseline schedule
+        - ``static_assumption`` — single-scalar derate (HRX day-one)
+        - ``none`` — no source configured (read-only flag, never used
+          to drive optimization)
+    """
+
+    type: Literal["meter", "api", "manual", "static_assumption", "none"]
     provider: Optional[str] = Field(default=None, max_length=128)
     identifier: Optional[str] = Field(default=None, max_length=128)
     interval_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    assumption_kw: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Constant baseline kW applied as a derate when type='static_assumption'. "
+            "Required when type='static_assumption'; ignored otherwise."
+        ),
+    )
     notes: Optional[str] = Field(default=None, max_length=1024)
+
+    @model_validator(mode="after")
+    def _validate_assumption_required(self) -> "BuildingLoadSourcePayload":
+        """``assumption_kw`` must be set (>0) iff type=='static_assumption'."""
+        if self.type == "static_assumption":
+            if self.assumption_kw is None or self.assumption_kw <= 0:
+                raise ValueError("assumption_kw must be > 0 when type='static_assumption'")
+        elif self.assumption_kw not in (None, 0):
+            raise ValueError("assumption_kw must be omitted unless type='static_assumption'")
+        return self
 
 
 class StationaryBatteryPayload(BaseModel):
@@ -1060,7 +1095,9 @@ class DepotSetupPayload(BaseModel):
     demand_charge: DepotDemandChargePayload
     billing: DepotBillingPayload = Field(default_factory=DepotBillingPayload)
     building_load_source: BuildingLoadSourcePayload
-    stationary_battery: StationaryBatteryPayload = Field(default_factory=lambda: StationaryBatteryPayload(present=False))
+    stationary_battery: StationaryBatteryPayload = Field(
+        default_factory=lambda: StationaryBatteryPayload(present=False)
+    )
 
 
 class FirstDepotSetupRequest(BaseModel):
@@ -1120,6 +1157,7 @@ class ChargerCreateRequest(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("connectorIds must be unique")
         return value
+
 
 class ChargerOnboardingMetadata(BaseModel):
     """Provisioned charger metadata."""
@@ -1501,9 +1539,7 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
                 logger.warning(f"Depot not found: {depot_id}")
                 raise HTTPException(status_code=404, detail=error_msg)
             logger.error(f"Invalid depot configuration: {error_msg}")
-            raise HTTPException(
-                status_code=500, detail=f"Invalid depot configuration: {error_msg}"
-            )
+            raise HTTPException(status_code=500, detail=f"Invalid depot configuration: {error_msg}")
         except HTTPException:
             raise
         except Exception as e:
@@ -1709,10 +1745,14 @@ async def _build_depot_readiness_checklist(
 
     async with db_pools.static.acquire() as conn:
         has_vehicles = bool(
-            await conn.fetchval("SELECT EXISTS(SELECT 1 FROM vehicles WHERE depot_id = $1::uuid)", depot_id)
+            await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vehicles WHERE depot_id = $1::uuid)", depot_id
+            )
         )
         has_chargers = bool(
-            await conn.fetchval("SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id)
+            await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id
+            )
         )
         has_access = bool(
             await conn.fetchval(
@@ -1804,7 +1844,9 @@ async def _build_depot_readiness_checklist(
             "id": "vehicles",
             "label": "Vehicles configured",
             "status": "ready" if has_vehicles else "blocked",
-            "detail": "Vehicle fleet present" if has_vehicles else "No vehicles configured for depot",
+            "detail": (
+                "Vehicle fleet present" if has_vehicles else "No vehicles configured for depot"
+            ),
         }
     )
     checklist.append(
@@ -1820,9 +1862,11 @@ async def _build_depot_readiness_checklist(
             "id": "charger_access",
             "label": "Charger access mapped",
             "status": "ready" if has_access else "blocked",
-            "detail": "Charger/vehicle accessibility mapped"
-            if has_access
-            else "No charger_vehicle_access mappings found",
+            "detail": (
+                "Charger/vehicle accessibility mapped"
+                if has_access
+                else "No charger_vehicle_access mappings found"
+            ),
         }
     )
     checklist.append(
@@ -1830,7 +1874,9 @@ async def _build_depot_readiness_checklist(
             "id": "schedules",
             "label": "Schedules available",
             "status": "ready" if has_schedules else "blocked",
-            "detail": "Upcoming schedules found" if has_schedules else "No upcoming schedules found",
+            "detail": (
+                "Upcoming schedules found" if has_schedules else "No upcoming schedules found"
+            ),
         }
     )
     checklist.append(
@@ -1846,9 +1892,11 @@ async def _build_depot_readiness_checklist(
             "id": "building_load",
             "label": "Building load available",
             "status": "ready" if has_building_load else "blocked",
-            "detail": "Recent building load rows found"
-            if has_building_load
-            else "Missing building load data",
+            "detail": (
+                "Recent building load rows found"
+                if has_building_load
+                else "Missing building load data"
+            ),
         }
     )
     battery_status = "ready" if (not battery_present or has_battery) else "blocked"
@@ -1857,7 +1905,11 @@ async def _build_depot_readiness_checklist(
             "id": "battery",
             "label": "Stationary battery configuration",
             "status": battery_status,
-            "detail": "Battery configured" if battery_status == "ready" else "Battery marked present but not saved",
+            "detail": (
+                "Battery configured"
+                if battery_status == "ready"
+                else "Battery marked present but not saved"
+            ),
         }
     )
     return checklist
@@ -1976,7 +2028,9 @@ async def get_depot_metadata(
         raise
     except asyncpg.PostgresError as e:
         logger.error(
-            "Database error getting depot metadata: %s", e, exc_info=True,
+            "Database error getting depot metadata: %s",
+            e,
+            exc_info=True,
             extra={"depot_id": depot_id},
         )
         raise DatabaseError(f"Database error: {str(e)}")
@@ -2345,7 +2399,9 @@ async def create_charger_onboarding(
     if not db_pools:
         raise DatabaseError("Database not available")
     if not idempotency_key.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Idempotency-Key is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Idempotency-Key is required"
+        )
 
     endpoint = f"POST /admin/depots/{depot_id}/chargers"
     request_hash = _canonical_request_hash(request)
@@ -2494,7 +2550,9 @@ async def create_manual_schedules(
     depot_uuid = UUID(depot_id)
     vehicle_ids = [UUID(entry.vehicle_id) for entry in request.entries]
     async with db_pools.static.acquire() as conn:
-        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(conn, depot_uuid, vehicle_ids)
+        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(
+            conn, depot_uuid, vehicle_ids
+        )
         invalid_vehicle_ids = sorted(
             {str(vehicle_id) for vehicle_id in vehicle_ids} - valid_vehicle_ids
         )
@@ -2556,7 +2614,13 @@ async def patch_manual_schedule(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one schedule field is required",
         )
-    non_nullable_patch_fields = {"vehicle_id", "route_id", "departure_time", "return_time", "required_soc"}
+    non_nullable_patch_fields = {
+        "vehicle_id",
+        "route_id",
+        "departure_time",
+        "return_time",
+        "required_soc",
+    }
     null_fields = sorted(
         field_name
         for field_name, field_value in patch_data.items()
@@ -2585,7 +2649,9 @@ async def patch_manual_schedule(
             )
 
         vehicle_uuid = UUID(str(merged["vehicle_id"]))
-        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(conn, depot_uuid, [vehicle_uuid])
+        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(
+            conn, depot_uuid, [vehicle_uuid]
+        )
         if str(vehicle_uuid) not in valid_vehicle_ids:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -2653,6 +2719,7 @@ async def create_first_depot_setup(
     address = depot.address.model_dump(exclude_none=True)
     billing_metadata = depot.billing.model_dump(exclude_none=True)
     building_load_source = depot.building_load_source.model_dump(exclude_none=True)
+    building_load_assumption_kw = float(depot.building_load_source.assumption_kw or 0.0)
 
     async with db_pools.static.acquire() as conn:
         async with conn.transaction():
@@ -2671,6 +2738,7 @@ async def create_first_depot_setup(
                 address=address,
                 billing_metadata=billing_metadata,
                 building_load_source=building_load_source,
+                building_load_assumption_kw=building_load_assumption_kw,
             )
             if depot.stationary_battery.present:
                 max_power_kw = min(
@@ -2757,6 +2825,7 @@ async def update_depot_setup(
                 address=depot.address.model_dump(exclude_none=True),
                 billing_metadata=depot.billing.model_dump(exclude_none=True),
                 building_load_source=depot.building_load_source.model_dump(exclude_none=True),
+                building_load_assumption_kw=float(depot.building_load_source.assumption_kw or 0.0),
             )
             if not updated:
                 raise DepotNotFoundError(f"Depot {depot_id} not found")
@@ -2832,7 +2901,9 @@ async def update_depot_setup(
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
-async def run_optimization(request: OptimizationRequest, user: dict = Depends(ensure_tenant_mirrored)):
+async def run_optimization(
+    request: OptimizationRequest, user: dict = Depends(ensure_tenant_mirrored)
+):
     """Trigger depot charging optimization.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
@@ -3070,14 +3141,10 @@ async def get_depot_state(
 )
 async def get_optimization_readiness(
     depot_id: str = Depends(_require_depot_access),
-    horizon_hours: int = Query(
-        24, ge=1, le=48, description="Optimization horizon (hours)"
-    ),
+    horizon_hours: int = Query(24, ge=1, le=48, description="Optimization horizon (hours)"),
     persist: bool = Query(
         False,
-        description=(
-            "If true, write a row to optimization_input_snapshots (no run_id)."
-        ),
+        description=("If true, write a row to optimization_input_snapshots (no run_id)."),
     ),
     user: dict = Depends(ensure_tenant_mirrored),
 ):
@@ -3098,9 +3165,7 @@ async def get_optimization_readiness(
             state = await assembler.get_current_state(horizon_hours)
             await assembler.fetch_snapshot_extras(*assembler.last_horizon)
     except TimeoutError:
-        raise HTTPException(
-            status_code=503, detail="Readiness check timed out after 30s"
-        )
+        raise HTTPException(status_code=503, detail="Readiness check timed out after 30s")
 
     readiness = evaluate_readiness(
         config,
@@ -3125,6 +3190,7 @@ async def get_optimization_readiness(
             schedules=assembler.last_schedules,
             weather_features=assembler.last_weather_features,
             weather_forecast_id=assembler.last_weather_forecast_id,
+            recent_telemetry=assembler.last_recent_telemetry,
             readiness=readiness,
         )
         try:
@@ -3150,6 +3216,407 @@ async def get_optimization_readiness(
         captured_at=datetime.utcnow().isoformat(),
         snapshot_id=snapshot_id,
     )
+
+
+# ============ Energy Reporting Endpoints ============
+
+class EnergyReportCost(BaseModel):
+    """Cost breakdown for a single report row."""
+
+    amount: float = Field(..., description="Total cost for the bucket")
+    currency: str = Field(..., description="ISO 4217 currency code")
+    estimated: bool = Field(
+        False,
+        description=(
+            "True when any session in the bucket lacked cost_total and was "
+            "estimated using the depot tariff under_cap_rate."
+        ),
+    )
+
+
+class EnergyReportRow(BaseModel):
+    """Single row of an energy report."""
+
+    bucket: str = Field(..., description="Calendar bucket key in depot timezone (YYYY-MM)")
+    vehicle_id: Optional[str] = Field(None, description="Vehicle UUID or 'unassigned'")
+    charger_id: Optional[str] = Field(None, description="Charger UUID or 'unassigned'")
+    driver_id: Optional[str] = Field(None, description="Driver UUID or 'unassigned'")
+    card_id: Optional[str] = Field(None, description="RFID card UUID or 'unassigned'")
+    energy_kwh: float = Field(..., description="Total energy delivered in the bucket (kWh)")
+    session_count: int = Field(..., description="Number of charging sessions in the bucket")
+    avg_kw: float = Field(..., description="Average charging power across sessions (kWh / hours)")
+    cost: EnergyReportCost = Field(..., description="Bucketed cost (sum or estimate)")
+
+
+class EnergyReportResponse(BaseModel):
+    """Response from /reports/depots/{depot_id}/energy/monthly."""
+
+    depot_id: str
+    currency: str
+    from_: str = Field(..., alias="from")
+    to: str
+    rows: list[EnergyReportRow]
+
+    model_config = {"populate_by_name": True}
+
+
+def _parse_report_date(value: str, field_name: str) -> date:
+    """Parse an ISO 8601 calendar date for the from/to query parameters."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {field_name} date '{value}': expected ISO 8601 (YYYY-MM-DD)",
+        ) from exc
+
+
+def _validate_report_group_by(group_by: Optional[str]) -> Optional[str]:
+    """Validate the optional group_by query parameter."""
+    if group_by is None:
+        return None
+    if group_by not in REPORT_GROUP_BY_VALUES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid group_by '{group_by}': must be one of "
+                f"{', '.join(REPORT_GROUP_BY_VALUES)}"
+            ),
+        )
+    return group_by
+
+
+async def _verify_depot_access_for_report(depot_id: str, user: dict) -> None:
+    """Run verify_depot_access and re-raise 403s with error_code=CROSS_ORG_DENIED."""
+    try:
+        await verify_depot_access(
+            depot_id, user, db_pools.static if db_pools else None
+        )
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error_code": "CROSS_ORG_DENIED",
+                    "message": exc.detail
+                    if isinstance(exc.detail, str)
+                    else "Access denied: cross-organization access is not permitted",
+                },
+            ) from exc
+        raise
+
+
+def _coerce_under_cap_rate(billing_metadata: Optional[dict]) -> Optional[float]:
+    """Pull the depot tariff under_cap_rate out of billing_metadata."""
+    if not isinstance(billing_metadata, dict):
+        return None
+    raw = billing_metadata.get("under_cap_rate")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring non-numeric under_cap_rate in billing_metadata: %r", raw
+        )
+        return None
+
+
+def _optional_text(value: object) -> Optional[str]:
+    """Normalize nullable report dimension values from asyncpg records."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+async def _load_report_context(
+    depot_id: str,
+) -> tuple[str, str, Optional[float], list[str], dict[str, str]]:
+    """Fetch depot reporting context and charger mappings from static DB."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        depot_row = await conn.fetchrow(
+            """
+            SELECT timezone, currency, billing_metadata
+            FROM depots
+            WHERE depot_id = $1::uuid
+            """,
+            depot_id,
+        )
+        if not depot_row:
+            raise DepotNotFoundError(f"Depot {depot_id} not found")
+
+        charger_rows = await conn.fetch(
+            "SELECT charger_id::text AS charger_id, ocpp_id FROM chargers WHERE depot_id = $1::uuid",
+            depot_id,
+        )
+
+    timezone_name = depot_row["timezone"] or "America/Los_Angeles"
+    currency = depot_row["currency"] or "USD"
+    billing_metadata = depot_row["billing_metadata"]
+    if isinstance(billing_metadata, str):
+        try:
+            billing_metadata = json.loads(billing_metadata)
+        except (TypeError, ValueError):
+            billing_metadata = {}
+    under_cap_rate = _coerce_under_cap_rate(billing_metadata)
+
+    ocpp_ids = [r["ocpp_id"] for r in charger_rows]
+    charger_id_by_ocpp_id = {r["ocpp_id"]: r["charger_id"] for r in charger_rows}
+    return timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id
+
+
+async def _fetch_session_rows(
+    depot_id: str,
+    timezone_name: str,
+    ocpp_ids: list[str],
+    charger_id_by_ocpp_id: dict[str, str],
+    from_date: date,
+    to_date: date,
+) -> list[SessionRow]:
+    """Fetch charging_sessions rows in [from, to] (inclusive) in depot TZ."""
+    if not db_pools or db_pools.ts is None:
+        raise DatabaseError("Database not available")
+    if not ocpp_ids:
+        return []
+
+    query = """
+        SELECT
+            cs.start_time,
+            cs.end_time,
+            cs.energy_delivered_kwh,
+            cs.cost_total,
+            cs.vehicle_id::text AS vehicle_id,
+            cs.station_id AS charger_id,
+            cs.driver_id::text AS driver_id,
+            cs.card_id::text AS card_id
+        FROM charging_sessions cs
+        WHERE cs.station_id = ANY($1::text[])
+          AND cs.start_time >= ($2::date)::timestamp AT TIME ZONE $4
+          AND cs.start_time < (($3::date) + INTERVAL '1 day')::timestamp AT TIME ZONE $4
+        ORDER BY cs.start_time
+        """
+
+    async with db_pools.ts.acquire() as conn:
+        records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name)
+
+    rows: list[SessionRow] = []
+    for r in records:
+        energy = r["energy_delivered_kwh"]
+        cost = r["cost_total"]
+        rows.append(
+            SessionRow(
+                start_time=r["start_time"],
+                end_time=r["end_time"],
+                energy_kwh=float(energy) if energy is not None else None,
+                cost_total=float(cost) if cost is not None else None,
+                vehicle_id=_optional_text(r["vehicle_id"]),
+                charger_id=charger_id_by_ocpp_id.get(r["charger_id"]),
+                driver_id=_optional_text(r["driver_id"]),
+                card_id=_optional_text(r["card_id"]),
+            )
+        )
+    return rows
+
+
+async def _build_energy_report(
+    depot_id: str,
+    from_str: str,
+    to_str: str,
+    group_by: Optional[str],
+) -> tuple[dict, list[dict], str]:
+    """Run the full report pipeline and return (metadata, rows, currency)."""
+    from_date = _parse_report_date(from_str, "from")
+    to_date = _parse_report_date(to_str, "to")
+    if to_date < from_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'to' must be on or after 'from'",
+        )
+
+    timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
+        await _load_report_context(depot_id)
+    )
+    sessions = await _fetch_session_rows(
+        depot_id, timezone_name, ocpp_ids, charger_id_by_ocpp_id, from_date, to_date
+    )
+    rows = aggregate_energy_rows(
+        sessions,
+        timezone=timezone_name,
+        group_by=group_by,
+        under_cap_rate=under_cap_rate,
+        currency=currency,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    metadata = {
+        "depot_id": depot_id,
+        "currency": currency,
+        "from": from_str,
+        "to": to_str,
+    }
+    return metadata, rows, currency
+
+
+@app.get(
+    "/reports/depots/{depot_id}/energy/monthly",
+    response_model=EnergyReportResponse,
+    tags=["depots"],
+    summary="Energy report aggregated by month",
+    description=(
+        "Aggregate ``charging_sessions.energy_delivered_kwh`` into monthly "
+        "buckets in the depot's local timezone. Optional ``group_by`` "
+        "splits each bucket by vehicle, charger, driver, or card. NULL "
+        "identity columns collapse into an 'unassigned' bucket."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Cross-organization access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_energy_report_monthly(
+    depot_id: str,
+    from_: str = Query(..., alias="from", description="Start date (YYYY-MM-DD, inclusive, depot TZ)"),
+    to: str = Query(..., description="End date (YYYY-MM-DD, inclusive, depot TZ)"),
+    group_by: Optional[str] = Query(
+        None,
+        description="Optional grouping dimension: vehicle | charger | driver | card",
+    ),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Monthly energy + cost rollup for a depot."""
+    validate_depot_id(depot_id)
+    await _verify_depot_access_for_report(depot_id, user)
+    grouping = _validate_report_group_by(group_by)
+
+    try:
+        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+    except DepotNotFoundError:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error generating energy report: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+    return {**metadata, "rows": rows}
+
+
+@app.get(
+    "/reports/depots/{depot_id}/energy/sessions",
+    response_model=EnergyReportResponse,
+    tags=["depots"],
+    summary="Energy report broken out per session-derived row",
+    description=(
+        "Same shape as ``/energy/monthly`` but always grouped by session "
+        "identity dimensions (vehicle/charger/driver/card). The default "
+        "grouping is ``vehicle`` so a sessions roll-up still answers "
+        "'who/what charged when'. Supports the same ``group_by`` enum as "
+        "the monthly endpoint."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Cross-organization access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_energy_report_sessions(
+    depot_id: str,
+    from_: str = Query(..., alias="from"),
+    to: str = Query(...),
+    group_by: Optional[str] = Query(
+        "vehicle",
+        description="Grouping dimension: vehicle | charger | driver | card",
+    ),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Sessions-grained energy + cost rollup."""
+    validate_depot_id(depot_id)
+    await _verify_depot_access_for_report(depot_id, user)
+    grouping = _validate_report_group_by(group_by)
+    if grouping is None:
+        grouping = "vehicle"
+
+    try:
+        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+    except DepotNotFoundError:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error generating sessions report: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+    return {**metadata, "rows": rows}
+
+
+@app.get(
+    "/reports/depots/{depot_id}/energy/monthly.csv",
+    tags=["depots"],
+    summary="Energy report (CSV stream)",
+    description=(
+        "CSV equivalent of ``/reports/depots/{depot_id}/energy/monthly``. "
+        "Body is streamed via ``StreamingResponse``; rows match the JSON "
+        "endpoint one-for-one."
+    ),
+    responses={
+        200: {"content": {"text/csv": {}}, "description": "CSV report stream"},
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Cross-organization access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_energy_report_monthly_csv(
+    depot_id: str,
+    from_: str = Query(..., alias="from"),
+    to: str = Query(...),
+    group_by: Optional[str] = Query(None),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Stream the monthly energy report as CSV."""
+    validate_depot_id(depot_id)
+    await _verify_depot_access_for_report(depot_id, user)
+    grouping = _validate_report_group_by(group_by)
+
+    try:
+        _, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+    except DepotNotFoundError:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error generating energy CSV: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+    filename = f"depot_{depot_id}_energy_{from_}_{to}.csv"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+
+    # Bind to a local so the generator captures a stable reference.
+    rows_for_stream = rows
+
+    def _generate() -> Iterator[str]:
+        yield from stream_rows_as_csv(rows_for_stream, group_by=grouping)
+
+    return StreamingResponse(_generate(), media_type="text/csv", headers=headers)
 
 
 @app.get(
@@ -3325,16 +3792,20 @@ async def get_depot_alerts(
                 """,
                 depot_id,
             )
-            fault_rows = await conn.fetch(
-                """
+            fault_rows = (
+                await conn.fetch(
+                    """
                 SELECT DISTINCT ON (station_id, connector_id)
                     station_id, connector_id, status, error_code, timestamp
                 FROM connector_status
                 WHERE station_id = ANY($1) AND status = 'Faulted'
                 ORDER BY station_id, connector_id, timestamp DESC
                 """,
-                depot_ocpp_ids,
-            ) if depot_ocpp_ids else []
+                    depot_ocpp_ids,
+                )
+                if depot_ocpp_ids
+                else []
+            )
 
         last_optimization: Optional[LastOptimizationItem] = None
         if last_row:
@@ -3537,12 +4008,8 @@ async def send_handoff(
                 if signing_key:
                     import json as _json
 
-                    payload_bytes = _json.dumps(
-                        receive_payload, sort_keys=True
-                    ).encode()
-                    sig = hmac.new(
-                        signing_key.encode(), payload_bytes, hashlib.sha256
-                    ).hexdigest()
+                    payload_bytes = _json.dumps(receive_payload, sort_keys=True).encode()
+                    sig = hmac.new(signing_key.encode(), payload_bytes, hashlib.sha256).hexdigest()
                     receive_payload["signature"] = sig
 
                 response = await client.post(receive_url, json=receive_payload)
@@ -4192,7 +4659,9 @@ async def _handle_schedule_adjust(
     try:
         by_time_dt = datetime.fromisoformat(str(by_time).replace("Z", "+00:00"))
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail="by_time must be a valid ISO 8601 datetime") from exc
+        raise HTTPException(
+            status_code=422, detail="by_time must be a valid ISO 8601 datetime"
+        ) from exc
 
     if dry_run:
         return {
@@ -4402,8 +4871,9 @@ async def execute_command(
     spec = _COMMAND_REGISTRY.get(body.command)
     if spec is None:
         raise HTTPException(
-            status_code=400, detail=f"Unknown command '{body.command}'. "
-            f"Valid commands: {sorted(_COMMAND_REGISTRY)}"
+            status_code=400,
+            detail=f"Unknown command '{body.command}'. "
+            f"Valid commands: {sorted(_COMMAND_REGISTRY)}",
         )
 
     user_role = get_user_role(user)

@@ -133,7 +133,7 @@ Each depot runs its own optimization independently. Vehicles can move between de
 | **TimescaleDB for telemetry** | Optimized for time-series; compression for long-term storage |
 | **OCPP 1.6J only (MVP)** | 1.6J is dominant in field; chargers supporting 2.0.1 MUST be configured to use 1.6J subprotocol (not wire-compatible) |
 | **CCS connector only (MVP)** | Simplifies physical constraints; dominant DC fast charging standard |
-| **Building load required** | Enables accurate grid power tracking; sellable feature |
+| **Building load optional (deferred)** | Originally targeted as required for accurate grid power tracking. Deferred for initial customer onboarding (e.g. HRX): if `building_load` is not configured, the optimizer runs in **degraded mode** — it derates `max_grid_kw` by a conservative building-load assumption (configured per depot, defaults to a depot setup field) and marks the run `degraded`. Hard site-power constraint MUST still be respected. Re-introduced as required once meter/BMS integrations land. |
 | **VDV 463 for transit operations** | Standard interface for European transit market; enables ITCS/BMS integration |
 | **VDV 261 preconditioning via VDV 463** | VDV 463 `manualPreconditioning`/`automaticPreconditioning` fields handle preconditioning requests without full VDV 261 ISO 15118 stack |
 
@@ -199,7 +199,7 @@ SO THAT I can reduce monthly electricity costs
 - [ ] Optimization objective includes demand charge component
 - [ ] Month-to-date peak demand is visible via API
 - [ ] Battery storage dispatched to shave peaks
-- [ ] Building load included in grid power calculation
+- [ ] Building load included in grid power calculation when configured; otherwise a depot-level building-load assumption is applied as a `max_grid_kw` derate and the run is marked `degraded`
 
 #### US-03: Re-optimization on Price Spikes
 ```
@@ -1969,26 +1969,32 @@ When a StartTransaction is received:
 
 ### 9.4 Building Load Integration
 
-**Data Sources:**
-1. **Modbus Meter** (preferred): Direct connection to building power meter
-2. **Building Management System API**: Integration with BMS/SCADA
-3. **Forecast Model**: Historical patterns + calendar events (fallback)
+**Status:** OPTIONAL for initial customer onboarding (e.g. HRX pilot). Required once a meter/BMS integration is delivered. The optimizer MUST always respect the depot's hard site-power limit (`max_grid_kw`) regardless of building-load source.
 
-**Data Format:**
+**Data Sources (in preference order):**
+1. **Modbus Meter** (preferred, future): Direct connection to building power meter
+2. **Building Management System API**: Integration with BMS/SCADA
+3. **Forecast Model**: Historical patterns + calendar events
+4. **Static depot-level assumption**: Conservative constant `building_load_assumption_kw` configured at depot setup. Used when no live source is available. Applied as a derate on `max_grid_kw` so the site limit is never violated.
+
+**Data Format (when live source available):**
 - Time-series: `(timestamp, power_kw)` at 15-minute intervals
 - Forecast horizon: 24 hours ahead
 - Update frequency: Every 15 minutes (real-time) or hourly (forecast)
 
 **Storage:**
-- Stored in `building_load` hypertable
+- Live samples stored in `building_load` hypertable
+- The depot-level static assumption is stored on the `depots` row and copied into each optimization input snapshot
 - Used directly in optimization grid power balance constraint
 
 **Behavior:**
-- Building load is REQUIRED for accurate grid power calculation
-- If meter unavailable, use forecast model (degraded mode)
-- If no forecast available, assume 0 kW and log critical warning
-- Optimization will still run but with reduced accuracy
-- All building load sources are logged for audit trail
+- If a live source (meter/BMS/forecast) is configured AND data is fresh, use it directly in the grid power constraint
+- If no live source is configured, the optimization runs in **degraded mode**:
+  - Effective grid headroom = `max_grid_kw − building_load_assumption_kw`
+  - Run is marked `status='degraded'` with reason `building_load_unavailable`
+  - Snapshot records the assumption value used
+- If a live source is configured but data is stale (older than the configured freshness window), fall through to the static assumption AND mark `degraded`
+- All building load sources used (live, forecast, or static assumption) are logged in the optimization input snapshot for audit trail
 
 ### 9.5 Fleet Management System
 
@@ -2689,12 +2695,26 @@ AND handoff message includes battery_kwh and max_charge_kw
 ```
 
 #### AT-07: Building Load Integration
+
+**AT-07a (live source configured):**
 ```gherkin
-GIVEN a depot with building load averaging 50 kW
+GIVEN a depot with a live building-load source averaging 50 kW
 AND building load peaks at 80 kW during morning hours
 WHEN optimization runs
 THEN grid power calculation includes building load
 AND peak demand accounts for both charging and building load
+AND optimization status is 'optimal' or 'feasible'
+```
+
+**AT-07b (no live source — degraded mode, e.g. HRX day-one):**
+```gherkin
+GIVEN a depot with no live building-load source configured
+AND depot.building_load_assumption_kw = 30
+WHEN optimization runs
+THEN max_grid_kw is derated by 30 kW for the site-power constraint
+AND optimization run status is 'degraded' with reason 'building_load_unavailable'
+AND the input snapshot records the assumption value used
+AND no schedule causes site grid draw + 30 kW to exceed max_grid_kw
 ```
 
 #### AT-08: VDV 463 Charging Request Integration
@@ -2901,7 +2921,7 @@ Critical Constraints:
 - Optimization solve time MUST be < 60 seconds
 - OCPP 1.6J is the ONLY supported protocol (chargers MUST use 1.6J subprotocol)
 - CCS is the only supported connector type for MVP
-- Building load is REQUIRED in grid power calculation
+- Building load is OPTIONAL for initial onboarding (deferred). When no live source is configured, run in degraded mode with a depot-level static assumption derate so `max_grid_kw` is still respected. Required once meter/BMS integration is delivered.
 - VDV 463 v1.1.0 is the target protocol version
 - Preconditioning is a SOFT constraint (can be curtailed under site limit)
 
