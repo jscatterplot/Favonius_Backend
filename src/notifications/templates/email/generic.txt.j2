@@ -1,0 +1,11 @@
+{{ severity_display }}: {{ title }}
+{{ occurrence_count_text }}
+
+{% if detail %}
+{% for key, value in detail.items() %}  {{ key }}: {{ value }}
+{% endfor %}
+{% endif %}
+
+--
+Favonius Energy alerts
+Alert id: {{ alert_id }}

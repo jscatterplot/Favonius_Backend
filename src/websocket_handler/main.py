@@ -12,6 +12,9 @@ from .analytics_service import AnalyticsService
 from .api_server import APIServer
 from .auth_manager import AuthManager
 from .charging_profile_manager import ChargingCommandQueueConsumer
+from src.notifications.dispatcher import AlertDispatcher
+from src.notifications.email_client import EmailDeliveryClient, FakeEmailClient
+from src.notifications.resend_client import ResendEmailClient
 from .config import Config
 from .config_validator import ConfigValidator
 from .connection_monitor import ConnectionMonitor
@@ -65,6 +68,11 @@ class Application:
         # charging_command_queue rows that the FastAPI optimizer enqueues.
         self.queue_consumer: Optional[ChargingCommandQueueConsumer] = None
         self._active_tx_reconciler_task: Optional[asyncio.Task] = None
+
+        # Alerts pipeline (see docs/plans/alerts-pipeline.md). Optional —
+        # disabled by default in test envs without a Resend key.
+        self.alert_dispatcher: Optional[AlertDispatcher] = None
+        self._email_client: Optional[EmailDeliveryClient] = None
 
         # State
         self.running = False
@@ -154,6 +162,11 @@ class Application:
             self._active_tx_reconciler_task = asyncio.create_task(
                 self._active_tx_reconciler(), name="active_tx_reconciler"
             )
+
+            # Alerts dispatcher (optional). Only starts when notifications
+            # are enabled; the migration 022 trigger already produces
+            # notification_alerts rows independently.
+            await self._initialize_alert_dispatcher()
 
             # Start WebSocket server
             self.running = True
@@ -366,6 +379,12 @@ class Application:
             self._active_tx_reconciler_task.cancel()
             stop_tasks.append(self._active_tx_reconciler_task)
 
+        # Stop alert dispatcher before tearing down the DB pool.
+        if self.alert_dispatcher:
+            stop_tasks.append(self.alert_dispatcher.stop())
+        if isinstance(self._email_client, ResendEmailClient):
+            stop_tasks.append(self._email_client.aclose())
+
         # Stop connection monitoring
         if self.connection_monitor:
             stop_tasks.append(self.connection_monitor.stop_monitoring())
@@ -432,6 +451,49 @@ class Application:
                 except Exception:
                     pass
                 self.timescale_client = None
+
+    async def _initialize_alert_dispatcher(self) -> None:
+        """Wire up the alerts pipeline dispatcher.
+
+        Skipped when notifications are disabled via EMAIL_DELIVERY_ENABLED=false
+        or when the timescale pool isn't available. Without a Resend API key
+        we still start the dispatcher with a FakeEmailClient — useful for
+        staging/dev so alerts move through the pipeline and we can inspect
+        notification_deliveries without sending real email.
+        """
+        notifications_cfg = self.config.notifications
+        if not notifications_cfg.enabled:
+            self.logger.info("alerts: dispatcher disabled (EMAIL_DELIVERY_ENABLED=false)")
+            return
+
+        if not self.timescale_client or not self.timescale_client.pg_pool:
+            self.logger.warning(
+                "alerts: dispatcher not started; timescale pg_pool unavailable"
+            )
+            return
+
+        if notifications_cfg.resend_api_key:
+            self._email_client = ResendEmailClient(
+                api_key=notifications_cfg.resend_api_key,
+                default_from=notifications_cfg.resend_from_address,
+            )
+            self.logger.info("alerts: using Resend for outbound email")
+        else:
+            self._email_client = FakeEmailClient()
+            self.logger.warning(
+                "alerts: RESEND_API_KEY missing; dispatcher running with "
+                "FakeEmailClient — emails will NOT be delivered"
+            )
+
+        self.alert_dispatcher = AlertDispatcher(
+            pool=self.timescale_client.pg_pool,
+            email_client=self._email_client,
+            default_from=notifications_cfg.resend_from_address,
+            poll_interval_s=notifications_cfg.poll_interval_s,
+            resend_interval_s=notifications_cfg.resend_interval_s,
+            batch_size=notifications_cfg.batch_size,
+        )
+        await self.alert_dispatcher.start()
 
     async def _initialize_supabase_components(self) -> None:
         """Initialize Supabase components."""

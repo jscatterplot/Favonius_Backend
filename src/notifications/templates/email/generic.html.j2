@@ -1,0 +1,12 @@
+{% extends "_base.html.j2" %}
+{% block body %}
+  <p>{{ title }}</p>
+  {% if detail %}
+  <dl class="detail">
+    {% for key, value in detail.items() %}
+    <dt>{{ key }}</dt>
+    <dd>{{ value }}</dd>
+    {% endfor %}
+  </dl>
+  {% endif %}
+{% endblock %}

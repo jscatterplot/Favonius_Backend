@@ -185,6 +185,32 @@ class MainApiConfig(BaseModel):
         return bool(self.url)
 
 
+class NotificationsConfig(BaseModel):
+    """Alerts pipeline configuration (see docs/plans/alerts-pipeline.md)."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable the AlertDispatcher loop. False disables both LISTEN and polling.",
+    )
+    resend_api_key: str = Field(default="", description="Resend API bearer token")
+    resend_from_address: str = Field(
+        default="alerts@favonius.energy",
+        description="Default sender address for outbound alert emails",
+    )
+    poll_interval_s: float = Field(
+        default=30.0,
+        description="Reconciliation poll cadence; safety net for dropped pg_notify events",
+    )
+    resend_interval_s: int = Field(
+        default=3600,
+        description="Minimum seconds between re-notifications for a still-active alert",
+    )
+    batch_size: int = Field(
+        default=50,
+        description="Maximum alerts processed per dispatcher tick",
+    )
+
+
 class VDV463Config(BaseModel):
     """VDV 463 transit operations configuration."""
 
@@ -214,6 +240,7 @@ class Config(BaseModel):
     optimization: OptimizationServiceConfig = Field(default_factory=OptimizationServiceConfig)
     vdv463: VDV463Config = Field(default_factory=VDV463Config)
     main_api: MainApiConfig = Field(default_factory=MainApiConfig)
+    notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
 
     # Environment-specific settings
     environment: str = Field(
@@ -358,6 +385,17 @@ class Config(BaseModel):
                 validation_mode=os.getenv("VDV463_VALIDATION_MODE", "soft"),
                 schema_dir=os.getenv("VDV463_SCHEMA_DIR"),
                 default_depot_id=os.getenv("VDV463_DEFAULT_DEPOT_ID"),
+            ),
+            notifications=NotificationsConfig(
+                enabled=os.getenv("EMAIL_DELIVERY_ENABLED", "true").lower() == "true",
+                resend_api_key=secrets_manager.get_secret("RESEND_API_KEY")
+                or os.getenv("RESEND_API_KEY", ""),
+                resend_from_address=os.getenv(
+                    "RESEND_FROM_ADDRESS", "alerts@favonius.energy"
+                ),
+                poll_interval_s=float(os.getenv("ALERT_DISPATCHER_POLL_INTERVAL_S", "30")),
+                resend_interval_s=int(os.getenv("ALERT_NOTIFY_RESEND_INTERVAL_S", "3600")),
+                batch_size=int(os.getenv("ALERT_DISPATCHER_BATCH_SIZE", "50")),
             ),
             main_api=MainApiConfig(
                 url=os.getenv("MAIN_API_URL", ""),

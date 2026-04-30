@@ -70,6 +70,8 @@ dependencies = [
     # API framework
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
+    # Email templates (alerts pipeline; see docs/plans/alerts-pipeline.md)
+    "jinja2>=3.1.0",
     # Weather API
     "openmeteo-requests>=1.2.0",
     "requests-cache>=1.1.0",
@@ -106,7 +108,7 @@ Repository = "https://github.com/favonius-energy/favonius-backend"
 packages = ["src"]
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml", "*.yml", "*.json"]
+"*" = ["*.yaml", "*.yml", "*.json", "*.j2"]
 
 # Black configuration
 [tool.black]

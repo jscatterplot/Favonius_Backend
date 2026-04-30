@@ -328,7 +328,10 @@ These come directly from the PRD and are non-negotiable:
 - `interdepot_messages` — Cross-depot vehicle handoff messages
 - `trigger_log` — Audit trail of re-optimization triggers
 - `audit_log` — Application-level admin audit trail (cross-org reads, credential rotations). Distinct from `security_audit_log` (NKSC hypertable). Columns: `id, occurred_at, actor_user_id, actor_role, organization_id, depot_id, action, target_type, target_id, metadata` (JSONB). Common `action` values: `admin.read`, `charger.credentials.rotated`. Written by `src/security/admin_audit.py` from `_record_admin_action` after the endpoint succeeds.
-- `connector_status` — OCPP StatusNotification records per connector. Append-only; the latest row per `(station_id, connector_id)` is the current state. The legacy WS handler appends an `Unavailable`/`ConnectionLost` row when the WebSocket drops.
+- `connector_status` — OCPP StatusNotification records per connector. Append-only; the latest row per `(station_id, connector_id)` is the current state. The legacy WS handler appends an `Unavailable`/`ConnectionLost` row when the WebSocket drops. Migration 022 attaches the `fn_alerts_on_connector_status` trigger that produces `notification_alerts` rows on Faulted/Unavailable transitions and PERFORMs `pg_notify('notification_alerts_new', …)`.
+- `notification_alerts` — Depot/org-scoped alert aggregator (migration 022). Partial unique index `(organization_id, dedup_key) WHERE status != 'resolved'` keeps one active row per fault; resolved rows let new occurrences in. `severity_level` is a generated SMALLINT (1=info, 2=warning, 3=critical). Status: `'active' | 'acknowledged' | 'resolved'`.
+- `notification_recipients` — Per-org email subscribers (migration 022). `alert_types` is `TEXT[]` where `'{*}'` matches all types; `min_severity` (with generated `min_severity_level`) gates which alerts the recipient receives.
+- `notification_deliveries` — Append-only delivery ledger (migration 022). `UNIQUE (alert_id, recipient_id, notified_count)` is the idempotency anchor. Status: `'sent' | 'delivered' | 'bounced' | 'complained' | 'failed'`. Updated by the `POST /webhooks/resend` handler from Resend events.
 
 ### Key columns
 - All UUIDs use `gen_random_uuid()` as default
@@ -351,7 +354,8 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `POST` | `/optimize` | Trigger depot MILP optimization |
 | `GET` | `/depots/{id}/state` | Current SoCs, battery state, peak demand, price |
 | `GET` | `/depots/{id}/schedule` | Latest charging schedule |
-| `GET` | `/depots/{id}/alerts` | Charger faults + last optimization status |
+| `GET` | `/depots/{id}/alerts` | Charger faults + last optimization + notification_alerts (alerts pipeline) |
+| `POST` | `/depots/{id}/alerts/{alert_id}/acknowledge` | Mark a notification alert as acknowledged (alerts pipeline) |
 | `POST` | `/depots/{id}/vehicles/{vid}/handoff` | Send inter-depot handoff |
 | `POST` | `/depots/{id}/handoff/receive` | Receive inter-depot handoff |
 | `GET` | `/health` | Component health (DB, OCPP server, Gurobi license) |
@@ -365,6 +369,11 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `GET` | `/admin/depots/{id}/chargers/{charger_id}/credentials_status` | `{configured, created_at, last_rotated_at}` only — never plaintext or password_hash (favonius_admin or tenant member; cross-org reads write `admin.read`) |
 | `POST` | `/admin/depots/{id}/chargers/{charger_id}/rotate_credentials` | Generate new Basic Auth credential, replace `station_credentials.password_hash`, return plaintext exactly once (favonius_admin or matching customer_admin; writes `charger.credentials.rotated`) |
 | `GET` | `/admin/ocpp/{cp_id}/state` | (Legacy WS handler, port 8080) Per-charger debug dump: connection state, vendor/model, last_boot_at, last_heartbeat_at, latest connector_status, open transactions, charging_command_queue rollup. Owner role required. |
+| `GET` | `/admin/organizations/{org_id}/notification_recipients` | List alert recipients (favonius_admin or matching customer_admin; cross-org reads write `admin.read`) |
+| `POST` | `/admin/organizations/{org_id}/notification_recipients` | Create a recipient (alerts pipeline). 409 on duplicate `(org, email)`. |
+| `PATCH` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Patch a recipient |
+| `DELETE` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Hard-delete a recipient (cascades deliveries). |
+| `POST` | `/webhooks/resend` | Public, signature-verified Resend webhook for delivery status updates (alerts pipeline) |
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)
@@ -719,6 +728,20 @@ test(api): add coverage for handoff rate limiting
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `CORS_ORIGINS` | `*` | Allowed CORS origins (comma-separated) |
 
+### Alerts pipeline (notifications)
+See `docs/plans/alerts-pipeline.md` for the full design.
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMAIL_DELIVERY_ENABLED` | `true` | Master switch for the AlertDispatcher in the WS handler. False disables both LISTEN and the polling backstop. |
+| `RESEND_API_KEY` | — | Resend API bearer token. Without this, the dispatcher runs with `FakeEmailClient` and logs a warning (no real emails). |
+| `RESEND_FROM_ADDRESS` | `alerts@favonius.energy` | Default sender address. |
+| `RESEND_WEBHOOK_SECRET` | — | HMAC secret for `POST /webhooks/resend` signature verification. Without this every webhook call returns 401. |
+| `ALERT_DISPATCHER_POLL_INTERVAL_S` | `30` | Reconciliation cadence; safety net for dropped pg_notify events (decision 4.4). |
+| `ALERT_NOTIFY_RESEND_INTERVAL_S` | `3600` | Minimum interval between re-notifications for a still-active alert. |
+| `ALERT_DISPATCHER_BATCH_SIZE` | `50` | Maximum alerts processed per dispatcher tick. |
+| `WEB_CONCURRENCY` | (unset) | The dispatcher relies on a single-worker assumption (decision 4.1). If this is set above 1, startup logs CRITICAL and double-emails are likely. |
+
 See `.env.example` for full reference with comments.
 
 ---
@@ -783,6 +806,7 @@ Before marking any feature complete, verify:
 | AT-05 | Return Time Deviation — triggered on >15 min late return |
 | AT-06 | Inter-Depot Handoff — vehicle seamlessly handed off between depots |
 | AT-07 | Building Load Integration — grid power calc includes building load |
+| AT-17 | Alerts Pipeline End-to-End — Faulted → trigger → dispatcher email → Resend webhook → ack via API → recovery → resolve. See `tests/e2e/test_alerts_pipeline_e2e.py` and `docs/plans/alerts-pipeline.md`. |
 
 ---
 

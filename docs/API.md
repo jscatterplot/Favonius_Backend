@@ -107,7 +107,7 @@ Get current charging schedule.
 ---
 
 ### GET /depots/{depot_id}/alerts
-Get active charger faults and last optimization outcome for ops visibility (PRD §7.1, §10.5, AT-16).
+Get active charger faults, last optimization outcome, and pipeline alerts for ops visibility (PRD §7.1, §10.5, AT-16, AT-17).
 
 **Response:**
 ```json
@@ -129,14 +129,106 @@ Get active charger faults and last optimization outcome for ops visibility (PRD 
         "solver_used": "gurobi",
         "solve_time_s": 12.3,
         "timestamp": "2025-12-04T09:00:00Z"
-    }
+    },
+    "notification_alerts": [
+        {
+            "id": "uuid",
+            "alert_type": "charger_fault",
+            "severity": "critical",
+            "title": "Charger CP001 connector 1: Faulted",
+            "detail": {"station_id": "CP001", "connector_id": 1, "status": "Faulted", "error_code": "PowerMeterFailure"},
+            "status": "active",
+            "first_occurrence_at": "2025-12-04T09:55:00+00:00",
+            "last_occurrence_at": "2025-12-04T10:00:00+00:00",
+            "last_notified_at": "2025-12-04T09:55:30+00:00"
+        }
+    ]
 }
 ```
 
-- `charger_faults`: Active faults from OCPP StatusNotification (fault codes per OCPP 1.6). Cleared when charger sends status without fault.
+- `charger_faults`: Active faults from OCPP StatusNotification (legacy view; raw rows from `connector_status`).
 - `last_optimization`: Most recent run; `status` is `optimal`, `feasible`, `degraded`, `infeasible`, `timeout`, or `error`. Omitted if no run exists for the depot.
+- `notification_alerts`: Aggregated alerts from the alerts pipeline. `status` is `active` or `acknowledged`; `resolved` rows are not returned. `severity` is `info | warning | critical`. `last_notified_at` is null until the dispatcher first emails it.
 
 **Error Codes:** 400 (invalid depot_id), 404 (depot not found), 500 (server error).
+
+---
+
+### POST /depots/{depot_id}/alerts/{alert_id}/acknowledge
+Transition an active notification alert to `acknowledged` (alerts pipeline, AT-17).
+
+**Response:**
+```json
+{
+    "id": "uuid",
+    "status": "acknowledged",
+    "acknowledged_at": "2025-12-04T10:05:00Z"
+}
+```
+
+**Error Codes:** 404 (alert not found or doesn't belong to this depot), 409 (alert is not in `active` state — already acknowledged or resolved).
+
+---
+
+### GET /admin/organizations/{org_id}/notification_recipients
+List the email recipients subscribed to alerts for an organization. Allowed to `favonius_admin` (cross-tenant; writes `admin.read`) or to a `customer_admin` whose JWT `organization_id` matches the path. Other callers receive 403, NOT 404.
+
+**Query parameters:** `include_inactive=true` returns inactive rows too.
+
+**Response:**
+```json
+{
+    "organization_id": "uuid",
+    "recipients": [
+        {
+            "id": "uuid",
+            "organization_id": "uuid",
+            "email": "ops@example.com",
+            "display_name": "Ops Team",
+            "alert_types": ["*"],
+            "min_severity": "warning",
+            "active": true
+        }
+    ],
+    "count": 1
+}
+```
+
+---
+
+### POST /admin/organizations/{org_id}/notification_recipients
+Create a notification recipient (alerts pipeline). Same RBAC as the GET above.
+
+**Request:**
+```json
+{
+    "email": "ops@example.com",
+    "display_name": "Ops Team",
+    "alert_types": ["charger_fault"],
+    "min_severity": "warning"
+}
+```
+
+`alert_types` defaults to `["*"]` (all types). `min_severity` defaults to `warning` and is one of `info | warning | critical`.
+
+**Response:** 201 with the created `NotificationRecipientItem`. 409 if `(organization_id, email)` already exists. 400 for an unknown `min_severity`.
+
+---
+
+### PATCH /admin/organizations/{org_id}/notification_recipients/{recipient_id}
+Patch a notification recipient. Only `display_name`, `alert_types`, `min_severity`, `active` are mutable. 404 if the recipient doesn't exist or belongs to another org.
+
+---
+
+### DELETE /admin/organizations/{org_id}/notification_recipients/{recipient_id}
+Hard delete (cascades `notification_deliveries`). Returns 204 on success, 404 if absent.
+
+---
+
+### POST /webhooks/resend
+Resend webhook receiver (alerts pipeline). Public endpoint, signature-verified via `X-Resend-Signature` (or `Svix-Signature`) header using `RESEND_WEBHOOK_SECRET`. Updates `notification_deliveries.status` from `email.delivered | email.bounced | email.complained | email.failed | email.sent` events. Other event types are silently acknowledged.
+
+**Error codes:** 401 (invalid or missing signature), 400 (invalid JSON).
 
 ---
 

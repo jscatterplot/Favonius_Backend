@@ -1,0 +1,19 @@
+{{ severity_display }}: {{ title }}
+{{ occurrence_count_text }}
+
+A charger at one of your depots reported a fault.
+
+  Charger:      {{ detail.station_id }} (connector {{ detail.connector_id }})
+  OCPP status:  {{ detail.status }}
+{% if detail.error_code %}
+  Error code:   {{ detail.error_code }}
+{% endif %}
+
+The optimizer will route around this charger automatically until it
+recovers. Investigate on-site if the fault persists for more than a
+few minutes.
+
+--
+Favonius Energy alerts
+Alert id: {{ alert_id }}
+Manage notification preferences in your Favonius dashboard.

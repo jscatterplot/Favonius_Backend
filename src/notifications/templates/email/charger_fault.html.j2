@@ -1,0 +1,17 @@
+{% extends "_base.html.j2" %}
+{% block body %}
+  <p>A charger at one of your depots reported a fault.</p>
+  <dl class="detail">
+    <dt>Charger</dt>
+    <dd>{{ detail.station_id }} (connector {{ detail.connector_id }})</dd>
+    <dt>OCPP status</dt>
+    <dd>{{ detail.status }}</dd>
+    {% if detail.error_code %}
+    <dt>Error code</dt>
+    <dd>{{ detail.error_code }}</dd>
+    {% endif %}
+  </dl>
+  <p>The optimizer will route around this charger automatically until it
+     recovers. Investigate on-site if the fault persists for more than
+     a few minutes.</p>
+{% endblock %}
