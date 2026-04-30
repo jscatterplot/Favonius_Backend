@@ -295,7 +295,48 @@ modules are the primary deprecation candidates:
 - Incorporates vehicle into next optimization cycle
 - Returns acknowledgment with `acknowledged_at` timestamp
 
-### 7. BACKUP MODE (WebSocket Handler - Emergency Only)
+### 7. ALERTS PIPELINE (continuous - WebSocket Handler)
+
+See `docs/plans/alerts-pipeline.md` for the full design and locked decisions.
+
+```
+connector_status INSERT (Faulted/Unavailable)
+        │
+        ▼
+fn_alerts_on_connector_status (PG trigger, migration 022)
+  ├── UPSERT into notification_alerts (partial unique on org_id+dedup_key)
+  └── pg_notify('notification_alerts_new', JSON payload)
+        │
+        ▼  (LISTEN connection in WS handler)
+AlertDispatcher (single-worker; in-memory _currently_sending set)
+  ├── claim_pending_alerts (active AND last_notified_at older than resend window)
+  ├── list_for_alert recipients (org_id + alert_type wildcard match + severity threshold)
+  ├── render_alert (Jinja2; HTML autoescape, plain-text literal)
+  ├── EmailDeliveryClient.send (Resend in prod, Fake in dev/test)
+  └── record_delivery (UNIQUE on alert_id+recipient_id+notified_count)
+        │
+        ▼
+notification_deliveries (status='sent')
+        │
+        ▼  (Resend webhook → POST /webhooks/resend, signature-verified)
+notification_deliveries.status updates (delivered | bounced | complained | failed)
+```
+
+**Recovery:** When connector_status flips back to a non-fault status, the
+trigger updates the matching `notification_alerts` row to `status='resolved'`.
+Subsequent occurrences of the same fault create a new alert (the partial
+unique index is scoped `WHERE status != 'resolved'`).
+
+**Polling backstop (every 30s):** the dispatcher's main loop runs a
+`claim_pending_alerts` tick on a timer in addition to the LISTEN wakeup,
+so missed pg_notify events (e.g. WS handler restart, queue overflow) are
+recovered within the resend window.
+
+**Single-worker assumption:** the in-memory dedup set is not safe under
+multi-worker deployments. Startup logs `CRITICAL` if `WEB_CONCURRENCY > 1`.
+See decision 4.1 in the plan.
+
+### 8. BACKUP MODE (WebSocket Handler - Emergency Only)
 
 **Activation Condition:** Main API unavailable for > 1 hour
 
