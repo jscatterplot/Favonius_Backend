@@ -1373,3 +1373,34 @@ class TestCumulativeKwhPeriod:
         args = ts_conn.fetchrow.call_args.args
         assert len(args) == 5
         assert args[4] == "30 minutes"
+
+    @pytest.mark.asyncio
+    async def test_db_error_fetching_chargers_falls_back_to_energy_cap(
+        self, assembler, mock_db_pools
+    ):
+        """DB failures should assume no cap headroom when cap is configured."""
+        static_conn = AsyncMock()
+        mock_db_pools.static.acquire.return_value.__aenter__.return_value = static_conn
+        assembler.config.energy_cap_kwh = 500.0
+        static_conn.fetch.side_effect = Exception("static db unavailable")
+
+        sum_kwh = await assembler._get_cumulative_kwh_period(datetime.utcnow())
+
+        assert sum_kwh == 500.0
+
+    @pytest.mark.asyncio
+    async def test_db_error_fetching_telemetry_falls_back_to_energy_cap(
+        self, assembler, mock_db_pools
+    ):
+        """Timescale failures should assume no cap headroom when cap is configured."""
+        static_conn = AsyncMock()
+        ts_conn = AsyncMock()
+        mock_db_pools.static.acquire.return_value.__aenter__.return_value = static_conn
+        mock_db_pools.ts.acquire.return_value.__aenter__.return_value = ts_conn
+        assembler.config.energy_cap_kwh = 500.0
+        static_conn.fetch.return_value = [{"charger_id": uuid4()}]
+        ts_conn.fetchrow.side_effect = Exception("timescale unavailable")
+
+        sum_kwh = await assembler._get_cumulative_kwh_period(datetime.utcnow())
+
+        assert sum_kwh == 500.0

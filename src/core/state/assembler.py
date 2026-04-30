@@ -741,8 +741,8 @@ class StateAssembler:
 
         Used by the energy_cap tariff to compute remaining headroom against
         :attr:`DepotConfig.energy_cap_kwh`. Returns 0.0 if no telemetry is
-        available — that gives a conservative "full headroom" view on day
-        one, which the optimizer will then bound by the cap.
+        available. On DB errors, falls back to energy_cap_kwh (if configured)
+        so the optimizer uses a no-headroom, conservative cost assumption.
 
         Args:
             now: current wall-clock time (UTC; horizon start)
@@ -777,12 +777,16 @@ class StateAssembler:
                 )
             charger_ids = [row["charger_id"] for row in charger_rows]
         except Exception as exc:
+            fallback_kwh = (
+                float(self.config.energy_cap_kwh) if self.config.energy_cap_kwh is not None else 0.0
+            )
             logger.warning(
-                "Failed to fetch chargers for depot %s: %s; defaulting to 0",
+                "Failed to fetch chargers for depot %s: %s; defaulting cumulative kWh to %.2f",
                 self.depot_id,
                 exc,
+                fallback_kwh,
             )
-            return 0.0
+            return fallback_kwh
 
         if not charger_ids:
             return 0.0
@@ -838,12 +842,16 @@ class StateAssembler:
                 )
             sum_kwh = float(row["sum_kwh"]) if row and row["sum_kwh"] is not None else 0.0
         except Exception as exc:
+            fallback_kwh = (
+                float(self.config.energy_cap_kwh) if self.config.energy_cap_kwh is not None else 0.0
+            )
             logger.warning(
-                "Failed to compute cumulative kWh for depot %s: %s; defaulting to 0",
+                "Failed to compute cumulative kWh for depot %s: %s; defaulting cumulative kWh to %.2f",
                 self.depot_id,
                 exc,
+                fallback_kwh,
             )
-            return 0.0
+            return fallback_kwh
         return sum_kwh
 
     async def _get_building_power(
