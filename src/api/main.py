@@ -5015,25 +5015,7 @@ async def list_organization_depots_admin(
     customer_admin from a different org) get 403, NOT 404, so org existence
     is not leaked.
     """
-    validate_uuid(org_id, "organization_id")
-    role = _require_admin_role(user)
-
-    cross_org_read = False
-    if role == "favonius_admin":
-        cross_org_read = True
-    else:
-        # customer_admin: must match own org
-        caller_org = get_user_organization_id(user)
-        if not caller_org:
-            raise _forbidden(
-                "MISSING_ORGANIZATION",
-                "missing organization_id in token app_metadata",
-            )
-        if str(caller_org) != str(org_id):
-            raise _forbidden(
-                "FORBIDDEN_ORGANIZATION",
-                _ACCESS_DENIED_ORG_DETAIL,
-            )
+    _, cross_org_read = _require_org_admin_access(user, org_id)
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -5629,10 +5611,12 @@ async def acknowledge_notification_alert(
         raise HTTPException(
             status_code=409, detail=f"Alert {alert_id} is not in active state"
         )
+    if updated.acknowledged_at is None:
+        raise DatabaseError("Acknowledged alert missing acknowledged_at timestamp")
     return AcknowledgeAlertResponse(
         id=str(updated.id),
         status=updated.status,
-        acknowledged_at=datetime.utcnow().isoformat() + "Z",
+        acknowledged_at=updated.acknowledged_at.isoformat(),
     )
 
 

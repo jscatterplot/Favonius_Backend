@@ -34,6 +34,7 @@ class Alert:
     status: str
     first_occurrence_at: datetime
     last_occurrence_at: datetime
+    acknowledged_at: Optional[datetime]
     last_notified_at: Optional[datetime]
     last_notified_count: int
 
@@ -51,6 +52,7 @@ class Alert:
             status=row["status"],
             first_occurrence_at=row["first_occurrence_at"],
             last_occurrence_at=row["last_occurrence_at"],
+            acknowledged_at=row["acknowledged_at"],
             last_notified_at=row["last_notified_at"],
             last_notified_count=row["last_notified_count"],
         )
@@ -79,7 +81,7 @@ def _coerce_jsonb(value: Any) -> dict[str, Any]:
 _CLAIM_QUERY = """
     SELECT id, organization_id, depot_id, alert_type, severity, title, detail,
            dedup_key, status, first_occurrence_at, last_occurrence_at,
-           last_notified_at, last_notified_count
+           acknowledged_at, last_notified_at, last_notified_count
       FROM notification_alerts
      WHERE status = 'active'
        AND (last_notified_at IS NULL
@@ -147,7 +149,7 @@ async def list_for_depot(
         """
         SELECT id, organization_id, depot_id, alert_type, severity, title, detail,
                dedup_key, status, first_occurrence_at, last_occurrence_at,
-               last_notified_at, last_notified_count
+               acknowledged_at, last_notified_at, last_notified_count
           FROM notification_alerts
          WHERE depot_id = $1
            AND status = ANY($2::text[])
@@ -166,7 +168,7 @@ async def get_by_id(conn: Any, alert_id: UUID) -> Optional[Alert]:
         """
         SELECT id, organization_id, depot_id, alert_type, severity, title, detail,
                dedup_key, status, first_occurrence_at, last_occurrence_at,
-               last_notified_at, last_notified_count
+               acknowledged_at, last_notified_at, last_notified_count
           FROM notification_alerts
          WHERE id = $1
         """,
@@ -191,7 +193,7 @@ async def acknowledge(
            AND status = 'active'
          RETURNING id, organization_id, depot_id, alert_type, severity, title, detail,
                    dedup_key, status, first_occurrence_at, last_occurrence_at,
-                   last_notified_at, last_notified_count
+                  acknowledged_at, last_notified_at, last_notified_count
         """,
         alert_id,
         user_id,
