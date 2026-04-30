@@ -39,7 +39,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic.alias_generators import to_camel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.controller_manager import ControllerManager
@@ -1299,49 +1300,61 @@ class DepotSetupResponse(BaseModel):
     readiness_checklist: list[ReadinessChecklistItem]
 
 
-class ChargerCreateRequest(BaseModel):
+class _CamelOrSnakeModel(BaseModel):
+    """Pydantic base that accepts both snake_case and camelCase keys.
+
+    Canonical Python field names are snake_case; the camelCase alias is
+    derived via ``alias_generator=to_camel``, and ``populate_by_name=True``
+    keeps the snake form valid input. FastAPI serializes by field name by
+    default, so responses emit snake_case unless ``by_alias=True`` is used.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+
+class ChargerCreateRequest(_CamelOrSnakeModel):
     """Request to provision a production OCPP charger."""
 
-    displayName: str = Field(..., min_length=1, max_length=255)
+    display_name: str = Field(..., min_length=1, max_length=255)
     vendor: Optional[str] = Field(default=None, max_length=128)
     model: Optional[str] = Field(default=None, max_length=128)
-    serialNumber: Optional[str] = Field(default=None, max_length=128)
+    serial_number: Optional[str] = Field(default=None, max_length=128)
     firmware: Optional[str] = Field(default=None, max_length=128)
-    ratedKw: float = Field(..., gt=0, le=1000)
-    connectorType: Literal["CCS"] = "CCS"
-    connectorCount: int = Field(..., ge=1, le=20)
-    connectorIds: Optional[list[int]] = None
-    networkNotes: Optional[str] = Field(default=None, max_length=2048)
+    rated_kw: float = Field(..., gt=0, le=1000)
+    connector_type: Literal["CCS"] = "CCS"
+    connector_count: int = Field(..., ge=1, le=20)
+    connector_ids: Optional[list[int]] = None
+    network_notes: Optional[str] = Field(default=None, max_length=2048)
 
-    @field_validator("connectorIds")
+    @field_validator("connector_ids")
     @classmethod
     def validate_connector_ids(cls, value: Optional[list[int]]) -> Optional[list[int]]:
         """Ensure connector ids are positive and unique when supplied."""
         if value is None:
             return value
         if any(connector_id < 1 for connector_id in value):
-            raise ValueError("connectorIds must contain positive integers")
+            raise ValueError("connector_ids must contain positive integers")
         if len(set(value)) != len(value):
-            raise ValueError("connectorIds must be unique")
+            raise ValueError("connector_ids must be unique")
         return value
 
 
-class ChargerOnboardingMetadata(BaseModel):
+class ChargerOnboardingMetadata(_CamelOrSnakeModel):
     """Provisioned charger metadata."""
 
     id: str
-    displayName: str
-    depotId: str
-    ocppId: str
+    display_name: str
+    depot_id: str
+    ocpp_id: str
 
 
-class ChargerOnboardingCredentials(BaseModel):
+class ChargerOnboardingCredentials(_CamelOrSnakeModel):
     """One-time OCPP Basic Auth credential response."""
 
     username: str
     password: str
     scheme: Literal["basic"] = "basic"
-    shownOnce: bool = True
+    shown_once: bool = True
 
 
 class ChargerOnboardingResponse(BaseModel):
@@ -1354,70 +1367,70 @@ class ChargerOnboardingResponse(BaseModel):
 # ============ Fleet Identity Models ============
 
 
-class VehicleIdentityBase(BaseModel):
+class VehicleIdentityBase(_CamelOrSnakeModel):
     """Vehicle identity metadata managed by customer admins."""
 
-    externalId: str = Field(..., min_length=1, max_length=100)
-    displayName: Optional[str] = Field(default=None, max_length=255)
-    vehicleType: str = Field(..., min_length=1, max_length=50)
-    batteryKwh: float = Field(..., gt=0)
-    maxChargeKw: float = Field(..., gt=0)
-    idTag: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    external_id: str = Field(..., min_length=1, max_length=100)
+    display_name: Optional[str] = Field(default=None, max_length=255)
+    vehicle_type: str = Field(..., min_length=1, max_length=50)
+    battery_kwh: float = Field(..., gt=0)
+    max_charge_kw: float = Field(..., gt=0)
+    id_tag: Optional[str] = Field(default=None, min_length=1, max_length=100)
     vin: Optional[str] = Field(default=None, max_length=64)
-    licensePlate: Optional[str] = Field(default=None, max_length=64)
+    license_plate: Optional[str] = Field(default=None, max_length=64)
     status: Literal["active", "inactive", "retired"] = "active"
 
 
-class VehicleIdentityUpdate(BaseModel):
+class VehicleIdentityUpdate(_CamelOrSnakeModel):
     """Patch vehicle identity metadata except the primary idTag."""
 
-    externalId: Optional[str] = Field(default=None, min_length=1, max_length=100)
-    displayName: Optional[str] = Field(default=None, max_length=255)
-    vehicleType: Optional[str] = Field(default=None, min_length=1, max_length=50)
-    batteryKwh: Optional[float] = Field(default=None, gt=0)
-    maxChargeKw: Optional[float] = Field(default=None, gt=0)
+    external_id: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    display_name: Optional[str] = Field(default=None, max_length=255)
+    vehicle_type: Optional[str] = Field(default=None, min_length=1, max_length=50)
+    battery_kwh: Optional[float] = Field(default=None, gt=0)
+    max_charge_kw: Optional[float] = Field(default=None, gt=0)
     vin: Optional[str] = Field(default=None, max_length=64)
-    licensePlate: Optional[str] = Field(default=None, max_length=64)
+    license_plate: Optional[str] = Field(default=None, max_length=64)
     status: Optional[Literal["active", "inactive", "retired"]] = None
 
 
-class PrimaryIdTagRequest(BaseModel):
+class PrimaryIdTagRequest(_CamelOrSnakeModel):
     """Set or clear a vehicle's primary OCPP idTag."""
 
-    idTag: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    id_tag: Optional[str] = Field(default=None, min_length=1, max_length=100)
 
 
-class DriverIdentityCreate(BaseModel):
+class DriverIdentityCreate(_CamelOrSnakeModel):
     """Driver identity metadata managed by customer admins."""
 
-    externalDriverId: Optional[str] = Field(default=None, max_length=100)
-    displayName: str = Field(..., min_length=1, max_length=255)
+    external_driver_id: Optional[str] = Field(default=None, max_length=100)
+    display_name: str = Field(..., min_length=1, max_length=255)
     email: Optional[str] = Field(default=None, max_length=255)
     phone: Optional[str] = Field(default=None, max_length=64)
     status: Literal["active", "inactive"] = "active"
 
 
-class DriverIdentityUpdate(BaseModel):
+class DriverIdentityUpdate(_CamelOrSnakeModel):
     """Patch driver identity metadata."""
 
-    externalDriverId: Optional[str] = Field(default=None, max_length=100)
-    displayName: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    external_driver_id: Optional[str] = Field(default=None, max_length=100)
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     email: Optional[str] = Field(default=None, max_length=255)
     phone: Optional[str] = Field(default=None, max_length=64)
     status: Optional[Literal["active", "inactive"]] = None
 
 
-class RfidCardCreate(BaseModel):
+class RfidCardCreate(_CamelOrSnakeModel):
     """RFID card metadata and current assignments."""
 
-    idTag: str = Field(..., min_length=1, max_length=100)
+    id_tag: str = Field(..., min_length=1, max_length=100)
     label: Optional[str] = Field(default=None, max_length=255)
     status: Literal["active", "inactive", "lost", "stolen"] = "active"
     notes: Optional[str] = Field(default=None, max_length=2048)
-    assignedVehicleIds: list[str] = Field(default_factory=list)
-    assignedDriverIds: list[str] = Field(default_factory=list)
+    assigned_vehicle_ids: list[str] = Field(default_factory=list)
+    assigned_driver_ids: list[str] = Field(default_factory=list)
 
-    @field_validator("assignedVehicleIds", "assignedDriverIds")
+    @field_validator("assigned_vehicle_ids", "assigned_driver_ids")
     @classmethod
     def validate_assignment_ids(cls, value: list[str]) -> list[str]:
         """Ensure supplied relationship ids are valid UUIDs."""
@@ -1426,17 +1439,17 @@ class RfidCardCreate(BaseModel):
         return value
 
 
-class RfidCardUpdate(BaseModel):
+class RfidCardUpdate(_CamelOrSnakeModel):
     """Patch RFID card metadata and optionally replace current assignments."""
 
-    idTag: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    id_tag: Optional[str] = Field(default=None, min_length=1, max_length=100)
     label: Optional[str] = Field(default=None, max_length=255)
     status: Optional[Literal["active", "inactive", "lost", "stolen"]] = None
     notes: Optional[str] = Field(default=None, max_length=2048)
-    assignedVehicleIds: Optional[list[str]] = None
-    assignedDriverIds: Optional[list[str]] = None
+    assigned_vehicle_ids: Optional[list[str]] = None
+    assigned_driver_ids: Optional[list[str]] = None
 
-    @field_validator("assignedVehicleIds", "assignedDriverIds")
+    @field_validator("assigned_vehicle_ids", "assigned_driver_ids")
     @classmethod
     def validate_optional_assignment_ids(cls, value: Optional[list[str]]) -> Optional[list[str]]:
         """Ensure supplied relationship ids are valid UUIDs."""
@@ -1819,14 +1832,14 @@ async def _hash_ocpp_basic_password(password: str) -> str:
 
 def _connector_ids_for_request(payload: ChargerCreateRequest) -> list[int]:
     """Return connector ids, enforcing consistency with connector_count."""
-    if payload.connectorIds is None:
-        return list(range(1, payload.connectorCount + 1))
-    if len(payload.connectorIds) != payload.connectorCount:
+    if payload.connector_ids is None:
+        return list(range(1, payload.connector_count + 1))
+    if len(payload.connector_ids) != payload.connector_count:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="connectorIds length must equal connectorCount",
+            detail="connector_ids length must equal connector_count",
         )
-    return payload.connectorIds
+    return payload.connector_ids
 
 
 def _json_response_payload(value: object) -> object:
@@ -1837,19 +1850,23 @@ def _json_response_payload(value: object) -> object:
 
 
 def _format_charger_onboarding_response(charger: dict, password: str) -> dict:
-    """Build the public response shape, including one-time plaintext credential."""
+    """Build the public response shape, including one-time plaintext credential.
+
+    Wire format is snake_case to match the rest of the API surface; clients
+    that need camelCase can rely on the API client's case transform.
+    """
     return {
         "charger": {
             "id": charger["id"],
-            "displayName": charger["display_name"],
-            "depotId": charger["depot_id"],
-            "ocppId": charger["ocpp_id"],
+            "display_name": charger["display_name"],
+            "depot_id": charger["depot_id"],
+            "ocpp_id": charger["ocpp_id"],
         },
         "credentials": {
             "username": charger["ocpp_id"],
             "password": password,
             "scheme": "basic",
-            "shownOnce": True,
+            "shown_once": True,
         },
     }
 
@@ -2315,14 +2332,14 @@ async def create_vehicle_identity(
                 conn,
                 depot_id=depot_id,
                 organization_id=org_id,
-                external_id=request.externalId,
-                vehicle_type=request.vehicleType,
-                battery_kwh=request.batteryKwh,
-                max_charge_kw=request.maxChargeKw,
-                display_name=request.displayName,
-                id_tag=request.idTag,
+                external_id=request.external_id,
+                vehicle_type=request.vehicle_type,
+                battery_kwh=request.battery_kwh,
+                max_charge_kw=request.max_charge_kw,
+                display_name=request.display_name,
+                id_tag=request.id_tag,
                 vin=request.vin,
-                license_plate=request.licensePlate,
+                license_plate=request.license_plate,
                 vehicle_status=request.status,
             )
         if vehicle is None:
@@ -2366,13 +2383,13 @@ async def update_vehicle_identity(
                 depot_id=depot_id,
                 organization_id=org_id,
                 vehicle_id=vehicle_id,
-                display_name=request.displayName,
-                external_id=request.externalId,
-                vehicle_type=request.vehicleType,
-                battery_kwh=request.batteryKwh,
-                max_charge_kw=request.maxChargeKw,
+                display_name=request.display_name,
+                external_id=request.external_id,
+                vehicle_type=request.vehicle_type,
+                battery_kwh=request.battery_kwh,
+                max_charge_kw=request.max_charge_kw,
                 vin=request.vin,
-                license_plate=request.licensePlate,
+                license_plate=request.license_plate,
                 vehicle_status=request.status,
             )
         if vehicle is None:
@@ -2413,7 +2430,7 @@ async def set_vehicle_primary_id_tag(
                 depot_id=depot_id,
                 organization_id=org_id,
                 vehicle_id=vehicle_id,
-                id_tag=request.idTag,
+                id_tag=request.id_tag,
             )
         if vehicle is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
@@ -2448,8 +2465,8 @@ async def create_driver_identity(
                 conn,
                 depot_id=depot_id,
                 organization_id=org_id,
-                external_driver_id=request.externalDriverId,
-                display_name=request.displayName,
+                external_driver_id=request.external_driver_id,
+                display_name=request.display_name,
                 email=request.email,
                 phone=request.phone,
                 driver_status=request.status,
@@ -2492,8 +2509,8 @@ async def update_driver_identity(
                 depot_id=depot_id,
                 organization_id=org_id,
                 driver_id=driver_id,
-                external_driver_id=request.externalDriverId,
-                display_name=request.displayName,
+                external_driver_id=request.external_driver_id,
+                display_name=request.display_name,
                 email=request.email,
                 phone=request.phone,
                 driver_status=request.status,
@@ -2532,12 +2549,12 @@ async def create_rfid_card(
                     conn,
                     depot_id=depot_id,
                     organization_id=org_id,
-                    id_tag=request.idTag,
+                    id_tag=request.id_tag,
                     label=request.label,
                     card_status=request.status,
                     notes=request.notes,
-                    assigned_vehicle_ids=request.assignedVehicleIds,
-                    assigned_driver_ids=request.assignedDriverIds,
+                    assigned_vehicle_ids=request.assigned_vehicle_ids,
+                    assigned_driver_ids=request.assigned_driver_ids,
                 )
         if card is None:
             raise HTTPException(
@@ -2580,12 +2597,12 @@ async def update_rfid_card(
                     depot_id=depot_id,
                     organization_id=org_id,
                     card_id=card_id,
-                    id_tag=request.idTag,
+                    id_tag=request.id_tag,
                     label=request.label,
                     card_status=request.status,
                     notes=request.notes,
-                    assigned_vehicle_ids=request.assignedVehicleIds,
-                    assigned_driver_ids=request.assignedDriverIds,
+                    assigned_vehicle_ids=request.assigned_vehicle_ids,
+                    assigned_driver_ids=request.assigned_driver_ids,
                 )
         if card is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RFID card not found")
@@ -2688,16 +2705,16 @@ async def create_charger_onboarding(
                                 conn,
                                 depot_id=depot_id,
                                 ocpp_id=ocpp_id,
-                                display_name=request.displayName,
+                                display_name=request.display_name,
                                 vendor=request.vendor,
                                 model=request.model,
-                                serial_number=request.serialNumber,
+                                serial_number=request.serial_number,
                                 firmware=request.firmware,
-                                rated_kw=request.ratedKw,
-                                connector_type=request.connectorType,
-                                connector_count=request.connectorCount,
+                                rated_kw=request.rated_kw,
+                                connector_type=request.connector_type,
+                                connector_count=request.connector_count,
                                 connector_ids=connector_ids,
-                                network_notes=request.networkNotes,
+                                network_notes=request.network_notes,
                                 password_hash=password_hash,
                             )
                         break
@@ -5280,7 +5297,7 @@ async def rotate_charger_credentials_endpoint(
             "username": result["ocpp_id"],
             "password": new_password,
             "scheme": "basic",
-            "shownOnce": True,
+            "shown_once": True,
         },
         "rotated_at": result["last_rotated_at"],
     }

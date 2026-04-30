@@ -994,10 +994,10 @@ class TestChargerOnboarding:
 
         assert response.status_code == http_status.HTTP_201_CREATED
         data = response.json()
-        assert data["charger"]["ocppId"] == "acme-transit-berlin-depot-001"
+        assert data["charger"]["ocpp_id"] == "acme-transit-berlin-depot-001"
         assert data["credentials"]["username"] == "acme-transit-berlin-depot-001"
         assert data["credentials"]["password"]
-        assert data["credentials"]["shownOnce"] is True
+        assert data["credentials"]["shown_once"] is True
         assert create_mock.await_args.kwargs["connector_ids"] == [1, 2]
         access_mock.assert_awaited_once()
         password_hash = create_mock.await_args.kwargs["password_hash"]
@@ -1050,15 +1050,15 @@ class TestChargerOnboarding:
         replay = {
             "charger": {
                 "id": str(uuid4()),
-                "displayName": payload["displayName"],
-                "depotId": DEPOT_ID,
-                "ocppId": "acme-berlin-001",
+                "display_name": payload["displayName"],
+                "depot_id": DEPOT_ID,
+                "ocpp_id": "acme-berlin-001",
             },
             "credentials": {
                 "username": "acme-berlin-001",
                 "password": "plaintext-replay",
                 "scheme": "basic",
-                "shownOnce": True,
+                "shown_once": True,
             },
         }
 
