@@ -1966,20 +1966,6 @@ async def list_all_organizations(db) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def get_organization_by_id(db, organization_id: str) -> Optional[dict]:
-    """Return a single organization row, or None if not found."""
-    query = """
-        SELECT organization_id::text AS organization_id,
-               name,
-               created_at,
-               updated_at
-        FROM organizations
-        WHERE organization_id = $1::uuid
-    """
-    row = await db.fetchrow(query, organization_id)
-    return dict(row) if row else None
-
-
 async def get_charger_credentials_status(
     db, *, depot_id: str, charger_id: str
 ) -> Optional[dict]:
@@ -2017,30 +2003,23 @@ async def rotate_charger_credentials(
         SELECT ocpp_id
         FROM chargers
         WHERE charger_id = $1::uuid AND depot_id = $2::uuid
+        FOR UPDATE
     """
     row = await db.fetchrow(fetch_query, charger_id, depot_id)
     if row is None:
         return None
     ocpp_id = row["ocpp_id"]
 
-    update_query = """
-        UPDATE station_credentials
-        SET password_hash = $2,
-            last_rotated_at = NOW(),
-            active = TRUE
-        WHERE station_id = $1 AND username = $1
+    upsert_query = """
+        INSERT INTO station_credentials (station_id, username, password_hash, active, last_rotated_at)
+        VALUES ($1, $1, $2, TRUE, NOW())
+        ON CONFLICT (station_id, username) DO UPDATE
+        SET password_hash = EXCLUDED.password_hash,
+            active = TRUE,
+            last_rotated_at = NOW()
         RETURNING last_rotated_at, created_at
     """
-    updated = await db.fetchrow(update_query, ocpp_id, new_password_hash)
-    if updated is None:
-        # Charger exists but credential row missing (e.g. legacy provisioning).
-        # Insert a new row so rotation is idempotent.
-        insert_query = """
-            INSERT INTO station_credentials (station_id, username, password_hash, active, last_rotated_at)
-            VALUES ($1, $1, $2, TRUE, NOW())
-            RETURNING last_rotated_at, created_at
-        """
-        updated = await db.fetchrow(insert_query, ocpp_id, new_password_hash)
+    updated = await db.fetchrow(upsert_query, ocpp_id, new_password_hash)
     return {
         "ocpp_id": ocpp_id,
         "last_rotated_at": updated["last_rotated_at"],

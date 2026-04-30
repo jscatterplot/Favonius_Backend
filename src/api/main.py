@@ -4921,12 +4921,13 @@ async def rotate_charger_credentials_endpoint(
         raise DatabaseError("Database not available")
 
     async with db_pools.static.acquire() as conn:
-        result = await db_queries.rotate_charger_credentials(
-            conn,
-            depot_id=depot_id,
-            charger_id=charger_id,
-            new_password_hash=new_hash,
-        )
+        async with conn.transaction():
+            result = await db_queries.rotate_charger_credentials(
+                conn,
+                depot_id=depot_id,
+                charger_id=charger_id,
+                new_password_hash=new_hash,
+            )
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
