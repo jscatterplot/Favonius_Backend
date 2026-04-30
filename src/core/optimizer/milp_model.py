@@ -473,6 +473,7 @@ def build_optimization_model(
     # over_cap_penalty > under_cap_rate (enforced upstream by Pydantic /
     # CHECK constraint), the LP relaxation naturally fills kwh_under
     # before kwh_over, so no SOS2 is needed.
+    fixed_energy_cap_cost = 0.0
     if config.tariff_type == "energy_cap":
         if (
             config.energy_cap_kwh is None
@@ -495,6 +496,12 @@ def build_optimization_model(
 
         model.total_kwh_def = pyo.Constraint(rule=total_kwh_rule)
 
+        fixed_energy_cap_cost = (
+            config.under_cap_rate_per_kwh * min(state.cumulative_kwh_period, config.energy_cap_kwh)
+            + config.over_cap_penalty_per_kwh
+            * max(0.0, state.cumulative_kwh_period - config.energy_cap_kwh)
+        )
+
         def kwh_split_rule(m):
             return m.kwh_under + m.kwh_over == m.total_kwh_period
 
@@ -512,6 +519,7 @@ def build_optimization_model(
             tariff_cost = (
                 config.under_cap_rate_per_kwh * m.kwh_under
                 + config.over_cap_penalty_per_kwh * m.kwh_over
+                - fixed_energy_cap_cost
             )
         else:
             tariff_cost = state.demand_charge_rate * m.P_peak

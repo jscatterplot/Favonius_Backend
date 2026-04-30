@@ -1781,3 +1781,22 @@ class TestEnergyCapTariff:
         config = dataclasses.replace(simple_depot_config, tariff_type="energy_cap")
         with pytest.raises(ValueError, match="energy_cap"):
             build_optimization_model(simple_depot_state, config)
+
+    def test_energy_cap_objective_excludes_fixed_historical_cost(
+        self, simple_depot_state, simple_depot_config
+    ):
+        """Historical cumulative kWh should not shift objective_value."""
+        config = _energy_cap_config(simple_depot_config, energy_cap_kwh=400.0)
+        state_low = DepotState(
+            **{**simple_depot_state.__dict__, "cumulative_kwh_period": 350.0}
+        )
+        state_high = DepotState(
+            **{**simple_depot_state.__dict__, "cumulative_kwh_period": 500.0}
+        )
+
+        result_low = optimize(state_low, config, time_limit=60.0)
+        result_high = optimize(state_high, config, time_limit=60.0)
+
+        assert result_low.status == "completed"
+        assert result_high.status == "completed"
+        assert result_high.objective_value == pytest.approx(result_low.objective_value, abs=1e-5)

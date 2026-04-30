@@ -1014,6 +1014,8 @@ class DepotAddressPayload(BaseModel):
 class SimpleDemandTariffPayload(BaseModel):
     """Legacy demand-charge tariff: $/kW × peak grid power."""
 
+    model_config = {"extra": "forbid"}
+
     tariff_type: Literal["simple_demand"] = "simple_demand"
     rate_eur_per_kw: float = Field(..., gt=0)
     billing_period: str = Field(..., min_length=1, max_length=32)

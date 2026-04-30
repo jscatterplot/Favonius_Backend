@@ -659,6 +659,24 @@ class TestDepotSetupWrites:
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
         assert response.json()["error_code"] == "VALIDATION_ERROR"
 
+    def test_simple_demand_rejects_misrouted_energy_cap_fields_without_tariff_type(self, client):
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin")
+        )
+        payload = _first_depot_payload()
+        payload["depot"]["demand_charge"] = {
+            "energy_cap_kwh": 400.0,
+            "under_cap_rate_per_kwh": 0.10,
+            "over_cap_penalty_per_kwh": 2.00,
+            "billing_period": "monthly",
+            "rate_eur_per_kw": 8.5,
+        }
+        response = client.post(
+            "/admin/first-depot-setup", headers=AUTH_HDR, json=payload
+        )
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert response.json()["error_code"] == "VALIDATION_ERROR"
+
     def test_patch_depot_setup_invalidates_config_cache(self, client, mock_db_pool):
         from src.api import main as api_main
 
