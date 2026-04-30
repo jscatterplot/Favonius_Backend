@@ -771,16 +771,41 @@ class LastOptimizationItem(BaseModel):
 
 
 class NotificationAlertItem(BaseModel):
-    """Aggregated alert from notification_alerts (alerts pipeline)."""
+    """Aggregated alert from notification_alerts (alerts pipeline).
 
-    id: str = Field(..., description="Alert UUID")
-    alert_type: str = Field(..., description="charger_fault | optimization_failed | ...")
+    Field names match the frontend ``AlertItemSchema`` so the API client
+    receives the wire shape without renames. DB column names stay as-is
+    (``id``, ``title``, ``detail``, ``first_occurrence_at``, …); we map at
+    this boundary.
+    """
+
+    alert_id: str = Field(..., description="Alert UUID")
+    organization_id: str = Field(..., description="Owning organization UUID")
+    depot_id: Optional[str] = Field(None, description="Depot UUID (nullable)")
+    depot_name: Optional[str] = Field(None, description="Depot display name (denormalized via JOIN)")
+    alert_type: str = Field(
+        ...,
+        description=(
+            "Wire enum: charger_auth_failure | charger_fault | degraded_optimization | "
+            "missing_input | stale_telemetry"
+        ),
+    )
     severity: str = Field(..., description="info | warning | critical")
-    title: str = Field(..., description="Human-readable summary")
-    detail: dict[str, Any] = Field(default_factory=dict, description="Producer payload")
+    subject: str = Field(..., description="Human-readable summary (mapped from notification_alerts.title)")
+    body: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Producer payload. May include description, suggestedAction, context, "
+            "and type-specific fields (e.g. missing_inputs[])."
+        ),
+    )
+    dedup_key: str = Field(..., description="Producer-defined dedup tag")
     status: str = Field(..., description="active | acknowledged | resolved")
-    first_occurrence_at: str = Field(..., description="ISO 8601")
-    last_occurrence_at: str = Field(..., description="ISO 8601")
+    first_seen_at: str = Field(..., description="ISO 8601")
+    last_seen_at: str = Field(..., description="ISO 8601")
+    occurrence_count: int = Field(..., description="Times the dedup_key has fired since first_seen_at")
+    acknowledged_by: Optional[str] = Field(None, description="User UUID who acknowledged")
+    resolved_at: Optional[str] = Field(None, description="ISO 8601 if status == resolved")
     last_notified_at: Optional[str] = Field(None, description="ISO 8601 or null if not yet sent")
 
 
@@ -4093,14 +4118,15 @@ async def get_depot_alerts(
         raise DatabaseError("Database not available")
 
     try:
-        # Static data: depot existence check + charger ocpp_id → charger_id map
+        # Static data: depot existence check + name + charger ocpp_id → charger_id map
         async with db_pools.static.acquire() as conn:
-            depot_check = await conn.fetchval(
-                "SELECT 1 FROM depots WHERE depot_id = $1",
+            depot_row = await conn.fetchrow(
+                "SELECT name FROM depots WHERE depot_id = $1",
                 depot_id,
             )
-            if not depot_check:
+            if depot_row is None:
                 raise HTTPException(status_code=404, detail=f"Depot {depot_id} not found")
+            depot_name: Optional[str] = depot_row["name"]
 
             charger_rows = await conn.fetch(
                 "SELECT charger_id, ocpp_id FROM chargers WHERE depot_id = $1",
@@ -4177,14 +4203,21 @@ async def get_depot_alerts(
                 )
                 notification_alerts = [
                     NotificationAlertItem(
-                        id=str(a.id),
+                        alert_id=str(a.id),
+                        organization_id=str(a.organization_id),
+                        depot_id=str(a.depot_id) if a.depot_id else None,
+                        depot_name=depot_name,
                         alert_type=a.alert_type,
                         severity=a.severity.value,
-                        title=a.title,
-                        detail=a.detail,
+                        subject=a.title,
+                        body=a.detail,
+                        dedup_key=a.dedup_key,
                         status=a.status,
-                        first_occurrence_at=a.first_occurrence_at.isoformat(),
-                        last_occurrence_at=a.last_occurrence_at.isoformat(),
+                        first_seen_at=a.first_occurrence_at.isoformat(),
+                        last_seen_at=a.last_occurrence_at.isoformat(),
+                        occurrence_count=a.occurrence_count,
+                        acknowledged_by=str(a.acknowledged_by) if a.acknowledged_by else None,
+                        resolved_at=a.resolved_at.isoformat() if a.resolved_at else None,
                         last_notified_at=(
                             a.last_notified_at.isoformat() if a.last_notified_at else None
                         ),

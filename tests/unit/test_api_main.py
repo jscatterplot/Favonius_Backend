@@ -285,13 +285,16 @@ class TestDepotAlertsEndpoint:
 
         conn.fetchval = AsyncMock(return_value=1)
         conn.fetchrow = AsyncMock(
-            return_value={
-                "run_id": run_id,
-                "run_time": now,
-                "status": "optimal",
-                "solver_used": "gurobi",
-                "solve_time_s": 12.3,
-            }
+            side_effect=[
+                {"name": "Test Depot"},  # depot existence + name lookup
+                {
+                    "run_id": run_id,
+                    "run_time": now,
+                    "status": "optimal",
+                    "solver_used": "gurobi",
+                    "solve_time_s": 12.3,
+                },
+            ]
         )
         conn.fetch = AsyncMock(return_value=[])
 
@@ -322,13 +325,16 @@ class TestDepotAlertsEndpoint:
 
         conn.fetchval = AsyncMock(return_value=1)
         conn.fetchrow = AsyncMock(
-            return_value={
-                "run_id": uuid4(),
-                "run_time": now,
-                "status": "optimal",
-                "solver_used": "gurobi",
-                "solve_time_s": 5.0,
-            }
+            side_effect=[
+                {"name": "Test Depot"},  # depot existence + name lookup
+                {
+                    "run_id": uuid4(),
+                    "run_time": now,
+                    "status": "optimal",
+                    "solver_used": "gurobi",
+                    "solve_time_s": 5.0,
+                },
+            ]
         )
         # fetch is called twice: (1) charger rows from static pool, (2) fault rows from ts pool
         conn.fetch = AsyncMock(
@@ -366,7 +372,7 @@ class TestDepotAlertsEndpoint:
         """Alerts returns 404 when depot does not exist."""
         pool, conn = mock_db_pool
         depot_id = str(uuid4())
-        conn.fetchval = AsyncMock(return_value=None)
+        conn.fetchrow = AsyncMock(return_value=None)
 
         with patch("src.api.main.db_pools", pool):
             response = client.get(
