@@ -15,7 +15,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-from typing import Annotated, Iterator, Literal, Optional, Union
+from typing import Annotated, Any, Iterator, Literal, Optional, Union
 from urllib.parse import urlparse
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -769,6 +769,20 @@ class LastOptimizationItem(BaseModel):
     timestamp: str = Field(..., description="Run timestamp (ISO 8601)")
 
 
+class NotificationAlertItem(BaseModel):
+    """Aggregated alert from notification_alerts (alerts pipeline)."""
+
+    id: str = Field(..., description="Alert UUID")
+    alert_type: str = Field(..., description="charger_fault | optimization_failed | ...")
+    severity: str = Field(..., description="info | warning | critical")
+    title: str = Field(..., description="Human-readable summary")
+    detail: dict[str, Any] = Field(default_factory=dict, description="Producer payload")
+    status: str = Field(..., description="active | acknowledged | resolved")
+    first_occurrence_at: str = Field(..., description="ISO 8601")
+    last_occurrence_at: str = Field(..., description="ISO 8601")
+    last_notified_at: Optional[str] = Field(None, description="ISO 8601 or null if not yet sent")
+
+
 class AlertsResponse(BaseModel):
     """Alerts and last optimization (PRD §7.1 GET /depots/{id}/alerts)."""
 
@@ -782,6 +796,42 @@ class AlertsResponse(BaseModel):
         None,
         description="Most recent optimization run for this depot",
     )
+    notification_alerts: list[NotificationAlertItem] = Field(
+        default_factory=list,
+        description="Aggregated alerts from the notification_alerts pipeline (active or acknowledged)",
+    )
+
+
+class NotificationRecipientItem(BaseModel):
+    """A notification_recipients row."""
+
+    id: str = Field(...)
+    organization_id: str = Field(...)
+    email: str = Field(...)
+    display_name: Optional[str] = Field(None)
+    alert_types: list[str] = Field(...)
+    min_severity: str = Field(...)
+    active: bool = Field(...)
+
+
+class CreateNotificationRecipientRequest(BaseModel):
+    email: str = Field(..., description="Email address (delivered to via Resend)")
+    display_name: Optional[str] = Field(None)
+    alert_types: list[str] = Field(default_factory=lambda: ["*"])
+    min_severity: str = Field(default="warning", description="info | warning | critical")
+
+
+class UpdateNotificationRecipientRequest(BaseModel):
+    display_name: Optional[str] = None
+    alert_types: Optional[list[str]] = None
+    min_severity: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class AcknowledgeAlertResponse(BaseModel):
+    id: str
+    status: str
+    acknowledged_at: str
 
 
 class ScheduleResponse(BaseModel):
@@ -4062,12 +4112,45 @@ async def get_depot_alerts(
             if r["station_id"] in charger_map
         ]
 
+        # notification_alerts (alerts pipeline). Best-effort; if the table
+        # doesn't exist (migration 022 not applied) we just return the
+        # legacy charger_faults list.
+        notification_alerts: list[NotificationAlertItem] = []
+        try:
+            async with db_pools.ts.acquire() as conn:
+                from src.notifications.alerts import list_for_depot as _list_alerts
+
+                rows = await _list_alerts(
+                    conn, UUID(depot_id), statuses=("active", "acknowledged")
+                )
+                notification_alerts = [
+                    NotificationAlertItem(
+                        id=str(a.id),
+                        alert_type=a.alert_type,
+                        severity=a.severity.value,
+                        title=a.title,
+                        detail=a.detail,
+                        status=a.status,
+                        first_occurrence_at=a.first_occurrence_at.isoformat(),
+                        last_occurrence_at=a.last_occurrence_at.isoformat(),
+                        last_notified_at=(
+                            a.last_notified_at.isoformat() if a.last_notified_at else None
+                        ),
+                    )
+                    for a in rows
+                ]
+        except asyncpg.UndefinedTableError:
+            logger.debug("notification_alerts table not present; skipping")
+        except Exception as exc:
+            logger.warning("failed to read notification_alerts: %s", exc, exc_info=True)
+
         now = datetime.utcnow()
         return AlertsResponse(
             depot_id=depot_id,
             timestamp=now.isoformat() + "Z",
             charger_faults=charger_faults,
             last_optimization=last_optimization,
+            notification_alerts=notification_alerts,
         )
 
     except HTTPException:
@@ -5502,6 +5585,296 @@ async def execute_command(
         depot_id=body.depot_id,
         result=result,
     )
+
+
+# ── Alerts pipeline endpoints ────────────────────────────────────────────────
+# See docs/plans/alerts-pipeline.md.
+
+
+@app.post(
+    "/depots/{depot_id}/alerts/{alert_id}/acknowledge",
+    response_model=AcknowledgeAlertResponse,
+    tags=["depots"],
+    summary="Acknowledge a notification alert",
+)
+async def acknowledge_notification_alert(
+    alert_id: str,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Transition an active alert to acknowledged. Returns 404 if the alert
+    is missing, already resolved, or doesn't belong to this depot."""
+    validate_uuid(alert_id, "alert_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    actor_user_id = user.get("sub") if isinstance(user, dict) else None
+    if not actor_user_id:
+        raise _forbidden("FORBIDDEN", "user id not present in token")
+
+    from src.notifications import alerts as alerts_repo
+
+    async with db_pools.ts.acquire() as conn:
+        existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
+        if existing is None or str(existing.depot_id) != depot_id:
+            raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+
+        updated = await alerts_repo.acknowledge(
+            conn, UUID(alert_id), user_id=UUID(str(actor_user_id))
+        )
+    if updated is None:
+        # Existed and depot matched on get_by_id but acknowledge() returned None
+        # → alert was already resolved/acknowledged. Surface 409 so callers
+        # can distinguish from "not found".
+        raise HTTPException(
+            status_code=409, detail=f"Alert {alert_id} is not in active state"
+        )
+    return AcknowledgeAlertResponse(
+        id=str(updated.id),
+        status=updated.status,
+        acknowledged_at=datetime.utcnow().isoformat() + "Z",
+    )
+
+
+def _require_org_admin_access(user: dict, org_id: str) -> tuple[str, bool]:
+    """Resolve admin role for /admin/organizations/{org_id}/* endpoints.
+
+    Returns (role, cross_org_read). Mirrors list_organization_depots_admin.
+    """
+    validate_uuid(org_id, "organization_id")
+    role = _require_admin_role(user)
+    cross = False
+    if role == "favonius_admin":
+        cross = True
+    else:
+        caller_org = get_user_organization_id(user)
+        if not caller_org:
+            raise _forbidden("MISSING_ORGANIZATION", "missing organization_id in token app_metadata")
+        if str(caller_org) != str(org_id):
+            raise _forbidden("FORBIDDEN_ORGANIZATION", _ACCESS_DENIED_ORG_DETAIL)
+    return role, cross
+
+
+@app.get(
+    "/admin/organizations/{org_id}/notification_recipients",
+    tags=["admin"],
+    summary="List notification recipients for an organization",
+)
+async def list_notification_recipients(
+    org_id: str,
+    include_inactive: bool = False,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    role, cross = _require_org_admin_access(user, org_id)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    from src.notifications import recipients as recipients_repo
+
+    async with db_pools.ts.acquire() as conn:
+        recs = await recipients_repo.list_for_org(
+            conn, UUID(org_id), include_inactive=include_inactive
+        )
+
+    if cross and role == "favonius_admin":
+        await _record_admin_action(
+            user=user,
+            action="admin.read",
+            organization_id_override=org_id,
+            target_type="notification_recipients",
+            target_id="*",
+            metadata={"endpoint": "GET /admin/organizations/{org_id}/notification_recipients"},
+        )
+    return {
+        "organization_id": org_id,
+        "recipients": [
+            NotificationRecipientItem(
+                id=str(r.id),
+                organization_id=str(r.organization_id),
+                email=r.email,
+                display_name=r.display_name,
+                alert_types=r.alert_types,
+                min_severity=r.min_severity.value,
+                active=r.active,
+            )
+            for r in recs
+        ],
+        "count": len(recs),
+    }
+
+
+@app.post(
+    "/admin/organizations/{org_id}/notification_recipients",
+    response_model=NotificationRecipientItem,
+    tags=["admin"],
+    summary="Create a notification recipient",
+    status_code=201,
+)
+async def create_notification_recipient(
+    org_id: str,
+    body: CreateNotificationRecipientRequest,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    _require_org_admin_access(user, org_id)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    from src.notifications import recipients as recipients_repo
+    from src.notifications.severity import Severity
+
+    try:
+        sev = Severity.from_str(body.min_severity)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"Invalid min_severity: {body.min_severity!r}")
+
+    async with db_pools.ts.acquire() as conn:
+        try:
+            created = await recipients_repo.create(
+                conn,
+                organization_id=UUID(org_id),
+                email=body.email,
+                display_name=body.display_name,
+                alert_types=tuple(body.alert_types),
+                min_severity=sev,
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Recipient {body.email!r} already exists for this organization",
+            )
+
+    return NotificationRecipientItem(
+        id=str(created.id),
+        organization_id=str(created.organization_id),
+        email=created.email,
+        display_name=created.display_name,
+        alert_types=created.alert_types,
+        min_severity=created.min_severity.value,
+        active=created.active,
+    )
+
+
+@app.patch(
+    "/admin/organizations/{org_id}/notification_recipients/{recipient_id}",
+    response_model=NotificationRecipientItem,
+    tags=["admin"],
+    summary="Update a notification recipient",
+)
+async def update_notification_recipient(
+    org_id: str,
+    recipient_id: str,
+    body: UpdateNotificationRecipientRequest,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    _require_org_admin_access(user, org_id)
+    validate_uuid(recipient_id, "recipient_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    from src.notifications import recipients as recipients_repo
+    from src.notifications.severity import Severity
+
+    sev: Optional[Severity] = None
+    if body.min_severity is not None:
+        try:
+            sev = Severity.from_str(body.min_severity)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail=f"Invalid min_severity: {body.min_severity!r}"
+            )
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await recipients_repo.update(
+            conn,
+            UUID(recipient_id),
+            organization_id=UUID(org_id),
+            display_name=body.display_name,
+            alert_types=tuple(body.alert_types) if body.alert_types is not None else None,
+            min_severity=sev,
+            active=body.active,
+        )
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Recipient {recipient_id} not found")
+    return NotificationRecipientItem(
+        id=str(updated.id),
+        organization_id=str(updated.organization_id),
+        email=updated.email,
+        display_name=updated.display_name,
+        alert_types=updated.alert_types,
+        min_severity=updated.min_severity.value,
+        active=updated.active,
+    )
+
+
+@app.delete(
+    "/admin/organizations/{org_id}/notification_recipients/{recipient_id}",
+    tags=["admin"],
+    summary="Delete a notification recipient",
+    status_code=204,
+)
+async def delete_notification_recipient(
+    org_id: str,
+    recipient_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    _require_org_admin_access(user, org_id)
+    validate_uuid(recipient_id, "recipient_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    from src.notifications import recipients as recipients_repo
+
+    async with db_pools.ts.acquire() as conn:
+        deleted = await recipients_repo.delete(
+            conn, UUID(recipient_id), organization_id=UUID(org_id)
+        )
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Recipient {recipient_id} not found")
+    return Response(status_code=204)
+
+
+@app.post(
+    "/webhooks/resend",
+    include_in_schema=False,
+    summary="Resend webhook (signature-verified)",
+)
+async def resend_webhook(request: Request):
+    """Update notification_deliveries.status from Resend events.
+
+    Verified via X-Resend-Signature header (HMAC-SHA256 with replay window).
+    Unknown event types are silently acknowledged so Resend doesn't retry.
+    """
+    secret = os.getenv("RESEND_WEBHOOK_SECRET", "")
+    body_bytes = await request.body()
+
+    from src.notifications.webhook import parse_event, verify_signature
+
+    if not verify_signature(
+        secret=secret,
+        body=body_bytes,
+        signature_header=request.headers.get("X-Resend-Signature")
+        or request.headers.get("Svix-Signature"),
+    ):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    event = parse_event(payload)
+    if event is None:
+        return {"status": "ignored"}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    from src.notifications import alerts as alerts_repo
+
+    async with db_pools.ts.acquire() as conn:
+        await alerts_repo.update_delivery_status(
+            conn,
+            provider_message_id=event.provider_message_id,
+            status=event.status,
+            status_detail=event.detail,
+        )
+    return {"status": "ok", "provider_message_id": event.provider_message_id}
 
 
 # ── OpenAPI schema (admin-only, cached after first generation) ────────────────
