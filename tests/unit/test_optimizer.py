@@ -1788,10 +1788,10 @@ class TestEnergyCapTariff:
         """Historical cumulative kWh should not shift objective_value."""
         config = _energy_cap_config(simple_depot_config, energy_cap_kwh=400.0)
         state_low = DepotState(
-            **{**simple_depot_state.__dict__, "cumulative_kwh_period": 350.0}
+            **{**simple_depot_state.__dict__, "cumulative_kwh_period": 500.0}
         )
         state_high = DepotState(
-            **{**simple_depot_state.__dict__, "cumulative_kwh_period": 500.0}
+            **{**simple_depot_state.__dict__, "cumulative_kwh_period": 650.0}
         )
 
         result_low = optimize(state_low, config, time_limit=60.0)
