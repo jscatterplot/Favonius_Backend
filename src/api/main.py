@@ -60,8 +60,14 @@ from ..db.snapshot_store import persist_snapshot
 from ..db import queries as db_queries
 from ..db.pools import DatabasePools
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
+from ..security.admin_audit import AdminAuditRow, write_admin_audit_row
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
-from ..security.auth import get_user_role, verify_depot_access
+from ..security.auth import (
+    get_user_role,
+    get_user_organization_id,
+    is_platform_admin,
+    verify_depot_access,
+)
 from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
@@ -4597,6 +4603,365 @@ async def get_controller_health(depot_id: str = Depends(_require_depot_access)):
     return {
         "depot_id": depot_id,
         **health[depot_id],
+    }
+
+
+# ── Cross-org admin endpoints (organizations, depots, credentials) ───────────
+
+
+_ACCESS_DENIED_DEPOT_DETAIL = "Access denied: you do not have permission for this depot"
+_ACCESS_DENIED_ORG_DETAIL = "Access denied: you do not have permission for this organization"
+
+
+def _forbidden(error_code: str, detail: str) -> HTTPException:
+    """403 with a stable ``error_code`` payload that frontends can switch on."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error_code": error_code, "message": detail},
+    )
+
+
+def _require_admin_role(user: dict) -> str:
+    """Allow either favonius_admin or customer_admin. Raise 403 otherwise.
+
+    Returns the resolved role string.
+    """
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin"):
+        raise _forbidden("FORBIDDEN_ROLE", "Admin role required")
+    return role
+
+
+async def _record_admin_action(
+    *,
+    user: dict,
+    action: str,
+    depot_id: Optional[str] = None,
+    organization_id_override: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Best-effort write of one ``audit_log`` row after a successful admin action."""
+    if db_pools is None:
+        return
+    actor_user_id = user.get("sub") if isinstance(user, dict) else None
+    actor_role = get_user_role(user)
+    organization_id = organization_id_override or get_user_organization_id(user)
+    row = AdminAuditRow(
+        action=action,
+        actor_user_id=str(actor_user_id) if actor_user_id else None,
+        actor_role=actor_role,
+        organization_id=organization_id,
+        depot_id=depot_id,
+        target_type=target_type,
+        target_id=target_id,
+        metadata=metadata or {},
+    )
+    await write_admin_audit_row(db_pools.static, row)
+
+
+@app.get(
+    "/admin/organizations",
+    tags=["admin"],
+    summary="List all organizations (favonius_admin only)",
+)
+async def list_organizations_admin(user: dict = Depends(ensure_tenant_mirrored)):
+    """Return the full set of organizations.
+
+    Restricted to favonius_admin (cross-tenant). Records ``admin.read`` audit row.
+    """
+    if not is_platform_admin(user):
+        raise _forbidden(
+            "FORBIDDEN_ROLE",
+            "favonius_admin role required",
+        )
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        organizations = await db_queries.list_all_organizations(conn)
+
+    await _record_admin_action(
+        user=user,
+        action="admin.read",
+        target_type="organization",
+        target_id="*",
+        metadata={
+            "endpoint": "GET /admin/organizations",
+            "result_count": len(organizations),
+        },
+    )
+    return {"organizations": organizations, "count": len(organizations)}
+
+
+@app.get(
+    "/admin/organizations/{org_id}/depots",
+    tags=["admin"],
+    summary="List depots for an organization",
+)
+async def list_organization_depots_admin(
+    org_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return depots for the given organization.
+
+    Allowed to favonius_admin (cross-tenant) or to a customer_admin whose
+    JWT ``organization_id`` matches the path. Other callers (including
+    customer_admin from a different org) get 403, NOT 404, so org existence
+    is not leaked.
+    """
+    validate_uuid(org_id, "organization_id")
+    role = _require_admin_role(user)
+
+    cross_org_read = False
+    if role == "favonius_admin":
+        cross_org_read = True
+    else:
+        # customer_admin: must match own org
+        caller_org = get_user_organization_id(user)
+        if not caller_org:
+            raise _forbidden(
+                "MISSING_ORGANIZATION",
+                "missing organization_id in token app_metadata",
+            )
+        if str(caller_org) != str(org_id):
+            raise _forbidden(
+                "FORBIDDEN_ORGANIZATION",
+                _ACCESS_DENIED_ORG_DETAIL,
+            )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        depots = await db_queries.get_depots_for_organization(conn, organization_id=org_id)
+
+    if cross_org_read:
+        await _record_admin_action(
+            user=user,
+            action="admin.read",
+            target_type="organization",
+            target_id=str(org_id),
+            organization_id_override=str(org_id),
+            metadata={
+                "endpoint": "GET /admin/organizations/{org_id}/depots",
+                "result_count": len(depots),
+            },
+        )
+
+    return {"organization_id": str(org_id), "depots": depots, "count": len(depots)}
+
+
+async def _resolve_depot_for_admin(
+    depot_id: str, user: dict
+) -> tuple[dict, bool]:
+    """Resolve a depot for cross-org admin access.
+
+    Returns (depot_row, cross_org_read).
+
+    - favonius_admin: always allowed; cross_org_read=True if the depot's org
+      differs from any caller-org in the JWT (favonius_admin has no own org).
+    - customer_admin / customer_operator: must own the depot via organization_id.
+    - viewer or unknown roles: 403.
+
+    Raises 403 (never 404) when the depot does not exist or is not accessible
+    so existence does not leak across tenants.
+    """
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        depot_row = await db_queries.get_depot_by_id(conn, depot_id)
+
+    role = get_user_role(user)
+
+    if role == "favonius_admin":
+        if depot_row is None:
+            # Even for platform admin, return 403 to keep the API surface
+            # uniform for tenants observing across the wire — but admin will
+            # rarely hit this in practice. Use 404 here since admin is allowed
+            # to know about all depots.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error_code": "DEPOT_NOT_FOUND", "message": "Depot not found"},
+            )
+        return depot_row, True
+
+    if role not in ("customer_admin", "customer_operator"):
+        # viewer and unknown roles are denied without revealing existence
+        raise _forbidden("FORBIDDEN_ROLE", _ACCESS_DENIED_DEPOT_DETAIL)
+
+    caller_org = get_user_organization_id(user)
+    if not caller_org:
+        raise _forbidden(
+            "MISSING_ORGANIZATION",
+            "missing organization_id in token app_metadata",
+        )
+
+    if depot_row is None or str(depot_row.get("organization_id")) != str(caller_org):
+        # Leak-resistant: no distinction between "no such depot" and
+        # "depot belongs to another tenant" — both are 403.
+        raise _forbidden("FORBIDDEN_DEPOT", _ACCESS_DENIED_DEPOT_DETAIL)
+
+    return depot_row, False
+
+
+async def _resolve_charger_for_depot(
+    *, depot_id: str, charger_id: str
+) -> Optional[dict]:
+    """Return a credential-status row for a charger or None if the charger does not exist."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.static.acquire() as conn:
+        return await db_queries.get_charger_credentials_status(
+            conn, depot_id=depot_id, charger_id=charger_id
+        )
+
+
+@app.get(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/credentials_status",
+    tags=["admin"],
+    summary="Get charger credential metadata (never plaintext)",
+)
+async def get_charger_credentials_status(
+    depot_id: str,
+    charger_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return credential status for a charger.
+
+    Response shape: ``{configured: bool, created_at, last_rotated_at}``.
+    The plaintext password is NEVER included; the password_hash is also never
+    surfaced to the client.
+
+    Authorization:
+      - favonius_admin: allowed; cross-org read recorded as ``admin.read``.
+      - customer_admin / customer_operator: only when the caller's
+        ``organization_id`` matches ``depots.organization_id``.
+      - other roles: 403.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    depot_row, cross_org_read = await _resolve_depot_for_admin(depot_id, user)
+    charger_row = await _resolve_charger_for_depot(
+        depot_id=depot_id, charger_id=charger_id
+    )
+    if charger_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "CHARGER_NOT_FOUND", "message": "Charger not found"},
+        )
+
+    response = {
+        "depot_id": depot_id,
+        "charger_id": charger_id,
+        "ocpp_id": charger_row["ocpp_id"],
+        "configured": (
+            charger_row.get("credentials_created_at") is not None
+            and bool(charger_row.get("credentials_active", False))
+        ),
+        "created_at": charger_row.get("credentials_created_at"),
+        "last_rotated_at": charger_row.get("credentials_last_rotated_at"),
+    }
+
+    if cross_org_read:
+        await _record_admin_action(
+            user=user,
+            action="admin.read",
+            depot_id=depot_id,
+            organization_id_override=str(depot_row.get("organization_id"))
+            if depot_row.get("organization_id")
+            else None,
+            target_type="charger",
+            target_id=str(charger_id),
+            metadata={
+                "endpoint": "GET /admin/depots/{depot_id}/chargers/{charger_id}/credentials_status",
+            },
+        )
+
+    return response
+
+
+@app.post(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/rotate_credentials",
+    tags=["admin"],
+    summary="Rotate a charger's Basic Auth credentials",
+)
+async def rotate_charger_credentials_endpoint(
+    depot_id: str,
+    charger_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Generate a new Basic Auth password, replace the stored hash, and return the plaintext exactly once.
+
+    Authorization:
+      - favonius_admin: always allowed.
+      - customer_admin: allowed only when the caller's organization_id matches
+        the depot's organization_id.
+      - customer_operator / viewer / others: 403.
+
+    Always records a ``charger.credentials.rotated`` audit row on success.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin"):
+        raise _forbidden("FORBIDDEN_ROLE", "favonius_admin or customer_admin role required")
+
+    depot_row, _ = await _resolve_depot_for_admin(depot_id, user)
+    # _resolve_depot_for_admin already enforced tenant access for customer_admin
+    # and cross-org for favonius_admin; nothing more to check here.
+
+    new_password = _generate_ocpp_basic_password()
+    new_hash = await _hash_ocpp_basic_password(new_password)
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        async with conn.transaction():
+            result = await db_queries.rotate_charger_credentials(
+                conn,
+                depot_id=depot_id,
+                charger_id=charger_id,
+                new_password_hash=new_hash,
+            )
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "CHARGER_NOT_FOUND", "message": "Charger not found"},
+        )
+
+    await _record_admin_action(
+        user=user,
+        action="charger.credentials.rotated",
+        depot_id=depot_id,
+        organization_id_override=str(depot_row.get("organization_id"))
+        if depot_row.get("organization_id")
+        else None,
+        target_type="charger",
+        target_id=str(charger_id),
+        metadata={
+            "endpoint": "POST /admin/depots/{depot_id}/chargers/{charger_id}/rotate_credentials",
+            "ocpp_id": result["ocpp_id"],
+            # IMPORTANT: never include plaintext credentials in metadata.
+        },
+    )
+
+    return {
+        "depot_id": depot_id,
+        "charger_id": charger_id,
+        "ocpp_id": result["ocpp_id"],
+        "credentials": {
+            "username": result["ocpp_id"],
+            "password": new_password,
+            "scheme": "basic",
+            "shownOnce": True,
+        },
+        "rotated_at": result["last_rotated_at"],
     }
 
 

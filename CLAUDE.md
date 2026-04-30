@@ -327,6 +327,7 @@ These come directly from the PRD and are non-negotiable:
 - `charging_sessions` — OCPP 1.6 transaction lifecycle. `transaction_id` (BIGINT, from `ocpp_transaction_id` sequence), `last_seen_at` stamped by the WS close hook
 - `interdepot_messages` — Cross-depot vehicle handoff messages
 - `trigger_log` — Audit trail of re-optimization triggers
+- `audit_log` — Application-level admin audit trail (cross-org reads, credential rotations). Distinct from `security_audit_log` (NKSC hypertable). Columns: `id, occurred_at, actor_user_id, actor_role, organization_id, depot_id, action, target_type, target_id, metadata` (JSONB). Common `action` values: `admin.read`, `charger.credentials.rotated`. Written by `src/security/admin_audit.py` from `_record_admin_action` after the endpoint succeeds.
 - `connector_status` — OCPP StatusNotification records per connector. Append-only; the latest row per `(station_id, connector_id)` is the current state. The legacy WS handler appends an `Unavailable`/`ConnectionLost` row when the WebSocket drops.
 
 ### Key columns
@@ -359,6 +360,10 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `GET` | `/admin/controllers/{id}/health` | Controller health |
 | `POST` | `/admin/first-depot-setup` | Create initial tenant-scoped depot setup (customer_admin, JWT `app_metadata.organization_id` required) |
 | `PATCH` | `/admin/depots/{id}` | Update tenant-scoped depot setup (customer_admin + depot access required) |
+| `GET` | `/admin/organizations` | List all organizations (favonius_admin only; writes `admin.read` audit row) |
+| `GET` | `/admin/organizations/{org_id}/depots` | List depots for an organization (favonius_admin or matching customer_admin; cross-org reads write `admin.read`; mismatched customer_admin → 403, NOT 404) |
+| `GET` | `/admin/depots/{id}/chargers/{charger_id}/credentials_status` | `{configured, created_at, last_rotated_at}` only — never plaintext or password_hash (favonius_admin or tenant member; cross-org reads write `admin.read`) |
+| `POST` | `/admin/depots/{id}/chargers/{charger_id}/rotate_credentials` | Generate new Basic Auth credential, replace `station_credentials.password_hash`, return plaintext exactly once (favonius_admin or matching customer_admin; writes `charger.credentials.rotated`) |
 | `GET` | `/admin/ocpp/{cp_id}/state` | (Legacy WS handler, port 8080) Per-charger debug dump: connection state, vendor/model, last_boot_at, last_heartbeat_at, latest connector_status, open transactions, charging_command_queue rollup. Owner role required. |
 
 ### WebSocket endpoints
