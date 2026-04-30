@@ -999,10 +999,33 @@ class DepotMetadata(BaseModel):
     building_load_source: Optional[dict] = Field(None, description="Building load source metadata")
 
 
+class ViewerInfo(BaseModel):
+    """Identity context echoed back to the caller of GET /me/depots.
+
+    Lets the frontend make routing decisions (wizard vs. dashboard, tenant picker
+    for platform admins) without re-decoding the JWT client-side.
+    """
+
+    role: str = Field(..., description="Effective role from JWT app_metadata.favonius_role")
+    organization_id: Optional[str] = Field(
+        None, description="Caller's organization UUID (None for favonius_admin or unscoped users)"
+    )
+
+
 class DepotListResponse(BaseModel):
     """Response from GET /me/depots."""
 
     depots: list[DepotMetadata] = Field(default_factory=list)
+    needs_setup: bool = Field(
+        False,
+        description=(
+            "True only for customer_admin/customer_operator with an organization_id and zero "
+            "depots in that organization. Always False for favonius_admin and for users without "
+            "an organization_id. Frontends should use this to decide whether to render the "
+            "first-depot setup wizard rather than guessing from depots length."
+        ),
+    )
+    viewer: ViewerInfo = Field(..., description="Caller identity context")
 
 
 class DepotAddressPayload(BaseModel):
@@ -2088,6 +2111,12 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     For ``favonius_admin``, all depots are returned. Customer roles receive depots whose
     ``depots.organization_id`` matches ``app_metadata.organization_id`` on the JWT.
 
+    The response also carries ``needs_setup`` (True iff the caller is a
+    ``customer_admin``/``customer_operator`` with an ``organization_id`` and zero depots in
+    that organization) and ``viewer`` (the caller's role and organization_id). Frontends
+    should drive the first-depot setup wizard from ``needs_setup`` rather than guessing from
+    ``depots`` length, which is unreliable when seed/cross-tenant data leaks into the response.
+
     **Authentication:** Requires JWT token in Authorization header.
     """,
     responses={
@@ -2102,23 +2131,29 @@ async def list_my_depots(user: dict = Depends(ensure_tenant_mirrored)):
     if not db_pools:
         raise DatabaseError("Database not available")
 
+    role = get_user_role(user)
+    org_id = get_user_organization_id(user)
+    viewer = {"role": role, "organization_id": org_id}
+
     try:
         if is_platform_admin(user):
             async with db_pools.static.acquire() as conn:
                 depots = await db_queries.get_all_depots(conn)
-            return {"depots": depots}
+            return {"depots": depots, "needs_setup": False, "viewer": viewer}
 
-        role = get_user_role(user)
         if role not in ("customer_admin", "customer_operator"):
-            return {"depots": []}
+            return {"depots": [], "needs_setup": False, "viewer": viewer}
 
-        org_id = get_user_organization_id(user)
         if not org_id:
-            return {"depots": []}
+            return {"depots": [], "needs_setup": False, "viewer": viewer}
 
         async with db_pools.static.acquire() as conn:
             depots = await db_queries.get_depots_for_organization(conn, org_id)
-        return {"depots": depots}
+        return {
+            "depots": depots,
+            "needs_setup": len(depots) == 0,
+            "viewer": viewer,
+        }
     except asyncpg.PostgresError as e:
         logger.error("Database error listing depots: %s", e, exc_info=True)
         raise DatabaseError(f"Database error: {str(e)}")

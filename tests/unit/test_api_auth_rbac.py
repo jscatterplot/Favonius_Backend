@@ -373,6 +373,8 @@ class TestMyDepots:
         assert len(data["depots"]) == 1
         assert data["depots"][0]["depot_id"] == DEPOT_ID
         assert data["depots"][0]["organization_id"] == org_id
+        assert data["needs_setup"] is False
+        assert data["viewer"] == {"role": "customer_operator", "organization_id": org_id}
 
     def test_returns_empty_when_no_organization_id(self, client, mock_db_pool):
         pool, conn = mock_db_pool
@@ -383,7 +385,12 @@ class TestMyDepots:
         with patch("src.api.main.db_pools", pool):
             response = client.get("/me/depots", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_200_OK
-        assert response.json() == {"depots": []}
+        data = response.json()
+        assert data["depots"] == []
+        # Without an organization_id the user can't run the wizard, so needs_setup must
+        # stay False — the frontend should surface a different error path here.
+        assert data["needs_setup"] is False
+        assert data["viewer"] == {"role": "customer_operator", "organization_id": None}
 
     def test_favonius_admin_gets_all_depots(self, client, mock_db_pool):
         pool, conn = mock_db_pool
@@ -392,6 +399,82 @@ class TestMyDepots:
         with patch("src.api.main.db_pools", pool):
             response = client.get("/me/depots", headers=AUTH_HDR)
         assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        # Platform admins are not customers — they must never trigger the wizard, even when
+        # no depots happen to exist in the system.
+        assert data["needs_setup"] is False
+        assert data["viewer"] == {"role": "favonius_admin", "organization_id": None}
+
+    def test_customer_admin_with_zero_depots_triggers_wizard(self, client, mock_db_pool):
+        """The bug we are fixing: customer_admin in a fresh org must get needs_setup=True."""
+        pool, conn = mock_db_pool
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=org_id)
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        with patch("src.api.main.db_pools", pool):
+            response = client.get("/me/depots", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert data["depots"] == []
+        assert data["needs_setup"] is True
+        assert data["viewer"] == {"role": "customer_admin", "organization_id": org_id}
+
+    def test_customer_admin_with_existing_depots_does_not_trigger_wizard(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_admin", organization_id=org_id)
+        )
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "depot_id": DEPOT_ID,
+                    "organization_id": org_id,
+                    "name": "Test Depot",
+                    "timezone": "Europe/Vilnius",
+                    "currency": "EUR",
+                    "max_grid_kw": 800.0,
+                }
+            ]
+        )
+        with patch("src.api.main.db_pools", pool):
+            response = client.get("/me/depots", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert len(data["depots"]) == 1
+        assert data["needs_setup"] is False
+        assert data["viewer"] == {"role": "customer_admin", "organization_id": org_id}
+
+    def test_customer_operator_with_zero_depots_also_signals_setup(self, client, mock_db_pool):
+        """Operators get the same needs_setup signal; the frontend gates the wizard CTA to admins."""
+        pool, conn = mock_db_pool
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="customer_operator", organization_id=org_id)
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        with patch("src.api.main.db_pools", pool):
+            response = client.get("/me/depots", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert data["needs_setup"] is True
+        assert data["viewer"] == {"role": "customer_operator", "organization_id": org_id}
+
+    def test_unknown_role_returns_empty_without_setup_signal(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="authenticated", omit_organization_id=True)
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        with patch("src.api.main.db_pools", pool):
+            response = client.get("/me/depots", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert data["depots"] == []
+        assert data["needs_setup"] is False
+        assert data["viewer"] == {"role": "authenticated", "organization_id": None}
 
 
 class TestTenantMirrorOnAuthenticatedRequest:
