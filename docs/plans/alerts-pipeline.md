@@ -1,7 +1,7 @@
 # Alerts Pipeline — Implementation Plan
 
 **Branch:** `claude/alerts-pipeline-migration-7oK0g`
-**Status:** plan locked, implementation pending
+**Status:** implemented on this branch (commits in PR #74); see §10 for what shipped vs. plan
 **Authoritative spec context:** `docs/PRD_v2_7_Building_Integration.md` (re-optimization triggers, Section 5.1; alerts endpoint, Section 10)
 
 This document captures the decisions from the four-section plan review (Architecture / Code Quality / Tests / Performance) so the implementation work has a single source of truth. Every choice below was made interactively; deviations during coding require revisiting this doc.
@@ -274,3 +274,33 @@ These are details deferred to implementation, not blockers:
 - Resend webhook payload schema — pin the version in `webhook.py` and add a contract test against a recorded fixture.
 - Email subject line template — current placeholder `[Favonius] {severity}: {title}`; product may want different formatting.
 - Whether `notification_alerts.depot_id` should be NOT NULL — currently nullable to support future org-scoped alerts; reconsider if no use case materializes.
+
+---
+
+## 9. Test count summary (after implementation)
+
+158 tests across the alerts suite, all passing against real Postgres in ~5s:
+
+| Suite | File | Count |
+|---|---|---|
+| Unit — severity | `tests/unit/notifications/test_severity.py` | 32 |
+| Unit — email client + Resend | `tests/unit/notifications/test_email_client.py` + `test_resend_client.py` | 22 |
+| Unit — renderer | `tests/unit/notifications/test_renderer.py` | 15 |
+| Unit — webhook | `tests/unit/notifications/test_webhook.py` | 19 |
+| Unit — dispatcher wire-up | `tests/unit/notifications/test_dispatcher_wireup.py` | 5 |
+| Integration — trigger | `tests/integration/test_alerts_pipeline_trigger.py` | 8 |
+| Integration — repositories | `tests/integration/test_alerts_repositories.py` | 29 |
+| Integration — dispatcher | `tests/integration/test_alerts_dispatcher.py` | 9 |
+| Integration — API | `tests/integration/test_alerts_api.py` | 16 |
+| E2E — AT-17 | `tests/e2e/test_alerts_pipeline_e2e.py` | 3 |
+
+---
+
+## 10. What shipped vs. the plan
+
+- **Acceptance test ID:** plan said AT-08; AT-08 is taken (VDV463) and AT-16 is taken (existing /alerts endpoint). Used **AT-17**. CLAUDE.md and ARCHITECTURE.md reference AT-17.
+- **Migration number:** 022 (017 was taken when the plan was written, but the discussion in earlier review used "017").
+- **Decision 4.1 (single-worker):** in-memory `_currently_sending` set + a startup `WEB_CONCURRENCY` assertion that logs CRITICAL above 1. TODO marker is in `src/notifications/dispatcher.py`. Multi-worker safety would replace this with `SELECT … FOR UPDATE SKIP LOCKED LIMIT n` in `claim_pending_alerts`.
+- **Decision 4.4 (NOTIFY + 30s reconciliation):** the dispatcher's main loop already runs the same `claim_pending_alerts` query on a timer in addition to LISTEN — so a single code path covers both fast-path and reconciliation. No separate "backstop scan" was needed.
+- **Notification tables co-located in TimescaleDB pool:** `notification_alerts` must be in the same DB as `connector_status` (the trigger writes there). `notification_recipients` and `notification_deliveries` follow for FK simplicity, even though recipients are static config. API endpoints use `db_pools.ts` for all three.
+- **Webhook signature header:** accepts both `X-Resend-Signature` and `Svix-Signature` since Resend is migrating between the two names.
