@@ -89,10 +89,15 @@ def evaluate_readiness(
         missing.append("prices")
     if not schedules_present:
         missing.append("schedules")
-    if not config.charger_vehicle_access:
+    if (
+        config.charger_vehicle_access_default != "all_to_all"
+        and not config.charger_vehicle_access
+    ):
         # Without an access matrix we can't enforce physical pairing
-        # constraints. Treat as a hard miss rather than silently
-        # assuming any-charger-fits-any-vehicle.
+        # constraints. In 'all_to_all' mode the matrix is synthesized in
+        # the assembler so an empty stored matrix is fine; otherwise we
+        # treat it as a hard miss rather than silently assuming any
+        # charger fits any vehicle.
         missing.append("charger_vehicle_access")
 
     # Soft prerequisites — degrade rather than block.
@@ -221,10 +226,23 @@ def build_snapshot(
         "total": sum(config.charger_groups.values()),
     }
 
-    access_payload = {
-        charger_id: sorted(vehicle_ids)
-        for charger_id, vehicle_ids in config.charger_vehicle_access.items()
-    }
+    # In all_to_all mode the matrix is synthesized per run (and may be
+    # large for big depots). Persist only the mode and an empty matrix so
+    # replays know to re-synthesize from the current vehicle list rather
+    # than freezing today's roster into the snapshot.
+    if config.charger_vehicle_access_default == "all_to_all":
+        access_payload: dict[str, object] = {
+            "mode": "all_to_all",
+            "matrix": {},
+        }
+    else:
+        access_payload = {
+            "mode": "explicit_matrix",
+            "matrix": {
+                charger_id: sorted(vehicle_ids)
+                for charger_id, vehicle_ids in config.charger_vehicle_access.items()
+            },
+        }
 
     schedules_payload = [_serialize_schedule_row(s) for s in schedules]
 

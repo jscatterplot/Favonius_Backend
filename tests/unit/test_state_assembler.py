@@ -15,6 +15,13 @@ from src.core.models import DepotConfig
 from src.core.state.assembler import StateAssembler
 from src.db.pools import DatabasePools
 
+# tests/conftest.py installs an autouse fixture that overwrites
+# StateAssembler.load_depot_config with an AsyncMock returning a fixed
+# sample DepotConfig. That's fine for API-level tests but defeats any
+# direct test of the loader. Capture the original at module-import time
+# so we can restore it inside the tests that exercise it.
+_ORIGINAL_LOAD_DEPOT_CONFIG = StateAssembler.__dict__["load_depot_config"]
+
 
 @pytest.fixture
 def mock_db_pool():
@@ -1233,3 +1240,167 @@ class TestDepartureTimeComputation:
             if dep < start:
                 # Vehicle already departed - no departure constraint
                 pass
+
+
+class TestLoadDepotConfigAccessMode:
+    """Migration 021: charger_vehicle_access_default toggle.
+
+    `all_to_all` synthesizes a full charger×vehicle matrix in-memory and
+    skips the SQL against `charger_vehicle_access` entirely; the readiness
+    check then accepts the depot even with zero rows in that table.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_real_load_depot_config(self):
+        """Undo the project-wide AsyncMock patch from tests/conftest.py."""
+        patched = StateAssembler.load_depot_config
+        StateAssembler.load_depot_config = _ORIGINAL_LOAD_DEPOT_CONFIG
+        try:
+            yield
+        finally:
+            StateAssembler.load_depot_config = patched
+
+    def _depot_row(self, *, access_default: str = "explicit_matrix") -> dict:
+        return {
+            "max_grid_kw": 800.0,
+            "demand_charge_rate_kw": 20.0,
+            "building_load_assumption_kw": 0.0,
+            "charger_vehicle_access_default": access_default,
+            "tariff_type": "simple_demand",
+            "energy_cap_kwh": None,
+            "under_cap_rate_per_kwh": None,
+            "over_cap_penalty_per_kwh": None,
+            "cap_billing_period": "monthly",
+        }
+
+    @pytest.mark.asyncio
+    async def test_all_to_all_synthesizes_full_matrix_without_access_query(
+        self, mock_db_pools, mock_db_pool
+    ):
+        """In all_to_all mode, every charger reaches every vehicle and we
+        never SELECT FROM charger_vehicle_access — protects against
+        misleading "no matrix" warnings on depots that opted out.
+        """
+        depot_id = str(uuid4())
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # Sequence of fetchrow / fetch calls inside load_depot_config:
+        # 1. fetchrow depot row
+        # 2. fetch vehicles
+        # 3. fetch chargers (grouped by rated_kw)
+        # 4. fetchrow battery_storage (None means no battery)
+        # 5. fetch charger ids (for all_to_all matrix)
+        mock_conn.fetchrow.side_effect = [
+            self._depot_row(access_default="all_to_all"),
+            None,  # battery_storage row
+        ]
+        mock_conn.fetch.side_effect = [
+            # vehicles
+            [
+                {"vehicle_id": "v1", "battery_kwh": 324.0, "max_charge_kw": 80.0, "id_tag": None},
+                {"vehicle_id": "v2", "battery_kwh": 324.0, "max_charge_kw": 80.0, "id_tag": None},
+            ],
+            # chargers grouped
+            [{"rated_kw": 80.0, "efficiency": 0.95, "count": 3}],
+            # charger ids for all_to_all synthesis
+            [{"charger_id": "c1"}, {"charger_id": "c2"}, {"charger_id": "c3"}],
+        ]
+        config, _ = await StateAssembler.load_depot_config(mock_db_pools, depot_id)
+
+        # Every charger reaches every vehicle.
+        assert config.charger_vehicle_access_default == "all_to_all"
+        assert set(config.charger_vehicle_access.keys()) == {"c1", "c2", "c3"}
+        for chargers_vehicles in config.charger_vehicle_access.values():
+            assert chargers_vehicles == {"v1", "v2"}
+
+        # No query against charger_vehicle_access was issued — the third
+        # fetch call was the charger-id list, not the matrix table.
+        for call in mock_conn.fetch.call_args_list:
+            sql = call.args[0]
+            assert "FROM charger_vehicle_access" not in sql
+
+    @pytest.mark.asyncio
+    async def test_explicit_matrix_uses_access_table(
+        self, mock_db_pools, mock_db_pool
+    ):
+        depot_id = str(uuid4())
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        mock_conn.fetchrow.side_effect = [
+            self._depot_row(access_default="explicit_matrix"),
+            None,  # battery_storage row
+        ]
+        mock_conn.fetch.side_effect = [
+            # vehicles
+            [
+                {"vehicle_id": "v1", "battery_kwh": 324.0, "max_charge_kw": 80.0, "id_tag": None},
+            ],
+            # chargers grouped
+            [{"rated_kw": 80.0, "efficiency": 0.95, "count": 1}],
+            # charger_vehicle_access rows
+            [{"charger_id": "c1", "vehicle_id": "v1"}],
+        ]
+        config, _ = await StateAssembler.load_depot_config(mock_db_pools, depot_id)
+        assert config.charger_vehicle_access_default == "explicit_matrix"
+        assert config.charger_vehicle_access == {"c1": {"v1"}}
+
+        # Last fetch must be the access matrix query.
+        last_sql = mock_conn.fetch.call_args_list[-1].args[0]
+        assert "FROM charger_vehicle_access" in last_sql
+
+
+class TestCumulativeKwhPeriod:
+    """Tests for cumulative billing-period energy integration."""
+
+    @pytest.mark.asyncio
+    async def test_stale_last_sample_is_capped_to_30_minutes(self, assembler, mock_db_pools):
+        """Last non-zero sample should not extrapolate all the way to now."""
+        static_conn = AsyncMock()
+        ts_conn = AsyncMock()
+        mock_db_pools.static.acquire.return_value.__aenter__.return_value = static_conn
+        mock_db_pools.ts.acquire.return_value.__aenter__.return_value = ts_conn
+
+        static_conn.fetch.return_value = [{"charger_id": uuid4()}]
+        ts_conn.fetchrow.return_value = {"sum_kwh": 12.5}
+
+        now = datetime.utcnow()
+        sum_kwh = await assembler._get_cumulative_kwh_period(now)
+
+        assert sum_kwh == 12.5
+        assert ts_conn.fetchrow.call_count == 1
+        args = ts_conn.fetchrow.call_args.args
+        assert len(args) == 5
+        assert args[4] == "30 minutes"
+
+    @pytest.mark.asyncio
+    async def test_db_error_fetching_chargers_falls_back_to_energy_cap(
+        self, assembler, mock_db_pools
+    ):
+        """DB failures should assume no cap headroom when cap is configured."""
+        static_conn = AsyncMock()
+        mock_db_pools.static.acquire.return_value.__aenter__.return_value = static_conn
+        assembler.config.energy_cap_kwh = 500.0
+        static_conn.fetch.side_effect = Exception("static db unavailable")
+
+        sum_kwh = await assembler._get_cumulative_kwh_period(datetime.utcnow())
+
+        assert sum_kwh == 500.0
+
+    @pytest.mark.asyncio
+    async def test_db_error_fetching_telemetry_falls_back_to_energy_cap(
+        self, assembler, mock_db_pools
+    ):
+        """Timescale failures should assume no cap headroom when cap is configured."""
+        static_conn = AsyncMock()
+        ts_conn = AsyncMock()
+        mock_db_pools.static.acquire.return_value.__aenter__.return_value = static_conn
+        mock_db_pools.ts.acquire.return_value.__aenter__.return_value = ts_conn
+        assembler.config.energy_cap_kwh = 500.0
+        static_conn.fetch.return_value = [{"charger_id": uuid4()}]
+        ts_conn.fetchrow.side_effect = Exception("timescale unavailable")
+
+        sum_kwh = await assembler._get_cumulative_kwh_period(datetime.utcnow())
+
+        assert sum_kwh == 500.0

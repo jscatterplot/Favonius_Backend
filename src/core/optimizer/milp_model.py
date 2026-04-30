@@ -463,12 +463,68 @@ def build_optimization_model(
 
     model.batt_dynamics = pyo.Constraint(model.T, rule=batt_dynamics_rule)
 
-    # Objective: minimize energy cost + demand charges + preconditioning shortfall penalty
+    # Tariff branch (migration 021).
+    # 'simple_demand' keeps the legacy demand_charge_rate × P_peak term.
+    # 'energy_cap' replaces it with a piecewise rate over kWh consumed in
+    # the current billing period:
+    #     under_cap_rate × min(total_kwh, cap)
+    #     + over_cap_penalty × max(0, total_kwh - cap)
+    # implemented linearly via two slack variables. Because
+    # over_cap_penalty > under_cap_rate (enforced upstream by Pydantic /
+    # CHECK constraint), the LP relaxation naturally fills kwh_under
+    # before kwh_over, so no SOS2 is needed.
+    fixed_energy_cap_cost = 0.0
+    if config.tariff_type == "energy_cap":
+        if (
+            config.energy_cap_kwh is None
+            or config.under_cap_rate_per_kwh is None
+            or config.over_cap_penalty_per_kwh is None
+        ):
+            raise ValueError(
+                "tariff_type='energy_cap' requires energy_cap_kwh, "
+                "under_cap_rate_per_kwh, and over_cap_penalty_per_kwh"
+            )
+        model.total_kwh_period = pyo.Var(domain=pyo.NonNegativeReals)
+        model.kwh_under = pyo.Var(domain=pyo.NonNegativeReals)
+        model.kwh_over = pyo.Var(domain=pyo.NonNegativeReals)
+
+        def total_kwh_rule(m):
+            horizon_kwh = sum(
+                m.P_charge[b, t] * config.delta_t for b in m.B for t in m.T
+            )
+            return m.total_kwh_period == state.cumulative_kwh_period + horizon_kwh
+
+        model.total_kwh_def = pyo.Constraint(rule=total_kwh_rule)
+
+        fixed_energy_cap_cost = (
+            config.under_cap_rate_per_kwh * min(state.cumulative_kwh_period, config.energy_cap_kwh)
+            + config.over_cap_penalty_per_kwh
+            * max(0.0, state.cumulative_kwh_period - config.energy_cap_kwh)
+        )
+
+        def kwh_split_rule(m):
+            return m.kwh_under + m.kwh_over == m.total_kwh_period
+
+        model.kwh_split = pyo.Constraint(rule=kwh_split_rule)
+
+        def kwh_under_cap_rule(m):
+            return m.kwh_under <= config.energy_cap_kwh
+
+        model.kwh_under_cap = pyo.Constraint(rule=kwh_under_cap_rule)
+
+    # Objective: minimize energy cost + tariff cost + preconditioning shortfall penalty
     def objective_rule(m):
         energy_cost = sum(m.price[t] * m.P_grid[t] * config.delta_t for t in m.T)
-        demand_cost = state.demand_charge_rate * m.P_peak
+        if config.tariff_type == "energy_cap":
+            tariff_cost = (
+                config.under_cap_rate_per_kwh * m.kwh_under
+                + config.over_cap_penalty_per_kwh * m.kwh_over
+                - fixed_energy_cap_cost
+            )
+        else:
+            tariff_cost = state.demand_charge_rate * m.P_peak
         precond_penalty = M_PRECOND * sum(m.precond_slack[t] for t in m.T)
-        return energy_cost + demand_cost + precond_penalty
+        return energy_cost + tariff_cost + precond_penalty
 
     model.objective = pyo.Objective(rule=objective_rule, sense=pyo.minimize)
 

@@ -15,7 +15,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-from typing import Iterator, Literal, Optional
+from typing import Annotated, Iterator, Literal, Optional, Union
 from urllib.parse import urlparse
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -1017,11 +1017,50 @@ class DepotAddressPayload(BaseModel):
     longitude: float = Field(..., ge=-180.0, le=180.0)
 
 
-class DepotDemandChargePayload(BaseModel):
-    """Demand-charge settings."""
+class SimpleDemandTariffPayload(BaseModel):
+    """Legacy demand-charge tariff: $/kW × peak grid power."""
 
+    model_config = {"extra": "forbid"}
+
+    tariff_type: Literal["simple_demand"] = "simple_demand"
     rate_eur_per_kw: float = Field(..., gt=0)
     billing_period: str = Field(..., min_length=1, max_length=32)
+
+
+class EnergyCapTariffPayload(BaseModel):
+    """Energy-cap tariff: piecewise-linear under/over a kWh allowance.
+
+    Forbids ``rate_eur_per_kw`` so a misrouted simple_demand payload
+    cannot silently drop fields. The validator enforces that the
+    over-cap penalty strictly exceeds the under-cap rate, otherwise the
+    optimizer has no incentive to stay below the cap.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    tariff_type: Literal["energy_cap"]
+    energy_cap_kwh: float = Field(..., gt=0)
+    under_cap_rate_per_kwh: float = Field(..., gt=0)
+    over_cap_penalty_per_kwh: float = Field(..., gt=0)
+    cap_billing_period: str = Field(default="monthly", min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def _penalty_exceeds_under(self) -> "EnergyCapTariffPayload":
+        if self.over_cap_penalty_per_kwh <= self.under_cap_rate_per_kwh:
+            raise ValueError(
+                "over_cap_penalty_per_kwh must be strictly greater than "
+                "under_cap_rate_per_kwh"
+            )
+        return self
+
+
+# Discriminated union on tariff_type. Payloads without an explicit
+# tariff_type fall through to simple_demand (default on the literal),
+# preserving backward compatibility for existing clients.
+DepotDemandChargePayload = Annotated[
+    Union[SimpleDemandTariffPayload, EnergyCapTariffPayload],
+    Field(discriminator="tariff_type"),
+]
 
 
 class DepotBillingPayload(BaseModel):
@@ -1104,12 +1143,61 @@ class DepotSetupPayload(BaseModel):
     stationary_battery: StationaryBatteryPayload = Field(
         default_factory=lambda: StationaryBatteryPayload(present=False)
     )
+    # Migration 021: depots can opt out of the explicit charger×vehicle
+    # access matrix. 'all_to_all' means every charger reaches every
+    # vehicle and the matrix is synthesized at solve time.
+    charger_vehicle_access_default: Literal["all_to_all", "explicit_matrix"] = (
+        "explicit_matrix"
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_demand_charge_tariff_type(cls, data):
+        """Default ``demand_charge.tariff_type`` to ``simple_demand`` when
+        absent so existing clients (and pre-021 tests) keep working with
+        the strict discriminator on the new union.
+        """
+        if isinstance(data, dict):
+            dc = data.get("demand_charge")
+            if isinstance(dc, dict) and "tariff_type" not in dc:
+                data = {**data, "demand_charge": {**dc, "tariff_type": "simple_demand"}}
+            elif isinstance(dc, BaseModel):
+                dc_payload = dc.model_dump()
+                if "tariff_type" not in dc_payload:
+                    data = {
+                        **data,
+                        "demand_charge": {**dc_payload, "tariff_type": "simple_demand"},
+                    }
+        return data
 
 
 class FirstDepotSetupRequest(BaseModel):
     """Request for initial depot creation."""
 
     depot: DepotSetupPayload
+
+
+class ChargerVehicleAccessEntry(BaseModel):
+    """Single (charger, vehicle, accessible?) row for the access matrix."""
+
+    charger_id: str = Field(..., min_length=1, max_length=64)
+    vehicle_id: str = Field(..., min_length=1, max_length=64)
+    is_accessible: bool
+
+    @field_validator("charger_id", "vehicle_id")
+    @classmethod
+    def _validate_uuid(cls, value: str) -> str:
+        try:
+            UUID(value)
+        except ValueError as exc:
+            raise ValueError("must be a valid UUID") from exc
+        return value
+
+
+class ChargerVehicleAccessRequest(BaseModel):
+    """POST /admin/depots/{id}/charger-vehicle-access body."""
+
+    entries: list[ChargerVehicleAccessEntry] = Field(..., min_length=1)
 
 
 class ReadinessChecklistItem(BaseModel):
@@ -1575,6 +1663,38 @@ def _format_depot_setup_validation_errors(exc: ValidationError) -> dict:
     }
 
 
+def _depot_setup_tariff_kwargs(
+    demand_charge: "SimpleDemandTariffPayload | EnergyCapTariffPayload",
+) -> dict:
+    """Map a discriminated tariff payload to db_queries.create/update kwargs.
+
+    Both branches always populate ``demand_charge_rate_kw`` and
+    ``demand_charge_billing_period`` because those columns are
+    ``NOT NULL`` in the depots schema; the energy-cap variant just uses
+    sensible placeholders (rate=0, period from cap_billing_period) so
+    callers reading the legacy columns still see something coherent.
+    """
+    if isinstance(demand_charge, EnergyCapTariffPayload):
+        return {
+            "demand_charge_rate_kw": 0.0,
+            "demand_charge_billing_period": demand_charge.cap_billing_period,
+            "tariff_type": "energy_cap",
+            "energy_cap_kwh": demand_charge.energy_cap_kwh,
+            "under_cap_rate_per_kwh": demand_charge.under_cap_rate_per_kwh,
+            "over_cap_penalty_per_kwh": demand_charge.over_cap_penalty_per_kwh,
+            "cap_billing_period": demand_charge.cap_billing_period,
+        }
+    return {
+        "demand_charge_rate_kw": demand_charge.rate_eur_per_kw,
+        "demand_charge_billing_period": demand_charge.billing_period,
+        "tariff_type": "simple_demand",
+        "energy_cap_kwh": None,
+        "under_cap_rate_per_kwh": None,
+        "over_cap_penalty_per_kwh": None,
+        "cap_billing_period": "monthly",
+    }
+
+
 def _validate_depot_setup_payload(payload: DepotSetupPayload) -> None:
     """Run semantic validation that is not covered by simple field constraints."""
     try:
@@ -1760,19 +1880,27 @@ async def _build_depot_readiness_checklist(
                 "SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id
             )
         )
-        has_access = bool(
+        access_default = (
             await conn.fetchval(
-                """
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM charger_vehicle_access cva
-                    JOIN chargers c ON c.charger_id = cva.charger_id
-                    WHERE c.depot_id = $1::uuid AND cva.is_accessible = TRUE
-                )
-                """,
+                "SELECT charger_vehicle_access_default FROM depots WHERE depot_id = $1::uuid",
                 depot_id,
             )
-        )
+        ) or "explicit_matrix"
+        has_access = False
+        if access_default != "all_to_all":
+            has_access = bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM charger_vehicle_access cva
+                        JOIN chargers c ON c.charger_id = cva.charger_id
+                        WHERE c.depot_id = $1::uuid AND cva.is_accessible = TRUE
+                    )
+                    """,
+                    depot_id,
+                )
+            )
         has_schedules = bool(
             await conn.fetchval(
                 """
@@ -1863,16 +1991,22 @@ async def _build_depot_readiness_checklist(
             "detail": "Chargers present" if has_chargers else "No chargers configured for depot",
         }
     )
+    if access_default == "all_to_all":
+        access_status = "ready"
+        access_detail = "All chargers reach all vehicles (all_to_all mode)"
+    else:
+        access_status = "ready" if has_access else "blocked"
+        access_detail = (
+            "Charger/vehicle accessibility mapped"
+            if has_access
+            else "No charger_vehicle_access mappings found"
+        )
     checklist.append(
         {
             "id": "charger_access",
             "label": "Charger access mapped",
-            "status": "ready" if has_access else "blocked",
-            "detail": (
-                "Charger/vehicle accessibility mapped"
-                if has_access
-                else "No charger_vehicle_access mappings found"
-            ),
+            "status": access_status,
+            "detail": access_detail,
         }
     )
     checklist.append(
@@ -2726,6 +2860,7 @@ async def create_first_depot_setup(
     billing_metadata = depot.billing.model_dump(exclude_none=True)
     building_load_source = depot.building_load_source.model_dump(exclude_none=True)
     building_load_assumption_kw = float(depot.building_load_source.assumption_kw or 0.0)
+    tariff_kwargs = _depot_setup_tariff_kwargs(depot.demand_charge)
 
     async with db_pools.static.acquire() as conn:
         async with conn.transaction():
@@ -2739,12 +2874,12 @@ async def create_first_depot_setup(
                 currency=depot.currency.upper(),
                 utility_id=depot.utility_id,
                 max_grid_kw=depot.max_grid_kw,
-                demand_charge_rate_kw=depot.demand_charge.rate_eur_per_kw,
-                demand_charge_billing_period=depot.demand_charge.billing_period,
                 address=address,
                 billing_metadata=billing_metadata,
                 building_load_source=building_load_source,
                 building_load_assumption_kw=building_load_assumption_kw,
+                charger_vehicle_access_default=depot.charger_vehicle_access_default,
+                **tariff_kwargs,
             )
             if depot.stationary_battery.present:
                 max_power_kw = min(
@@ -2814,6 +2949,7 @@ async def update_depot_setup(
         raise DatabaseError("Database not available")
 
     depot = request.depot
+    tariff_kwargs = _depot_setup_tariff_kwargs(depot.demand_charge)
     async with db_pools.static.acquire() as conn:
         async with conn.transaction():
             updated = await db_queries.update_depot_setup(
@@ -2826,12 +2962,12 @@ async def update_depot_setup(
                 currency=depot.currency.upper(),
                 utility_id=depot.utility_id,
                 max_grid_kw=depot.max_grid_kw,
-                demand_charge_rate_kw=depot.demand_charge.rate_eur_per_kw,
-                demand_charge_billing_period=depot.demand_charge.billing_period,
                 address=depot.address.model_dump(exclude_none=True),
                 billing_metadata=depot.billing.model_dump(exclude_none=True),
                 building_load_source=depot.building_load_source.model_dump(exclude_none=True),
                 building_load_assumption_kw=float(depot.building_load_source.assumption_kw or 0.0),
+                charger_vehicle_access_default=depot.charger_vehicle_access_default,
+                **tariff_kwargs,
             )
             if not updated:
                 raise DepotNotFoundError(f"Depot {depot_id} not found")
@@ -2861,6 +2997,91 @@ async def update_depot_setup(
             "timezone": updated["timezone"],
             "currency": updated["currency"],
             "max_grid_kw": updated["max_grid_kw"],
+        },
+        "readiness_checklist": readiness,
+    }
+
+
+@app.post(
+    "/admin/depots/{depot_id}/charger-vehicle-access",
+    response_model=DepotSetupResponse,
+    tags=["admin"],
+    summary="Upsert charger-vehicle access matrix rows",
+)
+async def upsert_charger_vehicle_access_endpoint(
+    depot_id: str,
+    body: ChargerVehicleAccessRequest,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Per-row upsert into the charger_vehicle_access matrix.
+
+    Only valid when the depot is in ``explicit_matrix`` mode. Returns
+    409 for ``all_to_all`` depots, where the matrix is synthesized at
+    solve time. Returns 400 with the offending IDs if any
+    ``charger_id`` / ``vehicle_id`` does not belong to this depot.
+    Invalidates the depot config cache so the next solve reflects the
+    new rows immediately.
+    """
+    _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    result: dict[str, list[str]] = {"invalid_chargers": [], "invalid_vehicles": []}
+    async with db_pools.static.acquire() as conn:
+        access_default = (
+            await conn.fetchval(
+                "SELECT charger_vehicle_access_default FROM depots WHERE depot_id = $1::uuid",
+                depot_id,
+            )
+        ) or "explicit_matrix"
+        if access_default == "all_to_all":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Depot is in all_to_all mode; the access matrix is "
+                    "synthesized automatically. Switch to explicit_matrix "
+                    "via PATCH /admin/depots/{id} before posting rows."
+                ),
+            )
+        async with conn.transaction():
+            result = await db_queries.upsert_charger_vehicle_access(
+                conn,
+                depot_id=depot_id,
+                entries=[entry.model_dump() for entry in body.entries],
+            )
+            if result["invalid_chargers"] or result["invalid_vehicles"]:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={
+                        "detail": "One or more IDs do not belong to this depot",
+                        "error_code": "INVALID_DEPOT_MEMBERSHIP",
+                        "invalid_chargers": result["invalid_chargers"],
+                        "invalid_vehicles": result["invalid_vehicles"],
+                    },
+                )
+
+    _depot_config_cache.pop(depot_id, None)
+
+    async with db_pools.static.acquire() as conn:
+        depot_row = await conn.fetchrow(
+            "SELECT name, timezone, currency, max_grid_kw FROM depots "
+            "WHERE depot_id = $1::uuid",
+            depot_id,
+        )
+    if not depot_row:
+        raise DepotNotFoundError(f"Depot {depot_id} not found")
+
+    readiness = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "depot": {
+            "id": depot_id,
+            "name": depot_row["name"],
+            "timezone": depot_row["timezone"],
+            "currency": depot_row["currency"],
+            "max_grid_kw": depot_row["max_grid_kw"],
         },
         "readiness_checklist": readiness,
     }
