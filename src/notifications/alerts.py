@@ -34,7 +34,10 @@ class Alert:
     status: str
     first_occurrence_at: datetime
     last_occurrence_at: datetime
+    occurrence_count: int
     acknowledged_at: Optional[datetime]
+    acknowledged_by: Optional[UUID]
+    resolved_at: Optional[datetime]
     last_notified_at: Optional[datetime]
     last_notified_count: int
 
@@ -52,7 +55,10 @@ class Alert:
             status=row["status"],
             first_occurrence_at=row["first_occurrence_at"],
             last_occurrence_at=row["last_occurrence_at"],
+            occurrence_count=int(row["occurrence_count"]),
             acknowledged_at=row["acknowledged_at"],
+            acknowledged_by=row["acknowledged_by"],
+            resolved_at=row["resolved_at"],
             last_notified_at=row["last_notified_at"],
             last_notified_count=row["last_notified_count"],
         )
@@ -78,10 +84,16 @@ def _coerce_jsonb(value: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-_CLAIM_QUERY = """
-    SELECT id, organization_id, depot_id, alert_type, severity, title, detail,
-           dedup_key, status, first_occurrence_at, last_occurrence_at,
-           acknowledged_at, last_notified_at, last_notified_count
+_ALERT_COLUMNS = (
+    "id, organization_id, depot_id, alert_type, severity, title, detail, "
+    "dedup_key, status, first_occurrence_at, last_occurrence_at, "
+    "occurrence_count, acknowledged_at, acknowledged_by, resolved_at, "
+    "last_notified_at, last_notified_count"
+)
+
+
+_CLAIM_QUERY = f"""
+    SELECT {_ALERT_COLUMNS}
       FROM notification_alerts
      WHERE status = 'active'
        AND (last_notified_at IS NULL
@@ -146,10 +158,8 @@ async def list_for_depot(
     last_occurrence_at DESC.
     """
     rows = await conn.fetch(
-        """
-        SELECT id, organization_id, depot_id, alert_type, severity, title, detail,
-               dedup_key, status, first_occurrence_at, last_occurrence_at,
-               acknowledged_at, last_notified_at, last_notified_count
+        f"""
+        SELECT {_ALERT_COLUMNS}
           FROM notification_alerts
          WHERE depot_id = $1
            AND status = ANY($2::text[])
@@ -165,10 +175,8 @@ async def list_for_depot(
 
 async def get_by_id(conn: Any, alert_id: UUID) -> Optional[Alert]:
     row = await conn.fetchrow(
-        """
-        SELECT id, organization_id, depot_id, alert_type, severity, title, detail,
-               dedup_key, status, first_occurrence_at, last_occurrence_at,
-               acknowledged_at, last_notified_at, last_notified_count
+        f"""
+        SELECT {_ALERT_COLUMNS}
           FROM notification_alerts
          WHERE id = $1
         """,
@@ -183,7 +191,7 @@ async def acknowledge(
     """Mark an active alert as acknowledged. Returns the updated row, or None
     if the alert doesn't exist or is already resolved."""
     row = await conn.fetchrow(
-        """
+        f"""
         UPDATE notification_alerts
            SET status = 'acknowledged',
                acknowledged_at = NOW(),
@@ -191,12 +199,99 @@ async def acknowledge(
                updated_at = NOW()
          WHERE id = $1
            AND status = 'active'
-         RETURNING id, organization_id, depot_id, alert_type, severity, title, detail,
-                   dedup_key, status, first_occurrence_at, last_occurrence_at,
-                  acknowledged_at, last_notified_at, last_notified_count
+         RETURNING {_ALERT_COLUMNS}
         """,
         alert_id,
         user_id,
+    )
+    return Alert.from_record(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Producer-side UPSERT
+# ---------------------------------------------------------------------------
+
+
+_UPSERT_QUERY = f"""
+    INSERT INTO notification_alerts (
+        organization_id, depot_id, alert_type, severity, title, detail, dedup_key
+    ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+    ON CONFLICT (organization_id, dedup_key) WHERE status != 'resolved'
+    DO UPDATE SET
+        last_occurrence_at = NOW(),
+        occurrence_count   = notification_alerts.occurrence_count + 1,
+        severity           = EXCLUDED.severity,
+        title              = EXCLUDED.title,
+        detail             = EXCLUDED.detail,
+        updated_at         = NOW()
+    RETURNING {_ALERT_COLUMNS}
+"""
+
+
+async def upsert_alert(
+    conn: Any,
+    *,
+    organization_id: UUID,
+    depot_id: Optional[UUID],
+    alert_type: str,
+    severity: Severity,
+    title: str,
+    detail: dict[str, Any],
+    dedup_key: str,
+) -> Alert:
+    """Insert a new alert or bump an existing active row.
+
+    Mirrors the ``fn_alerts_on_connector_status`` trigger logic for app-code
+    producers (charger_auth_failure, degraded_optimization, missing_input,
+    stale_telemetry). Increments ``occurrence_count`` on dedup conflict; the
+    partial unique index keeps one active row per ``(org, dedup_key)``.
+
+    Callers should run this inside an existing transaction if they want the
+    insert to roll back atomically with their own writes.
+    """
+    row = await conn.fetchrow(
+        _UPSERT_QUERY,
+        organization_id,
+        depot_id,
+        alert_type,
+        severity.value,
+        title,
+        json.dumps(detail) if detail else "{}",
+        dedup_key,
+    )
+    if row is None:
+        raise RuntimeError(
+            f"upsert_alert returned no row for dedup_key={dedup_key!r}"
+        )
+    return Alert.from_record(row)
+
+
+async def resolve_alert(
+    conn: Any,
+    *,
+    organization_id: UUID,
+    dedup_key: str,
+) -> Optional[Alert]:
+    """Mark the active alert with the given dedup_key as resolved.
+
+    Returns the resolved row, or None if no active alert matched (already
+    resolved, or never existed). Producers call this when the underlying
+    condition clears (e.g. successful charger auth after a string of
+    failures).
+    """
+    row = await conn.fetchrow(
+        f"""
+        UPDATE notification_alerts
+           SET status = 'resolved',
+               resolved_at = NOW(),
+               updated_at = NOW()
+         WHERE organization_id = $1
+           AND dedup_key = $2
+           AND status != 'resolved'
+         RETURNING {_ALERT_COLUMNS}
+        """,
+        organization_id,
+        dedup_key,
     )
     return Alert.from_record(row) if row else None
 
@@ -276,6 +371,8 @@ __all__ = [
     "list_for_depot",
     "get_by_id",
     "acknowledge",
+    "upsert_alert",
+    "resolve_alert",
     "record_delivery",
     "update_delivery_status",
 ]

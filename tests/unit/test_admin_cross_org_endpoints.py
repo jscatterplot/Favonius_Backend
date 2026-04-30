@@ -414,7 +414,7 @@ class TestRotateCredentialsRBAC:
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
         body = response.json()
-        assert body["credentials"]["shownOnce"] is True
+        assert body["credentials"]["shown_once"] is True
         assert body["credentials"]["password"]
         # The plaintext returned must NOT equal the bcrypt hash that was stored.
         passed_hash = rotate_mock.await_args.kwargs["new_password_hash"]

@@ -177,6 +177,7 @@ class SecurityManager:
                 if await auth_func(station_id, auth_data, client_cert):
                     # Successful authentication
                     await self._clear_failed_attempts(station_id)
+                    await self._resolve_charger_auth_failure_alert(station_id)
                     await self._log_security_event(
                         station_id,
                         SecurityEventType.STARTUP_OF_THE_DEVICE,
@@ -192,6 +193,7 @@ class SecurityManager:
                 f"All authentication methods failed for station {station_id}",
                 {"reason": "invalid_credentials"},
             )
+            await self._emit_charger_auth_failure_alert(station_id, "invalid_credentials")
             return False, "Authentication failed"
 
         except Exception as e:
@@ -534,6 +536,116 @@ class SecurityManager:
     async def _clear_failed_attempts(self, station_id: str) -> None:
         """Clear failed authentication attempts."""
         self.failed_auth_attempts.pop(station_id, None)
+
+    async def _emit_charger_auth_failure_alert(self, station_id: str, reason: str) -> None:
+        """Best-effort: insert/bump a charger_auth_failure notification_alert.
+
+        Failures here must never break the auth path. The alert is keyed by
+        station, not connector — multiple bad attempts within the dedup
+        window bump occurrence_count rather than spawning new rows.
+        """
+        pool = getattr(self.timescale_client, "pg_pool", None)
+        if pool is None:
+            return
+        try:
+            # Resolve org / depot from the station's ocpp_id. Unknown station
+            # (test setup, charger not yet onboarded) → silently skip; we
+            # can't write a tenant-scoped alert without an organization.
+            from uuid import UUID  # noqa: PLC0415
+
+            from src.notifications.alerts import upsert_alert  # noqa: PLC0415
+            from src.notifications.severity import Severity  # noqa: PLC0415
+
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT d.organization_id, d.depot_id, d.name AS depot_name,
+                           c.charger_id, COALESCE(c.display_name, c.ocpp_id) AS charger_name
+                      FROM chargers c
+                      JOIN depots   d ON d.depot_id = c.depot_id
+                     WHERE c.ocpp_id = $1
+                     LIMIT 1
+                    """,
+                    station_id,
+                )
+                if row is None:
+                    return
+
+                detail = {
+                    "description": (
+                        f"Charger {row['charger_name']} failed to authenticate "
+                        f"({reason}). Repeated failures lock the station out for "
+                        f"{self.config.lockout_duration_minutes} minutes."
+                    ),
+                    "suggestedAction": (
+                        "Verify the charger's Basic Auth credentials match the "
+                        "values stored on this station. Rotate the credential "
+                        "from the admin panel if it may have been compromised."
+                    ),
+                    "context": {
+                        "kind": "charger",
+                        "id": str(row["charger_id"]),
+                        "label": row["charger_name"],
+                    },
+                    "station_id": station_id,
+                    "reason": reason,
+                }
+
+                await upsert_alert(
+                    conn,
+                    organization_id=UUID(str(row["organization_id"])),
+                    depot_id=UUID(str(row["depot_id"])),
+                    alert_type="charger_auth_failure",
+                    severity=Severity.CRITICAL,
+                    title=f"Charger {row['charger_name']} authentication failed",
+                    detail=detail,
+                    dedup_key=f"charger_auth_failure:{station_id}",
+                )
+        except Exception:
+            self.logger.warning(
+                "charger_auth_failure alert emit failed for station %s",
+                station_id,
+                exc_info=True,
+            )
+
+    async def _resolve_charger_auth_failure_alert(self, station_id: str) -> None:
+        """Best-effort: clear the active charger_auth_failure alert on success.
+
+        Mirrors the connector_status trigger's recovery path. No-op if no
+        active alert exists.
+        """
+        pool = getattr(self.timescale_client, "pg_pool", None)
+        if pool is None:
+            return
+        try:
+            from uuid import UUID  # noqa: PLC0415
+
+            from src.notifications.alerts import resolve_alert  # noqa: PLC0415
+
+            async with pool.acquire() as conn:
+                org_id = await conn.fetchval(
+                    """
+                    SELECT d.organization_id
+                      FROM chargers c
+                      JOIN depots   d ON d.depot_id = c.depot_id
+                     WHERE c.ocpp_id = $1
+                     LIMIT 1
+                    """,
+                    station_id,
+                )
+                if org_id is None:
+                    return
+                await resolve_alert(
+                    conn,
+                    organization_id=UUID(str(org_id)),
+                    dedup_key=f"charger_auth_failure:{station_id}",
+                )
+        except Exception:
+            self.logger.warning(
+                "charger_auth_failure alert resolve failed for station %s",
+                station_id,
+                exc_info=True,
+            )
 
     async def _log_security_event(
         self,
