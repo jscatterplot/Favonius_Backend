@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hmac
 import time
+from base64 import b64encode
+from base64 import b64decode
 from hashlib import sha256
 
 import pytest
@@ -11,84 +13,156 @@ import pytest
 from src.notifications.webhook import parse_event, verify_signature
 
 
-def _sign(body: bytes, secret: str, ts: int) -> str:
-    payload = f"{ts}.".encode() + body
-    digest = hmac.new(secret.encode(), payload, sha256).hexdigest()
-    return f"t={ts},v1={digest}"
+def _secret(signing_key: bytes = b"test-signing-key") -> str:
+    return f"whsec_{b64encode(signing_key).decode()}"
+
+
+def _sign(body: bytes, secret: str, msg_id: str, ts: int) -> str:
+    secret_b64 = secret[6:] if secret.startswith("whsec_") else secret
+    payload = f"{msg_id}.{ts}.".encode() + body
+    digest = b64encode(hmac.new(b64decode(secret_b64), payload, sha256).digest()).decode()
+    return f"v1,{digest}"
 
 
 class TestVerifySignature:
     def test_valid_signature_passes(self):
         body = b'{"type":"email.delivered","data":{"email_id":"x"}}'
-        secret = "whsec_test"
+        secret = _secret()
+        msg_id = "msg_123"
         ts = int(time.time())
-        header = _sign(body, secret, ts)
+        header = _sign(body, secret, msg_id, ts)
 
-        assert verify_signature(
-            secret=secret, body=body, signature_header=header, now=ts
-        ) is True
-
-    def test_tampered_body_fails(self):
-        body = b'{"type":"email.delivered","data":{"email_id":"x"}}'
-        secret = "whsec_test"
-        ts = int(time.time())
-        header = _sign(body, secret, ts)
-
-        tampered = body.replace(b"delivered", b"bounced!")
-        assert verify_signature(
-            secret=secret, body=tampered, signature_header=header, now=ts
-        ) is False
-
-    def test_wrong_secret_fails(self):
-        body = b"hello"
-        ts = int(time.time())
-        header = _sign(body, "actual_secret", ts)
-        assert verify_signature(
-            secret="other_secret", body=body, signature_header=header, now=ts
-        ) is False
-
-    def test_old_timestamp_rejected(self):
-        body = b"hello"
-        secret = "whsec"
-        old_ts = 1000
-        header = _sign(body, secret, old_ts)
         assert verify_signature(
             secret=secret,
             body=body,
             signature_header=header,
+            message_id=msg_id,
+            timestamp_header=str(ts),
+            now=ts,
+        ) is True
+
+    def test_tampered_body_fails(self):
+        body = b'{"type":"email.delivered","data":{"email_id":"x"}}'
+        secret = _secret()
+        msg_id = "msg_123"
+        ts = int(time.time())
+        header = _sign(body, secret, msg_id, ts)
+
+        tampered = body.replace(b"delivered", b"bounced!")
+        assert verify_signature(
+            secret=secret,
+            body=tampered,
+            signature_header=header,
+            message_id=msg_id,
+            timestamp_header=str(ts),
+            now=ts,
+        ) is False
+
+    def test_wrong_secret_fails(self):
+        body = b"hello"
+        msg_id = "msg_123"
+        ts = int(time.time())
+        header = _sign(body, _secret(b"actual"), msg_id, ts)
+        assert verify_signature(
+            secret=_secret(b"other"),
+            body=body,
+            signature_header=header,
+            message_id=msg_id,
+            timestamp_header=str(ts),
+            now=ts,
+        ) is False
+
+    def test_old_timestamp_rejected(self):
+        body = b"hello"
+        secret = _secret()
+        msg_id = "msg_123"
+        old_ts = 1000
+        header = _sign(body, secret, msg_id, old_ts)
+        assert verify_signature(
+            secret=secret,
+            body=body,
+            signature_header=header,
+            message_id=msg_id,
+            timestamp_header=str(old_ts),
             tolerance_s=300,
             now=old_ts + 600,
         ) is False
 
     def test_future_timestamp_rejected(self):
         body = b"hello"
-        secret = "whsec"
+        secret = _secret()
+        msg_id = "msg_123"
         ts = 2000
-        header = _sign(body, secret, ts)
+        header = _sign(body, secret, msg_id, ts)
         # `now` 600s in the past → also outside tolerance
         assert verify_signature(
             secret=secret,
             body=body,
             signature_header=header,
+            message_id=msg_id,
+            timestamp_header=str(ts),
             tolerance_s=300,
             now=ts - 600,
         ) is False
 
     def test_missing_header_returns_false(self):
-        assert verify_signature(secret="x", body=b"y", signature_header=None) is False
-        assert verify_signature(secret="x", body=b"y", signature_header="") is False
+        assert verify_signature(
+            secret=_secret(),
+            body=b"y",
+            signature_header=None,
+            message_id="m",
+            timestamp_header="1",
+        ) is False
+        assert verify_signature(
+            secret=_secret(),
+            body=b"y",
+            signature_header="",
+            message_id="m",
+            timestamp_header="1",
+        ) is False
 
     def test_malformed_header_returns_false(self):
-        assert verify_signature(secret="x", body=b"y", signature_header="garbage") is False
         assert verify_signature(
-            secret="x", body=b"y", signature_header="t=foo,v1=bar"
+            secret=_secret(),
+            body=b"y",
+            signature_header="garbage",
+            message_id="m",
+            timestamp_header="1",
+        ) is False
+        assert verify_signature(
+            secret=_secret(),
+            body=b"y",
+            signature_header="t=foo,v1=bar",
+            message_id="m",
+            timestamp_header="1",
         ) is False
 
     def test_empty_secret_returns_false(self):
         body = b"hello"
+        msg_id = "msg_123"
         ts = int(time.time())
-        header = _sign(body, "", ts)
-        assert verify_signature(secret="", body=body, signature_header=header) is False
+        header = _sign(body, _secret(), msg_id, ts)
+        assert verify_signature(
+            secret="",
+            body=body,
+            signature_header=header,
+            message_id=msg_id,
+            timestamp_header=str(ts),
+        ) is False
+
+    def test_missing_message_id_returns_false(self):
+        body = b"hello"
+        secret = _secret()
+        ts = int(time.time())
+        header = _sign(body, secret, "msg_123", ts)
+        assert verify_signature(
+            secret=secret,
+            body=body,
+            signature_header=header,
+            message_id=None,
+            timestamp_header=str(ts),
+            now=ts,
+        ) is False
 
 
 class TestParseEvent:

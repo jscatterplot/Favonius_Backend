@@ -7,12 +7,13 @@ asyncpg pool isn't fought over by two loops.
 
 from __future__ import annotations
 
-import hmac
 import json
 import os
 import sys
 import time
+from base64 import b64decode, b64encode
 from hashlib import sha256
+import hmac
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -294,15 +295,16 @@ class TestRecipientsCRUDEndpoints:
 # ===========================================================================
 
 
-def _sign_webhook(body: bytes, secret: str, ts: int) -> str:
-    payload = f"{ts}.".encode() + body
-    digest = hmac.new(secret.encode(), payload, sha256).hexdigest()
-    return f"t={ts},v1={digest}"
+def _sign_webhook(body: bytes, secret: str, msg_id: str, ts: int) -> str:
+    signing_secret = b64decode(secret[6:] if secret.startswith("whsec_") else secret)
+    payload = f"{msg_id}.{ts}.".encode() + body
+    digest = b64encode(hmac.new(signing_secret, payload, sha256).digest()).decode()
+    return f"v1,{digest}"
 
 
 class TestResendWebhook:
     async def test_invalid_signature_returns_401(self, client, monkeypatch):
-        monkeypatch.setenv("RESEND_WEBHOOK_SECRET", "whsec_test")
+        monkeypatch.setenv("RESEND_WEBHOOK_SECRET", "whsec_dGVzdA==")
         resp = await client.post(
             "/webhooks/resend",
             content=b'{"type":"email.delivered","data":{"email_id":"x"}}',
@@ -317,7 +319,11 @@ class TestResendWebhook:
         resp = await client.post(
             "/webhooks/resend",
             content=body,
-            headers={"X-Resend-Signature": _sign_webhook(body, "", ts)},
+            headers={
+                "X-Resend-Signature": _sign_webhook(body, "whsec_dGVzdA==", "msg_1", ts),
+                "svix-id": "msg_1",
+                "svix-timestamp": str(ts),
+            },
         )
         assert resp.status_code == 401
 
@@ -325,7 +331,7 @@ class TestResendWebhook:
         self, client, db_pool, org_depot, monkeypatch
     ):
         org_id, depot_id = org_depot
-        secret = "whsec_test"
+        secret = "whsec_dGVzdA=="
         monkeypatch.setenv("RESEND_WEBHOOK_SECRET", secret)
 
         async with db_pool.acquire() as conn:
@@ -356,10 +362,15 @@ class TestResendWebhook:
             }
         ).encode()
         ts = int(time.time())
+        msg_id = "msg_valid"
         resp = await client.post(
             "/webhooks/resend",
             content=body,
-            headers={"X-Resend-Signature": _sign_webhook(body, secret, ts)},
+            headers={
+                "X-Resend-Signature": _sign_webhook(body, secret, msg_id, ts),
+                "svix-id": msg_id,
+                "svix-timestamp": str(ts),
+            },
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "ok"
@@ -374,14 +385,19 @@ class TestResendWebhook:
         assert "email.bounced" in str(row["status_detail"])
 
     async def test_unknown_event_type_acked_silently(self, client, monkeypatch):
-        secret = "whsec_test"
+        secret = "whsec_dGVzdA=="
         monkeypatch.setenv("RESEND_WEBHOOK_SECRET", secret)
         body = b'{"type":"email.opened","data":{"email_id":"x"}}'
         ts = int(time.time())
+        msg_id = "msg_opened"
         resp = await client.post(
             "/webhooks/resend",
             content=body,
-            headers={"X-Resend-Signature": _sign_webhook(body, secret, ts)},
+            headers={
+                "X-Resend-Signature": _sign_webhook(body, secret, msg_id, ts),
+                "svix-id": msg_id,
+                "svix-timestamp": str(ts),
+            },
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "ignored"

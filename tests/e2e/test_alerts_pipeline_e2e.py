@@ -29,6 +29,7 @@ import json
 import os
 import sys
 import time
+from base64 import b64decode, b64encode
 from hashlib import sha256
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
@@ -74,8 +75,10 @@ def _admin_user() -> dict:
 
 
 def _sign(body: bytes, secret: str, ts: int) -> str:
-    digest = hmac.new(secret.encode(), f"{ts}.".encode() + body, sha256).hexdigest()
-    return f"t={ts},v1={digest}"
+    msg_id = "msg_e2e"
+    secret_b64 = secret[6:] if secret.startswith("whsec_") else secret
+    digest = b64encode(hmac.new(b64decode(secret_b64), f"{msg_id}.{ts}.".encode() + body, sha256).digest()).decode()
+    return f"v1,{digest}"
 
 
 @pytest_asyncio.fixture
@@ -229,7 +232,11 @@ class TestAlertsPipelineE2E:
         webhook_resp = await api_client.post(
             "/webhooks/resend",
             content=body,
-            headers={"X-Resend-Signature": _sign(body, secret, ts)},
+            headers={
+                "X-Resend-Signature": _sign(body, secret, ts),
+                "svix-id": "msg_e2e",
+                "svix-timestamp": str(ts),
+            },
         )
         assert webhook_resp.status_code == 200
         assert webhook_resp.json()["status"] == "ok"

@@ -1,8 +1,11 @@
 """Resend webhook verification + event parsing.
 
-Signature scheme (compatible with Svix-style signing as used by Resend):
-  Header: X-Resend-Signature: t=<unix_timestamp>,v1=<hex_hmac_sha256>
-  Compute: HMAC-SHA256(secret, f"{timestamp}.{body}")
+Signature scheme (Svix-style signing as used by Resend):
+  Headers:
+    svix-id: <message_id>
+    svix-timestamp: <unix_timestamp>
+    svix-signature: v1,<base64_hmac_sha256>
+  Compute: HMAC-SHA256(decoded_secret, f"{id}.{timestamp}.{body}")
 
 Reject when:
   - signature header missing or malformed
@@ -16,9 +19,11 @@ Other types are returned as `None` so the endpoint can ignore them.
 
 from __future__ import annotations
 
+import binascii
 import hmac
 import logging
 import time
+from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Optional
@@ -49,6 +54,8 @@ def verify_signature(
     secret: str,
     body: bytes,
     signature_header: Optional[str],
+    message_id: Optional[str],
+    timestamp_header: Optional[str],
     tolerance_s: int = _DEFAULT_TOLERANCE_S,
     now: Optional[float] = None,
 ) -> bool:
@@ -64,15 +71,14 @@ def verify_signature(
         logger.debug("webhook: missing signature header")
         return False
 
-    parts = _parse_header(signature_header)
-    if "t" not in parts or "v1" not in parts:
-        logger.debug("webhook: header missing t or v1")
+    if not message_id:
+        logger.debug("webhook: missing svix-id header")
         return False
 
     try:
-        ts = int(parts["t"])
+        ts = int(timestamp_header or "")
     except ValueError:
-        logger.debug("webhook: bad timestamp %r", parts["t"])
+        logger.debug("webhook: bad timestamp %r", timestamp_header)
         return False
 
     current = now if now is not None else time.time()
@@ -80,20 +86,35 @@ def verify_signature(
         logger.debug("webhook: timestamp out of tolerance (delta=%ss)", current - ts)
         return False
 
-    payload = f"{ts}.".encode() + body
-    expected = hmac.new(secret.encode(), payload, sha256).hexdigest()
-    return hmac.compare_digest(expected, parts["v1"])
+    signing_secret = _decode_secret(secret)
+    if signing_secret is None:
+        logger.debug("webhook: invalid signing secret format")
+        return False
+
+    signature = _extract_v1_signature(signature_header)
+    if not signature:
+        logger.debug("webhook: header missing v1 signature")
+        return False
+
+    payload = f"{message_id}.{ts}.".encode() + body
+    expected = b64encode(hmac.new(signing_secret, payload, sha256).digest()).decode()
+    return hmac.compare_digest(expected, signature)
 
 
-def _parse_header(header: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for token in header.split(","):
-        token = token.strip()
-        if "=" not in token:
-            continue
-        key, _, value = token.partition("=")
-        out[key.strip()] = value.strip()
-    return out
+def _decode_secret(secret: str) -> Optional[bytes]:
+    value = secret[6:] if secret.startswith("whsec_") else secret
+    try:
+        return b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+
+def _extract_v1_signature(signature_header: str) -> Optional[str]:
+    for token in signature_header.split():
+        version, sep, signature = token.partition(",")
+        if sep and version == "v1" and signature:
+            return signature
+    return None
 
 
 def parse_event(body: dict[str, Any]) -> Optional[WebhookEvent]:

@@ -5834,6 +5834,8 @@ async def resend_webhook(request: Request):
         body=body_bytes,
         signature_header=request.headers.get("X-Resend-Signature")
         or request.headers.get("Svix-Signature"),
+        message_id=request.headers.get("svix-id"),
+        timestamp_header=request.headers.get("svix-timestamp"),
     ):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
