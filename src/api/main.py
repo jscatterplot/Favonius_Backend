@@ -1153,6 +1153,13 @@ class DepotSetupPayload(BaseModel):
             dc = data.get("demand_charge")
             if isinstance(dc, dict) and "tariff_type" not in dc:
                 data = {**data, "demand_charge": {**dc, "tariff_type": "simple_demand"}}
+            elif isinstance(dc, BaseModel):
+                dc_payload = dc.model_dump()
+                if "tariff_type" not in dc_payload:
+                    data = {
+                        **data,
+                        "demand_charge": {**dc_payload, "tariff_type": "simple_demand"},
+                    }
         return data
 
 
@@ -3014,6 +3021,7 @@ async def upsert_charger_vehicle_access_endpoint(
     if not db_pools:
         raise DatabaseError("Database not available")
 
+    result: dict[str, list[str]] = {"invalid_chargers": [], "invalid_vehicles": []}
     async with db_pools.static.acquire() as conn:
         access_default = (
             await conn.fetchval(
@@ -3036,16 +3044,16 @@ async def upsert_charger_vehicle_access_endpoint(
                 depot_id=depot_id,
                 entries=[entry.model_dump() for entry in body.entries],
             )
-    if result["invalid_chargers"] or result["invalid_vehicles"]:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "detail": "One or more IDs do not belong to this depot",
-                "error_code": "INVALID_DEPOT_MEMBERSHIP",
-                "invalid_chargers": result["invalid_chargers"],
-                "invalid_vehicles": result["invalid_vehicles"],
-            },
-        )
+            if result["invalid_chargers"] or result["invalid_vehicles"]:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={
+                        "detail": "One or more IDs do not belong to this depot",
+                        "error_code": "INVALID_DEPOT_MEMBERSHIP",
+                        "invalid_chargers": result["invalid_chargers"],
+                        "invalid_vehicles": result["invalid_vehicles"],
+                    },
+                )
 
     _depot_config_cache.pop(depot_id, None)
 
