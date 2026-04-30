@@ -276,6 +276,7 @@ class DepotController:
         # multiple orphan rows for one logical run.
         snapshot = await self._capture_snapshot(state, effective_horizon)
         if snapshot.readiness.is_blocking:
+            await self._emit_readiness_alerts(snapshot, run_status=None)
             raise _ReadinessBlockedError(
                 "Optimization inputs not ready: " f"missing={snapshot.readiness.missing_inputs}"
             )
@@ -330,6 +331,9 @@ class DepotController:
                         extra={"depot_id": self.depot_id},
                     )
                     # Continue even if storage fails
+
+                # Reconcile readiness alerts. Best-effort; never blocks.
+                await self._emit_readiness_alerts(snapshot, run_status=result.status)
 
                 # Link snapshot to the optimization run row.
                 try:
@@ -614,6 +618,148 @@ class DepotController:
             )
 
         logger.debug(f"Stored optimization result {result.run_id}")
+
+    async def _emit_readiness_alerts(
+        self,
+        snapshot: "OptimizationInputSnapshot",
+        run_status: str | None,
+    ) -> None:
+        """Emit / resolve readiness-related alerts based on the latest run.
+
+        Called twice in the optimization path:
+        - Before solving with ``run_status=None`` to publish ``missing_input``
+          if readiness blocks the run.
+        - After ``_store_result`` with the final ``run_status`` to publish
+          ``degraded_optimization`` and reconcile ``missing_input``.
+
+        Best-effort; failures here never abort the optimization.
+        """
+        org_id = self.assembler.last_organization_id
+        if not org_id:
+            return
+        readiness = snapshot.readiness
+        depot_id = self.depot_id
+
+        try:
+            from uuid import UUID  # noqa: PLC0415
+
+            from src.notifications.alerts import (  # noqa: PLC0415
+                resolve_alert,
+                upsert_alert,
+            )
+            from src.notifications.severity import Severity  # noqa: PLC0415
+        except Exception:
+            logger.warning("notifications module unavailable; skipping alert emission")
+            return
+
+        org_uuid = UUID(str(org_id))
+        depot_uuid = UUID(str(depot_id))
+        missing_dedup = f"missing_input:{depot_id}"
+        degraded_dedup = f"degraded_optimization:{depot_id}"
+
+        try:
+            async with self.pools.ts.acquire() as conn:
+                if readiness.is_blocking:
+                    detail = {
+                        "description": (
+                            "Optimization cannot run — required inputs are missing: "
+                            f"{', '.join(readiness.missing_inputs)}."
+                        ),
+                        "suggestedAction": (
+                            "Resolve the missing inputs in the readiness checklist. "
+                            "Each item links to the screen where it can be fixed."
+                        ),
+                        "context": {"kind": "site", "id": depot_id, "label": depot_id},
+                        "missing_inputs": list(readiness.missing_inputs),
+                    }
+                    await upsert_alert(
+                        conn,
+                        organization_id=org_uuid,
+                        depot_id=depot_uuid,
+                        alert_type="missing_input",
+                        severity=Severity.CRITICAL,
+                        title="Optimization inputs missing",
+                        detail=detail,
+                        dedup_key=missing_dedup,
+                    )
+                    return
+
+                stale_dedup = f"stale_telemetry:{depot_id}"
+                telemetry_stale = "telemetry_all_defaulted" in readiness.degraded_reasons
+
+                # Run was attempted; reconcile based on final status.
+                if run_status == "degraded":
+                    detail = {
+                        "description": (
+                            "Optimization ran with documented assumptions: "
+                            f"{', '.join(readiness.degraded_reasons) or 'unknown'}."
+                        ),
+                        "suggestedAction": (
+                            "Connect the missing data source (e.g. building load "
+                            "meter or telemetry stream) so the next run can use "
+                            "real values instead of fallback assumptions."
+                        ),
+                        "context": {"kind": "site", "id": depot_id, "label": depot_id},
+                        "degraded_reasons": list(readiness.degraded_reasons),
+                        "assumptions": readiness.assumptions,
+                    }
+                    await upsert_alert(
+                        conn,
+                        organization_id=org_uuid,
+                        depot_id=depot_uuid,
+                        alert_type="degraded_optimization",
+                        severity=Severity.WARNING,
+                        title="Optimization degraded — using fallback assumptions",
+                        detail=detail,
+                        dedup_key=degraded_dedup,
+                    )
+                    await resolve_alert(
+                        conn, organization_id=org_uuid, dedup_key=missing_dedup
+                    )
+                else:
+                    # optimal / feasible / timeout / infeasible — clear both.
+                    await resolve_alert(
+                        conn, organization_id=org_uuid, dedup_key=missing_dedup
+                    )
+                    await resolve_alert(
+                        conn, organization_id=org_uuid, dedup_key=degraded_dedup
+                    )
+
+                if telemetry_stale:
+                    stale_detail = {
+                        "description": (
+                            "All vehicles in this depot are missing recent "
+                            "telemetry; the assembler is using a default 50% "
+                            "SoC. Charging schedules may be inaccurate until "
+                            "telemetry resumes."
+                        ),
+                        "suggestedAction": (
+                            "Confirm the OCPP MeterValues feed is connected "
+                            "and that vehicles are plugged in. Check connector "
+                            "status for stuck sessions."
+                        ),
+                        "context": {"kind": "site", "id": depot_id, "label": depot_id},
+                    }
+                    await upsert_alert(
+                        conn,
+                        organization_id=org_uuid,
+                        depot_id=depot_uuid,
+                        alert_type="stale_telemetry",
+                        severity=Severity.WARNING,
+                        title="Vehicle telemetry is stale across the depot",
+                        detail=stale_detail,
+                        dedup_key=stale_dedup,
+                    )
+                else:
+                    await resolve_alert(
+                        conn, organization_id=org_uuid, dedup_key=stale_dedup
+                    )
+        except Exception:
+            logger.warning(
+                "readiness alert emission failed for depot %s",
+                depot_id,
+                exc_info=True,
+            )
 
     async def run(self) -> None:
         """Main control loop.
