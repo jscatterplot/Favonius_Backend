@@ -119,7 +119,7 @@ BEGIN
                 temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
             )
             SELECT
-                gen_random_uuid()                          AS forecast_id,
+                COALESCE(forecast_id, gen_random_uuid())  AS forecast_id,
                 depot_id,
                 COALESCE(source, 'open_meteo')             AS source,
                 COALESCE(fetched_at, forecast_for, NOW())  AS fetched_at,
