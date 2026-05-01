@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Iterator, Literal, Optional, Union
@@ -45,8 +46,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
-from ..core.optimizer.exceptions import InfeasibleModelError, SolverError, SolverTimeoutError
+from ..core.optimizer.exceptions import (
+    InfeasibleModelError,
+    OptimizationError as _CoreOptimizationError,
+    SolverError,
+    SolverTimeoutError,
+)
 from ..core.state.assembler import StateAssembler
+from .error_codes import ERROR_MESSAGES, ErrorCode, http_status_for, safe_message_for
 from .reports import (
     REPORT_GROUP_BY_VALUES,
     SessionRow,
@@ -56,6 +63,11 @@ from .reports import (
 from ..core.state.readiness import (
     build_snapshot,
     evaluate_readiness,
+)
+from ..db.exceptions import (
+    DatabaseError as _DbDatabaseError,
+    IdempotencyKeyReusedError,
+    ResourceNotFoundError,
 )
 from ..db.snapshot_store import persist_snapshot
 from ..db import queries as db_queries
@@ -590,6 +602,57 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 # ============ Logging Middleware ============
 
 
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Stamp every request with a correlation ID.
+
+    Reads an inbound ``X-Request-ID`` header if present, otherwise generates
+    a UUID4. The value is exposed at ``request.state.request_id`` for
+    downstream code (especially exception handlers) and echoed back as
+    ``X-Request-ID`` so clients can quote it when reporting issues.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+def _get_request_id(request: Request) -> Optional[str]:
+    """Return the correlation ID stamped by ``RequestIdMiddleware`` if present."""
+    return getattr(request.state, "request_id", None)
+
+
+def _build_error_response(
+    request: Request,
+    error_code: ErrorCode,
+    *,
+    status_code: Optional[int] = None,
+    detail: Optional[str] = None,
+    extra: Optional[dict] = None,
+) -> JSONResponse:
+    """Build a sanitized JSON error response.
+
+    The ``detail`` argument is only used when the call site has explicit,
+    public-safe text (e.g. "Vehicle not found"). When omitted, the message
+    is taken from :data:`ERROR_MESSAGES`. Raw exception strings must never
+    flow through this function as ``detail``.
+    """
+    body = ErrorResponse(
+        detail=detail if detail is not None else safe_message_for(error_code),
+        error_code=str(error_code.value),
+        timestamp=datetime.utcnow().isoformat(),
+        request_id=_get_request_id(request),
+    ).model_dump()
+    if extra:
+        body.update(extra)
+    return JSONResponse(
+        status_code=status_code if status_code is not None else http_status_for(error_code),
+        content=body,
+    )
+
+
 class LoggingMiddleware(BaseHTTPMiddleware):
     """Middleware to log all requests and responses."""
 
@@ -656,6 +719,11 @@ app.add_middleware(RateLimitMiddleware)
 
 # Add logging middleware
 app.add_middleware(LoggingMiddleware)
+
+# Stamp each request with a correlation ID and echo via X-Request-ID.
+# Registered closest to the app so request.state.request_id is set before
+# exception handlers (which run inside the app, not in middleware) execute.
+app.add_middleware(RequestIdMiddleware)
 
 # Add security headers middleware (PRD Section 10.3)
 app.add_middleware(SecurityHeadersMiddleware)
@@ -1121,11 +1189,23 @@ class HandoffResponse(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Error response model matching PRD format."""
+    """Error response model matching PRD format.
+
+    The ``detail`` field is always a sanitized, public-safe string drawn from
+    ``src.api.error_codes.ERROR_MESSAGES`` (or controlled call-site text).
+    Raw exception strings, SQL fragments, table/column names, or other
+    internals must NOT be placed here — log them server-side instead.
+
+    ``request_id`` correlates the response with server logs so support can
+    look up the full traceback without exposing it to the client.
+    """
 
     detail: str = Field(..., description="Error message")
     error_code: Optional[str] = Field(None, description="Error code for programmatic handling")
     timestamp: str = Field(..., description="Error timestamp (ISO 8601)")
+    request_id: Optional[str] = Field(
+        None, description="Correlation ID for this request (also returned as X-Request-ID header)"
+    )
 
 
 # ============ Depot Metadata Models ============
@@ -1656,103 +1736,254 @@ class DepotNotFoundError(ValueError):
     pass
 
 
-class OptimizationError(Exception):
-    """Raised when optimization fails."""
-
-    pass
-
-
-class DatabaseError(Exception):
-    """Raised when database operation fails."""
-
-    pass
+# ``OptimizationError`` and ``DatabaseError`` are intentionally aliased to the
+# canonical definitions in ``src.core.optimizer.exceptions`` and
+# ``src.db.exceptions``. This way:
+#   * ``raise OptimizationError(...)`` from main.py matches the same handler
+#     as ``raise InfeasibleModelError(...)`` or ``raise SolverTimeoutError(...)``
+#     from the core layer (they are all subclasses of the core base).
+#   * ``raise DatabaseError(...)`` from main.py and the new typed db layer go
+#     through the same global handler regardless of where they originate.
+OptimizationError = _CoreOptimizationError
+DatabaseError = _DbDatabaseError
 
 
 # ============ Exception Handlers ============
+#
+# Every handler logs the raw exception with full traceback + request context
+# and returns a SANITIZED JSON body. The response body never echoes
+# ``str(exc)`` for INTERNAL_ERROR / DATABASE_ERROR cases — those messages may
+# contain SQL fragments, table/column names, file paths, or other internals
+# that an attacker can use for reconnaissance.
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Handle Pydantic validation errors."""
+    """Handle Pydantic validation errors.
+
+    Pydantic's own ``loc``/``msg`` strings reference the request schema and
+    are safe to expose. ``ctx`` and ``input`` may contain user-supplied data
+    so they are dropped.
+    """
     errors = exc.errors()
-    error_details = "; ".join(f"{err['loc']}: {err['msg']}" for err in errors)
-    logger.warning(f"Validation error on {request.url.path}: {error_details}")
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content=ErrorResponse(
-            detail=f"Validation error: {error_details}",
-            error_code="VALIDATION_ERROR",
-            timestamp=datetime.utcnow().isoformat(),
-        ).model_dump(),
+    field_errors: dict[str, list[str]] = {}
+    sanitized_errors: list[dict[str, str]] = []
+    for err in errors:
+        loc = err.get("loc", ())
+        path = ".".join(str(part) for part in loc if part != "body")
+        if not path:
+            path = "body"
+        message = str(err.get("msg", "Invalid value"))
+        field_errors.setdefault(path, []).append(message)
+        sanitized_errors.append({"path": path, "message": message})
+    logger.warning(
+        "Validation error on %s",
+        request.url.path,
+        extra={"path": request.url.path, "errors": sanitized_errors},
+    )
+    return _build_error_response(
+        request,
+        ErrorCode.VALIDATION_ERROR,
+        extra={"field_errors": field_errors, "validation_errors": sanitized_errors},
     )
 
 
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
-    """Handle ValueError exceptions (e.g., invalid UUID, depot not found)."""
+    """Handle ValueError exceptions (e.g., invalid UUID, depot not found).
+
+    ``ValueError`` is raised explicitly throughout the codebase with
+    operator-controlled, public-safe text (e.g. ``"Vehicle not found"``,
+    ``"Invalid UUID"``). We pass that text through as ``detail`` rather than
+    forcing the generic mapping, so the client gets a useful message.
+    """
     error_msg = str(exc)
     if "not found" in error_msg.lower() or isinstance(exc, DepotNotFoundError):
-        status_code = status.HTTP_404_NOT_FOUND
-        error_code = "DEPOT_NOT_FOUND"
+        code = ErrorCode.DEPOT_NOT_FOUND
     else:
-        status_code = status.HTTP_400_BAD_REQUEST
-        error_code = "INVALID_INPUT"
+        code = ErrorCode.INVALID_INPUT
 
     logger.warning(f"ValueError on {request.url.path}: {error_msg}")
-    return JSONResponse(
-        status_code=status_code,
-        content=ErrorResponse(
-            detail=error_msg,
-            error_code=error_code,
-            timestamp=datetime.utcnow().isoformat(),
-        ).model_dump(),
-    )
+    return _build_error_response(request, code, detail=error_msg)
 
 
 @app.exception_handler(OptimizationError)
 async def optimization_error_handler(request: Request, exc: OptimizationError) -> JSONResponse:
-    """Handle optimization failures."""
-    error_msg = str(exc)
-    logger.error(f"Optimization error on {request.url.path}: {error_msg}", exc_info=True)
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=ErrorResponse(
-            detail=f"Optimization failed: {error_msg}",
-            error_code="OPTIMIZATION_ERROR",
-            timestamp=datetime.utcnow().isoformat(),
-        ).model_dump(),
+    """Handle optimization failures.
+
+    Maps the specific subclass to a stable error code:
+      * ``InfeasibleModelError`` -> ``OPTIMIZER_INFEASIBLE`` (422)
+      * ``SolverTimeoutError``   -> ``OPTIMIZER_TIMEOUT`` (504)
+      * everything else          -> ``OPTIMIZATION_ERROR`` (500)
+
+    Original message is logged but never returned to the client.
+    """
+    if isinstance(exc, InfeasibleModelError):
+        code = ErrorCode.OPTIMIZER_INFEASIBLE
+    elif isinstance(exc, SolverTimeoutError):
+        code = ErrorCode.OPTIMIZER_TIMEOUT
+    else:
+        code = ErrorCode.OPTIMIZATION_ERROR
+    logger.error(
+        f"Optimization error on {request.url.path}: {exc}",
+        exc_info=True,
+        extra={"error_code": str(code.value), "path": request.url.path},
     )
+    return _build_error_response(request, code)
+
+
+@app.exception_handler(IdempotencyKeyReusedError)
+async def idempotency_key_reused_handler(
+    request: Request, exc: IdempotencyKeyReusedError
+) -> JSONResponse:
+    """Handle idempotency-key collisions with a stable 409 shape."""
+    logger.warning(
+        f"Idempotency key reused on {request.url.path}",
+        extra={"path": request.url.path},
+    )
+    return _build_error_response(request, ErrorCode.IDEMPOTENCY_KEY_REUSED)
 
 
 @app.exception_handler(DatabaseError)
 async def database_error_handler(request: Request, exc: DatabaseError) -> JSONResponse:
-    """Handle database operation failures."""
-    error_msg = str(exc)
-    logger.error(f"Database error on {request.url.path}: {error_msg}", exc_info=True)
-    return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content=ErrorResponse(
-            detail=f"Database error: {error_msg}",
-            error_code="DATABASE_ERROR",
-            timestamp=datetime.utcnow().isoformat(),
-        ).model_dump(),
+    """Handle database operation failures.
+
+    Note: a ``DatabaseError`` may be constructed with raw ``str(asyncpg_err)``
+    upstream. We log it (so operators can debug) but always send the generic
+    sanitized message back to the client. Subclasses with more specific
+    codes (e.g. ``IdempotencyKeyReusedError``) are caught by their own
+    handlers above this one due to FastAPI's MRO-based dispatch.
+    """
+    logger.error(
+        f"Database error on {request.url.path}: {exc}",
+        exc_info=True,
+        extra={"path": request.url.path},
     )
+    code = getattr(exc, "code", ErrorCode.DATABASE_ERROR)
+    if not isinstance(code, ErrorCode):
+        code = ErrorCode.DATABASE_ERROR
+    return _build_error_response(request, code)
 
 
 @app.exception_handler(asyncpg.PostgresError)
 async def postgres_error_handler(request: Request, exc: asyncpg.PostgresError) -> JSONResponse:
-    """Handle PostgreSQL-specific errors."""
-    logger.error(f"PostgreSQL error on {request.url.path}: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content=ErrorResponse(
-            detail="Database operation failed",
-            error_code="DATABASE_ERROR",
-            timestamp=datetime.utcnow().isoformat(),
-        ).model_dump(),
+    """Handle PostgreSQL-specific errors.
+
+    ``asyncpg`` exception messages frequently include SQL fragments, table
+    names, constraint names, and column metadata. They are logged
+    server-side and replaced with the stable ``DATABASE_ERROR`` message.
+    """
+    logger.error(
+        f"PostgreSQL error on {request.url.path}: {exc.__class__.__name__}",
+        exc_info=True,
+        extra={"path": request.url.path},
     )
+    return _build_error_response(request, ErrorCode.DATABASE_ERROR)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Render every ``HTTPException`` in the standard ``ErrorResponse`` shape.
+
+    FastAPI's default handler returns ``{"detail": ...}``. We add ``error_code``,
+    ``timestamp``, and ``request_id`` at the top level so every error response
+    on this API has the same envelope regardless of origin.
+
+    Backwards compatibility:
+      * If the call site passes ``detail`` as a string, ``response.detail`` is
+        that string verbatim (matches FastAPI default).
+      * If the call site passes ``detail`` as a dict (e.g.
+        ``{"error_code": "...", "vehicle_ids": [...]}``), the dict is
+        preserved verbatim under ``detail`` so existing clients can keep
+        reading ``response.detail.error_code`` and friends. The top-level
+        ``error_code`` reflects the same value if provided, otherwise it is
+        derived from the status code.
+    """
+    detail = exc.detail
+    if isinstance(detail, dict):
+        provided_code = detail.get("error_code")
+    else:
+        provided_code = None
+
+    code = _http_status_to_error_code(
+        exc.status_code,
+        provided_code if isinstance(provided_code, str) else None,
+    )
+
+    if exc.status_code >= 500:
+        logger.error(
+            f"HTTPException {exc.status_code} on {request.url.path}",
+            extra={"path": request.url.path, "status_code": exc.status_code},
+        )
+    else:
+        logger.info(
+            f"HTTPException {exc.status_code} on {request.url.path}",
+            extra={"path": request.url.path, "status_code": exc.status_code},
+        )
+
+    body: dict = {
+        "detail": detail if detail is not None else safe_message_for(code),
+        "error_code": str(provided_code) if provided_code else str(code.value),
+        "timestamp": datetime.utcnow().isoformat(),
+        "request_id": _get_request_id(request),
+    }
+    response = JSONResponse(status_code=exc.status_code, content=body)
+    if exc.headers:
+        for header, value in exc.headers.items():
+            response.headers[header] = value
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all handler for any exception not matched above.
+
+    Logs the full traceback with request context but returns ONLY the
+    generic ``INTERNAL_ERROR`` envelope — never ``str(exc)``. The client
+    sees the ``request_id`` so support can correlate the report with the
+    server log.
+    """
+    logger.error(
+        f"Unhandled exception on {request.url.path}: {exc.__class__.__name__}",
+        exc_info=True,
+        extra={
+            "path": request.url.path,
+            "method": request.method,
+            "exception_type": exc.__class__.__name__,
+        },
+    )
+    return _build_error_response(request, ErrorCode.INTERNAL_ERROR)
+
+
+def _http_status_to_error_code(
+    status_code: int, provided_code: Optional[str] = None
+) -> ErrorCode:
+    """Best-effort mapping from raw status code to an ``ErrorCode``.
+
+    Used by ``http_exception_handler`` so legacy call sites that raise
+    ``HTTPException(status_code=...)`` without an ``error_code`` still get a
+    sensible ``error_code`` field on the response. If the call site supplies
+    its own ``error_code`` (via ``detail={"error_code": ...}``) and it
+    matches a known value, we honor it.
+    """
+    if provided_code:
+        try:
+            return ErrorCode(provided_code)
+        except ValueError:
+            pass
+    return {
+        400: ErrorCode.BAD_REQUEST,
+        401: ErrorCode.UNAUTHORIZED,
+        403: ErrorCode.FORBIDDEN,
+        404: ErrorCode.NOT_FOUND,
+        409: ErrorCode.CONFLICT,
+        422: ErrorCode.UNPROCESSABLE_ENTITY,
+        429: ErrorCode.RATE_LIMIT_EXCEEDED,
+        500: ErrorCode.INTERNAL_ERROR,
+        503: ErrorCode.SERVICE_UNAVAILABLE,
+    }.get(status_code, ErrorCode.INTERNAL_ERROR)
 
 
 async def _get_depot_config(depot_id: str) -> DepotConfig:
@@ -1821,16 +2052,32 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
             error_msg = str(e)
             if "not found" in error_msg.lower():
                 logger.warning(f"Depot not found: {depot_id}")
-                raise HTTPException(status_code=404, detail=error_msg)
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error_code": ErrorCode.DEPOT_NOT_FOUND.value,
+                        "detail": error_msg,
+                    },
+                ) from e
             logger.error(f"Invalid depot configuration: {error_msg}")
-            raise HTTPException(status_code=500, detail=f"Invalid depot configuration: {error_msg}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error_code": ErrorCode.INTERNAL_ERROR.value,
+                    "detail": "Invalid depot configuration",
+                },
+            ) from e
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Failed to load depot config: {e}", exc_info=True)
             raise HTTPException(
-                status_code=500, detail=f"Failed to load depot configuration: {str(e)}"
-            )
+                status_code=500,
+                detail={
+                    "error_code": ErrorCode.INTERNAL_ERROR.value,
+                    "detail": "Failed to load depot configuration",
+                },
+            ) from e
 
 
 def _format_depot_setup_validation_errors(exc: ValidationError) -> dict:
@@ -3545,7 +3792,10 @@ async def get_depot_state(
         raise ValueError(error_msg)
     except Exception as e:
         logger.error(f"Failed to get depot state: {e}", exc_info=True, extra={"depot_id": depot_id})
-        raise HTTPException(status_code=500, detail=f"Failed to get depot state: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to get depot state"},
+        ) from e
 
 
 @app.get(
@@ -4175,10 +4425,13 @@ async def get_depot_schedule(
         logger.error(
             f"Database error getting schedule: {e}", exc_info=True, extra={"depot_id": depot_id}
         )
-        raise DatabaseError(f"Database error: {str(e)}")
+        raise DatabaseError() from e
     except Exception as e:
         logger.error(f"Failed to get schedule: {e}", exc_info=True, extra={"depot_id": depot_id})
-        raise HTTPException(status_code=500, detail=f"Failed to get schedule: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to get schedule"},
+        ) from e
 
 
 @app.get(
@@ -4345,14 +4598,17 @@ async def get_depot_alerts(
             exc_info=True,
             extra={"depot_id": depot_id},
         )
-        raise DatabaseError(f"Database error: {str(e)}")
+        raise DatabaseError() from e
     except Exception as e:
         logger.error(
             f"Failed to get alerts: {e}",
             exc_info=True,
             extra={"depot_id": depot_id},
         )
-        raise HTTPException(status_code=500, detail=f"Failed to get alerts: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to get alerts"},
+        ) from e
 
 
 @app.post(
@@ -4560,14 +4816,17 @@ async def send_handoff(
             exc_info=True,
             extra={"depot_id": depot_id, "vehicle_id": vehicle_id},
         )
-        raise DatabaseError(f"Database error: {str(e)}")
+        raise DatabaseError() from e
     except Exception as e:
         logger.error(
             f"Failed to send handoff: {e}",
             exc_info=True,
             extra={"depot_id": depot_id, "vehicle_id": vehicle_id},
         )
-        raise HTTPException(status_code=500, detail=f"Failed to send handoff: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to send handoff"},
+        ) from e
 
 
 class HandoffReceiveRequest(BaseModel):
@@ -4838,14 +5097,20 @@ async def receive_handoff(
             exc_info=True,
             extra={"depot_id": depot_id, "vehicle_id": request.vehicle_id},
         )
-        raise DatabaseError(f"Database error: {str(e)}")
+        raise DatabaseError() from e
     except Exception as e:
         logger.error(
             f"Failed to receive handoff: {e}",
             exc_info=True,
             extra={"depot_id": depot_id, "vehicle_id": request.vehicle_id},
         )
-        raise HTTPException(status_code=500, detail=f"Failed to receive handoff: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "detail": "Failed to receive handoff",
+            },
+        ) from e
 
 
 # ── Internal OCPP event endpoint ─────────────────────────────────────────────
@@ -5524,9 +5789,12 @@ async def _handle_charger_restart(
     except Exception as e:
         logger.warning(
             "Charger restart ROLLBACK_IMPOSSIBLE — reset already sent",
-            extra={"charger_id": charger_id, "depot_id": depot_id},
+            extra={"charger_id": charger_id, "depot_id": depot_id, "error": str(e)},
         )
-        raise HTTPException(status_code=500, detail=f"Charger restart failed: {e}") from e
+        raise HTTPException(
+            status_code=500,
+            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Charger restart failed"},
+        ) from e
 
 
 async def _handle_schedule_adjust(
