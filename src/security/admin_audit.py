@@ -11,9 +11,14 @@ This module is distinct from ``security/audit_log.py`` (which writes to the
 Every row is keyed by actor_user_id, actor_role, organization_id, depot_id,
 action, target_type, target_id, metadata (JSONB).
 
-Writes are best-effort: failures are logged and never raised back into the
-request path. The audit row is recorded *after* the endpoint succeeds via a
-FastAPI dependency (see ``record_admin_action`` below).
+Two write modes:
+    - best-effort (default): failures are logged and never raised — used for
+      audit rows that complement the endpoint response but are not required
+      for correctness.
+    - strict (``strict=True``): failures are raised so the caller can fail
+      the request closed — used for cross-org admin enumeration where the
+      audit row is part of the security guarantee (negative-result reads
+      MUST leave a trail).
 """
 
 from __future__ import annotations
@@ -58,12 +63,24 @@ class AdminAuditRow:
             self.occurred_at = datetime.now(timezone.utc)
 
 
-async def write_admin_audit_row(pool: Any, row: AdminAuditRow) -> None:
-    """Insert a single audit_log row. Errors are logged, never raised.
+class AdminAuditWriteError(RuntimeError):
+    """Raised by write_admin_audit_row when strict=True and the insert fails.
+
+    Callers in strict mode should translate this to an HTTP 503 with
+    ``error_code=AUDIT_LOG_UNAVAILABLE`` so the endpoint fails closed instead
+    of returning data without a trail.
+    """
+
+
+async def write_admin_audit_row(pool: Any, row: AdminAuditRow, *, strict: bool = False) -> None:
+    """Insert a single audit_log row.
 
     Args:
         pool: asyncpg pool (typically static Supabase pool).
         row: AdminAuditRow to insert.
+        strict: When True, propagate insert failures as
+            ``AdminAuditWriteError`` so the caller can fail the request
+            closed. Default False preserves best-effort semantics.
     """
     if pool is None:
         logger.warning(
@@ -72,6 +89,8 @@ async def write_admin_audit_row(pool: Any, row: AdminAuditRow) -> None:
             row.target_type,
             row.target_id,
         )
+        if strict:
+            raise AdminAuditWriteError(f"Admin audit pool unavailable for action={row.action}")
         return
 
     try:
@@ -101,12 +120,17 @@ async def write_admin_audit_row(pool: Any, row: AdminAuditRow) -> None:
                 row.target_id,
                 json.dumps(row.metadata or {}, default=str),
             )
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "Admin audit insert failed action=%s actor=%s target=%s/%s",
+            "Admin audit insert failed action=%s actor=%s target=%s/%s strict=%s",
             row.action,
             row.actor_user_id,
             row.target_type,
             row.target_id,
+            strict,
             exc_info=True,
         )
+        if strict:
+            raise AdminAuditWriteError(
+                f"Admin audit insert failed for action={row.action}"
+            ) from exc

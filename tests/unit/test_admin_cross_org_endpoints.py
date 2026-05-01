@@ -16,12 +16,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException, status as http_status
+from fastapi import HTTPException
+from fastapi import status as http_status
 
 from src.api.main import app
 from src.security.rate_limiter import get_rate_limiter
 from src.security.tenant_mirror import ensure_tenant_mirrored
-
 
 AUTH_HDR = {"Authorization": "Bearer test-token"}
 DEPOT_ID = str(uuid4())
@@ -136,9 +136,10 @@ class TestListOrganizationsRBAC:
         _override_user(_user("favonius_admin"))
         organizations = [{"organization_id": ORG_ID, "name": "Acme"}]
         conn.fetch = AsyncMock(return_value=organizations)
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
         body = response.json()
@@ -184,9 +185,10 @@ class TestListOrganizationDepotsRBAC:
         _override_user(_user("favonius_admin"))
         depots = [_depot_row(organization_id=OTHER_ORG_ID)]
         conn.fetch = AsyncMock(return_value=depots)
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client, OTHER_ORG_ID)
         assert response.status_code == http_status.HTTP_200_OK
         assert response.json()["count"] == 1
@@ -200,9 +202,10 @@ class TestListOrganizationDepotsRBAC:
         pool, conn = mock_pool
         _override_user(_user("customer_admin", organization_id=ORG_ID))
         conn.fetch = AsyncMock(return_value=[_depot_row()])
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client, ORG_ID)
         assert response.status_code == http_status.HTTP_200_OK
         # NOT a cross-org read — own org reads do not generate admin.read.
@@ -252,17 +255,20 @@ class TestCredentialsStatusRBAC:
     def test_favonius_admin_200_with_audit(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("favonius_admin"))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=OTHER_ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.get_charger_credentials_status",
-            new_callable=AsyncMock,
-            return_value=_charger_status_row(),
-        ), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.get_charger_credentials_status",
+                new_callable=AsyncMock,
+                return_value=_charger_status_row(),
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
         body = response.json()
@@ -279,17 +285,20 @@ class TestCredentialsStatusRBAC:
     def test_customer_admin_own_depot_200_no_audit(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("customer_admin", organization_id=ORG_ID))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.get_charger_credentials_status",
-            new_callable=AsyncMock,
-            return_value=_charger_status_row(),
-        ), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.get_charger_credentials_status",
+                new_callable=AsyncMock,
+                return_value=_charger_status_row(),
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
         # Own-org read is NOT cross-org — no audit row written
@@ -300,10 +309,13 @@ class TestCredentialsStatusRBAC:
     def test_customer_admin_other_org_depot_403_not_404(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("customer_admin", organization_id=ORG_ID))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=OTHER_ORG_ID),
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
         ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -313,17 +325,20 @@ class TestCredentialsStatusRBAC:
         """customer_operator can read credentials status for its own depot."""
         pool, _ = mock_pool
         _override_user(_user("customer_operator", organization_id=ORG_ID))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.get_charger_credentials_status",
-            new_callable=AsyncMock,
-            return_value=_charger_status_row(),
-        ), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.get_charger_credentials_status",
+                new_callable=AsyncMock,
+                return_value=_charger_status_row(),
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
         audit.assert_not_awaited()
@@ -331,10 +346,13 @@ class TestCredentialsStatusRBAC:
     def test_customer_operator_other_org_depot_403(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("customer_operator", organization_id=ORG_ID))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=OTHER_ORG_ID),
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
         ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -342,10 +360,13 @@ class TestCredentialsStatusRBAC:
     def test_viewer_403(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("viewer"))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(),
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(),
+            ),
         ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -359,14 +380,18 @@ class TestCredentialsStatusRBAC:
         # must still strip it.
         bad_row = _charger_status_row()
         bad_row["password_hash"] = "$2b$12$some.hash.that.must.not.leak"
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.get_charger_credentials_status",
-            new_callable=AsyncMock,
-            return_value=bad_row,
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.get_charger_credentials_status",
+                new_callable=AsyncMock,
+                return_value=bad_row,
+            ),
         ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
@@ -400,17 +425,20 @@ class TestRotateCredentialsRBAC:
             "last_rotated_at": rotated_at,
             "created_at": rotated_at,
         }
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=OTHER_ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.rotate_charger_credentials",
-            new_callable=AsyncMock,
-            return_value=rotated_row,
-        ) as rotate_mock, patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.rotate_charger_credentials",
+                new_callable=AsyncMock,
+                return_value=rotated_row,
+            ) as rotate_mock,
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
         body = response.json()
@@ -439,17 +467,20 @@ class TestRotateCredentialsRBAC:
             "last_rotated_at": rotated_at,
             "created_at": rotated_at,
         }
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.rotate_charger_credentials",
-            new_callable=AsyncMock,
-            return_value=rotated_row,
-        ), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.rotate_charger_credentials",
+                new_callable=AsyncMock,
+                return_value=rotated_row,
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
         body = response.json()
@@ -463,10 +494,13 @@ class TestRotateCredentialsRBAC:
     def test_customer_admin_other_org_403_not_404(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("customer_admin", organization_id=ORG_ID))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=OTHER_ORG_ID),
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
         ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_403_FORBIDDEN
@@ -490,17 +524,20 @@ class TestRotateCredentialsRBAC:
     def test_charger_not_found_404(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("customer_admin", organization_id=ORG_ID))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.rotate_charger_credentials",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
-        ) as audit:
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.rotate_charger_credentials",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_404_NOT_FOUND
         # No audit row written for a 404 — only successful rotations are audited.
@@ -517,19 +554,21 @@ class TestPlaintextNotRetrievable:
     endpoint NEVER returns plaintext.
     """
 
-    def test_status_endpoint_does_not_expose_plaintext_or_hash(
-        self, client, mock_pool
-    ):
+    def test_status_endpoint_does_not_expose_plaintext_or_hash(self, client, mock_pool):
         pool, _ = mock_pool
         _override_user(_user("customer_admin", organization_id=ORG_ID))
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.get_charger_credentials_status",
-            new_callable=AsyncMock,
-            return_value=_charger_status_row(),
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.get_charger_credentials_status",
+                new_callable=AsyncMock,
+                return_value=_charger_status_row(),
+            ),
         ):
             response = client.get(
                 f"/admin/depots/{DEPOT_ID}/chargers/{CHARGER_ID}/credentials_status",
@@ -546,9 +585,9 @@ class TestPlaintextNotRetrievable:
             "created_at",
             "last_rotated_at",
         }
-        assert set(body.keys()) <= allowed, (
-            f"Unexpected fields in credentials_status response: {set(body.keys()) - allowed}"
-        )
+        assert (
+            set(body.keys()) <= allowed
+        ), f"Unexpected fields in credentials_status response: {set(body.keys()) - allowed}"
         assert "password" not in response.text.lower()
         assert "$2b$" not in response.text
 
@@ -563,16 +602,19 @@ class TestPlaintextNotRetrievable:
             "last_rotated_at": rotated_at,
             "created_at": rotated_at,
         }
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.db_queries.get_depot_by_id",
-            new_callable=AsyncMock,
-            return_value=_depot_row(organization_id=ORG_ID),
-        ), patch(
-            "src.api.main.db_queries.rotate_charger_credentials",
-            new_callable=AsyncMock,
-            return_value=rotated_row,
-        ), patch(
-            "src.api.main.write_admin_audit_row", new_callable=AsyncMock
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.rotate_charger_credentials",
+                new_callable=AsyncMock,
+                return_value=rotated_row,
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock),
         ):
             first = client.post(
                 f"/admin/depots/{DEPOT_ID}/chargers/{CHARGER_ID}/rotate_credentials",
@@ -596,3 +638,214 @@ class TestPlaintextNotRetrievable:
             assert follow.status_code == http_status.HTTP_200_OK
             assert first_pwd not in follow.text
             assert "password" not in follow.text.lower()
+
+
+# ── H3: audit-on-404 for admin depot lookups + strict mode ──────────────────
+
+
+class TestAdminAudit404AndStrictMode:
+    """``_resolve_depot_for_admin`` must record an ``admin.read`` row before
+    returning 404 to a favonius_admin so negative-result enumeration is
+    audited.  Cross-org enumeration paths use ``strict=True`` so a failed
+    audit insert raises 503 instead of silently returning data."""
+
+    URL = f"/admin/depots/{DEPOT_ID}/chargers/{CHARGER_ID}/credentials_status"
+
+    def test_favonius_admin_404_writes_strict_audit_row(self, client, mock_pool):
+        """Nonexistent depot for favonius_admin → 404 AND audit row written."""
+        pool, _ = mock_pool
+        _override_user(_user("favonius_admin"))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
+            response = client.get(self.URL, headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_404_NOT_FOUND
+        # Audit row was written before the 404 was raised
+        audit.assert_awaited_once()
+        row = audit.await_args.args[1]
+        assert row.action == "admin.read"
+        assert row.target_type == "depot"
+        assert row.metadata["result"] == "not_found"
+        # Strict mode propagated to the writer
+        assert audit.await_args.kwargs.get("strict") is True
+
+    def test_strict_audit_failure_returns_503_not_404(self, client, mock_pool):
+        """If the strict audit insert fails, the request fails closed (503)."""
+        from src.security.admin_audit import AdminAuditWriteError
+
+        pool, _ = mock_pool
+        _override_user(_user("favonius_admin"))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "src.api.main.write_admin_audit_row",
+                new_callable=AsyncMock,
+                side_effect=AdminAuditWriteError("simulated audit DB outage"),
+            ),
+        ):
+            response = client.get(self.URL, headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+        body = response.json()
+        assert body["error_code"] == "AUDIT_LOG_UNAVAILABLE"
+        # No depot data leaked in the failure response
+        assert "depot_id" not in body
+
+    def test_customer_admin_other_org_403_writes_no_audit(self, client, mock_pool):
+        """customer_admin probing another org's depot must NOT generate an
+        audit row — leak-resistant 403 means audit volume cannot be used as
+        a side channel for existence."""
+        pool, _ = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
+            response = client.get(self.URL, headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+        audit.assert_not_awaited()
+
+    def test_favonius_admin_charger_not_found_writes_audit_row(self, client, mock_pool):
+        """Depot exists but charger doesn't → 404 AND audit row written
+        (cross-org admin enumerating chargers within a depot)."""
+        pool, _ = mock_pool
+        _override_user(_user("favonius_admin"))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.get_charger_credentials_status",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
+            response = client.get(self.URL, headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_404_NOT_FOUND
+        # Cross-org charger lookup still records an admin.read row
+        audit.assert_awaited_once()
+        row = audit.await_args.args[1]
+        assert row.action == "admin.read"
+        assert row.target_type == "charger"
+        assert row.metadata["result"] == "not_found"
+        assert audit.await_args.kwargs.get("strict") is True
+
+    def test_list_organizations_strict_audit_propagates_503(self, client, mock_pool):
+        """The `/admin/organizations` listing uses strict audit; if the audit
+        write fails the endpoint must return 503, not 200 + data."""
+        from src.security.admin_audit import AdminAuditWriteError
+
+        pool, _ = mock_pool
+        _override_user(_user("favonius_admin"))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.list_all_organizations",
+                new_callable=AsyncMock,
+                return_value=[
+                    {"organization_id": ORG_ID, "name": "Acme"},
+                ],
+            ),
+            patch(
+                "src.api.main.write_admin_audit_row",
+                new_callable=AsyncMock,
+                side_effect=AdminAuditWriteError("audit unavailable"),
+            ),
+        ):
+            response = client.get("/admin/organizations", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+        body = response.json()
+        assert body["error_code"] == "AUDIT_LOG_UNAVAILABLE"
+
+
+# ── H3: write_admin_audit_row strict-mode unit semantics ────────────────────
+
+
+class TestWriteAdminAuditRowStrictMode:
+    """Unit-level coverage for the writer's strict/best-effort modes."""
+
+    def test_strict_propagates_db_error(self):
+        import asyncio
+
+        from src.security.admin_audit import (
+            AdminAuditRow,
+            AdminAuditWriteError,
+            write_admin_audit_row,
+        )
+
+        bad_pool = MagicMock()
+        bad_acquire = MagicMock()
+        bad_acquire.__aenter__ = AsyncMock(side_effect=RuntimeError("DB down"))
+        bad_acquire.__aexit__ = AsyncMock(return_value=None)
+        bad_pool.acquire.return_value = bad_acquire
+
+        row = AdminAuditRow(action="admin.read", target_type="depot")
+
+        async def _run():
+            with pytest.raises(AdminAuditWriteError):
+                await write_admin_audit_row(bad_pool, row, strict=True)
+
+        asyncio.run(_run())
+
+    def test_best_effort_swallows_db_error(self):
+        import asyncio
+
+        from src.security.admin_audit import AdminAuditRow, write_admin_audit_row
+
+        bad_pool = MagicMock()
+        bad_acquire = MagicMock()
+        bad_acquire.__aenter__ = AsyncMock(side_effect=RuntimeError("DB down"))
+        bad_acquire.__aexit__ = AsyncMock(return_value=None)
+        bad_pool.acquire.return_value = bad_acquire
+
+        row = AdminAuditRow(action="admin.read", target_type="depot")
+
+        async def _run():
+            # Default strict=False — must not raise
+            await write_admin_audit_row(bad_pool, row)
+
+        asyncio.run(_run())
+
+    def test_strict_with_no_pool_raises(self):
+        import asyncio
+
+        from src.security.admin_audit import (
+            AdminAuditRow,
+            AdminAuditWriteError,
+            write_admin_audit_row,
+        )
+
+        async def _run():
+            with pytest.raises(AdminAuditWriteError):
+                await write_admin_audit_row(None, AdminAuditRow(action="admin.read"), strict=True)
+
+        asyncio.run(_run())
+
+    def test_best_effort_with_no_pool_does_not_raise(self):
+        import asyncio
+
+        from src.security.admin_audit import AdminAuditRow, write_admin_audit_row
+
+        async def _run():
+            await write_admin_audit_row(None, AdminAuditRow(action="admin.read"))
+
+        asyncio.run(_run())

@@ -47,38 +47,38 @@ from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.optimizer.exceptions import InfeasibleModelError, SolverError, SolverTimeoutError
 from ..core.state.assembler import StateAssembler
-from .reports import (
-    REPORT_GROUP_BY_VALUES,
-    SessionRow,
-    aggregate_energy_rows,
-    stream_rows_as_csv,
-)
 from ..core.state.readiness import (
     build_snapshot,
     evaluate_readiness,
 )
-from ..db.snapshot_store import persist_snapshot
 from ..db import queries as db_queries
 from ..db.pools import DatabasePools
+from ..db.snapshot_store import persist_snapshot
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
-from ..security.admin_audit import AdminAuditRow, write_admin_audit_row
+from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_admin_audit_row
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import (
-    get_user_role,
     get_user_organization_id,
+    get_user_role,
     is_platform_admin,
     verify_depot_access,
 )
-from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
 from ..security.rbac import Permission, has_permission, require_favonius_admin
+from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.validators import (
     validate_depot_id,
     validate_horizon_hours,
     validate_uuid,
     validate_vehicle_id,
+)
+from .reports import (
+    REPORT_GROUP_BY_VALUES,
+    SessionRow,
+    aggregate_energy_rows,
+    stream_rows_as_csv,
 )
 
 logger = logging.getLogger(__name__)
@@ -443,8 +443,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         auth_header = request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
             try:
-                from ..security.auth import _get_jwt_secrets, _ALLOWED_ALGORITHMS
                 import jwt as _jwt
+
+                from ..security.auth import _ALLOWED_ALGORITHMS, _get_jwt_secrets
 
                 payload = _jwt.decode(
                     auth_header[7:],
@@ -782,7 +783,9 @@ class NotificationAlertItem(BaseModel):
     alert_id: str = Field(..., description="Alert UUID")
     organization_id: str = Field(..., description="Owning organization UUID")
     depot_id: Optional[str] = Field(None, description="Depot UUID (nullable)")
-    depot_name: Optional[str] = Field(None, description="Depot display name (denormalized via JOIN)")
+    depot_name: Optional[str] = Field(
+        None, description="Depot display name (denormalized via JOIN)"
+    )
     alert_type: str = Field(
         ...,
         description=(
@@ -791,7 +794,9 @@ class NotificationAlertItem(BaseModel):
         ),
     )
     severity: str = Field(..., description="info | warning | critical")
-    subject: str = Field(..., description="Human-readable summary (mapped from notification_alerts.title)")
+    subject: str = Field(
+        ..., description="Human-readable summary (mapped from notification_alerts.title)"
+    )
     body: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -803,7 +808,9 @@ class NotificationAlertItem(BaseModel):
     status: str = Field(..., description="active | acknowledged | resolved")
     first_seen_at: str = Field(..., description="ISO 8601")
     last_seen_at: str = Field(..., description="ISO 8601")
-    occurrence_count: int = Field(..., description="Times the dedup_key has fired since first_seen_at")
+    occurrence_count: int = Field(
+        ..., description="Times the dedup_key has fired since first_seen_at"
+    )
     acknowledged_by: Optional[str] = Field(None, description="User UUID who acknowledged")
     resolved_at: Optional[str] = Field(None, description="ISO 8601 if status == resolved")
     last_notified_at: Optional[str] = Field(None, description="ISO 8601 or null if not yet sent")
@@ -1147,8 +1154,7 @@ class EnergyCapTariffPayload(BaseModel):
     def _penalty_exceeds_under(self) -> "EnergyCapTariffPayload":
         if self.over_cap_penalty_per_kwh <= self.under_cap_rate_per_kwh:
             raise ValueError(
-                "over_cap_penalty_per_kwh must be strictly greater than "
-                "under_cap_rate_per_kwh"
+                "over_cap_penalty_per_kwh must be strictly greater than " "under_cap_rate_per_kwh"
             )
         return self
 
@@ -1245,9 +1251,7 @@ class DepotSetupPayload(BaseModel):
     # Migration 021: depots can opt out of the explicit charger×vehicle
     # access matrix. 'all_to_all' means every charger reaches every
     # vehicle and the matrix is synthesized at solve time.
-    charger_vehicle_access_default: Literal["all_to_all", "explicit_matrix"] = (
-        "explicit_matrix"
-    )
+    charger_vehicle_access_default: Literal["all_to_all", "explicit_matrix"] = "explicit_matrix"
 
     @model_validator(mode="before")
     @classmethod
@@ -1671,6 +1675,27 @@ async def postgres_error_handler(request: Request, exc: asyncpg.PostgresError) -
         content=ErrorResponse(
             detail="Database operation failed",
             error_code="DATABASE_ERROR",
+            timestamp=datetime.utcnow().isoformat(),
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(AdminAuditWriteError)
+async def admin_audit_write_error_handler(
+    request: Request, exc: AdminAuditWriteError
+) -> JSONResponse:
+    """Translate strict-mode admin audit failures into 503.
+
+    Cross-org admin enumeration paths require a durable audit trail; if the
+    audit insert fails, the endpoint must fail closed rather than return data
+    without a record.
+    """
+    logger.error("Admin audit (strict) failed on %s: %s", request.url.path, exc, exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=ErrorResponse(
+            detail="Admin audit log unavailable",
+            error_code="AUDIT_LOG_UNAVAILABLE",
             timestamp=datetime.utcnow().isoformat(),
         ).model_dump(),
     )
@@ -2948,18 +2973,79 @@ async def patch_manual_schedule(
     }
 
 
-@app.post(
-    "/admin/first-depot-setup",
-    response_model=DepotSetupResponse,
-    tags=["admin"],
-    summary="Create initial depot setup",
-)
-async def create_first_depot_setup(
+_DEPOT_SETUP_IDEMPOTENCY_ENDPOINT = "POST /admin/depots"
+
+
+async def _create_depot_for_org(
+    *, organization_id: str, request: "FirstDepotSetupRequest", conn: Any
+) -> dict:
+    """Insert a depot row and any associated battery storage. Caller owns the transaction."""
+    depot = request.depot
+    address = depot.address.model_dump(exclude_none=True)
+    billing_metadata = depot.billing.model_dump(exclude_none=True)
+    building_load_source = depot.building_load_source.model_dump(exclude_none=True)
+    building_load_assumption_kw = float(depot.building_load_source.assumption_kw or 0.0)
+    tariff_kwargs = _depot_setup_tariff_kwargs(depot.demand_charge)
+
+    created = await db_queries.create_depot_setup(
+        conn,
+        organization_id=organization_id,
+        name=depot.name,
+        latitude=depot.address.latitude,
+        longitude=depot.address.longitude,
+        timezone=depot.timezone,
+        currency=depot.currency.upper(),
+        utility_id=depot.utility_id,
+        max_grid_kw=depot.max_grid_kw,
+        address=address,
+        billing_metadata=billing_metadata,
+        building_load_source=building_load_source,
+        building_load_assumption_kw=building_load_assumption_kw,
+        charger_vehicle_access_default=depot.charger_vehicle_access_default,
+        **tariff_kwargs,
+    )
+    if depot.stationary_battery.present:
+        max_power_kw = min(
+            float(depot.stationary_battery.max_charge_kw),
+            float(depot.stationary_battery.max_discharge_kw),
+        )
+        await db_queries.upsert_battery_storage(
+            conn,
+            depot_id=created["depot_id"],
+            capacity_kwh=float(depot.stationary_battery.capacity_kwh),
+            max_power_kw=max_power_kw,
+            soc_min=float(depot.stationary_battery.min_soc_pct) / 100.0,
+            soc_max=float(depot.stationary_battery.max_soc_pct) / 100.0,
+        )
+    else:
+        await db_queries.delete_battery_storage(conn, depot_id=created["depot_id"])
+    return created
+
+
+async def _depot_setup_endpoint(
     body: dict,
-    user: dict = Depends(ensure_tenant_mirrored),
+    idempotency_key: str,
+    user: dict,
 ):
-    """Create a tenant-scoped depot and return readiness checklist."""
+    """Shared handler for POST /admin/depots and POST /admin/first-depot-setup.
+
+    Creates a tenant-scoped depot in the caller's organization. Safe to call
+    multiple times to add additional depots. ``Idempotency-Key`` is required
+    so retries don't create phantom rows.
+    """
     org_id = _require_customer_admin_with_org(user)
+    user_id = str(user.get("sub") or "")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing 'sub' claim",
+        )
+    if not idempotency_key.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Idempotency-Key is required",
+        )
+
     try:
         request = FirstDepotSetupRequest.model_validate(body)
         _validate_depot_setup_payload(request.depot)
@@ -2982,59 +3068,106 @@ async def create_first_depot_setup(
     if not db_pools:
         raise DatabaseError("Database not available")
 
-    depot = request.depot
-    address = depot.address.model_dump(exclude_none=True)
-    billing_metadata = depot.billing.model_dump(exclude_none=True)
-    building_load_source = depot.building_load_source.model_dump(exclude_none=True)
-    building_load_assumption_kw = float(depot.building_load_source.assumption_kw or 0.0)
-    tariff_kwargs = _depot_setup_tariff_kwargs(depot.demand_charge)
+    endpoint = _DEPOT_SETUP_IDEMPOTENCY_ENDPOINT
+    request_hash = _canonical_request_hash(request)
 
     async with db_pools.static.acquire() as conn:
+        await db_queries.delete_expired_charger_onboarding_idempotency(conn)
         async with conn.transaction():
-            created = await db_queries.create_depot_setup(
+            await db_queries.acquire_charger_onboarding_idempotency_lock(
                 conn,
                 organization_id=org_id,
-                name=depot.name,
-                latitude=depot.address.latitude,
-                longitude=depot.address.longitude,
-                timezone=depot.timezone,
-                currency=depot.currency.upper(),
-                utility_id=depot.utility_id,
-                max_grid_kw=depot.max_grid_kw,
-                address=address,
-                billing_metadata=billing_metadata,
-                building_load_source=building_load_source,
-                building_load_assumption_kw=building_load_assumption_kw,
-                charger_vehicle_access_default=depot.charger_vehicle_access_default,
-                **tariff_kwargs,
+                endpoint=endpoint,
+                idempotency_key=idempotency_key,
             )
-            if depot.stationary_battery.present:
-                max_power_kw = min(
-                    float(depot.stationary_battery.max_charge_kw),
-                    float(depot.stationary_battery.max_discharge_kw),
+            existing = await db_queries.get_charger_onboarding_idempotency(
+                conn,
+                organization_id=org_id,
+                endpoint=endpoint,
+                idempotency_key=idempotency_key,
+            )
+            if existing:
+                if not hmac.compare_digest(existing["request_hash"], request_hash):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "error_code": "IDEMPOTENCY_KEY_REUSED",
+                            "message": "Idempotency-Key was already used with a different request body",
+                        },
+                    )
+                return JSONResponse(
+                    status_code=int(existing["status_code"] or status.HTTP_200_OK),
+                    content=_json_response_payload(existing["response_json"]),
                 )
-                await db_queries.upsert_battery_storage(
-                    conn,
-                    depot_id=created["depot_id"],
-                    capacity_kwh=float(depot.stationary_battery.capacity_kwh),
-                    max_power_kw=max_power_kw,
-                    soc_min=float(depot.stationary_battery.min_soc_pct) / 100.0,
-                    soc_max=float(depot.stationary_battery.max_soc_pct) / 100.0,
-                )
-            else:
-                await db_queries.delete_battery_storage(conn, depot_id=created["depot_id"])
 
-    readiness = await _build_readiness_checklist(created["depot_id"], depot)
-    return {
-        "depot": {
-            "id": created["depot_id"],
-            "name": created["name"],
-            "timezone": created["timezone"],
-            "currency": created["currency"],
-            "max_grid_kw": created["max_grid_kw"],
-        },
-        "readiness_checklist": readiness,
-    }
+            created = await _create_depot_for_org(
+                organization_id=org_id, request=request, conn=conn
+            )
+            readiness = await _build_readiness_checklist(created["depot_id"], request.depot)
+            response_payload = {
+                "depot": {
+                    "id": created["depot_id"],
+                    "name": created["name"],
+                    "timezone": created["timezone"],
+                    "currency": created["currency"],
+                    "max_grid_kw": created["max_grid_kw"],
+                },
+                "readiness_checklist": readiness,
+            }
+            await db_queries.store_charger_onboarding_idempotency(
+                conn,
+                organization_id=org_id,
+                user_id=user_id,
+                endpoint=endpoint,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                response_json=response_payload,
+                status_code=status.HTTP_200_OK,
+                ttl_minutes=30,
+            )
+
+    return JSONResponse(status_code=status.HTTP_200_OK, content=response_payload)
+
+
+@app.post(
+    "/admin/depots",
+    tags=["admin"],
+    summary="Create a depot in the caller's organization",
+)
+async def create_depot(
+    body: dict,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create a tenant-scoped depot.
+
+    Can be called multiple times to create additional depots in the caller's
+    organization. ``Idempotency-Key`` is required so retries cannot create
+    phantom rows; replays with the same key + same body return the original
+    response, while replays with the same key + different body return 409.
+
+    Authorization: customer_admin with ``app_metadata.organization_id`` set.
+    """
+    return await _depot_setup_endpoint(body, idempotency_key, user)
+
+
+@app.post(
+    "/admin/first-depot-setup",
+    tags=["admin"],
+    summary="Create a depot in the caller's organization (alias of POST /admin/depots)",
+)
+async def create_first_depot_setup(
+    body: dict,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Backward-compatible alias for POST /admin/depots.
+
+    Originally introduced as a "first depot" wizard endpoint, this route now
+    delegates to the same handler as ``POST /admin/depots`` and may be called
+    repeatedly to create additional depots. ``Idempotency-Key`` is required.
+    """
+    return await _depot_setup_endpoint(body, idempotency_key, user)
 
 
 @app.patch(
@@ -3194,8 +3327,7 @@ async def upsert_charger_vehicle_access_endpoint(
 
     async with db_pools.static.acquire() as conn:
         depot_row = await conn.fetchrow(
-            "SELECT name, timezone, currency, max_grid_kw FROM depots "
-            "WHERE depot_id = $1::uuid",
+            "SELECT name, timezone, currency, max_grid_kw FROM depots " "WHERE depot_id = $1::uuid",
             depot_id,
         )
     if not depot_row:
@@ -3574,6 +3706,7 @@ async def get_optimization_readiness(
 
 # ============ Energy Reporting Endpoints ============
 
+
 class EnergyReportCost(BaseModel):
     """Cost breakdown for a single report row."""
 
@@ -3643,18 +3776,18 @@ def _validate_report_group_by(group_by: Optional[str]) -> Optional[str]:
 async def _verify_depot_access_for_report(depot_id: str, user: dict) -> None:
     """Run verify_depot_access and re-raise 403s with error_code=CROSS_ORG_DENIED."""
     try:
-        await verify_depot_access(
-            depot_id, user, db_pools.static if db_pools else None
-        )
+        await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
     except HTTPException as exc:
         if exc.status_code == status.HTTP_403_FORBIDDEN:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={
                     "error_code": "CROSS_ORG_DENIED",
-                    "message": exc.detail
-                    if isinstance(exc.detail, str)
-                    else "Access denied: cross-organization access is not permitted",
+                    "message": (
+                        exc.detail
+                        if isinstance(exc.detail, str)
+                        else "Access denied: cross-organization access is not permitted"
+                    ),
                 },
             ) from exc
         raise
@@ -3670,9 +3803,7 @@ def _coerce_under_cap_rate(billing_metadata: Optional[dict]) -> Optional[float]:
     try:
         return float(raw)
     except (TypeError, ValueError):
-        logger.warning(
-            "Ignoring non-numeric under_cap_rate in billing_metadata: %r", raw
-        )
+        logger.warning("Ignoring non-numeric under_cap_rate in billing_metadata: %r", raw)
         return None
 
 
@@ -3836,7 +3967,9 @@ async def _build_energy_report(
 )
 async def get_energy_report_monthly(
     depot_id: str,
-    from_: str = Query(..., alias="from", description="Start date (YYYY-MM-DD, inclusive, depot TZ)"),
+    from_: str = Query(
+        ..., alias="from", description="Start date (YYYY-MM-DD, inclusive, depot TZ)"
+    ),
     to: str = Query(..., description="End date (YYYY-MM-DD, inclusive, depot TZ)"),
     group_by: Optional[str] = Query(
         None,
@@ -4198,9 +4331,7 @@ async def get_depot_alerts(
             async with db_pools.ts.acquire() as conn:
                 from src.notifications.alerts import list_for_depot as _list_alerts
 
-                rows = await _list_alerts(
-                    conn, UUID(depot_id), statuses=("active", "acknowledged")
-                )
+                rows = await _list_alerts(conn, UUID(depot_id), statuses=("active", "acknowledged"))
                 notification_alerts = [
                     NotificationAlertItem(
                         alert_id=str(a.id),
@@ -5030,9 +5161,18 @@ async def _record_admin_action(
     target_type: Optional[str] = None,
     target_id: Optional[str] = None,
     metadata: Optional[dict] = None,
+    strict: bool = False,
 ) -> None:
-    """Best-effort write of one ``audit_log`` row after a successful admin action."""
+    """Write one ``audit_log`` row after an admin action.
+
+    Default best-effort. Pass ``strict=True`` for cross-org admin
+    enumeration paths where the audit row is part of the security
+    guarantee — failures propagate as ``AdminAuditWriteError`` and
+    callers translate to HTTP 503 ``AUDIT_LOG_UNAVAILABLE``.
+    """
     if db_pools is None:
+        if strict:
+            raise AdminAuditWriteError(f"Admin audit DB pool unavailable for action={action}")
         return
     actor_user_id = user.get("sub") if isinstance(user, dict) else None
     actor_role = get_user_role(user)
@@ -5047,7 +5187,7 @@ async def _record_admin_action(
         target_id=target_id,
         metadata=metadata or {},
     )
-    await write_admin_audit_row(db_pools.static, row)
+    await write_admin_audit_row(db_pools.static, row, strict=strict)
 
 
 @app.get(
@@ -5080,6 +5220,7 @@ async def list_organizations_admin(user: dict = Depends(ensure_tenant_mirrored))
             "endpoint": "GET /admin/organizations",
             "result_count": len(organizations),
         },
+        strict=True,
     )
     return {"organizations": organizations, "count": len(organizations)}
 
@@ -5119,13 +5260,14 @@ async def list_organization_depots_admin(
                 "endpoint": "GET /admin/organizations/{org_id}/depots",
                 "result_count": len(depots),
             },
+            strict=True,
         )
 
     return {"organization_id": str(org_id), "depots": depots, "count": len(depots)}
 
 
 async def _resolve_depot_for_admin(
-    depot_id: str, user: dict
+    depot_id: str, user: dict, *, endpoint_name: Optional[str] = None
 ) -> tuple[dict, bool]:
     """Resolve a depot for cross-org admin access.
 
@@ -5133,11 +5275,17 @@ async def _resolve_depot_for_admin(
 
     - favonius_admin: always allowed; cross_org_read=True if the depot's org
       differs from any caller-org in the JWT (favonius_admin has no own org).
+      Negative-result lookups (depot_id does not exist) write a
+      strict ``admin.read`` audit row before raising 404 so platform-admin
+      enumeration cannot proceed silently.
     - customer_admin / customer_operator: must own the depot via organization_id.
+      403 path is leak-resistant (no distinction between "no such depot" and
+      "wrong tenant") and intentionally NOT audited so that audit volume
+      does not leak existence to untrusted tenants.
     - viewer or unknown roles: 403.
 
-    Raises 403 (never 404) when the depot does not exist or is not accessible
-    so existence does not leak across tenants.
+    Raises 403 (never 404) when the depot does not exist for non-admin
+    callers so existence does not leak across tenants.
     """
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -5149,10 +5297,18 @@ async def _resolve_depot_for_admin(
 
     if role == "favonius_admin":
         if depot_row is None:
-            # Even for platform admin, return 403 to keep the API surface
-            # uniform for tenants observing across the wire — but admin will
-            # rarely hit this in practice. Use 404 here since admin is allowed
-            # to know about all depots.
+            await _record_admin_action(
+                user=user,
+                action="admin.read",
+                depot_id=depot_id,
+                target_type="depot",
+                target_id=str(depot_id),
+                metadata={
+                    "endpoint": endpoint_name or "admin.depot_lookup",
+                    "result": "not_found",
+                },
+                strict=True,
+            )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"error_code": "DEPOT_NOT_FOUND", "message": "Depot not found"},
@@ -5178,9 +5334,7 @@ async def _resolve_depot_for_admin(
     return depot_row, False
 
 
-async def _resolve_charger_for_depot(
-    *, depot_id: str, charger_id: str
-) -> Optional[dict]:
+async def _resolve_charger_for_depot(*, depot_id: str, charger_id: str) -> Optional[dict]:
     """Return a credential-status row for a charger or None if the charger does not exist."""
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -5215,11 +5369,31 @@ async def get_charger_credentials_status(
     validate_uuid(depot_id, "depot_id")
     validate_uuid(charger_id, "charger_id")
 
-    depot_row, cross_org_read = await _resolve_depot_for_admin(depot_id, user)
-    charger_row = await _resolve_charger_for_depot(
-        depot_id=depot_id, charger_id=charger_id
+    depot_row, cross_org_read = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name="GET /admin/depots/{depot_id}/chargers/{charger_id}/credentials_status",
     )
+    charger_row = await _resolve_charger_for_depot(depot_id=depot_id, charger_id=charger_id)
     if charger_row is None:
+        if cross_org_read:
+            await _record_admin_action(
+                user=user,
+                action="admin.read",
+                depot_id=depot_id,
+                organization_id_override=(
+                    str(depot_row.get("organization_id"))
+                    if depot_row.get("organization_id")
+                    else None
+                ),
+                target_type="charger",
+                target_id=str(charger_id),
+                metadata={
+                    "endpoint": "GET /admin/depots/{depot_id}/chargers/{charger_id}/credentials_status",
+                    "result": "not_found",
+                },
+                strict=True,
+            )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error_code": "CHARGER_NOT_FOUND", "message": "Charger not found"},
@@ -5242,14 +5416,15 @@ async def get_charger_credentials_status(
             user=user,
             action="admin.read",
             depot_id=depot_id,
-            organization_id_override=str(depot_row.get("organization_id"))
-            if depot_row.get("organization_id")
-            else None,
+            organization_id_override=(
+                str(depot_row.get("organization_id")) if depot_row.get("organization_id") else None
+            ),
             target_type="charger",
             target_id=str(charger_id),
             metadata={
                 "endpoint": "GET /admin/depots/{depot_id}/chargers/{charger_id}/credentials_status",
             },
+            strict=True,
         )
 
     return response
@@ -5282,7 +5457,11 @@ async def rotate_charger_credentials_endpoint(
     if role not in ("favonius_admin", "customer_admin"):
         raise _forbidden("FORBIDDEN_ROLE", "favonius_admin or customer_admin role required")
 
-    depot_row, _ = await _resolve_depot_for_admin(depot_id, user)
+    depot_row, _ = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name="POST /admin/depots/{depot_id}/chargers/{charger_id}/rotate_credentials",
+    )
     # _resolve_depot_for_admin already enforced tenant access for customer_admin
     # and cross-org for favonius_admin; nothing more to check here.
 
@@ -5310,9 +5489,9 @@ async def rotate_charger_credentials_endpoint(
         user=user,
         action="charger.credentials.rotated",
         depot_id=depot_id,
-        organization_id_override=str(depot_row.get("organization_id"))
-        if depot_row.get("organization_id")
-        else None,
+        organization_id_override=(
+            str(depot_row.get("organization_id")) if depot_row.get("organization_id") else None
+        ),
         target_type="charger",
         target_id=str(charger_id),
         metadata={
@@ -5693,9 +5872,7 @@ async def acknowledge_notification_alert(
         # Existed and depot matched on get_by_id but acknowledge() returned None
         # → alert was already resolved/acknowledged. Surface 409 so callers
         # can distinguish from "not found".
-        raise HTTPException(
-            status_code=409, detail=f"Alert {alert_id} is not in active state"
-        )
+        raise HTTPException(status_code=409, detail=f"Alert {alert_id} is not in active state")
     if updated.acknowledged_at is None:
         raise DatabaseError("Acknowledged alert missing acknowledged_at timestamp")
     return AcknowledgeAlertResponse(
@@ -5718,7 +5895,9 @@ def _require_org_admin_access(user: dict, org_id: str) -> tuple[str, bool]:
     else:
         caller_org = get_user_organization_id(user)
         if not caller_org:
-            raise _forbidden("MISSING_ORGANIZATION", "missing organization_id in token app_metadata")
+            raise _forbidden(
+                "MISSING_ORGANIZATION", "missing organization_id in token app_metadata"
+            )
         if str(caller_org) != str(org_id):
             raise _forbidden("FORBIDDEN_ORGANIZATION", _ACCESS_DENIED_ORG_DETAIL)
     return role, cross
@@ -5752,6 +5931,7 @@ async def list_notification_recipients(
             target_type="notification_recipients",
             target_id="*",
             metadata={"endpoint": "GET /admin/organizations/{org_id}/notification_recipients"},
+            strict=True,
         )
     return {
         "organization_id": org_id,
