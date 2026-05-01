@@ -76,6 +76,7 @@ ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 -- Avoid broad table grants that could expose PII.
 REVOKE ALL ON TABLE public.profiles FROM PUBLIC;
 REVOKE ALL ON TABLE public.profiles FROM anon;
+REVOKE ALL ON TABLE public.profiles FROM authenticated;
 GRANT SELECT ON TABLE public.profiles TO authenticated;
 
 -- Authenticated users can only read their own profile row.
