@@ -26,9 +26,9 @@ BEGIN
     VALUES (
         NEW.id,
         NEW.email,
-        COALESCE(metadata->>'first_name', metadata->>'firstName', ''),
-        COALESCE(metadata->>'last_name', metadata->>'lastName', ''),
-        COALESCE(metadata->>'company', metadata->>'companyName', ''),
+        COALESCE(metadata->>'first_name', metadata->>'firstName'),
+        COALESCE(metadata->>'last_name', metadata->>'lastName'),
+        COALESCE(metadata->>'company', metadata->>'companyName'),
         COALESCE(NEW.created_at, NOW()),
         NOW()
     )
@@ -56,9 +56,9 @@ INSERT INTO public.profiles (id, email, first_name, last_name, company, created_
 SELECT
     u.id,
     u.email,
-    COALESCE(u.raw_user_meta_data->>'first_name', u.raw_user_meta_data->>'firstName', ''),
-    COALESCE(u.raw_user_meta_data->>'last_name', u.raw_user_meta_data->>'lastName', ''),
-    COALESCE(u.raw_user_meta_data->>'company', u.raw_user_meta_data->>'companyName', ''),
+    COALESCE(u.raw_user_meta_data->>'first_name', u.raw_user_meta_data->>'firstName'),
+    COALESCE(u.raw_user_meta_data->>'last_name', u.raw_user_meta_data->>'lastName'),
+    COALESCE(u.raw_user_meta_data->>'company', u.raw_user_meta_data->>'companyName'),
     COALESCE(u.created_at, NOW()),
     NOW()
 FROM auth.users u
