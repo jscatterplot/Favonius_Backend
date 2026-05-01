@@ -14,7 +14,7 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Iterator, Literal, Optional, Union
 from urllib.parse import urlparse
 from uuid import UUID
@@ -72,6 +72,7 @@ from ..security.auth import (
 from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.geo_block import GeoBlockMiddleware
 from ..security.headers import SecurityHeadersMiddleware
+from ..security.ocpp_auth import verify_ocpp_basic_auth
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
 from ..security.rbac import Permission, has_permission, require_favonius_admin
 from ..security.validators import (
@@ -190,13 +191,18 @@ async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
 
 
 # Security: INTERNAL_API_TOKEN required in production (M1).
-# Empty string disables auth — only acceptable in dev.
+# When unset, /internal/ocpp-event refuses every request (C3 fail-closed).
 _INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 _environment = os.getenv("ENVIRONMENT", "development")
 if _environment == "production" and not _INTERNAL_API_TOKEN:
     raise RuntimeError(
         "INTERNAL_API_TOKEN must be set in production. "
         "The /internal/ocpp-event endpoint is unauthenticated without it."
+    )
+if not _INTERNAL_API_TOKEN:
+    logger.warning(
+        "INTERNAL_API_TOKEN is not set; /internal/ocpp-event will refuse every "
+        "request with 503 until the token is configured."
     )
 
 
@@ -415,6 +421,79 @@ _MAX_CONCURRENT_SOLVES = int(os.getenv("MAX_CONCURRENT_SOLVES", "2"))
 _optimize_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SOLVES)
 _last_depot_solve: dict[str, float] = {}  # depot_id -> timestamp
 _DEPOT_SOLVE_COOLDOWN = float(os.getenv("DEPOT_SOLVE_COOLDOWN_SECONDS", "120"))  # 2 min
+
+
+# ============ Inter-depot handoff signature verification (C2) ============
+
+# Replay window for inter-depot handoff timestamps (seconds). Matches the
+# Resend webhook tolerance and is small enough that captured signatures
+# expire before they can be reused at scale.
+_HANDOFF_REPLAY_WINDOW_S = 300
+
+# In-memory nonce store: nonce -> earliest expiry. Sized for short TTL so
+# growth is bounded by the rate-limited handoff throughput (50/hr per pair).
+_handoff_nonces: dict[str, float] = {}
+
+
+def _prune_handoff_nonces(now: float) -> None:
+    """Drop expired entries from ``_handoff_nonces`` (called on each verify)."""
+    expired = [n for n, exp in _handoff_nonces.items() if exp < now]
+    for n in expired:
+        _handoff_nonces.pop(n, None)
+
+
+def reset_handoff_nonces_for_tests() -> None:
+    """Test helper: clear the in-memory nonce store between cases."""
+    _handoff_nonces.clear()
+
+
+def _verify_handoff_payload(
+    payload: dict,
+    signing_key: str,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """Verify HMAC-SHA256 + replay window + nonce uniqueness on a handoff body.
+
+    Mirrors the canonicalization used by ``send_handoff``:
+        sig = hmac_sha256(signing_key, json.dumps(payload_without_signature,
+                                                  sort_keys=True))
+
+    Returns True iff the payload is properly signed, recent (within
+    ``_HANDOFF_REPLAY_WINDOW_S``), and the nonce has not been seen.
+    """
+    if not isinstance(payload, dict):
+        return False
+    sig = payload.get("signature")
+    nonce = payload.get("nonce")
+    timestamp_str = payload.get("timestamp")
+    if not isinstance(sig, str) or not isinstance(nonce, str) or not isinstance(
+        timestamp_str, str
+    ):
+        return False
+
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+
+    current = now if now is not None else time.time()
+    if abs(current - ts.timestamp()) > _HANDOFF_REPLAY_WINDOW_S:
+        return False
+
+    canonical = {k: v for k, v in payload.items() if k != "signature"}
+    body_bytes = json.dumps(canonical, sort_keys=True).encode("utf-8")
+    expected = hmac.new(signing_key.encode(), body_bytes, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return False
+
+    _prune_handoff_nonces(current)
+    if nonce in _handoff_nonces:
+        return False
+    _handoff_nonces[nonce] = current + _HANDOFF_REPLAY_WINDOW_S
+    return True
 
 
 # ============ Rate Limiting Middleware ============
@@ -2172,20 +2251,40 @@ async def _build_depot_readiness_checklist(
 
 @app.websocket("/ocpp/{charge_point_id}")
 async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
-    """OCPP 1.6 WebSocket endpoint (same port as REST when OCPP_USE_SAME_PORT=true)."""
-    if not charge_point_id or not charge_point_id.strip():
+    """OCPP 1.6 WebSocket endpoint (same port as REST when OCPP_USE_SAME_PORT=true).
+
+    Security (C1): the upgrade is gated by OCPP-J Security Profile 1 Basic Auth.
+    The Authorization header is verified against ``station_credentials`` BEFORE
+    ``websocket.accept`` so unauthenticated peers cannot complete the handshake
+    or learn anything beyond a generic policy-violation close.
+    """
+    cp_id = (charge_point_id or "").strip()
+    if not cp_id:
         await websocket.close(code=4000)
         return
-    if ocpp_server is None:
+    if ocpp_server is None or db_pools is None:
         await websocket.close(code=1011)
         return
+
+    auth_header = websocket.headers.get("authorization")
+    if not await verify_ocpp_basic_auth(auth_header, cp_id, db_pools.static):
+        peer = websocket.client.host if websocket.client else "unknown"
+        logger.warning(
+            "OCPP auth rejected: charge_point_id=%s peer=%s",
+            cp_id,
+            peer,
+        )
+        # 1008 = policy violation. Don't reveal which precondition failed.
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept(subprotocol="ocpp1.6")
     try:
-        await ocpp_server.handle_websocket(websocket, charge_point_id.strip())
+        await ocpp_server.handle_websocket(websocket, cp_id)
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.error(f"OCPP WebSocket error for {charge_point_id}: {e}", exc_info=True)
+        logger.error(f"OCPP WebSocket error for {cp_id}: {e}", exc_info=True)
         try:
             await websocket.close(code=1011)
         except Exception:
@@ -4379,13 +4478,26 @@ async def send_handoff(
                 detail="Inter-depot handoff requires HTTPS in production",
             )
 
+        # Security (C2): HMAC signing key is mandatory. Without it the receive
+        # side will reject the request, so refuse here to surface the misconfig
+        # at the source rather than after a network round-trip.
+        signing_key = os.getenv("HANDOFF_SIGNING_KEY", "")
+        if not signing_key:
+            logger.error("HANDOFF_SIGNING_KEY is not configured; refusing send_handoff")
+            raise HTTPException(
+                status_code=503,
+                detail="Inter-depot handoff is unavailable: signing key not configured",
+            )
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 receive_url = (
                     f"{dest_depot_endpoint}/depots/{request.dest_depot_id}/handoff/receive"
                 )
                 nonce = str(uuid4())
-                timestamp_str = datetime.utcnow().isoformat()
+                # Use timezone-aware UTC so the receiver's window check is
+                # unambiguous regardless of host clock representation.
+                timestamp_str = datetime.now(timezone.utc).isoformat()
                 receive_payload = {
                     "message_id": str(message_id),
                     "origin_depot_id": depot_id,
@@ -4398,14 +4510,10 @@ async def send_handoff(
                     "nonce": nonce,
                     "timestamp": timestamp_str,
                 }
-                # Security (H4): HMAC-SHA256 signature for mutual auth
-                signing_key = os.getenv("HANDOFF_SIGNING_KEY", "")
-                if signing_key:
-                    import json as _json
-
-                    payload_bytes = _json.dumps(receive_payload, sort_keys=True).encode()
-                    sig = hmac.new(signing_key.encode(), payload_bytes, hashlib.sha256).hexdigest()
-                    receive_payload["signature"] = sig
+                # Security (C2): HMAC-SHA256 signature for mutual auth.
+                payload_bytes = json.dumps(receive_payload, sort_keys=True).encode()
+                sig = hmac.new(signing_key.encode(), payload_bytes, hashlib.sha256).hexdigest()
+                receive_payload["signature"] = sig
 
                 response = await client.post(receive_url, json=receive_payload)
                 response.raise_for_status()
@@ -4546,7 +4654,10 @@ class HandoffReceiveResponse(BaseModel):
     },
 )
 async def receive_handoff(
-    depot_id: str, request: HandoffReceiveRequest, user: dict = Depends(ensure_tenant_mirrored)
+    depot_id: str,
+    request: HandoffReceiveRequest,
+    http_request: Request,
+    user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Receive inter-depot handoff message.
 
@@ -4554,6 +4665,12 @@ async def receive_handoff(
     1. Validates the request
     2. Stores message in interdepot_messages with status='acknowledged'
     3. Returns acknowledgment with acknowledged_at timestamp
+
+    Security (C2): the request body MUST carry an HMAC-SHA256 signature
+    keyed by ``HANDOFF_SIGNING_KEY``, plus a fresh ``nonce`` and ``timestamp``
+    within ``_HANDOFF_REPLAY_WINDOW_S`` of now. JWT auth alone is insufficient
+    because authenticated tenants would otherwise be able to inject handoff
+    messages claiming any ``origin_depot_id``.
 
     Reference: PRD_v2.md#7-1-rest-api-endpoints
     """
@@ -4564,6 +4681,40 @@ async def receive_handoff(
     validate_depot_id(depot_id)
     validate_depot_id(request.origin_depot_id)
     validate_vehicle_id(request.vehicle_id)
+
+    # Security (C2): verify the inter-depot HMAC signature on the raw body.
+    # Without a configured signing key the endpoint must refuse.
+    signing_key = os.getenv("HANDOFF_SIGNING_KEY", "")
+    if not signing_key:
+        logger.error(
+            "HANDOFF_SIGNING_KEY is not configured; refusing handoff for depot=%s",
+            depot_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Inter-depot handoff is unavailable: signing key not configured",
+        )
+
+    try:
+        raw_body = await http_request.body()
+        body_dict = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body_dict, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    if not _verify_handoff_payload(body_dict, signing_key):
+        peer = http_request.client.host if http_request.client else "unknown"
+        logger.warning(
+            "Handoff signature verification failed: depot=%s origin_claimed=%s peer=%s",
+            depot_id,
+            request.origin_depot_id,
+            peer,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired handoff signature",
+        )
 
     await verify_depot_access(depot_id, user, db_pools.static)
 
@@ -4715,16 +4866,23 @@ async def receive_ocpp_event(
 ) -> dict:
     """Receive an OCPP event from the websocket_handler and trigger immediate re-evaluation.
 
-    Not exposed in the public OpenAPI schema. Protected by X-Internal-Token header
-    when INTERNAL_API_TOKEN env var is set.
+    Not exposed in the public OpenAPI schema. Always requires a valid
+    ``X-Internal-Token`` matching ``INTERNAL_API_TOKEN``.
+
+    Security (C3): the endpoint fails closed in every environment when the
+    token is unset. Previously the dev/staging path treated a missing token as
+    a no-op which left the endpoint open to anyone who could reach the host.
     """
-    # Security (M11): timing-safe token comparison to prevent timing attacks
-    if _INTERNAL_API_TOKEN:
-        token = request.headers.get("X-Internal-Token", "")
-        if not secrets.compare_digest(token, _INTERNAL_API_TOKEN):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-    elif _environment == "production":
-        raise HTTPException(status_code=503, detail="Internal endpoint not configured")
+    # Security (C3): always require the shared token, regardless of environment.
+    if not _INTERNAL_API_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Internal endpoint not configured (INTERNAL_API_TOKEN missing)",
+        )
+    # Security (M11): timing-safe token comparison to prevent timing attacks.
+    token = request.headers.get("X-Internal-Token", "")
+    if not secrets.compare_digest(token, _INTERNAL_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not controller_manager or not db_pools:
         return {"status": "unavailable"}
