@@ -127,6 +127,9 @@ BEGIN
                 temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
             FROM weather_forecasts
             ON CONFLICT (depot_id, source, fetched_at, forecast_for) DO NOTHING;
+        ELSE
+            RAISE EXCEPTION
+                'weather_forecasts has unexpected schema: expected "time" or "forecast_for"';
         END IF;
     END IF;
 END$$;
