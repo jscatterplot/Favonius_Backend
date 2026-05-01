@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from http import HTTPStatus
 from typing import Any, Callable, Optional
 
 import asyncpg
@@ -27,6 +28,7 @@ from .charge_point import FleetChargePoint
 from .mapping import get_charger_id_from_ocpp_id
 from ...db import queries as db_queries
 from ...db.pools import DatabasePools
+from ...security.ocpp_auth import verify_ocpp_basic_auth
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +89,44 @@ class OCPPServer:
 
         logger.info(f"Initialized OCPPServer on {host}:{port}")
 
+    async def _process_request(self, path: str, request_headers: Any):
+        """websockets pre-handshake hook: enforce OCPP-J Basic Auth.
+
+        Returns None to accept the upgrade, or an HTTP response tuple to reject.
+        This runs BEFORE the WebSocket handshake, so unauthenticated clients
+        get a 401 with WWW-Authenticate and never reach a charge-point handler.
+        """
+        cp_id = path.strip("/").strip()
+        if not cp_id:
+            return HTTPStatus.BAD_REQUEST, [], b""
+        if self.pools is None:
+            logger.error("OCPP auth refused: no DB pool")
+            return HTTPStatus.SERVICE_UNAVAILABLE, [], b""
+
+        auth_header: Optional[str] = None
+        try:
+            auth_header = request_headers.get("Authorization")  # websockets.Headers
+        except AttributeError:
+            try:
+                auth_header = request_headers["Authorization"]  # mapping fallback
+            except (KeyError, TypeError):
+                auth_header = None
+
+        if not await verify_ocpp_basic_auth(auth_header, cp_id, self.pools.static):
+            logger.warning("OCPP auth rejected at handshake for %s", cp_id)
+            return (
+                HTTPStatus.UNAUTHORIZED,
+                [("WWW-Authenticate", 'Basic realm="ocpp"')],
+                b"",
+            )
+        return None
+
     async def on_connect(self, websocket: WebSocketServerProtocol, path: str) -> None:
         """Handle new charge point connection.
 
         Extracts charge point ID from path and creates FleetChargePoint instance.
+        Authentication has already been enforced by ``_process_request`` before
+        the handshake completed.
         """
         charge_point_id = path.strip("/")
         if not charge_point_id:
@@ -541,6 +577,7 @@ class OCPPServer:
             self.host,
             self.port,
             subprotocols=["ocpp1.6"],
+            process_request=self._process_request,
         ) as server:
             self.server = server
             logger.info(f"OCPP server started on ws://{self.host}:{self.port}")
