@@ -1003,8 +1003,15 @@ class TestChargerOnboarding:
         password_hash = create_mock.await_args.kwargs["password_hash"]
         assert data["credentials"]["password"] not in password_hash
         assert password_hash.startswith("$2")
+        # H5: the stored idempotency payload is the *replay* receipt — never
+        # the plaintext that was just emitted. Replay is shape-compatible
+        # minus the password and includes a "replayed: true" marker plus a
+        # rotate_credentials hint.
         replay_payload = idem_store.await_args.kwargs["response_json"]
-        assert replay_payload["credentials"]["password"] == data["credentials"]["password"]
+        assert "password" not in replay_payload["credentials"]
+        assert replay_payload["replayed"] is True
+        assert "rotate_credentials" in replay_payload["detail"]
+        assert idem_store.await_args.kwargs["status_code"] == http_status.HTTP_200_OK
         assert idem_store.await_args.kwargs["ttl_minutes"] == 30
 
     def test_null_sub_claim_is_rejected_before_idempotency_write(self, client):
@@ -1721,8 +1728,13 @@ class TestCrossOrganizationDepotAccessDenied:
         mock_httpx_client,
         client,
         mock_db_pool,
+        monkeypatch,
     ):
         """Sender should only be authorized for source depot, not destination depot."""
+        # H4: a destination endpoint must be configured (no localhost
+        # fallback), and the SSRF guard must accept the URL. Patch the
+        # validator so the test isn't tied to live DNS.
+        monkeypatch.setenv("DEFAULT_DEPOT_ENDPOINT", "https://depot.example.com")
         pool, conn = mock_db_pool
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_valid_user(role="customer_operator"))
         app.dependency_overrides[_require_depot_access] = _bypass_depot_access
@@ -1753,7 +1765,9 @@ class TestCrossOrganizationDepotAccessDenied:
             "max_charge_kw": 80.0,
         }
 
-        with patch("src.api.main.db_pools", pool):
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.validate_handoff_destination"
+        ):
             response = client.post(
                 f"/depots/{DEPOT_ID}/vehicles/{VEHICLE_ID}/handoff",
                 json=request,

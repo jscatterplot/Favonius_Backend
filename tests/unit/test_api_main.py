@@ -407,10 +407,12 @@ class TestHandoffEndpoint:
         vehicle_id = str(uuid4())
         dest_depot_id = str(uuid4())
 
-        # Security (C2): send_handoff now requires HANDOFF_SIGNING_KEY to be
-        # configured; without it the endpoint refuses to issue an unsigned
-        # request.
+        # Security (C2/H4): send_handoff now requires HANDOFF_SIGNING_KEY and a
+        # configured destination endpoint. There is no localhost fallback any
+        # more, so we set DEFAULT_DEPOT_ENDPOINT explicitly and bypass the
+        # SSRF guard (it would block the example.com -> network call too).
         monkeypatch.setenv("HANDOFF_SIGNING_KEY", "test-key-for-handoff-signature")
+        monkeypatch.setenv("DEFAULT_DEPOT_ENDPOINT", "https://depot.example.com")
 
         conn.execute = AsyncMock()
         conn.fetchrow = AsyncMock(
@@ -429,7 +431,9 @@ class TestHandoffEndpoint:
             "max_charge_kw": 80.0,
         }
 
-        with patch("src.api.main.db_pools", mock_pool):
+        with patch("src.api.main.db_pools", mock_pool), patch(
+            "src.api.main.validate_handoff_destination"
+        ):
             response = client.post(
                 f"/depots/{depot_id}/vehicles/{vehicle_id}/handoff", json=request
             )
