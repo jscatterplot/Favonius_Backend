@@ -82,11 +82,17 @@ async def mirror_user_tenant(user: dict, pool: Optional["asyncpg.Pool"]) -> None
                 org_id,
                 organization_name,
             )
+            # Supabase models user_organizations as multi-org-per-user with PK
+            # (user_id, organization_id). The backend authorizes per-request via
+            # the JWT's app_metadata.organization_id, so writing a row per
+            # (user, org) pair is correct: a user with multiple Supabase orgs
+            # gets one row each, and the role on the (user, jwt-org) pair is
+            # what gets refreshed.
             await conn.execute(
                 "INSERT INTO user_organizations (user_id, organization_id, role) "
                 "VALUES ($1::uuid, $2::uuid, $3) "
-                "ON CONFLICT (user_id) DO UPDATE "
-                "SET organization_id = EXCLUDED.organization_id, role = EXCLUDED.role",
+                "ON CONFLICT (user_id, organization_id) DO UPDATE "
+                "SET role = EXCLUDED.role",
                 user_id,
                 org_id,
                 role,
