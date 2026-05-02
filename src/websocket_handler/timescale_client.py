@@ -1924,7 +1924,7 @@ class TimescaleClient:
                            WHERE cva.card_id = c.card_id
                              AND v.depot_id = c.depot_id
                              AND COALESCE(v.status, 'active') = 'active'
-                           ORDER BY v.vehicle_id
+                           ORDER BY v.external_id
                            LIMIT 1
                        ) AS vehicle_id,
                        (

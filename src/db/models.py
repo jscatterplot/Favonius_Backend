@@ -61,13 +61,13 @@ class Organization(Base):
 
 
 class OrganizationUser(Base):
-    """Membership linking Supabase auth user UUID to one organization."""
+    """Membership linking Supabase auth user UUIDs to organizations."""
 
     __tablename__ = "user_organizations"
 
     user_id = Column(PGUUID(as_uuid=True), primary_key=True)
     organization_id = Column(
-        PGUUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), primary_key=True, nullable=False
     )
     role = Column(String(50), nullable=False, default="customer_operator")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
