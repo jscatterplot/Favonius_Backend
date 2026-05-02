@@ -729,6 +729,16 @@ test(api): add coverage for handoff rate limiting
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `CORS_ORIGINS` | `*` | Allowed CORS origins (comma-separated) |
 
+### Geo-blocking (Article 73-3 compliance)
+| Variable | Default | Description |
+|---|---|---|
+| `GEO_BLOCK_ENABLED` | `true` | Enable geo-blocking middleware |
+| `GEO_BLOCK_COUNTRIES` | `RU,CN,BY` | ISO-3166 alpha-2 country codes to block |
+| `GEO_BLOCK_ALLOWLIST` | — | Comma-separated IPs/CIDRs that bypass geo-blocking |
+| `GEO_BLOCK_FAIL_CLOSED` | `true` | Block requests when GeoIP resolution fails |
+| `GEOIP_DB_PATH` | `/app/data/GeoLite2-Country.mmdb` | MaxMind DB path |
+| `MAXMIND_LICENSE_KEY` | — | MaxMind license. Set as **both** a build variable (Dockerfile downloads at build, `Dockerfile:54`) **and** a runtime variable (app re-downloads at startup with retries via `_download_geoip_db` if the build-time download was skipped or hit a transient outage). Without it set anywhere, the app fails closed. |
+
 ### Alerts pipeline (notifications)
 See `docs/plans/alerts-pipeline.md` for the full design.
 

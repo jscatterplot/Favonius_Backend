@@ -32,6 +32,7 @@ Where to set each variable: **Railway project → select service (API or WebSock
 | **GUROBI_LIC_CONTENT** | — | **Secret.** Required only if you use Gurobi. Paste the **entire contents** of your `gurobi.lic` file. The app/entrypoint must write this to `/opt/gurobi/gurobi.lic`; if your Dockerfile/entrypoint does not do that, you may need to add it. Without this, the solver falls back to HiGHS. |
 | **HANDOFF_DEST_DEPOT_ENDPOINT** | — | Base URL of the “destination” depot API for inter-depot handoff (e.g. `https://other-api.railway.app`). Only if you use handoff. |
 | **DEFAULT_DEPOT_ENDPOINT** | `http://localhost:8000` | Default depot API URL used when a specific destination is not set. |
+| **MAXMIND_LICENSE_KEY** | — | **Secret.** MaxMind license key for the GeoLite2-Country DB used by the Article 73-3 geo-blocking middleware. **Set in two places:** (1) under **Build** variables so the Dockerfile downloads the DB at image build (`Dockerfile:54-97`); (2) under **Service** variables so `src/security/geo_block.py::_download_geoip_db` can re-download with retries at startup if the build-time download was skipped or hit a transient MaxMind outage. Without it, the service starts with no GeoIP DB and fails closed (every non-private IP gets a 403 “Access denied”). Get a key for free from maxmind.com → Account → License Keys. |
 
 ### Pre-deploy command (API only)
 
