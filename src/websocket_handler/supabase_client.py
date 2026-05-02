@@ -221,6 +221,7 @@ class SupabaseClient:
         """Get depot configuration from Supabase."""
         query = """
             SELECT id AS depot_id,
+                   name,
                    organization_id,
                    max_grid_kw,
                    demand_charge_rate_kw,

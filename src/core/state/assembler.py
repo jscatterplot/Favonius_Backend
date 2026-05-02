@@ -1363,7 +1363,13 @@ class StateAssembler:
         vehicle_to_ocpp = {}
         for row in vehicle_rows:
             vid = row["vehicle_id"]
-            vehicle_capacities[vid] = float(row["battery_kwh"])
+            raw_battery_kwh = row["battery_kwh"]
+            if raw_battery_kwh is None:
+                raise ValueError(
+                    f"Vehicle {vid} in depot {depot_id_str} has NULL battery_capacity_kwh; "
+                    "set vehicles.battery_capacity_kwh before optimization"
+                )
+            vehicle_capacities[vid] = float(raw_battery_kwh)
             if row["id_tag"]:
                 vehicle_to_ocpp[vid] = row["id_tag"]
 
@@ -1387,7 +1393,13 @@ class StateAssembler:
             charger_groups = {}
             charger_efficiency = None
             for row in charger_rows:
-                rated_kw = float(row["rated_kw"])
+                raw_rated_kw = row["rated_kw"]
+                if raw_rated_kw is None:
+                    raise ValueError(
+                        f"Depot {depot_id_str} has NULL max_power_kw in charging_stations; "
+                        "set charging_stations.max_power_kw before optimization"
+                    )
+                rated_kw = float(raw_rated_kw)
                 count = int(row["count"])
                 charger_groups[rated_kw] = count
                 # Use efficiency from first charger (assumed uniform per PRD)
