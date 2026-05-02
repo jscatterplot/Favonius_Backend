@@ -602,6 +602,26 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 # ============ Logging Middleware ============
 
 
+_REQUEST_ID_MAX_LEN = 128
+
+
+def _sanitize_inbound_request_id(raw: Optional[str]) -> Optional[str]:
+    """Return a safe correlation ID or None if the header is unusable.
+
+    Rejects empty values, excessive length, and non-printable ASCII (control
+    characters) so request IDs cannot be used for log injection or response
+    amplification.
+    """
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s or len(s) > _REQUEST_ID_MAX_LEN:
+        return None
+    if not all(32 <= ord(c) <= 126 for c in s):
+        return None
+    return s
+
+
 class RequestIdMiddleware(BaseHTTPMiddleware):
     """Stamp every request with a correlation ID.
 
@@ -612,7 +632,8 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        inbound = _sanitize_inbound_request_id(request.headers.get("x-request-id"))
+        request_id = inbound if inbound is not None else str(uuid.uuid4())
         request.state.request_id = request_id
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -3647,10 +3668,10 @@ async def run_optimization(
             result = await controller.run_optimization(
                 "api_request", horizon_hours=request.horizon_hours
             )
-        except SolverTimeoutError as e:
-            raise OptimizationError(f"Optimization timeout: {e}")
-        except InfeasibleModelError as e:
-            raise OptimizationError(f"Optimization infeasible: {e}")
+        except SolverTimeoutError:
+            raise
+        except InfeasibleModelError:
+            raise
         except SolverError as e:
             raise OptimizationError(f"Solver error: {e}")
         except Exception as opt_error:
