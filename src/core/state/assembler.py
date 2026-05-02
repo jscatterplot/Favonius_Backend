@@ -1387,7 +1387,7 @@ class StateAssembler:
         battery_query = """
         SELECT capacity_kwh, max_power_kw, efficiency, soc_min, soc_max
         FROM battery_storage
-        WHERE depot_id = $1
+        WHERE site_id = $1
         LIMIT 1
         """
         async with pool.acquire() as conn:
