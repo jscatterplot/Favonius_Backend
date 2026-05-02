@@ -6,6 +6,18 @@ These models define the database schema for the Favonius platform.
 While the codebase primarily uses raw SQL with asyncpg for performance,
 these models serve as the canonical schema definition and can be used
 for migrations and ORM-based operations where convenient.
+
+Naming notes
+------------
+Supabase owns the canonical naming for the static (reference) tables, so the
+SQLAlchemy classes here use the Supabase table names (``sites``,
+``charging_stations``, ``vehicles``, ``organizations``) and ``id`` as the PK
+column. The Python class names remain the internal Favonius vocabulary
+(``Depot`` for ``sites``, ``Charger`` for ``charging_stations``) because that
+is how the rest of the codebase, the optimizer, and the OCPP layer reason
+about depots and chargers. SQL strings throughout the backend alias the new
+column names back to the legacy Python names (``id AS depot_id`` etc.) at
+the SQL boundary so caller code keeps reading ``row["depot_id"]``.
 """
 
 from __future__ import annotations
@@ -37,7 +49,7 @@ class Organization(Base):
 
     __tablename__ = "organizations"
 
-    organization_id = Column(
+    id = Column(
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
     name = Column(String(255), nullable=False)
@@ -55,7 +67,7 @@ class OrganizationUser(Base):
 
     user_id = Column(PGUUID(as_uuid=True), primary_key=True)
     organization_id = Column(
-        PGUUID(as_uuid=True), ForeignKey("organizations.organization_id"), nullable=False
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
     )
     role = Column(String(50), nullable=False, default="customer_operator")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -64,28 +76,28 @@ class OrganizationUser(Base):
 
 
 class Depot(Base):
-    """Depot (charging facility) reference data.
+    """Depot (charging facility) reference data — ``public.sites`` in Supabase.
 
     Reference: PRD_v2.md Section 6.1
     """
 
-    __tablename__ = "depots"
+    __tablename__ = "sites"
 
-    depot_id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
     organization_id = Column(
         PGUUID(as_uuid=True),
-        ForeignKey("organizations.organization_id"),
+        ForeignKey("organizations.id"),
         nullable=False,
     )
     name = Column(String(255), nullable=False)
-    latitude = Column(Double, nullable=False)
-    longitude = Column(Double, nullable=False)
+    latitude = Column(Double, nullable=True)
+    longitude = Column(Double, nullable=True)
     timezone = Column(String(50), default="America/Los_Angeles")
     currency = Column(String(10), nullable=False, default="EUR")
     utility_id = Column(
         String(100), nullable=True, comment="Utility provider identifier (e.g., 'PG&E', 'SCE')"
     )
-    max_grid_kw = Column(Double, nullable=False)
+    max_grid_kw = Column(Double, nullable=True)
     demand_charge_rate_kw = Column(Double, default=20.0)
     demand_charge_billing_period = Column(String(32), nullable=False, default="monthly")
     address = Column(JSONB, nullable=False, default=dict)
@@ -109,22 +121,31 @@ class Vehicle(Base):
 
     __tablename__ = "vehicles"
 
-    vehicle_id = Column(
+    id = Column(
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    depot_id = Column(PGUUID(as_uuid=True), ForeignKey("depots.depot_id"), nullable=False)
-    external_id = Column(
-        String(100), unique=True, nullable=False, comment="Customer's vehicle ID (e.g., 'bus_101')"
+    organization_id = Column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True
     )
-    vehicle_type = Column(String(50), nullable=False, comment="'bus_large', 'bus_small', 'van'")
-    battery_kwh = Column(Double, nullable=False)
-    max_charge_kw = Column(Double, nullable=False, comment="Default from config, updated by OCPP")
+    site_id = Column(PGUUID(as_uuid=True), ForeignKey("sites.id"), nullable=True)
+    external_id = Column(
+        String(100), unique=True, nullable=True, comment="Customer's vehicle ID (e.g., 'bus_101')"
+    )
+    vehicle_type = Column(String(50), nullable=True, comment="'bus_large', 'bus_small', 'van'")
+    battery_capacity_kwh = Column(Double, nullable=True)
+    max_charge_rate_kw = Column(Double, nullable=True, comment="Default from config, updated by OCPP")
+    max_discharge_rate_kw = Column(Double, nullable=True)
+    v2g_capable = Column(Boolean, default=False)
+    vin = Column(String(64), nullable=True, unique=True)
+    license_plate = Column(String(64), nullable=True)
+    status = Column(String(32), nullable=False, default="active")
     id_tag = Column(
         String(100),
         nullable=True,
         comment="OCPP idTag used in Authorize messages to map sessions to vehicles",
     )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relationships
     depot = relationship("Depot", back_populates="vehicles")
@@ -133,22 +154,23 @@ class Vehicle(Base):
 
 
 class Charger(Base):
-    """Charger reference data.
+    """Charger reference data — ``public.charging_stations`` in Supabase.
 
     Reference: PRD_v2.md Section 6.1
     """
 
-    __tablename__ = "chargers"
+    __tablename__ = "charging_stations"
 
-    charger_id = Column(
+    id = Column(
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    depot_id = Column(PGUUID(as_uuid=True), ForeignKey("depots.depot_id"), nullable=False)
-    ocpp_id = Column(String(100), unique=True, nullable=False)
-    rated_kw = Column(Double, nullable=False)
+    site_id = Column(PGUUID(as_uuid=True), ForeignKey("sites.id"), nullable=True)
+    station_id = Column(String(100), unique=True, nullable=False)
+    max_power_kw = Column(Double, nullable=True)
     efficiency = Column(Double, default=0.95)
     connector_type = Column(String(50), default="CCS", comment="MVP: CCS only")
-    status = Column(String(20), default="Available")
+    status = Column(String(20), default="operational")
+    auth_required = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships
@@ -165,8 +187,10 @@ class ChargerVehicleAccess(Base):
 
     __tablename__ = "charger_vehicle_access"
 
-    charger_id = Column(PGUUID(as_uuid=True), ForeignKey("chargers.charger_id"), primary_key=True)
-    vehicle_id = Column(PGUUID(as_uuid=True), ForeignKey("vehicles.vehicle_id"), primary_key=True)
+    charging_station_id = Column(
+        PGUUID(as_uuid=True), ForeignKey("charging_stations.id"), primary_key=True
+    )
+    vehicle_id = Column(PGUUID(as_uuid=True), ForeignKey("vehicles.id"), primary_key=True)
     is_accessible = Column(Boolean, default=True)
     notes = Column(String(255), nullable=True, comment="e.g., 'bay 3 blocked by pillar'")
 
@@ -183,10 +207,10 @@ class BatteryStorage(Base):
 
     __tablename__ = "battery_storage"
 
-    battery_id = Column(
+    id = Column(
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    depot_id = Column(PGUUID(as_uuid=True), ForeignKey("depots.depot_id"), nullable=False)
+    site_id = Column(PGUUID(as_uuid=True), ForeignKey("sites.id"), nullable=False)
     capacity_kwh = Column(Double, nullable=False)
     max_power_kw = Column(Double, nullable=False)
     efficiency = Column(Double, default=0.92)
@@ -220,10 +244,12 @@ class Telemetry(Base):
 
     __tablename__ = "telemetry"
 
-    # TimescaleDB hypertable - time is part of primary key
+    # TimescaleDB hypertable - time is part of primary key.
+    # vehicle_id / charger_id reference UUIDs from Supabase static tables but
+    # the FK is logical (cross-DB) so we don't declare it here.
     time = Column(DateTime(timezone=True), primary_key=True, nullable=False)
     vehicle_id = Column(PGUUID(as_uuid=True), primary_key=True, nullable=False)
-    charger_id = Column(PGUUID(as_uuid=True), ForeignKey("chargers.charger_id"), nullable=True)
+    charger_id = Column(PGUUID(as_uuid=True), nullable=True)
     soc = Column(Double, nullable=True)
     location_lat = Column(Double, nullable=True)
     location_lon = Column(Double, nullable=True)
@@ -323,10 +349,10 @@ class Schedule(Base):
 
     __tablename__ = "schedules"
 
-    schedule_id = Column(
+    id = Column(
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    vehicle_id = Column(PGUUID(as_uuid=True), ForeignKey("vehicles.vehicle_id"), nullable=False)
+    vehicle_id = Column(PGUUID(as_uuid=True), ForeignKey("vehicles.id"), nullable=False)
     route_id = Column(String(100), nullable=True)
     departure_time = Column(DateTime(timezone=True), nullable=False)
     return_time = Column(DateTime(timezone=True), nullable=False)
@@ -337,9 +363,9 @@ class Schedule(Base):
         Double, nullable=True, comment="Estimated energy consumption (kWh) from surrogate model"
     )
     required_soc = Column(Double, default=1.0)
-    dest_depot_id = Column(
+    dest_site_id = Column(
         PGUUID(as_uuid=True),
-        ForeignKey("depots.depot_id"),
+        ForeignKey("sites.id"),
         nullable=True,
         comment="if different from home depot",
     )
@@ -360,7 +386,8 @@ class OptimizationRun(Base):
     __tablename__ = "optimization_runs"
 
     run_id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
-    depot_id = Column(PGUUID(as_uuid=True), ForeignKey("depots.depot_id"), nullable=False)
+    # depot_id is a logical (cross-DB) reference to sites.id in Supabase.
+    depot_id = Column(PGUUID(as_uuid=True), nullable=False)
     run_time = Column(DateTime(timezone=True), server_default=func.now())
     trigger_reason = Column(
         String(50),
@@ -394,8 +421,10 @@ class ChargingCommand(Base):
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
     run_id = Column(PGUUID(as_uuid=True), ForeignKey("optimization_runs.run_id"), nullable=True)
-    charger_id = Column(PGUUID(as_uuid=True), ForeignKey("chargers.charger_id"), nullable=False)
-    vehicle_id = Column(PGUUID(as_uuid=True), ForeignKey("vehicles.vehicle_id"), nullable=True)
+    # charger_id / vehicle_id are logical (cross-DB) FKs to charging_stations.id
+    # and vehicles.id in Supabase; not declared as ForeignKey here.
+    charger_id = Column(PGUUID(as_uuid=True), nullable=False)
+    vehicle_id = Column(PGUUID(as_uuid=True), nullable=True)
     issued_at = Column(DateTime(timezone=True), server_default=func.now())
     profile_json = Column(JSONB, nullable=False)
     status = Column(String(20), default="pending", comment="'pending', 'accepted', 'rejected'")
@@ -417,9 +446,10 @@ class InterdepotMessage(Base):
     message_id = Column(
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    origin_depot_id = Column(PGUUID(as_uuid=True), ForeignKey("depots.depot_id"), nullable=False)
-    dest_depot_id = Column(PGUUID(as_uuid=True), ForeignKey("depots.depot_id"), nullable=False)
-    vehicle_id = Column(PGUUID(as_uuid=True), ForeignKey("vehicles.vehicle_id"), nullable=False)
+    # Logical cross-DB FKs to sites.id / vehicles.id in Supabase.
+    origin_depot_id = Column(PGUUID(as_uuid=True), nullable=False)
+    dest_depot_id = Column(PGUUID(as_uuid=True), nullable=False)
+    vehicle_id = Column(PGUUID(as_uuid=True), nullable=False)
     departure_time = Column(DateTime(timezone=True), nullable=False)
     expected_soc = Column(Double, nullable=False)
     arrival_time = Column(DateTime(timezone=True), nullable=False)
@@ -454,7 +484,8 @@ class TriggerLog(Base):
     trigger_id = Column(
         PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    depot_id = Column(PGUUID(as_uuid=True), ForeignKey("depots.depot_id"), nullable=False)
+    # depot_id is a logical (cross-DB) reference to sites.id in Supabase.
+    depot_id = Column(PGUUID(as_uuid=True), nullable=False)
     trigger_type = Column(
         String(50),
         nullable=False,

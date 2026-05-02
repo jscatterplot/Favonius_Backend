@@ -336,8 +336,8 @@ async def get_depot_location(
 
     query = """
     SELECT latitude, longitude
-    FROM depots
-    WHERE depot_id = $1::uuid
+    FROM sites
+    WHERE id = $1::uuid
     LIMIT 1
     """
 

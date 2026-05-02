@@ -65,12 +65,12 @@ def _make_pool(static_records: dict[str, Any], ts_records: list[dict]):
     static_conn = AsyncMock()
 
     async def static_fetchrow(query: str, *args, **kwargs):
-        if "FROM depots" in query:
+        if "FROM sites" in query:
             return static_records.get("depot_row")
         return None
 
     async def static_fetch(query: str, *args, **kwargs):
-        if "FROM chargers" in query:
+        if "FROM charging_stations" in query:
             return static_records.get("charger_rows", [])
         return []
 

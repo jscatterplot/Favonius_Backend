@@ -69,8 +69,8 @@ class ControllerManager:
         try:
             # Query all depots from Supabase (static pool)
             query = """
-            SELECT depot_id::text
-            FROM depots
+            SELECT id::text AS depot_id
+            FROM sites
             ORDER BY created_at
             """
             async with self.pools.static.acquire() as conn:

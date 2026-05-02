@@ -86,11 +86,11 @@ class WeatherIngestionService:
             Dictionary mapping depot_id to number of forecasts stored
         """
         query = """
-        SELECT depot_id, latitude, longitude
-        FROM depots
+        SELECT id AS depot_id, latitude, longitude
+        FROM sites
         WHERE latitude IS NOT NULL
           AND longitude IS NOT NULL
-        ORDER BY depot_id
+        ORDER BY id
         """
 
         results: dict[str, int] = {}

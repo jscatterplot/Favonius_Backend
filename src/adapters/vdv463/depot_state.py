@@ -50,17 +50,17 @@ async def get_depot_charging_info(
         async with _static.acquire() as static_conn:
             if depot_name is None:
                 row = await static_conn.fetchrow(
-                    "SELECT name FROM depots WHERE depot_id = $1::uuid",
+                    "SELECT name FROM sites WHERE id = $1::uuid",
                     depot_id,
                 )
                 depot_name = row["name"] if row else str(depot_id)
 
             chargers = await static_conn.fetch(
                 """
-                SELECT charger_id, ocpp_id, status, rated_kw
-                FROM chargers
-                WHERE depot_id = $1::uuid
-                ORDER BY ocpp_id
+                SELECT id AS charger_id, station_id AS ocpp_id, status, max_power_kw AS rated_kw
+                FROM charging_stations
+                WHERE site_id = $1::uuid
+                ORDER BY station_id
                 """,
                 depot_id,
             )
@@ -99,7 +99,7 @@ async def get_depot_charging_info(
                 if telem_row["vehicle_id"]:
                     async with _static.acquire() as static_conn2:
                         v_row = await static_conn2.fetchrow(
-                            "SELECT external_id FROM vehicles WHERE vehicle_id = $1",
+                            "SELECT external_id FROM vehicles WHERE id = $1",
                             telem_row["vehicle_id"],
                         )
                         vehicle_external_id = (

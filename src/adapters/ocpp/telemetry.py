@@ -69,7 +69,7 @@ async def store_meter_values(
         try:
             async with pools.static.acquire() as conn:
                 charger_row = await conn.fetchrow(
-                    "SELECT charger_id FROM chargers WHERE ocpp_id = $1", charge_point_id
+                    "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1", charge_point_id
                 )
                 if charger_row:
                     charger_id = charger_row["charger_id"]
@@ -133,9 +133,9 @@ async def _update_vehicle_max_charge_kw(
             await conn.execute(
                 """
                 UPDATE vehicles
-                SET max_charge_kw = $1
-                WHERE vehicle_id = $2::uuid
-                  AND (max_charge_kw IS NULL OR max_charge_kw != $1)
+                SET max_charge_rate_kw = $1
+                WHERE id = $2::uuid
+                  AND (max_charge_rate_kw IS NULL OR max_charge_rate_kw != $1)
                 """,
                 max_charge_kw,
                 str(vehicle_id),

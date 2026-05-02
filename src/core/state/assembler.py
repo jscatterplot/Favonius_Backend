@@ -738,8 +738,8 @@ class StateAssembler:
         # Priority 2: Fall back to depots.demand_charge_rate_kw (Supabase)
         depot_query = """
         SELECT demand_charge_rate_kw
-        FROM depots
-        WHERE depot_id = $1
+        FROM sites
+        WHERE id = $1
         """
         async with self.pools.static.acquire() as conn:
             row = await conn.fetchrow(depot_query, self.depot_id)
@@ -789,7 +789,7 @@ class StateAssembler:
         try:
             async with self.pools.static.acquire() as static_conn:
                 charger_rows = await static_conn.fetch(
-                    "SELECT charger_id FROM chargers WHERE depot_id = $1",
+                    "SELECT id AS charger_id FROM charging_stations WHERE site_id = $1",
                     self.depot_id,
                 )
             charger_ids = [row["charger_id"] for row in charger_rows]
@@ -1180,7 +1180,7 @@ class StateAssembler:
             async with self.pools.static.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT organization_id::text AS organization_id "
-                    "FROM depots WHERE depot_id = $1",
+                    "FROM sites WHERE id = $1",
                     self.depot_id,
                 )
         except asyncpg.PostgresError as e:
@@ -1300,8 +1300,8 @@ class StateAssembler:
                under_cap_rate_per_kwh,
                over_cap_penalty_per_kwh,
                COALESCE(cap_billing_period, 'monthly') AS cap_billing_period
-        FROM depots
-        WHERE depot_id = $1
+        FROM sites
+        WHERE id = $1
         """
         async with pool.acquire() as conn:
             depot_row = await conn.fetchrow(depot_query, depot_id_str)
@@ -1332,9 +1332,12 @@ class StateAssembler:
 
         # Query vehicles
         vehicles_query = """
-        SELECT vehicle_id::text, battery_kwh, max_charge_kw, id_tag
+        SELECT id::text AS vehicle_id,
+               battery_capacity_kwh AS battery_kwh,
+               max_charge_rate_kw AS max_charge_kw,
+               id_tag
         FROM vehicles
-        WHERE depot_id = $1
+        WHERE site_id = $1
         """
         async with pool.acquire() as conn:
             vehicle_rows = await conn.fetch(vehicles_query, depot_id_str)
@@ -1352,11 +1355,11 @@ class StateAssembler:
 
         # Query chargers - aggregate by rated_kw per PRD Section 8.3
         chargers_query = """
-        SELECT rated_kw, efficiency, COUNT(*) as count
-        FROM chargers
-        WHERE depot_id = $1
-        GROUP BY rated_kw, efficiency
-        ORDER BY rated_kw DESC
+        SELECT max_power_kw AS rated_kw, efficiency, COUNT(*) as count
+        FROM charging_stations
+        WHERE site_id = $1
+        GROUP BY max_power_kw, efficiency
+        ORDER BY max_power_kw DESC
         """
         async with pool.acquire() as conn:
             charger_rows = await conn.fetch(chargers_query, depot_id_str)
@@ -1413,7 +1416,7 @@ class StateAssembler:
         charger_vehicle_access: dict[str, set[str]] = {}
         if access_default == "all_to_all":
             charger_id_query = """
-            SELECT charger_id::text FROM chargers WHERE depot_id = $1
+            SELECT id::text AS charger_id FROM charging_stations WHERE site_id = $1
             """
             async with pool.acquire() as conn:
                 charger_id_rows = await conn.fetch(charger_id_query, depot_id_str)
@@ -1422,10 +1425,10 @@ class StateAssembler:
                 charger_vehicle_access[row["charger_id"]] = set(all_vehicle_ids)
         else:
             access_query = """
-            SELECT charger_id::text, vehicle_id::text
+            SELECT charging_station_id::text AS charger_id, vehicle_id::text
             FROM charger_vehicle_access
-            WHERE charger_id IN (
-                SELECT charger_id FROM chargers WHERE depot_id = $1
+            WHERE charging_station_id IN (
+                SELECT id FROM charging_stations WHERE site_id = $1
             )
             AND is_accessible = TRUE
             """

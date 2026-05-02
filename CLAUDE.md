@@ -299,14 +299,35 @@ These come directly from the PRD and are non-negotiable:
 
 ## Database Schema (TimescaleDB / PostgreSQL 16)
 
-### Reference (static) tables
-- `organizations` — Customer / workspace tenant (`organization_id` UUID). Rows are **JIT-mirrored** from verified Supabase JWT `app_metadata` (see Tenant mirroring below); canonical org lifecycle lives in Supabase / frontend.
-- `user_organizations` — At most one org per user (`user_id` PK → `organization_id`, `role`). JIT-mirrored from JWT `app_metadata` (`organization_id`, `favonius_role`). Name matches the canonical Supabase project schema. **Not** used for API authorization; access control compares JWT claims to `depots.organization_id`.
-- `depots` — Physical locations; `max_grid_kw` is the hard site power limit; `organization_id` FK to `organizations`; includes setup metadata fields (`address`, `billing_metadata`, `building_load_source`, `demand_charge_billing_period`, `timezone`, `currency`, `utility_id`)
-- `vehicles` — Fleet vehicles; `max_charge_kw` updated from OCPP MeterValues
-- `chargers` — EVSE; `ocpp_id` links to OCPP protocol
-- `charger_vehicle_access` — Physical accessibility matrix
-- `battery_storage` — Stationary batteries
+### Reference (static) tables — Supabase project `favonius-pilot`
+
+> **Naming convention:** Supabase owns the canonical naming for the static
+> tables, so the actual table names in Postgres differ from the Favonius
+> internal vocabulary. The backend continues to call them "depots" and
+> "chargers" in Python (`depot_id`, `charger_id`, `Depot` class, etc.) and
+> aliases the Supabase column names back at the SQL boundary
+> (`SELECT id AS depot_id FROM sites …`). Supabase additions live in
+> `migrations/supabase/006_align_static_schema_to_supabase.sql` and
+> `migrations/supabase/007_supabase_static_operational_tables.sql`.
+
+| Backend concept | Supabase table | PK column (alias) | Key columns / aliases |
+|---|---|---|---|
+| Depot | `sites` | `id` (`AS depot_id`) | `organization_id`, `max_grid_kw`, `demand_charge_rate_kw`, `demand_charge_billing_period`, `timezone`, `currency`, `utility_id`, `address`, `billing_metadata`, `building_load_source`, `building_load_assumption_kw`, `access_mode`, `charger_vehicle_access_default`, `tariff_config`, `latitude`, `longitude` |
+| Charger | `charging_stations` | `id` (`AS charger_id`) | `site_id` (`AS depot_id`), `station_id` (`AS ocpp_id`), `max_power_kw` (`AS rated_kw`), `efficiency`, `auth_required`, `connector_type`, `display_name`, `vendor`, `connector_count`, `connector_ids` |
+| Vehicle | `vehicles` | `id` (`AS vehicle_id`) | `organization_id` (Supabase native), `site_id` (`AS depot_id`, added by mig 006), `vin` (Supabase native, UNIQUE), `external_id` (mig 006), `vehicle_type` (mig 006), `id_tag` (mig 006), `battery_capacity_kwh` (`AS battery_kwh`), `max_charge_rate_kw` (`AS max_charge_kw`), `max_discharge_rate_kw`, `v2g_capable`, `license_plate`, `driver_id`, `status` |
+| Organization | `organizations` | `id` (`AS organization_id`) | `name`, `type`, `billing_address`, `primary_contact`, `subscription_tier`, `is_active` |
+| Org membership | `user_organizations` | `(user_id, organization_id)` | `role` (Supabase vocab: `owner|admin|operator|viewer`; backend writes Favonius vocab: `customer_admin|customer_operator|favonius_admin`) |
+| Charger ↔ Vehicle access | `charger_vehicle_access` | `(charging_station_id, vehicle_id)` | `is_accessible`, `notes`. Note the FK column name is `charging_station_id`, not `charger_id`. |
+| Battery | `battery_storage` | `id` (`AS battery_id`) | `site_id` (`AS depot_id`), `capacity_kwh`, `max_power_kw`, `efficiency`, `soc_min`, `soc_max` |
+| Per-day route | `schedules` | `id` (`AS schedule_id`) | `vehicle_id`, `route_id`, `departure_time`, `return_time`, `actual_return_time`, `energy_kwh`, `required_soc`, `dest_site_id` (`AS dest_depot_id`). Distinct from Supabase's recurring `vehicle_schedules` table. |
+| Driver | `drivers` | `id` (`AS driver_id`) | `site_id`, `external_driver_id`, `display_name`, `email`, `phone`, `status` |
+| RFID card | `rfid_cards` | `id` (`AS card_id`) | `site_id`, `id_tag` (UNIQUE), `label`, `status` |
+| RFID assignments | `rfid_card_vehicle_assignments`, `rfid_card_driver_assignments` | composite | `card_id`, `vehicle_id` / `driver_id` (FK column names retained on join tables) |
+| Per-charger Basic Auth | `station_credentials` | `id` (SERIAL) | `station_id` (the OCPP id; lookup key — NOT the UUID PK), `username`, `password_hash`, `active`, `last_rotated_at` |
+| Charger onboarding cache | `charger_onboarding_idempotency` | `id` | `organization_id`, `endpoint`, `idempotency_key`, `request_hash`, `response_json`, `expires_at` |
+| Failed-auth events | `security_events` | `id` (SERIAL) | `station_id`, `event_type`, `timestamp`, `tech_info`, `additional_info` |
+
+Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitlist`, `faqs`, `glossary_items`, `vehicle_schedules` (recurring patterns), `charging_schedules_config`, `charging_sessions_active`, `charging_sessions_summary`, `vehicle_realtime_state`, `api_usage`.
 
 ### Time-series hypertables
 - `telemetry` — Vehicle SoC, charging_kw, is_plugged (from OCPP MeterValues)
@@ -315,7 +336,7 @@ These come directly from the PRD and are non-negotiable:
 - `building_load` — Non-EV site power draw (**required** for grid calc)
 
 ### Tenant mirroring (JIT)
-- On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `user_organizations` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.organization_name`, `app_metadata.favonius_role`). If `organization_name` is absent, a deterministic placeholder (`org-<org_uuid_prefix>`) is used for bootstrap rows. **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `depots.organization_id`).
+- On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `user_organizations` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.organization_name`, `app_metadata.favonius_role`). The org row uses `organizations.id` as the PK column. If `organization_name` is absent, a deterministic placeholder (`org-<org_uuid_prefix>`) is used for bootstrap rows. **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `sites.organization_id`).
 - In-process TTL cache: `TENANT_MIRROR_TTL_S` (default `300`) seconds per `sub` to limit DB writes.
 - Workspace **invitations** are managed in Supabase only; there is no `invitations` table in this backend.
 

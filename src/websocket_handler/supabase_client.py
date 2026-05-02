@@ -154,21 +154,21 @@ class SupabaseClient:
         """Get vehicles from Supabase."""
         query = "SELECT * FROM vehicles"
         if depot_id:
-            query += " WHERE depot_id = $1"
+            query += " WHERE site_id = $1"
             return await self.fetch_all(query, depot_id)
         return await self.fetch_all(query)
 
     async def get_chargers(self, depot_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get chargers from Supabase."""
-        query = "SELECT * FROM chargers"
+        query = "SELECT * FROM charging_stations"
         if depot_id:
-            query += " WHERE depot_id = $1"
+            query += " WHERE site_id = $1"
             return await self.fetch_all(query, depot_id)
         return await self.fetch_all(query)
 
     async def get_depot_config(self, depot_id: str) -> Optional[Dict[str, Any]]:
         """Get depot configuration from Supabase."""
-        query = "SELECT * FROM depots WHERE depot_id = $1"
+        query = "SELECT * FROM sites WHERE id = $1"
         return await self.fetch_one(query, depot_id)
 
     async def get_organization(self, org_id: str) -> Optional[Dict[str, Any]]:

@@ -155,9 +155,9 @@ class PriceIngestionService:
             Dictionary mapping depot_id to number of prices stored
         """
         query = """
-        SELECT depot_id, utility_id, timezone
-        FROM depots
-        ORDER BY depot_id
+        SELECT id AS depot_id, utility_id, timezone
+        FROM sites
+        ORDER BY id
         """
 
         results: dict[str, int] = {}
