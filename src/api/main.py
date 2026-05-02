@@ -76,6 +76,11 @@ from ..security.headers import SecurityHeadersMiddleware
 from ..security.ocpp_auth import verify_ocpp_basic_auth
 from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
 from ..security.rbac import Permission, has_permission, require_favonius_admin
+from ..security.handoff_validator import (
+    compute_handoff_signature,
+    prepare_handoff_http_target,
+    verify_handoff_signature,
+)
 from ..security.validators import (
     validate_depot_id,
     validate_horizon_hours,
@@ -325,6 +330,18 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_heartbeat_loop(ts_pool))
     logger.info("Optimizer heartbeat task started")
 
+    # ── Handoff signing key gate ──────────────────────────────────────────────
+    # Security (H4): the handoff endpoints fail closed without HANDOFF_SIGNING_KEY
+    # in production/staging. Surface the misconfig at startup so operators
+    # notice before traffic arrives. Don't block the app from coming up so
+    # the rest of the API still serves traffic.
+    if _environment in {"production", "staging"} and not os.getenv("HANDOFF_SIGNING_KEY"):
+        logger.critical(
+            "HANDOFF_SIGNING_KEY is not configured; "
+            "inter-depot handoff endpoints will fail closed (env=%s).",
+            _environment,
+        )
+
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
@@ -449,28 +466,37 @@ def reset_handoff_nonces_for_tests() -> None:
 
 
 def _verify_handoff_payload(
-    payload: dict,
+    body_bytes: bytes,
+    signature_hex: str,
     signing_key: str,
     *,
     now: Optional[float] = None,
 ) -> bool:
     """Verify HMAC-SHA256 + replay window + nonce uniqueness on a handoff body.
 
-    Mirrors the canonicalization used by ``send_handoff``:
-        sig = hmac_sha256(signing_key, json.dumps(payload_without_signature,
-                                                  sort_keys=True))
+    The signature lives in the ``X-Handoff-Signature`` header (per H4), so the
+    verifier takes raw body bytes plus the header value rather than reading
+    ``signature`` out of the parsed JSON. The nonce and timestamp still live
+    inside the body so they're covered by the HMAC.
 
-    Returns True iff the payload is properly signed, recent (within
-    ``_HANDOFF_REPLAY_WINDOW_S``), and the nonce has not been seen.
+    Returns True iff the signature matches, the timestamp is within
+    ``_HANDOFF_REPLAY_WINDOW_S`` of ``now``, and the nonce hasn't been seen.
     """
-    if not isinstance(payload, dict):
+    if not isinstance(body_bytes, (bytes, bytearray)):
         return False
-    sig = payload.get("signature")
-    nonce = payload.get("nonce")
-    timestamp_str = payload.get("timestamp")
-    if not isinstance(sig, str) or not isinstance(nonce, str) or not isinstance(
-        timestamp_str, str
-    ):
+    if not isinstance(signature_hex, str) or not signature_hex:
+        return False
+
+    try:
+        body = json.loads(body_bytes)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(body, dict):
+        return False
+
+    nonce = body.get("nonce")
+    timestamp_str = body.get("timestamp")
+    if not isinstance(nonce, str) or not isinstance(timestamp_str, str):
         return False
 
     try:
@@ -484,10 +510,7 @@ def _verify_handoff_payload(
     if abs(current - ts.timestamp()) > _HANDOFF_REPLAY_WINDOW_S:
         return False
 
-    canonical = {k: v for k, v in payload.items() if k != "signature"}
-    body_bytes = json.dumps(canonical, sort_keys=True).encode("utf-8")
-    expected = hmac.new(signing_key.encode(), body_bytes, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig):
+    if not verify_handoff_signature(signing_key.encode(), bytes(body_bytes), signature_hex):
         return False
 
     _prune_handoff_nonces(current)
@@ -1958,8 +1981,8 @@ def _json_response_payload(value: object) -> object:
     return value
 
 
-def _format_charger_onboarding_response(charger: dict, password: str) -> dict:
-    """Build the public response shape, including one-time plaintext credential.
+def _format_charger_onboarding_first_response(charger: dict, password: str) -> dict:
+    """Build the first-response shape with the one-time plaintext credential.
 
     Wire format is snake_case to match the rest of the API surface; clients
     that need camelCase can rely on the API client's case transform.
@@ -1977,6 +2000,33 @@ def _format_charger_onboarding_response(charger: dict, password: str) -> dict:
             "scheme": "basic",
             "shown_once": True,
         },
+    }
+
+
+def _format_charger_onboarding_replay_response(charger: dict) -> dict:
+    """Build the replay-response shape — same as the first response minus the plaintext.
+
+    Security (H5): the idempotency record stores this payload (no password)
+    so a retry of the same Idempotency-Key never re-emits the credential.
+    """
+    return {
+        "charger": {
+            "id": charger["id"],
+            "display_name": charger["display_name"],
+            "depot_id": charger["depot_id"],
+            "ocpp_id": charger["ocpp_id"],
+        },
+        "credentials": {
+            "username": charger["ocpp_id"],
+            "scheme": "basic",
+            "shown_once": True,
+        },
+        "replayed": True,
+        "detail": (
+            "Credentials are returned exactly once. "
+            "Use POST /admin/depots/{depot_id}/chargers/{charger_id}/rotate_credentials "
+            "to obtain new credentials."
+        ),
     }
 
 
@@ -2800,10 +2850,16 @@ async def create_charger_onboarding(
                     if not hmac.compare_digest(existing["request_hash"], request_hash):
                         raise HTTPException(
                             status_code=status.HTTP_409_CONFLICT,
-                            detail="Idempotency-Key was already used with a different request body",
+                            detail=(
+                                "Idempotency-Key was already used with a different "
+                                "request body (error_code=IDEMPOTENCY_KEY_REUSED)"
+                            ),
                         )
+                    # Security (H5): the stored payload is the *replay* shape
+                    # (no plaintext password). Return it with 200 so clients
+                    # can distinguish a retry from a first-time creation.
                     return JSONResponse(
-                        status_code=int(existing["status_code"] or status.HTTP_201_CREATED),
+                        status_code=int(existing["status_code"] or status.HTTP_200_OK),
                         content=_json_response_payload(existing["response_json"]),
                     )
                 context = await db_queries.get_depot_org_slug_context(
@@ -2854,7 +2910,12 @@ async def create_charger_onboarding(
                 if charger is None:
                     raise RuntimeError("Could not create charger")
 
-                response_payload = _format_charger_onboarding_response(charger, password)
+                # Security (H5): the first response carries the plaintext
+                # password and is returned to the original caller; the
+                # idempotency store gets the *replay* receipt with no
+                # password so retries can never re-emit the credential.
+                first_response = _format_charger_onboarding_first_response(charger, password)
+                replay_response = _format_charger_onboarding_replay_response(charger)
                 await db_queries.store_charger_onboarding_idempotency(
                     conn,
                     organization_id=org_id,
@@ -2862,13 +2923,13 @@ async def create_charger_onboarding(
                     endpoint=endpoint,
                     idempotency_key=idempotency_key,
                     request_hash=request_hash,
-                    response_json=response_payload,
-                    status_code=status.HTTP_201_CREATED,
+                    response_json=replay_response,
+                    status_code=status.HTTP_200_OK,
                     ttl_minutes=30,
                 )
 
         _depot_config_cache.pop(depot_id, None)
-        return JSONResponse(status_code=status.HTTP_201_CREATED, content=response_payload)
+        return JSONResponse(status_code=status.HTTP_201_CREATED, content=first_response)
     except HTTPException:
         raise
     except asyncpg.UniqueViolationError as exc:
@@ -4470,35 +4531,52 @@ async def send_handoff(
             )
 
         # Call destination depot's receive endpoint (per PRD Section 5.4)
-        # Get destination depot endpoint from environment or config
+        # Security (H4): no localhost fallback. The destination must be
+        # configured per-depot or via DEFAULT_DEPOT_ENDPOINT. A missing
+        # endpoint is a config error, not a silent self-callback.
         dest_depot_endpoint = os.getenv(
             f"DEPOT_{request.dest_depot_id}_ENDPOINT",
-            os.getenv("DEFAULT_DEPOT_ENDPOINT", "http://localhost:8000"),
+            os.getenv("DEFAULT_DEPOT_ENDPOINT", ""),
         )
-        # Security (H4): require HTTPS for inter-depot communication
-        if _environment == "production" and dest_depot_endpoint.startswith("http://"):
-            logger.warning("Handoff to non-HTTPS endpoint blocked in production")
+        if not dest_depot_endpoint:
+            logger.error(
+                "Handoff destination endpoint not configured for depot=%s",
+                request.dest_depot_id,
+            )
             raise HTTPException(
-                status_code=400,
-                detail="Inter-depot handoff requires HTTPS in production",
+                status_code=503,
+                detail=(
+                    "Inter-depot handoff is unavailable: "
+                    "destination depot endpoint not configured "
+                    "(error_code=DEPOT_ENDPOINT_NOT_CONFIGURED)"
+                ),
             )
 
-        # Security (C2): HMAC signing key is mandatory. Without it the receive
-        # side will reject the request, so refuse here to surface the misconfig
-        # at the source rather than after a network round-trip.
+        # Security (H4): SSRF guard + DNS rebinding mitigation — validate once,
+        # connect to the pinned IP with Host/SNI from the original hostname.
+        receive_url = f"{dest_depot_endpoint}/depots/{request.dest_depot_id}/handoff/receive"
+        request_url, host_header, httpx_extensions = await prepare_handoff_http_target(
+            receive_url, _environment
+        )
+
+        # Security (C2/H4): HMAC signing key is mandatory in non-development
+        # environments. Without it the receive side fails closed, so refuse
+        # here to surface the misconfig at the source rather than after a
+        # network round-trip.
         signing_key = os.getenv("HANDOFF_SIGNING_KEY", "")
-        if not signing_key:
+        if not signing_key and _environment in {"production", "staging"}:
             logger.error("HANDOFF_SIGNING_KEY is not configured; refusing send_handoff")
             raise HTTPException(
                 status_code=503,
-                detail="Inter-depot handoff is unavailable: signing key not configured",
+                detail=(
+                    "Inter-depot handoff is unavailable: "
+                    "signing key not configured "
+                    "(error_code=HANDOFF_SIGNING_KEY_NOT_CONFIGURED)"
+                ),
             )
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                receive_url = (
-                    f"{dest_depot_endpoint}/depots/{request.dest_depot_id}/handoff/receive"
-                )
                 nonce = str(uuid4())
                 # Use timezone-aware UTC so the receiver's window check is
                 # unambiguous regardless of host clock representation.
@@ -4515,12 +4593,29 @@ async def send_handoff(
                     "nonce": nonce,
                     "timestamp": timestamp_str,
                 }
-                # Security (C2): HMAC-SHA256 signature for mutual auth.
-                payload_bytes = json.dumps(receive_payload, sort_keys=True).encode()
-                sig = hmac.new(signing_key.encode(), payload_bytes, hashlib.sha256).hexdigest()
-                receive_payload["signature"] = sig
+                # Security (H4): sign canonical body bytes; ship signature in
+                # the X-Handoff-Signature header so it stays out of the JSON
+                # body schema. ``sort_keys=True`` matches the receiver's
+                # canonicalisation rule.
+                payload_bytes = json.dumps(receive_payload, sort_keys=True).encode("utf-8")
+                headers: dict[str, str] = {}
+                if signing_key:
+                    headers["X-Handoff-Signature"] = compute_handoff_signature(
+                        signing_key.encode(), payload_bytes
+                    )
 
-                response = await client.post(receive_url, json=receive_payload)
+                post_kw: dict = {"content": payload_bytes}
+                if httpx_extensions:
+                    post_kw["extensions"] = httpx_extensions
+                response = await client.post(
+                    request_url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Host": host_header,
+                        **headers,
+                    },
+                    **post_kw,
+                )
                 response.raise_for_status()
                 ack_data = response.json()
 
@@ -4559,6 +4654,10 @@ async def send_handoff(
 
         return HandoffResponse(message_id=str(message_id), status="sent")
 
+    except HTTPException:
+        # Preserve status codes raised inside the body (e.g. SSRF guard 400,
+        # missing endpoint/key 503) — don't downgrade them to 500.
+        raise
     except asyncpg.PostgresError as e:
         logger.error(
             f"Database error sending handoff: {e}",
@@ -4660,7 +4759,6 @@ class HandoffReceiveResponse(BaseModel):
 )
 async def receive_handoff(
     depot_id: str,
-    request: HandoffReceiveRequest,
     http_request: Request,
     user: dict = Depends(ensure_tenant_mirrored),
 ):
@@ -4671,9 +4769,12 @@ async def receive_handoff(
     2. Stores message in interdepot_messages with status='acknowledged'
     3. Returns acknowledgment with acknowledged_at timestamp
 
-    Security (C2): the request body MUST carry an HMAC-SHA256 signature
-    keyed by ``HANDOFF_SIGNING_KEY``, plus a fresh ``nonce`` and ``timestamp``
-    within ``_HANDOFF_REPLAY_WINDOW_S`` of now. JWT auth alone is insufficient
+    Security (H4): the request MUST carry an HMAC-SHA256 signature in the
+    ``X-Handoff-Signature`` header. The signed body must include a fresh
+    ``nonce`` and ``timestamp`` within ``_HANDOFF_REPLAY_WINDOW_S`` of now.
+    In production/staging the signing key is required; in development we
+    log and continue if the header is absent so local dev tooling can
+    exercise the path without ceremony. JWT auth alone is insufficient
     because authenticated tenants would otherwise be able to inject handoff
     messages claiming any ``origin_depot_id``.
 
@@ -4682,44 +4783,90 @@ async def receive_handoff(
     if not db_pools:
         raise DatabaseError("Database not available")
 
-    # Validate UUIDs
+    # Validate depot_id early so the SSRF guard error is surfaced before any
+    # signature work. The body-level UUIDs are validated below after parsing.
     validate_depot_id(depot_id)
-    validate_depot_id(request.origin_depot_id)
-    validate_vehicle_id(request.vehicle_id)
 
-    # Security (C2): verify the inter-depot HMAC signature on the raw body.
-    # Without a configured signing key the endpoint must refuse.
-    signing_key = os.getenv("HANDOFF_SIGNING_KEY", "")
-    if not signing_key:
-        logger.error(
-            "HANDOFF_SIGNING_KEY is not configured; refusing handoff for depot=%s",
-            depot_id,
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="Inter-depot handoff is unavailable: signing key not configured",
-        )
-
+    # Security (H4): read raw body and signature header before parsing so we
+    # can verify the HMAC over the exact bytes the sender hashed.
     try:
         raw_body = await http_request.body()
-        body_dict = json.loads(raw_body) if raw_body else {}
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-    if not isinstance(body_dict, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    except Exception:  # pragma: no cover - starlette wraps recv errors
+        raise HTTPException(status_code=400, detail="Could not read request body")
 
-    if not _verify_handoff_payload(body_dict, signing_key):
-        peer = http_request.client.host if http_request.client else "unknown"
-        logger.warning(
-            "Handoff signature verification failed: depot=%s origin_claimed=%s peer=%s",
-            depot_id,
-            request.origin_depot_id,
-            peer,
-        )
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired handoff signature",
-        )
+    signing_key = os.getenv("HANDOFF_SIGNING_KEY", "")
+    signature_header = http_request.headers.get("X-Handoff-Signature", "")
+
+    if _environment in {"production", "staging"}:
+        if not signing_key:
+            logger.error(
+                "HANDOFF_SIGNING_KEY is not configured; refusing handoff for depot=%s",
+                depot_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Inter-depot handoff is unavailable: "
+                    "signing key not configured "
+                    "(error_code=HANDOFF_SIGNING_KEY_NOT_CONFIGURED)"
+                ),
+            )
+        if not signature_header:
+            peer = http_request.client.host if http_request.client else "unknown"
+            logger.warning(
+                "Handoff signature header missing: depot=%s peer=%s",
+                depot_id,
+                peer,
+            )
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Inter-depot handoff requires X-Handoff-Signature header "
+                    "(error_code=HANDOFF_SIGNATURE_REQUIRED)"
+                ),
+            )
+        if not _verify_handoff_payload(raw_body, signature_header, signing_key):
+            peer = http_request.client.host if http_request.client else "unknown"
+            logger.warning(
+                "Handoff signature verification failed: depot=%s peer=%s",
+                depot_id,
+                peer,
+            )
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Invalid or expired handoff signature "
+                    "(error_code=HANDOFF_SIGNATURE_INVALID)"
+                ),
+            )
+    else:
+        # Development: verify if the sender bothered to sign; otherwise warn.
+        if signature_header and signing_key:
+            if not _verify_handoff_payload(raw_body, signature_header, signing_key):
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "Invalid or expired handoff signature "
+                        "(error_code=HANDOFF_SIGNATURE_INVALID)"
+                    ),
+                )
+        else:
+            logger.warning(
+                "Handoff received without HMAC signature in development; "
+                "production/staging will require X-Handoff-Signature."
+            )
+
+    # Parse the body into the request schema only after signature verification
+    # so we never act on an unverified payload.
+    try:
+        request = HandoffReceiveRequest.model_validate_json(raw_body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.errors()) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}") from exc
+
+    validate_depot_id(request.origin_depot_id)
+    validate_vehicle_id(request.vehicle_id)
 
     await verify_depot_access(depot_id, user, db_pools.static)
 
@@ -4837,6 +4984,10 @@ async def receive_handoff(
             acknowledged_at=acknowledged_at,
         )
 
+    except HTTPException:
+        # Preserve any HTTP error raised inside the body (rate-limit 429, etc.)
+        # rather than masking it as a 500.
+        raise
     except asyncpg.PostgresError as e:
         logger.error(
             f"Database error receiving handoff: {e}",
