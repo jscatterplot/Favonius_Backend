@@ -31,6 +31,7 @@ from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from .forwarded_ip import extract_forwarded_ip, parse_ip_networks
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,13 @@ _DEFAULT_BLOCKED_COUNTRIES = ["RU", "CN", "BY"]
 
 # Default path to the MaxMind GeoLite2-Country database
 _DEFAULT_GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "/app/data/GeoLite2-Country.mmdb")
+
+# RFC 6598 carrier-grade NAT (CGNAT) shared address space. Not routable on the
+# public internet; used by Railway, Fly.io, Render, and other PaaS providers
+# for the internal network between their edge proxy and the application
+# container. Python's ipaddress module does NOT classify this as is_private,
+# so we treat it explicitly when deciding whether to trust forwarded headers.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 # Runtime download configuration. Build-time download lives in the Dockerfile;
 # this is the second-layer fallback used when the build-time download failed
@@ -455,6 +463,58 @@ def check_ip_blocked(ip_str: str) -> GeoBlockResult:
     return checker.check_ip(ip_str)
 
 
+# ============ Forwarded-IP helpers ============
+#
+# When the API runs behind a reverse proxy (Railway edge, Cloudflare, nginx,
+# the Lithuanian DSO firewall, etc.) the immediate TCP peer is the proxy, not
+# the real client. Geo-blocking decisions must be made against the real client
+# IP, so we extract it from RFC 7239 ``Forwarded`` or the de-facto standard
+# ``X-Forwarded-For`` / ``X-Real-IP`` headers — but only when the peer is
+# itself a trusted proxy. Trusting forwarded headers from arbitrary internet
+# peers would let attackers spoof their origin country.
+
+
+def _extract_forwarded_ip(headers: object) -> Optional[str]:
+    """Extract the original client IP from common reverse-proxy headers.
+
+    Order of precedence: RFC 7239 ``Forwarded`` > ``X-Forwarded-For`` >
+    ``X-Real-IP``. For ``X-Forwarded-For`` with multiple hops, the leftmost
+    valid IP is returned (that is the original client).
+    """
+    return extract_forwarded_ip(headers)
+
+
+def _parse_ip_networks(
+    ranges: str,
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parse a comma-separated list of CIDR ranges, ignoring invalid entries."""
+    return parse_ip_networks(
+        ranges,
+        logger=logger,
+        env_var_name="GEO_BLOCK_TRUSTED_PROXY_RANGES",
+    )
+
+
+def _is_implicitly_trusted_proxy(ip_str: str) -> bool:
+    """Return True when an IP is implicitly trusted to act as a reverse proxy.
+
+    Includes private (RFC 1918 / RFC 4193), loopback, link-local, and CGNAT
+    (RFC 6598) addresses. CGNAT is needed for Railway / Render / Fly.io and
+    similar PaaS providers whose edge proxy reaches the container over the
+    100.64.0.0/10 internal network. Public-internet IPs are never implicitly
+    trusted — operators must opt in via ``GEO_BLOCK_TRUSTED_PROXY_RANGES``.
+    """
+    try:
+        ip_addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local:
+        return True
+    if isinstance(ip_addr, ipaddress.IPv4Address) and ip_addr in _CGNAT_NETWORK:
+        return True
+    return False
+
+
 # ============ FastAPI Middleware ============
 
 
@@ -464,11 +524,59 @@ class GeoBlockMiddleware(BaseHTTPMiddleware):
     Returns a generic 403 Forbidden response for blocked IPs.
     Does not reveal geo-blocking logic in the response body.
     Logs blocked requests to the security audit log.
+
+    When the request arrives through a trusted reverse proxy, the real client
+    IP is extracted from ``Forwarded`` / ``X-Forwarded-For`` / ``X-Real-IP``
+    headers. A peer is considered a trusted proxy when (a) it is a private,
+    loopback, link-local, or CGNAT address and ``GEO_BLOCK_TRUST_PROXY_HEADERS``
+    is true (default), or (b) it is contained in any CIDR listed in
+    ``GEO_BLOCK_TRUSTED_PROXY_RANGES``.
+
+    Environment variables:
+        GEO_BLOCK_TRUST_PROXY_HEADERS: "true"/"false" (default "true").
+            When true, forwarded headers from private/loopback/link-local/CGNAT
+            peers are honoured. PaaS providers like Railway require this.
+        GEO_BLOCK_TRUSTED_PROXY_RANGES: Comma-separated CIDR list of additional
+            peers whose forwarded headers can be trusted (e.g. an on-prem load
+            balancer with a public IP).
     """
+
+    def __init__(self, app):
+        """Initialise middleware and load trusted-proxy configuration from env."""
+        super().__init__(app)
+        self._trust_proxy_headers = (
+            os.getenv("GEO_BLOCK_TRUST_PROXY_HEADERS", "true").lower() == "true"
+        )
+        self._trusted_proxy_networks = _parse_ip_networks(
+            os.getenv("GEO_BLOCK_TRUSTED_PROXY_RANGES", "")
+        )
+
+    def _is_trusted_proxy(self, peer_ip: str) -> bool:
+        """Return True when forwarded headers from this peer may be trusted."""
+        if self._trust_proxy_headers and _is_implicitly_trusted_proxy(peer_ip):
+            return True
+        try:
+            ip_addr = ipaddress.ip_address(peer_ip)
+        except ValueError:
+            return False
+        return any(
+            ip_addr.version == network.version and ip_addr in network
+            for network in self._trusted_proxy_networks
+        )
+
+    def _resolve_client_ip(self, request: Request) -> Optional[str]:
+        """Resolve the effective client IP, honouring trusted proxy headers."""
+        peer_ip = request.client.host if request.client else None
+        if not peer_ip:
+            return None
+        if not self._is_trusted_proxy(peer_ip):
+            return peer_ip
+        forwarded_ip = _extract_forwarded_ip(request.headers)
+        return forwarded_ip or peer_ip
 
     async def dispatch(self, request: Request, call_next):
         """Check geo-blocking before processing the request."""
-        client_ip = request.client.host if request.client else None
+        client_ip = self._resolve_client_ip(request)
 
         if client_ip:
             result = check_ip_blocked(client_ip)

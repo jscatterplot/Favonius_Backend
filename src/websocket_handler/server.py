@@ -17,6 +17,8 @@ import uvloop
 import websockets
 from websockets import WebSocketServerProtocol
 
+from src.security.forwarded_ip import extract_forwarded_ip, parse_ip_networks
+
 # V2X removed - out of scope for MVP per PRD Section 1.2
 from .cache_manager import CacheManager
 from .certificate_manager import CertificateManager
@@ -154,8 +156,10 @@ class OCPPWebSocketServer:
         self._ip_connection_count: dict[str, int] = defaultdict(int)
         self._max_connections_per_ip = int(os.getenv("MAX_CONNECTIONS_PER_IP", "10"))
         self._connection_client_ips: dict[str, str] = {}
-        self._trusted_proxy_networks = self._parse_ip_networks(
-            os.getenv("OCPP_TRUSTED_PROXY_RANGES", "")
+        self._trusted_proxy_networks = parse_ip_networks(
+            os.getenv("OCPP_TRUSTED_PROXY_RANGES", ""),
+            logger=logging.getLogger(__name__),
+            env_var_name="OCPP_TRUSTED_PROXY_RANGES",
         )
         self._trust_private_proxy_headers = (
             os.getenv("OCPP_TRUST_PRIVATE_PROXY_HEADERS", "true").lower() == "true"
@@ -346,64 +350,6 @@ class OCPPWebSocketServer:
         return None
 
     @staticmethod
-    def _parse_ip_networks(ranges: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-        """Parse comma-separated IP/CIDR ranges, ignoring invalid entries."""
-        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-        for raw_range in ranges.split(","):
-            raw_range = raw_range.strip()
-            if not raw_range:
-                continue
-            try:
-                networks.append(ipaddress.ip_network(raw_range, strict=False))
-            except ValueError:
-                logging.getLogger(__name__).warning(
-                    "Invalid OCPP_TRUSTED_PROXY_RANGES entry ignored: %s", raw_range
-                )
-        return networks
-
-    @staticmethod
-    def _normalize_forwarded_ip(raw_ip: str) -> Optional[str]:
-        """Normalize one forwarded IP candidate, stripping quotes, brackets, and ports."""
-        value = raw_ip.strip().strip('"')
-        if not value:
-            return None
-
-        if value.startswith("["):
-            host, separator, _port = value[1:].partition("]")
-            value = host if separator else value
-        elif value.count(":") == 1 and "." in value:
-            value = value.rsplit(":", 1)[0]
-
-        try:
-            return str(ipaddress.ip_address(value))
-        except ValueError:
-            return None
-
-    @classmethod
-    def _extract_forwarded_ip(cls, headers: Any) -> Optional[str]:
-        """Extract the original client IP from common reverse-proxy headers."""
-        if not hasattr(headers, "get"):
-            return None
-
-        forwarded = headers.get("Forwarded", "")
-        for proxy_hop in forwarded.split(","):
-            for item in proxy_hop.split(";"):
-                key, separator, value = item.strip().partition("=")
-                if separator and key.lower() == "for":
-                    parsed = cls._normalize_forwarded_ip(value)
-                    if parsed:
-                        return parsed
-
-        x_forwarded_for = headers.get("X-Forwarded-For", "")
-        for candidate in x_forwarded_for.split(","):
-            parsed = cls._normalize_forwarded_ip(candidate)
-            if parsed:
-                return parsed
-
-        x_real_ip = headers.get("X-Real-IP", "")
-        return cls._normalize_forwarded_ip(x_real_ip) if x_real_ip else None
-
-    @staticmethod
     def _get_peer_ip(websocket: WebSocketServerProtocol) -> str:
         """Return the direct TCP peer IP, or unknown when unavailable."""
         remote_address = getattr(websocket, "remote_address", None)
@@ -433,7 +379,7 @@ class OCPPWebSocketServer:
 
         request = getattr(websocket, "request", None)
         headers = getattr(request, "headers", {}) if request is not None else {}
-        forwarded_ip = self._extract_forwarded_ip(headers)
+        forwarded_ip = extract_forwarded_ip(headers)
         if forwarded_ip:
             self.logger.info(
                 "Using forwarded OCPP client IP %s from trusted proxy %s",

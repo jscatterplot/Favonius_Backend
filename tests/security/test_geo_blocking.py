@@ -534,6 +534,327 @@ class TestGeoBlockMiddleware:
         assert response.status_code == 200
 
 
+# ============ Tests: Forwarded-IP Helpers ============
+
+
+class TestForwardedIpHelpers:
+    """Test the pure helper functions used to extract real client IPs."""
+
+    def test_normalize_plain_ipv4(self):
+        from src.security.forwarded_ip import normalize_forwarded_ip
+
+        assert normalize_forwarded_ip("203.0.113.5") == "203.0.113.5"
+
+    def test_normalize_strips_quotes(self):
+        from src.security.forwarded_ip import normalize_forwarded_ip
+
+        assert normalize_forwarded_ip('"203.0.113.5"') == "203.0.113.5"
+
+    def test_normalize_strips_ipv4_port(self):
+        from src.security.forwarded_ip import normalize_forwarded_ip
+
+        assert normalize_forwarded_ip("203.0.113.5:54321") == "203.0.113.5"
+
+    def test_normalize_handles_bracketed_ipv6(self):
+        from src.security.forwarded_ip import normalize_forwarded_ip
+
+        assert normalize_forwarded_ip("[2001:db8::1]:443") == "2001:db8::1"
+
+    def test_normalize_returns_none_for_invalid(self):
+        from src.security.forwarded_ip import normalize_forwarded_ip
+
+        assert normalize_forwarded_ip("not-an-ip") is None
+        assert normalize_forwarded_ip("") is None
+        assert normalize_forwarded_ip("   ") is None
+
+    def test_extract_prefers_forwarded_header(self):
+        """RFC 7239 Forwarded header wins over X-Forwarded-For."""
+        from src.security.geo_block import _extract_forwarded_ip
+
+        headers = {
+            "Forwarded": 'for="203.0.113.5";proto=https',
+            "X-Forwarded-For": "198.51.100.7",
+        }
+        assert _extract_forwarded_ip(headers) == "203.0.113.5"
+
+    def test_extract_xff_picks_leftmost_valid(self):
+        """X-Forwarded-For: client, proxy1, proxy2 — leftmost is the real client."""
+        from src.security.geo_block import _extract_forwarded_ip
+
+        headers = {"X-Forwarded-For": "203.0.113.5, 100.64.0.2, 100.64.0.3"}
+        assert _extract_forwarded_ip(headers) == "203.0.113.5"
+
+    def test_extract_xff_skips_invalid_leading_entries(self):
+        from src.security.geo_block import _extract_forwarded_ip
+
+        headers = {"X-Forwarded-For": "garbage, 203.0.113.5"}
+        assert _extract_forwarded_ip(headers) == "203.0.113.5"
+
+    def test_extract_falls_back_to_xreal_ip(self):
+        from src.security.geo_block import _extract_forwarded_ip
+
+        headers = {"X-Real-IP": "203.0.113.5"}
+        assert _extract_forwarded_ip(headers) == "203.0.113.5"
+
+    def test_extract_returns_none_when_no_headers_present(self):
+        from src.security.geo_block import _extract_forwarded_ip
+
+        assert _extract_forwarded_ip({}) is None
+
+    def test_extract_returns_none_when_headers_lack_get(self):
+        from src.security.geo_block import _extract_forwarded_ip
+
+        assert _extract_forwarded_ip(object()) is None
+
+    def test_implicitly_trusted_includes_cgnat(self):
+        """Railway / Render / Fly.io use 100.64.0.0/10 between edge and container."""
+        from src.security.geo_block import _is_implicitly_trusted_proxy
+
+        assert _is_implicitly_trusted_proxy("100.64.0.2") is True
+        assert _is_implicitly_trusted_proxy("100.127.255.254") is True
+
+    def test_implicitly_trusted_includes_private(self):
+        from src.security.geo_block import _is_implicitly_trusted_proxy
+
+        assert _is_implicitly_trusted_proxy("10.0.0.1") is True
+        assert _is_implicitly_trusted_proxy("172.16.0.1") is True
+        assert _is_implicitly_trusted_proxy("192.168.1.1") is True
+        assert _is_implicitly_trusted_proxy("127.0.0.1") is True
+        assert _is_implicitly_trusted_proxy("::1") is True
+        assert _is_implicitly_trusted_proxy("fe80::1") is True
+
+    def test_implicitly_trusted_rejects_public(self):
+        """Real public-internet IPs must NOT be implicitly trusted as proxies.
+
+        Note: RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24,
+        203.0.113.0/24) are classified as is_private=True in Python's
+        ipaddress module, so they cannot be used here as "public" examples.
+        """
+        from src.security.geo_block import _is_implicitly_trusted_proxy
+
+        assert _is_implicitly_trusted_proxy("8.8.8.8") is False
+        assert _is_implicitly_trusted_proxy("93.184.216.34") is False  # example.com
+        assert _is_implicitly_trusted_proxy("18.196.90.141") is False  # AWS Frankfurt
+        assert _is_implicitly_trusted_proxy("not-an-ip") is False
+
+    def test_parse_ip_networks_skips_invalid(self):
+        from src.security.geo_block import _parse_ip_networks
+
+        nets = _parse_ip_networks("10.0.0.0/8, junk, 192.168.0.0/16, ")
+        assert len(nets) == 2
+        assert str(nets[0]) == "10.0.0.0/8"
+        assert str(nets[1]) == "192.168.0.0/16"
+
+
+# ============ Tests: Proxy Header Resolution in Middleware ============
+
+
+def _make_request(peer_ip: Optional[str], headers: Optional[dict] = None) -> MagicMock:
+    """Build a mock Starlette Request with a given peer IP and header dict."""
+    request = MagicMock()
+    if peer_ip is None:
+        request.client = None
+    else:
+        request.client = MagicMock()
+        request.client.host = peer_ip
+
+    class _Headers:
+        """Minimal stand-in supporting case-insensitive ``.get()``."""
+
+        def __init__(self, raw: dict):
+            self._raw = {k.lower(): v for k, v in raw.items()}
+
+        def get(self, key, default=""):
+            return self._raw.get(key.lower(), default)
+
+    request.headers = _Headers(headers or {})
+    request.url.path = "/admin/depots"
+    request.method = "POST"
+    return request
+
+
+class TestProxyHeaderResolution:
+    """End-to-end: middleware uses the real client IP behind a trusted proxy."""
+
+    @pytest.mark.asyncio
+    async def test_railway_cgnat_peer_uses_xff_real_ip(self):
+        """Reproduces the Railway production bug: peer is 100.64.x.x, XFF holds the real client.
+
+        The middleware MUST geo-check the real client IP from X-Forwarded-For,
+        not the CGNAT peer IP (which would always miss the GeoIP DB and fail
+        closed, blocking all legitimate Railway traffic).
+        """
+        from src.security.geo_block import GeoBlockMiddleware
+
+        request = _make_request(
+            peer_ip="100.64.0.2",
+            headers={"X-Forwarded-For": "18.196.90.141"},
+        )
+
+        captured: dict = {}
+
+        def fake_check(ip: str) -> GeoBlockResult:
+            captured["ip"] = ip
+            return GeoBlockResult(blocked=False, reason="allowed_country", ip=ip, country_code="DE")
+
+        async def call_next(_):
+            response = MagicMock()
+            response.status_code = 200
+            return response
+
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("GEO_BLOCK_TRUST_PROXY_HEADERS", "GEO_BLOCK_TRUSTED_PROXY_RANGES"):
+                os.environ.pop(key, None)
+            middleware = GeoBlockMiddleware(app=MagicMock())
+
+        with patch("src.security.geo_block.check_ip_blocked", side_effect=fake_check):
+            response = await middleware.dispatch(request, call_next)
+
+        assert captured["ip"] == "18.196.90.141"
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_xff_blocked_country_still_blocks_through_proxy(self):
+        """A blocked country in XFF must still produce a 403 even via a trusted proxy."""
+        from src.security.geo_block import GeoBlockMiddleware
+
+        request = _make_request(
+            peer_ip="100.64.0.2",
+            headers={"X-Forwarded-For": "93.184.216.34"},
+        )
+
+        blocked_result = GeoBlockResult(
+            blocked=True, reason="blocked_country", ip="93.184.216.34", country_code="RU"
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("GEO_BLOCK_TRUST_PROXY_HEADERS", "GEO_BLOCK_TRUSTED_PROXY_RANGES"):
+                os.environ.pop(key, None)
+            middleware = GeoBlockMiddleware(app=MagicMock())
+
+        with patch("src.security.geo_block.check_ip_blocked", return_value=blocked_result):
+            response = await middleware.dispatch(request, call_next=MagicMock())
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_untrusted_public_peer_does_not_honour_xff(self):
+        """An attacker spoofing X-Forwarded-For from the public internet must be ignored."""
+        from src.security.geo_block import GeoBlockMiddleware
+
+        request = _make_request(
+            peer_ip="93.184.216.34",  # public, untrusted
+            headers={"X-Forwarded-For": "8.8.8.8"},  # spoofed allowed-country IP
+        )
+
+        captured: dict = {}
+
+        def fake_check(ip: str) -> GeoBlockResult:
+            captured["ip"] = ip
+            return GeoBlockResult(blocked=True, reason="blocked_country", ip=ip, country_code="RU")
+
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("GEO_BLOCK_TRUST_PROXY_HEADERS", "GEO_BLOCK_TRUSTED_PROXY_RANGES"):
+                os.environ.pop(key, None)
+            middleware = GeoBlockMiddleware(app=MagicMock())
+
+        with patch("src.security.geo_block.check_ip_blocked", side_effect=fake_check):
+            response = await middleware.dispatch(request, call_next=MagicMock())
+
+        # We must check the peer, not the spoofed XFF
+        assert captured["ip"] == "93.184.216.34"
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_explicit_trusted_proxy_cidr_honours_xff(self):
+        """An on-prem load balancer with a public IP can be opted in via env var.
+
+        Uses a truly public peer IP (18.196.90.0/24 — AWS Frankfurt) so the
+        implicit-trust path cannot fire and the explicit CIDR opt-in is what
+        actually trusts the forwarded header.
+        """
+        from src.security.geo_block import GeoBlockMiddleware
+
+        request = _make_request(
+            peer_ip="18.196.90.141",
+            headers={"X-Forwarded-For": "8.8.4.4"},
+        )
+
+        captured: dict = {}
+
+        def fake_check(ip: str) -> GeoBlockResult:
+            captured["ip"] = ip
+            return GeoBlockResult(blocked=False, reason="allowed_country", ip=ip, country_code="US")
+
+        async def call_next(_):
+            response = MagicMock()
+            response.status_code = 200
+            return response
+
+        with patch.dict(
+            os.environ,
+            {"GEO_BLOCK_TRUSTED_PROXY_RANGES": "18.196.90.0/24"},
+        ):
+            middleware = GeoBlockMiddleware(app=MagicMock())
+
+        with patch("src.security.geo_block.check_ip_blocked", side_effect=fake_check):
+            response = await middleware.dispatch(request, call_next)
+
+        assert captured["ip"] == "8.8.4.4"
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_trust_proxy_headers_disabled_uses_peer_ip(self):
+        """When the operator disables proxy trust, even private peers fall back to the peer IP."""
+        from src.security.geo_block import GeoBlockMiddleware
+
+        request = _make_request(
+            peer_ip="100.64.0.2",
+            headers={"X-Forwarded-For": "18.196.90.141"},
+        )
+
+        captured: dict = {}
+
+        def fake_check(ip: str) -> GeoBlockResult:
+            captured["ip"] = ip
+            return GeoBlockResult(blocked=True, reason="country_unknown_fail_closed", ip=ip)
+
+        with patch.dict(
+            os.environ,
+            {"GEO_BLOCK_TRUST_PROXY_HEADERS": "false", "GEO_BLOCK_TRUSTED_PROXY_RANGES": ""},
+        ):
+            middleware = GeoBlockMiddleware(app=MagicMock())
+
+        with patch("src.security.geo_block.check_ip_blocked", side_effect=fake_check):
+            response = await middleware.dispatch(request, call_next=MagicMock())
+
+        assert captured["ip"] == "100.64.0.2"
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_trusted_peer_without_xff_falls_back_to_peer_ip(self):
+        """If a trusted proxy forgets X-Forwarded-For, fall back to the peer IP (then geo-check it)."""
+        from src.security.geo_block import GeoBlockMiddleware
+
+        request = _make_request(peer_ip="100.64.0.2", headers={})
+
+        captured: dict = {}
+
+        def fake_check(ip: str) -> GeoBlockResult:
+            captured["ip"] = ip
+            return GeoBlockResult(blocked=True, reason="country_unknown_fail_closed", ip=ip)
+
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("GEO_BLOCK_TRUST_PROXY_HEADERS", "GEO_BLOCK_TRUSTED_PROXY_RANGES"):
+                os.environ.pop(key, None)
+            middleware = GeoBlockMiddleware(app=MagicMock())
+
+        with patch("src.security.geo_block.check_ip_blocked", side_effect=fake_check):
+            await middleware.dispatch(request, call_next=MagicMock())
+
+        assert captured["ip"] == "100.64.0.2"
+
+
 # ============ Tests: Runtime DB Download ============
 
 
@@ -602,9 +923,7 @@ class TestRuntimeDownload:
         db_path = tmp_path / "GeoLite2-Country.mmdb"
         db_path.write_bytes(b"existing-db-bytes")
         with patch("src.security.geo_block.urllib.request.urlopen") as mock_open:
-            assert (
-                _download_geoip_db(str(db_path), license_key="key", account_id="acct") is True
-            )
+            assert _download_geoip_db(str(db_path), license_key="key", account_id="acct") is True
             mock_open.assert_not_called()
 
     def test_successful_download_writes_mmdb(self, tmp_path):
@@ -616,9 +935,7 @@ class TestRuntimeDownload:
             return _FakeUrlopenResponse(archive)
 
         with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
-            assert (
-                _download_geoip_db(db_path, license_key="real-key", account_id="acct") is True
-            )
+            assert _download_geoip_db(db_path, license_key="real-key", account_id="acct") is True
 
         assert os.path.exists(db_path)
         with open(db_path, "rb") as f:
@@ -783,9 +1100,7 @@ class TestRuntimeDownload:
             raise urllib.error.URLError("would corrupt existing DB if called")
 
         with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
-            assert (
-                _download_geoip_db(str(db_path), license_key="key", account_id="acct") is True
-            )
+            assert _download_geoip_db(str(db_path), license_key="key", account_id="acct") is True
 
         assert db_path.read_bytes() == b"original-mmdb"
 
@@ -836,9 +1151,7 @@ class TestCheckerWiresRuntimeDownload:
             GeoBlockChecker(config)
             mock_dl.assert_not_called()
 
-    def test_checker_skips_runtime_download_when_no_account_id(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    def test_checker_skips_runtime_download_when_no_account_id(self, tmp_path, monkeypatch, caplog):
         """License key set but no account ID → download skipped + WARNING logged."""
         import logging
 
