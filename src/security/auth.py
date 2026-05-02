@@ -7,7 +7,10 @@ Environment variables:
     JWT_SECRET_KEY: Current Supabase JWT secret
     JWT_SECRET_KEY_PREVIOUS: Previous key (valid during rotation window)
     JWT_ALGORITHM: Signing algorithm (default HS256) — must be in allowlist
-    JWT_ISSUER: Expected token issuer (optional, e.g. Supabase project URL)
+    JWT_ISSUER: Expected token issuer. If unset and ``SUPABASE_URL`` is
+        configured, it is auto-derived as ``f"{SUPABASE_URL}/auth/v1"``
+        (the issuer Supabase Auth emits by default). Set explicitly to
+        override (e.g. for non-Supabase IDPs).
 """
 
 from __future__ import annotations
@@ -34,10 +37,25 @@ if JWT_ALGORITHM not in _ALLOWED_ALGORITHMS:
         "the allowlist and verification key type accordingly."
     )
 
-# Optional issuer validation (set to your Supabase project URL)
-JWT_ISSUER: Optional[str] = os.getenv("JWT_ISSUER")
-
 security = HTTPBearer()
+
+
+def _get_jwt_issuer() -> Optional[str]:
+    """Resolve the expected JWT issuer.
+
+    Priority:
+      1. ``JWT_ISSUER`` env var (explicit override).
+      2. ``SUPABASE_URL`` env var → derive ``f"{url}/auth/v1"``
+         (the ``iss`` claim Supabase Auth/GoTrue emits).
+      3. ``None`` — issuer check skipped.
+    """
+    explicit = os.getenv("JWT_ISSUER")
+    if explicit:
+        return explicit
+    supabase_url = os.getenv("SUPABASE_URL")
+    if supabase_url:
+        return f"{supabase_url.rstrip('/')}/auth/v1"
+    return None
 
 
 def _get_jwt_secrets() -> list[str]:
@@ -89,8 +107,9 @@ async def verify_token(
         "algorithms": _ALLOWED_ALGORITHMS,
         "audience": "authenticated",
     }
-    if JWT_ISSUER:
-        decode_kwargs["issuer"] = JWT_ISSUER
+    issuer = _get_jwt_issuer()
+    if issuer:
+        decode_kwargs["issuer"] = issuer
 
     for secret in secrets:
         try:

@@ -20,6 +20,7 @@ import pytest
 from fastapi import HTTPException
 
 from src.security.auth import (
+    _get_jwt_issuer,
     _get_jwt_secrets,
     get_user_id,
     get_user_role,
@@ -152,6 +153,114 @@ class TestVerifyToken:
             with pytest.raises(HTTPException) as exc_info:
                 await verify_token(creds)
             assert exc_info.value.status_code == 401
+
+
+class TestJwtIssuerResolution:
+    """Test issuer resolution: explicit JWT_ISSUER > derived from SUPABASE_URL > None."""
+
+    def test_explicit_issuer_wins(self):
+        """JWT_ISSUER takes precedence over SUPABASE_URL."""
+        env = {
+            "JWT_ISSUER": "https://explicit.example/auth/v1",
+            "SUPABASE_URL": "https://derived.supabase.co",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            assert _get_jwt_issuer() == "https://explicit.example/auth/v1"
+
+    def test_derived_from_supabase_url(self):
+        """Derives ``<SUPABASE_URL>/auth/v1`` when JWT_ISSUER is unset."""
+        with patch.dict(os.environ, {"SUPABASE_URL": "https://abc.supabase.co"}, clear=False):
+            os.environ.pop("JWT_ISSUER", None)
+            assert _get_jwt_issuer() == "https://abc.supabase.co/auth/v1"
+
+    def test_derived_strips_trailing_slash(self):
+        """Trailing slash on SUPABASE_URL is normalized."""
+        with patch.dict(os.environ, {"SUPABASE_URL": "https://abc.supabase.co/"}, clear=False):
+            os.environ.pop("JWT_ISSUER", None)
+            assert _get_jwt_issuer() == "https://abc.supabase.co/auth/v1"
+
+    def test_returns_none_when_neither_set(self):
+        """Returns None when both env vars are absent (issuer check skipped)."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JWT_ISSUER", None)
+            os.environ.pop("SUPABASE_URL", None)
+            assert _get_jwt_issuer() is None
+
+    @pytest.mark.asyncio
+    async def test_token_with_wrong_issuer_rejected(self):
+        """A token whose ``iss`` claim does not match the derived issuer is rejected."""
+        from unittest.mock import MagicMock
+
+        secret = "issuer_test_secret"
+        payload = {
+            "sub": "user-uuid-123",
+            "aud": "authenticated",
+            "exp": int(time.time()) + 3600,
+            "iss": "https://attacker.example/auth/v1",
+        }
+        token = jwt.encode(payload, secret, algorithm="HS256")
+        creds = MagicMock()
+        creds.credentials = token
+
+        env = {
+            "JWT_SECRET_KEY": secret,
+            "SUPABASE_URL": "https://legit.supabase.co",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("JWT_SECRET_KEY_PREVIOUS", None)
+            os.environ.pop("JWT_ISSUER", None)
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_token(creds)
+            assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_token_with_matching_derived_issuer_accepted(self):
+        """A token with the Supabase-shaped ``iss`` claim verifies against the derived issuer."""
+        from unittest.mock import MagicMock
+
+        secret = "issuer_test_secret"
+        payload = {
+            "sub": "user-uuid-123",
+            "aud": "authenticated",
+            "exp": int(time.time()) + 3600,
+            "iss": "https://legit.supabase.co/auth/v1",
+        }
+        token = jwt.encode(payload, secret, algorithm="HS256")
+        creds = MagicMock()
+        creds.credentials = token
+
+        env = {
+            "JWT_SECRET_KEY": secret,
+            "SUPABASE_URL": "https://legit.supabase.co",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("JWT_SECRET_KEY_PREVIOUS", None)
+            os.environ.pop("JWT_ISSUER", None)
+            decoded = await verify_token(creds)
+            assert decoded["sub"] == "user-uuid-123"
+
+    @pytest.mark.asyncio
+    async def test_token_without_iss_accepted_when_no_issuer_configured(self):
+        """When neither JWT_ISSUER nor SUPABASE_URL is set, ``iss`` is not checked."""
+        from unittest.mock import MagicMock
+
+        secret = "issuer_test_secret"
+        payload = {
+            "sub": "user-uuid-123",
+            "aud": "authenticated",
+            "exp": int(time.time()) + 3600,
+        }
+        token = jwt.encode(payload, secret, algorithm="HS256")
+        creds = MagicMock()
+        creds.credentials = token
+
+        env = {"JWT_SECRET_KEY": secret}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("JWT_SECRET_KEY_PREVIOUS", None)
+            os.environ.pop("JWT_ISSUER", None)
+            os.environ.pop("SUPABASE_URL", None)
+            decoded = await verify_token(creds)
+            assert decoded["sub"] == "user-uuid-123"
 
 
 class TestUserHelpers:
