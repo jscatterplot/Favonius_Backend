@@ -1989,11 +1989,17 @@ async def _audit_identity_write(user: dict, depot_id: str, action: str, resource
     )
 
 
-async def _build_readiness_checklist(depot_id: str, payload: DepotSetupPayload) -> list[dict]:
+async def _build_readiness_checklist(
+    depot_id: str,
+    payload: DepotSetupPayload,
+    *,
+    conn: Optional[asyncpg.Connection] = None,
+) -> list[dict]:
     """Build exact setup readiness checklist for optimization prerequisites."""
     return await _build_depot_readiness_checklist(
         depot_id,
         battery_present=payload.stationary_battery.present,
+        conn=conn,
     )
 
 
@@ -2001,6 +2007,7 @@ async def _build_depot_readiness_checklist(
     depot_id: str,
     *,
     battery_present: Optional[bool] = None,
+    conn: Optional[asyncpg.Connection] = None,
 ) -> list[dict]:
     """Build persisted depot readiness checklist for setup and schedule screens."""
     if not db_pools:
@@ -2009,19 +2016,21 @@ async def _build_depot_readiness_checklist(
     if battery_present is None:
         battery_present = False
 
-    async with db_pools.static.acquire() as conn:
+    async def _static_depot_readiness(
+        static_conn: asyncpg.Connection,
+    ) -> tuple[bool, bool, str, bool, bool, bool]:
         has_vehicles = bool(
-            await conn.fetchval(
+            await static_conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vehicles WHERE depot_id = $1::uuid)", depot_id
             )
         )
         has_chargers = bool(
-            await conn.fetchval(
+            await static_conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id
             )
         )
         access_default = (
-            await conn.fetchval(
+            await static_conn.fetchval(
                 "SELECT charger_vehicle_access_default FROM depots WHERE depot_id = $1::uuid",
                 depot_id,
             )
@@ -2029,7 +2038,7 @@ async def _build_depot_readiness_checklist(
         has_access = False
         if access_default != "all_to_all":
             has_access = bool(
-                await conn.fetchval(
+                await static_conn.fetchval(
                     """
                     SELECT EXISTS(
                         SELECT 1
@@ -2042,7 +2051,7 @@ async def _build_depot_readiness_checklist(
                 )
             )
         has_schedules = bool(
-            await conn.fetchval(
+            await static_conn.fetchval(
                 """
                 SELECT EXISTS(
                     SELECT 1
@@ -2055,11 +2064,32 @@ async def _build_depot_readiness_checklist(
             )
         )
         has_battery = bool(
-            await conn.fetchval(
+            await static_conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM battery_storage WHERE depot_id = $1::uuid)",
                 depot_id,
             )
         )
+        return has_vehicles, has_chargers, access_default, has_access, has_schedules, has_battery
+
+    if conn is not None:
+        (
+            has_vehicles,
+            has_chargers,
+            access_default,
+            has_access,
+            has_schedules,
+            has_battery,
+        ) = await _static_depot_readiness(conn)
+    else:
+        async with db_pools.static.acquire() as acquired:
+            (
+                has_vehicles,
+                has_chargers,
+                access_default,
+                has_access,
+                has_schedules,
+                has_battery,
+            ) = await _static_depot_readiness(acquired)
 
     has_prices = False
     has_building_load = False
@@ -3103,7 +3133,9 @@ async def _depot_setup_endpoint(
             created = await _create_depot_for_org(
                 organization_id=org_id, request=request, conn=conn
             )
-            readiness = await _build_readiness_checklist(created["depot_id"], request.depot)
+            readiness = await _build_readiness_checklist(
+                created["depot_id"], request.depot, conn=conn
+            )
             response_payload = {
                 "depot": {
                     "id": created["depot_id"],
