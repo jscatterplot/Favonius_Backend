@@ -2094,9 +2094,9 @@ async def _build_depot_readiness_checklist(
     has_prices = False
     has_building_load = False
     if db_pools.ts is not None:
-        async with db_pools.ts.acquire() as conn:
+        async with db_pools.ts.acquire() as ts_conn:
             has_prices = bool(
-                await conn.fetchval(
+                await ts_conn.fetchval(
                     """
                     SELECT EXISTS(
                         SELECT 1 FROM prices
@@ -2107,7 +2107,7 @@ async def _build_depot_readiness_checklist(
                 )
             )
             has_building_load = bool(
-                await conn.fetchval(
+                await ts_conn.fetchval(
                     """
                     SELECT EXISTS(
                         SELECT 1 FROM building_load
