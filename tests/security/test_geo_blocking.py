@@ -541,31 +541,31 @@ class TestForwardedIpHelpers:
     """Test the pure helper functions used to extract real client IPs."""
 
     def test_normalize_plain_ipv4(self):
-        from src.security.geo_block import _normalize_forwarded_ip
+        from src.security.forwarded_ip import normalize_forwarded_ip
 
-        assert _normalize_forwarded_ip("203.0.113.5") == "203.0.113.5"
+        assert normalize_forwarded_ip("203.0.113.5") == "203.0.113.5"
 
     def test_normalize_strips_quotes(self):
-        from src.security.geo_block import _normalize_forwarded_ip
+        from src.security.forwarded_ip import normalize_forwarded_ip
 
-        assert _normalize_forwarded_ip('"203.0.113.5"') == "203.0.113.5"
+        assert normalize_forwarded_ip('"203.0.113.5"') == "203.0.113.5"
 
     def test_normalize_strips_ipv4_port(self):
-        from src.security.geo_block import _normalize_forwarded_ip
+        from src.security.forwarded_ip import normalize_forwarded_ip
 
-        assert _normalize_forwarded_ip("203.0.113.5:54321") == "203.0.113.5"
+        assert normalize_forwarded_ip("203.0.113.5:54321") == "203.0.113.5"
 
     def test_normalize_handles_bracketed_ipv6(self):
-        from src.security.geo_block import _normalize_forwarded_ip
+        from src.security.forwarded_ip import normalize_forwarded_ip
 
-        assert _normalize_forwarded_ip("[2001:db8::1]:443") == "2001:db8::1"
+        assert normalize_forwarded_ip("[2001:db8::1]:443") == "2001:db8::1"
 
     def test_normalize_returns_none_for_invalid(self):
-        from src.security.geo_block import _normalize_forwarded_ip
+        from src.security.forwarded_ip import normalize_forwarded_ip
 
-        assert _normalize_forwarded_ip("not-an-ip") is None
-        assert _normalize_forwarded_ip("") is None
-        assert _normalize_forwarded_ip("   ") is None
+        assert normalize_forwarded_ip("not-an-ip") is None
+        assert normalize_forwarded_ip("") is None
+        assert normalize_forwarded_ip("   ") is None
 
     def test_extract_prefers_forwarded_header(self):
         """RFC 7239 Forwarded header wins over X-Forwarded-For."""

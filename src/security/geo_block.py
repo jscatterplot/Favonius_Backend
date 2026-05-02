@@ -31,7 +31,7 @@ from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from .forwarded_ip import extract_forwarded_ip, normalize_forwarded_ip, parse_ip_networks
+from .forwarded_ip import extract_forwarded_ip, parse_ip_networks
 
 logger = logging.getLogger(__name__)
 
@@ -472,15 +472,6 @@ def check_ip_blocked(ip_str: str) -> GeoBlockResult:
 # ``X-Forwarded-For`` / ``X-Real-IP`` headers — but only when the peer is
 # itself a trusted proxy. Trusting forwarded headers from arbitrary internet
 # peers would let attackers spoof their origin country.
-
-
-def _normalize_forwarded_ip(raw_ip: str) -> Optional[str]:
-    """Normalize one forwarded IP candidate, stripping quotes, brackets, ports.
-
-    Returns the canonical IP string, or ``None`` if the value cannot be parsed
-    as an IPv4 / IPv6 address.
-    """
-    return normalize_forwarded_ip(raw_ip)
 
 
 def _extract_forwarded_ip(headers: object) -> Optional[str]:
