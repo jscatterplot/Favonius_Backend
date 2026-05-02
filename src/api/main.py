@@ -24,7 +24,6 @@ from zoneinfo import ZoneInfo
 import asyncpg
 import bcrypt
 import httpx
-import jwt
 from fastapi import (
     Depends,
     FastAPI,
@@ -572,7 +571,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 sub = payload.get("sub")
                 if sub:
                     client_id = f"user:{sub}"
-            except jwt.ExpiredSignatureError:
+            except _jwt.ExpiredSignatureError:
                 logger.debug("Rate limit: expired token, falling back to IP")
             except Exception:
                 pass  # Invalid/tampered/missing claims — fall back to IP-based limiting
