@@ -1309,7 +1309,12 @@ class StateAssembler:
         if not depot_row:
             raise ValueError(f"Depot {depot_id_str} not found")
 
-        max_site_power = float(depot_row["max_grid_kw"])
+        raw_max_grid_kw = depot_row["max_grid_kw"]
+        if raw_max_grid_kw is None:
+            raise ValueError(
+                f"Depot {depot_id_str} has NULL max_grid_kw; set sites.max_grid_kw before optimization"
+            )
+        max_site_power = float(raw_max_grid_kw)
         building_load_assumption_kw = float(depot_row["building_load_assumption_kw"])
         access_default = str(depot_row["charger_vehicle_access_default"])
         tariff_type = str(depot_row["tariff_type"])
