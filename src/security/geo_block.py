@@ -559,7 +559,10 @@ class GeoBlockMiddleware(BaseHTTPMiddleware):
             ip_addr = ipaddress.ip_address(peer_ip)
         except ValueError:
             return False
-        return any(ip_addr in network for network in self._trusted_proxy_networks)
+        return any(
+            ip_addr.version == network.version and ip_addr in network
+            for network in self._trusted_proxy_networks
+        )
 
     def _resolve_client_ip(self, request: Request) -> Optional[str]:
         """Resolve the effective client IP, honouring trusted proxy headers."""
