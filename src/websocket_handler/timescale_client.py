@@ -1840,8 +1840,8 @@ class TimescaleClient:
                 await conn.fetchval(
                     """
                     SELECT COALESCE(auth_required, FALSE)
-                    FROM chargers
-                    WHERE ocpp_id = $1
+                    FROM charging_stations
+                    WHERE station_id = $1
                     """,
                     station_id,
                 )
@@ -1878,14 +1878,14 @@ class TimescaleClient:
             params: list[Any] = [id_tag]
             if station_id is not None:
                 station_filter = (
-                    "AND EXISTS (SELECT 1 FROM chargers c "
-                    "WHERE c.ocpp_id = $2 AND c.depot_id = v.depot_id)"
+                    "AND EXISTS (SELECT 1 FROM charging_stations c "
+                    "WHERE c.station_id = $2 AND c.site_id = v.site_id)"
                 )
                 params.append(station_id)
             rows = await conn.fetch(
                 f"""
-                SELECT v.vehicle_id::text AS vehicle_id,
-                       v.depot_id::text AS depot_id,
+                SELECT v.id::text AS vehicle_id,
+                       v.site_id::text AS depot_id,
                        NULL::text AS driver_id,
                        NULL::text AS card_id,
                        'vehicle'::text AS source
@@ -1910,20 +1910,20 @@ class TimescaleClient:
             params = [id_tag]
             if station_id is not None:
                 card_filter = (
-                    "AND EXISTS (SELECT 1 FROM chargers ch "
-                    "WHERE ch.ocpp_id = $2 AND ch.depot_id = c.depot_id)"
+                    "AND EXISTS (SELECT 1 FROM charging_stations ch "
+                    "WHERE ch.station_id = $2 AND ch.site_id = c.site_id)"
                 )
                 params.append(station_id)
             rows = await conn.fetch(
                 f"""
-                SELECT c.card_id::text AS card_id,
-                       c.depot_id::text AS depot_id,
+                SELECT c.id::text AS card_id,
+                       c.site_id::text AS depot_id,
                        (
                            SELECT cva.vehicle_id::text
                            FROM rfid_card_vehicle_assignments cva
-                           JOIN vehicles v ON v.vehicle_id = cva.vehicle_id
-                           WHERE cva.card_id = c.card_id
-                             AND v.depot_id = c.depot_id
+                           JOIN vehicles v ON v.id = cva.vehicle_id
+                           WHERE cva.card_id = c.id
+                             AND v.site_id = c.site_id
                              AND COALESCE(v.status, 'active') = 'active'
                            ORDER BY v.external_id
                            LIMIT 1
@@ -1931,9 +1931,9 @@ class TimescaleClient:
                        (
                            SELECT cda.driver_id::text
                            FROM rfid_card_driver_assignments cda
-                           JOIN drivers dr ON dr.driver_id = cda.driver_id
-                           WHERE cda.card_id = c.card_id
-                             AND dr.depot_id = c.depot_id
+                           JOIN drivers dr ON dr.id = cda.driver_id
+                           WHERE cda.card_id = c.id
+                             AND dr.site_id = c.site_id
                              AND dr.status = 'active'
                            ORDER BY dr.display_name
                            LIMIT 1

@@ -1234,7 +1234,7 @@ class StateAssembler:
             vehicle_ids = [str(row["vehicle_id"]) for row in rows]
             async with self.pools.static.acquire() as conn:
                 ext_rows = await conn.fetch(
-                    "SELECT vehicle_id::text, external_id FROM vehicles WHERE vehicle_id = ANY($1::uuid[])",
+                    "SELECT id::text AS vehicle_id, external_id FROM vehicles WHERE id = ANY($1::uuid[])",
                     vehicle_ids,
                 )
             external_id_map = {r["vehicle_id"]: r["external_id"] for r in ext_rows}
