@@ -14,7 +14,9 @@ Tests cover:
 
 from __future__ import annotations
 
+import io
 import os
+import urllib.error
 from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock, patch
@@ -26,9 +28,9 @@ from src.security.geo_block import (
     GeoBlockConfig,
     GeoBlockMiddleware,
     GeoBlockResult,
+    _download_geoip_db,
     check_ip_blocked,
 )
-
 
 # ============ Fixtures ============
 
@@ -292,9 +294,7 @@ class TestPrivateIPs:
             "fe80::1",
         ],
     )
-    def test_private_and_loopback_always_allowed(
-        self, checker_with_mock: GeoBlockChecker, ip: str
-    ):
+    def test_private_and_loopback_always_allowed(self, checker_with_mock: GeoBlockChecker, ip: str):
         """Private, loopback, and link-local IPs bypass geo-blocking."""
         result = checker_with_mock.check_ip(ip)
         assert result.blocked is False
@@ -397,7 +397,9 @@ class TestGeoBlockResult:
 
     def test_blocked_result(self):
         """Blocked result has correct fields."""
-        result = GeoBlockResult(blocked=True, reason="blocked_country", ip="1.2.3.4", country_code="RU")
+        result = GeoBlockResult(
+            blocked=True, reason="blocked_country", ip="1.2.3.4", country_code="RU"
+        )
         assert result.blocked is True
         assert result.reason == "blocked_country"
         assert result.ip == "1.2.3.4"
@@ -405,7 +407,9 @@ class TestGeoBlockResult:
 
     def test_allowed_result(self):
         """Allowed result has correct fields."""
-        result = GeoBlockResult(blocked=False, reason="allowed_country", ip="1.2.3.4", country_code="US")
+        result = GeoBlockResult(
+            blocked=False, reason="allowed_country", ip="1.2.3.4", country_code="US"
+        )
         assert result.blocked is False
         assert result.country_code == "US"
 
@@ -528,3 +532,264 @@ class TestGeoBlockMiddleware:
         middleware = GeoBlockMiddleware(app=MagicMock())
         response = await middleware.dispatch(mock_request, call_next=mock_call_next)
         assert response.status_code == 200
+
+
+# ============ Tests: Runtime DB Download ============
+
+
+def _build_mmdb_tarball(
+    mmdb_bytes: bytes, *, mmdb_name: str = "GeoLite2-Country_20260101/GeoLite2-Country.mmdb"
+) -> bytes:
+    """Build an in-memory tar.gz archive containing a fake mmdb file."""
+    import gzip
+    import io
+    import tarfile
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        info = tarfile.TarInfo(name=mmdb_name)
+        info.size = len(mmdb_bytes)
+        tar.addfile(info, io.BytesIO(mmdb_bytes))
+    return gzip.compress(raw.getvalue())
+
+
+class _FakeUrlopenResponse:
+    """Context-managed stand-in for urllib.request.urlopen()'s return value."""
+
+    def __init__(self, body: bytes, *, status: int = 200, reason: str = "OK"):
+        self._body = io.BytesIO(body) if isinstance(body, bytes) else body
+        self.status = status
+        self.reason = reason
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._body.close()
+        return False
+
+    def read(self, *args, **kwargs):
+        return self._body.read(*args, **kwargs)
+
+
+class TestRuntimeDownload:
+    """Tests for the runtime fallback download path in geo_block.py."""
+
+    def test_returns_false_when_license_key_empty(self, tmp_path):
+        """No license key is a no-op — returns False, no network call."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        with patch("src.security.geo_block.urllib.request.urlopen") as mock_open:
+            assert _download_geoip_db(db_path, license_key="") is False
+            mock_open.assert_not_called()
+        assert not os.path.exists(db_path)
+
+    def test_returns_true_when_db_already_exists(self, tmp_path):
+        """Idempotent: existing non-empty DB short-circuits download."""
+        db_path = tmp_path / "GeoLite2-Country.mmdb"
+        db_path.write_bytes(b"existing-db-bytes")
+        with patch("src.security.geo_block.urllib.request.urlopen") as mock_open:
+            assert _download_geoip_db(str(db_path), license_key="key") is True
+            mock_open.assert_not_called()
+
+    def test_successful_download_writes_mmdb(self, tmp_path):
+        """Happy path — tarball is fetched, mmdb extracted to db_path."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        archive = _build_mmdb_tarball(b"FAKE_MMDB_BYTES")
+
+        def fake_urlopen(url, timeout):  # noqa: ARG001
+            return _FakeUrlopenResponse(archive)
+
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            assert _download_geoip_db(db_path, license_key="real-key") is True
+
+        assert os.path.exists(db_path)
+        with open(db_path, "rb") as f:
+            assert f.read() == b"FAKE_MMDB_BYTES"
+
+    def test_retries_on_transient_http_error_then_succeeds(self, tmp_path):
+        """First attempt raises, second succeeds — DB written, sleep called once."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        archive = _build_mmdb_tarball(b"OK")
+        attempts = {"n": 0}
+
+        def fake_urlopen(url, timeout):  # noqa: ARG001
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise urllib.error.URLError("connection refused")
+            return _FakeUrlopenResponse(archive)
+
+        sleep_calls: list[float] = []
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            assert (
+                _download_geoip_db(
+                    db_path,
+                    license_key="key",
+                    retries=2,
+                    backoff_s=0.01,
+                    sleep=sleep_calls.append,
+                )
+                is True
+            )
+
+        assert attempts["n"] == 2
+        assert sleep_calls == [0.01]
+        assert os.path.exists(db_path)
+
+    def test_returns_false_when_response_not_gzip(self, tmp_path):
+        """Rate-limit page (non-gzip body) → all attempts fail, no DB written."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+
+        def fake_urlopen(url, timeout):  # noqa: ARG001
+            return _FakeUrlopenResponse(b"<html>rate limited</html>")
+
+        sleep_calls: list[float] = []
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = _download_geoip_db(
+                db_path,
+                license_key="key",
+                retries=2,
+                backoff_s=0.01,
+                sleep=sleep_calls.append,
+            )
+
+        assert result is False
+        assert not os.path.exists(db_path)
+        # 2 retries means 3 total attempts → 2 sleeps between them
+        assert len(sleep_calls) == 2
+
+    def test_returns_false_when_archive_missing_mmdb_member(self, tmp_path):
+        """Tarball without GeoLite2-Country.mmdb → all attempts fail."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        archive = _build_mmdb_tarball(b"x", mmdb_name="something_else.txt")
+
+        def fake_urlopen(url, timeout):  # noqa: ARG001
+            return _FakeUrlopenResponse(archive)
+
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            assert (
+                _download_geoip_db(
+                    db_path,
+                    license_key="key",
+                    retries=1,
+                    backoff_s=0.0,
+                    sleep=lambda _: None,
+                )
+                is False
+            )
+        assert not os.path.exists(db_path)
+
+    def test_all_retries_exhausted_returns_false(self, tmp_path):
+        """Persistent network failure — no DB, returns False, retries exhausted."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+
+        def fake_urlopen(url, timeout):  # noqa: ARG001
+            raise urllib.error.URLError("network unreachable")
+
+        sleep_calls: list[float] = []
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = _download_geoip_db(
+                db_path,
+                license_key="key",
+                retries=3,
+                backoff_s=0.5,
+                sleep=sleep_calls.append,
+            )
+
+        assert result is False
+        assert not os.path.exists(db_path)
+        # Linear backoff: 0.5, 1.0, 1.5 between 4 total attempts
+        assert sleep_calls == [0.5, 1.0, 1.5]
+
+    def test_url_encodes_license_key_with_special_chars(self, tmp_path):
+        """License keys with URL-significant chars must be percent-encoded."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        archive = _build_mmdb_tarball(b"OK")
+        captured = {}
+
+        def fake_urlopen(url, timeout):  # noqa: ARG001
+            captured["url"] = url
+            return _FakeUrlopenResponse(archive)
+
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            _download_geoip_db(db_path, license_key="abc&def=xyz")
+
+        assert "abc%26def%3Dxyz" in captured["url"]
+        assert "abc&def=xyz" not in captured["url"]
+
+    def test_partial_download_does_not_replace_existing_db(self, tmp_path):
+        """Atomic replace: a failed extraction must not clobber an existing DB."""
+        db_path = tmp_path / "GeoLite2-Country.mmdb"
+        # Simulate a *different* DB at the path (size > 0 → short-circuits download).
+        db_path.write_bytes(b"original-mmdb")
+
+        def fake_urlopen(url, timeout):  # noqa: ARG001
+            raise urllib.error.URLError("would corrupt existing DB if called")
+
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            assert _download_geoip_db(str(db_path), license_key="key") is True
+
+        assert db_path.read_bytes() == b"original-mmdb"
+
+
+class TestCheckerWiresRuntimeDownload:
+    """Tests that GeoBlockChecker.__init__ invokes the runtime download fallback."""
+
+    def test_checker_attempts_runtime_download_when_db_missing(self, tmp_path, monkeypatch):
+        """If DB missing and license key set, download is attempted at init."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        monkeypatch.setenv("MAXMIND_LICENSE_KEY", "test-key")
+        config = GeoBlockConfig(
+            blocked_countries=["RU"],
+            geoip_db_path=db_path,
+            enabled=True,
+            fail_closed=True,
+        )
+
+        called: dict = {}
+
+        def fake_download(path, license_key, **kwargs):
+            called["path"] = path
+            called["license_key"] = license_key
+            return False  # fail — DB still missing, fall through to existing error path
+
+        with patch("src.security.geo_block._download_geoip_db", side_effect=fake_download):
+            checker = GeoBlockChecker(config)
+
+        assert called == {"path": db_path, "license_key": "test-key"}
+        # Download failed → reader stays None → fail-closed at request time
+        assert checker._reader is None
+
+    def test_checker_skips_runtime_download_when_no_license_key(self, tmp_path, monkeypatch):
+        """No env license key → no download attempted, even if DB missing."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        monkeypatch.delenv("MAXMIND_LICENSE_KEY", raising=False)
+        config = GeoBlockConfig(
+            blocked_countries=["RU"],
+            geoip_db_path=db_path,
+            enabled=True,
+            fail_closed=True,
+        )
+
+        with patch("src.security.geo_block._download_geoip_db") as mock_dl:
+            GeoBlockChecker(config)
+            mock_dl.assert_not_called()
+
+    def test_checker_skips_runtime_download_when_db_present(self, tmp_path, monkeypatch):
+        """Existing DB at path → no download attempted."""
+        db_path = tmp_path / "GeoLite2-Country.mmdb"
+        # We need the file to merely exist for the os.path.exists() check before
+        # geoip2 tries to open it. geoip2 will fail to parse but that's fine —
+        # the assertion is on _download_geoip_db not being called.
+        db_path.write_bytes(b"")
+        monkeypatch.setenv("MAXMIND_LICENSE_KEY", "test-key")
+        config = GeoBlockConfig(
+            blocked_countries=["RU"],
+            geoip_db_path=str(db_path),
+            enabled=True,
+            fail_closed=True,
+        )
+
+        with patch("src.security.geo_block._download_geoip_db") as mock_dl:
+            GeoBlockChecker(config)
+            mock_dl.assert_not_called()

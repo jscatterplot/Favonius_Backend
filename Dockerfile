@@ -58,6 +58,7 @@ ARG MAXMIND_LICENSE_KEY
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
+    file \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r appuser && useradd -r -g appuser appuser
@@ -83,8 +84,19 @@ COPY schemas/ ./schemas/
 # Without a license key, a bundled fallback is used (if available).
 RUN mkdir -p /app/data && \
     if [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then \
-        curl -sSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" \
-        | tar -xz --strip-components=1 -C /app/data --wildcards '*/GeoLite2-Country.mmdb'; \
+        if curl -sSL --fail --retry 3 --retry-delay 5 --retry-all-errors \
+            -o /tmp/geoip.tar.gz \
+            "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"; then \
+            if file /tmp/geoip.tar.gz | grep -q gzip; then \
+                tar -xzf /tmp/geoip.tar.gz --strip-components=1 -C /app/data --wildcards '*/GeoLite2-Country.mmdb' && \
+                echo "GeoLite2-Country.mmdb downloaded successfully"; \
+            else \
+                echo "WARNING: MaxMind download did not return a gzip archive — runtime fallback will retry"; \
+            fi; \
+        else \
+            echo "WARNING: MaxMind download failed after retries — runtime fallback will retry"; \
+        fi; \
+        rm -f /tmp/geoip.tar.gz; \
     else \
         echo "MAXMIND_LICENSE_KEY not set — GeoIP DB must be mounted at /app/data/GeoLite2-Country.mmdb"; \
     fi
