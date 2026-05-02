@@ -170,8 +170,13 @@ class TestOcppRouteWiring:
 # ---------------------------------------------------------------------------
 
 
-def _signed_handoff_body(signing_key: str, *, ts: float | None = None) -> dict:
-    """Build a payload with valid signature, nonce, and timestamp."""
+def _signed_handoff_body(signing_key: str, *, ts: float | None = None) -> tuple[bytes, str]:
+    """Build canonical body bytes + matching X-Handoff-Signature header value.
+
+    H4 moved the signature out of the JSON body and into the
+    ``X-Handoff-Signature`` HTTP header. Tests now feed the verifier raw
+    body bytes plus that header value.
+    """
     payload = {
         "message_id": "11111111-1111-1111-1111-111111111111",
         "origin_depot_id": "22222222-2222-2222-2222-222222222222",
@@ -187,10 +192,8 @@ def _signed_handoff_body(signing_key: str, *, ts: float | None = None) -> dict:
         ).isoformat(),
     }
     body_bytes = json.dumps(payload, sort_keys=True).encode()
-    payload["signature"] = hmac.new(
-        signing_key.encode(), body_bytes, hashlib.sha256
-    ).hexdigest()
-    return payload
+    sig = hmac.new(signing_key.encode(), body_bytes, hashlib.sha256).hexdigest()
+    return body_bytes, sig
 
 
 class TestHandoffSignatureVerifier:
@@ -206,44 +209,43 @@ class TestHandoffSignatureVerifier:
     def test_valid_signature_accepted(self):
         from src.api.main import _verify_handoff_payload
 
-        body = _signed_handoff_body(self.SIGNING_KEY)
-        assert _verify_handoff_payload(body, self.SIGNING_KEY) is True
+        body, sig = _signed_handoff_body(self.SIGNING_KEY)
+        assert _verify_handoff_payload(body, sig, self.SIGNING_KEY) is True
 
     def test_missing_signature_rejected(self):
         from src.api.main import _verify_handoff_payload
 
-        body = _signed_handoff_body(self.SIGNING_KEY)
-        body.pop("signature")
-        assert _verify_handoff_payload(body, self.SIGNING_KEY) is False
+        body, _sig = _signed_handoff_body(self.SIGNING_KEY)
+        assert _verify_handoff_payload(body, "", self.SIGNING_KEY) is False
 
     def test_tampered_payload_rejected(self):
         from src.api.main import _verify_handoff_payload
 
-        body = _signed_handoff_body(self.SIGNING_KEY)
-        # Forge a different origin_depot_id without resigning.
-        body["origin_depot_id"] = "99999999-9999-9999-9999-999999999999"
-        assert _verify_handoff_payload(body, self.SIGNING_KEY) is False
+        body, sig = _signed_handoff_body(self.SIGNING_KEY)
+        # Mutate the body bytes after signing — verifier must reject.
+        tampered = body.replace(b"22222222-2222-2222-2222-222222222222", b"99999999-9999-9999-9999-999999999999")
+        assert _verify_handoff_payload(tampered, sig, self.SIGNING_KEY) is False
 
     def test_wrong_signing_key_rejected(self):
         from src.api.main import _verify_handoff_payload
 
-        body = _signed_handoff_body(self.SIGNING_KEY)
-        assert _verify_handoff_payload(body, "different-key") is False
+        body, sig = _signed_handoff_body(self.SIGNING_KEY)
+        assert _verify_handoff_payload(body, sig, "different-key") is False
 
     def test_expired_timestamp_rejected(self):
         from src.api.main import _verify_handoff_payload
 
         # Sign a body whose timestamp is 1 hour in the past.
-        body = _signed_handoff_body(self.SIGNING_KEY, ts=time.time() - 3600)
-        assert _verify_handoff_payload(body, self.SIGNING_KEY) is False
+        body, sig = _signed_handoff_body(self.SIGNING_KEY, ts=time.time() - 3600)
+        assert _verify_handoff_payload(body, sig, self.SIGNING_KEY) is False
 
     def test_replay_rejected(self):
         from src.api.main import _verify_handoff_payload
 
-        body = _signed_handoff_body(self.SIGNING_KEY)
-        assert _verify_handoff_payload(body, self.SIGNING_KEY) is True
+        body, sig = _signed_handoff_body(self.SIGNING_KEY)
+        assert _verify_handoff_payload(body, sig, self.SIGNING_KEY) is True
         # Identical body — same nonce — must be rejected the second time.
-        assert _verify_handoff_payload(body, self.SIGNING_KEY) is False
+        assert _verify_handoff_payload(body, sig, self.SIGNING_KEY) is False
 
     def test_round_trip_matches_send_handoff_canonicalization(self):
         """The verifier MUST accept what send_handoff produces."""
@@ -263,10 +265,8 @@ class TestHandoffSignatureVerifier:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         body_bytes = json.dumps(payload, sort_keys=True).encode()
-        payload["signature"] = hmac.new(
-            self.SIGNING_KEY.encode(), body_bytes, hashlib.sha256
-        ).hexdigest()
-        assert _verify_handoff_payload(payload, self.SIGNING_KEY) is True
+        sig = hmac.new(self.SIGNING_KEY.encode(), body_bytes, hashlib.sha256).hexdigest()
+        assert _verify_handoff_payload(body_bytes, sig, self.SIGNING_KEY) is True
 
 
 class TestReceiveHandoffWiring:
@@ -287,7 +287,7 @@ class TestReceiveHandoffWiring:
         source = inspect.getsource(main.send_handoff)
         # Refuses to send if the key isn't configured (fail-closed at source).
         assert "HANDOFF_SIGNING_KEY" in source
-        assert 'detail="Inter-depot handoff is unavailable: signing key not configured"' in source
+        assert "HANDOFF_SIGNING_KEY_NOT_CONFIGURED" in source
 
 
 # ---------------------------------------------------------------------------
