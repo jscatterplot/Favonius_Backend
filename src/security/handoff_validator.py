@@ -19,6 +19,7 @@ Reference: Audit finding H4 (handoff SSRF + HMAC).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import ipaddress
@@ -26,7 +27,7 @@ import logging
 import os
 import socket
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import HTTPException, status
 
@@ -91,31 +92,41 @@ def _allow_private_hosts(env: str) -> bool:
     return os.getenv(_PRIVATE_HOSTS_ENV, "false").lower() == "true"
 
 
-def validate_handoff_destination(url: str, env: str) -> None:
-    """Reject outbound handoff URLs that violate the SSRF policy.
+def _host_header_value(hostname: str, port: int | None, scheme: str) -> str:
+    """HTTP Host header value (include brackets for IPv6, optional non-default port)."""
+    h = f"[{hostname}]" if ":" in hostname else hostname
+    default = 443 if scheme == "https" else 80
+    if port is None or port == default:
+        return h
+    return f"{h}:{port}"
 
-    Args:
-        url: Fully-qualified destination URL (scheme + host + optional port).
-        env: Application environment ("development", "staging", "production").
 
-    Raises:
-        HTTPException(400): scheme/host invalid, ``http`` outside dev, or the
-            host resolves to a private/loopback/link-local/reserved address.
+def _ip_literal_for_url(addr: ipaddress._BaseAddress) -> str:
+    """Netloc fragment for the resolved address (bracket IPv6)."""
+    return f"[{addr.compressed}]" if addr.version == 6 else str(addr)
+
+
+def _pinned_handoff_request_parts(url: str, env: str) -> tuple[str, str, dict[str, str]]:
+    """Validate URL for SSRF policy and return an IP-pinned request URL + Host + httpx extensions.
+
+    Connecting to the pinned IP avoids a second DNS lookup (DNS rebinding) while
+    preserving the original server name via the Host header and TLS SNI
+    (``extensions['sni_hostname']`` for HTTPS).
     """
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {"http", "https"}:
+    parts = urlsplit(url)
+    scheme = parts.scheme
+    if scheme not in {"http", "https"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid handoff scheme: {parsed.scheme!r}; only http/https allowed",
+            detail=f"Invalid handoff scheme: {scheme!r}; only http/https allowed",
         )
-    if parsed.scheme == "http" and env not in _DEV_ENVIRONMENTS:
+    if scheme == "http" and env not in _DEV_ENVIRONMENTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Inter-depot handoff requires HTTPS outside development",
         )
 
-    host = parsed.hostname
+    host = parts.hostname
     if not host:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -132,8 +143,6 @@ def validate_handoff_destination(url: str, env: str) -> None:
     allow_private = _allow_private_hosts(env)
     blocked = [str(a) for a in addresses if _is_blocked_address(a)]
     if blocked and not allow_private:
-        # Log once with all blocked IPs so an operator can diagnose multi-A
-        # records where one entry is private and forces a reject.
         logger.warning(
             "Handoff destination rejected: host=%s blocked_addresses=%s env=%s",
             host,
@@ -147,6 +156,40 @@ def validate_handoff_destination(url: str, env: str) -> None:
                 f"({blocked[0]}); refusing to send"
             ),
         )
+
+    pin_addr = addresses[0]
+    netloc = _ip_literal_for_url(pin_addr)
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    request_url = urlunsplit((scheme, netloc, parts.path, parts.query, parts.fragment))
+    host_header = _host_header_value(host, parts.port, scheme)
+    extensions: dict[str, str] = {}
+    if scheme == "https":
+        # TLS verification uses this name; URL uses IP in netloc (see httpx docs).
+        extensions["sni_hostname"] = host
+    return request_url, host_header, extensions
+
+
+def validate_handoff_destination(url: str, env: str) -> None:
+    """Reject outbound handoff URLs that violate the SSRF policy.
+
+    Args:
+        url: Fully-qualified destination URL (scheme + host + optional port).
+        env: Application environment ("development", "staging", "production").
+
+    Raises:
+        HTTPException(400): scheme/host invalid, ``http`` outside dev, or the
+            host resolves to a private/loopback/link-local/reserved address.
+    """
+    _pinned_handoff_request_parts(url, env)
+
+
+async def prepare_handoff_http_target(url: str, env: str) -> tuple[str, str, dict[str, str]]:
+    """Like ``validate_handoff_destination`` but returns pinned URL parts for ``httpx``.
+
+    DNS resolution runs in a thread pool so the event loop is not blocked.
+    """
+    return await asyncio.to_thread(_pinned_handoff_request_parts, url, env)
 
 
 def compute_handoff_signature(secret: bytes, body: bytes) -> str:
@@ -170,6 +213,7 @@ def verify_handoff_signature(secret: bytes, body: bytes, signature_hex: str) -> 
 
 __all__: Iterable[str] = (
     "compute_handoff_signature",
+    "prepare_handoff_http_target",
     "validate_handoff_destination",
     "verify_handoff_signature",
 )

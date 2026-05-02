@@ -8,17 +8,16 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import pytest
-from fastapi import status as http_status
 from fastapi.testclient import TestClient
 
 from src.api import main
 from src.api.main import app
 from src.security.handoff_validator import compute_handoff_signature
 from src.security.tenant_mirror import ensure_tenant_mirrored
-
 
 SIGNING_KEY = "unit-test-handoff-signing-key"
 DEPOT_ID = str(uuid4())
@@ -119,8 +118,18 @@ class TestSendHandoff:
         monkeypatch.setenv("DEFAULT_DEPOT_ENDPOINT", "https://depot.example.com")
         monkeypatch.delenv("HANDOFF_SIGNING_KEY", raising=False)
 
-        with patch("src.api.main.db_pools", mock_pool), patch(
-            "src.api.main.validate_handoff_destination"
+        async def _fake_prepare(url: str, env: str):
+            p = urlsplit(url)
+            netloc = "8.8.8.8" + (f":{p.port}" if p.port else "")
+            return (
+                urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment)),
+                p.hostname or "",
+                {"sni_hostname": p.hostname} if p.scheme == "https" else {},
+            )
+
+        with (
+            patch("src.api.main.db_pools", mock_pool),
+            patch("src.api.main.prepare_handoff_http_target", side_effect=_fake_prepare),
         ):
             response = client.post(
                 f"/depots/{DEPOT_ID}/vehicles/{VEHICLE_ID}/handoff",
@@ -135,9 +144,10 @@ class TestSendHandoff:
         monkeypatch.setenv("DEFAULT_DEPOT_ENDPOINT", "https://depot.example.com")
         monkeypatch.setenv("HANDOFF_SIGNING_KEY", SIGNING_KEY)
 
-        with patch("src.api.main.db_pools", mock_pool), patch(
-            "src.security.handoff_validator._resolve_addresses"
-        ) as resolve:
+        with (
+            patch("src.api.main.db_pools", mock_pool),
+            patch("src.security.handoff_validator._resolve_addresses") as resolve,
+        ):
             import ipaddress
 
             resolve.return_value = [ipaddress.ip_address("10.0.0.1")]
@@ -179,11 +189,14 @@ class TestSendHandoff:
                 captured["url"] = url
                 captured["body"] = content
                 captured["headers"] = headers or {}
+                captured["extensions"] = kwargs.get("extensions") or {}
                 return FakeResponse()
 
-        with patch("src.api.main.db_pools", mock_pool), patch(
-            "src.security.handoff_validator._resolve_addresses"
-        ) as resolve, patch("src.api.main.httpx.AsyncClient", FakeAsyncClient):
+        with (
+            patch("src.api.main.db_pools", mock_pool),
+            patch("src.security.handoff_validator._resolve_addresses") as resolve,
+            patch("src.api.main.httpx.AsyncClient", FakeAsyncClient),
+        ):
             import ipaddress
 
             resolve.return_value = [ipaddress.ip_address("8.8.8.8")]
@@ -193,6 +206,9 @@ class TestSendHandoff:
             )
 
         assert response.status_code == 200, response.json()
+        assert captured["url"].startswith("https://8.8.8.8")
+        assert captured["headers"].get("Host") == "depot.example.com"
+        assert captured["extensions"].get("sni_hostname") == "depot.example.com"
         assert "X-Handoff-Signature" in captured["headers"]
         sig = captured["headers"]["X-Handoff-Signature"]
         assert len(sig) == 64
@@ -216,9 +232,11 @@ class TestReceiveHandoff:
         headers = {"Content-Type": "application/json"}
         if signature is not None:
             headers["X-Handoff-Signature"] = signature
-        with patch("src.api.main.db_pools", mock_pool), patch(
-            "src.api.main.verify_depot_access", new_callable=AsyncMock
-        ), patch("src.api.main.controller_manager", None):
+        with (
+            patch("src.api.main.db_pools", mock_pool),
+            patch("src.api.main.verify_depot_access", new_callable=AsyncMock),
+            patch("src.api.main.controller_manager", None),
+        ):
             mock_pool.acquire.return_value.__aenter__.return_value.fetchrow = AsyncMock(
                 return_value=None
             )
@@ -242,9 +260,7 @@ class TestReceiveHandoff:
         monkeypatch.setenv("HANDOFF_SIGNING_KEY", SIGNING_KEY)
 
         body = _receive_body()
-        response = self._post(
-            client, body, signature="0" * 64, mock_pool=mock_pool
-        )
+        response = self._post(client, body, signature="0" * 64, mock_pool=mock_pool)
         assert response.status_code == 401
         assert "HANDOFF_SIGNATURE_INVALID" in response.json()["detail"]
 
@@ -256,9 +272,11 @@ class TestReceiveHandoff:
         body_bytes = json.dumps(body, sort_keys=True).encode("utf-8")
         sig = compute_handoff_signature(SIGNING_KEY.encode(), body_bytes)
 
-        with patch("src.api.main.db_pools", mock_pool), patch(
-            "src.api.main.verify_depot_access", new_callable=AsyncMock
-        ), patch("src.api.main.controller_manager", None):
+        with (
+            patch("src.api.main.db_pools", mock_pool),
+            patch("src.api.main.verify_depot_access", new_callable=AsyncMock),
+            patch("src.api.main.controller_manager", None),
+        ):
             mock_pool.acquire.return_value.__aenter__.return_value.fetchrow = AsyncMock(
                 return_value=None
             )
@@ -293,9 +311,7 @@ class TestReceiveHandoff:
         with caplog.at_level("WARNING", logger="src.api.main"):
             response = self._post(client, body, signature=None, mock_pool=mock_pool)
         assert response.status_code == 200, response.json()
-        assert any(
-            "without HMAC signature" in record.message for record in caplog.records
-        )
+        assert any("without HMAC signature" in record.message for record in caplog.records)
 
     def test_replay_of_same_signature_rejected(self, client, mock_pool, monkeypatch):
         """Even with a valid signature, the same nonce must only fly once."""
@@ -306,9 +322,11 @@ class TestReceiveHandoff:
         body_bytes = json.dumps(body, sort_keys=True).encode("utf-8")
         sig = compute_handoff_signature(SIGNING_KEY.encode(), body_bytes)
 
-        with patch("src.api.main.db_pools", mock_pool), patch(
-            "src.api.main.verify_depot_access", new_callable=AsyncMock
-        ), patch("src.api.main.controller_manager", None):
+        with (
+            patch("src.api.main.db_pools", mock_pool),
+            patch("src.api.main.verify_depot_access", new_callable=AsyncMock),
+            patch("src.api.main.controller_manager", None),
+        ):
             mock_pool.acquire.return_value.__aenter__.return_value.fetchrow = AsyncMock(
                 return_value=None
             )

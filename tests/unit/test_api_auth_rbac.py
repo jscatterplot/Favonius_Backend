@@ -12,6 +12,7 @@ Reference: PRD.md#10-4-rate-limiting, PRD.md#11-2-unit-test-requirements
 
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import asyncpg
@@ -1765,8 +1766,17 @@ class TestCrossOrganizationDepotAccessDenied:
             "max_charge_kw": 80.0,
         }
 
+        async def _fake_prepare(url: str, env: str):
+            p = urlsplit(url)
+            netloc = "8.8.8.8" + (f":{p.port}" if p.port else "")
+            return (
+                urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment)),
+                p.hostname or "",
+                {"sni_hostname": p.hostname} if p.scheme == "https" else {},
+            )
+
         with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.validate_handoff_destination"
+            "src.api.main.prepare_handoff_http_target", side_effect=_fake_prepare
         ):
             response = client.post(
                 f"/depots/{DEPOT_ID}/vehicles/{VEHICLE_ID}/handoff",

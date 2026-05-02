@@ -5,6 +5,7 @@ Reference: PRD.md#11-2-unit-test-requirements
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import pytest
@@ -13,7 +14,6 @@ from fastapi import status as http_status
 from src.api.main import (
     HandoffRequest,
     OptimizationRequest,
-    _require_depot_access,
     app,
     describe_database_target,
     resolve_database_url,
@@ -274,9 +274,7 @@ class TestDepotAlertsEndpoint:
     """Test GET /depots/{depot_id}/alerts (PRD §7.1, AT-16)."""
 
     @patch("src.api.main.db_pools")
-    def test_get_alerts_success_with_last_optimization(
-        self, mock_pool, client, mock_db_pool
-    ):
+    def test_get_alerts_success_with_last_optimization(self, mock_pool, client, mock_db_pool):
         """Alerts returns last_optimization and charger_faults."""
         pool, conn = mock_db_pool
         depot_id = str(uuid4())
@@ -431,8 +429,18 @@ class TestHandoffEndpoint:
             "max_charge_kw": 80.0,
         }
 
-        with patch("src.api.main.db_pools", mock_pool), patch(
-            "src.api.main.validate_handoff_destination"
+        async def _fake_prepare(url: str, env: str):
+            p = urlsplit(url)
+            netloc = "8.8.8.8" + (f":{p.port}" if p.port else "")
+            return (
+                urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment)),
+                p.hostname or "",
+                {"sni_hostname": p.hostname} if p.scheme == "https" else {},
+            )
+
+        with (
+            patch("src.api.main.db_pools", mock_pool),
+            patch("src.api.main.prepare_handoff_http_target", side_effect=_fake_prepare),
         ):
             response = client.post(
                 f"/depots/{depot_id}/vehicles/{vehicle_id}/handoff", json=request
@@ -583,7 +591,9 @@ class TestDatabaseConfiguration:
 
     def test_resolve_database_url_prefers_database_url(self, monkeypatch):
         """DATABASE_URL should take precedence over TIMESCALE_SERVICE_URL."""
-        monkeypatch.setenv("TIMESCALE_SERVICE_URL", "postgresql://ts_user:ts_pw@timescale:5432/tsdb")
+        monkeypatch.setenv(
+            "TIMESCALE_SERVICE_URL", "postgresql://ts_user:ts_pw@timescale:5432/tsdb"
+        )
         monkeypatch.setenv("DATABASE_URL", "postgresql://api_user:api_pw@api-db:5432/apidb")
 
         database_url, source = resolve_database_url()
@@ -594,7 +604,9 @@ class TestDatabaseConfiguration:
     def test_resolve_database_url_uses_timescale_service_url_fallback(self, monkeypatch):
         """TIMESCALE_SERVICE_URL should be used when DATABASE_URL is absent."""
         monkeypatch.delenv("DATABASE_URL", raising=False)
-        monkeypatch.setenv("TIMESCALE_SERVICE_URL", "postgresql://ts_user:ts_pw@timescale:5432/tsdb")
+        monkeypatch.setenv(
+            "TIMESCALE_SERVICE_URL", "postgresql://ts_user:ts_pw@timescale:5432/tsdb"
+        )
 
         database_url, source = resolve_database_url()
 

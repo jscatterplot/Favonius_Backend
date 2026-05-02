@@ -77,7 +77,7 @@ from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limi
 from ..security.rbac import Permission, has_permission, require_favonius_admin
 from ..security.handoff_validator import (
     compute_handoff_signature,
-    validate_handoff_destination,
+    prepare_handoff_http_target,
     verify_handoff_signature,
 )
 from ..security.validators import (
@@ -4547,10 +4547,12 @@ async def send_handoff(
                 ),
             )
 
-        # Security (H4): SSRF guard. Block private/loopback/link-local targets
-        # and require HTTPS outside development. Raises 400 on violations.
+        # Security (H4): SSRF guard + DNS rebinding mitigation — validate once,
+        # connect to the pinned IP with Host/SNI from the original hostname.
         receive_url = f"{dest_depot_endpoint}/depots/{request.dest_depot_id}/handoff/receive"
-        validate_handoff_destination(receive_url, _environment)
+        request_url, host_header, httpx_extensions = await prepare_handoff_http_target(
+            receive_url, _environment
+        )
 
         # Security (C2/H4): HMAC signing key is mandatory in non-development
         # environments. Without it the receive side fails closed, so refuse
@@ -4597,10 +4599,17 @@ async def send_handoff(
                         signing_key.encode(), payload_bytes
                     )
 
+                post_kw: dict = {"content": payload_bytes}
+                if httpx_extensions:
+                    post_kw["extensions"] = httpx_extensions
                 response = await client.post(
-                    receive_url,
-                    content=payload_bytes,
-                    headers={"Content-Type": "application/json", **headers},
+                    request_url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Host": host_header,
+                        **headers,
+                    },
+                    **post_kw,
                 )
                 response.raise_for_status()
                 ack_data = response.json()
