@@ -140,10 +140,31 @@ class SupabaseClient:
 
     async def get_active_routes(self, depot_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get active route schedules from Supabase (schedules table)."""
-        query = "SELECT * FROM schedules WHERE departure_time > NOW()"
+        query = """
+            SELECT s.id AS schedule_id,
+                   s.vehicle_id,
+                   s.route_id,
+                   s.departure_time,
+                   s.return_time,
+                   s.actual_return_time,
+                   s.energy_kwh,
+                   s.required_soc,
+                   s.dest_site_id AS dest_depot_id
+            FROM schedules s
+            WHERE s.departure_time > NOW()
+        """
         if depot_id:
             query = (
-                "SELECT s.* FROM schedules s"
+                "SELECT s.id AS schedule_id,"
+                "       s.vehicle_id,"
+                "       s.route_id,"
+                "       s.departure_time,"
+                "       s.return_time,"
+                "       s.actual_return_time,"
+                "       s.energy_kwh,"
+                "       s.required_soc,"
+                "       s.dest_site_id AS dest_depot_id"
+                " FROM schedules s"
                 " JOIN vehicles v ON v.id = s.vehicle_id"
                 " WHERE v.site_id = $1 AND s.departure_time > NOW()"
             )
@@ -152,7 +173,23 @@ class SupabaseClient:
 
     async def get_vehicles(self, depot_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get vehicles from Supabase."""
-        query = "SELECT * FROM vehicles"
+        query = """
+            SELECT id AS vehicle_id,
+                   organization_id,
+                   site_id AS depot_id,
+                   vin,
+                   external_id,
+                   vehicle_type,
+                   id_tag,
+                   battery_capacity_kwh AS battery_kwh,
+                   max_charge_rate_kw AS max_charge_kw,
+                   max_discharge_rate_kw,
+                   v2g_capable,
+                   license_plate,
+                   driver_id,
+                   status
+            FROM vehicles
+        """
         if depot_id:
             query += " WHERE site_id = $1"
             return await self.fetch_all(query, depot_id)
@@ -160,7 +197,21 @@ class SupabaseClient:
 
     async def get_chargers(self, depot_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get chargers from Supabase."""
-        query = "SELECT * FROM charging_stations"
+        query = """
+            SELECT id AS charger_id,
+                   site_id AS depot_id,
+                   station_id AS ocpp_id,
+                   max_power_kw AS rated_kw,
+                   efficiency,
+                   auth_required,
+                   connector_type,
+                   display_name,
+                   vendor,
+                   connector_count,
+                   connector_ids,
+                   status
+            FROM charging_stations
+        """
         if depot_id:
             query += " WHERE site_id = $1"
             return await self.fetch_all(query, depot_id)
@@ -168,7 +219,27 @@ class SupabaseClient:
 
     async def get_depot_config(self, depot_id: str) -> Optional[Dict[str, Any]]:
         """Get depot configuration from Supabase."""
-        query = "SELECT * FROM sites WHERE id = $1"
+        query = """
+            SELECT id AS depot_id,
+                   organization_id,
+                   max_grid_kw,
+                   demand_charge_rate_kw,
+                   demand_charge_billing_period,
+                   timezone,
+                   currency,
+                   utility_id,
+                   address,
+                   billing_metadata,
+                   building_load_source,
+                   building_load_assumption_kw,
+                   access_mode,
+                   charger_vehicle_access_default,
+                   tariff_config,
+                   latitude,
+                   longitude
+            FROM sites
+            WHERE id = $1
+        """
         return await self.fetch_one(query, depot_id)
 
     async def get_organization(self, org_id: str) -> Optional[Dict[str, Any]]:

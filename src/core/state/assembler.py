@@ -1290,17 +1290,26 @@ class StateAssembler:
         # by migration 020 — COALESCE handles the brief window after that
         # migration runs on a depot row inserted before it.
         depot_query = """
-        SELECT max_grid_kw,
-               demand_charge_rate_kw,
-               COALESCE(building_load_assumption_kw, 0.0) AS building_load_assumption_kw,
-               COALESCE(charger_vehicle_access_default, 'explicit_matrix')
-                   AS charger_vehicle_access_default,
-               COALESCE(tariff_type, 'simple_demand') AS tariff_type,
-               energy_cap_kwh,
-               under_cap_rate_per_kwh,
-               over_cap_penalty_per_kwh,
-               COALESCE(cap_billing_period, 'monthly') AS cap_billing_period
-        FROM sites
+        SELECT s.max_grid_kw,
+               s.demand_charge_rate_kw,
+               COALESCE(s.building_load_assumption_kw, 0.0) AS building_load_assumption_kw,
+               CASE
+                   WHEN COALESCE(to_jsonb(s)->>'charger_vehicle_access_default', '')
+                        IN ('all_to_all', 'explicit_matrix')
+                       THEN to_jsonb(s)->>'charger_vehicle_access_default'
+                   WHEN COALESCE(to_jsonb(s)->>'charger_vehicle_access_default', '')
+                        IN ('true', 't', '1')
+                       THEN 'all_to_all'
+                   ELSE 'explicit_matrix'
+               END AS charger_vehicle_access_default,
+               COALESCE(to_jsonb(s)->>'tariff_type', 'simple_demand') AS tariff_type,
+               NULLIF(to_jsonb(s)->>'energy_cap_kwh', '')::DOUBLE PRECISION AS energy_cap_kwh,
+               NULLIF(to_jsonb(s)->>'under_cap_rate_per_kwh', '')::DOUBLE PRECISION
+                   AS under_cap_rate_per_kwh,
+               NULLIF(to_jsonb(s)->>'over_cap_penalty_per_kwh', '')::DOUBLE PRECISION
+                   AS over_cap_penalty_per_kwh,
+               COALESCE(to_jsonb(s)->>'cap_billing_period', 'monthly') AS cap_billing_period
+        FROM sites s
         WHERE id = $1
         """
         async with pool.acquire() as conn:
