@@ -30,12 +30,28 @@ BEGIN;
 -- 1. Fix charger_vehicle_access_default type (boolean -> varchar)
 -- ============================================================
 
--- Drop the wrongly-typed column. sites is empty so no data loss.
-ALTER TABLE public.sites
-    DROP COLUMN IF EXISTS charger_vehicle_access_default;
+-- Convert only when needed so re-running this migration is non-destructive.
+DO $$
+DECLARE
+    _dtype text;
+BEGIN
+    SELECT data_type
+      INTO _dtype
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'sites'
+       AND column_name = 'charger_vehicle_access_default';
 
-ALTER TABLE public.sites
-    ADD COLUMN charger_vehicle_access_default VARCHAR(32) NOT NULL DEFAULT 'explicit_matrix';
+    IF _dtype IS NULL THEN
+        ALTER TABLE public.sites
+            ADD COLUMN charger_vehicle_access_default VARCHAR(32) NOT NULL DEFAULT 'explicit_matrix';
+    ELSIF _dtype = 'boolean' THEN
+        ALTER TABLE public.sites
+            DROP COLUMN charger_vehicle_access_default;
+        ALTER TABLE public.sites
+            ADD COLUMN charger_vehicle_access_default VARCHAR(32) NOT NULL DEFAULT 'explicit_matrix';
+    END IF;
+END$$;
 
 DO $$
 BEGIN

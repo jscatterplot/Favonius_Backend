@@ -312,7 +312,8 @@ class TimescaleClient:
         if not token_value:
             return None
         vehicle_row = await conn.fetchrow(
-            "SELECT vehicle_id FROM vehicles WHERE id_tag = $1 LIMIT 1", token_value
+            "SELECT id AS vehicle_id FROM vehicles WHERE id_tag = $1 LIMIT 1",
+            token_value,
         )
         return vehicle_row["vehicle_id"] if vehicle_row else None
 
@@ -322,7 +323,7 @@ class TimescaleClient:
         if not station_id:
             return None
         row = await conn.fetchrow(
-            "SELECT charger_id FROM chargers WHERE ocpp_id = $1 LIMIT 1",
+            "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
             station_id,
         )
         return row["charger_id"] if row else None
