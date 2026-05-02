@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import asyncpg
 import bcrypt
 import httpx
+import jwt
 from fastapi import (
     Depends,
     FastAPI,
@@ -518,23 +519,27 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Security (H5): use authenticated user_id as primary rate-limit key.
         # Falls back to IP only for unauthenticated endpoints — never trust
         # X-API-Key or X-Forwarded-For blindly as they are attacker-controlled.
+        # Expiration is verified so a holder of a leaked/expired token cannot
+        # keep draining a victim's per-user bucket.
         client_id = request.client.host if request.client else "unknown"
         auth_header = request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
             try:
                 from ..security.auth import _get_jwt_secrets, _ALLOWED_ALGORITHMS
-                import jwt as _jwt
 
-                payload = _jwt.decode(
+                payload = jwt.decode(
                     auth_header[7:],
                     _get_jwt_secrets()[0],
                     algorithms=_ALLOWED_ALGORITHMS,
                     audience="authenticated",
-                    options={"verify_exp": False},
                 )
-                client_id = f"user:{payload.get('sub', client_id)}"
+                sub = payload.get("sub")
+                if sub:
+                    client_id = f"user:{sub}"
+            except jwt.ExpiredSignatureError:
+                logger.debug("Rate limit: expired token, falling back to IP")
             except Exception:
-                pass  # Fall back to IP-based limiting
+                pass  # Invalid/tampered/missing claims — fall back to IP-based limiting
 
         limiter = get_rate_limiter()
 
