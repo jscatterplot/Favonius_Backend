@@ -1,6 +1,6 @@
 """Just-in-time mirror of Supabase JWT tenancy into static DB rows.
 
-``organizations`` / ``organization_users`` are write-side caches for FKs and
+``organizations`` / ``user_organizations`` are write-side caches for FKs and
 joins. Authorization still uses ``app_metadata`` vs ``depots.organization_id``;
 this module never trusts ``user_metadata``.
 """
@@ -80,7 +80,7 @@ async def mirror_user_tenant(user: dict, pool: Optional["asyncpg.Pool"]) -> None
                 organization_name,
             )
             await conn.execute(
-                "INSERT INTO organization_users (user_id, organization_id, role) "
+                "INSERT INTO user_organizations (user_id, organization_id, role) "
                 "VALUES ($1::uuid, $2::uuid, $3) "
                 "ON CONFLICT (user_id) DO UPDATE "
                 "SET organization_id = EXCLUDED.organization_id, role = EXCLUDED.role",
