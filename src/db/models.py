@@ -51,7 +51,7 @@ class Organization(Base):
 class OrganizationUser(Base):
     """Membership linking Supabase auth user UUID to one organization."""
 
-    __tablename__ = "organization_users"
+    __tablename__ = "user_organizations"
 
     user_id = Column(PGUUID(as_uuid=True), primary_key=True)
     organization_id = Column(

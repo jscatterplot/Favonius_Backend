@@ -301,7 +301,7 @@ These come directly from the PRD and are non-negotiable:
 
 ### Reference (static) tables
 - `organizations` — Customer / workspace tenant (`organization_id` UUID). Rows are **JIT-mirrored** from verified Supabase JWT `app_metadata` (see Tenant mirroring below); canonical org lifecycle lives in Supabase / frontend.
-- `organization_users` — At most one org per user (`user_id` PK → `organization_id`, `role`). JIT-mirrored from JWT `app_metadata` (`organization_id`, `favonius_role`). **Not** used for API authorization; access control compares JWT claims to `depots.organization_id`.
+- `user_organizations` — At most one org per user (`user_id` PK → `organization_id`, `role`). JIT-mirrored from JWT `app_metadata` (`organization_id`, `favonius_role`). Name matches the canonical Supabase project schema. **Not** used for API authorization; access control compares JWT claims to `depots.organization_id`.
 - `depots` — Physical locations; `max_grid_kw` is the hard site power limit; `organization_id` FK to `organizations`; includes setup metadata fields (`address`, `billing_metadata`, `building_load_source`, `demand_charge_billing_period`, `timezone`, `currency`, `utility_id`)
 - `vehicles` — Fleet vehicles; `max_charge_kw` updated from OCPP MeterValues
 - `chargers` — EVSE; `ocpp_id` links to OCPP protocol
@@ -315,7 +315,7 @@ These come directly from the PRD and are non-negotiable:
 - `building_load` — Non-EV site power draw (**required** for grid calc)
 
 ### Tenant mirroring (JIT)
-- On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `organization_users` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.organization_name`, `app_metadata.favonius_role`). If `organization_name` is absent, a deterministic placeholder (`org-<org_uuid_prefix>`) is used for bootstrap rows. **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `depots.organization_id`).
+- On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `user_organizations` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.organization_name`, `app_metadata.favonius_role`). If `organization_name` is absent, a deterministic placeholder (`org-<org_uuid_prefix>`) is used for bootstrap rows. **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `depots.organization_id`).
 - In-process TTL cache: `TENANT_MIRROR_TTL_S` (default `300`) seconds per `sub` to limit DB writes.
 - Workspace **invitations** are managed in Supabase only; there is no `invitations` table in this backend.
 

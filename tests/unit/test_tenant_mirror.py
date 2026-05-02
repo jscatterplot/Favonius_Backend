@@ -89,7 +89,7 @@ async def test_mirror_inserts_org_and_membership_for_new_user():
     assert len(pool.conn.executes) == 2
     assert "INSERT INTO organizations" in pool.conn.executes[0][0]
     assert pool.conn.executes[0][1][1] == "Acme Transit"
-    assert "INSERT INTO organization_users" in pool.conn.executes[1][0]
+    assert "INSERT INTO user_organizations" in pool.conn.executes[1][0]
 
 
 @pytest.mark.asyncio
