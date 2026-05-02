@@ -97,8 +97,8 @@ class ChargingPointResolver:
             if uid:
                 row = await self.db_pool.fetchrow(
                     """
-                    SELECT charger_id FROM chargers
-                    WHERE depot_id = $1::uuid AND charger_id = $2
+                    SELECT id AS charger_id FROM charging_stations
+                    WHERE site_id = $1::uuid AND id = $2
                     """,
                     depot_id,
                     uid,
@@ -106,8 +106,8 @@ class ChargingPointResolver:
             else:
                 row = await self.db_pool.fetchrow(
                     """
-                    SELECT charger_id FROM chargers
-                    WHERE depot_id = $1::uuid AND ocpp_id = $2
+                    SELECT id AS charger_id FROM charging_stations
+                    WHERE site_id = $1::uuid AND station_id = $2
                     """,
                     depot_id,
                     charging_point_id,

@@ -1,8 +1,11 @@
 """Just-in-time mirror of Supabase JWT tenancy into static DB rows.
 
 ``organizations`` / ``user_organizations`` are write-side caches for FKs and
-joins. Authorization still uses ``app_metadata`` vs ``depots.organization_id``;
+joins. Authorization still uses ``app_metadata`` vs ``sites.organization_id``;
 this module never trusts ``user_metadata``.
+
+Supabase owns the canonical naming (``organizations.id``, ``user_organizations``).
+This module aliases ``id`` to ``organization_id`` only at the SQL boundary.
 """
 
 from __future__ import annotations
@@ -74,16 +77,22 @@ async def mirror_user_tenant(user: dict, pool: Optional["asyncpg.Pool"]) -> None
     try:
         async with pool.acquire() as conn, conn.transaction():
             await conn.execute(
-                "INSERT INTO organizations (organization_id, name) "
-                "VALUES ($1::uuid, $2) ON CONFLICT (organization_id) DO NOTHING",
+                "INSERT INTO organizations (id, name) "
+                "VALUES ($1::uuid, $2) ON CONFLICT (id) DO NOTHING",
                 org_id,
                 organization_name,
             )
+            # Supabase models user_organizations as multi-org-per-user with PK
+            # (user_id, organization_id). The backend authorizes per-request via
+            # the JWT's app_metadata.organization_id, so writing a row per
+            # (user, org) pair is correct: a user with multiple Supabase orgs
+            # gets one row each, and the role on the (user, jwt-org) pair is
+            # what gets refreshed.
             await conn.execute(
                 "INSERT INTO user_organizations (user_id, organization_id, role) "
                 "VALUES ($1::uuid, $2::uuid, $3) "
-                "ON CONFLICT (user_id) DO UPDATE "
-                "SET organization_id = EXCLUDED.organization_id, role = EXCLUDED.role",
+                "ON CONFLICT (user_id, organization_id) DO UPDATE "
+                "SET role = EXCLUDED.role",
                 user_id,
                 org_id,
                 role,

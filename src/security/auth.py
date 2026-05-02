@@ -194,8 +194,8 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
     try:
         async with pool.acquire() as conn:
             has_access = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM depots "
-                "WHERE depot_id = $1::uuid AND organization_id = $2::uuid)",
+                "SELECT EXISTS(SELECT 1 FROM sites "
+                "WHERE id = $1::uuid AND organization_id = $2::uuid)",
                 depot_id,
                 org_id,
             )

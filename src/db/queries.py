@@ -233,8 +233,8 @@ async def get_schedules(
         end_time = start_time + timedelta(hours=24)
 
     query = """
-        SELECT schedule_id, route_id, departure_time, return_time,
-               actual_return_time, energy_kwh, required_soc, dest_depot_id
+        SELECT id AS schedule_id, route_id, departure_time, return_time,
+               actual_return_time, energy_kwh, required_soc, dest_site_id AS dest_depot_id
         FROM schedules
         WHERE vehicle_id = $1
           AND departure_time >= $2
@@ -265,12 +265,12 @@ async def get_depot_schedules(
         end_time = start_time + timedelta(hours=24)
 
     query = """
-        SELECT s.schedule_id, s.vehicle_id, v.external_id,
+        SELECT s.id AS schedule_id, s.vehicle_id, v.external_id,
                s.route_id, s.departure_time, s.return_time,
-               s.actual_return_time, s.energy_kwh, s.required_soc, s.dest_depot_id
+               s.actual_return_time, s.energy_kwh, s.required_soc, s.dest_site_id AS dest_depot_id
         FROM schedules s
-        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
-        WHERE v.depot_id = $1
+        JOIN vehicles v ON s.vehicle_id = v.id
+        WHERE v.site_id = $1
           AND s.departure_time >= $2
           AND s.departure_time <= $3
         ORDER BY s.departure_time ASC
@@ -284,10 +284,10 @@ async def get_vehicle_ids_for_depot(db, depot_id: UUID, vehicle_ids: list[UUID])
         return set()
 
     query = """
-        SELECT vehicle_id::text AS vehicle_id
+        SELECT id::text AS vehicle_id
         FROM vehicles
-        WHERE depot_id = $1
-          AND vehicle_id = ANY($2::uuid[])
+        WHERE site_id = $1
+          AND id = ANY($2::uuid[])
     """
     rows = await db.fetch(query, depot_id, vehicle_ids)
     return {row["vehicle_id"] for row in rows}
@@ -314,7 +314,7 @@ async def create_manual_schedule(
             energy_kwh
         )
         VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING schedule_id::text AS schedule_id,
+        RETURNING id::text AS schedule_id,
                   vehicle_id::text AS vehicle_id,
                   route_id,
                   departure_time,
@@ -337,7 +337,7 @@ async def create_manual_schedule(
 async def get_schedule_for_depot(db, *, depot_id: UUID, schedule_id: UUID) -> Optional[dict]:
     """Fetch one schedule only if it belongs to a vehicle in the depot."""
     query = """
-        SELECT s.schedule_id::text AS schedule_id,
+        SELECT s.id::text AS schedule_id,
                s.vehicle_id::text AS vehicle_id,
                s.route_id,
                s.departure_time,
@@ -345,9 +345,9 @@ async def get_schedule_for_depot(db, *, depot_id: UUID, schedule_id: UUID) -> Op
                s.required_soc,
                s.energy_kwh
         FROM schedules s
-        JOIN vehicles v ON v.vehicle_id = s.vehicle_id
-        WHERE s.schedule_id = $1
-          AND v.depot_id = $2
+        JOIN vehicles v ON v.id = s.vehicle_id
+        WHERE s.id = $1
+          AND v.site_id = $2
     """
     row = await db.fetchrow(query, schedule_id, depot_id)
     return dict(row) if row else None
@@ -375,12 +375,12 @@ async def update_manual_schedule(
             required_soc = $7,
             energy_kwh = $8
         FROM vehicles old_v, vehicles new_v
-        WHERE s.schedule_id = $1
-          AND old_v.vehicle_id = s.vehicle_id
-          AND old_v.depot_id = $2
-          AND new_v.vehicle_id = $3
-          AND new_v.depot_id = $2
-        RETURNING s.schedule_id::text AS schedule_id,
+        WHERE s.id = $1
+          AND old_v.id = s.vehicle_id
+          AND old_v.site_id = $2
+          AND new_v.id = $3
+          AND new_v.site_id = $2
+        RETURNING s.id::text AS schedule_id,
                   s.vehicle_id::text AS vehicle_id,
                   s.route_id,
                   s.departure_time,
@@ -713,8 +713,8 @@ async def get_vehicle_by_id_tag(
         Vehicle record or None if not found
     """
     query = """
-        SELECT vehicle_id, depot_id, external_id, vehicle_type,
-               battery_kwh, max_charge_kw, id_tag
+        SELECT id AS vehicle_id, site_id AS depot_id, external_id, vehicle_type,
+               battery_capacity_kwh AS battery_kwh, max_charge_rate_kw AS max_charge_kw, id_tag
         FROM vehicles
         WHERE id_tag = $1
     """
@@ -738,8 +738,8 @@ async def list_fleet_identity(db, *, depot_id: str, organization_id: str) -> Opt
         """
         SELECT EXISTS(
             SELECT 1
-            FROM depots
-            WHERE depot_id = $1::uuid
+            FROM sites
+            WHERE id = $1::uuid
               AND organization_id = $2::uuid
         )
         """,
@@ -751,13 +751,13 @@ async def list_fleet_identity(db, *, depot_id: str, organization_id: str) -> Opt
 
     vehicles = await db.fetch(
         """
-        SELECT vehicle_id::text AS vehicle_id,
-               depot_id::text AS depot_id,
+        SELECT id::text AS vehicle_id,
+               site_id::text AS depot_id,
                external_id,
                display_name,
                vehicle_type,
-               battery_kwh,
-               max_charge_kw,
+               battery_capacity_kwh AS battery_kwh,
+               max_charge_rate_kw AS max_charge_kw,
                id_tag,
                vin,
                license_plate,
@@ -765,15 +765,15 @@ async def list_fleet_identity(db, *, depot_id: str, organization_id: str) -> Opt
                created_at,
                updated_at
         FROM vehicles
-        WHERE depot_id = $1::uuid
+        WHERE site_id = $1::uuid
         ORDER BY external_id
         """,
         depot_id,
     )
     drivers = await db.fetch(
         """
-        SELECT driver_id::text AS driver_id,
-               depot_id::text AS depot_id,
+        SELECT id::text AS driver_id,
+               site_id::text AS depot_id,
                external_driver_id,
                display_name,
                email,
@@ -782,15 +782,15 @@ async def list_fleet_identity(db, *, depot_id: str, organization_id: str) -> Opt
                created_at,
                updated_at
         FROM drivers
-        WHERE depot_id = $1::uuid
+        WHERE site_id = $1::uuid
         ORDER BY display_name
         """,
         depot_id,
     )
     cards = await db.fetch(
         """
-        SELECT c.card_id::text AS card_id,
-               c.depot_id::text AS depot_id,
+        SELECT c.id::text AS card_id,
+               c.site_id::text AS depot_id,
                c.id_tag,
                c.label,
                c.status,
@@ -808,10 +808,10 @@ async def list_fleet_identity(db, *, depot_id: str, organization_id: str) -> Opt
                c.created_at,
                c.updated_at
         FROM rfid_cards c
-        LEFT JOIN rfid_card_vehicle_assignments cva ON cva.card_id = c.card_id
-        LEFT JOIN rfid_card_driver_assignments cda ON cda.card_id = c.card_id
-        WHERE c.depot_id = $1::uuid
-        GROUP BY c.card_id
+        LEFT JOIN rfid_card_vehicle_assignments cva ON cva.card_id = c.id
+        LEFT JOIN rfid_card_driver_assignments cda ON cda.card_id = c.id
+        WHERE c.site_id = $1::uuid
+        GROUP BY c.id
         ORDER BY c.label NULLS LAST, c.id_tag
         """,
         depot_id,
@@ -841,20 +841,20 @@ async def create_vehicle_identity(
     """Create a vehicle under an organization-owned depot."""
     query = """
         INSERT INTO vehicles (
-            depot_id, external_id, vehicle_type, battery_kwh, max_charge_kw,
+            site_id, external_id, vehicle_type, battery_capacity_kwh, max_charge_rate_kw,
             display_name, id_tag, vin, license_plate, status
         )
-        SELECT d.depot_id, $3, $4, $5, $6, $7, $8, $9, $10, $11
-        FROM depots d
-        WHERE d.depot_id = $1::uuid
+        SELECT d.id, $3, $4, $5, $6, $7, $8, $9, $10, $11
+        FROM sites d
+        WHERE d.id = $1::uuid
           AND d.organization_id = $2::uuid
-        RETURNING vehicle_id::text AS vehicle_id,
-                  depot_id::text AS depot_id,
+        RETURNING id::text AS vehicle_id,
+                  site_id::text AS depot_id,
                   external_id,
                   display_name,
                   vehicle_type,
-                  battery_kwh,
-                  max_charge_kw,
+                  battery_capacity_kwh AS battery_kwh,
+                  max_charge_rate_kw AS max_charge_kw,
                   id_tag,
                   vin,
                   license_plate,
@@ -900,24 +900,24 @@ async def update_vehicle_identity(
         SET display_name = COALESCE($4, display_name),
             external_id = COALESCE($5, external_id),
             vehicle_type = COALESCE($6, vehicle_type),
-            battery_kwh = COALESCE($7, battery_kwh),
-            max_charge_kw = COALESCE($8, max_charge_kw),
+            battery_capacity_kwh = COALESCE($7, battery_capacity_kwh),
+            max_charge_rate_kw = COALESCE($8, max_charge_rate_kw),
             vin = COALESCE($9, vin),
             license_plate = COALESCE($10, license_plate),
             status = COALESCE($11, status),
             updated_at = NOW()
-        FROM depots d
-        WHERE v.depot_id = d.depot_id
-          AND v.depot_id = $1::uuid
+        FROM sites d
+        WHERE v.site_id = d.id
+          AND v.site_id = $1::uuid
           AND d.organization_id = $2::uuid
-          AND v.vehicle_id = $3::uuid
-        RETURNING v.vehicle_id::text AS vehicle_id,
-                  v.depot_id::text AS depot_id,
+          AND v.id = $3::uuid
+        RETURNING v.id::text AS vehicle_id,
+                  v.site_id::text AS depot_id,
                   v.external_id,
                   v.display_name,
                   v.vehicle_type,
-                  v.battery_kwh,
-                  v.max_charge_kw,
+                  v.battery_capacity_kwh AS battery_kwh,
+                  v.max_charge_rate_kw AS max_charge_kw,
                   v.id_tag,
                   v.vin,
                   v.license_plate,
@@ -955,18 +955,18 @@ async def set_vehicle_primary_id_tag(
         UPDATE vehicles v
         SET id_tag = $4,
             updated_at = NOW()
-        FROM depots d
-        WHERE v.depot_id = d.depot_id
-          AND v.depot_id = $1::uuid
+        FROM sites d
+        WHERE v.site_id = d.id
+          AND v.site_id = $1::uuid
           AND d.organization_id = $2::uuid
-          AND v.vehicle_id = $3::uuid
-        RETURNING v.vehicle_id::text AS vehicle_id,
-                  v.depot_id::text AS depot_id,
+          AND v.id = $3::uuid
+        RETURNING v.id::text AS vehicle_id,
+                  v.site_id::text AS depot_id,
                   v.external_id,
                   v.display_name,
                   v.vehicle_type,
-                  v.battery_kwh,
-                  v.max_charge_kw,
+                  v.battery_capacity_kwh AS battery_kwh,
+                  v.max_charge_rate_kw AS max_charge_kw,
                   v.id_tag,
                   v.vin,
                   v.license_plate,
@@ -991,13 +991,13 @@ async def create_driver_identity(
 ) -> Optional[dict]:
     """Create a driver under an organization-owned depot."""
     query = """
-        INSERT INTO drivers (depot_id, external_driver_id, display_name, email, phone, status)
-        SELECT d.depot_id, $3, $4, $5, $6, $7
-        FROM depots d
-        WHERE d.depot_id = $1::uuid
+        INSERT INTO drivers (site_id, external_driver_id, display_name, email, phone, status)
+        SELECT d.id, $3, $4, $5, $6, $7
+        FROM sites d
+        WHERE d.id = $1::uuid
           AND d.organization_id = $2::uuid
-        RETURNING driver_id::text AS driver_id,
-                  depot_id::text AS depot_id,
+        RETURNING id::text AS driver_id,
+                  site_id::text AS depot_id,
                   external_driver_id,
                   display_name,
                   email,
@@ -1040,13 +1040,13 @@ async def update_driver_identity(
             phone = COALESCE($7, phone),
             status = COALESCE($8, status),
             updated_at = NOW()
-        FROM depots d
-        WHERE dr.depot_id = d.depot_id
-          AND dr.depot_id = $1::uuid
+        FROM sites d
+        WHERE dr.site_id = d.id
+          AND dr.site_id = $1::uuid
           AND d.organization_id = $2::uuid
-          AND dr.driver_id = $3::uuid
-        RETURNING dr.driver_id::text AS driver_id,
-                  dr.depot_id::text AS depot_id,
+          AND dr.id = $3::uuid
+        RETURNING dr.id::text AS driver_id,
+                  dr.site_id::text AS depot_id,
                   dr.external_driver_id,
                   dr.display_name,
                   dr.email,
@@ -1084,13 +1084,13 @@ async def create_rfid_card(
     """Create an RFID card and current assignments under an org-owned depot."""
     row = await db.fetchrow(
         """
-        INSERT INTO rfid_cards (depot_id, id_tag, label, status, notes)
-        SELECT d.depot_id, $3, $4, $5, $6
-        FROM depots d
-        WHERE d.depot_id = $1::uuid
+        INSERT INTO rfid_cards (site_id, id_tag, label, status, notes)
+        SELECT d.id, $3, $4, $5, $6
+        FROM sites d
+        WHERE d.id = $1::uuid
           AND d.organization_id = $2::uuid
-        RETURNING card_id::text AS card_id,
-                  depot_id::text AS depot_id,
+        RETURNING id::text AS card_id,
+                  site_id::text AS depot_id,
                   id_tag,
                   label,
                   status,
@@ -1142,12 +1142,12 @@ async def update_rfid_card(
             status = COALESCE($6, status),
             notes = COALESCE($7, notes),
             updated_at = NOW()
-        FROM depots d
-        WHERE c.depot_id = d.depot_id
-          AND c.depot_id = $1::uuid
+        FROM sites d
+        WHERE c.site_id = d.id
+          AND c.site_id = $1::uuid
           AND d.organization_id = $2::uuid
-          AND c.card_id = $3::uuid
-        RETURNING c.card_id::text AS card_id
+          AND c.id = $3::uuid
+        RETURNING c.id::text AS card_id
         """,
         depot_id,
         organization_id,
@@ -1188,8 +1188,8 @@ async def replace_rfid_card_assignments(
                 """
                 SELECT COUNT(*)
                 FROM vehicles
-                WHERE depot_id = $1::uuid
-                  AND vehicle_id = ANY($2::uuid[])
+                WHERE site_id = $1::uuid
+                  AND id = ANY($2::uuid[])
                 """,
                 depot_id,
                 vehicle_ids,
@@ -1215,8 +1215,8 @@ async def replace_rfid_card_assignments(
                 """
                 SELECT COUNT(*)
                 FROM drivers
-                WHERE depot_id = $1::uuid
-                  AND driver_id = ANY($2::uuid[])
+                WHERE site_id = $1::uuid
+                  AND id = ANY($2::uuid[])
                 """,
                 depot_id,
                 driver_ids,
@@ -1247,8 +1247,8 @@ async def get_rfid_card(
     """Return one RFID card with current assignments."""
     row = await db.fetchrow(
         """
-        SELECT c.card_id::text AS card_id,
-               c.depot_id::text AS depot_id,
+        SELECT c.id::text AS card_id,
+               c.site_id::text AS depot_id,
                c.id_tag,
                c.label,
                c.status,
@@ -1266,13 +1266,13 @@ async def get_rfid_card(
                c.created_at,
                c.updated_at
         FROM rfid_cards c
-        JOIN depots d ON d.depot_id = c.depot_id
-        LEFT JOIN rfid_card_vehicle_assignments cva ON cva.card_id = c.card_id
-        LEFT JOIN rfid_card_driver_assignments cda ON cda.card_id = c.card_id
-        WHERE c.depot_id = $1::uuid
+        JOIN sites d ON d.id = c.site_id
+        LEFT JOIN rfid_card_vehicle_assignments cva ON cva.card_id = c.id
+        LEFT JOIN rfid_card_driver_assignments cda ON cda.card_id = c.id
+        WHERE c.site_id = $1::uuid
           AND d.organization_id = $2::uuid
-          AND c.card_id = $3::uuid
-        GROUP BY c.card_id
+          AND c.id = $3::uuid
+        GROUP BY c.id
         """,
         depot_id,
         organization_id,
@@ -1296,13 +1296,13 @@ async def resolve_id_tag_identity(
     depot_filter = ""
     params: list[Any] = [id_tag]
     if station_id is not None:
-        depot_filter = " AND EXISTS (SELECT 1 FROM chargers c WHERE c.ocpp_id = $2 AND c.depot_id = v.depot_id)"
+        depot_filter = " AND EXISTS (SELECT 1 FROM charging_stations c WHERE c.station_id = $2 AND c.site_id = v.site_id)"
         params.append(station_id)
 
     vehicle_rows = await db.fetch(
         f"""
-        SELECT v.vehicle_id::text AS vehicle_id,
-               v.depot_id::text AS depot_id,
+        SELECT v.id::text AS vehicle_id,
+               v.site_id::text AS depot_id,
                NULL::text AS driver_id,
                NULL::text AS card_id,
                'vehicle'::text AS source
@@ -1323,18 +1323,18 @@ async def resolve_id_tag_identity(
     card_depot_filter = ""
     params = [id_tag]
     if station_id is not None:
-        card_depot_filter = " AND EXISTS (SELECT 1 FROM chargers ch WHERE ch.ocpp_id = $2 AND ch.depot_id = c.depot_id)"
+        card_depot_filter = " AND EXISTS (SELECT 1 FROM charging_stations ch WHERE ch.station_id = $2 AND ch.site_id = c.site_id)"
         params.append(station_id)
     card_rows = await db.fetch(
         f"""
-        SELECT c.card_id::text AS card_id,
-               c.depot_id::text AS depot_id,
+        SELECT c.id::text AS card_id,
+               c.site_id::text AS depot_id,
                (
                    SELECT cva.vehicle_id::text
                    FROM rfid_card_vehicle_assignments cva
-                   JOIN vehicles v ON v.vehicle_id = cva.vehicle_id
-                   WHERE cva.card_id = c.card_id
-                     AND v.depot_id = c.depot_id
+                   JOIN vehicles v ON v.id = cva.vehicle_id
+                   WHERE cva.card_id = c.id
+                     AND v.site_id = c.site_id
                      AND v.status = 'active'
                    ORDER BY v.external_id
                    LIMIT 1
@@ -1342,9 +1342,9 @@ async def resolve_id_tag_identity(
                (
                    SELECT cda.driver_id::text
                    FROM rfid_card_driver_assignments cda
-                   JOIN drivers dr ON dr.driver_id = cda.driver_id
-                   WHERE cda.card_id = c.card_id
-                     AND dr.depot_id = c.depot_id
+                   JOIN drivers dr ON dr.id = cda.driver_id
+                   WHERE cda.card_id = c.id
+                     AND dr.site_id = c.site_id
                      AND dr.status = 'active'
                    ORDER BY dr.display_name
                    LIMIT 1
@@ -1375,7 +1375,7 @@ async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
         Dict with depot fields, or None if not found
     """
     query = """
-        SELECT depot_id::text AS depot_id,
+        SELECT id::text AS depot_id,
                organization_id::text AS organization_id,
                name,
                latitude,
@@ -1389,8 +1389,8 @@ async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
                address,
                billing_metadata,
                building_load_source
-        FROM depots
-        WHERE depot_id = $1::uuid
+        FROM sites
+        WHERE id = $1::uuid
     """
     row = await db.fetchrow(query, depot_id)
     if not row:
@@ -1413,7 +1413,7 @@ async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
         List of depot metadata dicts (same order not guaranteed)
     """
     query = """
-        SELECT depot_id::text AS depot_id,
+        SELECT id::text AS depot_id,
                organization_id::text AS organization_id,
                name,
                latitude,
@@ -1427,8 +1427,8 @@ async def get_depots_by_ids(db, depot_ids: list[str]) -> list[dict]:
                address,
                billing_metadata,
                building_load_source
-        FROM depots
-        WHERE depot_id = ANY($1::uuid[])
+        FROM sites
+        WHERE id = ANY($1::uuid[])
         ORDER BY name
     """
     rows = await db.fetch(query, depot_ids)
@@ -1452,7 +1452,7 @@ async def get_all_depots(db) -> list[dict]:
         List of depot metadata dicts ordered by name
     """
     query = """
-        SELECT depot_id::text AS depot_id,
+        SELECT id::text AS depot_id,
                organization_id::text AS organization_id,
                name,
                latitude,
@@ -1466,7 +1466,7 @@ async def get_all_depots(db) -> list[dict]:
                address,
                billing_metadata,
                building_load_source
-        FROM depots
+        FROM sites
         ORDER BY name
     """
     rows = await db.fetch(query)
@@ -1483,7 +1483,7 @@ async def get_all_depots(db) -> list[dict]:
 async def get_depots_for_organization(db, organization_id: str) -> list[dict]:
     """Return depot metadata rows for a single organization."""
     query = """
-        SELECT depot_id::text AS depot_id,
+        SELECT id::text AS depot_id,
                organization_id::text AS organization_id,
                name,
                latitude,
@@ -1497,7 +1497,7 @@ async def get_depots_for_organization(db, organization_id: str) -> list[dict]:
                address,
                billing_metadata,
                building_load_source
-        FROM depots
+        FROM sites
         WHERE organization_id = $1::uuid
         ORDER BY name
     """
@@ -1516,8 +1516,8 @@ async def depot_belongs_to_organization(db, depot_id: str, organization_id: str)
     """Return True if the depot exists and is assigned to the organization."""
     q = """
         SELECT EXISTS(
-            SELECT 1 FROM depots
-            WHERE depot_id = $1::uuid AND organization_id = $2::uuid
+            SELECT 1 FROM sites
+            WHERE id = $1::uuid AND organization_id = $2::uuid
         )
     """
     return bool(await db.fetchval(q, depot_id, organization_id))
@@ -1526,13 +1526,13 @@ async def depot_belongs_to_organization(db, depot_id: str, organization_id: str)
 async def get_depot_org_slug_context(db, *, depot_id: str, organization_id: str) -> Optional[dict]:
     """Return organization/depot names for an organization-owned depot."""
     query = """
-        SELECT d.depot_id::text AS depot_id,
+        SELECT d.id::text AS depot_id,
                d.name AS depot_name,
                d.organization_id::text AS organization_id,
                o.name AS organization_name
-        FROM depots d
-        JOIN organizations o ON o.organization_id = d.organization_id
-        WHERE d.depot_id = $1::uuid AND d.organization_id = $2::uuid
+        FROM sites d
+        JOIN organizations o ON o.id = d.organization_id
+        WHERE d.id = $1::uuid AND d.organization_id = $2::uuid
     """
     row = await db.fetchrow(query, depot_id, organization_id)
     return dict(row) if row else None
@@ -1548,10 +1548,10 @@ async def next_charger_ocpp_id(
     # Use a separator that slugification never emits to keep org/depot boundaries unambiguous.
     prefix = f"{organization_slug}_{depot_slug}"
     query = """
-        SELECT ocpp_id
-        FROM chargers
-        WHERE ocpp_id ~ ('^' || $1 || '-[0-9]+$')
-        ORDER BY substring(ocpp_id FROM '([0-9]+)$')::integer DESC
+        SELECT station_id AS ocpp_id
+        FROM charging_stations
+        WHERE station_id ~ ('^' || $1 || '-[0-9]+$')
+        ORDER BY substring(station_id FROM '([0-9]+)$')::integer DESC
         LIMIT 1
     """
     latest = await db.fetchval(query, prefix)
@@ -1583,10 +1583,10 @@ async def create_charger_with_credentials(
 ) -> dict:
     """Create a charger and its Basic Auth credential in one transaction."""
     charger_query = """
-        INSERT INTO chargers (
-            depot_id,
-            ocpp_id,
-            rated_kw,
+        INSERT INTO charging_stations (
+            site_id,
+            station_id,
+            max_power_kw,
             connector_type,
             display_name,
             vendor,
@@ -1601,15 +1601,15 @@ async def create_charger_with_credentials(
         VALUES (
             $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, TRUE
         )
-        RETURNING charger_id::text AS id,
-                  depot_id::text AS depot_id,
-                  ocpp_id,
+        RETURNING id::text AS id,
+                  site_id::text AS depot_id,
+                  station_id AS ocpp_id,
                   display_name,
                   vendor,
                   model,
                   serial_number,
                   firmware,
-                  rated_kw,
+                  max_power_kw AS rated_kw,
                   efficiency,
                   connector_type,
                   connector_count,
@@ -1765,7 +1765,7 @@ async def create_depot_setup(
 ) -> dict:
     """Create a depot row scoped to organization and return metadata."""
     query = """
-        INSERT INTO depots (
+        INSERT INTO sites (
             organization_id,
             name,
             latitude,
@@ -1792,7 +1792,7 @@ async def create_depot_setup(
             $11::jsonb, $12::jsonb, $13::jsonb, $14,
             $15, $16, $17, $18, $19, $20
         )
-        RETURNING depot_id::text AS depot_id,
+        RETURNING id::text AS depot_id,
                   organization_id::text AS organization_id,
                   name,
                   latitude,
@@ -1870,7 +1870,7 @@ async def update_depot_setup(
 ) -> Optional[dict]:
     """Update depot setup metadata and return updated row."""
     query = """
-        UPDATE depots
+        UPDATE sites
         SET name = $2,
             latitude = $3,
             longitude = $4,
@@ -1891,8 +1891,8 @@ async def update_depot_setup(
             over_cap_penalty_per_kwh = $19,
             cap_billing_period = $20,
             updated_at = NOW()
-        WHERE depot_id = $1::uuid
-        RETURNING depot_id::text AS depot_id,
+        WHERE id = $1::uuid
+        RETURNING id::text AS depot_id,
                   organization_id::text AS organization_id,
                   name,
                   latitude,
@@ -1966,8 +1966,8 @@ async def upsert_charger_vehicle_access(
     valid_chargers = {
         row["charger_id"]
         for row in await db.fetch(
-            "SELECT charger_id::text AS charger_id FROM chargers "
-            "WHERE depot_id = $1::uuid AND charger_id = ANY($2::uuid[])",
+            "SELECT id::text AS charger_id FROM charging_stations "
+            "WHERE site_id = $1::uuid AND id = ANY($2::uuid[])",
             depot_id,
             list(charger_ids),
         )
@@ -1975,8 +1975,8 @@ async def upsert_charger_vehicle_access(
     valid_vehicles = {
         row["vehicle_id"]
         for row in await db.fetch(
-            "SELECT vehicle_id::text AS vehicle_id FROM vehicles "
-            "WHERE depot_id = $1::uuid AND vehicle_id = ANY($2::uuid[])",
+            "SELECT id::text AS vehicle_id FROM vehicles "
+            "WHERE site_id = $1::uuid AND id = ANY($2::uuid[])",
             depot_id,
             list(vehicle_ids),
         )
@@ -1990,9 +1990,9 @@ async def upsert_charger_vehicle_access(
         }
 
     upsert_query = """
-        INSERT INTO charger_vehicle_access (charger_id, vehicle_id, is_accessible)
+        INSERT INTO charger_vehicle_access (charging_station_id, vehicle_id, is_accessible)
         VALUES ($1::uuid, $2::uuid, $3)
-        ON CONFLICT (charger_id, vehicle_id) DO UPDATE
+        ON CONFLICT (charging_station_id, vehicle_id) DO UPDATE
         SET is_accessible = EXCLUDED.is_accessible
     """
     for entry in entries:
@@ -2016,9 +2016,9 @@ async def upsert_battery_storage(
 ) -> None:
     """Create/update depot battery row."""
     query = """
-        INSERT INTO battery_storage (depot_id, capacity_kwh, max_power_kw, soc_min, soc_max)
+        INSERT INTO battery_storage (site_id, capacity_kwh, max_power_kw, soc_min, soc_max)
         VALUES ($1::uuid, $2, $3, $4, $5)
-        ON CONFLICT (depot_id) DO UPDATE
+        ON CONFLICT (site_id) DO UPDATE
         SET capacity_kwh = EXCLUDED.capacity_kwh,
             max_power_kw = EXCLUDED.max_power_kw,
             soc_min = EXCLUDED.soc_min,
@@ -2029,7 +2029,7 @@ async def upsert_battery_storage(
 
 async def delete_battery_storage(db, *, depot_id: str) -> None:
     """Delete battery config for depot."""
-    await db.execute("DELETE FROM battery_storage WHERE depot_id = $1::uuid", depot_id)
+    await db.execute("DELETE FROM battery_storage WHERE site_id = $1::uuid", depot_id)
 
 
 async def update_vehicle_max_charge_kw(
@@ -2051,8 +2051,8 @@ async def update_vehicle_max_charge_kw(
     """
     query = """
         UPDATE vehicles
-        SET max_charge_kw = $2
-        WHERE vehicle_id = $1
+        SET max_charge_rate_kw = $2
+        WHERE id = $1
     """
     result = await db.execute(query, vehicle_id, max_charge_kw)
     return result != "UPDATE 0"
@@ -2064,7 +2064,7 @@ async def update_vehicle_max_charge_kw(
 async def list_all_organizations(db) -> list[dict]:
     """Return all organizations (favonius_admin only)."""
     query = """
-        SELECT organization_id::text AS organization_id,
+        SELECT id::text AS organization_id,
                name,
                created_at,
                updated_at
@@ -2085,16 +2085,16 @@ async def get_charger_credentials_status(
     NEVER returns the password_hash.
     """
     query = """
-        SELECT c.charger_id::text AS charger_id,
-               c.depot_id::text AS depot_id,
-               c.ocpp_id,
+        SELECT c.id::text AS charger_id,
+               c.site_id::text AS depot_id,
+               c.station_id AS ocpp_id,
                sc.created_at AS credentials_created_at,
                sc.last_rotated_at AS credentials_last_rotated_at,
                sc.active AS credentials_active
-        FROM chargers c
+        FROM charging_stations c
         LEFT JOIN station_credentials sc
-            ON sc.station_id = c.ocpp_id AND sc.username = c.ocpp_id
-        WHERE c.charger_id = $1::uuid AND c.depot_id = $2::uuid
+            ON sc.station_id = c.station_id AND sc.username = c.station_id
+        WHERE c.id = $1::uuid AND c.site_id = $2::uuid
     """
     row = await db.fetchrow(query, charger_id, depot_id)
     return dict(row) if row else None
@@ -2109,9 +2109,9 @@ async def rotate_charger_credentials(
     does not exist. Never reads or returns the previous hash.
     """
     fetch_query = """
-        SELECT ocpp_id
-        FROM chargers
-        WHERE charger_id = $1::uuid AND depot_id = $2::uuid
+        SELECT station_id AS ocpp_id
+        FROM charging_stations
+        WHERE id = $1::uuid AND site_id = $2::uuid
         FOR UPDATE
     """
     row = await db.fetchrow(fetch_query, charger_id, depot_id)

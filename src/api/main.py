@@ -2433,17 +2433,17 @@ async def _build_depot_readiness_checklist(
     ) -> tuple[bool, bool, str, bool, bool, bool]:
         has_vehicles = bool(
             await static_conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM vehicles WHERE depot_id = $1::uuid)", depot_id
+                "SELECT EXISTS(SELECT 1 FROM vehicles WHERE site_id = $1::uuid)", depot_id
             )
         )
         has_chargers = bool(
             await static_conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM chargers WHERE depot_id = $1::uuid)", depot_id
+                "SELECT EXISTS(SELECT 1 FROM charging_stations WHERE site_id = $1::uuid)", depot_id
             )
         )
         access_default = (
             await static_conn.fetchval(
-                "SELECT charger_vehicle_access_default FROM depots WHERE depot_id = $1::uuid",
+                "SELECT charger_vehicle_access_default FROM sites WHERE id = $1::uuid",
                 depot_id,
             )
         ) or "explicit_matrix"
@@ -2455,8 +2455,8 @@ async def _build_depot_readiness_checklist(
                     SELECT EXISTS(
                         SELECT 1
                         FROM charger_vehicle_access cva
-                        JOIN chargers c ON c.charger_id = cva.charger_id
-                        WHERE c.depot_id = $1::uuid AND cva.is_accessible = TRUE
+                        JOIN charging_stations c ON c.id = cva.charging_station_id
+                        WHERE c.site_id = $1::uuid AND cva.is_accessible = TRUE
                     )
                     """,
                     depot_id,
@@ -2468,8 +2468,8 @@ async def _build_depot_readiness_checklist(
                 SELECT EXISTS(
                     SELECT 1
                     FROM schedules s
-                    JOIN vehicles v ON v.vehicle_id = s.vehicle_id
-                    WHERE v.depot_id = $1::uuid AND s.departure_time >= NOW() - INTERVAL '1 hour'
+                    JOIN vehicles v ON v.id = s.vehicle_id
+                    WHERE v.site_id = $1::uuid AND s.departure_time >= NOW() - INTERVAL '1 hour'
                 )
                 """,
                 depot_id,
@@ -2477,7 +2477,7 @@ async def _build_depot_readiness_checklist(
         )
         has_battery = bool(
             await static_conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM battery_storage WHERE depot_id = $1::uuid)",
+                "SELECT EXISTS(SELECT 1 FROM battery_storage WHERE site_id = $1::uuid)",
                 depot_id,
             )
         )
@@ -3768,7 +3768,7 @@ async def upsert_charger_vehicle_access_endpoint(
     async with db_pools.static.acquire() as conn:
         access_default = (
             await conn.fetchval(
-                "SELECT charger_vehicle_access_default FROM depots WHERE depot_id = $1::uuid",
+                "SELECT charger_vehicle_access_default FROM sites WHERE id = $1::uuid",
                 depot_id,
             )
         ) or "explicit_matrix"
@@ -3802,7 +3802,7 @@ async def upsert_charger_vehicle_access_endpoint(
 
     async with db_pools.static.acquire() as conn:
         depot_row = await conn.fetchrow(
-            "SELECT name, timezone, currency, max_grid_kw FROM depots " "WHERE depot_id = $1::uuid",
+            "SELECT name, timezone, currency, max_grid_kw FROM sites " "WHERE id = $1::uuid",
             depot_id,
         )
     if not depot_row:
@@ -4304,8 +4304,8 @@ async def _load_report_context(
         depot_row = await conn.fetchrow(
             """
             SELECT timezone, currency, billing_metadata
-            FROM depots
-            WHERE depot_id = $1::uuid
+            FROM sites
+            WHERE id = $1::uuid
             """,
             depot_id,
         )
@@ -4313,7 +4313,7 @@ async def _load_report_context(
             raise DepotNotFoundError(f"Depot {depot_id} not found")
 
         charger_rows = await conn.fetch(
-            "SELECT charger_id::text AS charger_id, ocpp_id FROM chargers WHERE depot_id = $1::uuid",
+            "SELECT id::text AS charger_id, station_id AS ocpp_id FROM charging_stations WHERE site_id = $1::uuid",
             depot_id,
         )
 
@@ -4735,7 +4735,7 @@ async def get_depot_alerts(
         # Static data: depot existence check + name + charger ocpp_id → charger_id map
         async with db_pools.static.acquire() as conn:
             depot_row = await conn.fetchrow(
-                "SELECT name FROM depots WHERE depot_id = $1",
+                "SELECT name FROM sites WHERE id = $1",
                 depot_id,
             )
             if depot_row is None:
@@ -4743,7 +4743,7 @@ async def get_depot_alerts(
             depot_name: Optional[str] = depot_row["name"]
 
             charger_rows = await conn.fetch(
-                "SELECT charger_id, ocpp_id FROM chargers WHERE depot_id = $1",
+                "SELECT id AS charger_id, station_id AS ocpp_id FROM charging_stations WHERE site_id = $1",
                 depot_id,
             )
         charger_map: dict[str, str] = {r["ocpp_id"]: str(r["charger_id"]) for r in charger_rows}
@@ -4939,9 +4939,9 @@ async def send_handoff(
 
         # Get vehicle details for handoff message (vehicles is in Supabase)
         vehicle_query = """
-        SELECT external_id, battery_kwh, max_charge_kw
+        SELECT external_id, battery_capacity_kwh AS battery_kwh, max_charge_rate_kw AS max_charge_kw
         FROM vehicles
-        WHERE vehicle_id = $1 AND depot_id = $2
+        WHERE id = $1 AND site_id = $2
         """
         async with db_pools.static.acquire() as conn:
             vehicle_row = await conn.fetchrow(vehicle_query, vehicle_id, depot_id)
@@ -5506,7 +5506,7 @@ async def receive_ocpp_event(
     try:
         async with db_pools.static.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT depot_id::text FROM chargers WHERE ocpp_id = $1",
+                "SELECT site_id::text AS depot_id FROM charging_stations WHERE station_id = $1",
                 payload.charge_point_id,
             )
     except Exception as e:
@@ -6236,11 +6236,11 @@ async def _handle_schedule_adjust(
 
     update_query = """
         WITH target_schedule AS (
-            SELECT s.schedule_id
+            SELECT s.id AS schedule_id
             FROM schedules s
-            JOIN vehicles v ON v.vehicle_id = s.vehicle_id
+            JOIN vehicles v ON v.id = s.vehicle_id
             WHERE s.vehicle_id = $1::uuid
-              AND v.depot_id = $2::uuid
+              AND v.site_id = $2::uuid
               AND s.departure_time >= $3
             ORDER BY s.departure_time
             LIMIT 1
@@ -6248,8 +6248,8 @@ async def _handle_schedule_adjust(
         UPDATE schedules s
         SET required_soc = $4
         FROM target_schedule ts
-        WHERE s.schedule_id = ts.schedule_id
-        RETURNING s.schedule_id::text AS schedule_id, s.departure_time, s.required_soc
+        WHERE s.id = ts.schedule_id
+        RETURNING s.id::text AS schedule_id, s.departure_time, s.required_soc
     """
     async with db_pools.static.acquire() as conn:
         updated_schedule = await conn.fetchrow(
@@ -6316,8 +6316,8 @@ async def _handle_depot_config_update(
         values.append(params["max_grid_kw"])
 
     query = (
-        f"UPDATE depots SET {', '.join(set_clauses)} "
-        "WHERE depot_id = $1::uuid RETURNING max_grid_kw"
+        f"UPDATE sites SET {', '.join(set_clauses)} "
+        "WHERE id = $1::uuid RETURNING max_grid_kw"
     )
     async with db_pools.static.acquire() as conn:
         row = await conn.fetchrow(query, *values)

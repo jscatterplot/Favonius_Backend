@@ -93,8 +93,8 @@ class VehicleResolver:
             try:
                 row = await self.db_pool.fetchrow(
                     """
-                    SELECT vehicle_id FROM vehicles
-                    WHERE depot_id = $1::uuid AND external_id = $2
+                    SELECT id AS vehicle_id FROM vehicles
+                    WHERE site_id = $1::uuid AND external_id = $2
                     """,
                     depot_id,
                     vehicle_external_id,

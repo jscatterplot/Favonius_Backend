@@ -47,17 +47,17 @@ async def get_vehicle_to_charger_map(
         return _mapping_cache[depot_id_str]
 
     query = """
-    SELECT DISTINCT ON (v.vehicle_id)
-        v.vehicle_id::text as vehicle_id,
-        c.ocpp_id as charge_point_id,
+    SELECT DISTINCT ON (v.id)
+        v.id::text as vehicle_id,
+        c.station_id as charge_point_id,
         1 as connector_id  -- Default to connector 1
     FROM vehicles v
-    JOIN charger_vehicle_access cva ON v.vehicle_id = cva.vehicle_id
-    JOIN chargers c ON cva.charger_id = c.charger_id
-    WHERE v.depot_id = $1::uuid
+    JOIN charger_vehicle_access cva ON v.id = cva.vehicle_id
+    JOIN charging_stations c ON cva.charging_station_id = c.id
+    WHERE v.site_id = $1::uuid
       AND cva.is_accessible = TRUE
-      AND c.ocpp_id IS NOT NULL
-    ORDER BY v.vehicle_id, c.ocpp_id
+      AND c.station_id IS NOT NULL
+    ORDER BY v.id, c.station_id
     """
 
     mapping: dict[str, tuple[str, int]] = {}
@@ -102,9 +102,9 @@ async def get_charger_id_from_ocpp_id(pool: asyncpg.Pool, ocpp_id: str) -> Optio
         Charger UUID or None if not found
     """
     query = """
-    SELECT charger_id
-    FROM chargers
-    WHERE ocpp_id = $1
+    SELECT id AS charger_id
+    FROM charging_stations
+    WHERE station_id = $1
     LIMIT 1
     """
 
