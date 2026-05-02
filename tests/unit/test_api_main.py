@@ -398,7 +398,7 @@ class TestHandoffEndpoint:
     """Test /depots/{depot_id}/vehicles/{vehicle_id}/handoff endpoint."""
 
     @patch("src.api.main.db_pools")
-    def test_send_handoff_success(self, mock_pool, client, mock_db_pool):
+    def test_send_handoff_success(self, mock_pool, client, mock_db_pool, monkeypatch):
         """Test successful handoff message."""
         pool, conn = mock_db_pool
         mock_pool = pool
@@ -406,6 +406,11 @@ class TestHandoffEndpoint:
         depot_id = str(uuid4())
         vehicle_id = str(uuid4())
         dest_depot_id = str(uuid4())
+
+        # Security (C2): send_handoff now requires HANDOFF_SIGNING_KEY to be
+        # configured; without it the endpoint refuses to issue an unsigned
+        # request.
+        monkeypatch.setenv("HANDOFF_SIGNING_KEY", "test-key-for-handoff-signature")
 
         conn.execute = AsyncMock()
         conn.fetchrow = AsyncMock(

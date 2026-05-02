@@ -80,23 +80,57 @@ BEGIN
         WHERE table_name = 'weather_forecasts'
           AND table_schema = current_schema()
     ) THEN
-        INSERT INTO weather_forecasts_v2 (
-            forecast_id, depot_id, source, fetched_at, forecast_for,
-            temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
-        )
-        SELECT
-            gen_random_uuid()                          AS forecast_id,
-            depot_id,
-            'open_meteo'                               AS source,
-            -- Older rows may have NULL fetched_at because the legacy
-            -- schema's DEFAULT NOW() didn't apply to manual backfills.
-            -- Fall back to ``time`` so the row still has a sensible
-            -- partition key.
-            COALESCE(fetched_at, time, NOW())          AS fetched_at,
-            time                                       AS forecast_for,
-            temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
-        FROM weather_forecasts
-        ON CONFLICT (depot_id, source, fetched_at, forecast_for) DO NOTHING;
+        -- Handle both legacy schemas:
+        --   * migration 001 shape: has column "time"
+        --   * partially-migrated/newer shape: has "forecast_for"
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'weather_forecasts'
+              AND column_name = 'time'
+        ) THEN
+            INSERT INTO weather_forecasts_v2 (
+                forecast_id, depot_id, source, fetched_at, forecast_for,
+                temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
+            )
+            SELECT
+                gen_random_uuid()                          AS forecast_id,
+                depot_id,
+                'open_meteo'                               AS source,
+                -- Older rows may have NULL fetched_at because the legacy
+                -- schema's DEFAULT NOW() didn't apply to manual backfills.
+                -- Fall back to ``time`` so the row still has a sensible
+                -- partition key.
+                COALESCE(fetched_at, time, NOW())          AS fetched_at,
+                time                                       AS forecast_for,
+                temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
+            FROM weather_forecasts
+            ON CONFLICT (depot_id, source, fetched_at, forecast_for) DO NOTHING;
+        ELSIF EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'weather_forecasts'
+              AND column_name = 'forecast_for'
+        ) THEN
+            INSERT INTO weather_forecasts_v2 (
+                forecast_id, depot_id, source, fetched_at, forecast_for,
+                temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
+            )
+            SELECT
+                COALESCE(forecast_id, gen_random_uuid())  AS forecast_id,
+                depot_id,
+                COALESCE(source, 'open_meteo')             AS source,
+                COALESCE(fetched_at, forecast_for, NOW())  AS fetched_at,
+                forecast_for,
+                temp_f, temp_max_f, temp_min_f, precip_in, solar_rad
+            FROM weather_forecasts
+            ON CONFLICT (depot_id, source, fetched_at, forecast_for) DO NOTHING;
+        ELSE
+            RAISE EXCEPTION
+                'weather_forecasts has unexpected schema: expected "time" or "forecast_for"';
+        END IF;
     END IF;
 END$$;
 
