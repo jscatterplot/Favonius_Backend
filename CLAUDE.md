@@ -362,7 +362,8 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `GET` | `/metrics` | Prometheus metrics (text format) |
 | `GET` | `/admin/controllers` | List active depot controllers |
 | `GET` | `/admin/controllers/{id}/health` | Controller health |
-| `POST` | `/admin/first-depot-setup` | Create initial tenant-scoped depot setup (customer_admin, JWT `app_metadata.organization_id` required) |
+| `POST` | `/admin/depots` | Create a tenant-scoped depot in the caller's organization. Safe to call repeatedly; `Idempotency-Key` header required (customer_admin, JWT `app_metadata.organization_id` required) |
+| `POST` | `/admin/first-depot-setup` | Backward-compatible alias for `POST /admin/depots`. Same handler; same `Idempotency-Key` requirement |
 | `PATCH` | `/admin/depots/{id}` | Update tenant-scoped depot setup (customer_admin + depot access required) |
 | `GET` | `/admin/organizations` | List all organizations (favonius_admin only; writes `admin.read` audit row) |
 | `GET` | `/admin/organizations/{org_id}/depots` | List depots for an organization (favonius_admin or matching customer_admin; cross-org reads write `admin.read`; mismatched customer_admin → 403, NOT 404) |
