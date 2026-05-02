@@ -52,6 +52,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # Build with: docker build --secret id=maxmind_key,src=maxmind.key .
 # Then: RUN --mount=type=secret,id=maxmind_key curl ... $(cat /run/secrets/maxmind_key)
 ARG MAXMIND_LICENSE_KEY
+ARG MAXMIND_ACCOUNT_ID
 
 # Install runtime dependencies
 # Per PRD Section 8.2: Gurobi requires specific system libraries
@@ -80,13 +81,17 @@ COPY schemas/ ./schemas/
 # Download MaxMind GeoLite2-Country database for Article 73-3 geo-blocking.
 # The database is loaded into memory at startup (~5MB) for sub-microsecond lookups.
 # Rebuild the image monthly to refresh the database.
-# Note: In production, set MAXMIND_LICENSE_KEY to download the latest version.
-# Without a license key, a bundled fallback is used (if available).
+#
+# Authenticates via HTTP Basic Auth (account ID + license key) per MaxMind's
+# 2024 policy change. Both MAXMIND_ACCOUNT_ID and MAXMIND_LICENSE_KEY must be
+# set as build args; without them the build skips the download and the runtime
+# fallback in geo_block.py picks up the same credentials at startup.
 RUN mkdir -p /app/data && \
-    if [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then \
+    if [ -n "${MAXMIND_LICENSE_KEY:-}" ] && [ -n "${MAXMIND_ACCOUNT_ID:-}" ]; then \
         if curl -sSL --fail --retry 3 --retry-delay 5 --retry-all-errors \
+            -u "${MAXMIND_ACCOUNT_ID}:${MAXMIND_LICENSE_KEY}" \
             -o /tmp/geoip.tar.gz \
-            "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"; then \
+            "https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz"; then \
             if file /tmp/geoip.tar.gz | grep -q gzip; then \
                 tar -xzf /tmp/geoip.tar.gz --strip-components=1 -C /app/data --wildcards '*/GeoLite2-Country.mmdb' && \
                 echo "GeoLite2-Country.mmdb downloaded successfully"; \
@@ -97,8 +102,10 @@ RUN mkdir -p /app/data && \
             echo "WARNING: MaxMind download failed after retries — runtime fallback will retry"; \
         fi; \
         rm -f /tmp/geoip.tar.gz; \
+    elif [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then \
+        echo "WARNING: MAXMIND_LICENSE_KEY set but MAXMIND_ACCOUNT_ID missing — MaxMind requires both since 2024. Skipping build-time download."; \
     else \
-        echo "MAXMIND_LICENSE_KEY not set — GeoIP DB must be mounted at /app/data/GeoLite2-Country.mmdb"; \
+        echo "MAXMIND_ACCOUNT_ID/MAXMIND_LICENSE_KEY not set — GeoIP DB must be mounted at /app/data/GeoLite2-Country.mmdb"; \
     fi
 
 # Create directories for logs, data, and ensure proper permissions

@@ -737,7 +737,8 @@ test(api): add coverage for handoff rate limiting
 | `GEO_BLOCK_ALLOWLIST` | — | Comma-separated IPs/CIDRs that bypass geo-blocking |
 | `GEO_BLOCK_FAIL_CLOSED` | `true` | Block requests when GeoIP resolution fails |
 | `GEOIP_DB_PATH` | `/app/data/GeoLite2-Country.mmdb` | MaxMind DB path |
-| `MAXMIND_LICENSE_KEY` | — | MaxMind license. Set as **both** a build variable (Dockerfile downloads at build, `Dockerfile:54`) **and** a runtime variable (app re-downloads at startup with retries via `_download_geoip_db` if the build-time download was skipped or hit a transient outage). Without it set anywhere, the app fails closed. |
+| `MAXMIND_ACCOUNT_ID` | — | MaxMind account ID. Required since MaxMind's 2024 policy change — paired with `MAXMIND_LICENSE_KEY` in HTTP Basic Auth (account ID = username, license key = password) against `https://download.maxmind.com/geoip/databases/GeoLite2-Country/download`. Set as **both** a build variable and a runtime variable, same as the license key. Without it the download is skipped and the app fails closed. |
+| `MAXMIND_LICENSE_KEY` | — | MaxMind license. Set as **both** a build variable (Dockerfile downloads at build, `Dockerfile:54`) **and** a runtime variable (app re-downloads at startup with retries via `_download_geoip_db` if the build-time download was skipped or hit a transient outage). Requires `MAXMIND_ACCOUNT_ID`; without either set anywhere, the app fails closed. |
 
 ### Alerts pipeline (notifications)
 See `docs/plans/alerts-pipeline.md` for the full design.

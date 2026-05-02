@@ -15,6 +15,7 @@ This module provides:
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import logging
 import os
@@ -23,7 +24,6 @@ import tarfile
 import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -42,10 +42,15 @@ _DEFAULT_GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "/app/data/GeoLite2-Country.
 
 # Runtime download configuration. Build-time download lives in the Dockerfile;
 # this is the second-layer fallback used when the build-time download failed
-# (transient MaxMind outage) or the image was built without MAXMIND_LICENSE_KEY.
+# (transient MaxMind outage) or the image was built without
+# MAXMIND_ACCOUNT_ID / MAXMIND_LICENSE_KEY.
+#
+# As of MaxMind's 2024 policy change the legacy `?license_key=` query-param
+# endpoint is deprecated. Database downloads now require HTTP Basic Auth with
+# the account ID as the username and the license key as the password against
+# the new `/geoip/databases/{edition_id}/download` endpoint.
 _MAXMIND_DOWNLOAD_URL = (
-    "https://download.maxmind.com/app/geoip_download"
-    "?edition_id=GeoLite2-Country&license_key={license_key}&suffix=tar.gz"
+    "https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz"
 )
 _DEFAULT_DOWNLOAD_RETRIES = 3
 _DEFAULT_DOWNLOAD_BACKOFF_S = 5.0
@@ -58,6 +63,7 @@ def _download_geoip_db(
     db_path: str,
     license_key: str,
     *,
+    account_id: str = "",
     retries: int = _DEFAULT_DOWNLOAD_RETRIES,
     backoff_s: float = _DEFAULT_DOWNLOAD_BACKOFF_S,
     timeout_s: float = _DEFAULT_DOWNLOAD_TIMEOUT_S,
@@ -69,9 +75,15 @@ def _download_geoip_db(
     db_path. Returns False (and logs a warning) on any failure — never raises,
     so a missing DB still falls through to the existing fail-closed runtime path.
 
+    Authenticates to MaxMind's database download endpoint via HTTP Basic Auth
+    (account ID as username, license key as password) per MaxMind's 2024
+    policy change.
+
     Args:
         db_path: Destination .mmdb path.
         license_key: MaxMind license key. Empty string is a no-op.
+        account_id: MaxMind account ID. Empty string is a no-op (paired with
+            license_key, both are required by MaxMind's current download API).
         retries: Retry attempts after the initial try (total = retries + 1).
         backoff_s: Linear backoff base; sleep is backoff_s * (attempt + 1).
         timeout_s: Per-request HTTP timeout in seconds.
@@ -80,7 +92,7 @@ def _download_geoip_db(
     Returns:
         True if a valid .mmdb is at db_path after this call, False otherwise.
     """
-    if not license_key:
+    if not license_key or not account_id:
         return False
 
     if os.path.exists(db_path) and os.path.getsize(db_path) > 0:
@@ -94,7 +106,7 @@ def _download_geoip_db(
         logger.error("Cannot create GeoIP DB parent dir %s: %s", parent_dir, exc)
         return False
 
-    url = _MAXMIND_DOWNLOAD_URL.format(license_key=urllib.parse.quote(license_key, safe=""))
+    auth_token = base64.b64encode(f"{account_id}:{license_key}".encode("utf-8")).decode("ascii")
     total_attempts = retries + 1
     last_error = ""
 
@@ -103,11 +115,19 @@ def _download_geoip_db(
         try:
             with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
                 tmp_path = tmp.name
-            with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # noqa: S310
+            request = urllib.request.Request(
+                _MAXMIND_DOWNLOAD_URL,
+                headers={"Authorization": f"Basic {auth_token}"},
+            )
+            with urllib.request.urlopen(request, timeout=timeout_s) as resp:  # noqa: S310
                 status = getattr(resp, "status", 200)
                 if status != 200:
                     raise urllib.error.HTTPError(
-                        url, status, getattr(resp, "reason", ""), resp.headers, None
+                        _MAXMIND_DOWNLOAD_URL,
+                        status,
+                        getattr(resp, "reason", ""),
+                        resp.headers,
+                        None,
                     )
                 with open(tmp_path, "wb") as out:
                     shutil.copyfileobj(resp, out)
@@ -261,12 +281,23 @@ class GeoBlockChecker:
         if config.enabled and GEOIP2_AVAILABLE:
             if not os.path.exists(config.geoip_db_path):
                 license_key = os.getenv("MAXMIND_LICENSE_KEY", "").strip()
-                if license_key:
+                account_id = os.getenv("MAXMIND_ACCOUNT_ID", "").strip()
+                if license_key and account_id:
                     logger.info(
                         "GeoIP DB missing at %s — attempting runtime download",
                         config.geoip_db_path,
                     )
-                    _download_geoip_db(config.geoip_db_path, license_key)
+                    _download_geoip_db(
+                        config.geoip_db_path,
+                        license_key,
+                        account_id=account_id,
+                    )
+                elif license_key and not account_id:
+                    logger.warning(
+                        "MAXMIND_LICENSE_KEY is set but MAXMIND_ACCOUNT_ID is not — "
+                        "MaxMind requires both for database downloads since the 2024 "
+                        "policy change. Skipping runtime download."
+                    )
 
             try:
                 self._reader = geoip2.database.Reader(config.geoip_db_path)
