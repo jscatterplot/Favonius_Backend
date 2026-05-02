@@ -144,8 +144,8 @@ class SupabaseClient:
         if depot_id:
             query = (
                 "SELECT s.* FROM schedules s"
-                " JOIN vehicles v ON v.vehicle_id = s.vehicle_id"
-                " WHERE v.depot_id = $1 AND s.departure_time > NOW()"
+                " JOIN vehicles v ON v.id = s.vehicle_id"
+                " WHERE v.site_id = $1 AND s.departure_time > NOW()"
             )
             return await self.fetch_all(query, depot_id)
         return await self.fetch_all(query)

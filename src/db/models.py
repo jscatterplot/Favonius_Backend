@@ -176,7 +176,6 @@ class Charger(Base):
     # Relationships
     depot = relationship("Depot", back_populates="chargers")
     vehicle_access = relationship("ChargerVehicleAccess", back_populates="charger")
-    charging_commands = relationship("ChargingCommand", back_populates="charger")
 
 
 class ChargerVehicleAccess(Base):
@@ -432,7 +431,6 @@ class ChargingCommand(Base):
 
     # Relationships
     optimization_run = relationship("OptimizationRun", back_populates="charging_commands")
-    charger = relationship("Charger", back_populates="charging_commands")
 
 
 class InterdepotMessage(Base):
