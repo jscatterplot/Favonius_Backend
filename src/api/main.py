@@ -67,7 +67,6 @@ from ..core.state.readiness import (
 from ..db.exceptions import (
     DatabaseError as _DbDatabaseError,
     IdempotencyKeyReusedError,
-    ResourceNotFoundError,
 )
 from ..db.snapshot_store import persist_snapshot
 from ..db import queries as db_queries
