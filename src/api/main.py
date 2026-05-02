@@ -1912,8 +1912,10 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     on this API has the same envelope regardless of origin.
 
     Backwards compatibility:
-      * If the call site passes ``detail`` as a string, ``response.detail`` is
-        that string verbatim (matches FastAPI default).
+      * If the call site passes ``detail`` as a string and the status is
+        below 500, ``response.detail`` is that string verbatim (matches
+        FastAPI default). For 5xx, string ``detail`` is replaced with the
+        sanitized message for the mapped ``ErrorCode`` so internals cannot leak.
       * If the call site passes ``detail`` as a dict (e.g.
         ``{"error_code": "...", "vehicle_ids": [...]}``), the dict is
         preserved verbatim under ``detail`` so existing clients can keep
@@ -1927,10 +1929,10 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     else:
         provided_code = None
 
-    code = _http_status_to_error_code(
-        exc.status_code,
-        provided_code if isinstance(provided_code, str) else None,
+    effective_provided_code = (
+        provided_code if isinstance(provided_code, str) else None
     )
+    code = _http_status_to_error_code(exc.status_code, effective_provided_code)
 
     if exc.status_code >= 500:
         logger.error(
@@ -1943,9 +1945,18 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
             extra={"path": request.url.path, "status_code": exc.status_code},
         )
 
+    if exc.status_code >= 500 and isinstance(detail, str):
+        response_detail: object = safe_message_for(code)
+    else:
+        response_detail = detail if detail is not None else safe_message_for(code)
+
     body: dict = {
-        "detail": detail if detail is not None else safe_message_for(code),
-        "error_code": str(provided_code) if provided_code else str(code.value),
+        "detail": response_detail,
+        "error_code": (
+            str(effective_provided_code)
+            if effective_provided_code
+            else str(code.value)
+        ),
         "timestamp": datetime.utcnow().isoformat(),
         "request_id": _get_request_id(request),
     }

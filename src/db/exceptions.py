@@ -11,8 +11,6 @@ status code.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from ..api.error_codes import ErrorCode
 
 
@@ -38,17 +36,3 @@ class IdempotencyKeyReusedError(DatabaseError):
 
     def __init__(self, message: str = "Idempotency key has already been used") -> None:
         super().__init__(message)
-
-
-class ResourceNotFoundError(DatabaseError):
-    """Raised when a referenced row does not exist."""
-
-    code = ErrorCode.NOT_FOUND
-
-    def __init__(
-        self,
-        message: str = "Resource not found",
-        resource_type: Optional[str] = None,
-    ) -> None:
-        super().__init__(message)
-        self.resource_type = resource_type

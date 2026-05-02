@@ -33,7 +33,6 @@ from fastapi.testclient import TestClient  # noqa: E402
 from src.api.error_codes import ERROR_MESSAGES, ErrorCode  # noqa: E402
 from src.api.main import DatabaseError, OptimizationError, app  # noqa: E402
 
-
 # Patterns that should never appear in any error response body.
 # Each pattern represents a class of leak we have seen before.
 _LEAK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -78,16 +77,12 @@ def _make_test_app() -> FastAPI:
 
     @router.get("/leak/asyncpg-relation")
     async def _():
-        raise asyncpg.exceptions.UndefinedTableError(
-            'relation "stations" does not exist'
-        )
+        raise asyncpg.exceptions.UndefinedTableError('relation "stations" does not exist')
 
     @router.get("/leak/db-with-sql")
     async def _():
         # Real-world pattern: callers wrap asyncpg errors in DatabaseError.
-        raise DatabaseError(
-            "Database error: SELECT * FROM organization_users WHERE id = $1 failed"
-        )
+        raise DatabaseError("Database error: SELECT * FROM organization_users WHERE id = $1 failed")
 
     @router.get("/leak/runtime-fs")
     async def _():
@@ -103,8 +98,7 @@ def _make_test_app() -> FastAPI:
     @router.get("/leak/optimizer")
     async def _():
         raise OptimizationError(
-            "constraint violation in vehicle_charging[bus_42, t=12]: "
-            "see /var/log/gurobi.log"
+            "constraint violation in vehicle_charging[bus_42, t=12]: " "see /var/log/gurobi.log"
         )
 
     @router.get("/leak/http-500-message")
@@ -113,7 +107,7 @@ def _make_test_app() -> FastAPI:
         # f"...: {str(e)}" as detail.
         raise HTTPException(
             status_code=500,
-            detail="Failed to get depot state: relation \"depots\" does not exist",
+            detail='Failed to get depot state: relation "depots" does not exist',
         )
 
     test_app.include_router(router)
@@ -173,18 +167,14 @@ def test_optimizer_error_no_constraint_leak(client: TestClient) -> None:
 
 
 def test_http_500_with_leaky_detail_does_not_propagate(client: TestClient) -> None:
-    """Legacy code that does ``HTTPException(500, detail=f"...: {e}")`` must
-    not leak the inner string. The HTTPException handler keeps the call-site
-    text but tests assert that ``main.py`` no longer contains those patterns
-    after this changeset (see ``test_no_legacy_str_exc_in_500_raises``).
-    """
+    """String ``detail`` on 5xx must be replaced with the sanitized message."""
     response = client.get("/leak/http-500-message")
-    # We don't sanitize call-site provided text — but we do assert that the
-    # production code base never raises HTTPException with f"...: {str(e)}"
-    # as detail anymore (separate test below).
     assert response.status_code == 500
     body = response.json()
-    assert "error_code" in body and "request_id" in body
+    assert body["error_code"] == ErrorCode.INTERNAL_ERROR.value
+    assert body["detail"] == ERROR_MESSAGES[ErrorCode.INTERNAL_ERROR]
+    assert "relation" not in response.text
+    assert "depots" not in response.text
 
 
 def test_no_legacy_str_exc_in_500_raises() -> None:
