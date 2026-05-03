@@ -191,28 +191,12 @@ def decode_jwt_for_rate_limit(token_str: str) -> Optional[dict[str, Any]]:
 
     try:
         if alg in _HS_ALGORITHMS:
-            secrets = _try_get_hs256_secrets()
-            if secrets is None:
-                return None
-            for secret in secrets:
-                try:
-                    return jwt.decode(token_str, secret, **decode_kwargs)
-                except jwt.ExpiredSignatureError:
-                    raise
-                except jwt.InvalidTokenError:
-                    continue
-            return None
-
-        client = _get_jwks_client()
-        if client is None:
-            return None
-        try:
-            signing_key = client.get_signing_key_from_jwt(token_str)
-        except PyJWKClientError:
-            return None
-        return jwt.decode(token_str, signing_key.key, **decode_kwargs)
+            return _decode_with_hs256(token_str, decode_kwargs)
+        return _decode_with_jwks(token_str, decode_kwargs)
     except jwt.ExpiredSignatureError:
         raise
+    except HTTPException:
+        return None
     except jwt.PyJWTError:
         return None
 
