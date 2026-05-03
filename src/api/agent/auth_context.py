@@ -21,7 +21,7 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel, ConfigDict
 
 from src.db.queries import get_all_depots, get_depots_for_organization
-from src.security.auth import get_user_organization_id, get_user_role
+from src.security.auth import get_user_id, get_user_organization_id, get_user_role
 
 AgentRole = Literal["favonius_admin", "customer_admin", "customer_operator"]
 
@@ -64,13 +64,7 @@ async def build_auth_context(token_payload: dict, static_pool: Any) -> AuthConte
         HTTPException(403): If the role is not one of the agent-permitted
             values, or if a non-admin caller has no ``organization_id``.
     """
-    user_id_str = token_payload.get("sub")
-    if not user_id_str:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token missing 'sub' claim",
-        )
-    user_id = UUID(str(user_id_str))
+    user_id = UUID(get_user_id(token_payload))
 
     # ``get_user_role`` is the favonius-aware role getter (returns
     # ``app_metadata.favonius_role`` if set, else the Supabase top-level
