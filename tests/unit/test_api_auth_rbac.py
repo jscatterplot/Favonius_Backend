@@ -2037,6 +2037,26 @@ class TestVerifyDepotAccessDbFailureModes:
         assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
 
     @pytest.mark.asyncio
+    async def test_asyncpg_interface_error_raises_503(self, mock_db_pool):
+        """InterfaceError is a sibling of PostgresError; pool-closing raises this."""
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=asyncpg.InterfaceError("pool is closing"))
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_asyncpg_internal_client_error_raises_503(self, mock_db_pool):
+        """InternalClientError is also a sibling of PostgresError; must not become 500."""
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=asyncpg.InternalClientError("internal client error"))
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
     async def test_oserror_from_pool_raises_503(self, mock_db_pool):
         pool, conn = mock_db_pool
         conn.fetchval = AsyncMock(side_effect=OSError("socket gone"))
