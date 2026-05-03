@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import anthropic
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from src.api.agent.plan import QueryPlan
@@ -118,12 +117,6 @@ logger.info(
 def _load_schema_graph_text() -> str:
     """Return the schema_graph.yaml contents as a string for the prompt."""
     return _SCHEMA_GRAPH_PATH.read_text(encoding="utf-8")
-
-
-@lru_cache(maxsize=1)
-def _load_schema_graph_dict() -> dict[str, Any]:
-    """Return the schema_graph.yaml contents parsed as a dict."""
-    return yaml.safe_load(_load_schema_graph_text())
 
 
 # ── System prompts ────────────────────────────────────────────────────────
@@ -465,20 +458,41 @@ async def extract_plan(message: str, *, model: Optional[str] = None) -> QueryPla
     # context, then add the failed assistant response and a corrective
     # user message that names the validation error.
     schema_json = json.dumps(QueryPlan.model_json_schema(), indent=2)
+    corrective_text = (
+        "Your last output was malformed and failed validation. "
+        f"Validation error:\n{first_error}\n\n"
+        "Here is the QueryPlan JSON schema again — call the "
+        f"`{_QUERY_PLAN_TOOL_NAME}` tool exactly once with input "
+        "that matches it:\n"
+        f"{schema_json}"
+    )
+    # Anthropic requires a tool_result block for each assistant tool_use
+    # before further user text; plain text alone yields 400 BadRequest.
+    retry_user_content: str | list[dict[str, Any]]
+    tool_result_blocks: list[dict[str, Any]] = []
+    for block in response.content:
+        if getattr(block, "type", None) == "tool_use":
+            tool_use_id = getattr(block, "id", None) or ""
+            tool_result_blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": first_error,
+                    "is_error": True,
+                }
+            )
+    if tool_result_blocks:
+        retry_user_content = [
+            *tool_result_blocks,
+            {"type": "text", "text": corrective_text},
+        ]
+    else:
+        retry_user_content = corrective_text
+
     retry_messages: list[dict[str, Any]] = [
         {"role": "user", "content": message},
         {"role": "assistant", "content": response.content},
-        {
-            "role": "user",
-            "content": (
-                "Your last output was malformed and failed validation. "
-                f"Validation error:\n{first_error}\n\n"
-                "Here is the QueryPlan JSON schema again — call the "
-                f"`{_QUERY_PLAN_TOOL_NAME}` tool exactly once with input "
-                "that matches it:\n"
-                f"{schema_json}"
-            ),
-        },
+        {"role": "user", "content": retry_user_content},
     ]
 
     retry_response = await client.messages.create(
@@ -501,16 +515,6 @@ async def extract_plan(message: str, *, model: Optional[str] = None) -> QueryPla
 
 
 # ── Answer formatting ──────────────────────────────────────────────────────
-
-
-def _summarize_rows_for_format(rows: list[dict[str, Any]]) -> str:
-    """Compact, deterministic JSON summary of the SQL rows for the model.
-
-    Keeps the payload bounded so a runaway query doesn't blow the
-    formatter's max_tokens budget. The formatter has a known small
-    output shape (one row per driver-day for v0).
-    """
-    return json.dumps(rows, default=str, sort_keys=True)
 
 
 async def format_answer(
@@ -554,7 +558,7 @@ async def format_answer(
         "Format the following result set into a friendly, concise reply. "
         "The user's original question is implied by `user_intent` and "
         "`resolved_subjects`. Do not invent rows that aren't here.\n\n"
-        f"```json\n{_summarize_rows_for_format([payload])}\n```"
+        f"```json\n{json.dumps(payload, default=str, sort_keys=True)}\n```"
     )
 
     system: list[dict[str, Any]] = [
