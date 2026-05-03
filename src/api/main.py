@@ -48,27 +48,22 @@ from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.optimizer.exceptions import (
     InfeasibleModelError,
-    OptimizationError as _CoreOptimizationError,
+)
+from ..core.optimizer.exceptions import OptimizationError as _CoreOptimizationError
+from ..core.optimizer.exceptions import (
     SolverError,
     SolverTimeoutError,
 )
 from ..core.state.assembler import StateAssembler
-from .error_codes import ERROR_MESSAGES, ErrorCode, http_status_for, safe_message_for
-from .reports import (
-    REPORT_GROUP_BY_VALUES,
-    SessionRow,
-    aggregate_energy_rows,
-    stream_rows_as_csv,
-)
 from ..core.state.readiness import (
     build_snapshot,
     evaluate_readiness,
 )
+from ..db import queries as db_queries
+from ..db.exceptions import DatabaseError as _DbDatabaseError
 from ..db.exceptions import (
-    DatabaseError as _DbDatabaseError,
     IdempotencyKeyReusedError,
 )
-from ..db import queries as db_queries
 from ..db.pools import DatabasePools
 from ..db.snapshot_store import persist_snapshot
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
@@ -82,21 +77,28 @@ from ..security.auth import (
     verify_depot_access,
 )
 from ..security.geo_block import GeoBlockMiddleware
-from ..security.headers import SecurityHeadersMiddleware
-from ..security.ocpp_auth import verify_ocpp_basic_auth
-from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
-from ..security.rbac import Permission, has_permission, require_favonius_admin
-from ..security.tenant_mirror import ensure_tenant_mirrored
 from ..security.handoff_validator import (
     compute_handoff_signature,
     prepare_handoff_http_target,
     verify_handoff_signature,
 )
+from ..security.headers import SecurityHeadersMiddleware
+from ..security.ocpp_auth import verify_ocpp_basic_auth
+from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
+from ..security.rbac import Permission, has_permission, require_favonius_admin
+from ..security.tenant_mirror import ensure_tenant_mirrored, mirror_user_tenant_atomic
 from ..security.validators import (
     validate_depot_id,
     validate_horizon_hours,
     validate_uuid,
     validate_vehicle_id,
+)
+from .error_codes import ERROR_MESSAGES, ErrorCode, http_status_for, safe_message_for
+from .reports import (
+    REPORT_GROUP_BY_VALUES,
+    SessionRow,
+    aggregate_energy_rows,
+    stream_rows_as_csv,
 )
 
 logger = logging.getLogger(__name__)
@@ -1515,9 +1517,17 @@ class ReadinessChecklistItem(BaseModel):
 
 
 class DepotSetupSummary(BaseModel):
-    """Depot summary returned by setup endpoints."""
+    """Depot summary returned by setup endpoints.
+
+    ``depot_id`` and ``organization_id`` match the wire shape of
+    ``GET /me/depots`` so frontends can use a single ``DepotSummary`` schema.
+    ``id`` is a deprecated alias of ``depot_id`` retained for back-compat;
+    drop after one release once consumers have migrated.
+    """
 
     id: str
+    depot_id: str
+    organization_id: Optional[str] = None
     name: str
     timezone: str
     currency: str
@@ -1956,9 +1966,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     else:
         provided_code = None
 
-    effective_provided_code = (
-        provided_code if isinstance(provided_code, str) else None
-    )
+    effective_provided_code = provided_code if isinstance(provided_code, str) else None
     code = _http_status_to_error_code(exc.status_code, effective_provided_code)
 
     if exc.status_code >= 500:
@@ -1980,9 +1988,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     body: dict = {
         "detail": response_detail,
         "error_code": (
-            str(effective_provided_code)
-            if effective_provided_code
-            else str(code.value)
+            str(effective_provided_code) if effective_provided_code else str(code.value)
         ),
         "timestamp": datetime.utcnow().isoformat(),
         "request_id": _get_request_id(request),
@@ -2015,9 +2021,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     return _build_error_response(request, ErrorCode.INTERNAL_ERROR)
 
 
-def _http_status_to_error_code(
-    status_code: int, provided_code: Optional[str] = None
-) -> ErrorCode:
+def _http_status_to_error_code(status_code: int, provided_code: Optional[str] = None) -> ErrorCode:
     """Best-effort mapping from raw status code to an ``ErrorCode``.
 
     Used by ``http_exception_handler`` so legacy call sites that raise
@@ -3444,6 +3448,36 @@ async def patch_manual_schedule(
 _DEPOT_SETUP_IDEMPOTENCY_ENDPOINT = "POST /admin/depots"
 
 
+def _depot_setup_response_payload(
+    depot_row: dict,
+    readiness: list[dict],
+    *,
+    depot_id_override: Optional[str] = None,
+    organization_id_override: Optional[str] = None,
+) -> dict:
+    """Build the standard ``{depot, readiness_checklist}`` payload for depot-setup endpoints.
+
+    Returns ``depot_id`` and ``organization_id`` (snake_case, matching
+    ``GET /me/depots``) so the frontend can use a single ``DepotSummary`` schema
+    across read and write paths. ``id`` is kept as a deprecated alias so existing
+    callers keep working; remove after one release once the frontend has migrated.
+    """
+    depot_id = depot_id_override or depot_row.get("depot_id") or depot_row.get("id")
+    organization_id = organization_id_override or depot_row.get("organization_id")
+    return {
+        "depot": {
+            "id": depot_id,  # deprecated alias of depot_id; kept for back-compat
+            "depot_id": depot_id,
+            "organization_id": organization_id,
+            "name": depot_row["name"],
+            "timezone": depot_row["timezone"],
+            "currency": depot_row["currency"],
+            "max_grid_kw": depot_row["max_grid_kw"],
+        },
+        "readiness_checklist": readiness,
+    }
+
+
 async def _create_depot_for_org(
     *, organization_id: str, request: "FirstDepotSetupRequest", conn: Any
 ) -> dict:
@@ -3568,22 +3602,23 @@ async def _depot_setup_endpoint(
                     content=_json_response_payload(existing["response_json"]),
                 )
 
+            # Atomic with depot insert: ensure the org + user_organizations rows
+            # exist so RLS-gated reads (e.g. Supabase PostgREST policies on
+            # ``sites``) can see this depot immediately. ensure_tenant_mirrored
+            # already ran best-effort; this guarantees consistency or rolls back.
+            await mirror_user_tenant_atomic(conn, user)
+
             created = await _create_depot_for_org(
                 organization_id=org_id, request=request, conn=conn
             )
             readiness = await _build_readiness_checklist(
                 created["depot_id"], request.depot, conn=conn
             )
-            response_payload = {
-                "depot": {
-                    "id": created["depot_id"],
-                    "name": created["name"],
-                    "timezone": created["timezone"],
-                    "currency": created["currency"],
-                    "max_grid_kw": created["max_grid_kw"],
-                },
-                "readiness_checklist": readiness,
-            }
+            response_payload = _depot_setup_response_payload(
+                created,
+                readiness,
+                organization_id_override=org_id,
+            )
             await db_queries.store_charger_onboarding_idempotency(
                 conn,
                 organization_id=org_id,
@@ -3720,16 +3755,11 @@ async def update_depot_setup(
 
     _depot_config_cache.pop(depot_id, None)
     readiness = await _build_readiness_checklist(depot_id, depot)
-    return {
-        "depot": {
-            "id": depot_id,
-            "name": updated["name"],
-            "timezone": updated["timezone"],
-            "currency": updated["currency"],
-            "max_grid_kw": updated["max_grid_kw"],
-        },
-        "readiness_checklist": readiness,
-    }
+    return _depot_setup_response_payload(
+        updated,
+        readiness,
+        depot_id_override=depot_id,
+    )
 
 
 @app.post(
@@ -3797,23 +3827,19 @@ async def upsert_charger_vehicle_access_endpoint(
 
     async with db_pools.static.acquire() as conn:
         depot_row = await conn.fetchrow(
-            "SELECT name, timezone, currency, max_grid_kw FROM sites " "WHERE id = $1::uuid",
+            "SELECT organization_id::text AS organization_id, name, timezone, currency, "
+            "max_grid_kw FROM sites WHERE id = $1::uuid",
             depot_id,
         )
     if not depot_row:
         raise DepotNotFoundError(f"Depot {depot_id} not found")
 
     readiness = await _build_depot_readiness_checklist(depot_id)
-    return {
-        "depot": {
-            "id": depot_id,
-            "name": depot_row["name"],
-            "timezone": depot_row["timezone"],
-            "currency": depot_row["currency"],
-            "max_grid_kw": depot_row["max_grid_kw"],
-        },
-        "readiness_checklist": readiness,
-    }
+    return _depot_setup_response_payload(
+        dict(depot_row),
+        readiness,
+        depot_id_override=depot_id,
+    )
 
 
 @app.post(
@@ -4050,7 +4076,10 @@ async def get_depot_state(
         logger.error(f"Failed to get depot state: {e}", exc_info=True, extra={"depot_id": depot_id})
         raise HTTPException(
             status_code=500,
-            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to get depot state"},
+            detail={
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "detail": "Failed to get depot state",
+            },
         ) from e
 
 
@@ -4687,7 +4716,10 @@ async def get_depot_schedule(
         logger.error(f"Failed to get schedule: {e}", exc_info=True, extra={"depot_id": depot_id})
         raise HTTPException(
             status_code=500,
-            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to get schedule"},
+            detail={
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "detail": "Failed to get schedule",
+            },
         ) from e
 
 
@@ -5118,7 +5150,10 @@ async def send_handoff(
         )
         raise HTTPException(
             status_code=500,
-            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to send handoff"},
+            detail={
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "detail": "Failed to send handoff",
+            },
         ) from e
 
 
@@ -5283,8 +5318,7 @@ async def receive_handoff(
             raise HTTPException(
                 status_code=401,
                 detail=(
-                    "Invalid or expired handoff signature "
-                    "(error_code=HANDOFF_SIGNATURE_INVALID)"
+                    "Invalid or expired handoff signature " "(error_code=HANDOFF_SIGNATURE_INVALID)"
                 ),
             )
     else:
@@ -6186,7 +6220,10 @@ async def _handle_charger_restart(
         )
         raise HTTPException(
             status_code=500,
-            detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Charger restart failed"},
+            detail={
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "detail": "Charger restart failed",
+            },
         ) from e
 
 
@@ -6311,8 +6348,7 @@ async def _handle_depot_config_update(
         values.append(params["max_grid_kw"])
 
     query = (
-        f"UPDATE sites SET {', '.join(set_clauses)} "
-        "WHERE id = $1::uuid RETURNING max_grid_kw"
+        f"UPDATE sites SET {', '.join(set_clauses)} " "WHERE id = $1::uuid RETURNING max_grid_kw"
     )
     async with db_pools.static.acquire() as conn:
         row = await conn.fetchrow(query, *values)

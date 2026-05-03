@@ -199,3 +199,81 @@ async def test_mirror_skips_missing_sub():
     user = {"app_metadata": {"organization_id": "22222222-2222-4222-8222-222222222222"}}
     await tm.mirror_user_tenant(user, pool)
     assert pool.conn.executes == []
+
+
+# ============ mirror_user_tenant_atomic ============
+
+
+@pytest.mark.asyncio
+async def test_atomic_mirror_inserts_org_and_membership_on_passed_conn():
+    """``mirror_user_tenant_atomic`` runs the same UPSERTs but on the caller's
+    connection so the work is part of the enclosing transaction."""
+    conn = _FakeConn()
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "customer_admin",
+        "HRX",
+    )
+    await tm.mirror_user_tenant_atomic(conn, user)
+    assert len(conn.executes) == 2
+    assert "INSERT INTO organizations" in conn.executes[0][0]
+    assert "INSERT INTO user_organizations" in conn.executes[1][0]
+
+
+@pytest.mark.asyncio
+async def test_atomic_mirror_propagates_db_errors():
+    """Errors must NOT be swallowed so the caller's transaction rolls back."""
+
+    class _RaisingConn:
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("simulated failure")
+
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "customer_admin",
+    )
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        await tm.mirror_user_tenant_atomic(_RaisingConn(), user)
+
+
+@pytest.mark.asyncio
+async def test_atomic_mirror_skips_favonius_admin():
+    conn = _FakeConn()
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "favonius_admin",
+    )
+    await tm.mirror_user_tenant_atomic(conn, user)
+    assert conn.executes == []
+
+
+@pytest.mark.asyncio
+async def test_atomic_mirror_skips_user_without_org_id():
+    conn = _FakeConn()
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        None,
+        "customer_admin",
+    )
+    await tm.mirror_user_tenant_atomic(conn, user)
+    assert conn.executes == []
+
+
+@pytest.mark.asyncio
+async def test_atomic_mirror_primes_cache_so_subsequent_best_effort_is_noop():
+    """After atomic mirror succeeds, the next ``mirror_user_tenant`` call
+    within the TTL window should hit the cache and skip its own DB writes."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    org = "22222222-2222-4222-8222-222222222222"
+    user = _user(sub, org, "customer_admin", "HRX")
+
+    conn = _FakeConn()
+    await tm.mirror_user_tenant_atomic(conn, user)
+    assert len(conn.executes) == 2
+
+    pool = _FakePool()
+    await tm.mirror_user_tenant(user, pool)
+    assert pool.conn.executes == []  # cache hit, no DB writes

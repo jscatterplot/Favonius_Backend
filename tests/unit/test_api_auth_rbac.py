@@ -622,10 +622,68 @@ class TestDepotSetupWrites:
             )
 
         assert response.status_code == http_status.HTTP_200_OK
-        assert response.json()["depot"]["id"] == DEPOT_ID
+        depot_resp = response.json()["depot"]
+        # Wire-shape contract: ``depot_id`` and ``organization_id`` match
+        # ``GET /me/depots`` so the FE can use a single DepotSummary schema.
+        # ``id`` is a deprecated alias of ``depot_id``.
+        assert depot_resp["depot_id"] == DEPOT_ID
+        assert depot_resp["organization_id"] == DEFAULT_ORG_ID
+        assert depot_resp["id"] == DEPOT_ID
         assert response.json()["readiness_checklist"] == readiness
         mirror_mock.assert_awaited_once()
         assert create_mock.await_args.kwargs["organization_id"] == DEFAULT_ORG_ID
+
+    def test_membership_upsert_atomic_with_depot_insert(self, mock_db_pool):
+        """If the atomic mirror UPSERT fails, the depot insert and idempotency
+        write must not be attempted — the enclosing transaction rolls back."""
+        from fastapi.testclient import TestClient
+
+        from src.security.rate_limiter import get_rate_limiter
+
+        app.dependency_overrides.pop(ensure_tenant_mirrored, None)
+        app.dependency_overrides[verify_token] = _override_token(
+            _valid_user(role="customer_admin", organization_id=DEFAULT_ORG_ID)
+        )
+        pool, _conn = mock_db_pool
+
+        # The rate-limiter middleware accumulates per-IP buckets in process;
+        # clearing them here keeps this test order-independent (TestClient
+        # always uses 127.0.0.1, which exhausts the bucket as the suite grows).
+        limiter = get_rate_limiter()
+        limiter._api_buckets.clear()
+        limiter._optimize_buckets.clear()
+        limiter._handoff_buckets.clear()
+
+        # raise_server_exceptions=False so we can inspect the 500 instead of
+        # having TestClient re-raise the simulated DB error.
+        bubble_client = TestClient(app, raise_server_exceptions=False)
+
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.security.tenant_mirror.mirror_user_tenant", new_callable=AsyncMock),
+            patch(
+                "src.api.main.mirror_user_tenant_atomic",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("simulated user_organizations write failure"),
+            ),
+            patch(
+                "src.api.main.db_queries.create_depot_setup",
+                new_callable=AsyncMock,
+            ) as create_mock,
+            patch(
+                "src.api.main.db_queries.store_charger_onboarding_idempotency",
+                new_callable=AsyncMock,
+            ) as store_mock,
+        ):
+            response = bubble_client.post(
+                "/admin/first-depot-setup",
+                headers=_idempotency_hdr("atomic-mirror-test"),
+                json=_first_depot_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_500_INTERNAL_SERVER_ERROR
+        create_mock.assert_not_awaited()
+        store_mock.assert_not_awaited()
 
     def test_cross_org_update_denied(self, client, mock_db_pool):
         pool, conn = mock_db_pool
@@ -1938,8 +1996,9 @@ class TestCrossOrganizationDepotAccessDenied:
                 {"sni_hostname": p.hostname} if p.scheme == "https" else {},
             )
 
-        with patch("src.api.main.db_pools", pool), patch(
-            "src.api.main.prepare_handoff_http_target", side_effect=_fake_prepare
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.prepare_handoff_http_target", side_effect=_fake_prepare),
         ):
             response = client.post(
                 f"/depots/{DEPOT_ID}/vehicles/{VEHICLE_ID}/handoff",
