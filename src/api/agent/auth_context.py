@@ -14,7 +14,7 @@ candidate set.
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, cast
+from typing import Any, Literal, Optional, cast, get_args
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -25,11 +25,7 @@ from src.security.auth import get_user_organization_id, get_user_role
 
 AgentRole = Literal["favonius_admin", "customer_admin", "customer_operator"]
 
-_ALLOWED_ROLES: tuple[str, ...] = (
-    "favonius_admin",
-    "customer_admin",
-    "customer_operator",
-)
+_ALLOWED_ROLES: tuple[str, ...] = get_args(AgentRole)
 
 
 class AuthContext(BaseModel):
