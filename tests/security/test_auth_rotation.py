@@ -5,7 +5,8 @@ Tests cover:
 - HS256 token verification with previous key during rotation
 - Expired tokens rejected regardless of key
 - Invalid tokens rejected
-- Missing JWT_SECRET_KEY raises 500
+- Missing JWT_SECRET_KEY: verify_token returns 401 for HS256 tokens;
+  _get_jwt_secrets still raises 500 for operational paths that require HS256
 - get_user_role extracts Favonius role from metadata
 - ES256 token verified via mocked PyJWKClient
 - ES256 token rejected when JWKS URL is not configured
@@ -231,8 +232,9 @@ class TestVerifyTokenJWKS:
         fake_client = MagicMock()
         fake_client.get_signing_key_from_jwt.return_value = signing_key
 
-        with patch.dict(os.environ, env, clear=False), patch.object(
-            auth_mod, "PyJWKClient", return_value=fake_client
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(auth_mod, "PyJWKClient", return_value=fake_client),
         ):
             os.environ.pop("JWT_SECRET_KEY", None)
             auth_mod._reset_jwks_client_for_tests()
@@ -240,6 +242,32 @@ class TestVerifyTokenJWKS:
 
         assert decoded["sub"] == "user-uuid-es256"
         fake_client.get_signing_key_from_jwt.assert_called_once_with(token)
+
+    @pytest.mark.asyncio
+    async def test_hs256_rejected_when_symmetric_secret_missing(self):
+        """HS256 token with no JWT_SECRET_KEY returns 401 (asymmetric-only deploy)."""
+        from unittest.mock import MagicMock
+
+        from src.security import auth as auth_mod
+
+        payload = {
+            "sub": "user-uuid",
+            "aud": "authenticated",
+            "exp": int(time.time()) + 3600,
+        }
+        token = jwt.encode(payload, "any_secret", algorithm="HS256")
+        creds = MagicMock()
+        creds.credentials = token
+
+        env = {"SUPABASE_URL": "https://example.supabase.co"}
+        with patch.dict(os.environ, env, clear=False):
+            for var in ("JWT_SECRET_KEY", "JWT_SECRET_KEY_PREVIOUS"):
+                os.environ.pop(var, None)
+            auth_mod._reset_jwks_client_for_tests()
+            with pytest.raises(HTTPException) as exc_info:
+                await auth_mod.verify_token(creds)
+            assert exc_info.value.status_code == 401
+            assert exc_info.value.detail == "Invalid token"
 
     @pytest.mark.asyncio
     async def test_es256_rejected_when_jwks_url_missing(self):
@@ -309,8 +337,9 @@ class TestVerifyTokenJWKS:
         fake_client.get_signing_key_from_jwt.side_effect = PyJWKClientError("boom")
 
         env = {"SUPABASE_URL": "https://example.supabase.co"}
-        with patch.dict(os.environ, env, clear=False), patch.object(
-            auth_mod, "PyJWKClient", return_value=fake_client
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(auth_mod, "PyJWKClient", return_value=fake_client),
         ):
             auth_mod._reset_jwks_client_for_tests()
             with pytest.raises(HTTPException) as exc_info:

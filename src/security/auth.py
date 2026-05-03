@@ -85,16 +85,23 @@ def _reset_jwks_client_for_tests() -> None:
     _jwks_client = None
 
 
+def _try_get_hs256_secrets() -> Optional[list[str]]:
+    """Return HS256 secrets if configured, else None."""
+    try:
+        return get_secrets_manager().get_rotation_secrets("JWT_SECRET_KEY")
+    except ValueError:
+        return None
+
+
 def _get_jwt_secrets() -> list[str]:
     """Return all valid HS256 secrets (current + optional previous).
 
     Raises:
         HTTPException(500): If no HS256 secret is configured but the caller
-            needs one to verify a presented HS256 token.
+            needs one (operational paths such as rate-limit key extraction).
     """
-    try:
-        return get_secrets_manager().get_rotation_secrets("JWT_SECRET_KEY")
-    except ValueError:
+    secrets = _try_get_hs256_secrets()
+    if secrets is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
@@ -103,11 +110,21 @@ def _get_jwt_secrets() -> list[str]:
                 "(Dashboard → Settings → API → JWT Secret)."
             ),
         )
+    return secrets
 
 
 def _decode_with_hs256(token_str: str, decode_kwargs: dict[str, Any]) -> dict:
     """Verify a HS256 token against current + previous secrets."""
-    secrets = _get_jwt_secrets()
+    secrets = _try_get_hs256_secrets()
+    if secrets is None:
+        logger.warning(
+            "Received HS256 JWT but JWT_SECRET_KEY is not configured "
+            "(asymmetric-only deployment)."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
     last_error: Optional[Exception] = None
     for secret in secrets:
         try:
@@ -205,7 +222,7 @@ async def verify_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token expired",
         )
-    except jwt.InvalidTokenError:
+    except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
