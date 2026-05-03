@@ -439,13 +439,14 @@ def _app_metadata_indicates_confirmed_email_identity(meta: dict) -> bool:
 def _jwt_email_confirmation_present(token: dict) -> bool:
     """True if the JWT indicates a confirmed email identity for staff promotion.
 
-    Standard Supabase access tokens omit ``email_confirmed_at`` (that field
-    lives on ``auth.users``); a Custom Access Token Hook may add it — when
-    present and non-empty, it is honored.
-
     ``user_metadata`` is user-editable and must not *grant* confirmation, but
     Supabase mirrors ``email_verified: false`` there for unverified addresses;
-    when explicitly ``False``, promotion is denied.
+    when explicitly ``False``, promotion is denied — including when a Custom
+    Access Token Hook injects a non-empty ``email_confirmed_at``.
+
+    Standard Supabase access tokens omit ``email_confirmed_at`` (that field
+    lives on ``auth.users``); a hook may add it — when present and non-empty,
+    it is honored only after the unverified mirror check above.
 
     Otherwise, rely on issuer-signed ``app_metadata`` (``provider`` /
     ``providers``): any identity beyond phone-only is treated as email-backed
@@ -453,13 +454,13 @@ def _jwt_email_confirmation_present(token: dict) -> bool:
     providers). ``confirmed_at`` alone is not used: it is set when either email
     or phone is confirmed.
     """
-    val = token.get("email_confirmed_at")
-    if isinstance(val, str) and val.strip():
-        return True
-
     user_meta = token.get("user_metadata")
     if isinstance(user_meta, dict) and user_meta.get("email_verified") is False:
         return False
+
+    val = token.get("email_confirmed_at")
+    if isinstance(val, str) and val.strip():
+        return True
 
     app_meta = token.get("app_metadata")
     if not isinstance(app_meta, dict):

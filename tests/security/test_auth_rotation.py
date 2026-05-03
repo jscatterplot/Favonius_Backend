@@ -293,6 +293,15 @@ class TestEmailBasedAdminPromotion:
         }
         assert get_user_role(token) == "authenticated"
 
+    def test_email_verified_false_blocks_promotion_even_with_email_confirmed_at(self):
+        """Issuer/hook ``email_confirmed_at`` must not win over ``email_verified: false``."""
+        token = {
+            "email": "alice@favoniusenergy.com",
+            "email_confirmed_at": "2024-01-01T00:00:00Z",
+            "user_metadata": {"email_verified": False},
+        }
+        assert get_user_role(token) == "authenticated"
+
     def test_confirmed_email_allows_promotion(self):
         token = {"email": "alice@favoniusenergy.com", **self._confirmed_at}
         assert get_user_role(token) == "favonius_admin"
