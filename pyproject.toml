@@ -43,6 +43,8 @@ dependencies = [
     "cryptography>=41.0.8",
     "pyopenssl>=23.3.0",
     "bcrypt>=5.0.0",
+    # JWT (Supabase auth, JWKS for asymmetric signing keys ≥ 2.4.0)
+    "PyJWT[crypto]>=2.8.0",
     # Geo-blocking (Article 73-3 compliance)
     "geoip2>=4.8.0",
     # Configuration management

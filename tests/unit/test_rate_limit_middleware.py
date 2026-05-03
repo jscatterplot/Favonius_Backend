@@ -20,6 +20,9 @@ from uuid import uuid4
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
+
+from src.security import auth as auth_mod
 
 from src.api.main import RateLimitMiddleware
 from src.security import rate_limiter as _rl_module
@@ -108,6 +111,42 @@ async def test_valid_token_keys_on_user_sub(middleware, fresh_limiter):
 
     assert f"user:{sub}" in fresh_limiter._api_buckets
     assert "9.9.9.9" not in fresh_limiter._api_buckets
+
+
+@pytest.mark.asyncio
+async def test_es256_jwks_token_keys_on_user_sub_no_hs_secret(middleware, fresh_limiter):
+    """ES256 + JWKS still buckets on `user:<sub>` when JWT_SECRET_KEY is unset."""
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key = private_key.public_key()
+
+    class _FakeSigningKey:
+        def __init__(self, key):
+            self.key = key
+
+    sub = str(uuid4())
+    payload = {
+        "sub": sub,
+        "aud": "authenticated",
+        "exp": int(time.time()) + 3600,
+    }
+    token = jwt.encode(payload, private_key, algorithm="ES256", headers={"kid": "k1"})
+
+    fake_client = MagicMock()
+    fake_client.get_signing_key_from_jwt.return_value = _FakeSigningKey(public_key)
+
+    with (
+        patch.dict(os.environ, {"SUPABASE_URL": "https://example.supabase.co"}, clear=False),
+        patch.object(auth_mod, "PyJWKClient", return_value=fake_client),
+    ):
+        for var in ("JWT_SECRET_KEY", "JWT_SECRET_KEY_PREVIOUS"):
+            os.environ.pop(var, None)
+        auth_mod._reset_jwks_client_for_tests()
+        request = _make_request(ip="9.9.9.9", token=token)
+        await middleware.dispatch(request, _stub_call_next())
+
+    assert f"user:{sub}" in fresh_limiter._api_buckets
+    assert "9.9.9.9" not in fresh_limiter._api_buckets
+    auth_mod._reset_jwks_client_for_tests()
 
 
 @pytest.mark.asyncio

@@ -1,13 +1,25 @@
-"""JWT authentication for API endpoints with key rotation support.
+"""JWT authentication for API endpoints with key rotation and JWKS support.
 
-Verifies Supabase-issued JWT tokens. Supports multiple valid signing
-keys during rotation windows per NIS2 Article 21 requirements.
+Verifies Supabase-issued JWT tokens. Supports two signing modes:
+
+- HS256 — legacy symmetric signing. The current and previous secrets in
+  ``JWT_SECRET_KEY`` / ``JWT_SECRET_KEY_PREVIOUS`` are both tried, so a
+  Supabase JWT-secret rotation does not cause downtime (NIS2 Article 21).
+- ES256 / RS256 / EdDSA — asymmetric signing introduced by Supabase's
+  "JWT Signing Keys" feature. New Supabase projects (CLI ≥ 2.71.1) default
+  to ES256. The verifier fetches the project's public keys from the JWKS
+  endpoint and selects the right key by ``kid``.
+
+The token's own ``alg`` header decides which path is taken, validated
+against an explicit allowlist below — this prevents ``alg=none`` and any
+algorithm Supabase would not have produced.
 
 Environment variables:
-    JWT_SECRET_KEY: Current Supabase JWT secret
-    JWT_SECRET_KEY_PREVIOUS: Previous key (valid during rotation window)
-    JWT_ALGORITHM: Signing algorithm (default HS256) — must be in allowlist
-    JWT_ISSUER: Expected token issuer (optional, e.g. Supabase project URL)
+    JWT_SECRET_KEY: Current Supabase HS256 secret (legacy projects).
+    JWT_SECRET_KEY_PREVIOUS: Previous HS256 secret (valid during rotation).
+    SUPABASE_URL: Project URL — used to derive the JWKS URL automatically.
+    SUPABASE_JWKS_URL: Full JWKS URL override (optional).
+    JWT_ISSUER: Expected ``iss`` claim (optional).
 """
 
 from __future__ import annotations
@@ -19,39 +31,77 @@ from typing import Any, Optional
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jwt import PyJWKClient, PyJWKClientError
 
 from .secrets import get_secrets_manager
 
 logger = logging.getLogger(__name__)
 
-# Security: hardcoded algorithm allowlist — never trust env alone
-_ALLOWED_ALGORITHMS = ["HS256"]
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-if JWT_ALGORITHM not in _ALLOWED_ALGORITHMS:
-    raise RuntimeError(
-        f"JWT_ALGORITHM '{JWT_ALGORITHM}' is not in the allowlist {_ALLOWED_ALGORITHMS}. "
-        "Supabase uses HS256. Do NOT set this to 'none' or 'RS256' unless you update "
-        "the allowlist and verification key type accordingly."
-    )
+# Hardcoded algorithm allowlist. HS256 is the legacy Supabase default;
+# ES256 is the new default for projects on JWT Signing Keys; RS256 / EdDSA
+# are also offered as asymmetric options. Anything else (notably "none")
+# is rejected before key lookup.
+_HS_ALGORITHMS: tuple[str, ...] = ("HS256",)
+_ASYMMETRIC_ALGORITHMS: tuple[str, ...] = ("ES256", "RS256", "EdDSA")
+_ALLOWED_ALGORITHMS: tuple[str, ...] = _HS_ALGORITHMS + _ASYMMETRIC_ALGORITHMS
 
-# Optional issuer validation (set to your Supabase project URL)
+# Optional issuer validation (e.g. https://<ref>.supabase.co/auth/v1)
 JWT_ISSUER: Optional[str] = os.getenv("JWT_ISSUER")
+
+# JWKS client cache lifetime — default 1 hour; Supabase keys rotate rarely.
+_JWKS_CACHE_LIFESPAN_S = int(os.getenv("JWT_JWKS_CACHE_LIFESPAN_S", "3600"))
 
 security = HTTPBearer()
 
+_jwks_client: Optional[PyJWKClient] = None
 
-def _get_jwt_secrets() -> list[str]:
-    """Get all valid JWT secrets (current + previous during rotation).
 
-    Returns:
-        List of valid JWT secret strings.
+def _derive_jwks_url() -> Optional[str]:
+    """Resolve the Supabase JWKS URL from env, preferring an explicit override."""
+    explicit = os.getenv("SUPABASE_JWKS_URL")
+    if explicit:
+        return explicit.strip()
+    base = os.getenv("SUPABASE_URL")
+    if not base:
+        return None
+    return base.rstrip("/") + "/auth/v1/.well-known/jwks.json"
 
-    Raises:
-        HTTPException: If no JWT secrets are configured.
-    """
+
+def _get_jwks_client() -> Optional[PyJWKClient]:
+    """Return a memoised PyJWKClient if a JWKS URL is configured, else None."""
+    global _jwks_client
+    if _jwks_client is not None:
+        return _jwks_client
+    url = _derive_jwks_url()
+    if not url:
+        return None
+    _jwks_client = PyJWKClient(url, cache_keys=True, lifespan=_JWKS_CACHE_LIFESPAN_S)
+    return _jwks_client
+
+
+def _reset_jwks_client_for_tests() -> None:
+    """Clear the cached JWKS client. Test-only hook."""
+    global _jwks_client
+    _jwks_client = None
+
+
+def _try_get_hs256_secrets() -> Optional[list[str]]:
+    """Return HS256 secrets if configured, else None."""
     try:
         return get_secrets_manager().get_rotation_secrets("JWT_SECRET_KEY")
     except ValueError:
+        return None
+
+
+def _get_jwt_secrets() -> list[str]:
+    """Return all valid HS256 secrets (current + optional previous).
+
+    Raises:
+        HTTPException(500): If no HS256 secret is configured but the caller
+            needs one (operational paths such as rate-limit key extraction).
+    """
+    secrets = _try_get_hs256_secrets()
+    if secrets is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
@@ -60,6 +110,95 @@ def _get_jwt_secrets() -> list[str]:
                 "(Dashboard → Settings → API → JWT Secret)."
             ),
         )
+    return secrets
+
+
+def _decode_with_hs256(token_str: str, decode_kwargs: dict[str, Any]) -> dict:
+    """Verify a HS256 token against current + previous secrets."""
+    secrets = _try_get_hs256_secrets()
+    if secrets is None:
+        logger.warning(
+            "Received HS256 JWT but JWT_SECRET_KEY is not configured "
+            "(asymmetric-only deployment)."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+    last_error: Optional[Exception] = None
+    for secret in secrets:
+        try:
+            return jwt.decode(token_str, secret, **decode_kwargs)
+        except jwt.ExpiredSignatureError:
+            raise
+        except jwt.InvalidTokenError as e:
+            last_error = e
+            continue
+    if last_error is not None:
+        raise last_error
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid token",
+    )
+
+
+def _decode_with_jwks(token_str: str, decode_kwargs: dict[str, Any]) -> dict:
+    """Verify an asymmetric token using the project's JWKS public keys."""
+    client = _get_jwks_client()
+    if client is None:
+        logger.error(
+            "Received asymmetric JWT but no JWKS URL is configured. "
+            "Set SUPABASE_URL or SUPABASE_JWKS_URL."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+    try:
+        signing_key = client.get_signing_key_from_jwt(token_str)
+    except PyJWKClientError as e:
+        logger.warning("JWKS key lookup failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+    return jwt.decode(token_str, signing_key.key, **decode_kwargs)
+
+
+def decode_jwt_for_rate_limit(token_str: str) -> Optional[dict[str, Any]]:
+    """Verify JWT and return payload for per-user rate limiting.
+
+    Mirrors ``verify_token`` verification paths (HS256 vs JWKS) so asymmetric
+    deployments without ``JWT_SECRET_KEY`` still bucket by ``sub``. Returns
+    ``None`` for unusable tokens; raises ``jwt.ExpiredSignatureError`` when the
+    signature is valid but the token is expired (callers fall back to IP).
+    """
+    try:
+        header = jwt.get_unverified_header(token_str)
+    except jwt.InvalidTokenError:
+        return None
+
+    alg = header.get("alg")
+    if alg not in _ALLOWED_ALGORITHMS:
+        return None
+
+    decode_kwargs: dict[str, Any] = {
+        "algorithms": [str(alg)],
+        "audience": "authenticated",
+    }
+    if JWT_ISSUER:
+        decode_kwargs["issuer"] = JWT_ISSUER
+
+    try:
+        if alg in _HS_ALGORITHMS:
+            return _decode_with_hs256(token_str, decode_kwargs)
+        return _decode_with_jwks(token_str, decode_kwargs)
+    except jwt.ExpiredSignatureError:
+        raise
+    except HTTPException:
+        return None
+    except jwt.PyJWTError:
+        return None
 
 
 async def verify_token(
@@ -67,50 +206,63 @@ async def verify_token(
 ) -> dict:
     """Verify a Supabase JWT token and return the decoded payload.
 
-    Tries all valid signing keys during rotation windows. The current
-    key is tried first, then the previous key if rotation is in progress.
+    Picks the verification path from the token's ``alg`` header so the
+    backend can simultaneously serve projects on legacy HS256 and projects
+    on the new asymmetric signing keys. The algorithm is validated against
+    a hardcoded allowlist before any key lookup.
 
-    The payload contains:
+    The returned payload contains:
       - sub: user UUID (auth.uid() in Supabase)
       - email: user email
       - role: "authenticated" (Supabase default)
       - aud: "authenticated"
       - exp: expiration timestamp
-      - app_metadata: Favonius tenancy (organization_id, favonius_role) — trusted claims
-      - user_metadata: user-editable fields (e.g. is_demo) — not used for access control
+      - app_metadata: trusted Favonius tenancy claims (organization_id,
+        favonius_role)
+      - user_metadata: user-editable fields (e.g. is_demo) — not used for
+        access control
 
     Raises HTTPException if the token is invalid or expired.
     """
-    secrets = _get_jwt_secrets()
     token_str = credentials.credentials
 
-    last_error: Optional[Exception] = None
+    try:
+        header = jwt.get_unverified_header(token_str)
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+
+    alg = header.get("alg")
+    if alg not in _ALLOWED_ALGORITHMS:
+        logger.warning("Rejecting token with disallowed alg=%r", alg)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+
     decode_kwargs: dict[str, Any] = {
-        "algorithms": _ALLOWED_ALGORITHMS,
+        "algorithms": [alg],
         "audience": "authenticated",
     }
     if JWT_ISSUER:
         decode_kwargs["issuer"] = JWT_ISSUER
 
-    for secret in secrets:
-        try:
-            payload = jwt.decode(token_str, secret, **decode_kwargs)
-            return payload
-        except jwt.ExpiredSignatureError:
-            # Expired tokens fail regardless of which key was used
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token expired",
-            )
-        except jwt.InvalidTokenError as e:
-            last_error = e
-            continue  # Try next key during rotation
-
-    # All keys failed — redact token details from the error
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid token",
-    )
+    try:
+        if alg in _HS_ALGORITHMS:
+            return _decode_with_hs256(token_str, decode_kwargs)
+        return _decode_with_jwks(token_str, decode_kwargs)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired",
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
 
 
 def get_user_id(token: dict) -> str:

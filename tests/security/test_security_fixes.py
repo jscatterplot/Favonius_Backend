@@ -124,17 +124,24 @@ class TestVerifyDepotAccess:
 class TestJWTAlgorithmAllowlist:
     """Test JWT algorithm enforcement (H1 fix)."""
 
-    def test_allowed_algorithms_is_hs256_only(self):
-        """The hardcoded allowlist should contain only HS256."""
+    def test_allowed_algorithms_hardcoded_tuple(self):
+        """Allowlist is a fixed tuple: legacy HS256 plus Supabase JWT Signing Key algs."""
+        from src.security.auth import (
+            _ALLOWED_ALGORITHMS,
+            _ASYMMETRIC_ALGORITHMS,
+            _HS_ALGORITHMS,
+        )
+
+        assert _ALLOWED_ALGORITHMS == _HS_ALGORITHMS + _ASYMMETRIC_ALGORITHMS
+        assert _HS_ALGORITHMS == ("HS256",)
+        assert _ASYMMETRIC_ALGORITHMS == ("ES256", "RS256", "EdDSA")
+
+    def test_disallowed_algorithms_not_in_allowlist(self):
+        """Unsafe or env-driven algorithms (e.g. none) must never verify."""
         from src.security.auth import _ALLOWED_ALGORITHMS
 
-        assert _ALLOWED_ALGORITHMS == ["HS256"]
-
-    def test_jwt_algorithm_env_matches_allowlist(self):
-        """JWT_ALGORITHM should be in the allowlist (module imports would fail otherwise)."""
-        from src.security.auth import JWT_ALGORITHM, _ALLOWED_ALGORITHMS
-
-        assert JWT_ALGORITHM in _ALLOWED_ALGORITHMS
+        for bad in ("none", "HS384", "HS512"):
+            assert bad not in _ALLOWED_ALGORITHMS
 
     def test_error_message_redacted(self):
         """verify_token should return 'Invalid token' without leaking details."""
