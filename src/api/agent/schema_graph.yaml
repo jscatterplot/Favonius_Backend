@@ -1,0 +1,112 @@
+# Hand-curated schema map for the depot chat agent (v0).
+#
+# Loaded by src/api/agent/llm.py at startup and embedded in the extraction
+# system prompt. Gives the LLM consistent vocabulary for the small slice
+# of tables the v0 `consumption_by_user` intent touches.
+#
+# This is NOT a full schema dump — only the tables, columns, and
+# relationships the agent should be aware of. UUIDs never reach the LLM
+# from a user message; this map exists so the model can correctly extract
+# entity mentions ("driver", "vehicle", "depot", "rfid card") and time
+# phrases. Resolution of names to IDs happens server-side in
+# src/api/agent/resolve.py.
+#
+# Naming convention: backend uses the Favonius vocabulary (driver_id,
+# depot_id) but the underlying Supabase tables use (id, site_id). The
+# agent and SQL compilers alias at the SQL boundary — this map matches
+# what the model should *say*, not the raw Postgres column name.
+
+tables:
+  drivers:
+    db: supabase
+    pk: id
+    description: |
+      A person assigned to operate vehicles in a depot. Holds RFID cards
+      that authenticate at chargers. The depot scoping is via site_id;
+      the table has no organization_id of its own.
+    columns:
+      id: "Primary key (UUID); aliased AS driver_id in agent SQL."
+      site_id: "FK to sites.id; aliased AS depot_id."
+      display_name: "Human-readable name shown to operators."
+      external_driver_id: "Customer-supplied employee/badge ID; matched in resolver."
+      email: "Contact email; matched in resolver."
+      status: "active | inactive — agent filters to active by default."
+      category: "delivery | employee | NULL (uncategorized)."
+
+  sites:
+    db: supabase
+    pk: id
+    description: |
+      A depot — a physical site with chargers. Backend code calls these
+      'depots' but the table is named 'sites' in Supabase.
+    columns:
+      id: "Primary key (UUID); aliased AS depot_id."
+      organization_id: "FK to organizations.id — the tenant scope."
+      name: "Display name, e.g. 'Vilnius depot'."
+      timezone: "IANA timezone string, e.g. 'Europe/Vilnius'. Used to convert relative time phrases to UTC bounds."
+      currency: "ISO 4217 code."
+
+  rfid_cards:
+    db: supabase
+    pk: id
+    description: |
+      A physical or virtual RFID card used at chargers. A driver may
+      hold zero, one, or many cards over time.
+    columns:
+      id: "Primary key (UUID); aliased AS card_id."
+      site_id: "FK to sites.id."
+      id_tag: "The OCPP idTag string; UNIQUE."
+      label: "Optional human-readable label."
+      status: "active | inactive | revoked."
+
+  rfid_card_driver_assignments:
+    db: supabase
+    description: |
+      Join table mapping cards to drivers. A card can be reassigned
+      between drivers; the agent reads the *current* assignment when
+      resolving a driver's card_ids for the consumption intent.
+    columns:
+      card_id: "FK to rfid_cards.id."
+      driver_id: "FK to drivers.id."
+
+  charging_sessions:
+    db: timescale
+    pk: ocpp_transaction_id
+    description: |
+      One row per OCPP charging transaction. NOT a TimescaleDB
+      hypertable — needs explicit indexes on (driver_id, start_time)
+      and (card_id, start_time). Sessions can have driver_id NULL when
+      the card was unassigned at session start; the consumption intent
+      filters with `driver_id = ANY(...) OR card_id = ANY(...)` to catch
+      both cases.
+    columns:
+      driver_id: "Nullable FK to drivers.id (added in migration 018)."
+      card_id: "Nullable FK to rfid_cards.id (added in migration 018)."
+      energy_delivered_kwh: "NUMERIC. The kWh metric for consumption queries."
+      cost_total: "DECIMAL(10,2). Read as-is; no projections in v0."
+      start_time: "TIMESTAMPTZ. Use AT TIME ZONE depot_tz for daily buckets."
+      end_time: "TIMESTAMPTZ."
+
+  vehicles:
+    db: supabase
+    pk: id
+    description: |
+      Reserved for future intents (vehicle_status, session_list).
+      Not consumed by the v0 consumption_by_user intent, but listed
+      here so the model knows 'vehicle' is a valid EntityMention.kind.
+    columns:
+      id: "Primary key (UUID); aliased AS vehicle_id."
+      site_id: "FK to sites.id; aliased AS depot_id."
+      vin: "VIN; UNIQUE."
+      external_id: "Customer-supplied vehicle ID."
+      license_plate: "Display plate."
+
+# Time-window vocabulary the model is allowed to emit on TimeWindow.relative.
+# Server-side resolver converts these to UTC bounds in the depot's timezone.
+relative_time_phrases:
+  - last_month
+  - this_month
+  - last_week
+  - this_week
+  - today
+  - yesterday

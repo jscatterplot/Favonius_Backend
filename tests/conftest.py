@@ -1346,6 +1346,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "acceptance: PRD acceptance criteria tests (AT-01 through AT-07)"
     )
+    config.addinivalue_line(
+        "markers",
+        "snapshot: snapshot tests against the live LLM (gated; nightly only)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
