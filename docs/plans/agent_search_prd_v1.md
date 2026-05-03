@@ -417,7 +417,7 @@ but not commitments — what we learn from v0 will reshape them.
 This section is the live source of truth for sprint progress. Each sprint's
 PR must update the matching row before requesting review.
 
-**Last updated:** 2026-05-03 (B1 in PR)
+**Last updated:** 2026-05-03 (B3 in PR)
 
 ### Backend
 
@@ -425,7 +425,7 @@ PR must update the matching row before requesting review.
 |--------|-------|--------|--------|----|----|-------|
 | B1 | Foundations: migrations + plan types + auth context | in PR | `claude/review-agent-search-auth-yuNlo` | [#94](https://github.com/jscatterplot/Favonius_Backend/pull/94) | — | Branch name diverges from `agent-search/sprint-b1-foundations` (sprint-prompt convention); PR opens against the branch the agent runner provisioned. |
 | B2 | Entity resolution + time window | not started | `agent-search/sprint-b2-resolution` | — | — | — |
-| B3 | Intent compiler + audit writer | not started | `agent-search/sprint-b3-compiler` | — | — | — |
+| B3 | Intent compiler + audit writer | in PR | `claude/convert-agent-runs-audit-M4IrX` | — | — | Branch name diverges from `agent-search/sprint-b3-compiler` (sprint-prompt convention); PR opens against the branch the agent runner provisioned. |
 | B4 | LLM integration | not started | `agent-search/sprint-b4-llm` | — | — | — |
 | B5 | Router + SSE + integration test | not started | `agent-search/sprint-b5-router` | — | — | — |
 | B6 | Golden tests + observability + acceptance + docs | not started | `agent-search/sprint-b6-launch` | — | — | — |
