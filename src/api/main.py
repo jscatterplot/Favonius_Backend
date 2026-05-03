@@ -93,6 +93,7 @@ from ..security.validators import (
     validate_uuid,
     validate_vehicle_id,
 )
+from . import fleet_list as _fleet_list
 from .error_codes import ERROR_MESSAGES, ErrorCode, http_status_for, safe_message_for
 from .reports import (
     REPORT_GROUP_BY_VALUES,
@@ -116,6 +117,14 @@ _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (c
 _config_cache_ttl: float = 300.0  # 5 minutes
 _depot_config_locks: dict[str, asyncio.Lock] = {}  # single-flight locks per depot
 _background_tasks: set[asyncio.Task] = set()
+
+# Fleet list response cache (chargers + vehicles). 2 s TTL is enough to dedupe
+# multi-tab thundering herd (frontend polls at 10 s) without making the data
+# stale. Cache keys are (depot_id, "chargers"|"vehicles"); values are (payload
+# dict, timestamp). Pair of asyncio.Locks per key to single-flight refreshes.
+_fleet_list_cache: dict[tuple[str, str], tuple[dict, float]] = {}
+_fleet_list_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_fleet_list_cache_ttl: float = 2.0  # seconds
 
 
 def _create_background_task(coro) -> None:
@@ -1057,6 +1066,133 @@ class AcknowledgeAlertResponse(BaseModel):
     id: str
     status: str
     acknowledged_at: str
+
+
+# ============ Fleet List Models (GET /depots/{id}/chargers, /vehicles) ============
+
+
+class ChargerCurrentSession(BaseModel):
+    """Active charging session running on this charger right now."""
+
+    session_id: str
+    vehicle_id: Optional[str] = None
+    started_at: str = Field(..., description="Session start (ISO 8601)")
+    current_power_kw: Optional[float] = None
+    current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    target_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    estimated_end_at: Optional[str] = None
+
+
+class ChargerListItem(BaseModel):
+    """One charger row for ``GET /depots/{id}/chargers``."""
+
+    id: str = Field(..., description="charging_stations.id (UUID)")
+    depot_id: str
+    ocpp_id: str = Field(..., description="OCPP charge_point_id (charging_stations.station_id)")
+    display_name: Optional[str] = None
+    vendor: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    firmware: Optional[str] = None
+    rated_kw: Optional[float] = None
+    efficiency: Optional[float] = None
+    connector_type: Optional[str] = None
+    connector_count: int = Field(..., ge=1)
+    connector_ids: list[int] = Field(default_factory=list)
+    auth_required: bool
+    status: Literal["charging", "idle", "offline", "fault"] = Field(
+        ..., description="Four-state pill: charging | idle | offline | fault"
+    )
+    ocpp_connector_status: Optional[str] = Field(
+        None,
+        description=(
+            "Raw OCPP StatusNotification value (Available, Preparing, Charging, "
+            "SuspendedEV, SuspendedEVSE, Faulted, Unavailable, Reserved, Finishing) "
+            "for tooltips and /admin/support drilldown."
+        ),
+    )
+    network_notes: Optional[str] = None
+    created_at: str
+    last_heartbeat_at: Optional[str] = Field(
+        None,
+        description="MAX(connector_status.timestamp) across this station's connectors. Null if never connected.",
+    )
+    current_session: Optional[ChargerCurrentSession] = None
+
+
+class ChargerListResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/chargers``."""
+
+    items: list[ChargerListItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+class VehicleNextDeparture(BaseModel):
+    """Next scheduled departure for this vehicle."""
+
+    schedule_id: str
+    route_id: Optional[str] = None
+    departure_time: str = Field(..., description="ISO 8601")
+    return_time: str = Field(..., description="ISO 8601")
+    required_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    energy_kwh: Optional[float] = None
+
+
+class VehicleCurrentState(BaseModel):
+    """Live operational state for a vehicle.
+
+    State derivation priority (top wins):
+      1. ``offline`` — ``last_seen_at`` is NULL or older than 30 minutes.
+      2. ``charging`` — an open ``charging_sessions`` row exists for this vehicle.
+      3. ``in_route`` — within an active schedule window
+         (``departure_time <= now() < COALESCE(actual_return_time, return_time)``).
+      4. ``ready`` — ``current_soc >= COALESCE(next_departure.required_soc, 0.95)``.
+      5. ``at_risk`` — ``current_soc < COALESCE(next_departure.required_soc, 0.95)``.
+    """
+
+    state: Literal["ready", "charging", "at_risk", "in_route", "offline"]
+    current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    current_power_kw: Optional[float] = None
+    connected_charger_id: Optional[str] = Field(
+        None, description="charging_stations.id (UUID), not the OCPP id"
+    )
+    connected_session_id: Optional[str] = None
+    last_seen_at: Optional[str] = Field(None, description="Latest telemetry timestamp (ISO 8601)")
+
+
+class VehicleListItem(BaseModel):
+    """One vehicle row for ``GET /depots/{id}/vehicles``."""
+
+    id: str = Field(..., description="vehicles.id (UUID)")
+    depot_id: str
+    external_id: str = Field(
+        ...,
+        min_length=1,
+        description="Customer's fleet number (vehicles.external_id, required + unique per depot)",
+    )
+    display_name: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    vin: Optional[str] = None
+    license_plate: Optional[str] = None
+    id_tag: Optional[str] = None
+    battery_capacity_kwh: Optional[float] = None
+    max_charge_rate_kw: Optional[float] = None
+    max_discharge_rate_kw: Optional[float] = None
+    v2g_capable: bool = False
+    make: Optional[str] = None
+    model: Optional[str] = None
+    year: Optional[int] = None
+    status: Optional[str] = None
+    created_at: str
+    current_state: VehicleCurrentState
+    next_departure: Optional[VehicleNextDeparture] = None
+
+
+class VehicleListResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/vehicles``."""
+
+    items: list[VehicleListItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
 
 
 class ScheduleResponse(BaseModel):
@@ -4896,6 +5032,236 @@ async def get_depot_alerts(
             status_code=500,
             detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to get alerts"},
         ) from e
+
+
+# ============ Fleet List Endpoints (chargers + vehicles) ============
+
+
+def _fleet_list_cache_get(depot_id: str, kind: str) -> Optional[dict]:
+    """Return a cached fleet list payload if it's fresh, else None."""
+    key = (depot_id, kind)
+    entry = _fleet_list_cache.get(key)
+    if entry is None:
+        return None
+    payload, cached_at = entry
+    if time.time() - cached_at >= _fleet_list_cache_ttl:
+        _fleet_list_cache.pop(key, None)
+        return None
+    return payload
+
+
+def _fleet_list_cache_set(depot_id: str, kind: str, payload: dict) -> None:
+    """Store a fleet list payload in the per-depot cache."""
+    _fleet_list_cache[(depot_id, kind)] = (payload, time.time())
+
+
+def _fleet_list_lock(depot_id: str, kind: str) -> asyncio.Lock:
+    """Return the single-flight lock for ``(depot_id, kind)``, creating it lazily."""
+    key = (depot_id, kind)
+    lock = _fleet_list_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _fleet_list_locks[key] = lock
+    return lock
+
+
+def _fleet_list_response(payload: dict) -> JSONResponse:
+    """Wrap a fleet list payload in a JSONResponse with Cache-Control."""
+    return JSONResponse(
+        content=payload,
+        headers={"Cache-Control": "max-age=5, stale-while-revalidate=10"},
+    )
+
+
+async def _safe_runtime_fetch(coro_factory):
+    """Run a runtime DB query, returning ``{}`` if the table is missing.
+
+    Some environments (fresh Supabase project, local dev with partial migrations)
+    don't have the Timescale-side tables yet. We degrade gracefully rather than
+    503-ing the whole list endpoint.
+    """
+    try:
+        return await coro_factory()
+    except asyncpg.UndefinedTableError:
+        return {}
+
+
+@app.get(
+    "/depots/{depot_id}/chargers",
+    response_model=ChargerListResponse,
+    tags=["depots"],
+    summary="List chargers for a depot with live status",
+    description=(
+        "Static charger reference data from `charging_stations` joined with the "
+        "latest `connector_status` and any open `charging_sessions` rows. The "
+        "`status` field is a 4-state pill (`charging | idle | offline | fault`) "
+        "computed server-side; `ocpp_connector_status` exposes the raw OCPP "
+        "literal for tooltips and admin drilldown."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_chargers(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """List chargers for a depot with live status and any active session."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "chargers")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "chargers"):
+        cached = _fleet_list_cache_get(depot_id, "chargers")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                static_rows = await db_queries.list_chargers_for_depot(
+                    static_conn, depot_id=depot_id
+                )
+
+            ocpp_ids = [row["ocpp_id"] for row in static_rows]
+
+            connector_statuses: dict[str, dict] = {}
+            open_sessions: dict[str, dict] = {}
+            if ocpp_ids:
+                async with db_pools.ts.acquire() as ts_conn:
+                    connector_statuses = await _safe_runtime_fetch(
+                        lambda: db_queries.latest_connector_status_by_stations(ts_conn, ocpp_ids)
+                    )
+                    open_sessions = await _safe_runtime_fetch(
+                        lambda: db_queries.open_sessions_by_stations(ts_conn, ocpp_ids)
+                    )
+
+            now = datetime.now(timezone.utc)
+            items = [
+                _fleet_list.format_charger_item(
+                    static_row,
+                    connector_status=connector_statuses.get(static_row["ocpp_id"]),
+                    open_session=open_sessions.get(static_row["ocpp_id"]),
+                    now=now,
+                )
+                for static_row in static_rows
+            ]
+
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            _fleet_list_cache_set(depot_id, "chargers", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing chargers for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
+
+
+@app.get(
+    "/depots/{depot_id}/vehicles",
+    response_model=VehicleListResponse,
+    tags=["depots"],
+    summary="List vehicles for a depot with live state",
+    description=(
+        "Static vehicle reference data from `vehicles` joined with the latest "
+        "`telemetry`, any open `charging_sessions`, the next future `schedules` "
+        "row, and (if applicable) the currently active schedule window. The "
+        "`current_state.state` field is a 5-state pill "
+        "(`ready | charging | at_risk | in_route | offline`) computed server-side."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_vehicles(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """List vehicles for a depot with live state and next departure."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "vehicles")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "vehicles"):
+        cached = _fleet_list_cache_get(depot_id, "vehicles")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                static_rows = await db_queries.list_vehicles_for_depot(
+                    static_conn, depot_id=depot_id
+                )
+                charger_id_map = await db_queries.charger_id_by_ocpp_id(
+                    static_conn, depot_id=depot_id
+                )
+
+            vehicle_ids = [row["id"] for row in static_rows]
+
+            telemetry: dict[str, dict] = {}
+            sessions: dict[str, dict] = {}
+            next_departures: dict[str, dict] = {}
+            active_schedules: dict[str, dict] = {}
+            if vehicle_ids:
+                async with db_pools.ts.acquire() as ts_conn:
+                    telemetry = await _safe_runtime_fetch(
+                        lambda: db_queries.latest_telemetry_by_vehicles(ts_conn, vehicle_ids)
+                    )
+                    sessions = await _safe_runtime_fetch(
+                        lambda: db_queries.open_session_by_vehicles(ts_conn, vehicle_ids)
+                    )
+                    next_departures = await _safe_runtime_fetch(
+                        lambda: db_queries.next_departures_by_vehicles(ts_conn, vehicle_ids)
+                    )
+                    active_schedules = await _safe_runtime_fetch(
+                        lambda: db_queries.active_schedule_by_vehicles(ts_conn, vehicle_ids)
+                    )
+
+            now = datetime.now(timezone.utc)
+            items = [
+                _fleet_list.format_vehicle_item(
+                    static_row,
+                    telemetry=telemetry.get(static_row["id"]),
+                    open_session=sessions.get(static_row["id"]),
+                    next_departure=next_departures.get(static_row["id"]),
+                    active_schedule=active_schedules.get(static_row["id"]),
+                    charger_id_by_ocpp_id=charger_id_map,
+                    now=now,
+                )
+                for static_row in static_rows
+            ]
+
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            _fleet_list_cache_set(depot_id, "vehicles", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing vehicles for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
 
 
 @app.post(
