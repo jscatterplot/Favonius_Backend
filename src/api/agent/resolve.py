@@ -23,53 +23,12 @@ Reference:
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Literal, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field
-
-from src.api.agent.auth_context import AuthContext
+from src.api.agent.auth_context import AuthContext, ResolvedEntity, ResolvedTimeWindow
 from src.api.agent.plan import EntityMention, TimeWindow
-
-EntityKind = Literal["driver", "vehicle", "depot", "rfid"]
-
-
-class ResolvedEntity(BaseModel):
-    """A subject mention, resolved (or not) to a static-DB row.
-
-    ``primary_id=None`` is the "not found" signal. ``candidates`` is
-    populated only when the underlying lookup matched more than one
-    row; the head of the list is also the primary entity, so the
-    caller can render disambiguation UX without losing the top match.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    kind: EntityKind
-    display: str
-    primary_id: Optional[UUID] = None
-    card_ids: list[UUID] = Field(default_factory=list)
-    candidates: list["ResolvedEntity"] = Field(default_factory=list)
-
-
-ResolvedEntity.model_rebuild()
-
-
-class ResolvedTimeWindow(BaseModel):
-    """A half-open UTC interval ``[start_utc, end_utc)`` plus its source TZ.
-
-    The ``timezone`` field carries the IANA name used to anchor the
-    interval, so the compiler can pass it through to ``AT TIME ZONE``
-    when grouping by local day / month.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    start_utc: datetime
-    end_utc: datetime
-    timezone: str
-
 
 _ResolverFn = Callable[[str, AuthContext, Any], Awaitable[list[ResolvedEntity]]]
 
