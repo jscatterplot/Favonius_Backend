@@ -132,8 +132,9 @@ async def mirror_user_tenant_atomic(conn: "asyncpg.Connection", user: dict) -> N
     enclosing transaction can roll back.
 
     Use this from endpoints (e.g. depot creation) where the membership row is
-    a hard prerequisite for downstream RLS-gated reads. Updates the in-process
-    cache on success so the next ``ensure_tenant_mirrored`` call is a no-op.
+    a hard prerequisite for downstream RLS-gated reads. Does not update the
+    in-process cache: the caller owns the transaction; caching before commit
+    would skip re-UPSERTs after rollback until TTL expiry.
 
     No-op for ``favonius_admin`` or users without ``organization_id``.
     """
@@ -148,7 +149,6 @@ async def mirror_user_tenant_atomic(conn: "asyncpg.Connection", user: dict) -> N
         role=role,
         organization_name=organization_name,
     )
-    _cache[str(user_id)] = _TenantCacheEntry(org_id, role, time.monotonic() + _TTL_S)
 
 
 async def ensure_tenant_mirrored(user: dict = Depends(verify_token)) -> dict:

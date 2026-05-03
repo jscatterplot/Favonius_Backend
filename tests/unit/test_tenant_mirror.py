@@ -263,9 +263,9 @@ async def test_atomic_mirror_skips_user_without_org_id():
 
 
 @pytest.mark.asyncio
-async def test_atomic_mirror_primes_cache_so_subsequent_best_effort_is_noop():
-    """After atomic mirror succeeds, the next ``mirror_user_tenant`` call
-    within the TTL window should hit the cache and skip its own DB writes."""
+async def test_atomic_mirror_does_not_prime_cache_before_commit():
+    """Atomic mirror must not cache until the enclosing transaction commits;
+    the next ``mirror_user_tenant`` should still run UPSERTs (no stale skip)."""
     sub = "11111111-1111-4111-8111-111111111111"
     org = "22222222-2222-4222-8222-222222222222"
     user = _user(sub, org, "customer_admin", "HRX")
@@ -276,4 +276,4 @@ async def test_atomic_mirror_primes_cache_so_subsequent_best_effort_is_noop():
 
     pool = _FakePool()
     await tm.mirror_user_tenant(user, pool)
-    assert pool.conn.executes == []  # cache hit, no DB writes
+    assert len(pool.conn.executes) == 2
