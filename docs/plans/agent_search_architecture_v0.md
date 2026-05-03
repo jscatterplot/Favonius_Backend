@@ -461,9 +461,20 @@ Add to `pyproject.toml`:
 anthropic = ">=0.40.0"
 ```
 
-Recommended model: **`claude-sonnet-4-6`** for plan extraction and answer
-formatting. Fast, cheap, structured output is reliable. Reserve Opus for
-later if intents get more complex than `consumption_by_user`.
+**Model selection is environment-driven.** The agent reads
+`AGENT_LLM_MODEL` at startup (default `claude-sonnet-4-6`) and uses that
+model for both `extract_plan` and `format_answer`. Switching models is a
+redeploy of env, not a code change. The startup loader validates the value
+against a known-good list (`claude-opus-4-7`, `claude-sonnet-4-6`,
+`claude-haiku-4-5`) so a typo fails loudly. See `LLMConfig` in
+`src/api/agent/llm.py`.
+
+Default rationale: Sonnet 4.6 is fast, cheap enough at pilot volume
+(€30–€45/month, see PRD §6), and reliable at structured output. Haiku 4.5
+is the cost-optimization fallback. Opus 4.7 is reserved for future intents
+that need stronger reasoning. The PRD-spec'd `scripts/agent_eval.py` runs
+the same prompt across two models side-by-side so the choice is
+data-driven, not vibes-driven.
 
 The repo has a `claude-api` skill that codifies prompt caching, structured
 output, and the migration story; use it when wiring the client.
