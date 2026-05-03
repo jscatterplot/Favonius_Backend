@@ -560,7 +560,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     final_intent     TEXT,
     steps_json       JSONB NOT NULL DEFAULT '[]'::jsonb,
     status           TEXT NOT NULL
-        CHECK (status IN ('success', 'disambiguation', 'not_found', 'error')),
+        CHECK (status IN ('running', 'success', 'disambiguation', 'not_found', 'error')),
     duration_ms      INTEGER,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
