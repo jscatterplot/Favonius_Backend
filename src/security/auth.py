@@ -362,7 +362,13 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
                 depot_id,
                 org_id,
             )
-    except (asyncpg.PostgresError, OSError, asyncio.TimeoutError) as exc:
+    except (
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        asyncpg.InternalClientError,
+        OSError,
+        asyncio.TimeoutError,
+    ) as exc:
         # Real DB / network failure. Don't disguise as a policy denial — that
         # makes diagnosis impossible and falsely tells the user they lack
         # access. Log with traceback and surface 503 so the caller can retry.
