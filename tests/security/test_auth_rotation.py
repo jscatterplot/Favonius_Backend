@@ -1,12 +1,15 @@
-"""Tests for JWT authentication with key rotation support.
+"""Tests for JWT authentication with key rotation and JWKS support.
 
 Tests cover:
-- Token verification with current key
-- Token verification with previous key during rotation
+- HS256 token verification with current key
+- HS256 token verification with previous key during rotation
 - Expired tokens rejected regardless of key
 - Invalid tokens rejected
 - Missing JWT_SECRET_KEY raises 500
 - get_user_role extracts Favonius role from metadata
+- ES256 token verified via mocked PyJWKClient
+- ES256 token rejected when JWKS URL is not configured
+- Disallowed alg values rejected before key lookup
 """
 
 from __future__ import annotations
@@ -181,3 +184,164 @@ class TestUserHelpers:
         assert is_demo_user({"user_metadata": {"is_demo": True}}) is True
         assert is_demo_user({"user_metadata": {"is_demo": False}}) is False
         assert is_demo_user({}) is False
+
+
+class TestVerifyTokenJWKS:
+    """ES256 / asymmetric verification path (Supabase JWT Signing Keys)."""
+
+    @staticmethod
+    def _make_es256_keypair():
+        """Generate a P-256 keypair and the matching PyJWK signing key."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        from src.security import auth as auth_mod
+
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key = private_key.public_key()
+
+        class _FakeSigningKey:
+            def __init__(self, key):
+                self.key = key
+
+        signing_key = _FakeSigningKey(public_key)
+        # Reset cached client so each test starts fresh
+        auth_mod._reset_jwks_client_for_tests()
+        return private_key, signing_key
+
+    @pytest.mark.asyncio
+    async def test_es256_verified_via_jwks(self):
+        """ES256 token is decoded using the JWKS public key."""
+        from unittest.mock import MagicMock, patch
+
+        from src.security import auth as auth_mod
+
+        private_key, signing_key = self._make_es256_keypair()
+        payload = {
+            "sub": "user-uuid-es256",
+            "email": "es256@favonius.energy",
+            "role": "authenticated",
+            "aud": "authenticated",
+            "exp": int(time.time()) + 3600,
+        }
+        token = jwt.encode(payload, private_key, algorithm="ES256", headers={"kid": "k1"})
+        creds = MagicMock()
+        creds.credentials = token
+
+        env = {"SUPABASE_URL": "https://example.supabase.co"}
+        fake_client = MagicMock()
+        fake_client.get_signing_key_from_jwt.return_value = signing_key
+
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            auth_mod, "PyJWKClient", return_value=fake_client
+        ):
+            os.environ.pop("JWT_SECRET_KEY", None)
+            auth_mod._reset_jwks_client_for_tests()
+            decoded = await auth_mod.verify_token(creds)
+
+        assert decoded["sub"] == "user-uuid-es256"
+        fake_client.get_signing_key_from_jwt.assert_called_once_with(token)
+
+    @pytest.mark.asyncio
+    async def test_es256_rejected_when_jwks_url_missing(self):
+        """ES256 token without SUPABASE_URL is rejected as 401, not 500."""
+        from unittest.mock import MagicMock
+
+        from src.security import auth as auth_mod
+
+        private_key, _ = self._make_es256_keypair()
+        payload = {
+            "sub": "user-uuid",
+            "aud": "authenticated",
+            "exp": int(time.time()) + 3600,
+        }
+        token = jwt.encode(payload, private_key, algorithm="ES256")
+        creds = MagicMock()
+        creds.credentials = token
+
+        with patch.dict(os.environ, {}, clear=False):
+            for var in ("SUPABASE_URL", "SUPABASE_JWKS_URL", "JWT_SECRET_KEY"):
+                os.environ.pop(var, None)
+            auth_mod._reset_jwks_client_for_tests()
+            with pytest.raises(HTTPException) as exc_info:
+                await auth_mod.verify_token(creds)
+            assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_disallowed_alg_rejected(self):
+        """Tokens with an algorithm outside the allowlist are rejected."""
+        from unittest.mock import MagicMock
+
+        from src.security import auth as auth_mod
+
+        # Craft a header-only token with alg=none — never decode-able.
+        token = jwt.encode(
+            {"sub": "x", "aud": "authenticated"},
+            key="",
+            algorithm="none",
+        )
+        creds = MagicMock()
+        creds.credentials = token
+
+        auth_mod._reset_jwks_client_for_tests()
+        with pytest.raises(HTTPException) as exc_info:
+            await auth_mod.verify_token(creds)
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_jwks_lookup_failure_returns_401(self):
+        """A JWKS network/lookup failure is surfaced as 401, not 500."""
+        from unittest.mock import MagicMock, patch
+
+        from jwt import PyJWKClientError
+
+        from src.security import auth as auth_mod
+
+        private_key, _ = self._make_es256_keypair()
+        token = jwt.encode(
+            {"sub": "x", "aud": "authenticated", "exp": int(time.time()) + 3600},
+            private_key,
+            algorithm="ES256",
+        )
+        creds = MagicMock()
+        creds.credentials = token
+
+        fake_client = MagicMock()
+        fake_client.get_signing_key_from_jwt.side_effect = PyJWKClientError("boom")
+
+        env = {"SUPABASE_URL": "https://example.supabase.co"}
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            auth_mod, "PyJWKClient", return_value=fake_client
+        ):
+            auth_mod._reset_jwks_client_for_tests()
+            with pytest.raises(HTTPException) as exc_info:
+                await auth_mod.verify_token(creds)
+            assert exc_info.value.status_code == 401
+
+    def test_derive_jwks_url_from_supabase_url(self):
+        """SUPABASE_URL is normalised into the standard JWKS path."""
+        from src.security import auth as auth_mod
+
+        with patch.dict(
+            os.environ,
+            {"SUPABASE_URL": "https://abc.supabase.co/"},
+            clear=False,
+        ):
+            os.environ.pop("SUPABASE_JWKS_URL", None)
+            assert (
+                auth_mod._derive_jwks_url()
+                == "https://abc.supabase.co/auth/v1/.well-known/jwks.json"
+            )
+
+    def test_derive_jwks_url_explicit_override(self):
+        """SUPABASE_JWKS_URL overrides the derived path."""
+        from src.security import auth as auth_mod
+
+        with patch.dict(
+            os.environ,
+            {
+                "SUPABASE_URL": "https://abc.supabase.co",
+                "SUPABASE_JWKS_URL": "https://custom.example/jwks.json",
+            },
+            clear=False,
+        ):
+            assert auth_mod._derive_jwks_url() == "https://custom.example/jwks.json"

@@ -694,7 +694,12 @@ test(api): add coverage for handoff rate limiting
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string (TimescaleDB) |
-| `JWT_SECRET_KEY` | Secret for JWT verification |
+| `JWT_SECRET_KEY` | Supabase legacy HS256 secret. Required for projects that still sign tokens with HS256 (Dashboard → Settings → API → JWT Secret). |
+| `JWT_SECRET_KEY_PREVIOUS` | Optional previous HS256 secret; honoured during a rotation window so both old and new tokens verify. |
+| `SUPABASE_URL` | Project URL, e.g. `https://<ref>.supabase.co`. Required when the project signs tokens with the new asymmetric JWT Signing Keys (ES256/RS256/EdDSA). The backend derives the JWKS URL `<url>/auth/v1/.well-known/jwks.json` automatically. New Supabase projects (created with CLI ≥ 2.71.1) default to ES256 — `verify_token` selects the verification path from the token's own `alg` header. |
+| `SUPABASE_JWKS_URL` | Optional explicit JWKS URL override. |
+| `JWT_JWKS_CACHE_LIFESPAN_S` | Optional `PyJWKClient` cache TTL (default `3600`). |
+| `JWT_ISSUER` | Optional. If set, the JWT `iss` claim must match (e.g. `https://<ref>.supabase.co/auth/v1`). |
 | `ENVIRONMENT` | `development` / `staging` / `production` |
 
 ### Tenant mirroring (optional)
