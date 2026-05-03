@@ -53,6 +53,22 @@ JWT_ISSUER: Optional[str] = os.getenv("JWT_ISSUER")
 # JWKS client cache lifetime — default 1 hour; Supabase keys rotate rarely.
 _JWKS_CACHE_LIFESPAN_S = int(os.getenv("JWT_JWKS_CACHE_LIFESPAN_S", "3600"))
 
+# Email domains whose JWT subjects are auto-promoted to ``favonius_admin``.
+# Comparison is on the part after the final ``@``, lowercased, exact match —
+# so ``user@favoniusenergy.com`` matches but ``user@evil.favoniusenergy.com``
+# and ``user@favoniusenergy.com.attacker.com`` do not.
+_DEFAULT_FAVONIUS_ADMIN_DOMAINS: tuple[str, ...] = ("favoniusenergy.com",)
+
+
+def _load_favonius_admin_domains() -> tuple[str, ...]:
+    """Return the configured admin email domains (env override, lowercased)."""
+    raw = os.getenv("FAVONIUS_ADMIN_EMAIL_DOMAINS")
+    if not raw:
+        return _DEFAULT_FAVONIUS_ADMIN_DOMAINS
+    parsed = tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+    return parsed or _DEFAULT_FAVONIUS_ADMIN_DOMAINS
+
+
 security = HTTPBearer()
 
 _jwks_client: Optional[PyJWKClient] = None
@@ -215,7 +231,8 @@ async def verify_token(
 
     The returned payload contains:
       - sub: user UUID (auth.uid() in Supabase)
-      - email: user email
+      - email: user email — also used by :func:`get_user_role` to auto-promote
+        any verified ``@favoniusenergy.com`` address to ``favonius_admin``.
       - role: "authenticated" (Supabase default)
       - aud: "authenticated"
       - exp: expiration timestamp
@@ -393,8 +410,44 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
     )
 
 
+def _email_indicates_favonius_admin(token: dict) -> bool:
+    """Return True if the JWT email belongs to a Favonius staff domain.
+
+    Domain comparison is exact (no subdomain matching) and case-insensitive.
+    A token whose ``user_metadata.email_verified`` is explicitly ``False`` is
+    rejected — Supabase emits this claim for unconfirmed signups, and granting
+    platform-admin access on an unverified email would let anyone claim a
+    Favonius staff identity.
+    """
+    email = token.get("email")
+    if not isinstance(email, str) or "@" not in email:
+        return False
+
+    user_metadata = token.get("user_metadata")
+    if isinstance(user_metadata, dict) and user_metadata.get("email_verified") is False:
+        return False
+
+    domain = email.rsplit("@", 1)[-1].strip().lower()
+    return domain in _load_favonius_admin_domains()
+
+
 def get_user_role(token: dict) -> str:
-    """Extract Favonius role from ``app_metadata.favonius_role``, else Supabase ``role``."""
+    """Extract the Favonius role for the authenticated user.
+
+    Resolution order:
+      1. If the verified ``email`` claim belongs to a configured Favonius
+         staff domain (default ``favoniusenergy.com``), the role is
+         ``favonius_admin``. This grants platform-wide access to all depots
+         and tenants and overrides any explicit ``app_metadata.favonius_role``
+         so a stale Supabase metadata value cannot demote a Favonius
+         employee. Configure additional or alternate domains via the
+         ``FAVONIUS_ADMIN_EMAIL_DOMAINS`` env var (comma-separated).
+      2. Otherwise ``app_metadata.favonius_role`` if present.
+      3. Otherwise the Supabase top-level ``role`` claim
+         (defaults to ``authenticated``).
+    """
+    if _email_indicates_favonius_admin(token):
+        return "favonius_admin"
     meta = get_app_metadata(token)
     favonius_role = meta.get("favonius_role")
     if favonius_role:

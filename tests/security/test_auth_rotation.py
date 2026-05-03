@@ -28,6 +28,8 @@ from src.security.auth import (
     get_user_id,
     get_user_role,
     is_demo_user,
+    is_platform_admin,
+    verify_depot_access,
     verify_token,
 )
 
@@ -185,6 +187,147 @@ class TestUserHelpers:
         assert is_demo_user({"user_metadata": {"is_demo": True}}) is True
         assert is_demo_user({"user_metadata": {"is_demo": False}}) is False
         assert is_demo_user({}) is False
+
+
+class TestEmailBasedAdminPromotion:
+    """Auto-promotion to ``favonius_admin`` based on the JWT email domain.
+
+    Anyone who can authenticate with a verified ``@favoniusenergy.com`` address
+    must resolve to ``favonius_admin`` regardless of ``app_metadata.favonius_role``,
+    so a stale Supabase metadata value cannot demote a Favonius employee.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_env_override(self):
+        """Default to the hardcoded domain unless a test sets the override."""
+        env = {k: v for k, v in os.environ.items() if k != "FAVONIUS_ADMIN_EMAIL_DOMAINS"}
+        with patch.dict(os.environ, env, clear=True):
+            yield
+
+    def test_promotes_matching_email(self):
+        token = {"email": "alice@favoniusenergy.com"}
+        assert get_user_role(token) == "favonius_admin"
+
+    def test_promotes_when_email_case_varies(self):
+        token = {"email": "Alice@FavoniusEnergy.COM"}
+        assert get_user_role(token) == "favonius_admin"
+
+    def test_promotion_overrides_explicit_lower_role(self):
+        """A Favonius email beats any prior ``app_metadata.favonius_role``."""
+        token = {
+            "email": "alice@favoniusenergy.com",
+            "app_metadata": {"favonius_role": "customer_operator"},
+        }
+        assert get_user_role(token) == "favonius_admin"
+
+    def test_does_not_promote_other_domain(self):
+        token = {
+            "email": "alice@example.com",
+            "app_metadata": {"favonius_role": "customer_operator"},
+        }
+        assert get_user_role(token) == "customer_operator"
+
+    def test_does_not_promote_subdomain(self):
+        """Subdomains and prefix collisions must NOT match."""
+        token = {"email": "attacker@evil.favoniusenergy.com"}
+        assert get_user_role(token) == "authenticated"
+
+    def test_does_not_promote_suffix_lookalike(self):
+        """``…favoniusenergy.com.attacker.com`` ends in the brand string but is not it."""
+        token = {"email": "attacker@favoniusenergy.com.attacker.com"}
+        assert get_user_role(token) == "authenticated"
+
+    def test_does_not_promote_lookalike_brand(self):
+        """``favonius-energy.com`` and ``favonius.energy`` are distinct domains."""
+        for email in ("alice@favonius-energy.com", "alice@favonius.energy"):
+            assert get_user_role({"email": email}) == "authenticated"
+
+    def test_no_email_claim_falls_back(self):
+        token = {"app_metadata": {"favonius_role": "customer_admin"}}
+        assert get_user_role(token) == "customer_admin"
+
+    def test_malformed_email_falls_back(self):
+        token = {"email": "no-at-sign", "role": "authenticated"}
+        assert get_user_role(token) == "authenticated"
+
+    def test_empty_email_falls_back(self):
+        token = {"email": "", "role": "authenticated"}
+        assert get_user_role(token) == "authenticated"
+
+    def test_non_string_email_falls_back(self):
+        """Defensive: never crash if a malformed JWT carries a non-string email."""
+        token = {"email": 12345, "role": "authenticated"}
+        assert get_user_role(token) == "authenticated"
+
+    def test_unverified_email_blocks_promotion(self):
+        """An ``email_verified=False`` claim must defeat promotion."""
+        token = {
+            "email": "alice@favoniusenergy.com",
+            "user_metadata": {"email_verified": False},
+        }
+        assert get_user_role(token) == "authenticated"
+
+    def test_verified_email_allows_promotion(self):
+        token = {
+            "email": "alice@favoniusenergy.com",
+            "user_metadata": {"email_verified": True},
+        }
+        assert get_user_role(token) == "favonius_admin"
+
+    def test_missing_email_verified_claim_trusts_jwt(self):
+        """``email_verified`` is optional — Supabase only emits it on confirm."""
+        token = {"email": "alice@favoniusenergy.com", "user_metadata": {}}
+        assert get_user_role(token) == "favonius_admin"
+
+    def test_env_var_overrides_default_domain(self):
+        with patch.dict(
+            os.environ, {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "favonius.energy"}, clear=False
+        ):
+            assert get_user_role({"email": "ops@favonius.energy"}) == "favonius_admin"
+            # Default domain no longer counts when the override is set.
+            assert (
+                get_user_role({"email": "alice@favoniusenergy.com", "role": "authenticated"})
+                == "authenticated"
+            )
+
+    def test_env_var_supports_multiple_domains(self):
+        with patch.dict(
+            os.environ,
+            {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "favoniusenergy.com, favonius.energy"},
+            clear=False,
+        ):
+            assert get_user_role({"email": "ops@favonius.energy"}) == "favonius_admin"
+            assert get_user_role({"email": "alice@favoniusenergy.com"}) == "favonius_admin"
+            assert (
+                get_user_role({"email": "stranger@example.com", "role": "authenticated"})
+                == "authenticated"
+            )
+
+    def test_blank_env_var_falls_back_to_default(self):
+        """Whitespace-only override must not silently disable promotion."""
+        with patch.dict(
+            os.environ, {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "  ,  "}, clear=False
+        ):
+            assert get_user_role({"email": "alice@favoniusenergy.com"}) == "favonius_admin"
+
+    def test_is_platform_admin_honours_email_promotion(self):
+        """The downstream admin gate must also see the promoted role."""
+        token = {"email": "alice@favoniusenergy.com"}
+        assert is_platform_admin(token) is True
+
+    @pytest.mark.asyncio
+    async def test_verify_depot_access_bypasses_tenant_check_for_favonius_email(self):
+        """``verify_depot_access`` must bypass the DB lookup for Favonius staff.
+
+        Passes a sentinel ``object()`` as the static pool — if we got far enough
+        to call ``pool.acquire()`` the test would explode, so a clean return is
+        proof that the platform-admin shortcut fired before any DB access.
+        """
+        token = {"email": "ops@favoniusenergy.com"}
+        sentinel_pool = object()
+        await verify_depot_access(
+            "00000000-0000-4000-8000-000000000000", token, pool=sentinel_pool
+        )
 
 
 class TestVerifyTokenJWKS:

@@ -340,6 +340,12 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 - In-process TTL cache: `TENANT_MIRROR_TTL_S` (default `300`) seconds per `sub` to limit DB writes.
 - Workspace **invitations** are managed in Supabase only; there is no `invitations` table in this backend.
 
+### Favonius staff auto-promotion
+- `get_user_role` in `src/security/auth.py` resolves any verified JWT whose `email` ends with `@favoniusenergy.com` to `favonius_admin` regardless of `app_metadata.favonius_role`. This grants platform-wide access (all depots, all tenants, cross-org reads) and skips tenant mirroring as a side effect of the existing `favonius_admin` skip.
+- Domain comparison is exact (no subdomain matching) and case-insensitive. A token whose `user_metadata.email_verified` is explicitly `False` is **not** promoted — that defends against unverified-signup spoofing in projects that disabled email confirm.
+- Configure additional / alternate domains via `FAVONIUS_ADMIN_EMAIL_DOMAINS` (comma-separated). When set, it **replaces** the default — include `favoniusenergy.com` explicitly if you still want it.
+- Promotion overrides any explicit `app_metadata.favonius_role`, so a stale Supabase metadata value cannot demote a Favonius employee. To exclude a specific Favonius email (e.g. a contractor on a `@favoniusenergy.com` address), do not issue them an `@favoniusenergy.com` JWT email — there is no per-user opt-out hook.
+
 ### Operational tables
 - `schedules` — Vehicle route schedules (departure/return times)
 - `optimization_runs` — Solver results, schedule JSON, status, solver_used
@@ -700,6 +706,7 @@ test(api): add coverage for handoff rate limiting
 | `SUPABASE_JWKS_URL` | Optional explicit JWKS URL override. |
 | `JWT_JWKS_CACHE_LIFESPAN_S` | Optional `PyJWKClient` cache TTL (default `3600`). |
 | `JWT_ISSUER` | Optional. If set, the JWT `iss` claim must match (e.g. `https://<ref>.supabase.co/auth/v1`). |
+| `FAVONIUS_ADMIN_EMAIL_DOMAINS` | Optional, comma-separated. Email domains whose verified JWT subjects are auto-promoted to `favonius_admin` (default `favoniusenergy.com`). Setting this **replaces** the default — include the original entry explicitly to keep it. |
 | `ENVIRONMENT` | `development` / `staging` / `production` |
 
 ### Tenant mirroring (optional)
