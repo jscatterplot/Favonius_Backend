@@ -165,6 +165,58 @@ def _decode_with_jwks(token_str: str, decode_kwargs: dict[str, Any]) -> dict:
     return jwt.decode(token_str, signing_key.key, **decode_kwargs)
 
 
+def decode_jwt_for_rate_limit(token_str: str) -> Optional[dict[str, Any]]:
+    """Verify JWT and return payload for per-user rate limiting.
+
+    Mirrors ``verify_token`` verification paths (HS256 vs JWKS) so asymmetric
+    deployments without ``JWT_SECRET_KEY`` still bucket by ``sub``. Returns
+    ``None`` for unusable tokens; raises ``jwt.ExpiredSignatureError`` when the
+    signature is valid but the token is expired (callers fall back to IP).
+    """
+    try:
+        header = jwt.get_unverified_header(token_str)
+    except jwt.InvalidTokenError:
+        return None
+
+    alg = header.get("alg")
+    if alg not in _ALLOWED_ALGORITHMS:
+        return None
+
+    decode_kwargs: dict[str, Any] = {
+        "algorithms": [str(alg)],
+        "audience": "authenticated",
+    }
+    if JWT_ISSUER:
+        decode_kwargs["issuer"] = JWT_ISSUER
+
+    try:
+        if alg in _HS_ALGORITHMS:
+            secrets = _try_get_hs256_secrets()
+            if secrets is None:
+                return None
+            for secret in secrets:
+                try:
+                    return jwt.decode(token_str, secret, **decode_kwargs)
+                except jwt.ExpiredSignatureError:
+                    raise
+                except jwt.InvalidTokenError:
+                    continue
+            return None
+
+        client = _get_jwks_client()
+        if client is None:
+            return None
+        try:
+            signing_key = client.get_signing_key_from_jwt(token_str)
+        except PyJWKClientError:
+            return None
+        return jwt.decode(token_str, signing_key.key, **decode_kwargs)
+    except jwt.ExpiredSignatureError:
+        raise
+    except jwt.PyJWTError:
+        return None
+
+
 async def verify_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> dict:

@@ -75,6 +75,7 @@ from ..monitoring.metrics import CONTROLLER_MANAGER_UP
 from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_admin_audit_row
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import (
+    decode_jwt_for_rate_limit,
     get_user_organization_id,
     get_user_role,
     is_platform_admin,
@@ -560,17 +561,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             try:
                 import jwt as _jwt
 
-                from ..security.auth import _ALLOWED_ALGORITHMS, _get_jwt_secrets
-
-                payload = _jwt.decode(
-                    auth_header[7:],
-                    _get_jwt_secrets()[0],
-                    algorithms=_ALLOWED_ALGORITHMS,
-                    audience="authenticated",
-                )
-                sub = payload.get("sub")
-                if sub:
-                    client_id = f"user:{sub}"
+                payload = decode_jwt_for_rate_limit(auth_header[7:])
+                if payload:
+                    sub = payload.get("sub")
+                    if sub:
+                        client_id = f"user:{sub}"
             except _jwt.ExpiredSignatureError:
                 logger.debug("Rate limit: expired token, falling back to IP")
             except Exception:
