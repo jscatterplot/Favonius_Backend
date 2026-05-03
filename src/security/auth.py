@@ -232,15 +232,18 @@ async def verify_token(
     The returned payload contains:
       - sub: user UUID (auth.uid() in Supabase)
       - email: user email — also used by :func:`get_user_role` to auto-promote
-        a confirmed ``@favoniusenergy.com`` address (see ``email_confirmed_at``)
-        to ``favonius_admin``.
+        a staff-domain address when the token shows a confirmed email identity
+        (non-empty ``email_confirmed_at`` if present, else issuer-signed
+        ``app_metadata`` / ``user_metadata`` rules in
+        :func:`_jwt_email_confirmation_present`).
       - role: "authenticated" (Supabase default)
       - aud: "authenticated"
       - exp: expiration timestamp
       - app_metadata: trusted Favonius tenancy claims (organization_id,
         favonius_role)
-      - user_metadata: user-editable fields (e.g. is_demo) — not used for
-        access control
+      - user_metadata: user-editable fields (e.g. is_demo). Only
+        ``email_verified: false`` is consulted for the staff-domain promotion
+        gate; it does not grant extra privileges.
 
     Raises HTTPException if the token is invalid or expired.
     """
@@ -411,26 +414,66 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
     )
 
 
-def _jwt_email_confirmation_present(token: dict) -> bool:
-    """True if the JWT carries a non-empty issuer-signed email confirmation claim.
+def _app_metadata_indicates_confirmed_email_identity(meta: dict) -> bool:
+    """True when issuer-signed metadata ties the session to email (not phone-only).
 
-    ``user_metadata`` (including any ``email_verified`` mirror there) is
-    user-editable via ``auth.updateUser`` and must not gate access. Supabase
-    includes ``email_confirmed_at`` on access tokens when the auth server has
-    confirmed the email. ``confirmed_at`` is not used: it is set when either
-    email or phone is confirmed, so phone-only confirmation must not satisfy
-    staff-domain auto-promotion.
+    ``app_metadata.provider`` / ``providers`` are set by Supabase Auth, not the
+    end user. Phone-only confirmation must not satisfy staff-domain promotion
+    when the email claim is otherwise unconstrained.
+    """
+    names: set[str] = set()
+    prov = meta.get("provider")
+    if isinstance(prov, str) and prov.strip():
+        names.add(prov.strip().lower())
+    provs = meta.get("providers")
+    if isinstance(provs, list):
+        for item in provs:
+            if isinstance(item, str) and item.strip():
+                names.add(item.strip().lower())
+    if not names:
+        return False
+    # ``confirmed_at`` can reflect phone-only confirmation; reject phone-only.
+    return not names <= {"phone"}
+
+
+def _jwt_email_confirmation_present(token: dict) -> bool:
+    """True if the JWT indicates a confirmed email identity for staff promotion.
+
+    Standard Supabase access tokens omit ``email_confirmed_at`` (that field
+    lives on ``auth.users``); a Custom Access Token Hook may add it — when
+    present and non-empty, it is honored.
+
+    ``user_metadata`` is user-editable and must not *grant* confirmation, but
+    Supabase mirrors ``email_verified: false`` there for unverified addresses;
+    when explicitly ``False``, promotion is denied.
+
+    Otherwise, rely on issuer-signed ``app_metadata`` (``provider`` /
+    ``providers``): any identity beyond phone-only is treated as email-backed
+    for this gate (OAuth and email magic-link sessions include non-phone
+    providers). ``confirmed_at`` alone is not used: it is set when either email
+    or phone is confirmed.
     """
     val = token.get("email_confirmed_at")
-    return isinstance(val, str) and bool(val.strip())
+    if isinstance(val, str) and val.strip():
+        return True
+
+    user_meta = token.get("user_metadata")
+    if isinstance(user_meta, dict) and user_meta.get("email_verified") is False:
+        return False
+
+    app_meta = token.get("app_metadata")
+    if not isinstance(app_meta, dict):
+        return False
+    return _app_metadata_indicates_confirmed_email_identity(app_meta)
 
 
 def _email_indicates_favonius_admin(token: dict) -> bool:
     """Return True if the JWT email belongs to a Favonius staff domain.
 
     Domain comparison is exact (no subdomain matching) and case-insensitive.
-    Staff-domain auto-promotion requires a non-empty ``email_confirmed_at``
-    claim so unconfirmed signups cannot elevate by spoofing ``user_metadata``.
+    Staff-domain auto-promotion requires a confirmed email identity per
+    :func:`_jwt_email_confirmation_present` so unconfirmed signups cannot
+    elevate by spoofing ``user_metadata``.
     """
     email = token.get("email")
     if not isinstance(email, str) or "@" not in email:

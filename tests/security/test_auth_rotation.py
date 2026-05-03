@@ -263,8 +263,26 @@ class TestEmailBasedAdminPromotion:
         assert get_user_role(token) == "authenticated"
 
     def test_unconfirmed_email_blocks_promotion(self):
-        """No ``email_confirmed_at`` must defeat promotion."""
+        """No confirmation signals must defeat promotion."""
         token = {"email": "alice@favoniusenergy.com", "user_metadata": {}}
+        assert get_user_role(token) == "authenticated"
+
+    def test_promotes_without_email_confirmed_at_when_app_metadata_email_provider(
+        self,
+    ):
+        """Real Supabase access tokens omit ``email_confirmed_at``; ``app_metadata`` suffices."""
+        token = {
+            "email": "alice@favoniusenergy.com",
+            "app_metadata": {"provider": "email", "providers": ["email"]},
+        }
+        assert get_user_role(token) == "favonius_admin"
+
+    def test_phone_only_provider_without_email_confirmed_at_does_not_promote(self):
+        """Phone-only ``app_metadata`` must not promote (``confirmed_at`` pattern)."""
+        token = {
+            "email": "alice@favoniusenergy.com",
+            "app_metadata": {"provider": "phone", "providers": ["phone"]},
+        }
         assert get_user_role(token) == "authenticated"
 
     def test_user_metadata_email_verified_true_does_not_bypass_missing_confirmation(self):
