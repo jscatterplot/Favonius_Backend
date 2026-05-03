@@ -52,6 +52,26 @@ def _extract_mirror_inputs(user: dict) -> tuple[Optional[str], Optional[str], st
     return user_id, org_id, role, organization_name
 
 
+# user_organizations.role lives in Supabase's static schema, which has a
+# CHECK constraint allowing only Supabase vocab (owner|admin|operator|viewer).
+# The backend's JWT carries Favonius vocab (customer_admin|customer_operator|
+# favonius_admin). Writing the JWT vocab raises CheckViolationError, which
+# silently fails best-effort mirrors and rolls back atomic-mirror depot
+# creates. Translate at the write boundary; the backend never reads this
+# column for authorization (it uses JWT.app_metadata.organization_id vs
+# sites.organization_id), so the mapping only needs to satisfy the CHECK.
+_FAVONIUS_TO_SUPABASE_ROLE: dict[str, str] = {
+    "customer_admin": "owner",
+    "customer_operator": "operator",
+    "favonius_admin": "admin",  # mirror skips favonius_admin, kept for safety
+}
+
+
+def _supabase_role_for(favonius_role: str) -> str:
+    """Translate Favonius role vocab to the Supabase user_organizations.role CHECK."""
+    return _FAVONIUS_TO_SUPABASE_ROLE.get(favonius_role, "viewer")
+
+
 async def _execute_tenant_mirror_upserts(
     conn: "asyncpg.Connection",
     *,
@@ -79,7 +99,7 @@ async def _execute_tenant_mirror_upserts(
         "SET role = EXCLUDED.role",
         user_id,
         org_id,
-        role,
+        _supabase_role_for(role),
     )
 
 

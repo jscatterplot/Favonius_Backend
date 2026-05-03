@@ -277,3 +277,71 @@ async def test_atomic_mirror_does_not_prime_cache_before_commit():
     pool = _FakePool()
     await tm.mirror_user_tenant(user, pool)
     assert len(pool.conn.executes) == 2
+
+
+# ============ Favonius -> Supabase role-vocab translation ============
+#
+# Supabase's user_organizations.role column has a CHECK constraint that only
+# allows owner|admin|operator|viewer. The backend's JWT carries Favonius
+# vocab (customer_admin|customer_operator|favonius_admin). Without the
+# translation, every UPSERT raises CheckViolationError — silently swallowed
+# by best-effort mirror_user_tenant and rolling back depot creates inside
+# mirror_user_tenant_atomic. These tests pin the mapping.
+
+
+@pytest.mark.parametrize(
+    "favonius_role,expected_supabase_role",
+    [
+        ("customer_admin", "owner"),
+        ("customer_operator", "operator"),
+        ("favonius_admin", "admin"),
+        ("authenticated", "viewer"),
+        ("totally_unknown_role", "viewer"),
+    ],
+)
+def test_supabase_role_for_translates_known_and_unknown(
+    favonius_role: str, expected_supabase_role: str
+) -> None:
+    assert tm._supabase_role_for(favonius_role) == expected_supabase_role
+
+
+@pytest.mark.asyncio
+async def test_mirror_writes_supabase_role_vocab_not_favonius_vocab():
+    """The role written to user_organizations must satisfy the Supabase CHECK."""
+    pool = _FakePool()
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "customer_admin",
+    )
+    await tm.mirror_user_tenant(user, pool)
+    user_org_call = pool.conn.executes[1]
+    assert "INSERT INTO user_organizations" in user_org_call[0]
+    written_role = user_org_call[1][2]  # third positional arg
+    assert written_role == "owner"
+    assert written_role not in ("customer_admin", "customer_operator", "favonius_admin")
+
+
+@pytest.mark.asyncio
+async def test_mirror_translates_customer_operator_to_operator():
+    pool = _FakePool()
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "customer_operator",
+    )
+    await tm.mirror_user_tenant(user, pool)
+    assert pool.conn.executes[1][1][2] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_atomic_mirror_writes_supabase_role_vocab():
+    conn = _FakeConn()
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "customer_admin",
+        "HRX",
+    )
+    await tm.mirror_user_tenant_atomic(conn, user)
+    assert conn.executes[1][1][2] == "owner"

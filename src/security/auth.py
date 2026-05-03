@@ -24,10 +24,12 @@ Environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Optional
 
+import asyncpg
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -338,9 +340,18 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
         )
 
     if pool is None:
+        # Static DB pool unavailable means the auth check cannot be evaluated.
+        # Surface this as 503 so the client (and on-call) can distinguish it
+        # from a real policy denial — silently returning 403 here previously
+        # made every depot endpoint look access-denied during startup blips.
+        logger.error(
+            "depot access check unavailable: static DB pool not initialized " "(depot=%s org=%s)",
+            depot_id,
+            org_id,
+        )
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: you do not have permission for this depot",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Depot access check is temporarily unavailable",
         )
 
     try:
@@ -351,15 +362,30 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
                 depot_id,
                 org_id,
             )
-        if has_access:
-            return
-    except Exception:
-        logger.warning(
-            "depot organization access check failed for depot=%s org=%s",
+    except (
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        asyncpg.InternalClientError,
+        OSError,
+        asyncio.TimeoutError,
+    ) as exc:
+        # Real DB / network failure. Don't disguise as a policy denial — that
+        # makes diagnosis impossible and falsely tells the user they lack
+        # access. Log with traceback and surface 503 so the caller can retry.
+        logger.error(
+            "depot access check failed due to DB error for depot=%s org=%s: %s",
             depot_id,
             org_id,
+            exc,
             exc_info=True,
         )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Depot access check is temporarily unavailable",
+        ) from exc
+
+    if has_access:
+        return
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
