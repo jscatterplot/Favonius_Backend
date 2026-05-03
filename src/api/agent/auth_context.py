@@ -14,11 +14,12 @@ candidate set.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal, Optional, cast, get_args
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.db.queries import get_all_depots, get_depots_for_organization
 from src.security.auth import get_user_id, get_user_organization_id, get_user_role
@@ -37,6 +38,47 @@ class AuthContext(BaseModel):
     organization_id: Optional[UUID]
     role: AgentRole
     visible_depot_ids: list[UUID]
+
+
+class ResolvedEntity(BaseModel):
+    """A name-or-phrase resolved server-side to a primary UUID.
+
+    ``primary_id`` is ``None`` when no row matched (the formatter surfaces
+    that as a "not found" reply). For ``kind='driver'`` the resolver
+    populates ``card_ids`` with every RFID card currently assigned to
+    that driver, so the compiler can OR ``card_id`` into the
+    ``charging_sessions`` filter without a second round-trip — sessions
+    that landed before the assignment was created (or after it was
+    revoked) still attribute correctly.
+
+    ``candidates`` is populated when the resolver matched more than one
+    row; the head of the list is treated as the primary, the rest are
+    surfaced to the user as a disambiguation prompt.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["driver", "vehicle", "depot", "rfid"]
+    display: str
+    primary_id: Optional[UUID]
+    card_ids: list[UUID] = Field(default_factory=list)
+    candidates: list["ResolvedEntity"] = Field(default_factory=list)
+
+
+class ResolvedTimeWindow(BaseModel):
+    """UTC bounds plus the depot timezone the bounds were computed in.
+
+    ``timezone`` is the IANA zone name (e.g. ``Europe/Vilnius``) and is
+    threaded through the compiled SQL via ``AT TIME ZONE`` so that
+    ``DATE_TRUNC('day', …)`` buckets sessions on the depot's local
+    calendar day rather than UTC.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_utc: datetime
+    end_utc: datetime
+    timezone: str
 
 
 async def build_auth_context(token_payload: dict, static_pool: Any) -> AuthContext:
