@@ -232,8 +232,8 @@ async def verify_token(
     The returned payload contains:
       - sub: user UUID (auth.uid() in Supabase)
       - email: user email — also used by :func:`get_user_role` to auto-promote
-        a confirmed ``@favoniusenergy.com`` address (see ``email_confirmed_at`` /
-        ``confirmed_at``) to ``favonius_admin``.
+        a confirmed ``@favoniusenergy.com`` address (see ``email_confirmed_at``)
+        to ``favonius_admin``.
       - role: "authenticated" (Supabase default)
       - aud: "authenticated"
       - exp: expiration timestamp
@@ -416,23 +416,21 @@ def _jwt_email_confirmation_present(token: dict) -> bool:
 
     ``user_metadata`` (including any ``email_verified`` mirror there) is
     user-editable via ``auth.updateUser`` and must not gate access. Supabase
-    includes ``email_confirmed_at`` / ``confirmed_at`` on access tokens when the
-    auth server has confirmed the address.
+    includes ``email_confirmed_at`` on access tokens when the auth server has
+    confirmed the email. ``confirmed_at`` is not used: it is set when either
+    email or phone is confirmed, so phone-only confirmation must not satisfy
+    staff-domain auto-promotion.
     """
-    for key in ("email_confirmed_at", "confirmed_at"):
-        val = token.get(key)
-        if isinstance(val, str) and val.strip():
-            return True
-    return False
+    val = token.get("email_confirmed_at")
+    return isinstance(val, str) and bool(val.strip())
 
 
 def _email_indicates_favonius_admin(token: dict) -> bool:
     """Return True if the JWT email belongs to a Favonius staff domain.
 
     Domain comparison is exact (no subdomain matching) and case-insensitive.
-    Staff-domain auto-promotion requires a non-empty ``email_confirmed_at`` or
-    ``confirmed_at`` claim so unconfirmed signups cannot elevate by spoofing
-    ``user_metadata``.
+    Staff-domain auto-promotion requires a non-empty ``email_confirmed_at``
+    claim so unconfirmed signups cannot elevate by spoofing ``user_metadata``.
     """
     email = token.get("email")
     if not isinstance(email, str) or "@" not in email:

@@ -263,7 +263,7 @@ class TestEmailBasedAdminPromotion:
         assert get_user_role(token) == "authenticated"
 
     def test_unconfirmed_email_blocks_promotion(self):
-        """No ``email_confirmed_at`` / ``confirmed_at`` must defeat promotion."""
+        """No ``email_confirmed_at`` must defeat promotion."""
         token = {"email": "alice@favoniusenergy.com", "user_metadata": {}}
         assert get_user_role(token) == "authenticated"
 
@@ -279,12 +279,13 @@ class TestEmailBasedAdminPromotion:
         token = {"email": "alice@favoniusenergy.com", **self._confirmed_at}
         assert get_user_role(token) == "favonius_admin"
 
-    def test_confirmed_at_alternative_claim_allows_promotion(self):
+    def test_confirmed_at_without_email_confirmed_at_does_not_promote(self):
+        """``confirmed_at`` can reflect phone-only confirmation; it must not promote."""
         token = {
             "email": "alice@favoniusenergy.com",
             "confirmed_at": "2024-01-01T00:00:00Z",
         }
-        assert get_user_role(token) == "favonius_admin"
+        assert get_user_role(token) == "authenticated"
 
     def test_env_var_overrides_default_domain(self):
         with patch.dict(
@@ -327,9 +328,7 @@ class TestEmailBasedAdminPromotion:
 
     def test_blank_env_var_falls_back_to_default(self):
         """Whitespace-only override must not silently disable promotion."""
-        with patch.dict(
-            os.environ, {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "  ,  "}, clear=False
-        ):
+        with patch.dict(os.environ, {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "  ,  "}, clear=False):
             assert (
                 get_user_role({"email": "alice@favoniusenergy.com", **self._confirmed_at})
                 == "favonius_admin"
@@ -350,9 +349,7 @@ class TestEmailBasedAdminPromotion:
         """
         token = {"email": "ops@favoniusenergy.com", **self._confirmed_at}
         sentinel_pool = object()
-        await verify_depot_access(
-            "00000000-0000-4000-8000-000000000000", token, pool=sentinel_pool
-        )
+        await verify_depot_access("00000000-0000-4000-8000-000000000000", token, pool=sentinel_pool)
 
 
 class TestVerifyTokenJWKS:
