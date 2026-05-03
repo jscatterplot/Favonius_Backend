@@ -197,6 +197,8 @@ class TestEmailBasedAdminPromotion:
     so a stale Supabase metadata value cannot demote a Favonius employee.
     """
 
+    _confirmed_at = {"email_confirmed_at": "2024-01-01T00:00:00Z"}
+
     @pytest.fixture(autouse=True)
     def _clear_env_override(self):
         """Default to the hardcoded domain unless a test sets the override."""
@@ -205,11 +207,11 @@ class TestEmailBasedAdminPromotion:
             yield
 
     def test_promotes_matching_email(self):
-        token = {"email": "alice@favoniusenergy.com"}
+        token = {"email": "alice@favoniusenergy.com", **self._confirmed_at}
         assert get_user_role(token) == "favonius_admin"
 
     def test_promotes_when_email_case_varies(self):
-        token = {"email": "Alice@FavoniusEnergy.COM"}
+        token = {"email": "Alice@FavoniusEnergy.COM", **self._confirmed_at}
         assert get_user_role(token) == "favonius_admin"
 
     def test_promotion_overrides_explicit_lower_role(self):
@@ -217,6 +219,7 @@ class TestEmailBasedAdminPromotion:
         token = {
             "email": "alice@favoniusenergy.com",
             "app_metadata": {"favonius_role": "customer_operator"},
+            **self._confirmed_at,
         }
         assert get_user_role(token) == "favonius_admin"
 
@@ -259,34 +262,47 @@ class TestEmailBasedAdminPromotion:
         token = {"email": 12345, "role": "authenticated"}
         assert get_user_role(token) == "authenticated"
 
-    def test_unverified_email_blocks_promotion(self):
-        """An ``email_verified=False`` claim must defeat promotion."""
-        token = {
-            "email": "alice@favoniusenergy.com",
-            "user_metadata": {"email_verified": False},
-        }
+    def test_unconfirmed_email_blocks_promotion(self):
+        """No ``email_confirmed_at`` / ``confirmed_at`` must defeat promotion."""
+        token = {"email": "alice@favoniusenergy.com", "user_metadata": {}}
         assert get_user_role(token) == "authenticated"
 
-    def test_verified_email_allows_promotion(self):
+    def test_user_metadata_email_verified_true_does_not_bypass_missing_confirmation(self):
+        """``user_metadata`` is user-editable and must not imply a confirmed email."""
         token = {
             "email": "alice@favoniusenergy.com",
             "user_metadata": {"email_verified": True},
         }
+        assert get_user_role(token) == "authenticated"
+
+    def test_confirmed_email_allows_promotion(self):
+        token = {"email": "alice@favoniusenergy.com", **self._confirmed_at}
         assert get_user_role(token) == "favonius_admin"
 
-    def test_missing_email_verified_claim_trusts_jwt(self):
-        """``email_verified`` is optional — Supabase only emits it on confirm."""
-        token = {"email": "alice@favoniusenergy.com", "user_metadata": {}}
+    def test_confirmed_at_alternative_claim_allows_promotion(self):
+        token = {
+            "email": "alice@favoniusenergy.com",
+            "confirmed_at": "2024-01-01T00:00:00Z",
+        }
         assert get_user_role(token) == "favonius_admin"
 
     def test_env_var_overrides_default_domain(self):
         with patch.dict(
             os.environ, {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "favonius.energy"}, clear=False
         ):
-            assert get_user_role({"email": "ops@favonius.energy"}) == "favonius_admin"
+            assert (
+                get_user_role({"email": "ops@favonius.energy", **self._confirmed_at})
+                == "favonius_admin"
+            )
             # Default domain no longer counts when the override is set.
             assert (
-                get_user_role({"email": "alice@favoniusenergy.com", "role": "authenticated"})
+                get_user_role(
+                    {
+                        "email": "alice@favoniusenergy.com",
+                        "role": "authenticated",
+                        **self._confirmed_at,
+                    }
+                )
                 == "authenticated"
             )
 
@@ -296,8 +312,14 @@ class TestEmailBasedAdminPromotion:
             {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "favoniusenergy.com, favonius.energy"},
             clear=False,
         ):
-            assert get_user_role({"email": "ops@favonius.energy"}) == "favonius_admin"
-            assert get_user_role({"email": "alice@favoniusenergy.com"}) == "favonius_admin"
+            assert (
+                get_user_role({"email": "ops@favonius.energy", **self._confirmed_at})
+                == "favonius_admin"
+            )
+            assert (
+                get_user_role({"email": "alice@favoniusenergy.com", **self._confirmed_at})
+                == "favonius_admin"
+            )
             assert (
                 get_user_role({"email": "stranger@example.com", "role": "authenticated"})
                 == "authenticated"
@@ -308,11 +330,14 @@ class TestEmailBasedAdminPromotion:
         with patch.dict(
             os.environ, {"FAVONIUS_ADMIN_EMAIL_DOMAINS": "  ,  "}, clear=False
         ):
-            assert get_user_role({"email": "alice@favoniusenergy.com"}) == "favonius_admin"
+            assert (
+                get_user_role({"email": "alice@favoniusenergy.com", **self._confirmed_at})
+                == "favonius_admin"
+            )
 
     def test_is_platform_admin_honours_email_promotion(self):
         """The downstream admin gate must also see the promoted role."""
-        token = {"email": "alice@favoniusenergy.com"}
+        token = {"email": "alice@favoniusenergy.com", **self._confirmed_at}
         assert is_platform_admin(token) is True
 
     @pytest.mark.asyncio
@@ -323,7 +348,7 @@ class TestEmailBasedAdminPromotion:
         to call ``pool.acquire()`` the test would explode, so a clean return is
         proof that the platform-admin shortcut fired before any DB access.
         """
-        token = {"email": "ops@favoniusenergy.com"}
+        token = {"email": "ops@favoniusenergy.com", **self._confirmed_at}
         sentinel_pool = object()
         await verify_depot_access(
             "00000000-0000-4000-8000-000000000000", token, pool=sentinel_pool

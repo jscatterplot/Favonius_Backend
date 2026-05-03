@@ -232,7 +232,8 @@ async def verify_token(
     The returned payload contains:
       - sub: user UUID (auth.uid() in Supabase)
       - email: user email — also used by :func:`get_user_role` to auto-promote
-        any verified ``@favoniusenergy.com`` address to ``favonius_admin``.
+        a confirmed ``@favoniusenergy.com`` address (see ``email_confirmed_at`` /
+        ``confirmed_at``) to ``favonius_admin``.
       - role: "authenticated" (Supabase default)
       - aud: "authenticated"
       - exp: expiration timestamp
@@ -410,21 +411,34 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
     )
 
 
+def _jwt_email_confirmation_present(token: dict) -> bool:
+    """True if the JWT carries a non-empty issuer-signed email confirmation claim.
+
+    ``user_metadata`` (including any ``email_verified`` mirror there) is
+    user-editable via ``auth.updateUser`` and must not gate access. Supabase
+    includes ``email_confirmed_at`` / ``confirmed_at`` on access tokens when the
+    auth server has confirmed the address.
+    """
+    for key in ("email_confirmed_at", "confirmed_at"):
+        val = token.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+    return False
+
+
 def _email_indicates_favonius_admin(token: dict) -> bool:
     """Return True if the JWT email belongs to a Favonius staff domain.
 
     Domain comparison is exact (no subdomain matching) and case-insensitive.
-    A token whose ``user_metadata.email_verified`` is explicitly ``False`` is
-    rejected — Supabase emits this claim for unconfirmed signups, and granting
-    platform-admin access on an unverified email would let anyone claim a
-    Favonius staff identity.
+    Staff-domain auto-promotion requires a non-empty ``email_confirmed_at`` or
+    ``confirmed_at`` claim so unconfirmed signups cannot elevate by spoofing
+    ``user_metadata``.
     """
     email = token.get("email")
     if not isinstance(email, str) or "@" not in email:
         return False
 
-    user_metadata = token.get("user_metadata")
-    if isinstance(user_metadata, dict) and user_metadata.get("email_verified") is False:
+    if not _jwt_email_confirmation_present(token):
         return False
 
     domain = email.rsplit("@", 1)[-1].strip().lower()
