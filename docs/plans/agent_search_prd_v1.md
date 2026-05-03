@@ -417,13 +417,13 @@ but not commitments — what we learn from v0 will reshape them.
 This section is the live source of truth for sprint progress. Each sprint's
 PR must update the matching row before requesting review.
 
-**Last updated:** 2026-05-03 (initial)
+**Last updated:** 2026-05-03 (B1 in PR)
 
 ### Backend
 
 | Sprint | Title | Status | Branch | PR | Merged | Notes |
 |--------|-------|--------|--------|----|----|-------|
-| B1 | Foundations: migrations + plan types + auth context | not started | `agent-search/sprint-b1-foundations` | — | — | — |
+| B1 | Foundations: migrations + plan types + auth context | in PR | `claude/review-agent-search-auth-yuNlo` | [#94](https://github.com/jscatterplot/Favonius_Backend/pull/94) | — | Branch name diverges from `agent-search/sprint-b1-foundations` (sprint-prompt convention); PR opens against the branch the agent runner provisioned. |
 | B2 | Entity resolution + time window | not started | `agent-search/sprint-b2-resolution` | — | — | — |
 | B3 | Intent compiler + audit writer | not started | `agent-search/sprint-b3-compiler` | — | — | — |
 | B4 | LLM integration | not started | `agent-search/sprint-b4-llm` | — | — | — |
