@@ -561,6 +561,16 @@ def _verify_handoff_payload(
 # ============ Rate Limiting Middleware ============
 
 
+# Admin write paths used by the bulk-import flows on the fleet identity panel.
+# Match POST/PATCH/PUT requests against /admin/depots/{depot_id}/{vehicles|
+# drivers|rfid-cards}[/...]. Reusable for future bulk-import endpoints — add
+# the new resource segment to the alternation when chargers or schedules ship
+# their own xlsx import.
+_ADMIN_BULK_WRITE_PATH_RE = re.compile(
+    r"^/admin/depots/[^/]+/(?:vehicles|drivers|rfid-cards)(?:/|$)"
+)
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Middleware to enforce rate limits per PRD Section 10.4."""
 
@@ -624,6 +634,29 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # Handoff rate limiting handled in endpoint handlers
             # (requires reading request body which is not available in middleware)
             pass
+
+        # Admin bulk-import writes: dedicated bucket so a sequential xlsx
+        # import (one POST per row) does not trip the 100/min general limit.
+        # Replaces — does not stack on top of — the general bucket.
+        elif (
+            request.method in {"POST", "PATCH", "PUT"}
+            and _ADMIN_BULK_WRITE_PATH_RE.match(path)
+        ):
+            result = limiter.check_admin_write_limit(client_id)
+            if not result:
+                resp = JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        detail=(
+                            f"Rate limit exceeded: Maximum {result.limit} "
+                            "identity-write requests per minute"
+                        ),
+                        error_code="RATE_LIMIT_EXCEEDED",
+                        timestamp=datetime.utcnow().isoformat(),
+                    ).model_dump(),
+                )
+                self._add_rate_limit_headers(resp, result)
+                return resp
 
         # General API endpoints: 100 requests/minute
         else:
@@ -2546,21 +2579,35 @@ def _require_customer_admin_with_org(user: dict) -> str:
 
 
 def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTPException:
-    """Map identity uniqueness conflicts to frontend-stable 409 responses."""
+    """Map identity uniqueness conflicts to frontend-stable 409 responses.
+
+    The FE bulk-import flow keys off ``error_code`` to group per-row failures,
+    so each kind of conflict gets its own stable code (``DUPLICATE_ID_TAG`` for
+    a clashing RFID/vehicle id_tag, ``DUPLICATE_VIN`` for a clashing VIN, and
+    ``DUPLICATE_EXTERNAL_ID`` for a clashing external identifier).
+    """
     constraint = getattr(exc, "constraint_name", "") or ""
     if "id_tag" in constraint:
+        error_code = ErrorCode.DUPLICATE_ID_TAG.value
         detail = "idTag is already registered"
     elif "vehicles_vin" in constraint:
         # vehicles_vin_key is a global UNIQUE on vin, so this conflict can
         # surface across organizations and not just within the depot.
+        error_code = ErrorCode.DUPLICATE_VIN.value
         detail = "VIN is already registered"
     elif "vehicles_external_id" in constraint:
+        error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered"
     elif "external" in constraint:
+        error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered for this depot"
     else:
+        error_code = ErrorCode.CONFLICT.value
         detail = "Identity record already exists"
-    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"error_code": error_code, "detail": detail},
+    )
 
 
 async def _audit_identity_write(user: dict, depot_id: str, action: str, resource_id: str) -> None:

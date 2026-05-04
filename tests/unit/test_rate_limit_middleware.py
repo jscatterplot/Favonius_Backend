@@ -283,3 +283,107 @@ async def test_healthz_bypasses_rate_limit(middleware, fresh_limiter):
     await middleware.dispatch(request, _stub_call_next())
 
     assert not fresh_limiter._api_buckets
+
+
+# ============ Admin bulk-import write bucket ============
+#
+# The fleet-identity bulk-import dialog (favonius_frontend PR #62) issues
+# sequential POST /admin/depots/{id}/rfid-cards calls — one per row. The
+# middleware routes those to a dedicated admin-write bucket so a 200-row
+# import does not consume the 100/min general API budget. These tests pin
+# down the routing rules.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", f"/admin/depots/{uuid4()}/rfid-cards"),
+        ("PATCH", f"/admin/depots/{uuid4()}/rfid-cards/{uuid4()}"),
+        ("POST", f"/admin/depots/{uuid4()}/vehicles"),
+        ("PATCH", f"/admin/depots/{uuid4()}/vehicles/{uuid4()}"),
+        ("POST", f"/admin/depots/{uuid4()}/drivers"),
+        ("PATCH", f"/admin/depots/{uuid4()}/drivers/{uuid4()}"),
+    ],
+)
+async def test_admin_bulk_writes_use_admin_write_bucket(
+    middleware, fresh_limiter, method, path
+):
+    """Identity write paths land in the admin-write bucket, not the general one."""
+    sub = str(uuid4())
+    request = _make_request(
+        ip="9.9.9.9", token=_make_token(sub=sub), path=path, method=method
+    )
+
+    await middleware.dispatch(request, _stub_call_next())
+
+    assert f"user:{sub}" in fresh_limiter._admin_write_buckets
+    assert f"user:{sub}" not in fresh_limiter._api_buckets
+
+
+@pytest.mark.asyncio
+async def test_admin_get_uses_general_api_bucket(middleware, fresh_limiter):
+    """GETs under /admin/depots/.../vehicles still go to the general bucket."""
+    sub = str(uuid4())
+    request = _make_request(
+        ip="9.9.9.9",
+        token=_make_token(sub=sub),
+        path=f"/admin/depots/{uuid4()}/vehicles",
+        method="GET",
+    )
+
+    await middleware.dispatch(request, _stub_call_next())
+
+    assert f"user:{sub}" in fresh_limiter._api_buckets
+    assert f"user:{sub}" not in fresh_limiter._admin_write_buckets
+
+
+@pytest.mark.asyncio
+async def test_admin_write_bucket_rejects_when_drained(middleware):
+    """A drained admin-write bucket returns 429 with RATE_LIMIT_EXCEEDED."""
+    from src.security.rate_limiter import RateLimitConfig, RateLimiter
+
+    config = RateLimitConfig(admin_write_requests_per_minute=2)
+    fresh = RateLimiter(config=config)
+    set_rate_limiter(fresh)
+    try:
+        sub = str(uuid4())
+        token = _make_token(sub=sub)
+        path = f"/admin/depots/{uuid4()}/rfid-cards"
+
+        for _ in range(2):
+            resp = await middleware.dispatch(
+                _make_request(ip="9.9.9.9", token=token, path=path, method="POST"),
+                _stub_call_next(),
+            )
+            assert getattr(resp, "status_code", None) != 429
+
+        resp = await middleware.dispatch(
+            _make_request(ip="9.9.9.9", token=token, path=path, method="POST"),
+            _stub_call_next(),
+        )
+        assert resp.status_code == 429
+    finally:
+        _rl_module._rate_limiter = None
+
+
+@pytest.mark.asyncio
+async def test_admin_write_does_not_double_charge_general_bucket(middleware, fresh_limiter):
+    """An admin-write request does not also count against the general API bucket.
+
+    The middleware must pick exactly one bucket; otherwise a sequential bulk
+    import would consume both and still trip the 100/min general limit.
+    """
+    sub = str(uuid4())
+    token = _make_token(sub=sub)
+    path = f"/admin/depots/{uuid4()}/rfid-cards"
+
+    for _ in range(150):
+        resp = await middleware.dispatch(
+            _make_request(ip="9.9.9.9", token=token, path=path, method="POST"),
+            _stub_call_next(),
+        )
+        assert getattr(resp, "status_code", None) != 429
+
+    assert f"user:{sub}" not in fresh_limiter._api_buckets
+    assert len(fresh_limiter._admin_write_buckets[f"user:{sub}"]) == 150

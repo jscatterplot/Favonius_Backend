@@ -139,6 +139,45 @@ class TestInMemoryRateLimiting:
         assert result.allowed is True
         assert result.limit == 2
 
+    def test_admin_write_uses_dedicated_bucket(self, limiter: RateLimiter):
+        """Admin-write bucket is independent of the general API bucket.
+
+        Sized for sequential xlsx imports on the fleet identity panel — a
+        200-row file at the FE's serial cadence must not bleed into the
+        100/min general bucket and lock the rest of the admin UI.
+        """
+        config = RateLimitConfig(
+            api_requests_per_minute=5,
+            admin_write_requests_per_minute=3,
+            optimize_requests_per_minute=2,
+            agent_requests_per_minute=2,
+            handoff_messages_per_hour=3,
+            trigger_optimization_cooldown_seconds=10,
+        )
+        scoped = RateLimiter(config=config)
+
+        # Saturate the admin-write bucket for one user.
+        for _ in range(3):
+            scoped.check_admin_write_limit("user:abc")
+        denied = scoped.check_admin_write_limit("user:abc")
+        assert denied.allowed is False
+        assert denied.limit == 3
+
+        # Same user can still hit the general API bucket — buckets are independent.
+        result = scoped.check_api_limit("user:abc")
+        assert result.allowed is True
+        assert result.limit == 5
+
+    def test_admin_write_default_limit(self):
+        """Default admin-write limit comfortably absorbs a 200-row import.
+
+        Sequential xlsx import at any plausible network latency stays well
+        under 1200 req/min (20 rps). If we ever lower the default, revisit
+        the bulk-import flow.
+        """
+        config = RateLimitConfig()
+        assert config.admin_write_requests_per_minute >= 600
+
     def test_handoff_sorted_key(self, limiter: RateLimiter):
         """Handoff uses sorted depot pair — a→b and b→a share same bucket."""
         limiter.check_handoff_limit("depot_a", "depot_b")
@@ -278,6 +317,7 @@ class TestFlushToDB:
         limiter = RateLimiter(db_pool=mock_pool)
         limiter.check_api_limit("client_a")
         limiter.check_api_limit("client_a")
+        limiter.check_admin_write_limit("client_a")
         limiter.check_optimize_limit("client_b")
         limiter.check_agent_limit("client_c")
 
@@ -290,7 +330,7 @@ class TestFlushToDB:
 
         assert "INSERT INTO rate_limit_state" in sql
         assert "GREATEST" in sql
-        assert len(rows) == 3  # api, optimize, agent
+        assert len(rows) == 4  # api, admin_write, optimize, agent
 
     @pytest.mark.asyncio
     async def test_flush_with_no_data(self):
