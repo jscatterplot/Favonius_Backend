@@ -429,7 +429,7 @@ PR must update the matching row before requesting review.
 | B2 | Entity resolution + time window | in PR | `agent-search/sprint-b2-resolution` | — | — | — |
 | B3 | Intent compiler + audit writer | in PR | `claude/convert-agent-runs-audit-M4IrX` | — | — | Branch name diverges from `agent-search/sprint-b3-compiler` (sprint-prompt convention); PR opens against the branch the agent runner provisioned. |
 | B4 | LLM integration | in PR | `claude/claude-api-skill-9DJRA` | — | — | Anthropic SDK wired for plan extraction + answer formatting; model selectable via `AGENT_LLM_MODEL`; rotation-aware key plumbing through `secrets.py`. Branch diverges from `agent-search/sprint-b4-llm` (agent runner convention). |
-| B5 | Router + SSE + integration test | not started | `agent-search/sprint-b5-router` | — | — | — |
+| B5 | Router + SSE + integration test | in PR | `claude/streaming-rate-limit-u8qwP` | — | — | Three endpoints (`POST /agent/turn`, `POST /agent/turn/stream`, `GET /agent/runs/{id}`) mounted behind `AGENT_SEARCH_ENABLED` (default `false`). SSE wire format + integration suite against a real DB schema with a `FakeLLMClient`. Branch diverges from `agent-search/sprint-b5-router` (agent runner convention). |
 | B6 | Golden tests + observability + acceptance + docs | not started | `agent-search/sprint-b6-launch` | — | — | — |
 
 ### Frontend

@@ -823,6 +823,21 @@ app.add_middleware(
 app.add_middleware(GeoBlockMiddleware)
 
 
+# ── Depot chat agent (feature-flagged) ────────────────────────────────────
+# Mounted behind ``AGENT_SEARCH_ENABLED`` (default false; flipped to default-on
+# in sprint B6 after the golden tests pass — see
+# docs/plans/agent_search_architecture_v0.md §11). The router inherits the
+# JWT and geo-block pipeline above. The LLM-powered turn endpoints add their
+# own 10 req/min/user agent bucket; read-only run-trace fetches use JWT only.
+from .agent.feature_flag import is_agent_search_enabled
+
+if is_agent_search_enabled():
+    from .agent.router import router as agent_router  # noqa: PLC0415
+
+    app.include_router(agent_router)
+    logger.info("Depot chat agent enabled at /agent/*")
+
+
 class OptimizationRequest(BaseModel):
     """Request to run optimization.
 
