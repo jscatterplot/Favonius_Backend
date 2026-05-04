@@ -32,12 +32,14 @@ class _TenantCacheEntry(NamedTuple):
 
 
 _cache: dict[str, _TenantCacheEntry] = {}
+_repair_cache: dict[str, float] = {}
 _TTL_S = float(os.getenv("TENANT_MIRROR_TTL_S", "300"))
 
 
 def clear_tenant_mirror_cache() -> None:
     """Clear in-process mirror cache (tests)."""
     _cache.clear()
+    _repair_cache.clear()
 
 
 def _extract_mirror_inputs(user: dict) -> tuple[Optional[str], Optional[str], str, Optional[str]]:
@@ -70,6 +72,17 @@ _FAVONIUS_TO_SUPABASE_ROLE: dict[str, str] = {
 def _supabase_role_for(favonius_role: str) -> str:
     """Translate Favonius role vocab to the Supabase user_organizations.role CHECK."""
     return _FAVONIUS_TO_SUPABASE_ROLE.get(favonius_role, "viewer")
+
+
+# Reverse mapping for the self-heal path. Only roles that are unambiguous and
+# safe to auto-derive are listed: 'admin' (favonius_admin) is intentionally
+# excluded because backfilling staff promotion from a DB row would let a
+# corrupted user_organizations entry escalate privilege; 'viewer' has no
+# Favonius-vocab equivalent and is rarely the cause of a wizard-blocked signup.
+_SUPABASE_TO_FAVONIUS_ROLE: dict[str, str] = {
+    "owner": "customer_admin",
+    "operator": "customer_operator",
+}
 
 
 async def _execute_tenant_mirror_upserts(
@@ -171,11 +184,166 @@ async def mirror_user_tenant_atomic(conn: "asyncpg.Connection", user: dict) -> N
     )
 
 
+async def _fetch_single_user_org_membership(
+    conn: "asyncpg.Connection", user_id: str
+) -> Optional[tuple[str, str, Optional[str]]]:
+    """Return ``(org_id, supabase_role, organization_name)`` if the user has
+    exactly one ``user_organizations`` row whose role maps to a repairable
+    Favonius role. Returns ``None`` for zero rows, multiple rows, or a role
+    outside :data:`_SUPABASE_TO_FAVONIUS_ROLE` (admin / viewer / unknown).
+    """
+    rows = await conn.fetch(
+        "SELECT uo.organization_id::text AS organization_id, uo.role, o.name "
+        "FROM user_organizations uo "
+        "LEFT JOIN organizations o ON o.id = uo.organization_id "
+        "WHERE uo.user_id = $1::uuid",
+        user_id,
+    )
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    if row["role"] not in _SUPABASE_TO_FAVONIUS_ROLE:
+        return None
+    name = row["name"] if isinstance(row["name"], str) and row["name"].strip() else None
+    return (str(row["organization_id"]), str(row["role"]), name)
+
+
+async def _patch_supabase_app_metadata(
+    *,
+    supabase_url: str,
+    service_key: str,
+    user_id: str,
+    app_metadata: dict,
+    timeout_s: float = 5.0,
+) -> None:
+    """PUT a user's ``app_metadata`` via the Supabase Auth admin API.
+
+    Raises on non-2xx so the caller can decide whether to cache the repair or
+    retry on the next request. Tests monkeypatch this helper to assert the
+    payload shape without going through ``httpx``.
+    """
+    import httpx  # noqa: PLC0415 — keep import scoped to the repair path
+
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.put(
+            f"{supabase_url}/auth/v1/admin/users/{user_id}",
+            headers={
+                "Authorization": f"Bearer {service_key}",
+                "apikey": service_key,
+                "Content-Type": "application/json",
+            },
+            json={"app_metadata": app_metadata},
+        )
+        resp.raise_for_status()
+
+
+async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]) -> None:
+    """Self-heal stale signups by writing tenancy claims back to Supabase.
+
+    When a verified JWT lacks ``app_metadata.organization_id`` but the user has
+    exactly one ``user_organizations`` row, push the derived
+    ``favonius_role`` / ``organization_id`` / ``organization_name`` to the
+    Supabase Auth admin API. The current request still proceeds without org
+    context — the user's NEXT token refresh sees the corrected claims and the
+    first-depot wizard becomes visible.
+
+    No-op when:
+      * the JWT already has ``organization_id`` (nothing to repair);
+      * ``sub`` is missing or the role is ``favonius_admin`` (skipped per
+        existing tenant-mirror invariants);
+      * the user has zero or multiple ``user_organizations`` rows (ambiguous);
+      * the membership role isn't in :data:`_SUPABASE_TO_FAVONIUS_ROLE`;
+      * ``SUPABASE_URL`` or ``SUPABASE_SERVICE_KEY`` are unset (dev/local);
+      * ``pool`` is ``None`` or the repair was already issued within the TTL.
+
+    Errors are logged and swallowed so auth never breaks on a bad signup.
+    """
+    user_id = user.get("sub")
+    if not user_id:
+        return
+    if get_user_organization_id(user) is not None:
+        return
+    if get_user_role(user) == "favonius_admin":
+        return
+    if pool is None:
+        return
+
+    key = str(user_id)
+    now = time.monotonic()
+    cached_until = _repair_cache.get(key)
+    if cached_until is not None and cached_until > now:
+        return
+
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not supabase_url or not service_key:
+        return
+
+    try:
+        async with pool.acquire() as conn:
+            membership = await _fetch_single_user_org_membership(conn, user_id)
+    except Exception:
+        logger.warning(
+            "tenant_metadata_repair: db lookup failed user=%s",
+            user_id,
+            exc_info=True,
+        )
+        return
+
+    if membership is None:
+        # Cache the negative result so we don't re-scan user_organizations on
+        # every request for users who legitimately have no membership yet.
+        _repair_cache[key] = now + _TTL_S
+        return
+
+    org_id, supabase_role, org_name = membership
+    favonius_role = _SUPABASE_TO_FAVONIUS_ROLE[supabase_role]
+    payload = {
+        "favonius_role": favonius_role,
+        "organization_id": org_id,
+        "organization_name": org_name or f"org-{org_id[:8]}",
+    }
+
+    try:
+        await _patch_supabase_app_metadata(
+            supabase_url=supabase_url,
+            service_key=service_key,
+            user_id=user_id,
+            app_metadata=payload,
+        )
+    except Exception:
+        logger.warning(
+            "tenant_metadata_repair: admin API call failed user=%s org=%s",
+            user_id,
+            org_id,
+            exc_info=True,
+        )
+        # Do NOT cache on failure: the next request should retry so a transient
+        # outage doesn't lock the user out of the wizard for a full TTL.
+        return
+
+    logger.warning(
+        "tenant_metadata_repair: backfilled app_metadata user=%s org=%s role=%s",
+        user_id,
+        org_id,
+        favonius_role,
+    )
+    _repair_cache[key] = now + _TTL_S
+
+
 async def ensure_tenant_mirrored(user: dict = Depends(verify_token)) -> dict:
-    """FastAPI dependency: verify JWT then mirror org/membership (best-effort)."""
+    """FastAPI dependency: verify JWT, repair stale signups, mirror tenancy."""
     from ..api import main as api_main  # noqa: PLC0415 — avoid import cycle at startup
 
     pool = api_main.db_pools.static if api_main.db_pools else None
+    try:
+        # Repair runs before mirror so a healed JWT on a future request can
+        # then mirror normally. The current request still uses the unpatched
+        # token; that's by design — we never trust the DB-derived role for
+        # the in-flight authorization decision.
+        await repair_user_tenant_metadata(user, pool)
+    except Exception:
+        logger.warning("ensure_tenant_mirrored: repair step failed", exc_info=True)
     try:
         await mirror_user_tenant(user, pool)
     except Exception:

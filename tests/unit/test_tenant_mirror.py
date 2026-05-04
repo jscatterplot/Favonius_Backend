@@ -345,3 +345,401 @@ async def test_atomic_mirror_writes_supabase_role_vocab():
     )
     await tm.mirror_user_tenant_atomic(conn, user)
     assert conn.executes[1][1][2] == "owner"
+
+
+# ============ repair_user_tenant_metadata ============
+#
+# Self-heal path: a verified JWT lacks app_metadata.organization_id but the
+# user has exactly one user_organizations row. The repair pushes the derived
+# claims back to Supabase via the Auth admin API so the user's NEXT token
+# refresh sees correct claims and the first-depot wizard becomes visible.
+
+
+class _FetchableConn:
+    """``asyncpg.Connection`` stand-in that supports both ``execute`` and
+    ``fetch``. ``fetch`` returns canned rows (or raises if configured)."""
+
+    def __init__(self, fetch_rows=None, raise_on_fetch=None):
+        self._rows = fetch_rows if fetch_rows is not None else []
+        self._raise = raise_on_fetch
+        self.fetch_calls: list[tuple[str, tuple]] = []
+        self.executes: list[tuple[str, tuple]] = []
+
+    def transaction(self):
+        return _FakeTransaction()
+
+    async def execute(self, q, *args):
+        self.executes.append((q, tuple(args)))
+
+    async def fetch(self, q, *args):
+        self.fetch_calls.append((q, tuple(args)))
+        if self._raise is not None:
+            raise self._raise
+        return self._rows
+
+
+class _FetchablePool:
+    def __init__(self, fetch_rows=None, raise_on_fetch=None):
+        self.conn = _FetchableConn(fetch_rows, raise_on_fetch)
+
+    def acquire(self):
+        return _FakeAcquire(self.conn)
+
+
+@pytest.fixture
+def _supabase_env(monkeypatch):
+    """Set Supabase admin-API env vars; the repair is gated on both."""
+    monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "test-service-key")
+
+
+@pytest.fixture
+def _record_admin_calls(monkeypatch):
+    """Replace the httpx admin-API helper with an in-memory recorder."""
+    calls: list[dict] = []
+
+    async def _fake(*, supabase_url, service_key, user_id, app_metadata, **_):
+        calls.append(
+            {
+                "supabase_url": supabase_url,
+                "service_key": service_key,
+                "user_id": user_id,
+                "app_metadata": app_metadata,
+            }
+        )
+
+    monkeypatch.setattr(tm, "_patch_supabase_app_metadata", _fake)
+    return calls
+
+
+def _orphaned_user(sub: str) -> dict:
+    """JWT whose app_metadata is missing tenancy claims (the broken-signup case)."""
+    return {
+        "sub": sub,
+        "role": "authenticated",
+        "app_metadata": {"provider": "email", "providers": ["email"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_repair_backfills_app_metadata_for_owner_membership(
+    _supabase_env, _record_admin_calls
+):
+    """Happy path: 1 user_organizations row with role=owner → admin API called
+    with customer_admin and the org_id derived from the row."""
+    sub = "d24f55e8-2ee1-4d09-88a6-0811bdb3411b"
+    org_id = "d1288ddc-c696-4a94-b70b-7368f674580b"
+    pool = _FetchablePool([{"organization_id": org_id, "role": "owner", "name": "HRX, UAB"}])
+
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+
+    assert len(_record_admin_calls) == 1
+    call = _record_admin_calls[0]
+    assert call["user_id"] == sub
+    assert call["supabase_url"] == "https://test.supabase.co"
+    assert call["service_key"] == "test-service-key"
+    assert call["app_metadata"] == {
+        "favonius_role": "customer_admin",
+        "organization_id": org_id,
+        "organization_name": "HRX, UAB",
+    }
+
+
+@pytest.mark.asyncio
+async def test_repair_backfills_customer_operator_for_operator_membership(
+    _supabase_env, _record_admin_calls
+):
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"organization_id": org_id, "role": "operator", "name": "Acme"}])
+
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+
+    assert len(_record_admin_calls) == 1
+    assert _record_admin_calls[0]["app_metadata"]["favonius_role"] == "customer_operator"
+
+
+@pytest.mark.asyncio
+async def test_repair_uses_placeholder_when_org_name_is_null(_supabase_env, _record_admin_calls):
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"organization_id": org_id, "role": "owner", "name": None}])
+
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+
+    assert len(_record_admin_calls) == 1
+    assert _record_admin_calls[0]["app_metadata"]["organization_name"] == "org-22222222"
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_when_jwt_already_has_org_id(_supabase_env, _record_admin_calls):
+    """Healthy JWT must not trigger any admin call or DB lookup."""
+    pool = _FetchablePool([{"organization_id": "x", "role": "owner", "name": "y"}])
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "customer_admin",
+    )
+    await tm.repair_user_tenant_metadata(user, pool)
+    assert _record_admin_calls == []
+    assert pool.conn.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_for_favonius_admin(_supabase_env, _record_admin_calls):
+    """Favonius staff legitimately have no organization_id; never auto-repair them."""
+    pool = _FetchablePool([{"organization_id": "x", "role": "owner", "name": "y"}])
+    user = {
+        "sub": "11111111-1111-4111-8111-111111111111",
+        "app_metadata": {"favonius_role": "favonius_admin"},
+    }
+    await tm.repair_user_tenant_metadata(user, pool)
+    assert _record_admin_calls == []
+    assert pool.conn.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_when_sub_missing(_supabase_env, _record_admin_calls):
+    pool = _FetchablePool([{"organization_id": "x", "role": "owner", "name": "y"}])
+    await tm.repair_user_tenant_metadata({"app_metadata": {}}, pool)
+    assert _record_admin_calls == []
+    assert pool.conn.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_when_pool_is_none(_supabase_env, _record_admin_calls):
+    await tm.repair_user_tenant_metadata(
+        _orphaned_user("d24f55e8-2ee1-4d09-88a6-0811bdb3411b"), None
+    )
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_when_supabase_env_missing(monkeypatch, _record_admin_calls):
+    """Without SUPABASE_URL or SUPABASE_SERVICE_KEY the repair must skip
+    silently — dev/local environments have no admin credentials."""
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_KEY", raising=False)
+    pool = _FetchablePool([{"organization_id": "x", "role": "owner", "name": "y"}])
+    await tm.repair_user_tenant_metadata(
+        _orphaned_user("11111111-1111-4111-8111-111111111111"), pool
+    )
+    assert _record_admin_calls == []
+    # Skip happens before the DB lookup — don't even touch user_organizations.
+    assert pool.conn.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_when_user_has_no_membership(_supabase_env, _record_admin_calls):
+    pool = _FetchablePool([])
+    await tm.repair_user_tenant_metadata(
+        _orphaned_user("11111111-1111-4111-8111-111111111111"), pool
+    )
+    assert _record_admin_calls == []
+    # DB lookup happened, but no admin call.
+    assert len(pool.conn.fetch_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_repair_noop_when_user_has_multiple_memberships(_supabase_env, _record_admin_calls):
+    """Multiple user_organizations rows are ambiguous — we cannot pick a single
+    org to backfill, so skip and let an operator resolve it manually."""
+    pool = _FetchablePool(
+        [
+            {"organization_id": "a", "role": "owner", "name": "A"},
+            {"organization_id": "b", "role": "owner", "name": "B"},
+        ]
+    )
+    await tm.repair_user_tenant_metadata(
+        _orphaned_user("11111111-1111-4111-8111-111111111111"), pool
+    )
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_skips_admin_membership_role(_supabase_env, _record_admin_calls):
+    """A user_organizations row with role='admin' (Favonius staff) must NOT
+    auto-promote the user to favonius_admin — that would let a corrupted DB
+    row escalate privilege via the self-heal path."""
+    pool = _FetchablePool([{"organization_id": "x", "role": "admin", "name": "Staff"}])
+    await tm.repair_user_tenant_metadata(
+        _orphaned_user("11111111-1111-4111-8111-111111111111"), pool
+    )
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_skips_viewer_membership_role(_supabase_env, _record_admin_calls):
+    """'viewer' has no Favonius-vocab equivalent, so we don't auto-derive."""
+    pool = _FetchablePool([{"organization_id": "x", "role": "viewer", "name": "Y"}])
+    await tm.repair_user_tenant_metadata(
+        _orphaned_user("11111111-1111-4111-8111-111111111111"), pool
+    )
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_caches_within_ttl(_supabase_env, _record_admin_calls):
+    """Second repair call within the TTL must not re-issue the admin call."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    pool = _FetchablePool([{"organization_id": "y", "role": "owner", "name": "Y"}])
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+    assert len(_record_admin_calls) == 1
+    # Second call should not even hit the DB once cached.
+    assert len(pool.conn.fetch_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_repair_caches_negative_result_to_avoid_repeated_db_scans(
+    _supabase_env, _record_admin_calls
+):
+    """When membership lookup returns no rows the result is also cached, so
+    we don't scan ``user_organizations`` on every request for a user who
+    legitimately has no org yet."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    pool = _FetchablePool([])
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+    assert len(pool.conn.fetch_calls) == 1
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_does_not_cache_on_admin_api_failure(_supabase_env, monkeypatch, caplog):
+    """Transient admin-API failures must NOT lock the user out of repair for a
+    full TTL; the next request retries."""
+    caplog.set_level("WARNING")
+
+    call_count = {"n": 0}
+
+    async def _flaky(**_kwargs):
+        call_count["n"] += 1
+        raise RuntimeError("admin API down")
+
+    monkeypatch.setattr(tm, "_patch_supabase_app_metadata", _flaky)
+    sub = "11111111-1111-4111-8111-111111111111"
+    pool = _FetchablePool([{"organization_id": "y", "role": "owner", "name": "Y"}])
+
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+
+    assert call_count["n"] == 2
+    assert "tenant_metadata_repair: admin API call failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_repair_swallows_db_lookup_errors(_supabase_env, _record_admin_calls, caplog):
+    caplog.set_level("WARNING")
+    pool = _FetchablePool(raise_on_fetch=RuntimeError("db down"))
+    await tm.repair_user_tenant_metadata(
+        _orphaned_user("11111111-1111-4111-8111-111111111111"), pool
+    )
+    assert _record_admin_calls == []
+    assert "tenant_metadata_repair: db lookup failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_repair_logs_success_at_warning_level(_supabase_env, _record_admin_calls, caplog):
+    """The successful repair logs a structured WARNING so ops can see how often
+    the safety net is firing — high counts signal a frontend-signup regression."""
+    caplog.set_level("WARNING")
+    sub = "d24f55e8-2ee1-4d09-88a6-0811bdb3411b"
+    pool = _FetchablePool(
+        [
+            {
+                "organization_id": "d1288ddc-c696-4a94-b70b-7368f674580b",
+                "role": "owner",
+                "name": "HRX, UAB",
+            }
+        ]
+    )
+    await tm.repair_user_tenant_metadata(_orphaned_user(sub), pool)
+    assert "tenant_metadata_repair: backfilled app_metadata" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ensure_tenant_mirrored_runs_repair_before_mirror(
+    _supabase_env, _record_admin_calls, monkeypatch
+):
+    """Integration: the FastAPI dependency calls repair, then mirror — both
+    are best-effort and neither one breaks auth on failure."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    pool = _FetchablePool([{"organization_id": "y", "role": "owner", "name": "Y"}])
+
+    # Patch api_main.db_pools so ensure_tenant_mirrored uses our fake pool.
+    from src.api import main as api_main
+
+    class _Pools:
+        static = pool
+
+    monkeypatch.setattr(api_main, "db_pools", _Pools())
+
+    user = _orphaned_user(sub)
+    returned = await tm.ensure_tenant_mirrored(user)
+    assert returned is user  # dependency returns the verified token unchanged
+    assert len(_record_admin_calls) == 1
+    # Mirror still skips because the in-flight token wasn't mutated.
+    assert pool.conn.executes == []
+
+
+# ============ _fetch_single_user_org_membership ============
+
+
+@pytest.mark.asyncio
+async def test_fetch_membership_returns_none_for_zero_rows():
+    conn = _FetchableConn([])
+    assert await tm._fetch_single_user_org_membership(conn, "uid") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_membership_returns_none_for_multiple_rows():
+    conn = _FetchableConn(
+        [
+            {"organization_id": "a", "role": "owner", "name": "A"},
+            {"organization_id": "b", "role": "owner", "name": "B"},
+        ]
+    )
+    assert await tm._fetch_single_user_org_membership(conn, "uid") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_membership_returns_none_for_unrepairable_role():
+    conn = _FetchableConn([{"organization_id": "a", "role": "viewer", "name": "A"}])
+    assert await tm._fetch_single_user_org_membership(conn, "uid") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_membership_returns_tuple_for_owner():
+    conn = _FetchableConn([{"organization_id": "abc", "role": "owner", "name": "Acme"}])
+    result = await tm._fetch_single_user_org_membership(conn, "uid")
+    assert result == ("abc", "owner", "Acme")
+
+
+@pytest.mark.asyncio
+async def test_fetch_membership_normalizes_blank_org_name_to_none():
+    conn = _FetchableConn([{"organization_id": "abc", "role": "owner", "name": "   "}])
+    result = await tm._fetch_single_user_org_membership(conn, "uid")
+    assert result == ("abc", "owner", None)
+
+
+# ============ Reverse role-vocab mapping ============
+
+
+@pytest.mark.parametrize(
+    "supabase_role,expected_favonius_role",
+    [
+        ("owner", "customer_admin"),
+        ("operator", "customer_operator"),
+    ],
+)
+def test_supabase_to_favonius_role_mapping(supabase_role: str, expected_favonius_role: str) -> None:
+    assert tm._SUPABASE_TO_FAVONIUS_ROLE[supabase_role] == expected_favonius_role
+
+
+def test_supabase_to_favonius_excludes_admin_and_viewer() -> None:
+    """'admin' (favonius_admin) is excluded so a corrupted user_organizations
+    row cannot escalate to staff via the self-heal path. 'viewer' has no
+    Favonius equivalent."""
+    assert "admin" not in tm._SUPABASE_TO_FAVONIUS_ROLE
+    assert "viewer" not in tm._SUPABASE_TO_FAVONIUS_ROLE
