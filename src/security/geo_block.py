@@ -56,10 +56,18 @@ _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 # As of MaxMind's 2024 policy change the legacy `?license_key=` query-param
 # endpoint is deprecated. Database downloads now require HTTP Basic Auth with
 # the account ID as the username and the license key as the password against
-# the new `/geoip/databases/{edition_id}/download` endpoint.
+# the new `/geoip/databases/{edition_id}/download` endpoint. The endpoint then
+# 302-redirects to a Cloudflare R2 presigned URL (X-Amz-Signature in the query
+# string), so we send the Authorization header as an *unredirected* header —
+# urllib propagates `req.headers` to the redirected request, but R2 rejects
+# requests that mix AWS-Sig-v4 query auth with an HTTP Basic header.
 _MAXMIND_DOWNLOAD_URL = (
     "https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz"
 )
+# Cloudflare's WAF in front of MaxMind blocks the default `Python-urllib/3.x`
+# User-Agent. The official `geoipupdate` client uses `geoipupdate/<version>`;
+# we mirror that shape so MaxMind sees a recognisable client identifier.
+_MAXMIND_USER_AGENT = "favonius-geoip-fetcher/1.0 (+https://favoniusenergy.com)"
 _DEFAULT_DOWNLOAD_RETRIES = 3
 _DEFAULT_DOWNLOAD_BACKOFF_S = 5.0
 _DEFAULT_DOWNLOAD_TIMEOUT_S = 30.0
@@ -123,10 +131,14 @@ def _download_geoip_db(
         try:
             with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
                 tmp_path = tmp.name
-            request = urllib.request.Request(
-                _MAXMIND_DOWNLOAD_URL,
-                headers={"Authorization": f"Basic {auth_token}"},
-            )
+            request = urllib.request.Request(_MAXMIND_DOWNLOAD_URL)
+            # User-Agent rides through redirects (Cloudflare WAF on R2 also
+            # checks it), so it goes in the regular headers dict.
+            request.add_header("User-Agent", _MAXMIND_USER_AGENT)
+            # Authorization is intentionally *unredirected* so urllib does not
+            # forward it to the R2 presigned URL, which authenticates via the
+            # X-Amz-Signature query parameter and 400s on a stray Basic header.
+            request.add_unredirected_header("Authorization", f"Basic {auth_token}")
             with urllib.request.urlopen(request, timeout=timeout_s) as resp:  # noqa: S310
                 status = getattr(resp, "status", 200)
                 if status != 200:
@@ -152,6 +164,17 @@ def _download_geoip_db(
                 total_attempts,
             )
             return True
+        except urllib.error.HTTPError as exc:
+            # Surface the HTTP status so operators can distinguish 401 (bad
+            # credentials) from 403 (Cloudflare WAF) from 400 (R2 redirect
+            # auth conflict) from 404 (typo in edition ID), etc.
+            last_error = f"HTTP {exc.code} {exc.reason or ''}".strip()
+            logger.warning(
+                "GeoIP download attempt %d/%d failed: %s",
+                attempt + 1,
+                total_attempts,
+                last_error,
+            )
         except Exception as exc:  # noqa: BLE001 — never let download crash startup
             last_error = str(exc) or type(exc).__name__
             logger.warning(
