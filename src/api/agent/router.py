@@ -8,11 +8,12 @@ Three endpoints (architecture doc §6.1), all mounted under ``/agent`` in
 - ``GET  /agent/runs/{id}``    — fetch a stored ``agent_runs`` row, gated
                                  on ownership (or favonius_admin).
 
-All three depend on :func:`src.security.auth.verify_token` for JWT auth and
-on :func:`verify_token_and_check_agent_limit`, which runs **after** verification
-and applies the same 10 req/min cadence as ``POST /optimize`` via a
-dedicated in-memory bucket (``check_agent_limit``) so agent traffic does
-not share the middleware's ``/optimize`` counter.
+All three depend on :func:`src.security.auth.verify_token` for JWT auth. The
+LLM-powered turn endpoints additionally depend on
+:func:`verify_token_and_check_agent_limit`, which applies the same 10 req/min
+cadence as ``POST /optimize`` via a dedicated in-memory bucket
+(``check_agent_limit``). The read-only trace endpoint uses JWT auth only so
+lightweight history reads do not consume the expensive-turn budget.
 
 Geo-block + tenant-mirror inheritance is automatic: the router is mounted
 on the same FastAPI app, and the global ``GeoBlockMiddleware`` (registered
@@ -232,7 +233,7 @@ async def post_turn_stream(
 )
 async def get_run(
     run_id: UUID,
-    user: dict = Depends(verify_token_and_check_agent_limit),
+    user: dict = Depends(verify_token),
     ts_pool: Any = Depends(get_ts_pool),
 ) -> AgentRunRow:
     """Return the stored ``agent_runs`` row for ``run_id``.

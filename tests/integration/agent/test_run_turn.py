@@ -37,6 +37,8 @@ from src.api.agent.router import (
     verify_token_and_check_agent_limit,
 )
 from src.api.agent.router import router as agent_router
+from src.security.auth import verify_token
+from src.security.rate_limiter import RateLimitConfig, RateLimiter
 from tests.integration.agent.conftest import (
     FakeLLMClient,
     make_token_payload,
@@ -67,6 +69,7 @@ async def http_client(seeded_db, fake_llm_client):
     def _verify_token_override():
         return state["token_payload"]
 
+    app.dependency_overrides[verify_token] = _verify_token_override
     app.dependency_overrides[verify_token_and_check_agent_limit] = _verify_token_override
     app.dependency_overrides[get_static_pool] = lambda: seeded_db["static_pool"]
     app.dependency_overrides[get_ts_pool] = lambda: seeded_db["ts_pool"]
@@ -310,6 +313,42 @@ async def test_get_run_returns_stored_trace(http_client, seeded_db):
     assert body["final_intent"] == "consumption_by_user"
     assert isinstance(body["steps_json"], list)
     assert len(body["steps_json"]) >= 4  # extract, resolve, compile, execute
+
+
+@pytest.mark.asyncio
+async def test_get_run_does_not_consume_agent_turn_rate_limit(seeded_db, monkeypatch):
+    """GET /agent/runs/{id} is a cheap DB read and must not use the LLM-turn bucket."""
+    app = FastAPI()
+    app.include_router(agent_router)
+
+    token = make_token_payload(seeded_db["user_a"], organization_id=seeded_db["org_a"])
+    app.dependency_overrides[verify_token] = lambda: token
+    app.dependency_overrides[get_ts_pool] = lambda: seeded_db["ts_pool"]
+
+    limiter = RateLimiter(config=RateLimitConfig(agent_requests_per_minute=1))
+    assert limiter.check_agent_limit(f"user:{seeded_db['user_a']}").allowed is True
+    assert limiter.check_agent_limit(f"user:{seeded_db['user_a']}").allowed is False
+    monkeypatch.setattr("src.api.agent.router.get_rate_limiter", lambda: limiter)
+
+    async with seeded_db["ts_pool"].acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO agent_runs (
+                user_id, organization_id, user_message, final_intent, steps_json, status
+            )
+            VALUES ($1::uuid, $2::uuid, 'show me the trace', 'consumption_by_user', '[]', 'success')
+            RETURNING run_id
+            """,
+            str(seeded_db["user_a"]),
+            str(seeded_db["org_a"]),
+        )
+    assert row is not None
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/agent/runs/{row['run_id']}")
+
+    assert resp.status_code == 200
 
 
 @pytest.mark.asyncio
