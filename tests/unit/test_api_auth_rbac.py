@@ -491,7 +491,7 @@ class TestMyDepots:
         assert data["needs_setup"] is True
         assert data["viewer"] == {"role": "customer_operator", "organization_id": org_id}
 
-    def test_unknown_role_returns_empty_without_setup_signal(self, client, mock_db_pool):
+    def test_unknown_role_without_org_id_returns_no_setup_signal(self, client, mock_db_pool):
         pool, conn = mock_db_pool
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
             _valid_user(role="authenticated", omit_organization_id=True)
@@ -504,6 +504,27 @@ class TestMyDepots:
         assert data["depots"] == []
         assert data["needs_setup"] is False
         assert data["viewer"] == {"role": "authenticated", "organization_id": None}
+
+    def test_unprovisioned_role_with_org_id_signals_setup(self, client, mock_db_pool):
+        """User with org_id but no favonius_role in app_metadata still sees needs_setup=True.
+
+        Regression: gustas.diksa@hrx.lt had an organization but app_metadata.favonius_role
+        was unset, so role resolved to 'authenticated'. The early role-check returned
+        needs_setup=False, hiding the depot wizard entirely.
+        """
+        pool, conn = mock_db_pool
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="authenticated", organization_id=org_id)
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        with patch("src.api.main.db_pools", pool):
+            response = client.get("/me/depots", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert data["depots"] == []
+        assert data["needs_setup"] is True
+        assert data["viewer"] == {"role": "authenticated", "organization_id": org_id}
 
 
 class TestTenantMirrorOnAuthenticatedRequest:
