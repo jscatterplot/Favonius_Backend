@@ -2528,7 +2528,7 @@ def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTP
     constraint = getattr(exc, "constraint_name", "") or ""
     if "id_tag" in constraint:
         detail = "idTag is already registered"
-    elif "vin" in constraint:
+    elif "vehicles_vin" in constraint:
         # vehicles_vin_key is a global UNIQUE on vin, so this conflict can
         # surface across organizations and not just within the depot.
         detail = "VIN is already registered"
