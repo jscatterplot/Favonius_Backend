@@ -10,7 +10,8 @@ Where to set each variable: **Railway project → select service (API or WebSock
 
 | Variable | Secret? | Where / how to get it |
 |----------|---------|------------------------|
-| **DATABASE_URL** | Yes | **Full PostgreSQL connection string** for your single database (TimescaleDB, Supabase Postgres, or TigerDB). Format: `postgresql://USER:PASSWORD@HOST:PORT/DATABASE` or with SSL: `postgresql://USER:PASSWORD@HOST:PORT/DATABASE?sslmode=require`. **Supabase:** Project Settings → Database → Connection string → “URI” (use Session mode, port 5432, or Transaction mode, port 6543 — copy the URI as-is). **Timescale Cloud:** Service → Connection info → copy the connection string. **TigerDB / other:** From your provider’s dashboard or docs. This URL is used for the app and for pre-deploy migrations (`scripts/run_migrations.py`). |
+| **DATABASE_URL** | Yes | **Supabase Postgres URI** (static / reference data: `sites`, `vehicles`, `charging_stations`, tenant mirror, …). Project Settings → Database → Connection string → “URI” (Session/direct port **5432** or pooler **6543** — copy as-is). **Do not** point this at TigerCloud in production. |
+| **TIMESCALE_SERVICE_URL** | Yes | **TigerCloud / favonius-timeseries** (or other TimescaleDB) **full URI** for telemetry, sessions, prices, `connector_status`, `optimization_runs`, audit/rate-limit tables, etc. Format: `postgres://USER:PASSWORD@HOST:PORT/DATABASE?sslmode=require`. **Required** when `ENVIRONMENT` is `production` or `staging` — the API refuses to start without it so the time-series pool never accidentally uses `DATABASE_URL`. |
 | **JWT_SECRET_KEY** | Yes | **Secret used to verify JWTs** (e.g. Supabase-issued tokens). Generate a random value, e.g. run in terminal: `openssl rand -hex 32`. Use the same secret as your auth provider (e.g. Supabase JWT secret from Project Settings → API → “JWT Secret”); if your frontend uses Supabase Auth, use Supabase’s JWT secret here so the API accepts those tokens. |
 
 ### Recommended (non-secret)
@@ -37,25 +38,26 @@ Where to set each variable: **Railway project → select service (API or WebSock
 ### Pre-deploy command (API only)
 
 - In Railway: **Settings** (or **Deploy**) for the **API** service, set **Pre-deploy command** to:  
-  `python scripts/run_migrations.py`  
-- Migrations use `DATABASE_URL` (or `TIMESCALE_SERVICE_URL` if set). They create tables on first deploy; ensure `DATABASE_URL` is set before the first deploy.
+  `python scripts/run_migrations.py --target ts`  
+- This runs numbered SQL under `migrations/` against **TigerCloud** using `TIMESCALE_SERVICE_URL`. In production, `DATABASE_URL` points at Supabase, so the pre-deploy **must** have `TIMESCALE_SERVICE_URL` set (the runner does not fall back to `DATABASE_URL` for `--target ts` in that layout). For local single-DB dev, `TIMESCALE_SERVICE_URL` may be unset and the runner falls back to `DATABASE_URL`. Supabase static schema: `python scripts/run_migrations.py --target supabase` with `DATABASE_URL` = Supabase.
+
+**Post-deploy (optional, read-only):** with the same `TIMESCALE_SERVICE_URL` as the service, run `python scripts/verify_timescale_schema.py` to confirm `charging_sessions` live columns, `connector_status`, and `telemetry` match what `GET /depots/{id}/chargers` expects. If it fails, re-run the Timescale pre-deploy (additive migrations only).
 
 ---
 
 ## WebSocket Handler service
 
-The WebSocket handler currently reads **Timescale** from `TIMESCALE_SERVICE_URL` or from `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`/`PGSSLMODE`. It does **not** yet read `DATABASE_URL`; once the planned change is implemented, you can set **only** `DATABASE_URL` (same as API) for the database. Until then, use either a full URL in `TIMESCALE_SERVICE_URL` or the individual PG vars below.
+The WebSocket handler reads **Timescale** from `TIMESCALE_SERVICE_URL` (preferred: a single URI; host/user/password/port/database are parsed from it). Optional `PGHOST`/`PGUSER`/… override pieces of the URI. In **production** or **staging**, `TIMESCALE_SERVICE_URL` is **required** (same TigerCloud URI as the API). In local development only, if `TIMESCALE_SERVICE_URL` is unset, it may fall back to `DATABASE_URL` when that value is a `postgres://` URI (single-DB docker-compose).
 
 ### Required – database (Timescale / Postgres)
 
 Use **one** of these two options.
 
-**Option A – single URL (preferred once code supports it)**
+**Option A – single URL (preferred)**
 
 | Variable | Secret? | Where / how to get it |
 |----------|---------|------------------------|
-| **DATABASE_URL** | Yes | *(After the planned change: same value as API’s `DATABASE_URL`. Until then, prefer Option B.)* |
-| **TIMESCALE_SERVICE_URL** | Yes | **Full PostgreSQL URL** for the **same** database as the API. Same source as API’s `DATABASE_URL`: Supabase (Settings → Database → URI), Timescale Cloud (Connection info), or TigerDB dashboard. Example: `postgresql://USER:PASSWORD@HOST:PORT/DATABASE?sslmode=require`. |
+| **TIMESCALE_SERVICE_URL** | Yes | **Same TigerCloud / Timescale URI as the API** (`favonius-timeseries`). Example: `postgres://USER:PASSWORD@HOST:PORT/tsdb?sslmode=require`. |
 
 **Option B – individual PG vars (use if not using a single URL)**
 
@@ -114,13 +116,15 @@ These are for the Supabase **client** (REST API, auth, optional sync). Get them 
 
 ---
 
-## Single database (Supabase or TigerDB) – summary
+## Production split (Supabase static + TigerCloud timeseries) – summary
 
-If **one** Postgres is used for both API and WebSocket (e.g. Supabase or TigerDB):
-
-1. **API:** Set `DATABASE_URL` to that database’s **full URI** (from Supabase Database → URI or TigerDB connection string). Set `JWT_SECRET_KEY` (e.g. Supabase JWT secret from API settings). Run migrations via pre-deploy so tables exist.
-2. **WebSocket Handler:** Set **Timescale** to the **same** database: either `TIMESCALE_SERVICE_URL` = same URI as API’s `DATABASE_URL`, or `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD` (and `PGSSLMODE`) matching that DB. Set all **SUPABASE_*** vars from the **same** Supabase project (if you use Supabase); for Supabase-as-DB, `SUPABASE_DB_*` and Timescale point to the same Postgres instance.
+1. **API:** Set `DATABASE_URL` to **Supabase** (static schema). Set `TIMESCALE_SERVICE_URL` to **TigerCloud** (`favonius-timeseries`). Set `JWT_SECRET_KEY` / JWKS vars as for Supabase Auth. Pre-deploy: `python scripts/run_migrations.py --target ts` so operational tables exist on TigerCloud.
+2. **WebSocket Handler:** Set `TIMESCALE_SERVICE_URL` to the **same** TigerCloud URI as the API. Set all **SUPABASE_*** vars from the Supabase project (REST + optional direct DB sync). `SUPABASE_DB_*` targets Supabase Postgres, not TigerCloud.
 3. **“Tenant or user not found”** on Supabase: Fix `SUPABASE_DB_HOST`, `SUPABASE_DB_PORT`, `SUPABASE_DB_USER`, and `SUPABASE_DB_PASSWORD` using the exact values from Supabase Dashboard → Database → Connection string for the mode (Session vs Transaction) you use.
+
+### Local single-database (optional)
+
+If **one** Postgres hosts both roles (e.g. local docker-compose), you may set only `DATABASE_URL` and leave `TIMESCALE_SERVICE_URL` unset with `ENVIRONMENT=development`; the API uses `DATABASE_URL` for both pools. This layout is **not** supported for `production` / `staging`.
 
 ---
 
@@ -128,13 +132,14 @@ If **one** Postgres is used for both API and WebSocket (e.g. Supabase or TigerDB
 
 **API service**
 
-- [ ] `DATABASE_URL` (Secret) = full Postgres URI
+- [ ] `DATABASE_URL` (Secret) = Supabase Postgres URI
+- [ ] `TIMESCALE_SERVICE_URL` (Secret) = TigerCloud / Timescale URI
 - [ ] `JWT_SECRET_KEY` (Secret) = e.g. `openssl rand -hex 32` or Supabase JWT secret
 - [ ] `ENVIRONMENT=production`
 - [ ] `OCPP_SERVER_ENABLED=false`
 - [ ] `OCPP_USE_SAME_PORT=false`
 - [ ] `CORS_ORIGINS` = your frontend origin(s)
-- [ ] Pre-deploy: `python scripts/run_migrations.py`
+- [ ] Pre-deploy: `python scripts/run_migrations.py --target ts`
 
 **WebSocket Handler service**
 

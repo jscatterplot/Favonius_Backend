@@ -579,5 +579,51 @@ class TestConfig:
         assert config.environment == "production"
 
 
+class TestTimescaleConfigFromEnv:
+    """``_timescale_config_from_env`` TigerCloud URL contract."""
+
+    def test_production_requires_timescale_service_url(self) -> None:
+        from websocket_handler.config import _timescale_config_from_env
+        from websocket_handler.secrets_manager import SecretsConfig, SecretsManager
+
+        sm = SecretsManager(SecretsConfig(fallback_to_env=True, use_kubernetes_secrets=False))
+        with patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "production",
+                "DATABASE_URL": "postgresql://u:p@supabase.example:5432/postgres",
+            },
+            clear=False,
+        ):
+            os.environ.pop("TIMESCALE_SERVICE_URL", None)
+            with pytest.raises(ValueError, match="TIMESCALE_SERVICE_URL"):
+                _timescale_config_from_env(sm)
+
+    def test_production_parses_single_timescale_url(self) -> None:
+        from websocket_handler.config import _timescale_config_from_env
+        from websocket_handler.secrets_manager import SecretsConfig, SecretsManager
+
+        sm = SecretsManager(SecretsConfig(fallback_to_env=True, use_kubernetes_secrets=False))
+        with patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "production",
+                "TIMESCALE_SERVICE_URL": (
+                    "postgresql://tsuser:tssecret@tiger.example:31413/tsdb?sslmode=require"
+                ),
+            },
+            clear=False,
+        ):
+            for key in ("PGHOST", "PGUSER", "PGPASSWORD", "PGPORT"):
+                os.environ.pop(key, None)
+            cfg = _timescale_config_from_env(sm)
+        assert cfg.host == "tiger.example"
+        assert cfg.port == 31413
+        assert cfg.database == "tsdb"
+        assert cfg.user == "tsuser"
+        assert cfg.password == "tssecret"
+        assert cfg.sslmode == "require"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

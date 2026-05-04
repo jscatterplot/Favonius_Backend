@@ -260,10 +260,29 @@ async def lifespan(app: FastAPI):
 
     # ── Database pools ────────────────────────────────────────────────────────
     # Supabase (static/reference data): DATABASE_URL required.
-    # TimescaleDB (time-series/operational): TIMESCALE_SERVICE_URL required;
-    #   falls back to DATABASE_URL for single-DB local dev (docker-compose).
+    # TimescaleDB (TigerCloud / favonius-timeseries): TIMESCALE_SERVICE_URL required
+    # in production and staging so we never accidentally point the ts pool at
+    # Supabase. Local single-DB dev may omit TIMESCALE_SERVICE_URL and fall back
+    # to DATABASE_URL (docker-compose).
     static_url = os.getenv("DATABASE_URL")
-    ts_url = os.getenv("TIMESCALE_SERVICE_URL") or os.getenv("DATABASE_URL")
+    _env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    _ts_explicit = os.getenv("TIMESCALE_SERVICE_URL")
+    if _env in ("production", "staging"):
+        if not (_ts_explicit and _ts_explicit.strip()):
+            raise RuntimeError(
+                "TIMESCALE_SERVICE_URL must be set when ENVIRONMENT is production or staging. "
+                "DATABASE_URL is reserved for Supabase (static schema); TimescaleDB must be "
+                "TigerCloud (e.g. favonius-timeseries)."
+            )
+        ts_url = _ts_explicit.strip()
+        ts_url_source = "TIMESCALE_SERVICE_URL"
+    else:
+        ts_url = (_ts_explicit.strip() if _ts_explicit and _ts_explicit.strip() else None) or (
+            static_url
+        )
+        ts_url_source = (
+            "TIMESCALE_SERVICE_URL" if _ts_explicit and _ts_explicit.strip() else "DATABASE_URL"
+        )
 
     if not static_url:
         raise RuntimeError(
@@ -272,15 +291,12 @@ async def lifespan(app: FastAPI):
         )
     if not ts_url:
         raise RuntimeError(
-            "TIMESCALE_SERVICE_URL is not set. "
-            "Set it to the TimescaleDB connection string (time-series data)."
+            "No TimescaleDB URL available. Set TIMESCALE_SERVICE_URL (preferred), or in "
+            "local development set DATABASE_URL to a single Postgres that hosts both roles."
         )
 
     static_pool = await _create_pool(static_url, "DATABASE_URL")
-    ts_pool = await _create_pool(
-        ts_url,
-        "TIMESCALE_SERVICE_URL" if os.getenv("TIMESCALE_SERVICE_URL") else "DATABASE_URL",
-    )
+    ts_pool = await _create_pool(ts_url, ts_url_source)
     db_pools = DatabasePools(static=static_pool, ts=ts_pool)
 
     # ── Audit logger (Article 73-3 / NIS2 compliance) ────────────────────────

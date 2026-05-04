@@ -4,6 +4,8 @@ import os
 from typing import Any, Dict
 
 import asyncpg
+
+from src.db.postgres_url import ssl_context_for_postgres_sslmode
 import structlog
 from sqlalchemy import create_engine, text
 try:
@@ -134,7 +136,8 @@ class ConfigValidator:
             ):
                 message = (
                     "Timescale host points to localhost in production. "
-                    "Set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD to your external TimescaleDB instance."
+                    "Set TIMESCALE_SERVICE_URL to your TigerCloud / Timescale DSN, or set "
+                    "PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD to your external TimescaleDB instance."
                 )
                 self._record_detail("timescale", message)
                 self.logger.error(message)
@@ -147,7 +150,7 @@ class ConfigValidator:
                 database=self.config.timescale.database,
                 user=self.config.timescale.user,
                 password=self.config.timescale.password,
-                ssl=self.config.timescale.sslmode,
+                ssl=ssl_context_for_postgres_sslmode(str(self.config.timescale.sslmode)),
             )
 
             # Test TimescaleDB extension

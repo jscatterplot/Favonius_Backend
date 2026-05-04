@@ -5,6 +5,12 @@ from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, validator
 
+from src.db.postgres_url import (
+    build_postgres_dsn,
+    is_postgres_url,
+    merge_timescale_params_from_url,
+)
+
 from .secrets_manager import SecretsConfig, SecretsManager
 
 def _parse_int_env(primary_name: str, fallback_name: Optional[str] = None, default: int = 0) -> int:
@@ -227,6 +233,98 @@ class VDV463Config(BaseModel):
     )
 
 
+def _timescale_config_from_env(secrets_manager: SecretsManager) -> TimescaleConfig:
+    """Build ``TimescaleConfig`` from env, parsing ``TIMESCALE_SERVICE_URL`` when needed."""
+    _ts_secret_raw = secrets_manager.get_secret("TIMESCALE_SERVICE_URL") or os.getenv(
+        "TIMESCALE_SERVICE_URL"
+    )
+    _ts_s = (_ts_secret_raw or "").strip()
+    _env_ws = os.getenv("ENVIRONMENT", "development").strip().lower()
+    _prodlike_ws = _env_ws in ("production", "staging")
+
+    if _prodlike_ws and not _ts_s:
+        raise ValueError(
+            "TIMESCALE_SERVICE_URL must be set when ENVIRONMENT is production or staging "
+            "for the WebSocket handler (TigerCloud favonius-timeseries). "
+            "DATABASE_URL is reserved for Supabase static data."
+        )
+
+    _db_url_ws = (os.getenv("DATABASE_URL") or "").strip()
+    _merge_url_candidate = _ts_s if _ts_s else ("" if _prodlike_ws else _db_url_ws)
+    _merge_postgres_url = _merge_url_candidate if is_postgres_url(_merge_url_candidate) else None
+
+    _pgport_raw = secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT")
+    _pgport_explicit = bool(_pgport_raw and str(_pgport_raw).strip())
+
+    _host = secrets_manager.get_secret("PGHOST") or os.getenv("PGHOST")
+    _port = _parse_int_value(_pgport_raw, 5432)
+    _database = secrets_manager.get_secret("PGDATABASE") or os.getenv("PGDATABASE", "tsdb")
+    _user = secrets_manager.get_secret("PGUSER") or os.getenv("PGUSER")
+    _password = secrets_manager.get_secret("PGPASSWORD") or os.getenv("PGPASSWORD")
+    _sslmode = secrets_manager.get_secret("PGSSLMODE") or os.getenv("PGSSLMODE", "require")
+
+    h_m, port_m, d_m, u_m, pw_m, sm_m = merge_timescale_params_from_url(
+        service_url=_merge_postgres_url,
+        host=_host,
+        port=_port,
+        database=_database,
+        user=_user,
+        password=_password,
+        sslmode=_sslmode or "require",
+        pgport_explicit=_pgport_explicit,
+    )
+
+    if not h_m or not u_m or not pw_m:
+        raise ValueError(
+            "TimescaleDB connection is incomplete: set TIMESCALE_SERVICE_URL to a full "
+            "postgres:// or postgresql:// URI, or set PGHOST, PGUSER, and PGPASSWORD "
+            "(and optional PGPORT, PGDATABASE, PGSSLMODE)."
+        )
+
+    _service_url_field = _ts_s if _ts_s else (_merge_postgres_url or "")
+    if not _service_url_field:
+        _service_url_field = build_postgres_dsn(
+            host=h_m,
+            port=port_m,
+            database=d_m,
+            user=u_m,
+            password=pw_m,
+            sslmode=sm_m,
+        )
+
+    return TimescaleConfig(
+        service_url=_service_url_field,
+        host=h_m,
+        port=port_m,
+        database=d_m,
+        user=u_m,
+        password=pw_m,
+        sslmode=sm_m,
+        max_connections=int(
+            secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS")
+            or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")
+        ),
+        pool_size=int(
+            secrets_manager.get_secret("TIMESCALE_POOL_SIZE")
+            or os.getenv("TIMESCALE_POOL_SIZE", "20")
+        ),
+        statement_timeout=int(
+            secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT")
+            or os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")
+        ),
+        idle_timeout=int(
+            secrets_manager.get_secret("TIMESCALE_IDLE_TIMEOUT")
+            or os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")
+        ),
+        chunk_time_interval=secrets_manager.get_secret("TIMESCALE_CHUNK_INTERVAL")
+        or os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
+        compression_after=secrets_manager.get_secret("TIMESCALE_COMPRESSION_AFTER")
+        or os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
+        retention_period=secrets_manager.get_secret("TIMESCALE_RETENTION_PERIOD")
+        or os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
+    )
+
+
 class Config(BaseModel):
     """Main application configuration."""
 
@@ -297,39 +395,7 @@ class Config(BaseModel):
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "1048576")),
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
             ),
-            timescale=TimescaleConfig(
-                service_url=secrets_manager.get_secret("TIMESCALE_SERVICE_URL")
-                or os.getenv("TIMESCALE_SERVICE_URL"),
-                host=secrets_manager.get_secret("PGHOST") or os.getenv("PGHOST"),
-                port=_parse_int_value(secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT"), 5432),
-                database=secrets_manager.get_secret("PGDATABASE") or os.getenv("PGDATABASE", "tsdb"),
-                user=secrets_manager.get_secret("PGUSER") or os.getenv("PGUSER"),
-                password=secrets_manager.get_secret("PGPASSWORD") or os.getenv("PGPASSWORD"),
-                sslmode=secrets_manager.get_secret("PGSSLMODE")
-                or os.getenv("PGSSLMODE", "require"),
-                max_connections=int(
-                    secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS")
-                    or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")
-                ),
-                pool_size=int(
-                    secrets_manager.get_secret("TIMESCALE_POOL_SIZE")
-                    or os.getenv("TIMESCALE_POOL_SIZE", "20")
-                ),
-                statement_timeout=int(
-                    secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT")
-                    or os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")
-                ),
-                idle_timeout=int(
-                    secrets_manager.get_secret("TIMESCALE_IDLE_TIMEOUT")
-                    or os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")
-                ),
-                chunk_time_interval=secrets_manager.get_secret("TIMESCALE_CHUNK_INTERVAL")
-                or os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
-                compression_after=secrets_manager.get_secret("TIMESCALE_COMPRESSION_AFTER")
-                or os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
-                retention_period=secrets_manager.get_secret("TIMESCALE_RETENTION_PERIOD")
-                or os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
-            ),
+            timescale=_timescale_config_from_env(secrets_manager),
             supabase=SupabaseConfig(
                 url=secrets_manager.get_secret("SUPABASE_URL") or os.getenv("SUPABASE_URL"),
                 anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY"),
