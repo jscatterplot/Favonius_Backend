@@ -81,7 +81,7 @@ def get_llm_client() -> LLMClient:
     return RealLLMClient()
 
 
-def check_optimize_limit_dep(request: Request) -> None:
+async def check_optimize_limit_dep(request: Request) -> None:
     """FastAPI dependency: enforce the optimize-tier rate limit (10/min/user).
 
     Mirrors the per-user keying logic in ``RateLimitMiddleware`` so a
@@ -89,6 +89,11 @@ def check_optimize_limit_dep(request: Request) -> None:
     back to the request's source IP when the token is unauthenticated
     (which would have already failed at ``verify_token`` upstream — this
     is just defence in depth).
+
+    Defined as ``async def`` (not ``def``) so FastAPI runs this on the main
+    event loop, matching ``RateLimitMiddleware`` and avoiding unsynchronized
+    concurrent access to the process-global :class:`~src.security.rate_limiter.RateLimiter`
+    in-memory buckets from the default thread pool executor.
     """
     client_id = request.client.host if request.client else "unknown"
     auth_header = request.headers.get("authorization", "")
