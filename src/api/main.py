@@ -5279,16 +5279,20 @@ async def get_depot_vehicles(
             if vehicle_ids:
                 async with db_pools.ts.acquire() as ts_conn:
                     telemetry = await _safe_runtime_fetch(
-                        lambda: db_queries.latest_telemetry_by_vehicles(ts_conn, vehicle_ids)
+                        lambda: db_queries.latest_telemetry_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle telemetry",
                     )
                     sessions = await _safe_runtime_fetch(
-                        lambda: db_queries.open_session_by_vehicles(ts_conn, vehicle_ids)
+                        lambda: db_queries.open_session_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle open sessions",
                     )
                     next_departures = await _safe_runtime_fetch(
-                        lambda: db_queries.next_departures_by_vehicles(ts_conn, vehicle_ids)
+                        lambda: db_queries.next_departures_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle next departures",
                     )
                     active_schedules = await _safe_runtime_fetch(
-                        lambda: db_queries.active_schedule_by_vehicles(ts_conn, vehicle_ids)
+                        lambda: db_queries.active_schedule_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle active schedules",
                     )
 
             now = datetime.now(timezone.utc)

@@ -2203,9 +2203,6 @@ async def list_vehicles_for_depot(db, *, depot_id: str) -> list[dict]:
                max_charge_rate_kw,
                max_discharge_rate_kw,
                COALESCE(v2g_capable, FALSE)        AS v2g_capable,
-               make,
-               model,
-               year,
                status,
                created_at
         FROM vehicles
