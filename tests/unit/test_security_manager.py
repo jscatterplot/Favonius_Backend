@@ -268,8 +268,7 @@ class TestSecurityManager:
 
         assert success is True
         assert error is None
-        # Called in the basic_auth_required block AND inside _authenticate_basic_auth.
-        assert username_allowed.await_count >= 1
+        assert username_allowed.await_count == 1
         assert all(
             c == ((station_id, "TACW1141622G1433"), {})
             for c in username_allowed.await_args_list

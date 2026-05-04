@@ -171,8 +171,20 @@ class SecurityManager:
                     return False, "Basic Auth username must match station id or active alias"
 
             # Production chargers provisioned through onboarding must use Basic Auth.
+            async def _authenticate_required_basic_auth(
+                station: str,
+                method_auth_data: Dict[str, Any],
+                cert: Optional[x509.Certificate],
+            ) -> bool:
+                return await self._authenticate_basic_auth(
+                    station,
+                    method_auth_data,
+                    cert,
+                    username_prevalidated=True,
+                )
+
             auth_methods = (
-                [(AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth)]
+                [(AuthenticationMethod.BASIC_AUTH, _authenticate_required_basic_auth)]
                 if basic_auth_required
                 else [
                     (AuthenticationMethod.CLIENT_CERTIFICATE, self._authenticate_client_certificate),
@@ -480,7 +492,12 @@ class SecurityManager:
         return await self._validate_api_key(station_id, api_key)
 
     async def _authenticate_basic_auth(
-        self, station_id: str, auth_data: Dict[str, Any], client_cert: Optional[x509.Certificate]
+        self,
+        station_id: str,
+        auth_data: Dict[str, Any],
+        client_cert: Optional[x509.Certificate],
+        *,
+        username_prevalidated: bool = False,
     ) -> bool:
         """Authenticate using basic authentication."""
         username = auth_data.get("username")
@@ -489,7 +506,9 @@ class SecurityManager:
         if not username or not password:
             return False
 
-        if not await self._is_basic_auth_username_allowed(station_id, username):
+        if not username_prevalidated and not await self._is_basic_auth_username_allowed(
+            station_id, username
+        ):
             return False
 
         # Validate credentials against database

@@ -91,3 +91,34 @@ class TestSupabaseClient:
 
         assert result is True
         supabase_client.fetch_one.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_validate_basic_auth_succeeds_when_last_used_update_fails(self, supabase_client):
+        """A non-critical last_used update failure does not reject valid credentials."""
+        password_hash = bcrypt.hashpw(
+            b"valid-password",
+            bcrypt.gensalt(rounds=4),
+        ).decode("utf-8")
+        supabase_client.fetch_one = AsyncMock(return_value={"id": 42, "password_hash": password_hash})
+        supabase_client.logger = MagicMock()
+
+        conn = AsyncMock()
+        conn.execute.side_effect = RuntimeError("pool exhausted")
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        supabase_client.db_pool = pool
+
+        result = await supabase_client.validate_basic_auth(
+            "hrx-uab_hrx-vilnius-001",
+            "TACW1141622G1433",
+            "valid-password",
+        )
+
+        assert result is True
+        conn.execute.assert_awaited_once_with(
+            "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
+            42,
+        )
+        supabase_client.logger.warning.assert_called_once()

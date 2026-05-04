@@ -185,10 +185,17 @@ class SupabaseClient:
             row["password_hash"].encode("utf-8"),
         )
         if password_ok and self.db_pool:
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
+            try:
+                async with self.db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
+                        row["id"],
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to update station_credentials.last_used for id %s: %s",
                     row["id"],
+                    exc,
                 )
         return password_ok
 
