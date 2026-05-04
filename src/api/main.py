@@ -2528,6 +2528,10 @@ def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTP
     constraint = getattr(exc, "constraint_name", "") or ""
     if "id_tag" in constraint:
         detail = "idTag is already registered"
+    elif "vin" in constraint:
+        # vehicles_vin_key is a global UNIQUE on vin, so this conflict can
+        # surface across organizations and not just within the depot.
+        detail = "VIN is already registered"
     elif "vehicles_external_id" in constraint:
         detail = "External identifier is already registered"
     elif "external" in constraint:
@@ -3012,6 +3016,7 @@ async def create_vehicle_identity(
             )
         await _audit_identity_write(user, depot_id, "vehicle.create", vehicle["vehicle_id"])
         _depot_config_cache.pop(depot_id, None)
+        _fleet_list_cache.pop((depot_id, "vehicles"), None)
         return vehicle
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
@@ -3059,6 +3064,7 @@ async def update_vehicle_identity(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
         await _audit_identity_write(user, depot_id, "vehicle.update", vehicle_id)
         _depot_config_cache.pop(depot_id, None)
+        _fleet_list_cache.pop((depot_id, "vehicles"), None)
         return vehicle
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
@@ -3098,6 +3104,7 @@ async def set_vehicle_primary_id_tag(
         if vehicle is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
         await _audit_identity_write(user, depot_id, "vehicle.primary_id_tag", vehicle_id)
+        _fleet_list_cache.pop((depot_id, "vehicles"), None)
         return vehicle
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc

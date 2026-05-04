@@ -216,6 +216,125 @@ class TestFleetIdentityApi:
         assert "assigned_vehicle_ids" in response.json()["detail"]
 
 
+class TestVehicleWriteSideEffects:
+    """Cache invalidation and error mapping triggered by vehicle writes."""
+
+    @staticmethod
+    def _vehicle_payload() -> dict:
+        return {
+            "external_id": "bus-1",
+            "display_name": "Bus 1",
+            "vehicle_type": "bus_large",
+            "battery_kwh": 324.0,
+            "max_charge_kw": 150.0,
+        }
+
+    def test_create_vehicle_invalidates_fleet_list_cache(self, client, mock_db_pool):
+        from src.api import main as _main
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        vehicle_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, _ = mock_db_pool
+        # Seed the cache so we can assert it gets invalidated.
+        _main._fleet_list_cache[(depot_id, "vehicles")] = ({"items": []}, 9999999999.0)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.create_vehicle_identity",
+            new_callable=AsyncMock,
+            return_value=_vehicle_response(depot_id, vehicle_id),
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/vehicles",
+                headers=AUTH_HDR,
+                json=self._vehicle_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED, response.text
+        assert (depot_id, "vehicles") not in _main._fleet_list_cache
+
+    def test_update_vehicle_invalidates_fleet_list_cache(self, client, mock_db_pool):
+        from src.api import main as _main
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        vehicle_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, _ = mock_db_pool
+        _main._fleet_list_cache[(depot_id, "vehicles")] = ({"items": []}, 9999999999.0)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.update_vehicle_identity",
+            new_callable=AsyncMock,
+            return_value=_vehicle_response(depot_id, vehicle_id),
+        ):
+            response = client.patch(
+                f"/admin/depots/{depot_id}/vehicles/{vehicle_id}",
+                headers=AUTH_HDR,
+                json={"display_name": "Bus 1 (renamed)"},
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK, response.text
+        assert (depot_id, "vehicles") not in _main._fleet_list_cache
+
+    def test_set_primary_id_tag_invalidates_fleet_list_cache(self, client, mock_db_pool):
+        from src.api import main as _main
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        vehicle_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, _ = mock_db_pool
+        _main._fleet_list_cache[(depot_id, "vehicles")] = ({"items": []}, 9999999999.0)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.set_vehicle_primary_id_tag",
+            new_callable=AsyncMock,
+            return_value=_vehicle_response(depot_id, vehicle_id, id_tag="NEW-TAG"),
+        ):
+            response = client.put(
+                f"/admin/depots/{depot_id}/vehicles/{vehicle_id}/primary-id-tag",
+                headers=AUTH_HDR,
+                json={"id_tag": "NEW-TAG"},
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK, response.text
+        assert (depot_id, "vehicles") not in _main._fleet_list_cache
+
+    def test_create_vehicle_duplicate_vin_returns_409_with_vin_message(
+        self, client, mock_db_pool
+    ):
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, _ = mock_db_pool
+        err = asyncpg.UniqueViolationError("duplicate")
+        err.constraint_name = "vehicles_vin_key"
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.create_vehicle_identity",
+            new_callable=AsyncMock,
+            side_effect=err,
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/vehicles",
+                headers=AUTH_HDR,
+                json={**self._vehicle_payload(), "vin": "1HGBH41JXMN109186"},
+            )
+
+        assert response.status_code == http_status.HTTP_409_CONFLICT
+        assert "VIN" in response.json()["detail"]
+
+
 class TestFleetIdentityQueries:
     """Pure query helper behavior with mocked asyncpg connections."""
 
@@ -232,6 +351,33 @@ class TestFleetIdentityQueries:
                 assigned_vehicle_ids=[str(uuid4())],
                 assigned_driver_ids=None,
             )
+
+    @pytest.mark.asyncio
+    async def test_create_vehicle_identity_writes_organization_id(self):
+        """Insert must populate vehicles.organization_id from the parent site."""
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=None)
+
+        await db_queries.create_vehicle_identity(
+            conn,
+            depot_id=str(uuid4()),
+            organization_id=str(uuid4()),
+            external_id="bus-1",
+            vehicle_type="bus_large",
+            battery_kwh=324.0,
+            max_charge_kw=150.0,
+            display_name="Bus 1",
+            id_tag=None,
+            vin=None,
+            license_plate=None,
+            vehicle_status="active",
+        )
+
+        sql = conn.fetchrow.await_args.args[0]
+        # The INSERT lists organization_id and the SELECT sources it from
+        # the parent site row so RLS policies on vehicles can authorize the row.
+        assert "organization_id" in sql
+        assert "d.organization_id" in sql
 
     @pytest.mark.asyncio
     async def test_known_vehicle_id_tag_resolves_vehicle_identity(self):
