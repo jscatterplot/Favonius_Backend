@@ -624,6 +624,59 @@ class TestTimescaleConfigFromEnv:
         assert cfg.password == "tssecret"
         assert cfg.sslmode == "require"
 
+    def test_single_url_supplies_database_and_sslmode_when_unset(self) -> None:
+        from websocket_handler.config import _timescale_config_from_env
+        from websocket_handler.secrets_manager import SecretsConfig, SecretsManager
+
+        sm = SecretsManager(SecretsConfig(fallback_to_env=True, use_kubernetes_secrets=False))
+        with patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "production",
+                "TIMESCALE_SERVICE_URL": (
+                    "postgresql://tsuser:tssecret@tiger.example:31413/mydb?sslmode=verify-full"
+                ),
+            },
+            clear=False,
+        ):
+            for key in (
+                "PGHOST",
+                "PGUSER",
+                "PGPASSWORD",
+                "PGPORT",
+                "PGDATABASE",
+                "PGSSLMODE",
+            ):
+                os.environ.pop(key, None)
+            cfg = _timescale_config_from_env(sm)
+
+        assert cfg.database == "mydb"
+        assert cfg.sslmode == "verify-full"
+
+    def test_explicit_pgdatabase_and_pgsslmode_override_url(self) -> None:
+        from websocket_handler.config import _timescale_config_from_env
+        from websocket_handler.secrets_manager import SecretsConfig, SecretsManager
+
+        sm = SecretsManager(SecretsConfig(fallback_to_env=True, use_kubernetes_secrets=False))
+        with patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "production",
+                "TIMESCALE_SERVICE_URL": (
+                    "postgresql://tsuser:tssecret@tiger.example:31413/mydb?sslmode=verify-full"
+                ),
+                "PGDATABASE": "override_db",
+                "PGSSLMODE": "require",
+            },
+            clear=False,
+        ):
+            for key in ("PGHOST", "PGUSER", "PGPASSWORD", "PGPORT"):
+                os.environ.pop(key, None)
+            cfg = _timescale_config_from_env(sm)
+
+        assert cfg.database == "override_db"
+        assert cfg.sslmode == "require"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

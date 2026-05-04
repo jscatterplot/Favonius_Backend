@@ -63,7 +63,7 @@ def merge_timescale_params_from_url(
     database: str | None,
     user: str | None,
     password: str | None,
-    sslmode: str,
+    sslmode: str | None,
     pgport_explicit: bool = False,
 ) -> tuple[str, int, str, str, str, str]:
     """Fill missing Timescale discrete params from *service_url* when parseable.
@@ -76,11 +76,11 @@ def merge_timescale_params_from_url(
     d = (database or "").strip()
     u = (user or "").strip()
     pw = (password or "").strip()
-    sm = (sslmode or "require").strip() or "require"
+    sm = (sslmode or "").strip()
 
     parsed = parse_postgres_connection_url(service_url) if service_url else None
     if not parsed:
-        return h, port, d or "tsdb", u, pw, sm
+        return h, port, d or "tsdb", u, pw, sm or "require"
 
     def _nz(s: str, fallback: str) -> str:
         return s if s else fallback
