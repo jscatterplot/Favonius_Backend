@@ -2890,14 +2890,19 @@ async def list_my_depots(user: dict = Depends(ensure_tenant_mirrored)):
                 depots = await db_queries.get_all_depots(conn)
             return {"depots": depots, "needs_setup": False, "viewer": viewer}
 
-        if role not in ("customer_admin", "customer_operator"):
-            return {"depots": [], "needs_setup": False, "viewer": viewer}
-
         if not org_id:
             return {"depots": [], "needs_setup": False, "viewer": viewer}
 
         async with db_pools.static.acquire() as conn:
             depots = await db_queries.get_depots_for_organization(conn, org_id)
+
+        if role not in ("customer_admin", "customer_operator"):
+            # Role not yet provisioned in app_metadata (e.g. new customer whose
+            # favonius_role hasn't been set in Supabase yet). Withhold depot
+            # details but return the correct needs_setup signal so the wizard
+            # remains visible rather than silently hiding behind a false False.
+            return {"depots": [], "needs_setup": len(depots) == 0, "viewer": viewer}
+
         return {
             "depots": depots,
             "needs_setup": len(depots) == 0,
