@@ -2421,7 +2421,7 @@ def _canonical_request_hash(payload: BaseModel) -> str:
 
 
 _OCPP_BASIC_PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-_OCPP_BASIC_PASSWORD_LENGTH = 20
+_OCPP_BASIC_PASSWORD_LENGTH = 10
 
 
 def _generate_ocpp_basic_password() -> str:

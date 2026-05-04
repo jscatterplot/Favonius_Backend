@@ -106,11 +106,11 @@ def _charger_dict() -> dict:
 
 
 class TestResponseFormatters:
-    def test_generated_password_fits_abb_authorization_key_limit(self):
+    def test_generated_password_fits_abb_terraconfig_limit(self):
         password = _generate_ocpp_basic_password()
 
-        assert len(password) == 20
-        assert len(password.encode("utf-8")) == 20
+        assert len(password) == 10
+        assert len(password.encode("utf-8")) == 10
         assert password.isalnum()
 
     def test_first_response_includes_plaintext_password(self):
