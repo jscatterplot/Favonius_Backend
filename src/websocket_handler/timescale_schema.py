@@ -70,7 +70,11 @@ class TimescaleSchema:
             """
             ALTER TABLE charging_sessions
             ADD COLUMN IF NOT EXISTS cost_total DECIMAL(10,2),
-            ADD COLUMN IF NOT EXISTS revenue_v2g DECIMAL(10,2)
+            ADD COLUMN IF NOT EXISTS revenue_v2g DECIMAL(10,2),
+            ADD COLUMN IF NOT EXISTS current_power_kw DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS current_soc DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS target_soc DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS estimated_end_time TIMESTAMPTZ
             """
         )
 
@@ -107,6 +111,10 @@ class TimescaleSchema:
                 site_id UUID,
                 cost_total DECIMAL(10,2),
                 revenue_v2g DECIMAL(10,2),
+                current_power_kw DOUBLE PRECISION,
+                current_soc DOUBLE PRECISION,
+                target_soc DOUBLE PRECISION,
+                estimated_end_time TIMESTAMPTZ,
                 sync_status VARCHAR(20) DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()

@@ -221,6 +221,43 @@ class TestGetDepotChargers:
 
         app.dependency_overrides.clear()
 
+    def test_missing_runtime_column_degrades_to_offline(self, client, mock_db_pool):
+        """If optional session enrichment has schema drift, still return static chargers."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        charger = _charger_static_row(depot_id)
+
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.verify_depot_access", new_callable=AsyncMock),
+            patch(
+                "src.api.main.db_queries.list_chargers_for_depot",
+                new_callable=AsyncMock,
+                return_value=[charger],
+            ),
+            patch(
+                "src.api.main.db_queries.latest_connector_status_by_stations",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "src.api.main.db_queries.open_sessions_by_stations",
+                new_callable=AsyncMock,
+                side_effect=asyncpg.UndefinedColumnError("current_power_kw missing"),
+            ),
+        ):
+            response = client.get(f"/depots/{depot_id}/chargers", headers=AUTH_HDR)
+
+        assert response.status_code == 200
+        item = response.json()["items"][0]
+        assert item["status"] == "offline"
+        assert item["current_session"] is None
+
+        app.dependency_overrides.clear()
+
     def test_cache_returns_same_payload_within_ttl(self, client, mock_db_pool):
         depot_id = str(uuid4())
         org_id = str(uuid4())

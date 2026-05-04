@@ -5073,17 +5073,26 @@ def _fleet_list_response(payload: dict) -> JSONResponse:
     )
 
 
-async def _safe_runtime_fetch(coro_factory):
-    """Run a runtime DB query, returning ``{}`` if the table is missing.
+_RUNTIME_ENRICHMENT_DEGRADE_ERRORS = (
+    asyncpg.PostgresError,
+    asyncio.TimeoutError,
+)
 
-    Some environments (fresh Supabase project, local dev with partial migrations)
-    don't have the Timescale-side tables yet. We degrade gracefully rather than
-    503-ing the whole list endpoint.
-    """
+
+async def _safe_runtime_fetch(coro_factory, *, label: str, fallback_value=None):
+    """Run optional runtime enrichment without failing the static fleet list."""
+    if fallback_value is None:
+        fallback_value = {}
     try:
         return await coro_factory()
-    except asyncpg.UndefinedTableError:
-        return {}
+    except _RUNTIME_ENRICHMENT_DEGRADE_ERRORS as exc:
+        logger.warning(
+            "Optional runtime enrichment failed for %s; using fallback: %s",
+            label,
+            exc,
+            exc_info=True,
+        )
+        return fallback_value
 
 
 @app.get(
@@ -5133,13 +5142,23 @@ async def get_depot_chargers(
             connector_statuses: dict[str, dict] = {}
             open_sessions: dict[str, dict] = {}
             if ocpp_ids:
-                async with db_pools.ts.acquire() as ts_conn:
-                    connector_statuses = await _safe_runtime_fetch(
-                        lambda: db_queries.latest_connector_status_by_stations(ts_conn, ocpp_ids)
-                    )
-                    open_sessions = await _safe_runtime_fetch(
-                        lambda: db_queries.open_sessions_by_stations(ts_conn, ocpp_ids)
-                    )
+
+                async def _fetch_connector_statuses():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.latest_connector_status_by_stations(
+                            ts_conn, ocpp_ids
+                        )
+
+                async def _fetch_open_sessions():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.open_sessions_by_stations(ts_conn, ocpp_ids)
+
+                connector_statuses = await _safe_runtime_fetch(
+                    _fetch_connector_statuses, label="charger connector status"
+                )
+                open_sessions = await _safe_runtime_fetch(
+                    _fetch_open_sessions, label="charger open sessions"
+                )
 
             now = datetime.now(timezone.utc)
             items = [

@@ -310,7 +310,7 @@ class StateAssembler:
             # Step 1: Get vehicle_ids for this depot from Supabase (static)
             async with self.pools.static.acquire() as conn:
                 vehicle_rows = await conn.fetch(
-                    "SELECT vehicle_id::text FROM vehicles WHERE depot_id = $1",
+                    "SELECT id::text AS vehicle_id FROM vehicles WHERE site_id = $1",
                     self.depot_id,
                 )
             vehicle_ids = [row["vehicle_id"] for row in vehicle_rows]
@@ -595,8 +595,8 @@ class StateAssembler:
         SELECT s.vehicle_id::text, departure_time, return_time, 
                energy_kwh as estimated_energy_kwh, route_id
         FROM schedules s
-        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
-        WHERE v.depot_id = $1 
+        JOIN vehicles v ON s.vehicle_id = v.id
+        WHERE v.site_id = $1 
           AND s.departure_time >= $2 
           AND s.departure_time < $3
         ORDER BY departure_time
@@ -1037,7 +1037,7 @@ class StateAssembler:
         try:
             async with self.pools.static.acquire() as conn:
                 vehicle_rows = await conn.fetch(
-                    "SELECT vehicle_id::text FROM vehicles WHERE depot_id = $1",
+                    "SELECT id::text AS vehicle_id FROM vehicles WHERE site_id = $1",
                     self.depot_id,
                 )
             vehicle_ids = [row["vehicle_id"] for row in vehicle_rows]
