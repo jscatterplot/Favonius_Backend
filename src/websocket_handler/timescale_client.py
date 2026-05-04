@@ -1876,10 +1876,17 @@ class TimescaleClient:
                 row["password_hash"].encode("utf-8"),
             )
             if password_ok:
-                await conn.execute(
-                    "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
-                    row["id"],
-                )
+                try:
+                    await conn.execute(
+                        "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
+                        row["id"],
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to update station_credentials.last_used for id %s: %s",
+                        row["id"],
+                        exc,
+                    )
             return password_ok
 
     async def station_requires_basic_auth(self, station_id: str) -> bool:
