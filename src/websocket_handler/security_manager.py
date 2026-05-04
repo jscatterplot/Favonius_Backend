@@ -489,6 +489,9 @@ class SecurityManager:
         if not username or not password:
             return False
 
+        if not await self._is_basic_auth_username_allowed(station_id, username):
+            return False
+
         # Validate credentials against database
         return await self._validate_basic_auth(station_id, username, password)
 

@@ -49,6 +49,7 @@ class TestOCPPWebSocketServer:
         client.health_check = AsyncMock(return_value={"status": "healthy"})
         client.connect = AsyncMock()
         client.disconnect = AsyncMock()
+        client.resolve_station_id = AsyncMock(side_effect=lambda station_id: station_id)
         return client
 
     @pytest.fixture
@@ -316,6 +317,37 @@ class TestOCPPWebSocketServer:
             {},
         )
         websocket.close.assert_awaited_once_with(1008, "Authentication failed")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_path_alias_falls_back_to_timescale(
+        self, mock_config, mock_timescale_client, mock_connection_manager
+    ):
+        """When supabase_client is absent, alias resolution uses timescale_client."""
+        mock_timescale_client.resolve_station_id = AsyncMock(
+            return_value="hrx-uab_hrx-vilnius-001"
+        )
+        server = OCPPWebSocketServer(mock_config, mock_timescale_client)
+        server.connection_manager = mock_connection_manager
+        mock_task = Mock()
+        mock_task.done.return_value = False
+        mock_task.cancelled.return_value = False
+        server._rate_limit_cleanup_task = mock_task
+
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+
+        mock_timescale_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001",
+            {},
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)

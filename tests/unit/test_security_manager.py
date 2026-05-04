@@ -162,16 +162,22 @@ class TestSecurityManager:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
-    async def test_legacy_basic_auth_allows_username_distinct_from_station_id(
+    async def test_non_provisioned_basic_auth_allows_alias_username(
         self, security_manager
     ):
-        """Legacy Basic Auth stations may use any active username for that station."""
+        """Non-provisioned stations still require canonical id or alias as Basic Auth username."""
         station_id = "legacy-station-001"
         auth_data = {"username": "operator-user", "password": "valid_password"}
 
         with (
             patch.object(security_manager, "_is_station_locked_out", return_value=False),
             patch.object(security_manager, "_station_requires_basic_auth", return_value=False),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as username_allowed,
             patch.object(
                 security_manager,
                 "_validate_basic_auth",
@@ -185,6 +191,7 @@ class TestSecurityManager:
 
         assert success is True
         assert error is None
+        username_allowed.assert_awaited_once_with(station_id, "operator-user")
         validate_basic_auth.assert_awaited_once_with(
             station_id, "operator-user", "valid_password"
         )
@@ -261,10 +268,50 @@ class TestSecurityManager:
 
         assert success is True
         assert error is None
-        username_allowed.assert_awaited_once_with(station_id, "TACW1141622G1433")
+        # Called in the basic_auth_required block AND inside _authenticate_basic_auth.
+        assert username_allowed.await_count >= 1
+        assert all(
+            c == ((station_id, "TACW1141622G1433"), {})
+            for c in username_allowed.await_args_list
+        )
         validate_basic_auth.assert_awaited_once_with(
             station_id, "TACW1141622G1433", "valid_password"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_non_required_basic_auth_rejects_unknown_username(self, security_manager):
+        """Fallback basic-auth path must reject credentials with an unrecognised username."""
+        station_id = "non-provisioned-001"
+        auth_data = {"username": "random-hardware-serial", "password": "stolen-password"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=False),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as username_allowed,
+            patch.object(
+                security_manager,
+                "_validate_basic_auth",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as validate_basic_auth,
+            patch.object(security_manager, "_authenticate_client_certificate", return_value=False),
+            patch.object(security_manager, "_authenticate_bearer_token", return_value=False),
+            patch.object(security_manager, "_authenticate_api_key", return_value=False),
+            patch.object(security_manager, "_record_failed_attempt", return_value=None),
+            patch.object(security_manager, "_log_security_event", return_value=None),
+            patch.object(security_manager, "_emit_charger_auth_failure_alert", return_value=None),
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is False
+        username_allowed.assert_awaited_once_with(station_id, "random-hardware-serial")
+        validate_basic_auth.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)

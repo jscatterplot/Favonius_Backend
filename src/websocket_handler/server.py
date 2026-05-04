@@ -571,9 +571,10 @@ class OCPPWebSocketServer:
             # Use full UUID to avoid collisions
             station_id = f"station_{connection_id}"
 
-        if self.supabase_client:
+        resolver = self.supabase_client or self.timescale_client
+        if resolver and hasattr(resolver, "resolve_station_id"):
             try:
-                canonical_station_id = await self.supabase_client.resolve_station_id(station_id)
+                canonical_station_id = await resolver.resolve_station_id(station_id)
             except Exception as exc:
                 self.logger.warning(
                     "Could not resolve OCPP station alias for %s: %s",
