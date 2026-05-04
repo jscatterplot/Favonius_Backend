@@ -1,0 +1,332 @@
+"""FastAPI router for the depot chat agent.
+
+Three endpoints (architecture doc §6.1), all mounted under ``/agent`` in
+``src/api/main.py`` behind the ``AGENT_SEARCH_ENABLED`` feature flag:
+
+- ``POST /agent/turn``         — synchronous; returns an :class:`AgentReply`.
+- ``POST /agent/turn/stream``  — SSE; yields ``step`` events then ``answer``.
+- ``GET  /agent/runs/{id}``    — fetch a stored ``agent_runs`` row, gated
+                                 on ownership (or favonius_admin).
+
+All three depend on :func:`src.security.auth.verify_token` for JWT auth and
+on a tier-tightened rate-limit dependency :func:`check_optimize_limit_dep`
+that mirrors the existing ``RateLimitMiddleware``'s ``/optimize`` path
+(``check_optimize_limit`` — 10 req/min per user). LLM calls are the cost
+driver, so re-using the optimize tier is the right shape — see PRD §5.2.
+
+Geo-block + tenant-mirror inheritance is automatic: the router is mounted
+on the same FastAPI app, and the global ``GeoBlockMiddleware`` (registered
+last in ``main.py`` so it runs first) and the existing JWT pipeline cover
+every request that lands here.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from typing import Any, AsyncIterator, Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from src.api.agent.controller import AgentReply, LLMClient, RealLLMClient, run_turn
+from src.api.agent.stream import SSE_HEADERS, SSEEventStream
+from src.security.auth import (
+    decode_jwt_for_rate_limit,
+    get_user_id,
+    get_user_role,
+    verify_token,
+)
+from src.security.rate_limiter import get_rate_limiter
+
+logger = logging.getLogger(__name__)
+
+
+# ── Dependency providers ──────────────────────────────────────────────────
+#
+# These small wrappers exist so tests can override them via
+# ``app.dependency_overrides`` without monkey-patching module globals. They
+# all read from the lifespan-initialised state in ``src.api.main`` so the
+# production path picks up the same pools the rest of the app uses.
+
+
+def get_static_pool() -> Any:
+    """Return the static (Supabase) asyncpg pool from the live app state."""
+    from src.api import main as api_main  # local import: avoid circular import
+
+    if api_main.db_pools is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database not available",
+        )
+    return api_main.db_pools.static
+
+
+def get_ts_pool() -> Any:
+    """Return the time-series (TimescaleDB) asyncpg pool from the live app state."""
+    from src.api import main as api_main
+
+    if api_main.db_pools is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database not available",
+        )
+    return api_main.db_pools.ts
+
+
+def get_llm_client() -> LLMClient:
+    """Return the default :class:`LLMClient`. Tests override this."""
+    return RealLLMClient()
+
+
+def check_optimize_limit_dep(request: Request) -> None:
+    """FastAPI dependency: enforce the optimize-tier rate limit (10/min/user).
+
+    Mirrors the per-user keying logic in ``RateLimitMiddleware`` so a
+    single user across multiple connections can't bypass the cap. Falls
+    back to the request's source IP when the token is unauthenticated
+    (which would have already failed at ``verify_token`` upstream — this
+    is just defence in depth).
+    """
+    client_id = request.client.host if request.client else "unknown"
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            payload = decode_jwt_for_rate_limit(auth_header[7:])
+            if payload and payload.get("sub"):
+                client_id = f"user:{payload['sub']}"
+        except Exception:  # pragma: no cover - defensive
+            # Any JWT issue here means the verify_token dep already
+            # rejected the request, but the caller wins on ordering;
+            # fall back to IP-based limiting rather than crashing the
+            # rate-limit check itself.
+            logger.debug("Rate-limit dep: JWT decode failed; falling back to IP")
+
+    limiter = get_rate_limiter()
+    result = limiter.check_optimize_limit(client_id)
+    if not result.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded: 10 requests per minute on /agent/*",
+            headers={
+                "X-RateLimit-Limit": str(result.limit),
+                "X-RateLimit-Remaining": str(result.remaining),
+                "X-RateLimit-Reset": str(int(result.reset_at)),
+            },
+        )
+
+
+# ── Request / response models ─────────────────────────────────────────────
+
+
+class AgentTurnRequest(BaseModel):
+    """One-shot turn request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(..., min_length=1, max_length=2000)
+
+
+class AgentRunRow(BaseModel):
+    """``agent_runs`` row shape returned by ``GET /agent/runs/{id}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: UUID
+    user_id: UUID
+    organization_id: Optional[UUID] = None
+    depot_id: Optional[UUID] = None
+    user_message: str
+    final_intent: Optional[str] = None
+    steps_json: list[dict[str, Any]] = Field(default_factory=list)
+    status: str
+    duration_ms: Optional[int] = None
+    created_at: str
+
+
+# ── Router ────────────────────────────────────────────────────────────────
+
+
+router = APIRouter(prefix="/agent", tags=["agent"])
+
+
+@router.post(
+    "/turn",
+    response_model=AgentReply,
+    summary="Run one chat turn synchronously",
+    dependencies=[Depends(check_optimize_limit_dep)],
+)
+async def post_turn(
+    body: AgentTurnRequest,
+    user: dict = Depends(verify_token),
+    static_pool: Any = Depends(get_static_pool),
+    ts_pool: Any = Depends(get_ts_pool),
+    llm_client: LLMClient = Depends(get_llm_client),
+) -> AgentReply:
+    """Run one turn end-to-end and return the final reply."""
+    try:
+        return await run_turn(
+            message=body.message,
+            token_payload=user,
+            static_pool=static_pool,
+            ts_pool=ts_pool,
+            llm_client=llm_client,
+        )
+    except HTTPException:
+        # Auth-context errors (403 on missing org, etc.) bubble up as-is.
+        raise
+    except Exception:
+        logger.exception("Agent turn failed (synchronous endpoint)")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Agent turn failed. Please try again.",
+        )
+
+
+@router.post(
+    "/turn/stream",
+    summary="Run one chat turn and stream step events via SSE",
+    dependencies=[Depends(check_optimize_limit_dep)],
+)
+async def post_turn_stream(
+    body: AgentTurnRequest,
+    user: dict = Depends(verify_token),
+    static_pool: Any = Depends(get_static_pool),
+    ts_pool: Any = Depends(get_ts_pool),
+    llm_client: LLMClient = Depends(get_llm_client),
+) -> StreamingResponse:
+    """Run one turn and stream step + answer events as SSE.
+
+    The orchestrator runs in a background task that emits encoded SSE
+    events into a shared queue. A failure inside the orchestrator emits
+    a single ``error`` event with a generic message and closes the
+    stream — the underlying exception is logged but never reaches the
+    client. The synchronous JSON endpoint returns a 502 in the same
+    case; the SSE endpoint returns a 200 with the error event because
+    headers have already been sent by then.
+    """
+
+    stream = SSEEventStream()
+
+    async def _run() -> None:
+        try:
+            await run_turn(
+                message=body.message,
+                token_payload=user,
+                static_pool=static_pool,
+                ts_pool=ts_pool,
+                llm_client=llm_client,
+                sse=stream,
+            )
+        except HTTPException as exc:
+            # Auth/scope errors thrown inside build_auth_context — surface
+            # the status code in the event payload for client-side display
+            # without leaking the exception's detail beyond what HTTPException
+            # already exposes via its status code.
+            logger.warning("Agent SSE turn failed with HTTPException status=%s", exc.status_code)
+            await stream.emit("error", {"status": exc.status_code, "detail": exc.detail})
+        except Exception:
+            logger.exception("Agent SSE turn failed")
+            await stream.emit(
+                "error",
+                {"status": 502, "detail": "Agent turn failed. Please try again."},
+            )
+        finally:
+            stream.close()
+
+    asyncio.create_task(_run())
+
+    async def _iterator() -> AsyncIterator[bytes]:
+        async for chunk in stream:
+            yield chunk
+
+    return StreamingResponse(
+        _iterator(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+@router.get(
+    "/runs/{run_id}",
+    response_model=AgentRunRow,
+    summary="Fetch a stored agent run trace",
+    dependencies=[Depends(check_optimize_limit_dep)],
+)
+async def get_run(
+    run_id: UUID,
+    user: dict = Depends(verify_token),
+    ts_pool: Any = Depends(get_ts_pool),
+) -> AgentRunRow:
+    """Return the stored ``agent_runs`` row for ``run_id``.
+
+    Access is gated on ownership: the row's ``user_id`` must equal the
+    caller's ``sub`` claim, or the caller must be ``favonius_admin``. A
+    mismatched tenant user gets a 404 (not 403) so we don't leak the
+    existence of another tenant's run IDs.
+    """
+    caller_id = UUID(get_user_id(user))
+    role = get_user_role(user)
+
+    async with ts_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                run_id,
+                user_id,
+                organization_id,
+                depot_id,
+                user_message,
+                final_intent,
+                steps_json,
+                status,
+                duration_ms,
+                created_at
+            FROM agent_runs
+            WHERE run_id = $1::uuid
+            """,
+            str(run_id),
+        )
+
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+
+    row_user_id = UUID(str(row["user_id"]))
+    if role != "favonius_admin" and row_user_id != caller_id:
+        # Don't differentiate "exists but yours? no" from "doesn't exist"
+        # in the response — both are 404 to avoid run-id enumeration.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+
+    steps = row["steps_json"]
+    if isinstance(steps, str):
+        # asyncpg may return JSONB as raw text when a connection-level
+        # codec is not registered; decode defensively.
+        import json as _json
+
+        steps = _json.loads(steps)
+
+    return AgentRunRow(
+        run_id=UUID(str(row["run_id"])),
+        user_id=row_user_id,
+        organization_id=UUID(str(row["organization_id"])) if row["organization_id"] else None,
+        depot_id=UUID(str(row["depot_id"])) if row["depot_id"] else None,
+        user_message=row["user_message"],
+        final_intent=row["final_intent"],
+        steps_json=list(steps or []),
+        status=row["status"],
+        duration_ms=row["duration_ms"],
+        created_at=row["created_at"].isoformat() if row["created_at"] else "",
+    )
+
+
+def is_enabled() -> bool:
+    """Return True iff the agent router should be mounted.
+
+    Read at import / startup time only; flipping the env var requires a
+    redeploy. Default is **off** for v0 — flipped to default-on in B6
+    after the golden test suite passes per architecture doc §11 step 8.
+    """
+    return os.environ.get("AGENT_SEARCH_ENABLED", "false").lower() == "true"
