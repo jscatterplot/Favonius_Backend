@@ -208,6 +208,33 @@ async def _fetch_single_user_org_membership(
     return (str(row["organization_id"]), str(row["role"]), name)
 
 
+async def _fetch_role_for_org(
+    conn: "asyncpg.Connection", user_id: str, org_id: str
+) -> Optional[tuple[str, Optional[str]]]:
+    """Return ``(supabase_role, organization_name)`` for the specific (user, org) pair.
+
+    Returns ``None`` when no ``user_organizations`` row exists for that pair, or when
+    the role is not in :data:`_SUPABASE_TO_FAVONIUS_ROLE` (admin / viewer / unknown).
+    Used by the Case B self-heal path where ``organization_id`` is present in the JWT
+    but ``favonius_role`` is absent.
+    """
+    rows = await conn.fetch(
+        "SELECT uo.role, o.name "
+        "FROM user_organizations uo "
+        "LEFT JOIN organizations o ON o.id = uo.organization_id "
+        "WHERE uo.user_id = $1::uuid AND uo.organization_id = $2::uuid",
+        user_id,
+        org_id,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    if row["role"] not in _SUPABASE_TO_FAVONIUS_ROLE:
+        return None
+    name = row["name"] if isinstance(row["name"], str) and row["name"].strip() else None
+    return (str(row["role"]), name)
+
+
 async def _patch_supabase_app_metadata(
     *,
     supabase_url: str,
@@ -240,19 +267,27 @@ async def _patch_supabase_app_metadata(
 async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]) -> None:
     """Self-heal stale signups by writing tenancy claims back to Supabase.
 
-    When a verified JWT lacks ``app_metadata.organization_id`` but the user has
-    exactly one ``user_organizations`` row, push the derived
-    ``favonius_role`` / ``organization_id`` / ``organization_name`` to the
-    Supabase Auth admin API. The current request still proceeds without org
-    context — the user's NEXT token refresh sees the corrected claims and the
-    first-depot wizard becomes visible.
+    Handles two repair cases:
+
+    **Case A** — ``organization_id`` is missing from the JWT: derive it from a
+    single unambiguous ``user_organizations`` row and push the full triple
+    (``favonius_role``, ``organization_id``, ``organization_name``) to Supabase.
+
+    **Case B** — ``organization_id`` is present but ``favonius_role`` is absent
+    (the Gustas/HRX pattern): look up the role for that specific org and push
+    just ``favonius_role`` (and ``organization_name`` if also absent). The
+    ``organization_id`` is already correct in the JWT and is not overwritten.
+
+    The current request still proceeds with the unpatched token; the user's
+    NEXT token refresh sees the corrected claims and the depot list becomes
+    visible.
 
     No-op when:
-      * the JWT already has ``organization_id`` (nothing to repair);
-      * ``sub`` is missing or the role is ``favonius_admin`` (skipped per
-        existing tenant-mirror invariants);
-      * the user has zero or multiple ``user_organizations`` rows (ambiguous);
-      * the membership role isn't in :data:`_SUPABASE_TO_FAVONIUS_ROLE`;
+      * both ``organization_id`` and ``favonius_role`` are already set;
+      * ``sub`` is missing or the role is ``favonius_admin``;
+      * Case A: zero or multiple ``user_organizations`` rows (ambiguous);
+      * Case B: no ``user_organizations`` row for the token's org, or the role
+        maps to an unrepresentable value (admin / viewer);
       * ``SUPABASE_URL`` or ``SUPABASE_SERVICE_KEY`` are unset (dev/local);
       * ``pool`` is ``None`` or the repair was already issued within the TTL.
 
@@ -261,12 +296,16 @@ async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]
     user_id = user.get("sub")
     if not user_id:
         return
-    if get_user_organization_id(user) is not None:
-        return
     if get_user_role(user) == "favonius_admin":
         return
     if pool is None:
         return
+
+    org_id = get_user_organization_id(user)
+    app_meta = user.get("app_metadata") if isinstance(user.get("app_metadata"), dict) else {}
+    has_favonius_role = bool(app_meta.get("favonius_role"))
+    if org_id is not None and has_favonius_role:
+        return  # nothing to repair
 
     key = str(user_id)
     now = time.monotonic()
@@ -279,30 +318,56 @@ async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]
     if not supabase_url or not service_key:
         return
 
-    try:
-        async with pool.acquire() as conn:
-            membership = await _fetch_single_user_org_membership(conn, user_id)
-    except Exception:
-        logger.warning(
-            "tenant_metadata_repair: db lookup failed user=%s",
-            user_id,
-            exc_info=True,
-        )
-        return
+    if org_id is None:
+        # Case A: organization_id missing — derive from a single membership row.
+        try:
+            async with pool.acquire() as conn:
+                membership = await _fetch_single_user_org_membership(conn, user_id)
+        except Exception:
+            logger.warning(
+                "tenant_metadata_repair: db lookup failed user=%s",
+                user_id,
+                exc_info=True,
+            )
+            return
 
-    if membership is None:
-        # Cache the negative result so we don't re-scan user_organizations on
-        # every request for users who legitimately have no membership yet.
-        _repair_cache[key] = now + _TTL_S
-        return
+        if membership is None:
+            # Cache the negative so we don't re-scan on every request.
+            _repair_cache[key] = now + _TTL_S
+            return
 
-    org_id, supabase_role, org_name = membership
-    favonius_role = _SUPABASE_TO_FAVONIUS_ROLE[supabase_role]
-    payload = {
-        "favonius_role": favonius_role,
-        "organization_id": org_id,
-        "organization_name": org_name or f"org-{org_id[:8]}",
-    }
+        org_id_derived, supabase_role, org_name = membership
+        favonius_role = _SUPABASE_TO_FAVONIUS_ROLE[supabase_role]
+        payload: dict = {
+            "favonius_role": favonius_role,
+            "organization_id": org_id_derived,
+            "organization_name": org_name or f"org-{org_id_derived[:8]}",
+        }
+        log_org_id = org_id_derived
+
+    else:
+        # Case B: organization_id present but favonius_role missing.
+        try:
+            async with pool.acquire() as conn:
+                role_result = await _fetch_role_for_org(conn, user_id, org_id)
+        except Exception:
+            logger.warning(
+                "tenant_metadata_repair: db lookup failed user=%s",
+                user_id,
+                exc_info=True,
+            )
+            return
+
+        if role_result is None:
+            _repair_cache[key] = now + _TTL_S
+            return
+
+        supabase_role, org_name = role_result
+        favonius_role = _SUPABASE_TO_FAVONIUS_ROLE[supabase_role]
+        payload = {"favonius_role": favonius_role}
+        if not app_meta.get("organization_name") and org_name:
+            payload["organization_name"] = org_name
+        log_org_id = org_id
 
     try:
         await _patch_supabase_app_metadata(
@@ -315,7 +380,7 @@ async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]
         logger.warning(
             "tenant_metadata_repair: admin API call failed user=%s org=%s",
             user_id,
-            org_id,
+            log_org_id,
             exc_info=True,
         )
         # Do NOT cache on failure: the next request should retry so a transient
@@ -325,7 +390,7 @@ async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]
     logger.warning(
         "tenant_metadata_repair: backfilled app_metadata user=%s org=%s role=%s",
         user_id,
-        org_id,
+        log_org_id,
         favonius_role,
     )
     _repair_cache[key] = now + _TTL_S

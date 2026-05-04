@@ -421,6 +421,14 @@ def _orphaned_user(sub: str) -> dict:
     }
 
 
+def _user_with_org_no_role(sub: str, org_id: str, organization_name: str | None = None) -> dict:
+    """JWT with organization_id set but favonius_role absent (Case B / Gustas pattern)."""
+    meta: dict = {"provider": "email", "providers": ["email"], "organization_id": org_id}
+    if organization_name is not None:
+        meta["organization_name"] = organization_name
+    return {"sub": sub, "role": "authenticated", "app_metadata": meta}
+
+
 @pytest.mark.asyncio
 async def test_repair_backfills_app_metadata_for_owner_membership(
     _supabase_env, _record_admin_calls
@@ -721,6 +729,188 @@ async def test_fetch_membership_normalizes_blank_org_name_to_none():
     conn = _FetchableConn([{"organization_id": "abc", "role": "owner", "name": "   "}])
     result = await tm._fetch_single_user_org_membership(conn, "uid")
     assert result == ("abc", "owner", None)
+
+
+# ============ repair_user_tenant_metadata — Case B ============
+#
+# Case B: JWT carries organization_id but favonius_role is absent.
+# This is the Gustas/HRX pattern: signup provisioned the org claim but
+# Supabase never wrote favonius_role into app_metadata. The self-heal
+# must push just the role (and org_name when also absent), without
+# overwriting organization_id which is already correct.
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_backfills_favonius_role_for_owner(
+    _supabase_env, _record_admin_calls
+):
+    """Happy path: org_id present, favonius_role absent, DB has owner row → push role only."""
+    sub = "d24f55e8-2ee1-4d09-88a6-0811bdb3411b"
+    org_id = "d1288ddc-c696-4a94-b70b-7368f674580b"
+    pool = _FetchablePool([{"role": "owner", "name": "HRX, UAB"}])
+
+    await tm.repair_user_tenant_metadata(_user_with_org_no_role(sub, org_id), pool)
+
+    assert len(_record_admin_calls) == 1
+    call = _record_admin_calls[0]
+    assert call["user_id"] == sub
+    assert call["app_metadata"]["favonius_role"] == "customer_admin"
+    assert "organization_id" not in call["app_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_backfills_customer_operator_for_operator(
+    _supabase_env, _record_admin_calls
+):
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"role": "operator", "name": "Acme"}])
+
+    await tm.repair_user_tenant_metadata(_user_with_org_no_role(sub, org_id), pool)
+
+    assert _record_admin_calls[0]["app_metadata"]["favonius_role"] == "customer_operator"
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_also_backfills_org_name_when_absent(
+    _supabase_env, _record_admin_calls
+):
+    """When organization_name is also missing from the JWT, include it in the payload."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"role": "owner", "name": "HRX, UAB"}])
+
+    await tm.repair_user_tenant_metadata(_user_with_org_no_role(sub, org_id), pool)
+
+    call = _record_admin_calls[0]
+    assert call["app_metadata"]["organization_name"] == "HRX, UAB"
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_skips_org_name_when_already_set_in_jwt(
+    _supabase_env, _record_admin_calls
+):
+    """Do not overwrite an organization_name that's already correct in the JWT."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"role": "owner", "name": "HRX, UAB"}])
+
+    user = _user_with_org_no_role(sub, org_id, organization_name="Already Set")
+    await tm.repair_user_tenant_metadata(user, pool)
+
+    call = _record_admin_calls[0]
+    assert "organization_name" not in call["app_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_noop_when_no_membership_for_org(
+    _supabase_env, _record_admin_calls
+):
+    """No user_organizations row for the (user, org) pair → no admin call."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([])  # empty fetch result
+
+    await tm.repair_user_tenant_metadata(_user_with_org_no_role(sub, org_id), pool)
+
+    assert _record_admin_calls == []
+    assert len(pool.conn.fetch_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_noop_for_admin_role(_supabase_env, _record_admin_calls):
+    """A user_organizations row with role='admin' must not auto-promote via Case B."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"role": "admin", "name": "Staff"}])
+
+    await tm.repair_user_tenant_metadata(_user_with_org_no_role(sub, org_id), pool)
+
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_noop_for_viewer_role(_supabase_env, _record_admin_calls):
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"role": "viewer", "name": "View Only"}])
+
+    await tm.repair_user_tenant_metadata(_user_with_org_no_role(sub, org_id), pool)
+
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_caches_success_within_ttl(_supabase_env, _record_admin_calls):
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"role": "owner", "name": "Y"}])
+    user = _user_with_org_no_role(sub, org_id)
+
+    await tm.repair_user_tenant_metadata(user, pool)
+    await tm.repair_user_tenant_metadata(user, pool)
+
+    assert len(_record_admin_calls) == 1
+    assert len(pool.conn.fetch_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_caches_negative_result(_supabase_env, _record_admin_calls):
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([])
+    user = _user_with_org_no_role(sub, org_id)
+
+    await tm.repair_user_tenant_metadata(user, pool)
+    await tm.repair_user_tenant_metadata(user, pool)
+
+    assert len(pool.conn.fetch_calls) == 1
+    assert _record_admin_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repair_case_b_does_not_fire_when_both_claims_present(
+    _supabase_env, _record_admin_calls
+):
+    """Healthy JWT (org_id + favonius_role both set) must skip both DB and admin call."""
+    pool = _FetchablePool([{"role": "owner", "name": "Y"}])
+    user = _user(
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "customer_admin",
+    )
+    await tm.repair_user_tenant_metadata(user, pool)
+    assert _record_admin_calls == []
+    assert pool.conn.fetch_calls == []
+
+
+# ============ _fetch_role_for_org ============
+
+
+@pytest.mark.asyncio
+async def test_fetch_role_for_org_returns_none_for_no_rows():
+    conn = _FetchableConn([])
+    assert await tm._fetch_role_for_org(conn, "uid", "org") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_role_for_org_returns_none_for_unrepairable_role():
+    conn = _FetchableConn([{"role": "admin", "name": "Staff"}])
+    assert await tm._fetch_role_for_org(conn, "uid", "org") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_role_for_org_returns_tuple_for_owner():
+    conn = _FetchableConn([{"role": "owner", "name": "HRX, UAB"}])
+    result = await tm._fetch_role_for_org(conn, "uid", "org")
+    assert result == ("owner", "HRX, UAB")
+
+
+@pytest.mark.asyncio
+async def test_fetch_role_for_org_normalizes_blank_name_to_none():
+    conn = _FetchableConn([{"role": "operator", "name": "  "}])
+    result = await tm._fetch_role_for_org(conn, "uid", "org")
+    assert result == ("operator", None)
 
 
 # ============ Reverse role-vocab mapping ============
