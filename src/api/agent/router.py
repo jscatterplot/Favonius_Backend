@@ -9,10 +9,10 @@ Three endpoints (architecture doc §6.1), all mounted under ``/agent`` in
                                  on ownership (or favonius_admin).
 
 All three depend on :func:`src.security.auth.verify_token` for JWT auth and
-on a tier-tightened rate-limit dependency :func:`check_optimize_limit_dep`
-that mirrors the existing ``RateLimitMiddleware``'s ``/optimize`` path
-(``check_optimize_limit`` — 10 req/min per user). LLM calls are the cost
-driver, so re-using the optimize tier is the right shape — see PRD §5.2.
+on :func:`verify_token_and_check_agent_limit`, which runs **after** verification
+and applies the same 10 req/min cadence as ``POST /optimize`` via a
+dedicated in-memory bucket (``check_agent_limit``) so agent traffic does
+not share the middleware's ``/optimize`` counter.
 
 Geo-block + tenant-mirror inheritance is automatic: the router is mounted
 on the same FastAPI app, and the global ``GeoBlockMiddleware`` (registered
@@ -27,18 +27,13 @@ import logging
 from typing import Any, AsyncIterator, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.api.agent.controller import AgentReply, LLMClient, RealLLMClient, run_turn
 from src.api.agent.stream import SSE_HEADERS, SSEEventStream
-from src.security.auth import (
-    decode_jwt_for_rate_limit,
-    get_user_id,
-    get_user_role,
-    verify_token,
-)
+from src.security.auth import get_user_id, get_user_role, verify_token
 from src.security.rate_limiter import get_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -81,36 +76,11 @@ def get_llm_client() -> LLMClient:
     return RealLLMClient()
 
 
-async def check_optimize_limit_dep(request: Request) -> None:
-    """FastAPI dependency: enforce the optimize-tier rate limit (10/min/user).
-
-    Mirrors the per-user keying logic in ``RateLimitMiddleware`` so a
-    single user across multiple connections can't bypass the cap. Falls
-    back to the request's source IP when the token is unauthenticated
-    (which would have already failed at ``verify_token`` upstream — this
-    is just defence in depth).
-
-    Defined as ``async def`` (not ``def``) so FastAPI runs this on the main
-    event loop, matching ``RateLimitMiddleware`` and avoiding unsynchronized
-    concurrent access to the process-global :class:`~src.security.rate_limiter.RateLimiter`
-    in-memory buckets from the default thread pool executor.
-    """
-    client_id = request.client.host if request.client else "unknown"
-    auth_header = request.headers.get("authorization", "")
-    if auth_header.startswith("Bearer "):
-        try:
-            payload = decode_jwt_for_rate_limit(auth_header[7:])
-            if payload and payload.get("sub"):
-                client_id = f"user:{payload['sub']}"
-        except Exception:  # pragma: no cover - defensive
-            # Any JWT issue here means the verify_token dep already
-            # rejected the request, but the caller wins on ordering;
-            # fall back to IP-based limiting rather than crashing the
-            # rate-limit check itself.
-            logger.debug("Rate-limit dep: JWT decode failed; falling back to IP")
-
+async def verify_token_and_check_agent_limit(user: dict = Depends(verify_token)) -> dict:
+    """JWT auth then agent rate limit (10/min); returns the verified payload."""
+    client_id = f"user:{get_user_id(user)}"
     limiter = get_rate_limiter()
-    result = limiter.check_optimize_limit(client_id)
+    result = limiter.check_agent_limit(client_id)
     if not result.allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -121,6 +91,7 @@ async def check_optimize_limit_dep(request: Request) -> None:
                 "X-RateLimit-Reset": str(int(result.reset_at)),
             },
         )
+    return user
 
 
 # ── Request / response models ─────────────────────────────────────────────
@@ -161,11 +132,10 @@ router = APIRouter(prefix="/agent", tags=["agent"])
     "/turn",
     response_model=AgentReply,
     summary="Run one chat turn synchronously",
-    dependencies=[Depends(check_optimize_limit_dep)],
 )
 async def post_turn(
     body: AgentTurnRequest,
-    user: dict = Depends(verify_token),
+    user: dict = Depends(verify_token_and_check_agent_limit),
     static_pool: Any = Depends(get_static_pool),
     ts_pool: Any = Depends(get_ts_pool),
     llm_client: LLMClient = Depends(get_llm_client),
@@ -193,11 +163,10 @@ async def post_turn(
 @router.post(
     "/turn/stream",
     summary="Run one chat turn and stream step events via SSE",
-    dependencies=[Depends(check_optimize_limit_dep)],
 )
 async def post_turn_stream(
     body: AgentTurnRequest,
-    user: dict = Depends(verify_token),
+    user: dict = Depends(verify_token_and_check_agent_limit),
     static_pool: Any = Depends(get_static_pool),
     ts_pool: Any = Depends(get_ts_pool),
     llm_client: LLMClient = Depends(get_llm_client),
@@ -260,11 +229,10 @@ async def post_turn_stream(
     "/runs/{run_id}",
     response_model=AgentRunRow,
     summary="Fetch a stored agent run trace",
-    dependencies=[Depends(check_optimize_limit_dep)],
 )
 async def get_run(
     run_id: UUID,
-    user: dict = Depends(verify_token),
+    user: dict = Depends(verify_token_and_check_agent_limit),
     ts_pool: Any = Depends(get_ts_pool),
 ) -> AgentRunRow:
     """Return the stored ``agent_runs`` row for ``run_id``.

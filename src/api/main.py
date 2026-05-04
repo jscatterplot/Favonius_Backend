@@ -812,9 +812,9 @@ app.add_middleware(GeoBlockMiddleware)
 # in sprint B6 after the golden tests pass — see
 # docs/plans/agent_search_architecture_v0.md §11). The router inherits the
 # JWT, geo-block, and rate-limit pipeline above; it adds its own
-# Depends(check_optimize_limit_dep) so /agent/* runs at the optimize tier
-# (10 req/min/user) even though the path doesn't match the middleware's
-# /optimize equality check.
+# Router uses verify_token_and_check_agent_limit (10 req/min/user, agent
+# bucket) so /agent/* is capped like POST /optimize without sharing its
+# middleware bucket.
 from .agent.feature_flag import is_agent_search_enabled
 
 if is_agent_search_enabled():

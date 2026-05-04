@@ -31,13 +31,12 @@ from httpx import ASGITransport, AsyncClient
 
 from src.api.agent.controller import AgentReply, run_turn
 from src.api.agent.router import (
-    check_optimize_limit_dep,
     get_llm_client,
     get_static_pool,
     get_ts_pool,
+    verify_token_and_check_agent_limit,
 )
 from src.api.agent.router import router as agent_router
-from src.security.auth import verify_token
 from tests.integration.agent.conftest import (
     FakeLLMClient,
     make_token_payload,
@@ -68,11 +67,10 @@ async def http_client(seeded_db, fake_llm_client):
     def _verify_token_override():
         return state["token_payload"]
 
-    app.dependency_overrides[verify_token] = _verify_token_override
+    app.dependency_overrides[verify_token_and_check_agent_limit] = _verify_token_override
     app.dependency_overrides[get_static_pool] = lambda: seeded_db["static_pool"]
     app.dependency_overrides[get_ts_pool] = lambda: seeded_db["ts_pool"]
     app.dependency_overrides[get_llm_client] = lambda: fake_llm_client
-    app.dependency_overrides[check_optimize_limit_dep] = lambda: None
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -244,13 +242,12 @@ async def test_post_turn_error_returns_502(seeded_db):
     app.include_router(agent_router)
 
     bad_llm = FakeLLMClient(raise_on_extract=True)
-    app.dependency_overrides[verify_token] = lambda: make_token_payload(
+    app.dependency_overrides[verify_token_and_check_agent_limit] = lambda: make_token_payload(
         seeded_db["user_a"], organization_id=seeded_db["org_a"]
     )
     app.dependency_overrides[get_static_pool] = lambda: seeded_db["static_pool"]
     app.dependency_overrides[get_ts_pool] = lambda: seeded_db["ts_pool"]
     app.dependency_overrides[get_llm_client] = lambda: bad_llm
-    app.dependency_overrides[check_optimize_limit_dep] = lambda: None
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

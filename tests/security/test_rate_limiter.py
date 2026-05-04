@@ -2,7 +2,7 @@
 
 Tests cover:
 - RateLimitResult dataclass and __bool__ backward compatibility
-- In-memory rate limiting (API, optimize, handoff, trigger cooldown)
+- In-memory rate limiting (API, optimize, agent, handoff, trigger cooldown)
 - Sliding window expiry
 - Remaining count and reset time calculations
 - DB sync lifecycle (start/stop)
@@ -15,9 +15,8 @@ Tests cover:
 
 from __future__ import annotations
 
-import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
@@ -29,7 +28,6 @@ from src.security.rate_limiter import (
     get_rate_limiter,
     set_rate_limiter,
 )
-
 
 # ============ Tests: RateLimitResult ============
 
@@ -90,6 +88,7 @@ class TestInMemoryRateLimiting:
         config = RateLimitConfig(
             api_requests_per_minute=5,
             optimize_requests_per_minute=2,
+            agent_requests_per_minute=2,
             handoff_messages_per_hour=3,
             trigger_optimization_cooldown_seconds=10,
         )
@@ -128,6 +127,16 @@ class TestInMemoryRateLimiting:
 
         result = limiter.check_optimize_limit("client_1")
         assert result.allowed is False
+        assert result.limit == 2
+
+    def test_agent_bucket_independent_from_optimize(self, limiter: RateLimiter):
+        """Agent and optimize use separate sliding windows for the same key."""
+        for _ in range(2):
+            limiter.check_optimize_limit("user:abc")
+        assert limiter.check_optimize_limit("user:abc").allowed is False
+
+        result = limiter.check_agent_limit("user:abc")
+        assert result.allowed is True
         assert result.limit == 2
 
     def test_handoff_sorted_key(self, limiter: RateLimiter):
@@ -270,6 +279,7 @@ class TestFlushToDB:
         limiter.check_api_limit("client_a")
         limiter.check_api_limit("client_a")
         limiter.check_optimize_limit("client_b")
+        limiter.check_agent_limit("client_c")
 
         await limiter._flush_to_db()
 
@@ -280,7 +290,7 @@ class TestFlushToDB:
 
         assert "INSERT INTO rate_limit_state" in sql
         assert "GREATEST" in sql
-        assert len(rows) == 2  # api:client_a and optimize:client_b
+        assert len(rows) == 3  # api, optimize, agent
 
     @pytest.mark.asyncio
     async def test_flush_with_no_data(self):
@@ -331,6 +341,7 @@ class TestHydrateFromDB:
             return_value=[
                 {"bucket_type": "api", "bucket_key": "client_x", "request_count": 10},
                 {"bucket_type": "optimize", "bucket_key": "client_y", "request_count": 3},
+                {"bucket_type": "agent", "bucket_key": "client_z", "request_count": 2},
                 {"bucket_type": "handoff", "bucket_key": "depot_a:depot_b", "request_count": 5},
             ]
         )
@@ -345,6 +356,7 @@ class TestHydrateFromDB:
 
         assert len(limiter._api_buckets["client_x"]) == 10
         assert len(limiter._optimize_buckets["client_y"]) == 3
+        assert len(limiter._agent_buckets["client_z"]) == 2
         assert len(limiter._handoff_buckets[("depot_a", "depot_b")]) == 5
 
     @pytest.mark.asyncio
@@ -380,7 +392,12 @@ class TestMergeFromDB:
         mock_conn = AsyncMock()
         mock_conn.fetch = AsyncMock(
             return_value=[
-                {"bucket_type": "api", "bucket_key": "client_a", "window_start": None, "request_count": 20},
+                {
+                    "bucket_type": "api",
+                    "bucket_key": "client_a",
+                    "window_start": None,
+                    "request_count": 20,
+                },
             ]
         )
         mock_cm = AsyncMock()
@@ -406,7 +423,12 @@ class TestMergeFromDB:
         mock_conn = AsyncMock()
         mock_conn.fetch = AsyncMock(
             return_value=[
-                {"bucket_type": "api", "bucket_key": "client_a", "window_start": None, "request_count": 2},
+                {
+                    "bucket_type": "api",
+                    "bucket_key": "client_a",
+                    "window_start": None,
+                    "request_count": 2,
+                },
             ]
         )
         mock_cm = AsyncMock()
@@ -423,6 +445,34 @@ class TestMergeFromDB:
 
         # Local had 5, remote had 2 — keep 5
         assert len(limiter._api_buckets["client_a"]) == 5
+
+    @pytest.mark.asyncio
+    async def test_merge_agent_remote_exceeds_local(self):
+        """Merge pads agent bucket when remote count exceeds local."""
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "bucket_type": "agent",
+                    "bucket_key": "user:u1",
+                    "window_start": None,
+                    "request_count": 4,
+                },
+            ]
+        )
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value = mock_cm
+
+        limiter = RateLimiter(db_pool=mock_pool)
+        limiter.check_agent_limit("user:u1")
+        assert len(limiter._agent_buckets["user:u1"]) == 1
+
+        await limiter._merge_from_db()
+
+        assert len(limiter._agent_buckets["user:u1"]) == 4
 
 
 # ============ Tests: Synthetic Timestamps ============
