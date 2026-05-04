@@ -815,7 +815,9 @@ app.add_middleware(GeoBlockMiddleware)
 # Depends(check_optimize_limit_dep) so /agent/* runs at the optimize tier
 # (10 req/min/user) even though the path doesn't match the middleware's
 # /optimize equality check.
-if os.environ.get("AGENT_SEARCH_ENABLED", "false").lower() == "true":
+from .agent.feature_flag import is_agent_search_enabled
+
+if is_agent_search_enabled():
     from .agent.router import router as agent_router  # noqa: PLC0415
 
     app.include_router(agent_router)
