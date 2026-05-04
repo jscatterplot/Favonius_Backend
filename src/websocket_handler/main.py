@@ -90,6 +90,15 @@ class Application:
             # by main() before Application is created).
             setup_monitoring(self.config.monitoring)
 
+            # Eagerly initialise geo-blocking so the GeoIP runtime download
+            # and DB load happen before chargers connect. Without this, the
+            # singleton lazy-inits on the first connection and a missing /
+            # failed download silently fail-closes every subsequent request
+            # with "GeoIP unavailable, fail-closed: blocking IP <X>" — which
+            # is invisible at startup and looks identical to a hostile-country
+            # block in the logs.
+            await asyncio.to_thread(self._initialize_geo_blocking)
+
             # Initialize resilience manager
             await self._initialize_resilience()
 
@@ -271,6 +280,26 @@ class Application:
                 await self._cleanup_component(component_name)
                 await asyncio.sleep(delay_seconds)
                 delay_seconds = min(delay_seconds * 2, 30)
+
+    def _initialize_geo_blocking(self) -> None:
+        """Force GeoIP DB download and reader load before serving traffic.
+
+        Runs synchronously inside ``asyncio.to_thread`` because the runtime
+        download blocks for up to retries × backoff seconds. Failures are
+        reported through the geo_block module's logger; this method itself
+        does not raise — the singleton handles fail-closed correctly even
+        when the DB never loads, and the CRITICAL log line emitted by
+        ``initialize_geo_blocking`` is the operator-visible signal.
+        """
+        try:
+            from src.security.geo_block import initialize_geo_blocking
+        except ImportError:
+            self.logger.warning(
+                "Geo-blocking module not importable — Article 73-3 controls "
+                "inactive on this service"
+            )
+            return
+        initialize_geo_blocking()
 
     async def _initialize_resilience(self) -> None:
         """Initialize resilience manager and error handling."""

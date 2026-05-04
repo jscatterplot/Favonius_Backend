@@ -34,6 +34,13 @@ from .security_manager import SecurityConfig, SecurityManager
 from .supabase_client import SupabaseClient
 from .timescale_client import TimescaleClient
 
+# RFC 6598 carrier-grade NAT (CGNAT) shared address space. Not classified as
+# is_private by Python's ipaddress module, but Railway / Render / Fly.io route
+# their edge proxy → container traffic through this range, so we must treat it
+# as a trusted-proxy network when honouring forwarded headers. Mirrors the
+# constant in src/security/geo_block.py.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
 # Geo-blocking (Article 73-3 compliance)
 try:
     from src.security.geo_block import check_ip_blocked
@@ -361,16 +368,31 @@ class OCPPWebSocketServer:
         return "unknown"
 
     def _is_trusted_proxy_ip(self, ip_str: str) -> bool:
-        """Return True when forwarded headers from this peer may be trusted."""
+        """Return True when forwarded headers from this peer may be trusted.
+
+        Implicitly trusts private (RFC 1918 / RFC 4193 ULA), loopback,
+        link-local, and CGNAT (RFC 6598 ``100.64.0.0/10``) peers when
+        ``OCPP_TRUST_PRIVATE_PROXY_HEADERS=true`` (default). Railway / Render
+        / Fly.io and similar PaaS providers reach the container over the
+        CGNAT shared address space; without trusting it we'd geo-block on
+        the proxy IP itself rather than the real client. Public-internet
+        IPs are never implicitly trusted — operators must opt in via
+        ``OCPP_TRUSTED_PROXY_RANGES``. Mirrors the FastAPI middleware's
+        ``_is_implicitly_trusted_proxy`` in ``src/security/geo_block.py``.
+        """
         try:
             ip_addr = ipaddress.ip_address(ip_str)
         except ValueError:
             return False
 
-        if self._trust_private_proxy_headers and (
-            ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local
-        ):
-            return True
+        if self._trust_private_proxy_headers:
+            if ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local:
+                return True
+            if (
+                isinstance(ip_addr, ipaddress.IPv4Address)
+                and ip_addr in _CGNAT_NETWORK
+            ):
+                return True
 
         return any(ip_addr in network for network in self._trusted_proxy_networks)
 
@@ -562,9 +584,27 @@ class OCPPWebSocketServer:
             self._connection_client_ips.pop(connection_id, None)
             return
 
-        # Extract station ID from path
+        # Extract station ID from path.
+        #
+        # Most chargers send the OCPP-spec single-segment path
+        # ``/ocpp/{charge_point_id}``, but some integrations (e.g. the HRX
+        # Vilnius pilot's ABB Terra AC wallboxes) embed the depot routing
+        # in the path: ``/ocpp/{depot_id}/{charger_serial}``. The OCPP 1.6
+        # spec treats charge_point_id as opaque, so we accept any number of
+        # segments after ``/ocpp/`` and use the LAST segment as the station
+        # id (the actual charger identity). The intermediate segments are
+        # treated as depot routing context and discarded — the canonical
+        # station id is still resolved through the alias table downstream.
         if protocol == "ocpp" and len(path_parts) > 1:
-            station_id = path_parts[1]
+            station_id = path_parts[-1]
+            if len(path_parts) > 2:
+                self.logger.info(
+                    "OCPP multi-segment path %s parsed as station_id=%s "
+                    "(intermediate routing segments: %s)",
+                    path,
+                    station_id,
+                    path_parts[1:-1],
+                )
         elif path.strip("/"):
             station_id = path.strip("/")
         else:

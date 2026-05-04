@@ -1191,3 +1191,89 @@ class TestCheckerWiresRuntimeDownload:
         with patch("src.security.geo_block._download_geoip_db") as mock_dl:
             GeoBlockChecker(config)
             mock_dl.assert_not_called()
+
+
+class TestEagerInitialization:
+    """Cover ``initialize_geo_blocking()`` — the new startup hook.
+
+    Without this hook, the singleton is constructed lazily on the first
+    geo-block check and a missing DB or missing MaxMind credentials
+    produce a "GeoIP unavailable, fail-closed" log per request with no
+    earlier startup signal. The new hook surfaces the misconfig as a
+    single CRITICAL log line at boot.
+    """
+
+    def setup_method(self) -> None:
+        # Reset singleton so each test gets a fresh checker.
+        import src.security.geo_block as gb
+
+        gb._checker = None
+
+    def test_logs_critical_when_db_missing_and_creds_unset(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from src.security.geo_block import initialize_geo_blocking
+
+        monkeypatch.setenv("GEO_BLOCK_ENABLED", "true")
+        monkeypatch.setenv("GEO_BLOCK_FAIL_CLOSED", "true")
+        monkeypatch.setenv("GEOIP_DB_PATH", str(tmp_path / "missing.mmdb"))
+        monkeypatch.delenv("MAXMIND_ACCOUNT_ID", raising=False)
+        monkeypatch.delenv("MAXMIND_LICENSE_KEY", raising=False)
+
+        with caplog.at_level(logging.CRITICAL, logger="src.security.geo_block"):
+            checker = initialize_geo_blocking()
+
+        assert checker._reader is None
+        critical_messages = [
+            rec.message for rec in caplog.records if rec.levelname == "CRITICAL"
+        ]
+        assert any(
+            "Geo-blocking enabled and fail-closed" in msg
+            and "GeoIP database is NOT" in msg
+            for msg in critical_messages
+        ), f"Expected CRITICAL fail-closed warning, got: {critical_messages}"
+
+    def test_silent_when_disabled(self, monkeypatch, caplog):
+        import logging
+
+        from src.security.geo_block import initialize_geo_blocking
+
+        monkeypatch.setenv("GEO_BLOCK_ENABLED", "false")
+
+        with caplog.at_level(logging.CRITICAL, logger="src.security.geo_block"):
+            checker = initialize_geo_blocking()
+
+        assert checker.config.enabled is False
+        assert not any(rec.levelname == "CRITICAL" for rec in caplog.records)
+
+    def test_no_critical_when_db_loaded(self, tmp_path, monkeypatch, caplog):
+        """When the reader is loaded, the CRITICAL line MUST NOT fire."""
+        import logging
+
+        from src.security.geo_block import initialize_geo_blocking
+
+        monkeypatch.setenv("GEO_BLOCK_ENABLED", "true")
+        monkeypatch.setenv("GEO_BLOCK_FAIL_CLOSED", "true")
+        monkeypatch.setenv("GEOIP_DB_PATH", str(tmp_path / "stub.mmdb"))
+
+        # Patch geoip2.database.Reader so the checker constructor reports
+        # a loaded reader without needing a real .mmdb on disk.
+        (tmp_path / "stub.mmdb").write_bytes(b"")
+        with patch(
+            "src.security.geo_block.geoip2.database.Reader"
+        ) as mock_reader_cls:
+            mock_reader_cls.return_value = MagicMock()
+            with caplog.at_level(
+                logging.CRITICAL, logger="src.security.geo_block"
+            ):
+                checker = initialize_geo_blocking()
+
+        assert checker._reader is not None
+        assert not any(
+            rec.levelname == "CRITICAL"
+            and "fail-closed" in rec.message
+            and "NOT loaded" in rec.message
+            for rec in caplog.records
+        )

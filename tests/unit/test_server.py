@@ -351,6 +351,85 @@ class TestOCPPWebSocketServer:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_ocpp_multi_segment_path_uses_last_segment(self, server):
+        """``/ocpp/{depot}/{charger}`` paths resolve to the charger serial.
+
+        Some integrations (HRX Vilnius pilot) embed depot routing in the
+        WebSocket URL. The server must extract the trailing charger serial
+        as the station id, NOT the intermediate depot id, so alias
+        resolution and Basic Auth lookup target the actual charger row.
+        """
+        server.supabase_client.resolve_station_id = AsyncMock(
+            side_effect=lambda station_id: station_id
+        )
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(
+            websocket, "/ocpp/hrx-uab_hrx-vilnius-001/TACW1141622G1433"
+        )
+
+        # Alias lookup MUST target the charger serial, not the depot id.
+        server.supabase_client.resolve_station_id.assert_awaited_once_with(
+            "TACW1141622G1433"
+        )
+        # Auth MUST receive the charger serial too.
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "TACW1141622G1433",
+            {},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_single_segment_path_unchanged(self, server):
+        """Plain ``/ocpp/{station}`` paths still extract the lone segment."""
+        server.supabase_client.resolve_station_id = AsyncMock(
+            side_effect=lambda station_id: station_id
+        )
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+
+        server.supabase_client.resolve_station_id.assert_awaited_once_with(
+            "TACW1141622G1433"
+        )
+
+    def test_cgnat_peer_is_trusted_proxy(self, server):
+        """RFC 6598 100.64.0.0/10 peers are trusted when private-proxy headers are on.
+
+        Railway / Render / Fly.io route their edge proxy → container traffic
+        through CGNAT. Without trusting it, geo-blocking would resolve the
+        proxy's CGNAT IP rather than the real client.
+        """
+        server._trust_private_proxy_headers = True
+        assert server._is_trusted_proxy_ip("100.64.0.1") is True
+        assert server._is_trusted_proxy_ip("100.127.255.254") is True
+        # RFC 1918 / loopback / link-local still trusted
+        assert server._is_trusted_proxy_ip("10.0.0.1") is True
+        assert server._is_trusted_proxy_ip("127.0.0.1") is True
+        assert server._is_trusted_proxy_ip("169.254.0.1") is True
+        # IPv6 ULA still trusted (Railway sometimes uses fd00::/8)
+        assert server._is_trusted_proxy_ip("fd12:43ee:785e:1::1") is True
+        # Public IP NOT trusted
+        assert server._is_trusted_proxy_ip("85.254.97.158") is False
+
+    def test_cgnat_peer_not_trusted_when_disabled(self, server):
+        """Disabling OCPP_TRUST_PRIVATE_PROXY_HEADERS revokes implicit trust."""
+        server._trust_private_proxy_headers = False
+        assert server._is_trusted_proxy_ip("100.64.0.1") is False
+        assert server._is_trusted_proxy_ip("10.0.0.1") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_message_processing(self, server):
         """Test message processing functionality."""
         mock_websocket = Mock()

@@ -65,6 +65,17 @@ class AlertDispatcher:
     async def start(self) -> None:
         """Start the background loop and the LISTEN connection."""
         self._check_single_worker()
+        if not await self._preflight_schema():
+            # Migration 022 hasn't run on this database. Without notification_alerts
+            # the dispatcher would log a 'relation does not exist' UndefinedTableError
+            # every poll interval forever. Skip startup loudly so the operator knows
+            # to run scripts/run_migrations.py — but don't crash the whole WS handler.
+            logger.error(
+                "alerts: dispatcher disabled — required schema is missing. "
+                "Run `python scripts/run_migrations.py` so migration 022 "
+                "(alerts pipeline) is applied, then restart this service."
+            )
+            return
         try:
             await self._start_listener()
         except Exception as exc:
@@ -79,6 +90,27 @@ class AlertDispatcher:
             self._resend_interval_s,
             self._batch_size,
         )
+
+    async def _preflight_schema(self) -> bool:
+        """Return True iff the alerts pipeline tables exist.
+
+        Probes ``notification_alerts`` via ``to_regclass`` so a missing
+        migration produces a clean boolean rather than a per-tick crash.
+        Treats an unexpected pool error as 'present' so a transient DB
+        glitch at startup doesn't permanently disable the dispatcher.
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                exists = await conn.fetchval(
+                    "SELECT to_regclass('public.notification_alerts') IS NOT NULL"
+                )
+        except Exception:
+            logger.exception(
+                "alerts: schema preflight failed; assuming schema present "
+                "and starting dispatcher anyway"
+            )
+            return True
+        return bool(exists)
 
     async def stop(self) -> None:
         self._stop_event.set()
