@@ -37,6 +37,15 @@ class RateLimitConfig:
     # General API endpoints
     api_requests_per_minute: int = 100
 
+    # Admin write endpoints used by the bulk-import flows on the fleet
+    # identity panel (POST/PATCH /admin/depots/{id}/{vehicles|drivers|rfid-cards}).
+    # Sized for sequential xlsx imports — a 200-row file completes in ~10s at
+    # the FE's serial cadence and a 5,000-row file in ~5 minutes — without
+    # weakening the general 100/min limit on read-heavy admin paths. Reusable
+    # for future bulk-import endpoints (drivers, chargers); extend the path
+    # match in RateLimitMiddleware accordingly.
+    admin_write_requests_per_minute: int = 1200
+
     # POST /optimize endpoint (more expensive)
     optimize_requests_per_minute: int = 10
 
@@ -105,6 +114,7 @@ class RateLimiter:
 
         # In-memory sliding window buckets (timestamp lists)
         self._api_buckets: dict[str, list[float]] = defaultdict(list)
+        self._admin_write_buckets: dict[str, list[float]] = defaultdict(list)
         self._optimize_buckets: dict[str, list[float]] = defaultdict(list)
         self._agent_buckets: dict[str, list[float]] = defaultdict(list)
         self._handoff_buckets: dict[tuple, list[float]] = defaultdict(list)
@@ -143,6 +153,7 @@ class RateLimiter:
     def reset_in_memory_buckets_for_tests(self) -> None:
         """Clear sliding-window state (unit tests only; avoids cross-test 429s)."""
         self._api_buckets.clear()
+        self._admin_write_buckets.clear()
         self._optimize_buckets.clear()
         self._agent_buckets.clear()
         self._handoff_buckets.clear()
@@ -186,6 +197,26 @@ class RateLimiter:
 
         if len(bucket) >= limit:
             logger.warning("Rate limit exceeded for client %s", client_id)
+            return self._make_result(False, bucket, limit, 60)
+
+        bucket.append(time.time())
+        return self._make_result(True, bucket, limit, 60)
+
+    def check_admin_write_limit(self, client_id: str) -> RateLimitResult:
+        """Check if client is within the admin-write rate limit.
+
+        Used by the bulk-import flows that issue sequential POST/PATCH calls
+        against the fleet identity endpoints (vehicles, drivers, RFID cards).
+        This bucket is separate from the general API limit so a 200-row xlsx
+        import does not trip the 100/min ceiling shared with read-heavy admin
+        traffic.
+        """
+        limit = self.config.admin_write_requests_per_minute
+        bucket = self._clean_bucket(self._admin_write_buckets[client_id], 60)
+        self._admin_write_buckets[client_id] = bucket
+
+        if len(bucket) >= limit:
+            logger.warning("Admin write rate limit exceeded for client %s", client_id)
             return self._make_result(False, bucket, limit, 60)
 
         bucket.append(time.time())

@@ -561,6 +561,16 @@ def _verify_handoff_payload(
 # ============ Rate Limiting Middleware ============
 
 
+# Admin write paths used by the bulk-import flows on the fleet identity panel.
+# Match POST/PATCH/PUT requests against /admin/depots/{depot_id}/{vehicles|
+# drivers|rfid-cards}[/...]. Reusable for future bulk-import endpoints — add
+# the new resource segment to the alternation when chargers or schedules ship
+# their own xlsx import.
+_ADMIN_BULK_WRITE_PATH_RE = re.compile(
+    r"^/admin/depots/[^/]+/(?:vehicles|drivers|rfid-cards)(?:/|$)"
+)
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Middleware to enforce rate limits per PRD Section 10.4."""
 
@@ -624,6 +634,29 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # Handoff rate limiting handled in endpoint handlers
             # (requires reading request body which is not available in middleware)
             pass
+
+        # Admin bulk-import writes: dedicated bucket so a sequential xlsx
+        # import (one POST per row) does not trip the 100/min general limit.
+        # Replaces — does not stack on top of — the general bucket.
+        elif (
+            request.method in {"POST", "PATCH", "PUT"}
+            and _ADMIN_BULK_WRITE_PATH_RE.match(path)
+        ):
+            result = limiter.check_admin_write_limit(client_id)
+            if not result:
+                resp = JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        detail=(
+                            f"Rate limit exceeded: Maximum {result.limit} "
+                            "identity-write requests per minute"
+                        ),
+                        error_code="RATE_LIMIT_EXCEEDED",
+                        timestamp=datetime.utcnow().isoformat(),
+                    ).model_dump(),
+                )
+                self._add_rate_limit_headers(resp, result)
+                return resp
 
         # General API endpoints: 100 requests/minute
         else:
