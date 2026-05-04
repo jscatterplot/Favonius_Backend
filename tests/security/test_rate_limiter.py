@@ -317,6 +317,7 @@ class TestFlushToDB:
         limiter = RateLimiter(db_pool=mock_pool)
         limiter.check_api_limit("client_a")
         limiter.check_api_limit("client_a")
+        limiter.check_admin_write_limit("client_a")
         limiter.check_optimize_limit("client_b")
         limiter.check_agent_limit("client_c")
 
@@ -329,7 +330,7 @@ class TestFlushToDB:
 
         assert "INSERT INTO rate_limit_state" in sql
         assert "GREATEST" in sql
-        assert len(rows) == 3  # api, optimize, agent
+        assert len(rows) == 4  # api, admin_write, optimize, agent
 
     @pytest.mark.asyncio
     async def test_flush_with_no_data(self):

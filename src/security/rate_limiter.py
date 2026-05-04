@@ -346,6 +346,15 @@ class RateLimiter:
                 )
                 rows.append(("api", client_id, window_start, len(clean)))
 
+        # Aggregate admin-write buckets (same 60s window shape as api)
+        for client_id, timestamps in list(self._admin_write_buckets.items()):
+            clean = [t for t in timestamps if t > now - 60]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
+                )
+                rows.append(("admin_write", client_id, window_start, len(clean)))
+
         # Aggregate optimize buckets
         for client_id, timestamps in list(self._optimize_buckets.items()):
             clean = [t for t in timestamps if t > now - 60]
@@ -427,6 +436,12 @@ class RateLimiter:
                     self._api_buckets[bucket_key] = self._generate_synthetic_timestamps(
                         remote_count, 60, now
                     )
+            elif bucket_type == "admin_write":
+                local = self._clean_bucket(self._admin_write_buckets.get(bucket_key, []), 60)
+                if remote_count > len(local):
+                    self._admin_write_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                        remote_count, 60, now
+                    )
             elif bucket_type == "optimize":
                 local = self._clean_bucket(self._optimize_buckets.get(bucket_key, []), 60)
                 if remote_count > len(local):
@@ -487,6 +502,11 @@ class RateLimiter:
 
             if bucket_type == "api":
                 self._api_buckets[bucket_key] = self._generate_synthetic_timestamps(count, 60, now)
+                hydrated += 1
+            elif bucket_type == "admin_write":
+                self._admin_write_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                    count, 60, now
+                )
                 hydrated += 1
             elif bucket_type == "optimize":
                 self._optimize_buckets[bucket_key] = self._generate_synthetic_timestamps(
