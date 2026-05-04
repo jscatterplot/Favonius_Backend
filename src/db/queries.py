@@ -839,12 +839,17 @@ async def create_vehicle_identity(
     vehicle_status: str,
 ) -> Optional[dict]:
     """Create a vehicle under an organization-owned depot."""
+    # organization_id is sourced from the parent site row so the new vehicle
+    # row is visible to Supabase RLS policies that gate on organization_id
+    # (e.g. "Admins can manage vehicles"). Without it the row is invisible
+    # to RLS-bound roles and to org-scoped reads via PostgREST.
     query = """
         INSERT INTO vehicles (
-            site_id, external_id, vehicle_type, battery_capacity_kwh, max_charge_rate_kw,
+            site_id, organization_id, external_id, vehicle_type,
+            battery_capacity_kwh, max_charge_rate_kw,
             display_name, id_tag, vin, license_plate, status
         )
-        SELECT d.id, $3, $4, $5, $6, $7, $8, $9, $10, $11
+        SELECT d.id, d.organization_id, $3, $4, $5, $6, $7, $8, $9, $10, $11
         FROM sites d
         WHERE d.id = $1::uuid
           AND d.organization_id = $2::uuid
