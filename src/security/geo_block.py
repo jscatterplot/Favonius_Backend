@@ -454,6 +454,68 @@ def get_geo_block_checker() -> GeoBlockChecker:
     return _checker
 
 
+def initialize_geo_blocking() -> GeoBlockChecker:
+    """Eagerly construct the GeoBlockChecker and report its readiness.
+
+    Call this once during service startup (Main API and WebSocket Handler)
+    so the GeoIP runtime download and database load happen before the first
+    request arrives. Without this, the singleton constructs on the first
+    geo-block check and any download failure produces a "fail-closed"
+    silent-block that's only visible per-request.
+
+    Logs a single CRITICAL line when geo-blocking is enabled but the
+    database is not loaded — that combination causes every non-allowlisted,
+    non-private request to fail-closed and block, which is the most
+    common cause of "chargers can't connect" from a fresh deploy.
+    """
+    checker = get_geo_block_checker()
+    cfg = checker.config
+
+    if not cfg.enabled:
+        logger.info("Geo-blocking disabled (GEO_BLOCK_ENABLED=false)")
+        return checker
+
+    db_present = os.path.exists(cfg.geoip_db_path)
+    db_size = os.path.getsize(cfg.geoip_db_path) if db_present else 0
+    creds_present = bool(
+        os.getenv("MAXMIND_LICENSE_KEY", "").strip()
+        and os.getenv("MAXMIND_ACCOUNT_ID", "").strip()
+    )
+    reader_loaded = checker._reader is not None  # noqa: SLF001 — startup probe
+
+    logger.info(
+        "Geo-blocking startup: enabled=%s, fail_closed=%s, blocked=%s, "
+        "allowlist_count=%d, db_path=%s, db_present=%s, db_size=%d, "
+        "geoip2_installed=%s, maxmind_creds_present=%s, reader_loaded=%s",
+        cfg.enabled,
+        cfg.fail_closed,
+        cfg.blocked_countries,
+        len(cfg.allowed_ips),
+        cfg.geoip_db_path,
+        db_present,
+        db_size,
+        GEOIP2_AVAILABLE,
+        creds_present,
+        reader_loaded,
+    )
+
+    if cfg.fail_closed and not reader_loaded:
+        logger.critical(
+            "Geo-blocking enabled and fail-closed, but GeoIP database is NOT "
+            "loaded. Every request from a non-allowlisted public IP will be "
+            "rejected with 'GeoIP unavailable, fail-closed'. Likely causes: "
+            "(1) MAXMIND_ACCOUNT_ID and/or MAXMIND_LICENSE_KEY not set on "
+            "this service (creds_present=%s); (2) MaxMind download failed "
+            "(check earlier 'GeoIP download attempt' warnings); (3) the "
+            "image was built without the GeoLite2 DB and runtime download "
+            "did not run yet. Set both MAXMIND_* env vars on the service, "
+            "or add the IP / depot uplink to GEO_BLOCK_ALLOWLIST as a "
+            "temporary unblock.",
+            creds_present,
+        )
+    return checker
+
+
 def check_ip_blocked(ip_str: str) -> GeoBlockResult:
     """Convenience function to check if an IP is blocked.
 

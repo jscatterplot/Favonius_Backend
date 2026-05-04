@@ -299,6 +299,17 @@ async def lifespan(app: FastAPI):
     ts_pool = await _create_pool(ts_url, ts_url_source)
     db_pools = DatabasePools(static=static_pool, ts=ts_pool)
 
+    # ── Geo-blocking (Article 73-3) — eager init so the GeoIP runtime
+    # download and reader-load happen before requests arrive. The lazy
+    # singleton in geo_block.py would otherwise construct on first request
+    # and silently fail-closed if MaxMind credentials are missing.
+    try:
+        from ..security.geo_block import initialize_geo_blocking
+
+        await asyncio.to_thread(initialize_geo_blocking)
+    except Exception as exc:  # pragma: no cover — defensive: never block startup
+        logger.warning("Geo-blocking eager init failed: %s", exc)
+
     # ── Audit logger (Article 73-3 / NIS2 compliance) ────────────────────────
     audit_logger = AuditLogger(db_pool=ts_pool, service="main_api")
     set_audit_logger(audit_logger)
