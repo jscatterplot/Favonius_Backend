@@ -50,6 +50,9 @@ class ErrorCode(str, Enum):
     BAD_REQUEST = "BAD_REQUEST"
     CONFLICT = "CONFLICT"
     UNPROCESSABLE_ENTITY = "UNPROCESSABLE_ENTITY"
+    DUPLICATE_ID_TAG = "DUPLICATE_ID_TAG"
+    DUPLICATE_VIN = "DUPLICATE_VIN"
+    DUPLICATE_EXTERNAL_ID = "DUPLICATE_EXTERNAL_ID"
 
 
 ERROR_MESSAGES: dict[ErrorCode, str] = {
@@ -70,6 +73,9 @@ ERROR_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.BAD_REQUEST: "Bad request",
     ErrorCode.CONFLICT: "Resource conflict",
     ErrorCode.UNPROCESSABLE_ENTITY: "Unprocessable entity",
+    ErrorCode.DUPLICATE_ID_TAG: "idTag is already registered",
+    ErrorCode.DUPLICATE_VIN: "VIN is already registered",
+    ErrorCode.DUPLICATE_EXTERNAL_ID: "External identifier is already registered",
 }
 
 
@@ -91,6 +97,9 @@ _HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.BAD_REQUEST: status.HTTP_400_BAD_REQUEST,
     ErrorCode.CONFLICT: status.HTTP_409_CONFLICT,
     ErrorCode.UNPROCESSABLE_ENTITY: 422,
+    ErrorCode.DUPLICATE_ID_TAG: status.HTTP_409_CONFLICT,
+    ErrorCode.DUPLICATE_VIN: status.HTTP_409_CONFLICT,
+    ErrorCode.DUPLICATE_EXTERNAL_ID: status.HTTP_409_CONFLICT,
 }
 
 

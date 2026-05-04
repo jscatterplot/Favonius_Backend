@@ -133,7 +133,54 @@ class TestFleetIdentityApi:
             response = client.post(f"/admin/depots/{depot_id}/vehicles", headers=AUTH_HDR, json=payload)
 
         assert response.status_code == http_status.HTTP_409_CONFLICT
-        assert "idTag" in response.json()["detail"]
+        body = response.json()
+        # Top-level error_code is the stable discriminator the FE keys off.
+        assert body["error_code"] == "DUPLICATE_ID_TAG"
+        assert "idTag" in body["detail"]["detail"]
+
+    def test_create_rfid_card_duplicate_id_tag_returns_duplicate_id_tag_error_code(
+        self, client, mock_db_pool
+    ):
+        """Bulk RFID import (favonius_frontend PR #62) keys off this error_code.
+
+        The dialog issues sequential POSTs and renders per-row failures grouped
+        by error_code, so duplicates must be distinguishable from a generic
+        409 CONFLICT (e.g. depot-not-owned conflicts).
+        """
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, conn = mock_db_pool
+        conn.transaction = MagicMock()
+        conn.transaction.return_value.__aenter__.return_value = None
+        conn.transaction.return_value.__aexit__.return_value = None
+        payload = {
+            "id_tag": "041348A2861395",
+            "label": "EE1744",
+            "status": "active",
+            "assigned_vehicle_ids": [],
+            "assigned_driver_ids": [],
+        }
+        err = asyncpg.UniqueViolationError("duplicate")
+        err.constraint_name = "rfid_cards_id_tag_unique_idx"
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ), patch(
+            "src.api.main.db_queries.create_rfid_card",
+            new_callable=AsyncMock,
+            side_effect=err,
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/rfid-cards",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_409_CONFLICT
+        body = response.json()
+        assert body["error_code"] == "DUPLICATE_ID_TAG"
+        assert "idTag" in body["detail"]["detail"]
 
     def test_create_rfid_card_with_many_assignments(self, client, mock_db_pool):
         depot_id = str(uuid4())
@@ -213,6 +260,8 @@ class TestFleetIdentityApi:
             )
 
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        # ValueError surfaces a string detail (not a dict), per the global
+        # ValueError handler in src/api/main.py.
         assert "assigned_vehicle_ids" in response.json()["detail"]
 
 
@@ -332,7 +381,9 @@ class TestVehicleWriteSideEffects:
             )
 
         assert response.status_code == http_status.HTTP_409_CONFLICT
-        assert "VIN" in response.json()["detail"]
+        body = response.json()
+        assert body["error_code"] == "DUPLICATE_VIN"
+        assert "VIN" in body["detail"]["detail"]
 
 
 class TestFleetIdentityQueries:

@@ -2546,21 +2546,35 @@ def _require_customer_admin_with_org(user: dict) -> str:
 
 
 def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTPException:
-    """Map identity uniqueness conflicts to frontend-stable 409 responses."""
+    """Map identity uniqueness conflicts to frontend-stable 409 responses.
+
+    The FE bulk-import flow keys off ``error_code`` to group per-row failures,
+    so each kind of conflict gets its own stable code (``DUPLICATE_ID_TAG`` for
+    a clashing RFID/vehicle id_tag, ``DUPLICATE_VIN`` for a clashing VIN, and
+    ``DUPLICATE_EXTERNAL_ID`` for a clashing external identifier).
+    """
     constraint = getattr(exc, "constraint_name", "") or ""
     if "id_tag" in constraint:
+        error_code = ErrorCode.DUPLICATE_ID_TAG.value
         detail = "idTag is already registered"
     elif "vehicles_vin" in constraint:
         # vehicles_vin_key is a global UNIQUE on vin, so this conflict can
         # surface across organizations and not just within the depot.
+        error_code = ErrorCode.DUPLICATE_VIN.value
         detail = "VIN is already registered"
     elif "vehicles_external_id" in constraint:
+        error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered"
     elif "external" in constraint:
+        error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered for this depot"
     else:
+        error_code = ErrorCode.CONFLICT.value
         detail = "Identity record already exists"
-    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"error_code": error_code, "detail": detail},
+    )
 
 
 async def _audit_identity_write(user: dict, depot_id: str, action: str, resource_id: str) -> None:
