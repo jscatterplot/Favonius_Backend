@@ -101,8 +101,14 @@ class SecurityConfig:
 class SecurityManager:
     """Manages OCPP Security Profile 3 features."""
 
-    def __init__(self, timescale_client: TimescaleClient, config: SecurityConfig):
+    def __init__(
+        self,
+        timescale_client: TimescaleClient,
+        config: SecurityConfig,
+        static_auth_client: Optional[Any] = None,
+    ):
         self.timescale_client = timescale_client
+        self.static_auth_client = static_auth_client or timescale_client
         self.config = config
         self.logger = get_logger(__name__)
 
@@ -151,19 +157,34 @@ class SecurityManager:
                         {"reason": "missing_basic_auth"},
                     )
                     return False, "Basic Auth credentials required"
-                if username != station_id:
+                if not await self._is_basic_auth_username_allowed(station_id, username):
                     await self._record_failed_attempt(station_id)
                     await self._log_security_event(
                         station_id,
                         SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
-                        f"Basic Auth username must match station id for station {station_id}",
+                        (
+                            "Basic Auth username must match station id or an active alias "
+                            f"for station {station_id}"
+                        ),
                         {"reason": "basic_auth_username_mismatch"},
                     )
-                    return False, "Basic Auth username must match station id"
+                    return False, "Basic Auth username must match station id or active alias"
 
             # Production chargers provisioned through onboarding must use Basic Auth.
+            async def _authenticate_required_basic_auth(
+                station: str,
+                method_auth_data: Dict[str, Any],
+                cert: Optional[x509.Certificate],
+            ) -> bool:
+                return await self._authenticate_basic_auth(
+                    station,
+                    method_auth_data,
+                    cert,
+                    username_prevalidated=True,
+                )
+
             auth_methods = (
-                [(AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth)]
+                [(AuthenticationMethod.BASIC_AUTH, _authenticate_required_basic_auth)]
                 if basic_auth_required
                 else [
                     (AuthenticationMethod.CLIENT_CERTIFICATE, self._authenticate_client_certificate),
@@ -471,7 +492,12 @@ class SecurityManager:
         return await self._validate_api_key(station_id, api_key)
 
     async def _authenticate_basic_auth(
-        self, station_id: str, auth_data: Dict[str, Any], client_cert: Optional[x509.Certificate]
+        self,
+        station_id: str,
+        auth_data: Dict[str, Any],
+        client_cert: Optional[x509.Certificate],
+        *,
+        username_prevalidated: bool = False,
     ) -> bool:
         """Authenticate using basic authentication."""
         username = auth_data.get("username")
@@ -480,12 +506,33 @@ class SecurityManager:
         if not username or not password:
             return False
 
+        if not username_prevalidated and not await self._is_basic_auth_username_allowed(
+            station_id, username
+        ):
+            return False
+
         # Validate credentials against database
         return await self._validate_basic_auth(station_id, username, password)
 
+    async def _is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
+        """Return True when username is canonical or an explicitly configured alias."""
+        checker = getattr(self.static_auth_client, "is_basic_auth_username_allowed", None)
+        if checker is None:
+            return username == station_id
+        try:
+            return bool(await checker(station_id, username))
+        except Exception as exc:
+            self.logger.warning(
+                "Could not check Basic Auth username alias for station %s username %s: %s",
+                station_id,
+                username,
+                exc,
+            )
+            return username == station_id
+
     async def _station_requires_basic_auth(self, station_id: str) -> bool:
         """Return True when a provisioned production charger requires Basic Auth."""
-        checker = getattr(self.timescale_client, "station_requires_basic_auth", None)
+        checker = getattr(self.static_auth_client, "station_requires_basic_auth", None)
         if checker is None:
             self.logger.warning(
                 "Basic Auth requirement checker unavailable; allowing standard auth fallback for "
@@ -749,4 +796,4 @@ class SecurityManager:
 
     async def _validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
         """Validate basic authentication credentials."""
-        return await self.timescale_client.validate_basic_auth(station_id, username, password)
+        return await self.static_auth_client.validate_basic_auth(station_id, username, password)
