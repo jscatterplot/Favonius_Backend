@@ -285,21 +285,21 @@ class Application:
         """Force GeoIP DB download and reader load before serving traffic.
 
         Runs synchronously inside ``asyncio.to_thread`` because the runtime
-        download blocks for up to retries × backoff seconds. Failures are
-        reported through the geo_block module's logger; this method itself
-        does not raise — the singleton handles fail-closed correctly even
-        when the DB never loads, and the CRITICAL log line emitted by
-        ``initialize_geo_blocking`` is the operator-visible signal.
+        download blocks for up to retries × backoff seconds. Import or init
+        failures are logged here and do not abort startup (same policy as
+        ``src.api.main`` lifespan).
         """
         try:
             from src.security.geo_block import initialize_geo_blocking
+
+            initialize_geo_blocking()
         except ImportError:
             self.logger.warning(
                 "Geo-blocking module not importable — Article 73-3 controls "
                 "inactive on this service"
             )
-            return
-        initialize_geo_blocking()
+        except Exception as exc:  # pragma: no cover — defensive: never block startup
+            self.logger.warning("Geo-blocking eager init failed: %s", exc)
 
     async def _initialize_resilience(self) -> None:
         """Initialize resilience manager and error handling."""
