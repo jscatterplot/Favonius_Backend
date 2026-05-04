@@ -28,6 +28,7 @@ class TestSecurityManager:
         """Mock TimescaleDB client."""
         mock_client = Mock(spec=TimescaleClient)
         mock_client.station_requires_basic_auth.return_value = False
+        mock_client.is_basic_auth_username_allowed.return_value = False
         return mock_client
 
     @pytest.fixture
@@ -55,12 +56,29 @@ class TestSecurityManager:
         manager = SecurityManager(mock_timescale_client, security_config)
 
         assert manager.timescale_client == mock_timescale_client
+        assert manager.static_auth_client == mock_timescale_client
         assert manager.config == security_config
         assert manager.token_cache == {}
         assert manager.failed_auth_attempts == {}
         assert manager.security_events == []
         assert manager.jwt_secret is not None
         assert manager.cert_validation_cache == {}
+
+    @pytest.mark.timeout(10)
+    def test_security_manager_uses_static_auth_client(
+        self, mock_timescale_client, security_config
+    ):
+        """Static OCPP auth reads can be sourced from Supabase."""
+        static_auth_client = Mock()
+
+        manager = SecurityManager(
+            mock_timescale_client,
+            security_config,
+            static_auth_client=static_auth_client,
+        )
+
+        assert manager.timescale_client == mock_timescale_client
+        assert manager.static_auth_client == static_auth_client
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -176,13 +194,19 @@ class TestSecurityManager:
     async def test_production_basic_auth_requires_username_to_match_station_id(
         self, security_manager
     ):
-        """Onboarded production chargers must use the generated station id username."""
+        """Onboarded production chargers must use the station id or a configured alias."""
         station_id = "acme-berlin-001"
         auth_data = {"username": "operator-user", "password": "valid_password"}
 
         with (
             patch.object(security_manager, "_is_station_locked_out", return_value=False),
             patch.object(security_manager, "_station_requires_basic_auth", return_value=True),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as username_allowed,
             patch.object(
                 security_manager,
                 "_validate_basic_auth",
@@ -199,11 +223,48 @@ class TestSecurityManager:
             success, error = await security_manager.authenticate_station(station_id, auth_data)
 
         assert success is False
-        assert error == "Basic Auth username must match station id"
+        assert error == "Basic Auth username must match station id or active alias"
+        username_allowed.assert_awaited_once_with(station_id, "operator-user")
         validate_basic_auth.assert_not_awaited()
         failed.assert_awaited_once_with(station_id)
         log_event.assert_awaited_once()
         assert log_event.await_args.args[3]["reason"] == "basic_auth_username_mismatch"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_production_basic_auth_accepts_configured_username_alias(
+        self, security_manager
+    ):
+        """Onboarded production chargers may use an active vendor username alias."""
+        station_id = "hrx-uab_hrx-vilnius-001"
+        auth_data = {"username": "TACW1141622G1433", "password": "valid_password"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=True),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as username_allowed,
+            patch.object(
+                security_manager,
+                "_validate_basic_auth",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as validate_basic_auth,
+            patch.object(security_manager, "_clear_failed_attempts", return_value=None),
+            patch.object(security_manager, "_log_security_event", return_value=None),
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is True
+        assert error is None
+        username_allowed.assert_awaited_once_with(station_id, "TACW1141622G1433")
+        validate_basic_auth.assert_awaited_once_with(
+            station_id, "TACW1141622G1433", "valid_password"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)

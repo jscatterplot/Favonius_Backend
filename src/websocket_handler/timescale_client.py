@@ -1813,13 +1813,53 @@ class TimescaleClient:
             ).hexdigest()
         return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
+    async def resolve_station_id(self, station_id: str) -> str:
+        """Return the canonical station id for a path-supplied station or alias."""
+        async with self.pg_pool.acquire() as conn:
+            canonical = await conn.fetchval(
+                """
+                SELECT canonical_station_id
+                FROM ocpp_station_aliases
+                WHERE alias_station_id = $1
+                  AND active = TRUE
+                LIMIT 1
+                """,
+                station_id,
+            )
+        return str(canonical) if canonical else station_id
+
+    async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
+        """Return True when username is the canonical station id or an active alias."""
+        if hmac.compare_digest(username, station_id):
+            return True
+        async with self.pg_pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM ocpp_station_aliases
+                    WHERE alias_station_id = $1
+                      AND canonical_station_id = $2
+                      AND active = TRUE
+                    LIMIT 1
+                    """,
+                    username,
+                    station_id,
+                )
+            )
+
     async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
         """Validate basic authentication credentials."""
         async with self.pg_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT password_hash FROM station_credentials
-                WHERE station_id = $1 AND username = $2 AND active = true
+                SELECT id, password_hash
+                FROM station_credentials
+                WHERE station_id = $1
+                  AND username IN ($1, $2)
+                  AND active = true
+                ORDER BY CASE WHEN username = $2 THEN 0 ELSE 1 END
+                LIMIT 1
             """,
                 station_id,
                 username,
@@ -1831,7 +1871,16 @@ class TimescaleClient:
             # Verify password hash
             import bcrypt
 
-            return bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8"))
+            password_ok = bcrypt.checkpw(
+                password.encode("utf-8"),
+                row["password_hash"].encode("utf-8"),
+            )
+            if password_ok:
+                await conn.execute(
+                    "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
+                    row["id"],
+                )
+            return password_ok
 
     async def station_requires_basic_auth(self, station_id: str) -> bool:
         """Return True when a provisioned production charger requires Basic Auth."""
@@ -1898,7 +1947,7 @@ class TimescaleClient:
                 *params,
             )
             if len(rows) > 1:
-                logger.error(
+                self.logger.error(
                     "Rejecting id_tag lookup for %r: multiple vehicles share the same id_tag.",
                     id_tag,
                 )
@@ -1948,7 +1997,7 @@ class TimescaleClient:
                 *params,
             )
             if len(rows) > 1:
-                logger.error(
+                self.logger.error(
                     "Rejecting id_tag lookup for %r: multiple active RFID cards share it.",
                     id_tag,
                 )

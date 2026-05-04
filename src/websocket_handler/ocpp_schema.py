@@ -266,6 +266,18 @@ CREATE TABLE IF NOT EXISTS station_credentials (
     UNIQUE(station_id, username)
 );
 
+-- Station Alias Table
+CREATE TABLE IF NOT EXISTS ocpp_station_aliases (
+    alias_station_id VARCHAR(255) PRIMARY KEY,
+    canonical_station_id VARCHAR(255) NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT true,
+    source VARCHAR(50) NOT NULL DEFAULT 'manual',
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (alias_station_id <> canonical_station_id)
+);
+
 -- Contracts Table
 CREATE TABLE IF NOT EXISTS contracts (
     id SERIAL PRIMARY KEY,
@@ -780,6 +792,9 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
 CREATE INDEX IF NOT EXISTS idx_station_credentials_station_id ON station_credentials(station_id);
 CREATE INDEX IF NOT EXISTS idx_station_credentials_username ON station_credentials(username);
 CREATE INDEX IF NOT EXISTS idx_station_credentials_active ON station_credentials(active);
+CREATE INDEX IF NOT EXISTS idx_ocpp_station_aliases_canonical
+    ON ocpp_station_aliases(canonical_station_id)
+    WHERE active = TRUE;
 
 -- Contracts Indexes
 CREATE INDEX IF NOT EXISTS idx_contracts_contract_id ON contracts(contract_id);

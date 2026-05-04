@@ -1,6 +1,7 @@
 """Supabase client for static/reference data access."""
 
 import asyncio
+import hmac
 import random
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -135,6 +136,71 @@ class SupabaseClient:
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(query, *args)
             return [dict(row) for row in rows]
+
+    async def resolve_station_id(self, station_id: str) -> str:
+        """Return the canonical station id for a path-supplied station or alias."""
+        query = """
+            SELECT canonical_station_id
+            FROM ocpp_station_aliases
+            WHERE alias_station_id = $1
+              AND active = TRUE
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id)
+        return str(row["canonical_station_id"]) if row else station_id
+
+    async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
+        """Return True when username is the canonical station id or an active alias."""
+        if hmac.compare_digest(username, station_id):
+            return True
+        query = """
+            SELECT 1
+            FROM ocpp_station_aliases
+            WHERE alias_station_id = $1
+              AND canonical_station_id = $2
+              AND active = TRUE
+            LIMIT 1
+        """
+        return await self.fetch_one(query, username, station_id) is not None
+
+    async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
+        """Validate station Basic Auth credentials from Supabase static config."""
+        query = """
+            SELECT id, password_hash
+            FROM station_credentials
+            WHERE station_id = $1
+              AND username IN ($1, $2)
+              AND active = TRUE
+            ORDER BY CASE WHEN username = $2 THEN 0 ELSE 1 END
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id, username)
+        if not row:
+            return False
+
+        import bcrypt
+
+        password_ok = bcrypt.checkpw(
+            password.encode("utf-8"),
+            row["password_hash"].encode("utf-8"),
+        )
+        if password_ok and self.db_pool:
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
+                    row["id"],
+                )
+        return password_ok
+
+    async def station_requires_basic_auth(self, station_id: str) -> bool:
+        """Return True when a provisioned charger requires Basic Auth."""
+        query = """
+            SELECT COALESCE(auth_required, FALSE) AS auth_required
+            FROM charging_stations
+            WHERE station_id = $1
+        """
+        row = await self.fetch_one(query, station_id)
+        return bool(row["auth_required"]) if row else False
 
     # Static data access methods
 

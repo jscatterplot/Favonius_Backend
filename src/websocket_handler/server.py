@@ -7,7 +7,6 @@ import http
 import ipaddress
 import logging
 import os
-import secrets
 import ssl
 import uuid
 from collections import defaultdict
@@ -297,7 +296,11 @@ class OCPPWebSocketServer:
             require_station_auth=require_auth,
             require_mtls=False,  # Railway terminates TLS at edge
         )
-        self.security_manager = SecurityManager(self.timescale_client, security_config)
+        self.security_manager = SecurityManager(
+            self.timescale_client,
+            security_config,
+            static_auth_client=self.supabase_client,
+        )
         self.logger.info(
             "Security manager initialized (require_auth=%s)", require_auth
         )
@@ -568,6 +571,24 @@ class OCPPWebSocketServer:
             # Use full UUID to avoid collisions
             station_id = f"station_{connection_id}"
 
+        if self.supabase_client:
+            try:
+                canonical_station_id = await self.supabase_client.resolve_station_id(station_id)
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not resolve OCPP station alias for %s: %s",
+                    station_id,
+                    exc,
+                )
+            else:
+                if canonical_station_id != station_id:
+                    self.logger.info(
+                        "Resolved OCPP station alias %s to canonical station %s",
+                        station_id,
+                        canonical_station_id,
+                    )
+                    station_id = canonical_station_id
+
         # Authenticate station (Article 73-3 / NIS2 compliance)
         # Uses the SecurityManager's fallback chain: cert → JWT → API key → basic auth
         if self.security_manager and self.security_manager.config.require_station_auth:
@@ -592,15 +613,6 @@ class OCPPWebSocketServer:
                                 # OCPP 1.6 basic auth payload uses username:password.
                                 auth_data["username"] = username
                                 auth_data["password"] = password
-                                if not secrets.compare_digest(username, station_id):
-                                    self.logger.warning(
-                                        "Basic auth username mismatch from %s: station=%s username=%s",
-                                        client_ip,
-                                        station_id,
-                                        username,
-                                    )
-                                    auth_data.pop("username", None)
-                                    auth_data.pop("password", None)
                             else:
                                 self.logger.warning(
                                     "Malformed basic auth payload from %s for station %s",
