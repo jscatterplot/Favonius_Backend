@@ -2420,9 +2420,16 @@ def _canonical_request_hash(payload: BaseModel) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_OCPP_BASIC_PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_OCPP_BASIC_PASSWORD_LENGTH = 20
+
+
 def _generate_ocpp_basic_password() -> str:
-    """Generate a high-entropy URL-safe one-time Basic Auth password."""
-    return secrets.token_urlsafe(32)
+    """Generate an ABB-compatible high-entropy one-time Basic Auth password."""
+    return "".join(
+        secrets.choice(_OCPP_BASIC_PASSWORD_ALPHABET)
+        for _ in range(_OCPP_BASIC_PASSWORD_LENGTH)
+    )
 
 
 async def _hash_ocpp_basic_password(password: str) -> str:
