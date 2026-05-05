@@ -446,11 +446,16 @@ class OCPP16Session:
         of scope for the pilot.
         """
         decision = await self._authz.authorize(cp_id, id_tag, source)
-        if decision.status == RFIDAuthStatus.ACCEPTED:
+        return self._map_auth_status(decision.status)
+
+    @staticmethod
+    def _map_auth_status(status: RFIDAuthStatus) -> AuthorizationStatus:
+        """Map RFID authorization status to OCPP 1.6 AuthorizationStatus."""
+        if status == RFIDAuthStatus.ACCEPTED:
             return AuthorizationStatus.accepted
-        if decision.status == RFIDAuthStatus.EXPIRED:
+        if status == RFIDAuthStatus.EXPIRED:
             return AuthorizationStatus.expired
-        if decision.status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
+        if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
             return AuthorizationStatus.blocked
         return AuthorizationStatus.invalid
 
@@ -759,14 +764,7 @@ class OCPP16Session:
             return AuthorizationStatus.blocked
 
         decision = await self._authz.authorize(cp_id, id_tag, "StartTransaction")
-        if decision.status == RFIDAuthStatus.ACCEPTED:
-            auth_status = AuthorizationStatus.accepted
-        elif decision.status == RFIDAuthStatus.EXPIRED:
-            auth_status = AuthorizationStatus.expired
-        elif decision.status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
-            auth_status = AuthorizationStatus.blocked
-        else:
-            auth_status = AuthorizationStatus.invalid
+        auth_status = self._map_auth_status(decision.status)
         if auth_status != AuthorizationStatus.accepted:
             return auth_status
 

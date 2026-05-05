@@ -124,8 +124,11 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Initialize managers
         self.device_model = DeviceModel(timescale_client)
         self.charging_profile_manager = ChargingProfileManager(timescale_client)
-        self.transaction_manager = TransactionManager(timescale_client)
         self.rfid_authorization = RFIDAuthorizationService(timescale_client, self.logger)
+        self.transaction_manager = TransactionManager(
+            timescale_client,
+            rfid_authorization=self.rfid_authorization,
+        )
         self.certificate_manager = CertificateManager(timescale_client)
 
         # Initialize security manager

@@ -105,10 +105,16 @@ class Tariff:
 class TransactionManager:
     """Manages OCPP transactions with authorization and tariff support."""
 
-    def __init__(self, timescale_client: TimescaleClient):
+    def __init__(
+        self,
+        timescale_client: TimescaleClient,
+        rfid_authorization: Optional[RFIDAuthorizationService] = None,
+    ):
         self.timescale_client = timescale_client
         self.logger = get_logger(__name__)
-        self.rfid_authorization = RFIDAuthorizationService(timescale_client, self.logger)
+        self.rfid_authorization = rfid_authorization or RFIDAuthorizationService(
+            timescale_client, self.logger
+        )
 
         # Authorization cache
         self.auth_cache: Dict[str, Dict[str, Any]] = {}
