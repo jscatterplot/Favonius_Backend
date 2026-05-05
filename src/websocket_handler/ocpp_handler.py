@@ -362,7 +362,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                     },
                 }
             )
-        if self._token_field(id_token, "type") == "NoAuthorization":
+        token_type_raw = self._token_field(id_token, "type")
+        if hasattr(token_type_raw, "value"):
+            token_type_raw = token_type_raw.value
+        if token_type_raw == "NoAuthorization":
             return call_result.Authorize(
                 id_token_info={
                     "status": "Invalid",
