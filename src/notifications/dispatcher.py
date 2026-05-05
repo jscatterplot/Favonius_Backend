@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from . import alerts as alerts_repo

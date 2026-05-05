@@ -21,7 +21,7 @@ from .connection_monitor import ConnectionMonitor
 from .data_sync import DataSyncService
 from .database_schema import create_schema_from_config
 from .health import HealthCheckServer
-from .health_checks import create_health_checks, notify_websocket_ready
+from .health_checks import create_health_checks
 from .monitoring import (
     ACTIVE_TRANSACTIONS,
     get_logger,

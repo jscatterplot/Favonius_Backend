@@ -342,7 +342,6 @@ async def test_queue_consumer_emits_profile_push_latency_metric(
     from src.websocket_handler.charging_profile_manager import (
         ChargingCommandQueueConsumer,
     )
-    from src.websocket_handler import monitoring as m
 
     fake_queue.insert("CHARGER_001", 1, {"chargingSchedule": {}})
     fake_session = MagicMock()

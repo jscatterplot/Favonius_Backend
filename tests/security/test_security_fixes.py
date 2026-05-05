@@ -9,14 +9,7 @@ Reference: docs/SECURITY_AUDIT.md
 from __future__ import annotations
 
 import asyncio
-import ipaddress
-import json
-import math
-import os
-import re
 import socket
-import tempfile
-from collections import defaultdict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

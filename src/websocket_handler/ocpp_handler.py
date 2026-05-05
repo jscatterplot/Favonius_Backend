@@ -11,6 +11,23 @@ from ocpp.v201 import ChargePoint as OCPPChargePoint
 from ocpp.v201 import call_result
 from ocpp.v201.datatypes import ChargingStationType, IdTokenType, StatusInfoType
 from ocpp.v201.enums import Action, ConnectorStatusEnumType, TransactionEventEnumType
+from structlog.contextvars import bind_contextvars, unbind_contextvars
+
+from .certificate_manager import CertificateManager, CertificateType
+from .charging_profile_manager import ChargingProfileManager
+from .config import Config
+from .connection_manager import ConnectionManager
+from .device_model import DeviceModel
+from .diagnostics_firmware import DiagnosticsManager, FirmwareManager
+from .display_manager import DisplayManager
+from .monitoring import get_logger
+from .monitoring_manager import MonitoringManager
+from .privacy_manager import PrivacyManager
+from .security_manager import SecurityConfig, SecurityManager
+from .tariff_manager import TariffManager
+from .task_supervisor import TaskSupervisor
+from .timescale_client import TimescaleClient
+from .transaction_manager import TransactionManager
 
 # Per-call OCPP CALL message correlation id, bound for the duration of one
 # inbound message dispatch. The OCPP framing assigns a unique_id to every
@@ -31,8 +48,6 @@ def _bind_unique_id_to_structlog(unique_id: str, station_id: str) -> None:
     support (older tests or shimmed loggers).
     """
     try:
-        from structlog.contextvars import bind_contextvars
-
         bind_contextvars(ocpp_unique_id=unique_id, station_id=station_id)
     except Exception:
         pass
@@ -41,27 +56,9 @@ def _bind_unique_id_to_structlog(unique_id: str, station_id: str) -> None:
 def _clear_ocpp_log_context() -> None:
     """Tear down per-call structlog context after dispatch finishes."""
     try:
-        from structlog.contextvars import unbind_contextvars
-
         unbind_contextvars("ocpp_unique_id", "station_id")
     except Exception:
         pass
-
-from .certificate_manager import CertificateManager, CertificateType
-from .charging_profile_manager import ChargingProfileManager
-from .config import Config
-from .connection_manager import ConnectionManager
-from .device_model import DeviceModel
-from .diagnostics_firmware import DiagnosticsManager, FirmwareManager
-from .display_manager import DisplayManager
-from .monitoring import get_logger
-from .monitoring_manager import MonitoringManager
-from .privacy_manager import PrivacyManager
-from .security_manager import SecurityConfig, SecurityManager
-from .tariff_manager import TariffManager
-from .task_supervisor import TaskSupervisor
-from .timescale_client import TimescaleClient
-from .transaction_manager import TransactionManager
 
 
 # Optional OCPP extension actions (may be missing in ocpp package)

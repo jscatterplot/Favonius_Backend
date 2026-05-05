@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import csv
 import io
-import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch

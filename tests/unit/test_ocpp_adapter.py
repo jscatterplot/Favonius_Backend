@@ -15,7 +15,6 @@ from src.adapters.ocpp import (
     FleetChargePoint,
     OCPPServer,
     convert_schedule_to_ocpp_profile,
-    dispatch_charging_profiles,
     store_meter_values,
 )
 from src.core.models import OptimizationResult

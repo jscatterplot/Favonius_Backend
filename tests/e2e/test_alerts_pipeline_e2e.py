@@ -23,7 +23,6 @@ refactors must keep green.
 
 from __future__ import annotations
 
-import asyncio
 import hmac
 import json
 import os
@@ -32,7 +31,7 @@ import time
 from base64 import b64decode, b64encode
 from hashlib import sha256
 from unittest.mock import MagicMock
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import asyncpg
 import httpx
@@ -50,7 +49,6 @@ if "pyomo" not in sys.modules:
 
 
 from src.api.main import app
-from src.notifications import alerts as alerts_repo
 from src.notifications import recipients as recipients_repo
 from src.notifications.dispatcher import AlertDispatcher
 from src.notifications.email_client import FakeEmailClient
@@ -174,7 +172,6 @@ class TestAlertsPipelineE2E:
     async def test_full_lifecycle_fault_to_email_to_ack_to_resolve(
         self, db_pool, api_client, dispatcher, world, monkeypatch
     ):
-        org_id = world["org_id"]
         depot_id = world["depot_id"]
         ocpp_id = world["ocpp_id"]
         recipient_id = world["recipient_id"]

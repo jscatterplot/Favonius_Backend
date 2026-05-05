@@ -29,7 +29,6 @@ from src.security.geo_block import (
     GeoBlockMiddleware,
     GeoBlockResult,
     _download_geoip_db,
-    check_ip_blocked,
 )
 
 # ============ Fixtures ============

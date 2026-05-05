@@ -11,7 +11,6 @@ remove it. Tests do not require a running database.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import inspect

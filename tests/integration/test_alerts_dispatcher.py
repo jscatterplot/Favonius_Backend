@@ -15,7 +15,6 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from src.notifications import alerts as alerts_repo
 from src.notifications import recipients as recipients_repo
 from src.notifications.dispatcher import AlertDispatcher
 from src.notifications.email_client import DeliveryResult, FakeEmailClient

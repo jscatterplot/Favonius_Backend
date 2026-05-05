@@ -550,7 +550,7 @@ class TestRecipientsCRUD:
     async def test_list_for_org_active_only_by_default(self, db_pool, org_and_depot):
         org_id, _ = org_and_depot
         async with db_pool.acquire() as conn:
-            r1 = await recipients_repo.create(conn, organization_id=org_id, email="a@x.com")
+            await recipients_repo.create(conn, organization_id=org_id, email="a@x.com")
             r2 = await recipients_repo.create(conn, organization_id=org_id, email="b@x.com")
             await recipients_repo.update(conn, r2.id, organization_id=org_id, active=False)
 

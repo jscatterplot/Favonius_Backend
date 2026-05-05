@@ -12,7 +12,6 @@ security_manager to isolate it for testing.
 
 from __future__ import annotations
 
-import importlib
 import logging
 import sys
 from unittest.mock import MagicMock, patch

@@ -16,15 +16,6 @@ The legacy tests in this file that exercise the in-process push are
 skipped; the conversion / allocation tests remain in scope.
 """
 
-import pytest as _pytest
-
-# Apply skip to every test class in this module that exercises the legacy
-# in-process dispatch path. Conversion / allocation tests are unaffected.
-_LEGACY_DISPATCH_REASON = (
-    "Session 3: in-process OCPP dispatch removed; covered by "
-    "tests/integration/test_dispatch_queue.py."
-)
-
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -36,6 +27,14 @@ from src.adapters.ocpp.dispatch import dispatch_charging_profiles
 from src.adapters.ocpp.server import OCPPServer
 from src.core.models import DepotConfig, DepotState, OptimizationResult
 from src.core.optimizer import optimize
+
+
+# Apply skip to every test class in this module that exercises the legacy
+# in-process dispatch path. Conversion / allocation tests are unaffected.
+_LEGACY_DISPATCH_REASON = (
+    "Session 3: in-process OCPP dispatch removed; covered by "
+    "tests/integration/test_dispatch_queue.py."
+)
 
 
 @pytest.mark.integration

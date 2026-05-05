@@ -7,6 +7,11 @@ import sys
 import time
 from typing import Any, Dict
 
+import structlog
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram, Info, start_http_server
+
+from .config import MonitoringConfig
+
 
 class _WebsocketsEOFFilter(logging.Filter):
     """Suppress noisy EOF errors logged by the websockets library.
@@ -34,11 +39,6 @@ class _WebsocketsEOFFilter(logging.Filter):
                 return False  # suppress
             exc = exc.__cause__ or exc.__context__
         return True
-
-import structlog
-from prometheus_client import REGISTRY, Counter, Gauge, Histogram, Info, start_http_server
-
-from .config import MonitoringConfig
 
 # Global metrics storage to prevent duplicate registration
 _metrics_cache = {}

@@ -4,7 +4,6 @@ from typing import Optional
 
 from .enhanced_error_handler import (
     CircuitBreakerConfig,
-    CircuitBreakerState,
     EnhancedCircuitBreaker,
     EnhancedRetryManager,
 )

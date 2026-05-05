@@ -27,6 +27,7 @@ from .connection_manager import ConnectionManager
 from .der_control_manager import DERControlManager
 from .external_control_manager import ExternalControlManager
 from .message_handler import MessageHandler
+from .monitoring import CONNECTED_CHARGERS_COUNT, ERRORS_TOTAL, WEBSOCKET_CONNECTIONS
 from .monitoring import get_logger, setup_monitoring
 from .ocpp_handler import EnhancedOCPPChargePoint
 from .priority_charging_manager import PriorityChargingManager
@@ -66,9 +67,7 @@ except ImportError:
 
 
 # Prometheus metrics - imported from monitoring module
-from .monitoring import ERRORS_TOTAL
-from .monitoring import CONNECTED_CHARGERS_COUNT
-from .monitoring import WEBSOCKET_CONNECTIONS as CONNECTIONS_TOTAL
+CONNECTIONS_TOTAL = WEBSOCKET_CONNECTIONS
 
 try:
     from .ocpp16_adapter import OCPP16Session

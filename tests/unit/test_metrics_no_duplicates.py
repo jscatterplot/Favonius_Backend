@@ -19,7 +19,6 @@ before it reaches the container.
 from __future__ import annotations
 
 import importlib
-import sys
 
 import pytest
 

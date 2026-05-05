@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-import pytest
 
 from src.notifications.alerts import Alert
 from src.notifications.renderer import render_alert
