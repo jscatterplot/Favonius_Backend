@@ -24,7 +24,6 @@ import pytest
 from src.adapters.ocpp.dispatch import dispatch_charging_profiles
 from src.core.models import OptimizationResult
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -45,7 +44,13 @@ class FakeQueue:
         self.rows: list[dict] = []
         self._next_id = 1
 
-    def insert(self, charge_point_id: str, connector_id: int, payload: dict) -> int:
+    def insert(
+        self,
+        charge_point_id: str,
+        connector_id: int,
+        payload: dict,
+        command_type: str = "set_charging_profile",
+    ) -> int:
         queue_id = self._next_id
         self._next_id += 1
         self.rows.append(
@@ -53,7 +58,7 @@ class FakeQueue:
                 "queue_id": queue_id,
                 "charge_point_id": charge_point_id,
                 "connector_id": connector_id,
-                "command_type": "set_charging_profile",
+                "command_type": command_type,
                 "payload": payload,
                 "status": "pending",
                 "attempt_count": 0,
@@ -182,9 +187,7 @@ async def test_dispatch_skips_unmapped_vehicles(
     assert fake_queue.rows[0]["charge_point_id"] == "CHARGER_001"
 
 
-async def test_dispatch_skips_zero_power_schedule(
-    fake_queue: FakeQueue, fake_pools
-) -> None:
+async def test_dispatch_skips_zero_power_schedule(fake_queue: FakeQueue, fake_pools) -> None:
     """All-zero charging power means nothing to dispatch."""
     result = OptimizationResult(
         run_id=uuid4(),
@@ -265,9 +268,7 @@ async def test_queue_consumer_drains_pending_to_sent(fake_queue: FakeQueue) -> N
             "stackLevel": 0,
             "chargingSchedule": {
                 "chargingRateUnit": "W",
-                "chargingSchedulePeriod": [
-                    {"startPeriod": 0, "limit": 22000, "numberPhases": 3}
-                ],
+                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 22000, "numberPhases": 3}],
             },
         },
     )
@@ -385,6 +386,113 @@ async def test_queue_consumer_logs_listen_task_failure(fake_queue: FakeQueue) ->
         "LISTEN task crashed; polling-only mode active: %s", ANY
     )
     await consumer.stop()
+
+
+# ---------------------------------------------------------------------------
+# remote_reset dispatch — added for the /commands/execute fix.
+# ---------------------------------------------------------------------------
+
+
+async def test_queue_consumer_dispatches_remote_reset_to_send_reset(
+    fake_queue: FakeQueue,
+) -> None:
+    """A row with command_type='remote_reset' calls cp.send_reset and marks 'sent'."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    fake_queue.insert(
+        "CHARGER_001",
+        0,
+        {"type": "Soft"},
+        command_type="remote_reset",
+    )
+
+    fake_session = MagicMock()
+    fake_session.send_reset = AsyncMock(return_value=True)
+
+    consumer = ChargingCommandQueueConsumer(
+        FakeTimescaleClient(fake_queue), lambda cp: fake_session
+    )
+
+    processed = await consumer.drain_once()
+
+    assert processed == 1
+    fake_session.send_reset.assert_awaited_once_with("Soft")
+    assert fake_queue.rows[0]["status"] == "sent"
+
+
+async def test_queue_consumer_marks_failed_on_reset_reject(
+    fake_queue: FakeQueue,
+) -> None:
+    """send_reset returning False marks the row 'failed' (no replay)."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    fake_queue.insert("CHARGER_001", 0, {"type": "Hard"}, command_type="remote_reset")
+
+    fake_session = MagicMock()
+    fake_session.send_reset = AsyncMock(return_value=False)
+
+    consumer = ChargingCommandQueueConsumer(
+        FakeTimescaleClient(fake_queue), lambda cp: fake_session
+    )
+
+    await consumer.drain_once()
+
+    assert fake_queue.rows[0]["status"] == "failed"
+    assert "Rejected" in fake_queue.rows[0]["last_error"]
+
+
+async def test_queue_consumer_marks_failed_when_session_lacks_send_reset(
+    fake_queue: FakeQueue,
+) -> None:
+    """OCPP 2.0.1 sessions without send_reset are rejected with a clear error."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    fake_queue.insert("CHARGER_001", 0, {"type": "Soft"}, command_type="remote_reset")
+
+    # MagicMock by default would synthesize ANY attribute — use spec to forbid.
+    fake_session = MagicMock(spec=["send_charging_profile"])
+
+    consumer = ChargingCommandQueueConsumer(
+        FakeTimescaleClient(fake_queue), lambda cp: fake_session
+    )
+    consumer.logger = MagicMock()
+
+    await consumer.drain_once()
+
+    assert fake_queue.rows[0]["status"] == "failed"
+    assert "send_reset" in fake_queue.rows[0]["last_error"]
+
+
+async def test_queue_consumer_marks_failed_on_unknown_command_type(
+    fake_queue: FakeQueue,
+) -> None:
+    """An unrecognised command_type doesn't get treated as a charging profile."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    fake_queue.insert("CHARGER_001", 0, {}, command_type="something_new")
+
+    fake_session = MagicMock()
+    fake_session.send_charging_profile = AsyncMock(return_value=True)
+    fake_session.send_reset = AsyncMock(return_value=True)
+
+    consumer = ChargingCommandQueueConsumer(
+        FakeTimescaleClient(fake_queue), lambda cp: fake_session
+    )
+    consumer.logger = MagicMock()
+
+    await consumer.drain_once()
+
+    assert fake_queue.rows[0]["status"] == "failed"
+    fake_session.send_charging_profile.assert_not_awaited()
+    fake_session.send_reset.assert_not_awaited()
 
 
 def _collect_profile_push_count(station_id: str, outcome: str) -> int:
