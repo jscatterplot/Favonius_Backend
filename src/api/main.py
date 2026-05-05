@@ -4936,7 +4936,7 @@ async def _fetch_session_rows(
         FROM charging_sessions cs
         WHERE (
                 cs.station_id = ANY($1::text[])
-                OR cs.site_id = $5::uuid
+                OR (cs.site_id = $5::uuid AND cs.source = 'import')
               )
           AND cs.start_time >= ($2::date)::timestamp AT TIME ZONE $4
           AND cs.start_time < (($3::date) + INTERVAL '1 day')::timestamp AT TIME ZONE $4
