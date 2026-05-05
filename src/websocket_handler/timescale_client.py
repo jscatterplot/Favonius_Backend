@@ -2035,6 +2035,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -2092,6 +2093,7 @@ class TimescaleClient:
                  WHERE station_id = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
                 transaction_id,
@@ -2111,6 +2113,7 @@ class TimescaleClient:
                    SET last_seen_at = NOW()
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
             )
@@ -2349,6 +2352,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -2390,6 +2394,7 @@ class TimescaleClient:
                 SELECT station_id, COUNT(*)::bigint AS n
                   FROM charging_sessions
                  WHERE end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  GROUP BY station_id
                 """

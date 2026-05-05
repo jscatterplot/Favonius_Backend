@@ -578,7 +578,7 @@ def _verify_handoff_payload(
 # the new resource segment to the alternation when chargers or schedules ship
 # their own xlsx import.
 _ADMIN_BULK_WRITE_PATH_RE = re.compile(
-    r"^/admin/depots/[^/]+/(?:vehicles|drivers|rfid-cards)(?:/|$)"
+    r"^/admin/depots/[^/]+/(?:vehicles|drivers|rfid-cards|charging-sessions/import)(?:/|$)"
 )
 
 
@@ -1964,6 +1964,42 @@ class FleetIdentityResponse(BaseModel):
     rfid_cards: list[RfidCardResponse] = Field(default_factory=list)
 
 
+class HistoricalSessionImport(_CamelOrSnakeModel):
+    """One row of a historical charging-sessions XLSX upload.
+
+    Mirrors the bulk-RFID flow: the frontend parses the spreadsheet and POSTs
+    one row per call. Timestamps are accepted as naive strings interpreted in
+    the depot's local timezone (``sites.timezone``); the server converts to
+    UTC before persisting.
+    """
+
+    import_batch_id: UUID
+    start_time_local: str = Field(..., min_length=1, max_length=64)
+    end_time_local: Optional[str] = Field(default=None, max_length=64)
+    energy_delivered_kwh: float = Field(..., ge=0)
+    revenue: float = Field(default=0.0, ge=0)
+    id_tag: str = Field(..., min_length=1, max_length=255)
+    status: Literal["Charging", "Finished"]
+    transaction_type: str = Field(default="RFID", max_length=64)
+    user_full_name: Optional[str] = Field(default=None, max_length=255)
+    station_owner_full_name: Optional[str] = Field(default=None, max_length=255)
+
+
+class HistoricalSessionImportMatched(BaseModel):
+    """Identity resolution outcome for an imported session row."""
+
+    vehicle_id: Optional[str] = None
+    card_id: Optional[str] = None
+    driver_id: Optional[str] = None
+
+
+class HistoricalSessionImportResponse(BaseModel):
+    """201 response for POST /admin/depots/{id}/charging-sessions/import."""
+
+    session_id: str
+    matched: HistoricalSessionImportMatched
+
+
 # ============ Command Dispatcher Models ============
 
 
@@ -2605,6 +2641,9 @@ def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTP
     elif "vehicles_external_id" in constraint:
         error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered"
+    elif "charging_sessions_import_dedup" in constraint:
+        error_code = ErrorCode.DUPLICATE_SESSION.value
+        detail = "Charging session has already been imported"
     elif "external" in constraint:
         error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered for this depot"
@@ -3363,6 +3402,279 @@ async def update_rfid_card(
         raise _handle_identity_unique_violation(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+# ============ Historical charging-sessions XLSX import ============
+
+# Strict format the frontend RFID-bulk parser already emits ("YYYY-MM-DD HH:mm").
+# Accept seconds optionally so an export with finer granularity still works.
+_IMPORT_TS_FORMATS: tuple[str, ...] = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S")
+
+
+def _parse_import_local_timestamp(value: str, tz: ZoneInfo, *, field: str) -> datetime:
+    """Parse a depot-local timestamp string and return its UTC datetime."""
+    text = (value or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.MISSING_REQUIRED_FIELD.value,
+                "detail": f"{field} is required",
+                "field": field,
+            },
+        )
+    for fmt in _IMPORT_TS_FORMATS:
+        try:
+            naive = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                "detail": "Expected 'YYYY-MM-DD HH:mm' in the depot's local timezone",
+                "field": field,
+            },
+        )
+    return naive.replace(tzinfo=tz).astimezone(timezone.utc)
+
+
+def _compute_import_row_hash(
+    *,
+    depot_id: str,
+    start_time_utc: datetime,
+    id_tag: str,
+    energy_delivered_kwh: float,
+    revenue: float,
+) -> str:
+    """SHA-256 of the canonical row tuple, used for idempotent re-uploads."""
+    canonical = "|".join(
+        [
+            depot_id,
+            start_time_utc.isoformat(),
+            id_tag,
+            f"{float(energy_delivered_kwh):.6f}",
+            f"{float(revenue):.6f}",
+        ]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _resolve_import_id_tag(
+    conn: asyncpg.Connection, *, depot_id: str, id_tag: str
+) -> dict[str, Optional[str]]:
+    """Resolve raw id_tag against vehicles + rfid_cards scoped to this depot.
+
+    Returns a dict with vehicle_id / card_id / driver_id (any may be None).
+    Unknown tags resolve to all-None — the row is still imported with the raw
+    id_tag stored in id_token so the FE can surface an "unmatched" badge.
+    """
+    vehicle_row = await conn.fetchrow(
+        """
+        SELECT id::text AS vehicle_id
+        FROM vehicles
+        WHERE id_tag = $1
+          AND site_id = $2::uuid
+          AND COALESCE(status, 'active') = 'active'
+        LIMIT 1
+        """,
+        id_tag,
+        depot_id,
+    )
+    if vehicle_row:
+        return {
+            "vehicle_id": vehicle_row["vehicle_id"],
+            "card_id": None,
+            "driver_id": None,
+        }
+
+    card_row = await conn.fetchrow(
+        """
+        SELECT
+            c.id::text AS card_id,
+            (
+                SELECT cva.vehicle_id::text
+                FROM rfid_card_vehicle_assignments cva
+                JOIN vehicles v ON v.id = cva.vehicle_id
+                WHERE cva.card_id = c.id
+                  AND v.site_id = c.site_id
+                  AND COALESCE(v.status, 'active') = 'active'
+                ORDER BY v.external_id
+                LIMIT 1
+            ) AS vehicle_id,
+            (
+                SELECT cda.driver_id::text
+                FROM rfid_card_driver_assignments cda
+                JOIN drivers dr ON dr.id = cda.driver_id
+                WHERE cda.card_id = c.id
+                  AND dr.site_id = c.site_id
+                  AND dr.status = 'active'
+                ORDER BY dr.display_name
+                LIMIT 1
+            ) AS driver_id
+        FROM rfid_cards c
+        WHERE c.id_tag = $1
+          AND c.site_id = $2::uuid
+          AND c.status = 'active'
+        LIMIT 1
+        """,
+        id_tag,
+        depot_id,
+    )
+    if card_row:
+        return {
+            "vehicle_id": card_row["vehicle_id"],
+            "card_id": card_row["card_id"],
+            "driver_id": card_row["driver_id"],
+        }
+    return {"vehicle_id": None, "card_id": None, "driver_id": None}
+
+
+@app.post(
+    "/admin/depots/{depot_id}/charging-sessions/import",
+    response_model=HistoricalSessionImportResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Import a historical charging-session row from an XLSX upload",
+)
+async def import_historical_charging_session(
+    depot_id: str,
+    request: HistoricalSessionImport,
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> HistoricalSessionImportResponse:
+    """Insert one historical charging session for the Reports / Energy accounting backfill.
+
+    Mirrors the bulk-RFID dialog pattern: the frontend parses the XLSX and POSTs
+    one row per call. Imported rows are scoped by ``site_id`` and use a
+    deterministic placeholder ``station_id`` so they do not require a
+    matching ``charging_stations`` row.
+    """
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools or db_pools.ts is None:
+        raise DatabaseError("Database not available")
+
+    # Look up the depot timezone (and confirm it belongs to caller's org).
+    async with db_pools.static.acquire() as static_conn:
+        depot_row = await static_conn.fetchrow(
+            """
+            SELECT timezone
+            FROM sites
+            WHERE id = $1::uuid AND organization_id = $2::uuid
+            """,
+            depot_id,
+            org_id,
+        )
+        if depot_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error_code": ErrorCode.DEPOT_NOT_FOUND.value,
+                    "detail": "Depot not found",
+                },
+            )
+        timezone_name = depot_row["timezone"] or "America/Los_Angeles"
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+
+        identity = await _resolve_import_id_tag(
+            static_conn, depot_id=depot_id, id_tag=request.id_tag
+        )
+
+    start_time_utc = _parse_import_local_timestamp(
+        request.start_time_local, tz, field="start_time_local"
+    )
+    end_time_utc: Optional[datetime] = None
+    if request.status == "Finished" and request.end_time_local:
+        end_time_utc = _parse_import_local_timestamp(
+            request.end_time_local, tz, field="end_time_local"
+        )
+        if end_time_utc < start_time_utc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                    "detail": "end_time_local must be on or after start_time_local",
+                },
+            )
+
+    if not math.isfinite(request.energy_delivered_kwh):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.INVALID_ENERGY.value,
+                "detail": "energy_delivered_kwh must be a finite, non-negative number",
+            },
+        )
+
+    row_hash = _compute_import_row_hash(
+        depot_id=depot_id,
+        start_time_utc=start_time_utc,
+        id_tag=request.id_tag,
+        energy_delivered_kwh=request.energy_delivered_kwh,
+        revenue=request.revenue,
+    )
+    placeholder_station_id = f"imported:{depot_id}"
+
+    try:
+        async with db_pools.ts.acquire() as ts_conn:
+            session_id = await ts_conn.fetchval(
+                """
+                INSERT INTO charging_sessions (
+                    station_id, evse_id, connector_id,
+                    vehicle_id, id_token, driver_id, card_id,
+                    start_time, end_time,
+                    energy_delivered_kwh, cost_total,
+                    site_id, source,
+                    import_batch_id, import_row_hash,
+                    import_user_full_name, import_station_owner, import_status
+                )
+                VALUES (
+                    $1, 0, 0,
+                    $2, $3, $4::uuid, $5::uuid,
+                    $6, $7,
+                    $8, $9,
+                    $10::uuid, 'import',
+                    $11::uuid, $12,
+                    $13, $14, $15
+                )
+                RETURNING session_id::text
+                """,
+                placeholder_station_id,
+                identity["vehicle_id"],
+                request.id_tag,
+                identity["driver_id"],
+                identity["card_id"],
+                start_time_utc,
+                end_time_utc,
+                request.energy_delivered_kwh,
+                request.revenue,
+                depot_id,
+                str(request.import_batch_id),
+                row_hash,
+                request.user_full_name,
+                request.station_owner_full_name,
+                request.status,
+            )
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+
+    await _audit_identity_write(
+        user, depot_id, "charging_session.import", str(session_id)
+    )
+    return HistoricalSessionImportResponse(
+        session_id=str(session_id),
+        matched=HistoricalSessionImportMatched(
+            vehicle_id=identity["vehicle_id"],
+            card_id=identity["card_id"],
+            driver_id=identity["driver_id"],
+        ),
+    )
 
 
 @app.post(
@@ -4607,9 +4919,10 @@ async def _fetch_session_rows(
     """Fetch charging_sessions rows in [from, to] (inclusive) in depot TZ."""
     if not db_pools or db_pools.ts is None:
         raise DatabaseError("Database not available")
-    if not ocpp_ids:
-        return []
 
+    # Match live OCPP rows by their station_id and imported (XLSX backfill) rows
+    # by site_id directly. Imported rows carry a synthetic station_id that has
+    # no charging_stations row, so they must be selected via cs.site_id.
     query = """
         SELECT
             cs.start_time,
@@ -4621,14 +4934,19 @@ async def _fetch_session_rows(
             cs.driver_id::text AS driver_id,
             cs.card_id::text AS card_id
         FROM charging_sessions cs
-        WHERE cs.station_id = ANY($1::text[])
+        WHERE (
+                cs.station_id = ANY($1::text[])
+                OR (cs.site_id = $5::uuid AND cs.source = 'import')
+              )
           AND cs.start_time >= ($2::date)::timestamp AT TIME ZONE $4
           AND cs.start_time < (($3::date) + INTERVAL '1 day')::timestamp AT TIME ZONE $4
         ORDER BY cs.start_time
         """
 
     async with db_pools.ts.acquire() as conn:
-        records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name)
+        records = await conn.fetch(
+            query, ocpp_ids, from_date, to_date, timezone_name, depot_id
+        )
 
     rows: list[SessionRow] = []
     for r in records:
