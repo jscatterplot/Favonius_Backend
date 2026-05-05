@@ -2325,10 +2325,6 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
         try:
             config, _ = await StateAssembler.load_depot_config(db_pools, depot_id)
 
-            if not config.vehicle_capacities:
-                raise HTTPException(
-                    status_code=400, detail=f"Depot {depot_id} has no vehicles configured"
-                )
             if config.n_chargers == 0:
                 logger.warning(
                     f"Depot {depot_id} has no chargers configured, optimization may fail"

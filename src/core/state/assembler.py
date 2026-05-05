@@ -1356,9 +1356,6 @@ class StateAssembler:
         async with pool.acquire() as conn:
             vehicle_rows = await conn.fetch(vehicles_query, depot_id_str)
 
-        if not vehicle_rows:
-            raise ValueError(f"No vehicles found for depot {depot_id_str}")
-
         vehicle_capacities = {}
         vehicle_to_ocpp = {}
         for row in vehicle_rows:
