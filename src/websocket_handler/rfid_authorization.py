@@ -40,15 +40,37 @@ class RFIDAuthStatus(str, Enum):
     CONCURRENT_TX = "concurrent_tx"
 
 
+class RFIDAuthOutcome(str, Enum):
+    """Bucketing for RFID → OCPP authorization status (single branching point)."""
+
+    ACCEPTED = "accepted"
+    EXPIRED = "expired"
+    BLOCKED = "blocked"
+    INVALID = "invalid"
+
+
+def rfid_auth_outcome(status: RFIDAuthStatus) -> RFIDAuthOutcome:
+    """Map ``RFIDAuthStatus`` to a small outcome set; OCPP adapters map from here."""
+    if status == RFIDAuthStatus.ACCEPTED:
+        return RFIDAuthOutcome.ACCEPTED
+    if status == RFIDAuthStatus.EXPIRED:
+        return RFIDAuthOutcome.EXPIRED
+    if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
+        return RFIDAuthOutcome.BLOCKED
+    return RFIDAuthOutcome.INVALID
+
+
+_OCPP201_OUTCOME_STR: dict[RFIDAuthOutcome, str] = {
+    RFIDAuthOutcome.ACCEPTED: "Accepted",
+    RFIDAuthOutcome.EXPIRED: "Expired",
+    RFIDAuthOutcome.BLOCKED: "Blocked",
+    RFIDAuthOutcome.INVALID: "Invalid",
+}
+
+
 def map_auth_status_to_ocpp201(status: RFIDAuthStatus) -> str:
     """Map internal RFID auth outcomes to OCPP 2.0.1 idTokenInfo.status."""
-    if status == RFIDAuthStatus.ACCEPTED:
-        return "Accepted"
-    if status == RFIDAuthStatus.EXPIRED:
-        return "Expired"
-    if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
-        return "Blocked"
-    return "Invalid"
+    return _OCPP201_OUTCOME_STR[rfid_auth_outcome(status)]
 
 
 def user_message_for(decision: "RFIDAuthDecision") -> str:

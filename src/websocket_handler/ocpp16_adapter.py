@@ -27,7 +27,7 @@ from ocpp.v16.enums import AuthorizationStatus
 from src.adapters.ocpp.charge_point import FleetChargePoint
 
 from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
-from .rfid_authorization import RFIDAuthStatus
+from .rfid_authorization import RFIDAuthOutcome, RFIDAuthStatus, rfid_auth_outcome
 
 # Replay window after a charger reconnects: pending commands enqueued while
 # the charger was offline are flushed within this many seconds of boot.
@@ -63,6 +63,13 @@ def _new_profile_id_fallback_counter() -> count:
 
 
 _profile_id_fallback_counter = _new_profile_id_fallback_counter()
+
+_OCPP16_AUTH_FROM_OUTCOME: dict[RFIDAuthOutcome, AuthorizationStatus] = {
+    RFIDAuthOutcome.ACCEPTED: AuthorizationStatus.accepted,
+    RFIDAuthOutcome.EXPIRED: AuthorizationStatus.expired,
+    RFIDAuthOutcome.BLOCKED: AuthorizationStatus.blocked,
+    RFIDAuthOutcome.INVALID: AuthorizationStatus.invalid,
+}
 
 
 class OCPP16Session:
@@ -451,13 +458,7 @@ class OCPP16Session:
     @staticmethod
     def _map_auth_status(status: RFIDAuthStatus) -> AuthorizationStatus:
         """Map RFID authorization status to OCPP 1.6 AuthorizationStatus."""
-        if status == RFIDAuthStatus.ACCEPTED:
-            return AuthorizationStatus.accepted
-        if status == RFIDAuthStatus.EXPIRED:
-            return AuthorizationStatus.expired
-        if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
-            return AuthorizationStatus.blocked
-        return AuthorizationStatus.invalid
+        return _OCPP16_AUTH_FROM_OUTCOME[rfid_auth_outcome(status)]
 
     async def _on_authorize(self, cp_id: str, id_tag: str) -> AuthorizationStatus:
         """Handle Authorize by failing closed on unknown fleet idTags."""
