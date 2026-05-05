@@ -25,6 +25,17 @@ class RFIDAuthStatus(str, Enum):
     CONCURRENT_TX = "concurrent_tx"
 
 
+def map_auth_status_to_ocpp201(status: RFIDAuthStatus) -> str:
+    """Map internal RFID auth outcomes to OCPP 2.0.1 idTokenInfo.status."""
+    if status == RFIDAuthStatus.ACCEPTED:
+        return "Accepted"
+    if status == RFIDAuthStatus.EXPIRED:
+        return "Expired"
+    if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
+        return "Blocked"
+    return "Invalid"
+
+
 @dataclass(frozen=True)
 class RFIDAuthDecision:
     """Decision payload consumed by protocol-specific handlers."""
@@ -55,6 +66,7 @@ class RFIDAuthorizationService:
             result = method(*args)
             if inspect.isawaitable(result):
                 return await result
+            return result
         except Exception as exc:
             self._logger.warning("rfid_authorization_%s_failed: %s", method_name, exc)
         return None

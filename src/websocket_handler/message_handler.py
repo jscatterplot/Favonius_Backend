@@ -13,7 +13,10 @@ import aiohttp
 
 from .config import Config
 from .monitoring import get_logger
-from .rfid_authorization import RFIDAuthStatus, RFIDAuthorizationService
+from .rfid_authorization import (
+    RFIDAuthorizationService,
+    map_auth_status_to_ocpp201,
+)
 from .timescale_client import TimescaleClient
 
 if TYPE_CHECKING:
@@ -425,7 +428,7 @@ class MessageHandler:
                 token_value,
                 "Authorize",
             )
-            status = self._map_auth_status_to_ocpp201(decision.status)
+            status = map_auth_status_to_ocpp201(decision.status)
             reason = "Authorized" if status == "Accepted" else decision.reason
 
         return {
@@ -438,17 +441,6 @@ class MessageHandler:
                 "personalMessage": {"format": "UTF8", "language": "en", "content": reason},
             }
         }
-
-    @staticmethod
-    def _map_auth_status_to_ocpp201(status: RFIDAuthStatus) -> str:
-        """Map internal RFID auth outcomes to OCPP 2.0.1 idTokenInfo.status."""
-        if status == RFIDAuthStatus.ACCEPTED:
-            return "Accepted"
-        if status == RFIDAuthStatus.EXPIRED:
-            return "Expired"
-        if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
-            return "Blocked"
-        return "Invalid"
 
     async def _handle_data_transfer(
         self, station_id: str, payload: Dict[str, Any], unique_id: str

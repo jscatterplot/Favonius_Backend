@@ -57,7 +57,10 @@ from .display_manager import DisplayManager
 from .monitoring import get_logger
 from .monitoring_manager import MonitoringManager
 from .privacy_manager import PrivacyManager
-from .rfid_authorization import RFIDAuthStatus, RFIDAuthorizationService
+from .rfid_authorization import (
+    RFIDAuthorizationService,
+    map_auth_status_to_ocpp201,
+)
 from .security_manager import SecurityConfig, SecurityManager
 from .tariff_manager import TariffManager
 from .task_supervisor import TaskSupervisor
@@ -358,7 +361,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             )
 
         decision = await self.rfid_authorization.authorize(self.id, token_value, "Authorize")
-        status = self._map_auth_status_to_ocpp201(decision.status)
+        status = map_auth_status_to_ocpp201(decision.status)
         return call_result.Authorize(
             id_token_info={
                 "status": status,
@@ -434,17 +437,6 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         except Exception as e:
             self.logger.error(f"Failed to send charging profile to {self.id}: {e}")
             return False
-
-    @staticmethod
-    def _map_auth_status_to_ocpp201(status: RFIDAuthStatus) -> str:
-        """Map internal RFID auth outcomes to OCPP 2.0.1 idTokenInfo.status."""
-        if status == RFIDAuthStatus.ACCEPTED:
-            return "Accepted"
-        if status == RFIDAuthStatus.EXPIRED:
-            return "Expired"
-        if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
-            return "Blocked"
-        return "Invalid"
 
     @staticmethod
     def _token_field(id_token: Any, field: str) -> Any:
@@ -2021,19 +2013,6 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                 "status": "Rejected",
                 "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
             }
-
-    async def _handle_request_start_transaction(
-        self,
-        evse_id: int,
-        id_token: dict,
-        remote_start_id: Optional[int],
-        charging_profile: Optional[dict],
-        evse_id_token: Optional[dict],
-    ) -> None:
-        """Backward-compatible async task wrapper for older internal callers."""
-        await self._process_request_start_transaction(
-            evse_id, id_token, remote_start_id, charging_profile, evse_id_token
-        )
 
     async def _handle_request_stop_transaction(self, transaction_id: str, reason: Optional[str]):
         """Handle RequestStopTransaction request."""

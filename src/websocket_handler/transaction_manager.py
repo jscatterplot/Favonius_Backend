@@ -7,7 +7,11 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from .monitoring import get_logger
-from .rfid_authorization import RFIDAuthStatus, RFIDAuthorizationService
+from .rfid_authorization import (
+    RFIDAuthStatus,
+    RFIDAuthorizationService,
+    map_auth_status_to_ocpp201,
+)
 from .timescale_client import TimescaleClient
 
 
@@ -159,10 +163,7 @@ class TransactionManager:
                 id_token.id_token,
                 "RequestStartTransaction",
             )
-            id_token_info = {
-                "status": self._map_auth_status_to_ocpp201(auth_decision.status),
-                "cacheTimeout": 300,
-            }
+            id_token_info = {"status": map_auth_status_to_ocpp201(auth_decision.status), "cacheTimeout": 300}
             if auth_decision.status != RFIDAuthStatus.ACCEPTED:
                 return {
                     "status": "Rejected",
@@ -260,17 +261,6 @@ class TransactionManager:
             }
 
         return None
-
-    @staticmethod
-    def _map_auth_status_to_ocpp201(status: RFIDAuthStatus) -> str:
-        """Map internal RFID auth outcomes to OCPP 2.0.1 idTokenInfo.status."""
-        if status == RFIDAuthStatus.ACCEPTED:
-            return "Accepted"
-        if status == RFIDAuthStatus.EXPIRED:
-            return "Expired"
-        if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
-            return "Blocked"
-        return "Invalid"
 
     async def request_stop_transaction(
         self, station_id: str, transaction_id: str, reason: Optional[str] = None
