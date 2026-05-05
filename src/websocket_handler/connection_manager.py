@@ -348,27 +348,46 @@ class ConnectionManager:
         return len(self.connections)
 
     async def _monitor_connections(self) -> None:
-        """Monitor connection health in background."""
+        """Monitor connection health in background.
+
+        OCPP-frame inactivity alone is not a reliable liveness signal: some
+        chargers (e.g. ABB Terra AC firmware 1.8.x) only send StatusNotification
+        on state change and skip BootNotification on reconnect, going minutes
+        between OCPP frames while the WebSocket layer is healthy. We rely on
+        the websockets library's ping_interval/ping_timeout for true liveness
+        and only kill at the OCPP layer when either (a) the WS is closed or
+        (b) the session has been completely silent for ``absolute_silence_seconds``.
+        """
         while self._running:
             try:
                 now = time.time()
-                stale_threshold = now - (self.config.websocket.heartbeat_interval * 3)
-                stale_stations = []
+                quiet_threshold = now - (self.config.websocket.heartbeat_interval * 3)
+                absolute_silence_cutoff = now - self.config.websocket.absolute_silence_seconds
+                stations_to_kill: list[tuple[str, str]] = []
 
-                # Use copy to avoid dict modification during iteration
                 async with self._lock:
                     for station_id, last_heartbeat in self.last_heartbeats.copy().items():
-                        if last_heartbeat < stale_threshold:
-                            stale_stations.append(station_id)
+                        if last_heartbeat >= quiet_threshold:
+                            continue
 
-                # Cleanup stale connections
-                for station_id in stale_stations:
-                    self.logger.warning(f"Connection for station {station_id} appears stale")
+                        connection_id = self.station_connections.get(station_id)
+                        websocket = self.connections.get(connection_id) if connection_id else None
+                        if websocket is None or self._is_websocket_closed(websocket):
+                            stations_to_kill.append((station_id, "websocket_closed"))
+                            continue
+
+                        if last_heartbeat < absolute_silence_cutoff:
+                            stations_to_kill.append((station_id, "absolute_silence"))
+
+                for station_id, reason in stations_to_kill:
+                    self.logger.warning(
+                        "Connection for station %s appears stale (reason=%s)",
+                        station_id,
+                        reason,
+                    )
                     await self._mark_connection_for_cleanup(station_id)
 
-                # Redis connection status update removed for simplification
-
-                await asyncio.sleep(30)  # Monitor every 30 seconds
+                await asyncio.sleep(30)
 
             except Exception as e:
                 self.logger.error(f"Error in connection monitoring: {e}")

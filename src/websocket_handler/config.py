@@ -13,6 +13,7 @@ from src.db.postgres_url import (
 
 from .secrets_manager import SecretsConfig, SecretsManager
 
+
 def _parse_int_env(primary_name: str, fallback_name: Optional[str] = None, default: int = 0) -> int:
     """Parse integer env vars safely, tolerating unresolved templates like '$PORT'."""
     candidates = [primary_name]
@@ -46,6 +47,7 @@ def _parse_int_value(raw_value: Optional[str], default: int) -> int:
     except ValueError:
         return default
 
+
 # Redis and Kafka configuration removed for simplification
 
 
@@ -69,6 +71,14 @@ class WebSocketConfig(BaseModel):
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
     ping_interval: int = Field(default=45, description="Server ping interval in seconds")
     ping_timeout: int = Field(default=30, description="Server ping timeout in seconds")
+    absolute_silence_seconds: int = Field(
+        default=1800,
+        description=(
+            "Kill an OCPP session if no frame has been received for this long, "
+            "even when the WebSocket is still alive at ping/pong layer. Safety "
+            "net for chargers that handshake but never participate."
+        ),
+    )
     message_timeout: int = Field(default=60, description="Message timeout in seconds")
     max_message_size: int = Field(
         default=1048576, description="Maximum message size in bytes (PRD: 1 MB)"
@@ -391,6 +401,7 @@ class Config(BaseModel):
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),
                 ping_interval=int(os.getenv("WEBSOCKET_PING_INTERVAL", "45")),
                 ping_timeout=int(os.getenv("WEBSOCKET_PING_TIMEOUT", "30")),
+                absolute_silence_seconds=int(os.getenv("OCPP_ABSOLUTE_SILENCE_SECONDS", "1800")),
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "1048576")),
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
@@ -398,15 +409,30 @@ class Config(BaseModel):
             timescale=_timescale_config_from_env(secrets_manager),
             supabase=SupabaseConfig(
                 url=secrets_manager.get_secret("SUPABASE_URL") or os.getenv("SUPABASE_URL"),
-                anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY"),
-                service_key=secrets_manager.get_secret("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_KEY"),
-                db_host=secrets_manager.get_secret("SUPABASE_DB_HOST") or os.getenv("SUPABASE_DB_HOST"),
-                db_port=_parse_int_value(secrets_manager.get_secret("SUPABASE_DB_PORT") or os.getenv("SUPABASE_DB_PORT"), 6543),
-                db_name=secrets_manager.get_secret("SUPABASE_DB_NAME") or os.getenv("SUPABASE_DB_NAME", "postgres"),
-                db_user=secrets_manager.get_secret("SUPABASE_DB_USER") or os.getenv("SUPABASE_DB_USER"),
-                db_password=secrets_manager.get_secret("SUPABASE_DB_PASSWORD") or os.getenv("SUPABASE_DB_PASSWORD"),
-                max_connections=int(secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS") or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")),
-                connection_timeout=int(secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT") or os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")),
+                anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY")
+                or os.getenv("SUPABASE_ANON_KEY"),
+                service_key=secrets_manager.get_secret("SUPABASE_SERVICE_KEY")
+                or os.getenv("SUPABASE_SERVICE_KEY"),
+                db_host=secrets_manager.get_secret("SUPABASE_DB_HOST")
+                or os.getenv("SUPABASE_DB_HOST"),
+                db_port=_parse_int_value(
+                    secrets_manager.get_secret("SUPABASE_DB_PORT") or os.getenv("SUPABASE_DB_PORT"),
+                    6543,
+                ),
+                db_name=secrets_manager.get_secret("SUPABASE_DB_NAME")
+                or os.getenv("SUPABASE_DB_NAME", "postgres"),
+                db_user=secrets_manager.get_secret("SUPABASE_DB_USER")
+                or os.getenv("SUPABASE_DB_USER"),
+                db_password=secrets_manager.get_secret("SUPABASE_DB_PASSWORD")
+                or os.getenv("SUPABASE_DB_PASSWORD"),
+                max_connections=int(
+                    secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS")
+                    or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")
+                ),
+                connection_timeout=int(
+                    secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT")
+                    or os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")
+                ),
                 enable_realtime=os.getenv("SUPABASE_ENABLE_REALTIME", "true").lower() == "true",
             ),
             monitoring=MonitoringConfig(
@@ -456,9 +482,7 @@ class Config(BaseModel):
                 enabled=os.getenv("EMAIL_DELIVERY_ENABLED", "true").lower() == "true",
                 resend_api_key=secrets_manager.get_secret("RESEND_API_KEY")
                 or os.getenv("RESEND_API_KEY", ""),
-                resend_from_address=os.getenv(
-                    "RESEND_FROM_ADDRESS", "alerts@favonius.energy"
-                ),
+                resend_from_address=os.getenv("RESEND_FROM_ADDRESS", "alerts@favonius.energy"),
                 poll_interval_s=float(os.getenv("ALERT_DISPATCHER_POLL_INTERVAL_S", "30")),
                 resend_interval_s=int(os.getenv("ALERT_NOTIFY_RESEND_INTERVAL_S", "3600")),
                 batch_size=int(os.getenv("ALERT_DISPATCHER_BATCH_SIZE", "50")),

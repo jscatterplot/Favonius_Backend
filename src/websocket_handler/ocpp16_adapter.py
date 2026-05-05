@@ -32,6 +32,12 @@ from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
 # the charger was offline are flushed within this many seconds of boot.
 REPLAY_BACKOFF_SECONDS = 1.0
 
+# How long to wait for a charger to send its own BootNotification before
+# nudging it via TriggerMessage. Some ABB Terra AC firmwares (and other
+# OCPP 1.6 implementations) skip BootNotification on WebSocket reconnect,
+# leaving the heartbeat interval un-negotiated and the session stuck.
+BOOT_TRIGGER_GRACE_SECONDS = 5.0
+
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
     from .message_handler import MessageHandler
@@ -93,6 +99,7 @@ class OCPP16Session:
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
         self._replay_task: Optional[asyncio.Task[None]] = None
+        self._boot_trigger_task: Optional[asyncio.Task[None]] = None
         self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
         self._telemetry_flush_task: Optional[asyncio.Task[None]] = None
         self._stop_telemetry_flush = asyncio.Event()
@@ -134,13 +141,46 @@ class OCPP16Session:
         """Start processing messages from the charger (blocks until disconnect)."""
         self._stop_telemetry_flush.clear()
         self._telemetry_flush_task = asyncio.create_task(self._flush_telemetry_queue())
+        self._boot_trigger_task = asyncio.create_task(self._force_boot_notification())
         try:
             await self._cp.start()
         finally:
+            if self._boot_trigger_task is not None and not self._boot_trigger_task.done():
+                self._boot_trigger_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._boot_trigger_task
             if self._telemetry_flush_task is not None:
                 self._stop_telemetry_flush.set()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._telemetry_flush_task
+
+    async def _force_boot_notification(self) -> None:
+        """Nudge spec-violating chargers that skip BootNotification on reconnect.
+
+        OCPP 1.6 §4.2 requires the charger to send BootNotification on connect,
+        and the central system's response carries the negotiated heartbeat
+        interval. Some ABB Terra AC firmwares (1.8.x) skip BootNotification on
+        WebSocket reconnects after the initial cold boot, leaving the session
+        with no heartbeat cadence. TriggerMessage(BootNotification) is the
+        spec-sanctioned way to wake them up (OCPP 1.6 §4.18).
+        """
+        try:
+            await asyncio.sleep(BOOT_TRIGGER_GRACE_SECONDS)
+            if self._cp.last_boot_at is not None:
+                return
+            status = await self._cp.trigger_message("BootNotification")
+            logger.info(
+                "force_boot_notification station=%s status=%s",
+                self._station_id,
+                status,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "force_boot_notification failed for station=%s",
+                self._station_id,
+            )
 
     # ------------------------------------------------------------------
     # Outgoing commands (matches EnhancedOCPPChargePoint's interface)

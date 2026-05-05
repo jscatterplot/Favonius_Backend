@@ -28,6 +28,7 @@ class TestConnectionManager:
         config.websocket.max_connections = 100
         config.websocket.heartbeat_interval = 30
         config.websocket.message_timeout = 60
+        config.websocket.absolute_silence_seconds = 1800
         config.monitoring = Mock()
         config.monitoring.expected_stations = 100
         return config
@@ -309,6 +310,75 @@ class TestConnectionManager:
 
         # Should complete without error
         assert True
+
+    async def _run_monitor_once(self, cm):
+        """Drive a single sweep of _monitor_connections without the loop."""
+        cm._running = True
+        task = asyncio.create_task(cm._monitor_connections())
+        await asyncio.sleep(0.05)
+        cm._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_monitor_skips_kill_when_websocket_alive_and_recent(
+        self, connection_manager, mock_websocket
+    ):
+        """OCPP-frame-quiet but WS-alive within absolute cap → leave alone.
+
+        Regression for ABB Terra AC chargers that go minutes between
+        StatusNotifications while the WS layer is healthy via ping/pong.
+        """
+        mock_websocket.closed = False
+        await connection_manager.register_connection(
+            "ABB_QUIET", "conn_abb", "127.0.0.1", mock_websocket
+        )
+        # Push the OCPP-frame clock past the 90 s quiet threshold but well
+        # under the 1800 s absolute-silence cap.
+        connection_manager.last_heartbeats["ABB_QUIET"] = time.time() - 200
+
+        await self._run_monitor_once(connection_manager)
+
+        mock_websocket.close.assert_not_called()
+        assert "ABB_QUIET" in connection_manager.station_connections
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_monitor_kills_when_websocket_closed(self, connection_manager, mock_websocket):
+        """OCPP-quiet AND WS reports closed → unregister immediately.
+
+        The kill path skips ``websocket.close`` when the socket is already
+        reported closed, so the contract is "the station is gone", not "we
+        called close". See ``_mark_connection_for_cleanup``.
+        """
+        mock_websocket.closed = True
+        await connection_manager.register_connection(
+            "DEAD_WS", "conn_dead", "127.0.0.1", mock_websocket
+        )
+        connection_manager.last_heartbeats["DEAD_WS"] = time.time() - 200
+
+        await self._run_monitor_once(connection_manager)
+
+        assert "DEAD_WS" not in connection_manager.station_connections
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_monitor_kills_at_absolute_silence_cap(self, connection_manager, mock_websocket):
+        """WS alive but completely silent past the absolute cap → kill anyway."""
+        mock_websocket.closed = False
+        await connection_manager.register_connection(
+            "STUCK", "conn_stuck", "127.0.0.1", mock_websocket
+        )
+        connection_manager.last_heartbeats["STUCK"] = time.time() - 3600
+
+        await self._run_monitor_once(connection_manager)
+
+        mock_websocket.close.assert_awaited()
+        assert "STUCK" not in connection_manager.station_connections
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
