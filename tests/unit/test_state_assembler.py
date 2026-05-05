@@ -1384,6 +1384,42 @@ class TestLoadDepotConfigAccessMode:
         last_sql = mock_conn.fetch.call_args_list[-1].args[0]
         assert "FROM charger_vehicle_access" in last_sql
 
+    @pytest.mark.asyncio
+    async def test_zero_vehicles_returns_empty_config(
+        self, mock_db_pools, mock_db_pool
+    ):
+        """A depot with no vehicles must load successfully with empty maps.
+
+        Onboarding depots can be created before any vehicle is added; the
+        dashboard endpoints (/state, /optimization/readiness) must still
+        respond 200 so the FE can render an empty-state CTA. Hard-failing
+        here previously cascaded into a 500 via _get_depot_config's brittle
+        substring matching.
+        """
+        depot_id = str(uuid4())
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        mock_conn.fetchrow.side_effect = [
+            self._depot_row(access_default="explicit_matrix"),
+            None,  # battery_storage row
+        ]
+        mock_conn.fetch.side_effect = [
+            [],  # vehicles — empty
+            [],  # chargers grouped — empty (defaults applied)
+            [],  # access matrix — empty
+        ]
+
+        config, vehicle_to_ocpp = await StateAssembler.load_depot_config(
+            mock_db_pools, depot_id
+        )
+
+        assert config.vehicle_capacities == {}
+        assert config.vehicle_max_charge_kw == {}
+        assert vehicle_to_ocpp == {}
+        # Site-level config still loaded correctly.
+        assert config.max_site_power == 800.0
+
 
 class TestCumulativeKwhPeriod:
     """Tests for cumulative billing-period energy integration."""

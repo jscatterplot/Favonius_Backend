@@ -173,6 +173,56 @@ class TestDepotStateEndpoint:
         response = client.get("/depots/not-a-uuid/state")
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
 
+    @patch("src.api.main.db_pools")
+    @patch("src.api.main._get_depot_config")
+    @patch("src.api.main.StateAssembler")
+    def test_get_depot_state_empty_depot(
+        self,
+        mock_assembler_class,
+        mock_get_config,
+        mock_pool,
+        client,
+        sample_depot_config,
+    ):
+        """Depot with 0 vehicles must return 200 with empty vehicle_socs.
+
+        Onboarding depots can be created before any vehicle is added; the
+        dashboard must render so the FE can prompt the user to complete
+        setup. Previously this 500'd via _get_depot_config's hard guard.
+        """
+        from src.core.models import DepotState
+
+        empty_config = sample_depot_config
+        empty_config.vehicle_capacities = {}
+        empty_config.vehicle_max_charge_kw = {}
+        mock_get_config.return_value = empty_config
+
+        empty_state = DepotState(
+            vehicle_socs={},
+            battery_soc=0.5,
+            prices=[0.10] * 96,
+            demand_charge_rate=20.0,
+            current_month_peak=0.0,
+            vehicle_availability={},
+            energy_requirements={},
+            departure_times={},
+            building_power=[0.0] * 96,
+        )
+
+        mock_assembler = AsyncMock()
+        mock_assembler.get_current_state = AsyncMock(return_value=empty_state)
+        mock_assembler_class.return_value = mock_assembler
+
+        depot_id = str(uuid4())
+        with patch("src.api.main.db_pools", MagicMock()):
+            response = client.get(f"/depots/{depot_id}/state")
+
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert data["depot_id"] == depot_id
+        assert data["vehicle_socs"] == {}
+        assert data["current_month_peak_kw"] == 0.0
+
 
 class TestOptimizationReadinessEndpoint:
     """Test /depots/{id}/optimization/readiness endpoint."""
