@@ -192,6 +192,60 @@ async def test_set_charging_profile_rejects_relative_chargepointmaxprofile(
 
 
 @pytest.mark.asyncio
+async def test_route_message_invokes_on_message_received(mock_websocket, sample_charge_point_id):
+    """Liveness hook fires for every received OCPP frame.
+
+    The websocket-handler stale-connection sweeper relies on this to keep
+    OCPP 1.6 sockets alive when the charger sends only StatusNotification
+    or MeterValues between Heartbeats.
+    """
+    received = []
+
+    async def on_msg() -> None:
+        received.append(True)
+
+    cp = FleetChargePoint(
+        sample_charge_point_id,
+        mock_websocket,
+        on_message_received=on_msg,
+    )
+    # Bypass the upstream library router; we only care that the hook fires.
+    with patch("ocpp.v16.ChargePoint.route_message", new=AsyncMock()):
+        await cp.route_message('[2,"abc","Heartbeat",{}]')
+        await cp.route_message('[2,"def","StatusNotification",{}]')
+
+    assert len(received) == 2
+
+
+@pytest.mark.asyncio
+async def test_route_message_swallows_callback_exceptions(mock_websocket, sample_charge_point_id):
+    """A failing liveness hook must never break message routing."""
+
+    async def on_msg() -> None:
+        raise RuntimeError("connection_manager unavailable")
+
+    cp = FleetChargePoint(
+        sample_charge_point_id,
+        mock_websocket,
+        on_message_received=on_msg,
+    )
+    with patch("ocpp.v16.ChargePoint.route_message", new=AsyncMock()) as upstream:
+        await cp.route_message('[2,"abc","Heartbeat",{}]')
+        upstream.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_route_message_works_without_on_message_received(
+    mock_websocket, sample_charge_point_id
+):
+    """The hook is optional — existing call sites must keep working."""
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
+    with patch("ocpp.v16.ChargePoint.route_message", new=AsyncMock()) as upstream:
+        await cp.route_message('[2,"abc","Heartbeat",{}]')
+        upstream.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_remote_start_stop_transaction(mock_websocket, sample_charge_point_id):
     """Test RemoteStartTransaction and RemoteStopTransaction."""
     cp = FleetChargePoint(sample_charge_point_id, mock_websocket)

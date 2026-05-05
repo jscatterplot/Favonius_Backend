@@ -33,6 +33,7 @@ from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
 REPLAY_BACKOFF_SECONDS = 1.0
 
 if TYPE_CHECKING:
+    from .connection_manager import ConnectionManager
     from .message_handler import MessageHandler
     from .timescale_client import TimescaleClient
 
@@ -72,11 +73,20 @@ class OCPP16Session:
         websocket: Any,
         timescale_client: "TimescaleClient",
         message_handler: "MessageHandler",
+        connection_manager: Optional["ConnectionManager"] = None,
     ) -> None:
-        """Initialise the session and wire all FleetChargePoint callbacks."""
+        """Initialise the session and wire all FleetChargePoint callbacks.
+
+        ``connection_manager`` is optional only so that targeted unit tests
+        can construct a session without spinning up the full handler stack.
+        Production wiring (``OCPPWebSocketServer``) always passes one — it
+        is required for the stale-connection sweeper to see incoming OCPP
+        traffic on this socket.
+        """
         self._station_id = station_id
         self._timescale = timescale_client
         self._message_handler = message_handler
+        self._connection_manager = connection_manager
         # Single-slot stash for the most recent accepted StartTransaction so
         # ``_next_transaction_id`` can persist the open ``charging_sessions``
         # row alongside the generated tx_id. Safe because FleetChargePoint
@@ -96,8 +106,25 @@ class OCPP16Session:
             on_transaction_start=self._on_transaction_start,
             on_transaction_stop=self._on_transaction_stop,
             on_authorize=self._on_authorize,
+            on_message_received=self._on_message_received,
             tx_id_provider=self._next_transaction_id,
         )
+
+    async def _on_message_received(self) -> None:
+        """Refresh the connection-manager liveness clock on every OCPP frame.
+
+        OCPP 1.6 chargers vary widely in Heartbeat cadence (the spec only
+        requires "at least every Heartbeat interval", which BootNotification
+        sets to 300s). Without this hook the websocket handler's stale
+        sweeper kills the socket after ~90s even though MeterValues and
+        StatusNotification are flowing.
+        """
+        if self._connection_manager is None:
+            return
+        try:
+            await self._connection_manager.update_heartbeat(self._station_id)
+        except Exception:
+            logger.exception("update_heartbeat failed for station=%s", self._station_id)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -174,9 +201,7 @@ class OCPP16Session:
             accepted = await self._cp.set_charging_profile(
                 connector_id=evse_id,
                 charging_schedule=schedule_periods,
-                profile_purpose=charging_profile.get(
-                    "chargingProfilePurpose", "TxDefaultProfile"
-                ),
+                profile_purpose=charging_profile.get("chargingProfilePurpose", "TxDefaultProfile"),
                 profile_kind=charging_profile.get("chargingProfileKind", "Absolute"),
                 charging_rate_unit=charging_rate_unit,
                 stack_level=charging_profile.get("stackLevel", 0),
@@ -184,9 +209,9 @@ class OCPP16Session:
             )
         except Exception as exc:
             try:
-                PROFILE_PUSH_LATENCY.labels(
-                    station_id=self._station_id, outcome="raised"
-                ).observe(max(time.monotonic() - push_start, 1e-6))
+                PROFILE_PUSH_LATENCY.labels(station_id=self._station_id, outcome="raised").observe(
+                    max(time.monotonic() - push_start, 1e-6)
+                )
             except Exception:
                 pass
             if not allow_enqueue:
@@ -268,9 +293,7 @@ class OCPP16Session:
                 payload = _json.loads(payload)
             connector_id = row["connector_id"]
             try:
-                ok = await self.send_charging_profile(
-                    connector_id, payload, allow_enqueue=False
-                )
+                ok = await self.send_charging_profile(connector_id, payload, allow_enqueue=False)
             except Exception as exc:
                 try:
                     await self._timescale.mark_command_failed(queue_id, str(exc))
@@ -307,9 +330,7 @@ class OCPP16Session:
                         exc,
                     )
         if sent:
-            logger.info(
-                "Replayed %d queued command(s) to station=%s", sent, self._station_id
-            )
+            logger.info("Replayed %d queued command(s) to station=%s", sent, self._station_id)
         return sent
 
     # ------------------------------------------------------------------
@@ -425,9 +446,8 @@ class OCPP16Session:
             open_rows = await self._timescale.fetch_open_sessions(cp_id)
         except Exception as exc:
             open_rows = []
-            logger.error(
-                "fetch_open_sessions failed for station=%s: %s", cp_id, exc
-            )
+            logger.error("fetch_open_sessions failed for station=%s: %s", cp_id, exc)
+
         def _session_start(row: Dict[str, Any]) -> datetime:
             start_time = row.get("start_time")
             if isinstance(start_time, datetime):
@@ -776,7 +796,9 @@ class OCPP16Session:
                     parsed_ts = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
                     pass
-                for sampled in meter_value.get("sampledValue", meter_value.get("sampled_value", [])):
+                for sampled in meter_value.get(
+                    "sampledValue", meter_value.get("sampled_value", [])
+                ):
                     try:
                         parsed_value = float(sampled.get("value", "0"))
                     except (TypeError, ValueError):

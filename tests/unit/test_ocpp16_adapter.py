@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Import-path regression test
 # ---------------------------------------------------------------------------
@@ -76,7 +75,12 @@ def mock_timescale() -> MagicMock:
     tc = MagicMock()
     tc.insert_telemetry_batch = AsyncMock()
     tc.lookup_id_tag = AsyncMock(
-        return_value={"vehicle_id": "vehicle-1", "depot_id": "depot-1", "driver_id": None, "card_id": None}
+        return_value={
+            "vehicle_id": "vehicle-1",
+            "depot_id": "depot-1",
+            "driver_id": None,
+            "card_id": None,
+        }
     )
     tc.next_transaction_id = AsyncMock(return_value=4242)
     tc.next_charging_profile_id = AsyncMock(return_value=123456)
@@ -121,6 +125,86 @@ class TestOCPP16SessionInit:
         assert result is False
 
 
+class TestOCPP16SessionLiveness:
+    """The session must refresh ``connection_manager.last_heartbeats`` on
+    every received OCPP frame so the websocket-handler stale sweeper does
+    not kill chargers that send only StatusNotification/MeterValues."""
+
+    @pytest.mark.asyncio
+    async def test_message_hook_calls_update_heartbeat(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        cm = MagicMock()
+        cm.update_heartbeat = AsyncMock()
+        s = OCPP16Session(
+            station_id="liveness_001",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            connection_manager=cm,
+        )
+        await s._on_message_received()
+        cm.update_heartbeat.assert_awaited_once_with("liveness_001")
+
+    @pytest.mark.asyncio
+    async def test_message_hook_swallows_connection_manager_failure(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        cm = MagicMock()
+        cm.update_heartbeat = AsyncMock(side_effect=RuntimeError("redis down"))
+        s = OCPP16Session(
+            station_id="liveness_002",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            connection_manager=cm,
+        )
+        # Must not raise — message routing must keep working.
+        await s._on_message_received()
+
+    @pytest.mark.asyncio
+    async def test_message_hook_is_noop_without_connection_manager(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        s = OCPP16Session(
+            station_id="liveness_003",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+        )
+        # No connection_manager passed — must not raise.
+        await s._on_message_received()
+
+    @pytest.mark.asyncio
+    async def test_session_passes_message_hook_to_fleet_charge_point(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """Calling the wired hook on FleetChargePoint must reach the
+        connection_manager — proves the wiring without depending on
+        bound-method identity."""
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        cm = MagicMock()
+        cm.update_heartbeat = AsyncMock()
+        s = OCPP16Session(
+            station_id="liveness_004",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            connection_manager=cm,
+        )
+
+        assert s._cp._cb_message_received is not None
+        await s._cp._cb_message_received()
+        cm.update_heartbeat.assert_awaited_once_with("liveness_004")
+
+
 class TestOCPP16SessionCallbacks:
     @pytest.mark.asyncio
     async def test_on_boot_logs_without_error(self, session, caplog) -> None:
@@ -137,9 +221,7 @@ class TestOCPP16SessionCallbacks:
         assert "test_station_001" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_on_meter_values_writes_telemetry(
-        self, session, mock_timescale
-    ) -> None:
+    async def test_on_meter_values_writes_telemetry(self, session, mock_timescale) -> None:
         ts = datetime.now(tz=timezone.utc)
         await session._on_meter_values(
             cp_id="test_station_001",
@@ -179,9 +261,7 @@ class TestOCPP16SessionCallbacks:
         )
 
     @pytest.mark.asyncio
-    async def test_on_status_change_pushes_event(
-        self, session, mock_message_handler
-    ) -> None:
+    async def test_on_status_change_pushes_event(self, session, mock_message_handler) -> None:
         await session._on_status_change(
             cp_id="test_station_001",
             connector_id=1,
@@ -288,9 +368,7 @@ class TestOCPP16SessionCallbacks:
         mock_timescale.next_transaction_id.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_on_transaction_stop_pushes_event(
-        self, session, mock_message_handler
-    ) -> None:
+    async def test_on_transaction_stop_pushes_event(self, session, mock_message_handler) -> None:
         await session._on_transaction_stop(
             cp_id="test_station_001",
             transaction_id=99,
@@ -389,9 +467,9 @@ class TestServerRoutesOCPP16Correctly:
         # This assertion is the canonical check: if True, the branch that
         # creates OCPP16Session is reachable. If False, every 1.6 charger
         # gets an EnhancedOCPPChargePoint and the schema storm occurs.
-        assert OCPP16_AVAILABLE is True, (
-            "OCPP16_AVAILABLE is False — server will misroute OCPP 1.6 chargers"
-        )
+        assert (
+            OCPP16_AVAILABLE is True
+        ), "OCPP16_AVAILABLE is False — server will misroute OCPP 1.6 chargers"
         # Confirm OCPP16Session itself is the right type (not NoneType)
         assert OCPP16Session is not None
 
@@ -466,9 +544,7 @@ class TestOCPP16SessionRecovery:
         self, session, mock_timescale
     ) -> None:
         """``allow_enqueue=False`` (the replay path) must propagate exceptions."""
-        session._cp.set_charging_profile = AsyncMock(
-            side_effect=RuntimeError("ws closed")
-        )
+        session._cp.set_charging_profile = AsyncMock(side_effect=RuntimeError("ws closed"))
         mock_timescale.enqueue_charging_command = AsyncMock()
 
         with pytest.raises(RuntimeError):
@@ -494,9 +570,7 @@ class TestOCPP16SessionRecovery:
                         "chargingProfileKind": "Absolute",
                         "chargingSchedule": {
                             "chargingRateUnit": "W",
-                            "chargingSchedulePeriod": [
-                                {"startPeriod": 0, "limit": 1000}
-                            ],
+                            "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 1000}],
                         },
                     },
                     "attempt_count": 0,
@@ -574,16 +648,12 @@ class TestOCPP16SessionRecovery:
     async def test_replay_queued_commands_tolerates_fetch_failure(
         self, session, mock_timescale
     ) -> None:
-        mock_timescale.fetch_pending_commands = AsyncMock(
-            side_effect=RuntimeError("db down")
-        )
+        mock_timescale.fetch_pending_commands = AsyncMock(side_effect=RuntimeError("db down"))
         sent = await session.replay_queued_commands()
         assert sent == 0
 
     @pytest.mark.asyncio
-    async def test_on_boot_reloads_transactions_from_db(
-        self, session, mock_timescale
-    ) -> None:
+    async def test_on_boot_reloads_transactions_from_db(self, session, mock_timescale) -> None:
         mock_timescale.fetch_open_sessions = AsyncMock(
             return_value=[
                 {"transaction_id": 555, "connector_id": 1},
@@ -605,9 +675,7 @@ class TestOCPP16SessionRecovery:
         assert session._cp.transactions[2] == 556
 
     @pytest.mark.asyncio
-    async def test_on_boot_cancels_previous_delayed_replay(
-        self, session, mock_timescale
-    ) -> None:
+    async def test_on_boot_cancels_previous_delayed_replay(self, session, mock_timescale) -> None:
         mock_timescale.fetch_open_sessions = AsyncMock(return_value=[])
         previous = MagicMock()
         previous.done.return_value = False
@@ -654,12 +722,8 @@ class TestOCPP16SessionRecovery:
         assert session._cp.current_transaction_id == 556
 
     @pytest.mark.asyncio
-    async def test_on_boot_tolerates_fetch_failure(
-        self, session, mock_timescale
-    ) -> None:
-        mock_timescale.fetch_open_sessions = AsyncMock(
-            side_effect=RuntimeError("db down")
-        )
+    async def test_on_boot_tolerates_fetch_failure(self, session, mock_timescale) -> None:
+        mock_timescale.fetch_open_sessions = AsyncMock(side_effect=RuntimeError("db down"))
         # Should not raise — failures are best-effort.
         await session._on_boot(
             cp_id="test_station_001",
@@ -689,12 +753,8 @@ class TestOCPP16SessionRecovery:
         assert payload["error_code"] == "NoError"
 
     @pytest.mark.asyncio
-    async def test_on_status_change_tolerates_db_failure(
-        self, session, mock_timescale
-    ) -> None:
-        mock_timescale.insert_connector_status = AsyncMock(
-            side_effect=RuntimeError("db down")
-        )
+    async def test_on_status_change_tolerates_db_failure(self, session, mock_timescale) -> None:
+        mock_timescale.insert_connector_status = AsyncMock(side_effect=RuntimeError("db down"))
         # Must not raise; status pushes still continue downstream.
         await session._on_status_change(
             cp_id="test_station_001",
@@ -705,9 +765,7 @@ class TestOCPP16SessionRecovery:
         )
 
     @pytest.mark.asyncio
-    async def test_on_transaction_stop_closes_session_row(
-        self, session, mock_timescale
-    ) -> None:
+    async def test_on_transaction_stop_closes_session_row(self, session, mock_timescale) -> None:
         mock_timescale.close_open_session = AsyncMock()
 
         await session._on_transaction_stop(
@@ -783,4 +841,3 @@ class TestOCPP16SessionRecovery:
 
         assert tx_id == 1
         mock_timescale.insert_open_session.assert_not_called()
-
