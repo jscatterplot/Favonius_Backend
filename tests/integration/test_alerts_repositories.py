@@ -40,29 +40,17 @@ async def db_pool():
 
 @pytest_asyncio.fixture
 async def org_and_depot(db_pool):
+    """Yield (org_id, depot_id) as plain UUIDs.
+
+    After migration 029 the static shadow tables are gone; organization_id and
+    depot_id are unvalidated UUID references in notification_alerts.
+    """
     org_id = uuid4()
     depot_id = uuid4()
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO organizations (organization_id, name) VALUES ($1, $2)",
-            org_id,
-            "Repos Test Org",
-        )
-        await conn.execute(
-            """
-            INSERT INTO depots (depot_id, name, latitude, longitude, max_grid_kw, organization_id)
-            VALUES ($1, $2, 37.0, -122.0, 500.0, $3)
-            """,
-            depot_id,
-            "Repos Test Depot",
-            org_id,
-        )
     yield org_id, depot_id
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM notification_alerts WHERE organization_id = $1", org_id)
         await conn.execute("DELETE FROM notification_recipients WHERE organization_id = $1", org_id)
-        await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
-        await conn.execute("DELETE FROM organizations WHERE organization_id = $1", org_id)
 
 
 async def _insert_alert(
@@ -433,13 +421,10 @@ class TestRecipientsListForAlert:
     @pytest.mark.asyncio
     async def test_other_org_recipients_not_returned(self, db_pool, org_and_depot):
         org_id, _ = org_and_depot
+        # After migration 029 organizations shadow is dropped; other_org_id is an
+        # unvalidated UUID reference (no FK on notification_recipients.organization_id).
         other_org_id = uuid4()
         async with db_pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO organizations (organization_id, name) VALUES ($1, $2)",
-                other_org_id,
-                "Other org",
-            )
             try:
                 await recipients_repo.create(
                     conn, organization_id=other_org_id, email="other@x.com"
@@ -455,9 +440,6 @@ class TestRecipientsListForAlert:
                 await conn.execute(
                     "DELETE FROM notification_recipients WHERE organization_id = $1",
                     other_org_id,
-                )
-                await conn.execute(
-                    "DELETE FROM organizations WHERE organization_id = $1", other_org_id
                 )
 
 
