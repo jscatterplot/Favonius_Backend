@@ -217,6 +217,7 @@ class OCPPWebSocketServer:
             # reporting spurious failures during the startup grace period.
             try:
                 from .health_checks import notify_websocket_ready
+
                 notify_websocket_ready()
             except Exception:
                 pass
@@ -308,9 +309,7 @@ class OCPPWebSocketServer:
             security_config,
             static_auth_client=self.supabase_client,
         )
-        self.logger.info(
-            "Security manager initialized (require_auth=%s)", require_auth
-        )
+        self.logger.info("Security manager initialized (require_auth=%s)", require_auth)
 
         _environment = os.getenv("ENVIRONMENT", "development")
         if _environment == "production" and not require_auth:
@@ -388,10 +387,7 @@ class OCPPWebSocketServer:
         if self._trust_private_proxy_headers:
             if ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local:
                 return True
-            if (
-                isinstance(ip_addr, ipaddress.IPv4Address)
-                and ip_addr in _CGNAT_NETWORK
-            ):
+            if isinstance(ip_addr, ipaddress.IPv4Address) and ip_addr in _CGNAT_NETWORK:
                 return True
 
         return any(ip_addr in network for network in self._trusted_proxy_networks)
@@ -418,9 +414,7 @@ class OCPPWebSocketServer:
     def _release_client_ip(self, client_ip: str) -> None:
         """Decrement per-IP connection accounting for a rejected or closed connection."""
         if client_ip in self._ip_connection_count:
-            self._ip_connection_count[client_ip] = max(
-                0, self._ip_connection_count[client_ip] - 1
-            )
+            self._ip_connection_count[client_ip] = max(0, self._ip_connection_count[client_ip] - 1)
             if self._ip_connection_count[client_ip] == 0:
                 del self._ip_connection_count[client_ip]
 
@@ -448,9 +442,7 @@ class OCPPWebSocketServer:
                     geo_result.country_code,
                     geo_result.reason,
                 )
-                ERRORS_TOTAL.labels(
-                    error_type="geo_blocked", station_id="unknown"
-                ).inc()
+                ERRORS_TOTAL.labels(error_type="geo_blocked", station_id="unknown").inc()
                 await websocket.close(1008, "Access denied")
                 return
 
@@ -682,11 +674,11 @@ class OCPPWebSocketServer:
             if not auth_ok:
                 self.logger.warning(
                     "Authentication failed for station %s from %s: %s",
-                    station_id, client_ip, auth_error,
+                    station_id,
+                    client_ip,
+                    auth_error,
                 )
-                ERRORS_TOTAL.labels(
-                    error_type="auth_failed", station_id=station_id
-                ).inc()
+                ERRORS_TOTAL.labels(error_type="auth_failed", station_id=station_id).inc()
                 await websocket.close(1008, "Authentication failed")
                 self._release_client_ip(client_ip)
                 self._connection_client_ips.pop(connection_id, None)
@@ -718,6 +710,7 @@ class OCPPWebSocketServer:
                 websocket=websocket,
                 timescale_client=self.timescale_client,
                 message_handler=self.message_handler,
+                connection_manager=self.connection_manager,
             )
         else:
             charge_point = EnhancedOCPPChargePoint(

@@ -221,6 +221,7 @@ class FleetChargePoint(CP16):
         on_diagnostics_status: Optional[Callable] = None,
         on_firmware_status: Optional[Callable] = None,
         on_data_transfer: Optional[Callable] = None,
+        on_message_received: Optional[Callable[[], Awaitable[None]]] = None,
         tx_id_provider: Optional[Callable[[], Awaitable[int]]] = None,
     ):
         """Initialize FleetChargePoint.
@@ -237,6 +238,10 @@ class FleetChargePoint(CP16):
             on_diagnostics_status: Callback for diagnostics status
             on_firmware_status: Callback for firmware status
             on_data_transfer: Callback for data transfer messages
+            on_message_received: Liveness hook fired on every received OCPP
+                frame. The websocket-handler stale-connection sweeper relies
+                on this to keep OCPP 1.6 sockets alive when the charger sends
+                only StatusNotification / MeterValues between Heartbeats.
             tx_id_provider: Async callable returning the next transactionId
                 (back this with a DB sequence in production so IDs survive
                 restarts). Falls back to an in-memory monotonic counter.
@@ -251,6 +256,7 @@ class FleetChargePoint(CP16):
         self._cb_diagnostics = on_diagnostics_status
         self._cb_firmware = on_firmware_status
         self._cb_data_transfer = on_data_transfer
+        self._cb_message_received = on_message_received
         self._tx_id_provider = tx_id_provider
 
         # Backward-compatible attribute names (used by OCPPServer)
@@ -290,6 +296,12 @@ class FleetChargePoint(CP16):
                 action = parsed[2]
         except Exception:
             pass
+
+        if self._cb_message_received is not None:
+            try:
+                await self._cb_message_received()
+            except Exception:
+                logger.exception("on_message_received callback failed for %s", self.id)
 
         if structlog is not None:
             try:
