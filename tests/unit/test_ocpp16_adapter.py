@@ -205,6 +205,38 @@ class TestOCPP16SessionLiveness:
         cm.update_heartbeat.assert_awaited_once_with("liveness_004")
 
 
+class TestOCPP16SessionForceBootNotification:
+    """Workaround for ABB Terra AC firmware (1.8.x) and similar OCPP 1.6
+    chargers that skip BootNotification on WebSocket reconnect."""
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_charger_already_booted(self, session, monkeypatch) -> None:
+        """If BootNotification already arrived organically, don't nudge."""
+        from datetime import datetime, timezone
+
+        session._cp.last_boot_at = datetime.now(timezone.utc)
+        session._cp.trigger_message = AsyncMock()
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
+        await session._force_boot_notification()
+        session._cp.trigger_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sends_trigger_message_when_no_boot_seen(self, session, monkeypatch) -> None:
+        session._cp.last_boot_at = None
+        session._cp.trigger_message = AsyncMock(return_value="Accepted")
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
+        await session._force_boot_notification()
+        session._cp.trigger_message.assert_awaited_once_with("BootNotification")
+
+    @pytest.mark.asyncio
+    async def test_swallows_trigger_message_failure(self, session, monkeypatch) -> None:
+        """A broken charger that ignores TriggerMessage must not crash the session."""
+        session._cp.last_boot_at = None
+        session._cp.trigger_message = AsyncMock(side_effect=RuntimeError("boom"))
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
+        await session._force_boot_notification()  # must not raise
+
+
 class TestOCPP16SessionCallbacks:
     @pytest.mark.asyncio
     async def test_on_boot_logs_without_error(self, session, caplog) -> None:

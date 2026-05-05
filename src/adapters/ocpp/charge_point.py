@@ -286,15 +286,6 @@ class FleetChargePoint(CP16):
 
     async def route_message(self, message: str) -> None:
         """Route incoming OCPP message with bound structured logging context."""
-        # TEMP diagnostic for hrx-vilnius silent-charger investigation. Logs raw
-        # frame bytes (truncated) before any parsing so malformed/non-JSON frames
-        # are visible too. Remove once root cause is identified.
-        logger.info(
-            "ocpp_raw_frame station=%s len=%d head=%.200s",
-            self.id,
-            len(message),
-            message,
-        )
         call_id = None
         action = None
         try:
@@ -1055,10 +1046,10 @@ class FleetChargePoint(CP16):
         unknown-vendor-before-boot) chargers, the call is refused with
         ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
-        if (
-            _requires_abb_safe_measurands(self.vendor)
-            and key in {"MeterValuesSampledData", "MeterValuesAlignedData"}
-        ):
+        if _requires_abb_safe_measurands(self.vendor) and key in {
+            "MeterValuesSampledData",
+            "MeterValuesAlignedData",
+        }:
             requested = {m.strip() for m in value.split(",") if m.strip()}
             unsupported = requested - _ABB_SAFE_MEASURANDS
             if unsupported:
