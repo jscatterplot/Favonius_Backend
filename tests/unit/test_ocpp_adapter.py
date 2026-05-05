@@ -87,6 +87,60 @@ async def test_boot_notification_handler(mock_websocket, sample_charge_point_id)
 
 
 @pytest.mark.asyncio
+async def test_boot_notification_invokes_callback_without_kwarg_clash(
+    mock_websocket, sample_charge_point_id
+):
+    """Regression: ``firmware_version`` must not be passed twice to the callback.
+
+    The python-ocpp library forwards every BootNotification field into kwargs
+    (snake-cased), including ``firmware_version``. Passing it positionally AND
+    via ``**kwargs`` raised ``TypeError: multiple values for argument
+    'firmware_version'`` and silently swallowed the cross-restart recovery
+    work in OCPP16Session._on_boot.
+    """
+    captured = {}
+
+    async def cb(cp_id, vendor, model, serial_number, firmware_version, **kwargs):
+        captured.update(
+            cp_id=cp_id,
+            vendor=vendor,
+            model=model,
+            serial_number=serial_number,
+            firmware_version=firmware_version,
+            extra_kwargs=kwargs,
+        )
+
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket, on_boot=cb)
+    response = await cp.on_boot_notification(
+        "ABB",
+        "TerraAC",
+        charge_point_serial_number="TACW1141622G1433",
+        firmware_version="V1.8.36",
+        iccid="89000000000000000000",
+    )
+
+    assert isinstance(response, call_result.BootNotification)
+    assert captured["firmware_version"] == "V1.8.36"
+    assert captured["serial_number"] == "TACW1141622G1433"
+    # firmware_version must be stripped from kwargs to prevent the TypeError;
+    # other extra fields (charge_point_serial_number, iccid, ...) must survive.
+    assert "firmware_version" not in captured["extra_kwargs"]
+    assert captured["extra_kwargs"].get("iccid") == "89000000000000000000"
+
+
+@pytest.mark.asyncio
+async def test_security_event_notification_handler(mock_websocket, sample_charge_point_id):
+    """ABB Terra AC sends StartupOfTheDevice / SettingSystemTime; we must ack."""
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
+    response = await cp.on_security_event_notification(
+        type="StartupOfTheDevice",
+        timestamp="2026-05-04T15:43:41.000Z",
+        tech_info="ocppBoot",
+    )
+    assert isinstance(response, call_result.SecurityEventNotification)
+
+
+@pytest.mark.asyncio
 async def test_status_notification_handler(mock_websocket, sample_charge_point_id):
     """Test StatusNotification handler with callback."""
     callback_called = False
