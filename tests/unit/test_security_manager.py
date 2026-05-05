@@ -65,9 +65,7 @@ class TestSecurityManager:
         assert manager.cert_validation_cache == {}
 
     @pytest.mark.timeout(10)
-    def test_security_manager_uses_static_auth_client(
-        self, mock_timescale_client, security_config
-    ):
+    def test_security_manager_uses_static_auth_client(self, mock_timescale_client, security_config):
         """Static OCPP auth reads can be sourced from Supabase."""
         static_auth_client = Mock()
 
@@ -162,9 +160,7 @@ class TestSecurityManager:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
-    async def test_non_provisioned_basic_auth_allows_alias_username(
-        self, security_manager
-    ):
+    async def test_non_provisioned_basic_auth_allows_alias_username(self, security_manager):
         """Non-provisioned stations still require canonical id or alias as Basic Auth username."""
         station_id = "legacy-station-001"
         auth_data = {"username": "operator-user", "password": "valid_password"}
@@ -192,9 +188,7 @@ class TestSecurityManager:
         assert success is True
         assert error is None
         username_allowed.assert_awaited_once_with(station_id, "operator-user")
-        validate_basic_auth.assert_awaited_once_with(
-            station_id, "operator-user", "valid_password"
-        )
+        validate_basic_auth.assert_awaited_once_with(station_id, "operator-user", "valid_password")
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -239,9 +233,7 @@ class TestSecurityManager:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
-    async def test_production_basic_auth_accepts_configured_username_alias(
-        self, security_manager
-    ):
+    async def test_production_basic_auth_accepts_configured_username_alias(self, security_manager):
         """Onboarded production chargers may use an active vendor username alias."""
         station_id = "hrx-uab_hrx-vilnius-001"
         auth_data = {"username": "TACW1141622G1433", "password": "valid_password"}
@@ -270,8 +262,7 @@ class TestSecurityManager:
         assert error is None
         assert username_allowed.await_count == 1
         assert all(
-            c == ((station_id, "TACW1141622G1433"), {})
-            for c in username_allowed.await_args_list
+            c == ((station_id, "TACW1141622G1433"), {}) for c in username_allowed.await_args_list
         )
         validate_basic_auth.assert_awaited_once_with(
             station_id, "TACW1141622G1433", "valid_password"
@@ -631,3 +622,115 @@ class TestSecurityEnums:
         assert AuthenticationMethod.CLIENT_CERTIFICATE.value == "ClientCertificate"
         assert AuthenticationMethod.API_KEY.value == "ApiKey"
         assert AuthenticationMethod.OAUTH2.value == "OAuth2"
+
+
+class TestChargerAuthFailureAlertSql:
+    """Regression test: alert helpers must query the local TimescaleDB
+    schema (chargers/depots), not the Supabase static-data schema
+    (charging_stations/sites). The legacy WS handler's pg_pool only
+    sees TimescaleDB, so the wrong table names raise UndefinedTableError
+    on every successful auth and spam the logs (see incident 2026-05-05)."""
+
+    @pytest.fixture
+    def security_manager(self):
+        from src.websocket_handler.security_manager import SecurityConfig, SecurityManager
+
+        tc = Mock()
+        # The pool is read directly off the timescale_client.
+        return SecurityManager(tc, SecurityConfig())
+
+    def _make_pool_with_capture(self, fetchrow_return=None, fetchval_return=None):
+        """Build an asyncpg-style pool whose acquire() yields a connection
+        that records the SQL passed to ``fetchrow`` / ``fetchval``."""
+        captured: dict[str, str] = {}
+
+        conn = Mock()
+
+        async def fetchrow(sql, *args):
+            captured["sql"] = sql
+            captured["args"] = args
+            return fetchrow_return
+
+        async def fetchval(sql, *args):
+            captured["sql"] = sql
+            captured["args"] = args
+            return fetchval_return
+
+        conn.fetchrow = fetchrow
+        conn.fetchval = fetchval
+
+        class _Acquire:
+            async def __aenter__(self_inner):
+                return conn
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        pool = Mock()
+        pool.acquire = lambda: _Acquire()
+        return pool, captured
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_emit_uses_local_schema_names(self, security_manager):
+        pool, captured = self._make_pool_with_capture(fetchrow_return=None)
+        security_manager.timescale_client.pg_pool = pool
+
+        await security_manager._emit_charger_auth_failure_alert(
+            "hrx-uab_hrx-vilnius-001", "wrong_password"
+        )
+
+        sql = captured["sql"]
+        assert "FROM chargers c" in sql
+        assert "JOIN depots" in sql
+        assert "c.ocpp_id = $1" in sql
+        # Must not regress to Supabase-only names.
+        assert "charging_stations" not in sql
+        assert "FROM sites" not in sql
+        assert " sites " not in sql
+        assert captured["args"] == ("hrx-uab_hrx-vilnius-001",)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_resolve_uses_local_schema_names(self, security_manager):
+        pool, captured = self._make_pool_with_capture(fetchval_return=None)
+        security_manager.timescale_client.pg_pool = pool
+
+        await security_manager._resolve_charger_auth_failure_alert("hrx-uab_hrx-vilnius-001")
+
+        sql = captured["sql"]
+        assert "FROM chargers c" in sql
+        assert "JOIN depots" in sql
+        assert "c.ocpp_id = $1" in sql
+        assert "charging_stations" not in sql
+        assert "FROM sites" not in sql
+        assert captured["args"] == ("hrx-uab_hrx-vilnius-001",)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_resolve_swallows_query_failures(self, security_manager):
+        """Any DB error in the alert path must stay silent — the OCPP auth
+        request must not be blocked by an alert-pipeline outage."""
+        conn = Mock()
+        conn.fetchval = AsyncMock(side_effect=RuntimeError("DB down"))
+
+        class _Acquire:
+            async def __aenter__(self_inner):
+                return conn
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        pool = Mock()
+        pool.acquire = lambda: _Acquire()
+        security_manager.timescale_client.pg_pool = pool
+
+        # Must not raise.
+        await security_manager._resolve_charger_auth_failure_alert("station-x")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_resolve_is_noop_without_pool(self, security_manager):
+        security_manager.timescale_client.pg_pool = None
+        # Must not raise even without a configured pool.
+        await security_manager._resolve_charger_auth_failure_alert("station-x")

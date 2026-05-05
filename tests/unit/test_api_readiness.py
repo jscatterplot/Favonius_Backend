@@ -192,6 +192,36 @@ class TestReadinessEndpoint:
         assert body["status"] == "not_ready"
         assert "charger_vehicle_access" in body["missing_inputs"]
 
+    @patch("src.api.main.StateAssembler")
+    @patch("src.api.main._get_depot_config")
+    @patch("src.api.main.db_pools")
+    def test_not_ready_when_depot_has_no_vehicles(
+        self, mock_pool, mock_get_config, mock_assembler_cls, client
+    ):
+        """0-vehicle depot must report 'vehicles' missing rather than 500.
+
+        Customers create depots before deciding their fleet roster; the
+        dashboard must still render so the readiness CTA can guide them
+        to add vehicles.
+        """
+        config = _full_config()
+        config.vehicle_capacities = {}
+        config.vehicle_max_charge_kw = {}
+        mock_pool_value = MagicMock()
+        mock_get_config.return_value = config
+        mock_assembler_cls.return_value = _stub_assembler(
+            building_source="meter", schedules_present=True
+        )
+
+        depot_id = str(uuid4())
+        with patch("src.api.main.db_pools", mock_pool_value):
+            response = client.get(f"/depots/{depot_id}/optimization/readiness")
+
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert body["status"] == "not_ready"
+        assert "vehicles" in body["missing_inputs"]
+
     def test_invalid_depot_uuid_returns_400(self, client):
         response = client.get("/depots/not-a-uuid/optimization/readiness")
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST

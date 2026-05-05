@@ -167,6 +167,14 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             # below carry a consistent shape.
             unique_id = "-"
 
+        # Liveness: any received frame proves the socket is alive. Mirrors
+        # the OCPP 1.6 hook so a charger that sends MeterValues but rare
+        # Heartbeats does not get killed by the stale-connection sweeper.
+        self._task_supervisor.create_task(
+            self.connection_manager.update_heartbeat(self.id),
+            "update_heartbeat:route_message",
+        )
+
         token = _ocpp_unique_id.set(unique_id)
         _bind_unique_id_to_structlog(unique_id, getattr(self, "id", "-"))
         try:

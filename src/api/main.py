@@ -649,10 +649,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Admin bulk-import writes: dedicated bucket so a sequential xlsx
         # import (one POST per row) does not trip the 100/min general limit.
         # Replaces — does not stack on top of — the general bucket.
-        elif (
-            request.method in {"POST", "PATCH", "PUT"}
-            and _ADMIN_BULK_WRITE_PATH_RE.match(path)
-        ):
+        elif request.method in {"POST", "PATCH", "PUT"} and _ADMIN_BULK_WRITE_PATH_RE.match(path):
             result = limiter.check_admin_write_limit(client_id)
             if not result:
                 resp = JSONResponse(
@@ -2471,8 +2468,7 @@ _OCPP_BASIC_PASSWORD_LENGTH = 10
 def _generate_ocpp_basic_password() -> str:
     """Generate an ABB-compatible high-entropy one-time Basic Auth password."""
     return "".join(
-        secrets.choice(_OCPP_BASIC_PASSWORD_ALPHABET)
-        for _ in range(_OCPP_BASIC_PASSWORD_LENGTH)
+        secrets.choice(_OCPP_BASIC_PASSWORD_ALPHABET) for _ in range(_OCPP_BASIC_PASSWORD_LENGTH)
     )
 
 
@@ -6693,35 +6689,98 @@ async def _handle_charger_restart(
 ) -> dict:
     """Restart a charger via OCPP RemoteReset.
 
-    Params: charger_id (UUID)
-    Rollback: not applicable (physical reset is irreversible; logged as ROLLBACK_IMPOSSIBLE).
+    Params:
+        charger_id: UUID of the target charger (charging_stations.id).
+        reset_type: 'Soft' (default) or 'Hard'.
+
+    Production runs with ``OCPP_SERVER_ENABLED=false`` on the API service —
+    live charger sockets live in the legacy WS handler. Dispatch is therefore
+    queue-mediated: we INSERT a ``remote_reset`` row into
+    ``charging_command_queue`` and the WS handler's ``ChargingCommandQueueConsumer``
+    drains it (typically within 2 s, sooner via pg_notify).
+
+    Reset is irreversible at the device, so the row is treated terminal on
+    first attempt by the consumer and the boot-replay path skips it. We use
+    a short 5-minute expiry so a stale request doesn't lurk in the queue.
     """
     charger_id = params.get("charger_id")
     if not charger_id:
         raise HTTPException(status_code=400, detail="params.charger_id is required")
     validate_uuid(charger_id, "charger_id")
 
-    if dry_run:
-        return {"charger_id": charger_id, "action": "RemoteReset", "simulated": True}
-
-    if ocpp_server is None:
-        raise HTTPException(status_code=503, detail="OCPP server not available")
-
-    try:
-        result = await ocpp_server.remote_reset(charger_id)
-        return {"charger_id": charger_id, "ocpp_result": result}
-    except Exception as e:
-        logger.warning(
-            "Charger restart ROLLBACK_IMPOSSIBLE — reset already sent",
-            extra={"charger_id": charger_id, "depot_id": depot_id, "error": str(e)},
-        )
+    reset_type = str(params.get("reset_type", "Soft"))
+    if reset_type not in {"Soft", "Hard"}:
         raise HTTPException(
-            status_code=500,
-            detail={
-                "error_code": ErrorCode.INTERNAL_ERROR.value,
-                "detail": "Charger restart failed",
-            },
-        ) from e
+            status_code=422,
+            detail="reset_type must be 'Soft' or 'Hard'",
+        )
+
+    if dry_run:
+        return {
+            "charger_id": charger_id,
+            "action": "RemoteReset",
+            "reset_type": reset_type,
+            "simulated": True,
+        }
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT station_id AS ocpp_id
+              FROM charging_stations
+             WHERE id = $1::uuid
+               AND site_id = $2::uuid
+            """,
+            charger_id,
+            depot_id,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Charger {charger_id} not found in depot {depot_id}",
+        )
+    ocpp_id = row["ocpp_id"]
+
+    async with db_pools.ts.acquire() as conn:
+        queue_id = int(
+            await conn.fetchval(
+                """
+                INSERT INTO charging_command_queue (
+                    charge_point_id, connector_id, command_type,
+                    payload, expires_at
+                ) VALUES (
+                    $1, 0, 'remote_reset',
+                    $2::jsonb,
+                    NOW() + INTERVAL '5 minutes'
+                )
+                RETURNING queue_id
+                """,
+                ocpp_id,
+                json.dumps({"type": reset_type}),
+            )
+        )
+
+    logger.info(
+        "Charger restart enqueued",
+        extra={
+            "charger_id": charger_id,
+            "ocpp_id": ocpp_id,
+            "depot_id": depot_id,
+            "reset_type": reset_type,
+            "queue_id": queue_id,
+        },
+    )
+    return {
+        "charger_id": charger_id,
+        "ocpp_id": ocpp_id,
+        "action": "RemoteReset",
+        "reset_type": reset_type,
+        "queue_id": queue_id,
+        "status": "enqueued",
+    }
 
 
 async def _handle_schedule_adjust(

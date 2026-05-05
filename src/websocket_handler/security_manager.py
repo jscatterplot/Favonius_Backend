@@ -187,7 +187,10 @@ class SecurityManager:
                 [(AuthenticationMethod.BASIC_AUTH, _authenticate_required_basic_auth)]
                 if basic_auth_required
                 else [
-                    (AuthenticationMethod.CLIENT_CERTIFICATE, self._authenticate_client_certificate),
+                    (
+                        AuthenticationMethod.CLIENT_CERTIFICATE,
+                        self._authenticate_client_certificate,
+                    ),
                     (AuthenticationMethod.BEARER_TOKEN, self._authenticate_bearer_token),
                     (AuthenticationMethod.API_KEY, self._authenticate_api_key),
                     (AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth),
@@ -607,13 +610,13 @@ class SecurityManager:
                 row = await conn.fetchrow(
                     """
                     SELECT d.organization_id,
-                           d.id AS depot_id,
-                           d.name AS depot_name,
-                           c.id AS charger_id,
-                           COALESCE(c.display_name, c.station_id) AS charger_name
-                      FROM charging_stations c
-                      JOIN sites             d ON d.id = c.site_id
-                     WHERE c.station_id = $1
+                           d.depot_id,
+                           d.name        AS depot_name,
+                           c.charger_id,
+                           COALESCE(c.display_name, c.ocpp_id) AS charger_name
+                      FROM chargers c
+                      JOIN depots   d ON d.depot_id = c.depot_id
+                     WHERE c.ocpp_id = $1
                      LIMIT 1
                     """,
                     station_id,
@@ -676,9 +679,9 @@ class SecurityManager:
                 org_id = await conn.fetchval(
                     """
                     SELECT d.organization_id
-                      FROM charging_stations c
-                      JOIN sites             d ON d.id = c.site_id
-                     WHERE c.station_id = $1
+                      FROM chargers c
+                      JOIN depots   d ON d.depot_id = c.depot_id
+                     WHERE c.ocpp_id = $1
                      LIMIT 1
                     """,
                     station_id,

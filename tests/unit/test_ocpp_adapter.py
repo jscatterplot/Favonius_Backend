@@ -87,6 +87,60 @@ async def test_boot_notification_handler(mock_websocket, sample_charge_point_id)
 
 
 @pytest.mark.asyncio
+async def test_boot_notification_invokes_callback_without_kwarg_clash(
+    mock_websocket, sample_charge_point_id
+):
+    """Regression: ``firmware_version`` must not be passed twice to the callback.
+
+    The python-ocpp library forwards every BootNotification field into kwargs
+    (snake-cased), including ``firmware_version``. Passing it positionally AND
+    via ``**kwargs`` raised ``TypeError: multiple values for argument
+    'firmware_version'`` and silently swallowed the cross-restart recovery
+    work in OCPP16Session._on_boot.
+    """
+    captured = {}
+
+    async def cb(cp_id, vendor, model, serial_number, firmware_version, **kwargs):
+        captured.update(
+            cp_id=cp_id,
+            vendor=vendor,
+            model=model,
+            serial_number=serial_number,
+            firmware_version=firmware_version,
+            extra_kwargs=kwargs,
+        )
+
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket, on_boot=cb)
+    response = await cp.on_boot_notification(
+        "ABB",
+        "TerraAC",
+        charge_point_serial_number="TACW1141622G1433",
+        firmware_version="V1.8.36",
+        iccid="89000000000000000000",
+    )
+
+    assert isinstance(response, call_result.BootNotification)
+    assert captured["firmware_version"] == "V1.8.36"
+    assert captured["serial_number"] == "TACW1141622G1433"
+    # firmware_version must be stripped from kwargs to prevent the TypeError;
+    # other extra fields (charge_point_serial_number, iccid, ...) must survive.
+    assert "firmware_version" not in captured["extra_kwargs"]
+    assert captured["extra_kwargs"].get("iccid") == "89000000000000000000"
+
+
+@pytest.mark.asyncio
+async def test_security_event_notification_handler(mock_websocket, sample_charge_point_id):
+    """ABB Terra AC sends StartupOfTheDevice / SettingSystemTime; we must ack."""
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
+    response = await cp.on_security_event_notification(
+        type="StartupOfTheDevice",
+        timestamp="2026-05-04T15:43:41.000Z",
+        tech_info="ocppBoot",
+    )
+    assert isinstance(response, call_result.SecurityEventNotification)
+
+
+@pytest.mark.asyncio
 async def test_status_notification_handler(mock_websocket, sample_charge_point_id):
     """Test StatusNotification handler with callback."""
     callback_called = False
@@ -189,6 +243,60 @@ async def test_set_charging_profile_rejects_relative_chargepointmaxprofile(
             profile_purpose="ChargePointMaxProfile",
             profile_kind="Relative",
         )
+
+
+@pytest.mark.asyncio
+async def test_route_message_invokes_on_message_received(mock_websocket, sample_charge_point_id):
+    """Liveness hook fires for every received OCPP frame.
+
+    The websocket-handler stale-connection sweeper relies on this to keep
+    OCPP 1.6 sockets alive when the charger sends only StatusNotification
+    or MeterValues between Heartbeats.
+    """
+    received = []
+
+    async def on_msg() -> None:
+        received.append(True)
+
+    cp = FleetChargePoint(
+        sample_charge_point_id,
+        mock_websocket,
+        on_message_received=on_msg,
+    )
+    # Bypass the upstream library router; we only care that the hook fires.
+    with patch("ocpp.v16.ChargePoint.route_message", new=AsyncMock()):
+        await cp.route_message('[2,"abc","Heartbeat",{}]')
+        await cp.route_message('[2,"def","StatusNotification",{}]')
+
+    assert len(received) == 2
+
+
+@pytest.mark.asyncio
+async def test_route_message_swallows_callback_exceptions(mock_websocket, sample_charge_point_id):
+    """A failing liveness hook must never break message routing."""
+
+    async def on_msg() -> None:
+        raise RuntimeError("connection_manager unavailable")
+
+    cp = FleetChargePoint(
+        sample_charge_point_id,
+        mock_websocket,
+        on_message_received=on_msg,
+    )
+    with patch("ocpp.v16.ChargePoint.route_message", new=AsyncMock()) as upstream:
+        await cp.route_message('[2,"abc","Heartbeat",{}]')
+        upstream.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_route_message_works_without_on_message_received(
+    mock_websocket, sample_charge_point_id
+):
+    """The hook is optional — existing call sites must keep working."""
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket)
+    with patch("ocpp.v16.ChargePoint.route_message", new=AsyncMock()) as upstream:
+        await cp.route_message('[2,"abc","Heartbeat",{}]')
+        upstream.assert_awaited_once()
 
 
 @pytest.mark.asyncio

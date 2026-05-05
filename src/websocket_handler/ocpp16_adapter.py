@@ -32,7 +32,14 @@ from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
 # the charger was offline are flushed within this many seconds of boot.
 REPLAY_BACKOFF_SECONDS = 1.0
 
+# How long to wait for a charger to send its own BootNotification before
+# nudging it via TriggerMessage. Some ABB Terra AC firmwares (and other
+# OCPP 1.6 implementations) skip BootNotification on WebSocket reconnect,
+# leaving the heartbeat interval un-negotiated and the session stuck.
+BOOT_TRIGGER_GRACE_SECONDS = 5.0
+
 if TYPE_CHECKING:
+    from .connection_manager import ConnectionManager
     from .message_handler import MessageHandler
     from .timescale_client import TimescaleClient
 
@@ -72,17 +79,27 @@ class OCPP16Session:
         websocket: Any,
         timescale_client: "TimescaleClient",
         message_handler: "MessageHandler",
+        connection_manager: Optional["ConnectionManager"] = None,
     ) -> None:
-        """Initialise the session and wire all FleetChargePoint callbacks."""
+        """Initialise the session and wire all FleetChargePoint callbacks.
+
+        ``connection_manager`` is optional only so that targeted unit tests
+        can construct a session without spinning up the full handler stack.
+        Production wiring (``OCPPWebSocketServer``) always passes one — it
+        is required for the stale-connection sweeper to see incoming OCPP
+        traffic on this socket.
+        """
         self._station_id = station_id
         self._timescale = timescale_client
         self._message_handler = message_handler
+        self._connection_manager = connection_manager
         # Single-slot stash for the most recent accepted StartTransaction so
         # ``_next_transaction_id`` can persist the open ``charging_sessions``
         # row alongside the generated tx_id. Safe because FleetChargePoint
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
         self._replay_task: Optional[asyncio.Task[None]] = None
+        self._boot_trigger_task: Optional[asyncio.Task[None]] = None
         self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
         self._telemetry_flush_task: Optional[asyncio.Task[None]] = None
         self._stop_telemetry_flush = asyncio.Event()
@@ -96,8 +113,25 @@ class OCPP16Session:
             on_transaction_start=self._on_transaction_start,
             on_transaction_stop=self._on_transaction_stop,
             on_authorize=self._on_authorize,
+            on_message_received=self._on_message_received,
             tx_id_provider=self._next_transaction_id,
         )
+
+    async def _on_message_received(self) -> None:
+        """Refresh the connection-manager liveness clock on every OCPP frame.
+
+        OCPP 1.6 chargers vary widely in Heartbeat cadence (the spec only
+        requires "at least every Heartbeat interval", which BootNotification
+        sets to 300s). Without this hook the websocket handler's stale
+        sweeper kills the socket after ~90s even though MeterValues and
+        StatusNotification are flowing.
+        """
+        if self._connection_manager is None:
+            return
+        try:
+            await self._connection_manager.update_heartbeat(self._station_id)
+        except Exception:
+            logger.exception("update_heartbeat failed for station=%s", self._station_id)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -107,13 +141,46 @@ class OCPP16Session:
         """Start processing messages from the charger (blocks until disconnect)."""
         self._stop_telemetry_flush.clear()
         self._telemetry_flush_task = asyncio.create_task(self._flush_telemetry_queue())
+        self._boot_trigger_task = asyncio.create_task(self._force_boot_notification())
         try:
             await self._cp.start()
         finally:
+            if self._boot_trigger_task is not None and not self._boot_trigger_task.done():
+                self._boot_trigger_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._boot_trigger_task
             if self._telemetry_flush_task is not None:
                 self._stop_telemetry_flush.set()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._telemetry_flush_task
+
+    async def _force_boot_notification(self) -> None:
+        """Nudge spec-violating chargers that skip BootNotification on reconnect.
+
+        OCPP 1.6 §4.2 requires the charger to send BootNotification on connect,
+        and the central system's response carries the negotiated heartbeat
+        interval. Some ABB Terra AC firmwares (1.8.x) skip BootNotification on
+        WebSocket reconnects after the initial cold boot, leaving the session
+        with no heartbeat cadence. TriggerMessage(BootNotification) is the
+        spec-sanctioned way to wake them up (OCPP 1.6 §4.18).
+        """
+        try:
+            await asyncio.sleep(BOOT_TRIGGER_GRACE_SECONDS)
+            if self._cp.last_boot_at is not None:
+                return
+            status = await self._cp.trigger_message("BootNotification")
+            logger.info(
+                "force_boot_notification station=%s status=%s",
+                self._station_id,
+                status,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "force_boot_notification failed for station=%s",
+                self._station_id,
+            )
 
     # ------------------------------------------------------------------
     # Outgoing commands (matches EnhancedOCPPChargePoint's interface)
@@ -174,9 +241,7 @@ class OCPP16Session:
             accepted = await self._cp.set_charging_profile(
                 connector_id=evse_id,
                 charging_schedule=schedule_periods,
-                profile_purpose=charging_profile.get(
-                    "chargingProfilePurpose", "TxDefaultProfile"
-                ),
+                profile_purpose=charging_profile.get("chargingProfilePurpose", "TxDefaultProfile"),
                 profile_kind=charging_profile.get("chargingProfileKind", "Absolute"),
                 charging_rate_unit=charging_rate_unit,
                 stack_level=charging_profile.get("stackLevel", 0),
@@ -184,9 +249,9 @@ class OCPP16Session:
             )
         except Exception as exc:
             try:
-                PROFILE_PUSH_LATENCY.labels(
-                    station_id=self._station_id, outcome="raised"
-                ).observe(max(time.monotonic() - push_start, 1e-6))
+                PROFILE_PUSH_LATENCY.labels(station_id=self._station_id, outcome="raised").observe(
+                    max(time.monotonic() - push_start, 1e-6)
+                )
             except Exception:
                 pass
             if not allow_enqueue:
@@ -239,6 +304,26 @@ class OCPP16Session:
             )
         return False
 
+    async def send_reset(self, reset_type: str = "Soft") -> bool:
+        """Send OCPP 1.6 Reset to the charger.
+
+        Returns True if the charger responded ``Accepted``. Reset is irreversible
+        on the device side, so the queue consumer marks the row terminal on the
+        first attempt regardless of outcome — we do NOT enqueue on failure here
+        and the boot-replay path explicitly skips ``remote_reset`` rows.
+        """
+        try:
+            status = await self._cp.reset(reset_type=reset_type)
+        except Exception as exc:
+            logger.warning(
+                "Reset raised for station=%s type=%s: %s",
+                self._station_id,
+                reset_type,
+                exc,
+            )
+            return False
+        return status == "Accepted"
+
     async def replay_queued_commands(self) -> int:
         """Flush ``charging_command_queue`` rows for this station.
 
@@ -247,6 +332,10 @@ class OCPP16Session:
         ``allow_enqueue=False`` so a transient failure during replay does not
         re-enqueue an already-queued row. Returns the number of rows that
         were marked ``acked``.
+
+        Only ``set_charging_profile`` rows are replayed. Other command types
+        (e.g. ``remote_reset``) are intentionally skipped — replaying a reset
+        on every reconnect would loop a stuck charger.
         """
         try:
             rows = await self._timescale.fetch_pending_commands(self._station_id)
@@ -260,6 +349,8 @@ class OCPP16Session:
 
         sent = 0
         for row in rows:
+            if row.get("command_type", "set_charging_profile") != "set_charging_profile":
+                continue
             queue_id = row["queue_id"]
             payload = row["payload"]
             if isinstance(payload, str):
@@ -268,9 +359,7 @@ class OCPP16Session:
                 payload = _json.loads(payload)
             connector_id = row["connector_id"]
             try:
-                ok = await self.send_charging_profile(
-                    connector_id, payload, allow_enqueue=False
-                )
+                ok = await self.send_charging_profile(connector_id, payload, allow_enqueue=False)
             except Exception as exc:
                 try:
                     await self._timescale.mark_command_failed(queue_id, str(exc))
@@ -307,9 +396,7 @@ class OCPP16Session:
                         exc,
                     )
         if sent:
-            logger.info(
-                "Replayed %d queued command(s) to station=%s", sent, self._station_id
-            )
+            logger.info("Replayed %d queued command(s) to station=%s", sent, self._station_id)
         return sent
 
     # ------------------------------------------------------------------
@@ -425,9 +512,8 @@ class OCPP16Session:
             open_rows = await self._timescale.fetch_open_sessions(cp_id)
         except Exception as exc:
             open_rows = []
-            logger.error(
-                "fetch_open_sessions failed for station=%s: %s", cp_id, exc
-            )
+            logger.error("fetch_open_sessions failed for station=%s: %s", cp_id, exc)
+
         def _session_start(row: Dict[str, Any]) -> datetime:
             start_time = row.get("start_time")
             if isinstance(start_time, datetime):
@@ -776,7 +862,9 @@ class OCPP16Session:
                     parsed_ts = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
                     pass
-                for sampled in meter_value.get("sampledValue", meter_value.get("sampled_value", [])):
+                for sampled in meter_value.get(
+                    "sampledValue", meter_value.get("sampled_value", [])
+                ):
                     try:
                         parsed_value = float(sampled.get("value", "0"))
                     except (TypeError, ValueError):
