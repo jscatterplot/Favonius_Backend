@@ -269,7 +269,41 @@ async def test_validate_started_transaction_token_imports_resolve() -> None:
             status=RFIDAuthStatus.INVALID, source="TransactionEventStarted", reason="x"
         )
     )
+    cp.timescale_client = MagicMock()
+    cp.timescale_client.lookup_id_tag = AsyncMock(return_value=None)
 
     # If RFIDAuthStatus.ACCEPTED is unresolved at module level this raises NameError.
     await EnhancedOCPPChargePoint._validate_started_transaction_token(cp, "TOK")
+    cp.logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_validate_started_transaction_token_skips_authorize_for_known_token() -> None:
+    cp = EnhancedOCPPChargePoint.__new__(EnhancedOCPPChargePoint)
+    cp.id = "CP-1"
+    cp.logger = MagicMock()
+    cp.rfid_authorization = MagicMock()
+    cp.rfid_authorization.authorize = AsyncMock()
+    cp.timescale_client = MagicMock()
+    cp.timescale_client.lookup_id_tag = AsyncMock(return_value={"card_id": "card-1"})
+
+    await EnhancedOCPPChargePoint._validate_started_transaction_token(cp, "KNOWN")
+
+    cp.rfid_authorization.authorize.assert_not_called()
+    cp.logger.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_validate_started_transaction_token_lookup_error_is_warning_only() -> None:
+    cp = EnhancedOCPPChargePoint.__new__(EnhancedOCPPChargePoint)
+    cp.id = "CP-1"
+    cp.logger = MagicMock()
+    cp.rfid_authorization = MagicMock()
+    cp.rfid_authorization.authorize = AsyncMock()
+    cp.timescale_client = MagicMock()
+    cp.timescale_client.lookup_id_tag = AsyncMock(side_effect=RuntimeError("db down"))
+
+    await EnhancedOCPPChargePoint._validate_started_transaction_token(cp, "TOK")
+
+    cp.rfid_authorization.authorize.assert_not_called()
     cp.logger.warning.assert_called_once()

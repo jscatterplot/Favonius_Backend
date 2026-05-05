@@ -308,18 +308,27 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         fire-and-forget via ``_task_supervisor.create_task`` so a slow DB
         lookup can't delay the OCPP ack.
         """
-        decision = await self.rfid_authorization.authorize(
-            self.id,
-            id_token,
-            "TransactionEventStarted",
-        )
-        if decision.status != RFIDAuthStatus.ACCEPTED:
+        token_known = False
+        try:
+            token_known = bool(
+                await self.timescale_client.lookup_id_tag(id_token, station_id=self.id)
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "transaction_started_token_check_failed station_id=%s id_token=%s error=%s",
+                self.id,
+                id_token,
+                exc,
+            )
+            return
+
+        if not token_known:
             self.logger.warning(
                 "transaction_started_with_nonaccepted_token station_id=%s id_token=%s status=%s reason=%s",
                 self.id,
                 id_token,
-                decision.status.value,
-                decision.reason,
+                RFIDAuthStatus.INVALID.value,
+                "unknown_id_tag",
             )
 
     @on(Action.meter_values)
