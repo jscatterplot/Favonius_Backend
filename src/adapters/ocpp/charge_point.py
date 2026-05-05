@@ -342,13 +342,18 @@ class FleetChargePoint(CP16):
         status = RegistrationStatus.accepted
         if self._cb_boot:
             try:
+                # python-ocpp forwards every BootNotification field in kwargs
+                # (snake-cased), including ``firmware_version``. We pass that
+                # explicitly as a positional arg below, so drop it from kwargs
+                # to avoid TypeError: multiple values for argument.
+                cb_kwargs = {k: v for k, v in kwargs.items() if k != "firmware_version"}
                 result = await self._cb_boot(
                     self.id,
                     charge_point_vendor,
                     charge_point_model,
                     self.serial_number,
                     self.firmware_version,
-                    **kwargs,
+                    **cb_kwargs,
                 )
                 if result is not None:
                     status = result
@@ -733,6 +738,32 @@ class FleetChargePoint(CP16):
             except Exception as e:
                 logger.error(f"Error in firmware callback: {e}")
         return call_result.FirmwareStatusNotification()
+
+    @on("SecurityEventNotification")
+    async def on_security_event_notification(
+        self,
+        type: str,
+        timestamp: str,
+        tech_info: Optional[str] = None,
+        **kwargs,
+    ):
+        """Acknowledge OCPP 1.6 Security Whitepaper events from the charger.
+
+        ABB Terra AC and other modern OCPP 1.6 chargers send these on each
+        WebSocket reconnect (``StartupOfTheDevice``) and after time sync
+        (``SettingSystemTime``). Without a registered handler the python-ocpp
+        library raises NotImplementedError, returning CALLERROR to the
+        charger which then logs/disconnects.
+        """
+        logger.info(
+            "SecurityEventNotification from %s: type=%s timestamp=%s tech_info=%s",
+            self.id,
+            type,
+            timestamp,
+            tech_info,
+        )
+        _record_ocpp_metric("inbound", "SecurityEventNotification", type)
+        return call_result.SecurityEventNotification()
 
     # ===================================================================
     # Outgoing commands (CSMS → Charge Point)
