@@ -127,6 +127,7 @@ async def test_run_turn_not_found(seeded_db, fake_llm_client):
         llm_client=fake_llm_client,
     )
     assert reply.status == "not_found"
+    assert reply.intent == "consumption_by_user"
     assert "Zorblax" in reply.text
     assert reply.not_found == ["Zorblax"]
 
@@ -163,6 +164,7 @@ async def test_run_turn_disambiguation(seeded_db, fake_llm_client):
         )
 
         assert reply.status == "disambiguation"
+        assert reply.intent == "consumption_by_user"
         displays = sorted(c.display for c in reply.candidates)
         assert any("John Smith" in d for d in displays)
         assert any("John Roe" in d for d in displays)
