@@ -57,6 +57,7 @@ from .display_manager import DisplayManager
 from .monitoring import get_logger
 from .monitoring_manager import MonitoringManager
 from .privacy_manager import PrivacyManager
+from .rfid_authorization import RFIDAuthStatus, RFIDAuthorizationService
 from .security_manager import SecurityConfig, SecurityManager
 from .tariff_manager import TariffManager
 from .task_supervisor import TaskSupervisor
@@ -121,6 +122,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         self.device_model = DeviceModel(timescale_client)
         self.charging_profile_manager = ChargingProfileManager(timescale_client)
         self.transaction_manager = TransactionManager(timescale_client)
+        self.rfid_authorization = RFIDAuthorizationService(timescale_client, self.logger)
         self.certificate_manager = CertificateManager(timescale_client)
 
         # Initialize security manager
@@ -252,6 +254,15 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         evse_id = kwargs.get("evseId", 1)
         connector_id = kwargs.get("connectorId", 1)
 
+        if event_type == TransactionEventEnumType.started:
+            token_payload = kwargs.get("id_token") or transaction_info.get("idToken") or {}
+            id_token = self._token_field(token_payload, "idToken")
+            if id_token:
+                self._task_supervisor.create_task(
+                    self._validate_started_transaction_token(id_token),
+                    f"validate_started_tx:{transaction_id}",
+                )
+
         # Update active transactions
         if event_type == TransactionEventEnumType.started:
             self.active_transactions[connector_id] = transaction_id
@@ -273,6 +284,26 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         )
 
         return call_result.TransactionEvent()
+
+    async def _validate_started_transaction_token(self, id_token: str) -> None:
+        """Best-effort validation for started events to detect protocol drift.
+
+        OCPP 2.0.1 stations should have passed Authorize first; this catches
+        cases where a station starts a session with an unknown token.
+        """
+        decision = await self.rfid_authorization.authorize(
+            self.id,
+            id_token,
+            "TransactionEventStarted",
+        )
+        if decision.status != RFIDAuthStatus.ACCEPTED:
+            self.logger.warning(
+                "transaction_started_with_nonaccepted_token station_id=%s id_token=%s status=%s reason=%s",
+                self.id,
+                id_token,
+                decision.status.value,
+                decision.reason,
+            )
 
     @on(Action.meter_values)
     def on_meter_values(self, evse_id: int, meter_value: list, **kwargs):
@@ -300,18 +331,44 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         return call_result.Heartbeat(current_time=datetime.now(timezone.utc).isoformat())
 
     @on(Action.authorize)
-    def on_authorize(self, id_token: Dict, **kwargs):
+    async def on_authorize(self, id_token: Dict, **kwargs):
         """Handle Authorize message."""
-        self.logger.info(f"Authorization request from {self.id}")
+        token_value = self._token_field(id_token, "idToken")
+        if not token_value:
+            return call_result.Authorize(
+                id_token_info={
+                    "status": "Invalid",
+                    "personal_message": {
+                        "format": "UTF8",
+                        "language": "en",
+                        "content": "Missing RFID token",
+                    },
+                }
+            )
+        if self._token_field(id_token, "type") == "NoAuthorization":
+            return call_result.Authorize(
+                id_token_info={
+                    "status": "Invalid",
+                    "personal_message": {
+                        "format": "UTF8",
+                        "language": "en",
+                        "content": "Unsupported RFID token type",
+                    },
+                }
+            )
 
-        # For now, accept all authorizations
-        # In production, this would check against user database
+        decision = await self.rfid_authorization.authorize(self.id, token_value, "Authorize")
+        status = self._map_auth_status_to_ocpp201(decision.status)
         return call_result.Authorize(
             id_token_info={
-                "status": "Accepted",
+                "status": status,
                 "expiry_date": None,
                 "group_id_token": None,
-                "personal_message": {"format": "UTF8", "language": "en", "content": "Authorized"},
+                "personal_message": {
+                    "format": "UTF8",
+                    "language": "en",
+                    "content": "Authorized" if status == "Accepted" else "RFID denied",
+                },
             }
         )
 
@@ -377,6 +434,29 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         except Exception as e:
             self.logger.error(f"Failed to send charging profile to {self.id}: {e}")
             return False
+
+    @staticmethod
+    def _map_auth_status_to_ocpp201(status: RFIDAuthStatus) -> str:
+        """Map internal RFID auth outcomes to OCPP 2.0.1 idTokenInfo.status."""
+        if status == RFIDAuthStatus.ACCEPTED:
+            return "Accepted"
+        if status == RFIDAuthStatus.EXPIRED:
+            return "Expired"
+        if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
+            return "Blocked"
+        return "Invalid"
+
+    @staticmethod
+    def _token_field(id_token: Any, field: str) -> Any:
+        """Read an OCPP idToken field from dicts or generated dataclasses."""
+        if isinstance(id_token, dict):
+            return id_token.get(field)
+        snake_names = {
+            "idToken": "id_token",
+            "additionalInfo": "additional_info",
+        }
+        snake_name = snake_names.get(field, field)
+        return getattr(id_token, snake_name, None)
 
     async def send_der_control(self, der_control: Dict) -> bool:
         """Send SetDERControl command for V2G operations."""
@@ -963,7 +1043,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         return call_result.SetChargingProfile(status="Accepted")
 
     @on(Action.request_start_transaction)
-    def on_request_start_transaction(
+    async def on_request_start_transaction(
         self,
         evse_id: int,
         id_token: dict,
@@ -974,16 +1054,14 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
     ):
         """Handle RequestStartTransaction message."""
         self.logger.info(f"RequestStartTransaction from {self.id}")
-
-        # Process start transaction request
-        self._task_supervisor.create_task(
-            self._handle_request_start_transaction(
-                evse_id, id_token, remote_start_id, charging_profile, evse_id_token
-            ),
-            "request_start_transaction",
+        result = await self._process_request_start_transaction(
+            evse_id, id_token, remote_start_id, charging_profile, evse_id_token
         )
-
-        return call_result.RequestStartTransaction(status="Accepted")
+        return call_result.RequestStartTransaction(
+            status=result["status"],
+            status_info=result.get("statusInfo"),
+            transaction_id=result.get("transactionId"),
+        )
 
     @on(Action.request_stop_transaction)
     def on_request_stop_transaction(
@@ -1891,6 +1969,59 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         except Exception as e:
             self.logger.error(f"Error handling SetChargingProfile: {e}")
 
+    async def _process_request_start_transaction(
+        self,
+        evse_id: int,
+        id_token: dict,
+        remote_start_id: Optional[int],
+        charging_profile: Optional[dict],
+        evse_id_token: Optional[dict],
+    ) -> Dict[str, Any]:
+        """Validate and process RequestStartTransaction."""
+        try:
+            from .transaction_manager import IdToken, IdTokenType
+
+            token_value = self._token_field(id_token, "idToken")
+            if not token_value:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": "InvalidToken",
+                        "additionalInfo": "idToken is required",
+                    },
+                }
+
+            try:
+                token_type_raw = self._token_field(id_token, "type") or "ISO14443"
+                if hasattr(token_type_raw, "value"):
+                    token_type_raw = token_type_raw.value
+                token_type = IdTokenType(token_type_raw)
+            except ValueError:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": "InvalidTokenType",
+                        "additionalInfo": "Unsupported idToken type",
+                    },
+                }
+
+            parsed_id_token = IdToken(
+                id_token=token_value,
+                type=token_type,
+                additional_info=self._token_field(id_token, "additionalInfo"),
+            )
+
+            return await self.transaction_manager.request_start_transaction(
+                self.id, evse_id, remote_start_id, parsed_id_token, charging_profile
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error handling RequestStartTransaction: {e}")
+            return {
+                "status": "Rejected",
+                "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
+            }
+
     async def _handle_request_start_transaction(
         self,
         evse_id: int,
@@ -1898,35 +2029,11 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         remote_start_id: Optional[int],
         charging_profile: Optional[dict],
         evse_id_token: Optional[dict],
-    ):
-        """Handle RequestStartTransaction request."""
-        try:
-            from .transaction_manager import IdToken, IdTokenType
-
-            # Parse ID token
-            parsed_id_token = IdToken(
-                id_token=id_token["idToken"],
-                type=IdTokenType(id_token.get("type", "ISO14443")),
-                additional_info=id_token.get("additionalInfo"),
-            )
-
-            result = await self.transaction_manager.request_start_transaction(
-                self.id, evse_id, remote_start_id, parsed_id_token, charging_profile
-            )
-
-            # Send RequestStartTransactionResponse
-            from ocpp.v201 import call
-
-            request = call.RequestStartTransactionResponse(
-                status=result["status"],
-                status_info=result.get("statusInfo"),
-                transaction_id=result.get("transactionId"),
-                id_token_info=result.get("idTokenInfo"),
-            )
-            await self.call(request)
-
-        except Exception as e:
-            self.logger.error(f"Error handling RequestStartTransaction: {e}")
+    ) -> None:
+        """Backward-compatible async task wrapper for older internal callers."""
+        await self._process_request_start_transaction(
+            evse_id, id_token, remote_start_id, charging_profile, evse_id_token
+        )
 
     async def _handle_request_stop_transaction(self, transaction_id: str, reason: Optional[str]):
         """Handle RequestStopTransaction request."""

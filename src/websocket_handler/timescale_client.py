@@ -9,7 +9,7 @@ import json
 import os
 import random
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -1777,6 +1777,60 @@ class TimescaleClient:
 
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
+
+    async def record_invalid_rfid_attempt(self, station_id: str, id_tag: str) -> None:
+        """Persist an invalid RFID authorization attempt for abuse controls."""
+        await self.store_security_event(
+            {
+                "station_id": station_id,
+                "event_type": "rfid_authorization_invalid",
+                "timestamp": datetime.now(timezone.utc),
+                "tech_info": "RFID/idTag authorization denied",
+                "additional_info": {"id_tag": id_tag},
+            }
+        )
+
+    async def count_recent_invalid_rfid_attempts(
+        self,
+        station_id: str,
+        id_tag: str,
+        window_seconds: int = 60,
+    ) -> int:
+        """Count invalid RFID attempts for a station/tag in a recent window."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        async with self.pg_pool.acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                  FROM security_events
+                 WHERE station_id = $1
+                   AND event_type = 'rfid_authorization_invalid'
+                   AND timestamp >= $2
+                   AND COALESCE((additional_info::jsonb ->> 'id_tag'), '') = $3
+                """,
+                station_id,
+                cutoff,
+                id_tag,
+            )
+            return int(value or 0)
+
+    async def clear_invalid_rfid_attempts(self, station_id: str, id_tag: str) -> None:
+        """Record successful recovery after previous invalid attempts.
+
+        The invalid-attempt rows are append-only audit data. This marker keeps
+        the trail intact while giving operators a visible recovery signal.
+        """
+        if await self.count_recent_invalid_rfid_attempts(station_id, id_tag, 300) == 0:
+            return
+        await self.store_security_event(
+            {
+                "station_id": station_id,
+                "event_type": "rfid_authorization_recovered",
+                "timestamp": datetime.now(timezone.utc),
+                "tech_info": "RFID/idTag authorized after previous invalid attempts",
+                "additional_info": {"id_tag": id_tag},
+            }
+        )
 
     async def validate_api_key(self, station_id: str, api_key: str) -> bool:
         """Validate API key."""

@@ -400,7 +400,7 @@ class TestOcpp16SessionAuthorize:
         }
         result = await session._on_authorize("PILOT-01", "DEADBEEF01")
         assert result == AuthorizationStatus.accepted
-        session._timescale.lookup_id_tag.assert_awaited_once_with("DEADBEEF01")
+        session._timescale.lookup_id_tag.assert_awaited_once_with("DEADBEEF01", station_id="PILOT-01")
 
     @pytest.mark.asyncio
     async def test_unknown_id_tag_returns_invalid(self, session) -> None:

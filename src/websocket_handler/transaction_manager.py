@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from .monitoring import get_logger
+from .rfid_authorization import RFIDAuthStatus, RFIDAuthorizationService
 from .timescale_client import TimescaleClient
 
 
@@ -103,6 +104,7 @@ class TransactionManager:
     def __init__(self, timescale_client: TimescaleClient):
         self.timescale_client = timescale_client
         self.logger = get_logger(__name__)
+        self.rfid_authorization = RFIDAuthorizationService(timescale_client, self.logger)
 
         # Authorization cache
         self.auth_cache: Dict[str, Dict[str, Any]] = {}
@@ -127,18 +129,48 @@ class TransactionManager:
     ) -> Dict[str, Any]:
         """Request start transaction."""
         try:
-            # Authorize ID token
-            auth_result = await self.authorize_id_token(id_token)
+            validation_error = self._validate_id_token_shape(id_token)
+            if validation_error is not None:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": validation_error,
+                }
 
-            if auth_result["status"] not in ["Accepted", "Unknown"]:
+            profile_error = self._validate_request_start_profile(charging_profile)
+            if profile_error is not None:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": profile_error,
+                }
+
+            cache_key = f"{station_id}:{evse_id}"
+            if cache_key in self.active_transactions:
                 return {
                     "status": "Rejected",
                     "statusInfo": {
-                        "reasonCode": auth_result["status"],
-                        "additionalInfo": auth_result.get(
-                            "additional_info", "Authorization failed"
-                        ),
+                        "reasonCode": "ConcurrentTx",
+                        "additionalInfo": "EVSE already has an active transaction",
                     },
+                    "idTokenInfo": {"status": "Blocked"},
+                }
+
+            auth_decision = await self.rfid_authorization.authorize(
+                station_id,
+                id_token.id_token,
+                "RequestStartTransaction",
+            )
+            id_token_info = {
+                "status": self._map_auth_status_to_ocpp201(auth_decision.status),
+                "cacheTimeout": 300,
+            }
+            if auth_decision.status != RFIDAuthStatus.ACCEPTED:
+                return {
+                    "status": "Rejected",
+                    "statusInfo": {
+                        "reasonCode": id_token_info["status"],
+                        "additionalInfo": auth_decision.reason,
+                    },
+                    "idTokenInfo": id_token_info,
                 }
 
             # Check EVSE availability
@@ -168,7 +200,6 @@ class TransactionManager:
             await self._store_transaction(station_id, transaction_info, id_token)
 
             # Cache active transaction
-            cache_key = f"{station_id}:{evse_id}"
             self.active_transactions[cache_key] = transaction_info
 
             # Apply charging profile if provided
@@ -182,7 +213,7 @@ class TransactionManager:
             return {
                 "status": "Accepted",
                 "transactionId": transaction_id,
-                "idTokenInfo": auth_result,
+                "idTokenInfo": id_token_info,
             }
 
         except Exception as e:
@@ -191,6 +222,55 @@ class TransactionManager:
                 "status": "Rejected",
                 "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
             }
+
+    @staticmethod
+    def _validate_id_token_shape(id_token: IdToken) -> Optional[Dict[str, str]]:
+        """Validate OCPP token type/value before business lookup."""
+        if not id_token.id_token or not id_token.id_token.strip():
+            return {"reasonCode": "InvalidToken", "additionalInfo": "idToken is required"}
+        if id_token.type == IdTokenType.NO_AUTHORIZATION:
+            return {
+                "reasonCode": "InvalidTokenType",
+                "additionalInfo": "NoAuthorization is not valid for RFID start",
+            }
+        return None
+
+    @staticmethod
+    def _validate_request_start_profile(
+        charging_profile: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        """Validate CitrineOS-critical RequestStartTransaction profile semantics."""
+        if not charging_profile:
+            return None
+
+        purpose = (
+            charging_profile.get("chargingProfilePurpose")
+            or charging_profile.get("charging_profile_purpose")
+        )
+        if purpose and purpose != "TxProfile":
+            return {
+                "reasonCode": "InvalidChargingProfile",
+                "additionalInfo": "RequestStartTransaction requires TxProfile purpose",
+            }
+
+        if charging_profile.get("transactionId") or charging_profile.get("transaction_id"):
+            return {
+                "reasonCode": "InvalidChargingProfile",
+                "additionalInfo": "New RequestStartTransaction profiles must not include transactionId",
+            }
+
+        return None
+
+    @staticmethod
+    def _map_auth_status_to_ocpp201(status: RFIDAuthStatus) -> str:
+        """Map internal RFID auth outcomes to OCPP 2.0.1 idTokenInfo.status."""
+        if status == RFIDAuthStatus.ACCEPTED:
+            return "Accepted"
+        if status == RFIDAuthStatus.EXPIRED:
+            return "Expired"
+        if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
+            return "Blocked"
+        return "Invalid"
 
     async def request_stop_transaction(
         self, station_id: str, transaction_id: str, reason: Optional[str] = None

@@ -1,6 +1,10 @@
-"""OCPP WebSocket server for charge point connections — full coverage.
+"""Emergency-fallback OCPP WebSocket server for charge point connections.
 
 Reference: Development plan Step 3.1, PRD_v2.md#9-1-ocpp-integration
+
+This adapter path is intentionally *not* the primary production runtime.
+The canonical OCPP runtime is ``src/websocket_handler``. Keep this server as an
+explicit emergency fallback for controlled failover scenarios.
 
 Updates from original:
  - Status persistence to database (charger_status table or chargers table)
