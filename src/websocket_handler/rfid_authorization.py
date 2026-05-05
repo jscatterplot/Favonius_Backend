@@ -151,7 +151,7 @@ class RFIDAuthorizationService:
 
         decision = RFIDAuthDecision(
             status=RFIDAuthStatus.ACCEPTED,
-            source=str(row.get("source") or "unknown"),
+            source=source,
             reason="identity_matched",
             vehicle_id=row.get("vehicle_id"),
             driver_id=row.get("driver_id"),
@@ -167,7 +167,7 @@ class RFIDAuthorizationService:
             source,
             station_id,
             id_tag,
-            decision.source,
+            str(row.get("source") or "unknown"),
             decision.vehicle_id,
             decision.card_id,
         )

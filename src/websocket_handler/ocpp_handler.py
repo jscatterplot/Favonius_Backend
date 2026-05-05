@@ -2014,7 +2014,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
             self.logger.error(f"Error handling RequestStartTransaction: {e}")
             return {
                 "status": "Rejected",
-                "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
+                "statusInfo": {
+                    "reasonCode": "InternalError",
+                    "additionalInfo": "Internal processing error",
+                },
             }
 
     async def _handle_request_stop_transaction(self, transaction_id: str, reason: Optional[str]):

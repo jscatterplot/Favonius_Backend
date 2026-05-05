@@ -30,6 +30,7 @@ async def test_rfid_authorization_accepts_known_tag() -> None:
     decision = await service.authorize("CP-1", "TAG-OK", "Authorize")
 
     assert decision.status == RFIDAuthStatus.ACCEPTED
+    assert decision.source == "Authorize"
     assert decision.card_id == "card-1"
     timescale.lookup_id_tag.assert_awaited_once_with("TAG-OK", station_id="CP-1")
 
