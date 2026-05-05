@@ -1,0 +1,470 @@
+# Golden test suite for the depot chat agent — consumption_by_user intent.
+#
+# 50 Q&A pairs covering:
+#   hp-*   Happy paths (10)
+#   amb-*  Ambiguity (10)
+#   nf-*   Not found (10)
+#   edge-* Edge cases (15)
+#   ref-*  Refusals (5)
+#
+# Each entry:
+#   id                  — unique slug
+#   message             — raw user message sent to the agent
+#   expected_intent     — the QueryPlan intent the LLM should extract
+#   expected_subjects   — list of {kind, text} the plan should contain
+#   expected_status     — success | disambiguation | not_found | refused
+#   expected_row_count  — (optional) exact row count for seeded fixtures
+#
+# "refused" maps to expected_subjects: [] in the extracted plan.
+# The runner asserts the plan subjects list is empty for refusals.
+# expected_row_count is only asserted when the key is present (non-null).
+#
+# PRD §7 correctness target: ≥ 95% (≥ 48/50 entries must pass).
+
+# ── Happy paths ───────────────────────────────────────────────────────────────
+
+- id: hp-01
+  message: "How much did John charge last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: John
+  expected_status: success
+
+- id: hp-02
+  message: "Show me electricity consumption for Jane Doe in April 2026."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Jane Doe
+  expected_status: success
+
+- id: hp-03
+  message: "What was the total energy usage for both John Smith and Maria Petrauskas last week?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: John Smith
+    - kind: driver
+      text: Maria Petrauskas
+  expected_status: success
+
+- id: hp-04
+  message: >
+    Show consumption for drivers EMP-1042 and EMP-1158 from 2026-04-01 to
+    2026-04-30, grouped by day.
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: EMP-1042
+    - kind: driver
+      text: EMP-1158
+  expected_status: success
+
+- id: hp-05
+  message: "How much electricity did the Vilnius depot drivers consume this month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: depot
+      text: Vilnius
+  expected_status: success
+
+- id: hp-06
+  message: "Show me last month's consumption for all depots."
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: success
+
+- id: hp-07
+  message: "What did Lukas Jankauskas charge last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Lukas Jankauskas
+  expected_status: success
+
+- id: hp-08
+  message: "Show consumption for employee EMP-0999 this week."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: EMP-0999
+  expected_status: success
+
+- id: hp-09
+  message: >
+    How much electricity did Jonas Brazauskas use at the Kaunas depot last month?
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Jonas Brazauskas
+    - kind: depot
+      text: Kaunas
+  expected_status: success
+
+- id: hp-10
+  message: >
+    Give me consumption for Anna Nowak from 2026-03-01 to 2026-03-31,
+    grouped by day.
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Anna Nowak
+  expected_status: success
+
+# ── Ambiguity ─────────────────────────────────────────────────────────────────
+
+- id: amb-01
+  message: "How much did John charge last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: John
+  expected_status: disambiguation
+  # Fixture must have ≥2 drivers matching "John"
+
+- id: amb-02
+  message: "Show energy for Smith this week."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Smith
+  expected_status: disambiguation
+  # Fixture has John Smith and Eva Smith
+
+- id: amb-03
+  message: "How much did the two Johns consume yesterday?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: John
+  expected_status: disambiguation
+
+- id: amb-04
+  message: "What's the consumption for Maria last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Maria
+  expected_status: disambiguation
+  # Fixture has Maria Petrauskas and Maria Nowak
+
+- id: amb-05
+  message: "Show me data for Kim yesterday."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Kim
+  expected_status: disambiguation
+
+- id: amb-06
+  message: "How much did Pete charge this week?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Pete
+  expected_status: disambiguation
+  # Fixture has Peter Kessler and Pete Bauer
+
+- id: amb-07
+  message: "Show consumption for Lee last month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Lee
+  expected_status: disambiguation
+
+- id: amb-08
+  message: "How much did Alex use last week?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Alex
+  expected_status: disambiguation
+  # Alex matches Alexander and Alexandra
+
+- id: amb-09
+  message: "What did driver Park charge in April 2026?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Park
+  expected_status: disambiguation
+
+- id: amb-10
+  message: "Show energy for K. Schmidt this month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: K. Schmidt
+  expected_status: disambiguation
+  # Klaus Schmidt and Katja Schmidt both in fixture
+
+# ── Not found ─────────────────────────────────────────────────────────────────
+
+- id: nf-01
+  message: "How much did driver 999 charge last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: "999"
+  expected_status: not_found
+
+- id: nf-02
+  message: "Show consumption for Johhn Smith last week."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Johhn Smith
+  expected_status: not_found
+  # Deliberate typo — resolver finds no match
+
+- id: nf-03
+  message: "How much did the Warsaw depot drivers use last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: depot
+      text: Warsaw
+  expected_status: not_found
+  # Warsaw depot does not exist in fixture
+
+- id: nf-04
+  message: "Show energy for driver from Org B — Sarah Connor — last month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Sarah Connor
+  expected_status: not_found
+  # Sarah Connor belongs to a different org; resolver sees only visible_depot_ids
+
+- id: nf-05
+  message: "What did XYZ-9999 charge this month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: XYZ-9999
+  expected_status: not_found
+
+- id: nf-06
+  message: "Show consumption for Marta Kowalski last month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Marta Kowalski
+  expected_status: not_found
+  # Driver left before data window; no sessions and no DB row
+
+- id: nf-07
+  message: "How much did vehicle ABC-123 charge last week?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: vehicle
+      text: ABC-123
+  expected_status: not_found
+  # No vehicle with that plate in fixture
+
+- id: nf-08
+  message: "Show energy for Zaphod Beeblebrox last month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Zaphod Beeblebrox
+  expected_status: not_found
+
+- id: nf-09
+  message: "How much did EMP-0000 charge yesterday?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: EMP-0000
+  expected_status: not_found
+
+- id: nf-10
+  message: "Show consumption for john.smith@example.com last month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: john.smith@example.com
+  expected_status: not_found
+  # Email address — resolver only matches display_name / external_id
+
+# ── Edge cases ────────────────────────────────────────────────────────────────
+
+- id: edge-01
+  message: "Show me last month's charging for John Smith."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: John Smith
+  expected_status: success
+  expected_row_count: 0
+  # John Smith exists but all sessions have NULL driver_id (card-only); row count 0
+
+- id: edge-02
+  message: "How much did Jane Doe charge last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Jane Doe
+  expected_status: success
+  # Sessions span the month boundary; query must include both sides
+
+- id: edge-03
+  message: "Show me yesterday's consumption for Maria Petrauskas."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Maria Petrauskas
+  expected_status: success
+  # DST spring-forward Sunday; UTC bounds shift, Lithuanian TZ
+
+- id: edge-04
+  message: "How much did Lukas charge last week?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Lukas
+  expected_status: success
+  # DST fall-back weekend; week boundary in depot local time
+
+- id: edge-05
+  message: "Show consumption for EMP-2000 last month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: EMP-2000
+  expected_status: success
+  expected_row_count: 0
+  # Known driver with zero charging sessions in the period
+
+- id: edge-06
+  message: "How much did Anna Nowak charge yesterday?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Anna Nowak
+  expected_status: success
+  expected_row_count: 1
+  # Exactly one session yesterday
+
+- id: edge-07
+  message: "What did John Smith charge last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: John Smith
+  expected_status: success
+  # January — "last month" resolves to December of the previous year
+
+- id: edge-08
+  message: "How much did I charge today?"
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: success
+  expected_row_count: 0
+  # "Today" with no sessions yet; result is empty but status is success
+
+- id: edge-09
+  message: "Show me yesterday's usage for Jonas Brazauskas."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Jonas Brazauskas
+  expected_status: success
+  expected_row_count: 1
+  # Single session exactly matching yesterday
+
+- id: edge-10
+  message: >
+    Show Jonas Brazauskas consumption from 2025-11-01 to 2026-02-28.
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Jonas Brazauskas
+  expected_status: success
+  # Multi-month absolute window crossing year boundary
+
+- id: edge-11
+  message: "How much did Peter Kessler charge last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Peter Kessler
+  expected_status: success
+  # Peter Kessler has three RFID cards; all should be included
+
+- id: edge-12
+  message: "Show midnight sessions for EMP-1042 last month."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: EMP-1042
+  expected_status: success
+  # Sessions starting at exactly 00:00:00 UTC — time-zone truncation edge
+
+- id: edge-13
+  message: >
+    How much did Anna Nowak charge from 2024-02-28 to 2024-03-01?
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: Anna Nowak
+  expected_status: success
+  # Leap day (2024 is a leap year); absolute window straddles it
+
+- id: edge-14
+  message: "How much did EMP-1042 charge at the Kaunas depot last month?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: EMP-1042
+    - kind: depot
+      text: Kaunas
+  expected_status: success
+  # Driver assigned to multiple depots; filter to Kaunas only
+
+- id: edge-15
+  message: "Show me last week's consumption for O'Brien."
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: driver
+      text: "O'Brien"
+  expected_status: success
+  # Apostrophe in name; SQL parameter escaping must handle it
+
+# ── Refusals ─────────────────────────────────────────────────────────────────
+
+- id: ref-01
+  message: "Schedule John for a charge tomorrow morning."
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: refused
+  # Write intent — agent must return empty subjects
+
+- id: ref-02
+  message: "How much did John charge last month AND list all his sessions?"
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: refused
+  # Multi-intent — agent must refuse
+
+- id: ref-03
+  message: "Kiek Jonui buvo priskaičiuota praėjusį mėnesį?"
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: refused
+  # Lithuanian — agent is English-only at v0
+
+- id: ref-04
+  message: "What's the current state of charge of bus 42?"
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: refused
+  # Out-of-scope intent (vehicle SoC, not consumption)
+
+- id: ref-05
+  message: "Should I charge the fleet tomorrow at 3 AM based on tomorrow's tariffs?"
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: refused
+  # Forecasting / recommendation — out of scope

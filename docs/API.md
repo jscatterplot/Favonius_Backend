@@ -337,6 +337,206 @@ For detailed OCPP integration specifications, see [PRD_v2_7_Building_Integration
 
 ---
 
+---
+
+## Depot Chat Agent (`/agent/*`)
+
+The agent endpoints expose the depot chat interface that converts plain-English
+questions about charging data into SQL-sourced answers.  They are mounted only
+when `AGENT_SEARCH_ENABLED=true` (default **on** since sprint B6).  All three
+share the global JWT auth middleware and the geo-block middleware; the two turn
+endpoints additionally enforce a **10 req/min per user** rate limit (same cadence
+as `POST /optimize`).
+
+Full design: `docs/plans/agent_search_architecture_v0.md`.
+PRD: `docs/plans/agent_search_prd_v1.md`.
+
+---
+
+### POST /agent/turn
+
+Run one chat turn synchronously.  Blocks until the answer is ready, then returns
+the complete `AgentReply`.
+
+**Rate limit:** 10 req/min per authenticated user.
+
+**Request:**
+```json
+{
+    "message": "How much did John charge last month?"
+}
+```
+
+| Field | Type | Constraints |
+|---|---|---|
+| `message` | `string` | 1–2000 characters |
+
+**Response — success:**
+```json
+{
+    "run_id": "uuid",
+    "status": "success",
+    "text": "John Smith consumed 83.9 kWh last month across 2 sessions.",
+    "intent": "consumption_by_user",
+    "candidates": [],
+    "not_found": []
+}
+```
+
+**Response — disambiguation** (multiple drivers match the name):
+```json
+{
+    "run_id": "uuid",
+    "status": "disambiguation",
+    "text": "I found multiple matches. Please clarify which one you mean:\n- John Smith (Vilnius)\n- John Petrauskas (Vilnius)",
+    "intent": null,
+    "candidates": [
+        {"kind": "driver", "display": "John Smith (Vilnius)", "primary_id": "uuid"},
+        {"kind": "driver", "display": "John Petrauskas (Vilnius)", "primary_id": "uuid"}
+    ],
+    "not_found": []
+}
+```
+
+**Response — not_found:**
+```json
+{
+    "run_id": "uuid",
+    "status": "not_found",
+    "text": "I couldn't find 'driver 999' in your depots. Double-check the spelling…",
+    "intent": null,
+    "candidates": [],
+    "not_found": ["driver 999"]
+}
+```
+
+**Response — error** (LLM or DB failure):
+```json
+{
+    "run_id": "uuid",
+    "status": "error",
+    "text": "Something went wrong handling your request. Please try again.",
+    "intent": null,
+    "candidates": [],
+    "not_found": []
+}
+```
+
+**`status` values:** `success` | `disambiguation` | `not_found` | `error`
+
+**Error codes:**
+- 401 — missing or invalid JWT
+- 422 — `message` length out of range
+- 429 — rate limit exceeded (headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`)
+- 502 — orchestrator failed (details logged server-side only)
+- 503 — database pool not initialised
+
+---
+
+### POST /agent/turn/stream
+
+Run one chat turn and stream step events via **Server-Sent Events** (SSE).
+Returns `200 OK` with `Content-Type: text/event-stream` immediately; the
+orchestrator runs in a background task and emits events as it completes each
+phase.  On failure an `error` event is emitted and the stream closes — the HTTP
+status remains `200` because headers were already sent.
+
+**Rate limit:** 10 req/min per authenticated user (same bucket as `/agent/turn`).
+
+**Request body:** identical to `POST /agent/turn`.
+
+**SSE event contract:**
+
+Each event is encoded as:
+```
+event: <name>\n
+data: <json>\n
+\n
+```
+
+| Event name | When emitted | `data` shape |
+|---|---|---|
+| `step` | After each pipeline phase completes | `{"name": "<phase>", "summary": "<human-readable summary>"}` |
+| `answer` | After the final phase | Full `AgentReply` JSON (same shape as the sync endpoint) |
+| `error` | On unrecoverable failure | `{"status": <http_code>, "detail": "<message>"}` |
+
+**Phase names** (emitted in order): `extract_plan` → `resolve_entities` →
+`compile` → `execute` → *(answer emitted next)*.  The `compile` and `execute`
+steps are skipped when the turn short-circuits at disambiguation or not-found.
+
+**Required client headers for proxies:**
+```
+Cache-Control: no-cache
+X-Accel-Buffering: no
+Connection: keep-alive
+```
+These are set in the response automatically (`SSE_HEADERS` in `src/api/agent/stream.py`).
+
+**Example SSE sequence (success):**
+```
+event: step
+data: {"name": "extract_plan", "summary": "consumption_by_user, 1 subject(s), last_month"}
+
+event: step
+data: {"name": "resolve_entities", "summary": "driver: John Smith (Vilnius)"}
+
+event: step
+data: {"name": "compile", "summary": "consumption_by_user SQL prepared"}
+
+event: step
+data: {"name": "execute", "summary": "2 rows returned"}
+
+event: answer
+data: {"run_id": "…", "status": "success", "text": "John Smith consumed 83.9 kWh…", "intent": "consumption_by_user", "candidates": [], "not_found": []}
+```
+
+---
+
+### GET /agent/runs/{run_id}
+
+Fetch the stored `agent_runs` row for a completed turn.  Useful for rendering
+the collapsible reasoning panel in the UI.
+
+**Access control:** The row's `user_id` must match the caller's `sub` JWT claim,
+**or** the caller must be `favonius_admin`.  A mismatched tenant user receives
+`404` (not `403`) to avoid run-ID enumeration.
+
+**Path parameter:** `run_id` — UUID of the run.
+
+**Response:**
+```json
+{
+    "run_id": "uuid",
+    "user_id": "uuid",
+    "organization_id": "uuid",
+    "depot_id": null,
+    "user_message": "How much did John charge last month?",
+    "final_intent": "consumption_by_user",
+    "steps_json": [
+        {"name": "extract_plan", "payload": {"intent": "consumption_by_user", …}},
+        {"name": "resolve_entities", "payload": […]},
+        {"name": "compile", "payload": {"intent": "consumption_by_user", "param_shapes": […]}},
+        {"name": "execute", "payload": {"row_count": 2}}
+    ],
+    "status": "success",
+    "duration_ms": 3241,
+    "created_at": "2026-05-05T12:34:56.789Z"
+}
+```
+
+| Field | Notes |
+|---|---|
+| `status` | `running` \| `success` \| `disambiguation` \| `not_found` \| `error` |
+| `steps_json` | Ordered list of step records appended during the turn |
+| `duration_ms` | Wall-clock time from open to close; `null` while `status='running'` |
+| `depot_id` | Currently always `null` (reserved for multi-depot scoping in v1) |
+
+**Error codes:**
+- 401 — invalid JWT
+- 404 — run not found, or belongs to another user
+
+---
+
 ## Implementation Notes
 
 - All endpoints use FastAPI framework

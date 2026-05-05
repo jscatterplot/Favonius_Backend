@@ -53,6 +53,7 @@ from src.api.agent.resolve import (
     resolve_time_window,
 )
 from src.api.agent.stream import SSEEventStream
+from src.monitoring.metrics import AGENT_RESOLVER_MISSES
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +283,8 @@ async def run_turn(
         # 3a. Disambiguation short-circuit.
         ambiguous = [e for e in resolved if e.candidates]
         if ambiguous:
+            for _entity in ambiguous:
+                AGENT_RESOLVER_MISSES.labels(kind="ambiguous").inc()
             reply = AgentReply.disambiguation(run_id=run_id, ambiguous=ambiguous)
             await agent_runs_close(ts_pool, run_id, "disambiguation", reply)
             if sse is not None:
@@ -291,6 +294,8 @@ async def run_turn(
         # 3b. Not-found short-circuit.
         missing = [e for e in resolved if e.primary_id is None]
         if missing:
+            for _entity in missing:
+                AGENT_RESOLVER_MISSES.labels(kind="not_found").inc()
             reply = AgentReply.not_found_reply(run_id=run_id, missing=missing)
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
             if sse is not None:

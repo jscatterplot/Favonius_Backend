@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, AsyncIterator, Optional
 from uuid import UUID
 
@@ -34,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.api.agent.controller import AgentReply, LLMClient, RealLLMClient, run_turn
 from src.api.agent.stream import SSE_HEADERS, SSEEventStream
+from src.monitoring.metrics import AGENT_TURN_DURATION, AGENT_TURNS
 from src.security.auth import get_user_id, get_user_role, verify_token
 from src.security.rate_limiter import get_rate_limiter
 
@@ -142,19 +144,27 @@ async def post_turn(
     llm_client: LLMClient = Depends(get_llm_client),
 ) -> AgentReply:
     """Run one turn end-to-end and return the final reply."""
+    start = time.monotonic()
     try:
-        return await run_turn(
+        reply = await run_turn(
             message=body.message,
             token_payload=user,
             static_pool=static_pool,
             ts_pool=ts_pool,
             llm_client=llm_client,
         )
+        duration = time.monotonic() - start
+        intent = reply.intent or "unknown"
+        AGENT_TURNS.labels(status=reply.status, intent=intent).inc()
+        AGENT_TURN_DURATION.labels(intent=intent).observe(duration)
+        return reply
     except HTTPException:
         # Auth-context errors (403 on missing org, etc.) bubble up as-is.
+        AGENT_TURNS.labels(status="error", intent="unknown").inc()
         raise
     except Exception:
         logger.exception("Agent turn failed (synchronous endpoint)")
+        AGENT_TURNS.labels(status="error", intent="unknown").inc()
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Agent turn failed. Please try again.",
@@ -186,8 +196,9 @@ async def post_turn_stream(
     stream = SSEEventStream()
 
     async def _run() -> None:
+        start = time.monotonic()
         try:
-            await run_turn(
+            reply = await run_turn(
                 message=body.message,
                 token_payload=user,
                 static_pool=static_pool,
@@ -195,15 +206,21 @@ async def post_turn_stream(
                 llm_client=llm_client,
                 sse=stream,
             )
+            duration = time.monotonic() - start
+            intent = reply.intent or "unknown"
+            AGENT_TURNS.labels(status=reply.status, intent=intent).inc()
+            AGENT_TURN_DURATION.labels(intent=intent).observe(duration)
         except HTTPException as exc:
             # Auth/scope errors thrown inside build_auth_context — surface
             # the status code in the event payload for client-side display
             # without leaking the exception's detail beyond what HTTPException
             # already exposes via its status code.
             logger.warning("Agent SSE turn failed with HTTPException status=%s", exc.status_code)
+            AGENT_TURNS.labels(status="error", intent="unknown").inc()
             await stream.emit("error", {"status": exc.status_code, "detail": exc.detail})
         except Exception:
             logger.exception("Agent SSE turn failed")
+            AGENT_TURNS.labels(status="error", intent="unknown").inc()
             await stream.emit(
                 "error",
                 {"status": 502, "detail": "Agent turn failed. Please try again."},
