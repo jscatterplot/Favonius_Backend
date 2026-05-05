@@ -69,6 +69,7 @@ class TimescaleSchema:
         await conn.execute(
             """
             ALTER TABLE charging_sessions
+            ADD COLUMN IF NOT EXISTS site_id UUID,
             ADD COLUMN IF NOT EXISTS cost_total DECIMAL(10,2),
             ADD COLUMN IF NOT EXISTS revenue_v2g DECIMAL(10,2),
             ADD COLUMN IF NOT EXISTS current_power_kw DOUBLE PRECISION,
