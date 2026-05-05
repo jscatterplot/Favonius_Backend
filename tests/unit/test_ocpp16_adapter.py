@@ -84,6 +84,7 @@ def mock_timescale() -> MagicMock:
     )
     tc.next_transaction_id = AsyncMock(return_value=4242)
     tc.next_charging_profile_id = AsyncMock(return_value=123456)
+    tc.store_security_event = AsyncMock()
     return tc
 
 
@@ -235,6 +236,44 @@ class TestOCPP16SessionForceBootNotification:
         session._cp.trigger_message = AsyncMock(side_effect=RuntimeError("boom"))
         monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
         await session._force_boot_notification()  # must not raise
+
+
+class TestOCPP16SessionSecurityEventPersistence:
+    """Persist OCPP 1.6 SecurityEventNotification frames to ``security_events``."""
+
+    @pytest.mark.asyncio
+    async def test_persists_event_with_parsed_timestamp(self, session, mock_timescale) -> None:
+        from datetime import datetime, timezone
+
+        await session._on_security_event(
+            cp_id="test_station_001",
+            event_type="StartupOfTheDevice",
+            timestamp="2026-05-04T15:43:41.000Z",
+            tech_info=None,
+        )
+        mock_timescale.store_security_event.assert_awaited_once()
+        payload = mock_timescale.store_security_event.await_args.args[0]
+        assert payload["station_id"] == "test_station_001"
+        assert payload["event_type"] == "StartupOfTheDevice"
+        assert payload["tech_info"] is None
+        assert payload["timestamp"] == datetime(2026, 5, 4, 15, 43, 41, tzinfo=timezone.utc)
+        assert payload["additional_info"]["source"] == "ocpp1.6.SecurityEventNotification"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_timestamp_falls_back_to_now(self, session, mock_timescale) -> None:
+        from datetime import datetime, timezone
+
+        before = datetime.now(timezone.utc)
+        await session._on_security_event(
+            cp_id="test_station_001",
+            event_type="SettingSystemTime",
+            timestamp="not-a-timestamp",
+            tech_info="ocppBoot",
+        )
+        after = datetime.now(timezone.utc)
+        mock_timescale.store_security_event.assert_awaited_once()
+        payload = mock_timescale.store_security_event.await_args.args[0]
+        assert before <= payload["timestamp"] <= after
 
 
 class TestOCPP16SessionCallbacks:
