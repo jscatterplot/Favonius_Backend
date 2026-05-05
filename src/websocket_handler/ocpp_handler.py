@@ -47,6 +47,7 @@ def _clear_ocpp_log_context() -> None:
     except Exception:
         pass
 
+
 from .certificate_manager import CertificateManager, CertificateType
 from .charging_profile_manager import ChargingProfileManager
 from .config import Config
@@ -59,7 +60,9 @@ from .monitoring_manager import MonitoringManager
 from .privacy_manager import PrivacyManager
 from .rfid_authorization import (
     RFIDAuthorizationService,
+    RFIDAuthStatus,
     map_auth_status_to_ocpp201,
+    user_message_for,
 )
 from .security_manager import SecurityConfig, SecurityManager
 from .tariff_manager import TariffManager
@@ -261,6 +264,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         connector_id = kwargs.get("connectorId", 1)
 
         if event_type == TransactionEventEnumType.started:
+            # python-ocpp snake-cases top-level kwargs (so `id_token`), but the
+            # nested `transaction_info` dict keeps its OCPP 2.0.1 camelCase
+            # keys verbatim. Try both shapes — different library versions
+            # surface idToken at different layers.
             token_payload = kwargs.get("id_token") or transaction_info.get("idToken") or {}
             id_token = self._token_field(token_payload, "idToken")
             if id_token:
@@ -292,10 +299,14 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         return call_result.TransactionEvent()
 
     async def _validate_started_transaction_token(self, id_token: str) -> None:
-        """Best-effort validation for started events to detect protocol drift.
+        """Monitor-only drift detection for charger-initiated TransactionEvent.started.
 
-        OCPP 2.0.1 stations should have passed Authorize first; this catches
-        cases where a station starts a session with an unknown token.
+        OCPP 2.0.1 stations should have called Authorize first; this fires
+        a warning when they start a session with an unknown token instead.
+        It does NOT stop the transaction — by the time .started arrives the
+        charger has already energised the EVSE — and is intentionally
+        fire-and-forget via ``_task_supervisor.create_task`` so a slow DB
+        lookup can't delay the OCPP ack.
         """
         decision = await self.rfid_authorization.authorize(
             self.id,
@@ -373,7 +384,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                 "personal_message": {
                     "format": "UTF8",
                     "language": "en",
-                    "content": "Authorized" if status == "Accepted" else "RFID denied",
+                    "content": user_message_for(decision),
                 },
             }
         )

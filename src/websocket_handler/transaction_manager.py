@@ -1,5 +1,6 @@
 """OCPP 2.0.1 Transaction Manager with authorization caching and tariff calculations."""
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -122,11 +123,28 @@ class TransactionManager:
         # Active transactions cache
         self.active_transactions: Dict[str, TransactionInfo] = {}
 
+        # Per-EVSE locks serialise concurrent RequestStartTransaction calls so
+        # the active-transaction check-and-set is atomic. Without this, two
+        # concurrent starts for the same EVSE both pass the "is it free?"
+        # check (the gap is the await on rfid_authorization.authorize) and
+        # the second silently overwrites the first.
+        self._evse_locks: Dict[str, asyncio.Lock] = {}
+
         # Tariff cache
         self.tariff_cache: Dict[str, Tariff] = {}
 
         # Transaction costs cache
         self.transaction_costs: Dict[str, Dict[str, Any]] = {}
+
+    def _evse_lock(self, station_id: str, evse_id: int) -> asyncio.Lock:
+        """Return the per-EVSE Lock, lazily creating it on first use.
+
+        ``dict.setdefault`` is atomic under the GIL so concurrent callers
+        observe the same Lock instance — required for the check-and-set in
+        ``request_start_transaction`` to serialise correctly.
+        """
+        key = f"{station_id}:{evse_id}"
+        return self._evse_locks.setdefault(key, asyncio.Lock())
 
     async def request_start_transaction(
         self,
@@ -154,60 +172,67 @@ class TransactionManager:
                 }
 
             cache_key = f"{station_id}:{evse_id}"
-            if cache_key in self.active_transactions:
-                return {
-                    "status": "Rejected",
-                    "statusInfo": {
-                        "reasonCode": "ConcurrentTx",
-                        "additionalInfo": "EVSE already has an active transaction",
-                    },
-                    "idTokenInfo": {"status": "Blocked"},
+            # Hold the per-EVSE lock around the slot check, the auth roundtrip,
+            # and the slot population so two concurrent starts can't both
+            # observe an empty slot before either claims it.
+            async with self._evse_lock(station_id, evse_id):
+                if cache_key in self.active_transactions:
+                    return {
+                        "status": "Rejected",
+                        "statusInfo": {
+                            "reasonCode": "ConcurrentTx",
+                            "additionalInfo": "EVSE already has an active transaction",
+                        },
+                        "idTokenInfo": {"status": "Blocked"},
+                    }
+
+                auth_decision = await self.rfid_authorization.authorize(
+                    station_id,
+                    id_token.id_token,
+                    "RequestStartTransaction",
+                )
+                id_token_info = {
+                    "status": map_auth_status_to_ocpp201(auth_decision.status),
+                    "cacheTimeout": 300,
                 }
+                if auth_decision.status != RFIDAuthStatus.ACCEPTED:
+                    return {
+                        "status": "Rejected",
+                        "statusInfo": {
+                            "reasonCode": id_token_info["status"],
+                            "additionalInfo": auth_decision.reason,
+                        },
+                        "idTokenInfo": id_token_info,
+                    }
 
-            auth_decision = await self.rfid_authorization.authorize(
-                station_id,
-                id_token.id_token,
-                "RequestStartTransaction",
-            )
-            id_token_info = {"status": map_auth_status_to_ocpp201(auth_decision.status), "cacheTimeout": 300}
-            if auth_decision.status != RFIDAuthStatus.ACCEPTED:
-                return {
-                    "status": "Rejected",
-                    "statusInfo": {
-                        "reasonCode": id_token_info["status"],
-                        "additionalInfo": auth_decision.reason,
-                    },
-                    "idTokenInfo": id_token_info,
-                }
+                # Check EVSE availability
+                evse_available = await self._check_evse_availability(station_id, evse_id)
+                if not evse_available:
+                    return {
+                        "status": "Rejected",
+                        "statusInfo": {
+                            "reasonCode": "EVSEUnavailable",
+                            "additionalInfo": "EVSE is not available",
+                        },
+                    }
 
-            # Check EVSE availability
-            evse_available = await self._check_evse_availability(station_id, evse_id)
-            if not evse_available:
-                return {
-                    "status": "Rejected",
-                    "statusInfo": {
-                        "reasonCode": "EVSEUnavailable",
-                        "additionalInfo": "EVSE is not available",
-                    },
-                }
+                # Generate transaction ID
+                transaction_id = str(uuid.uuid4())
 
-            # Generate transaction ID
-            transaction_id = str(uuid.uuid4())
+                # Create transaction info
+                transaction_info = TransactionInfo(
+                    transaction_id=transaction_id,
+                    charging_state=ChargingState.EV_CONNECTED,
+                    evse_id=evse_id,
+                    connector_id=1,  # Default connector
+                    remote_start_id=remote_start_id,
+                )
 
-            # Create transaction info
-            transaction_info = TransactionInfo(
-                transaction_id=transaction_id,
-                charging_state=ChargingState.EV_CONNECTED,
-                evse_id=evse_id,
-                connector_id=1,  # Default connector
-                remote_start_id=remote_start_id,
-            )
+                # Store transaction
+                await self._store_transaction(station_id, transaction_info, id_token)
 
-            # Store transaction
-            await self._store_transaction(station_id, transaction_info, id_token)
-
-            # Cache active transaction
-            self.active_transactions[cache_key] = transaction_info
+                # Cache active transaction (under the lock, atomic with the check above)
+                self.active_transactions[cache_key] = transaction_info
 
             # Apply charging profile if provided
             if charging_profile:
@@ -250,9 +275,8 @@ class TransactionManager:
         if not charging_profile:
             return None
 
-        purpose = (
-            charging_profile.get("chargingProfilePurpose")
-            or charging_profile.get("charging_profile_purpose")
+        purpose = charging_profile.get("chargingProfilePurpose") or charging_profile.get(
+            "charging_profile_purpose"
         )
         if purpose and purpose != "TxProfile":
             return {
