@@ -113,6 +113,7 @@ class OCPP16Session:
             on_transaction_start=self._on_transaction_start,
             on_transaction_stop=self._on_transaction_stop,
             on_authorize=self._on_authorize,
+            on_security_event=self._on_security_event,
             on_message_received=self._on_message_received,
             tx_id_provider=self._next_transaction_id,
         )
@@ -537,6 +538,40 @@ class OCPP16Session:
         if self._replay_task is not None and not self._replay_task.done():
             self._replay_task.cancel()
         self._replay_task = asyncio.create_task(self._delayed_replay())
+
+    async def _on_security_event(
+        self,
+        cp_id: str,
+        event_type: str,
+        timestamp: str,
+        tech_info: Optional[str],
+    ) -> None:
+        """Persist OCPP 1.6 SecurityEventNotification to ``security_events``.
+
+        Charger-side timestamps arrive as ISO 8601 with a ``Z`` suffix; we
+        convert to a timezone-aware datetime before handing to asyncpg.
+        Exceptions propagate to the wrapper in
+        ``FleetChargePoint.on_security_event_notification`` which logs them
+        — the OCPP ack still goes back to the charger.
+        """
+        try:
+            event_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            event_ts = datetime.now(timezone.utc)
+            logger.warning(
+                "SecurityEventNotification timestamp unparseable for station=%s: %r",
+                cp_id,
+                timestamp,
+            )
+        await self._timescale.store_security_event(
+            {
+                "station_id": cp_id,
+                "event_type": event_type,
+                "timestamp": event_ts,
+                "tech_info": tech_info,
+                "additional_info": {"source": "ocpp1.6.SecurityEventNotification"},
+            }
+        )
 
     async def _delayed_replay(self) -> None:
         """Run the queued-command replay shortly after BootNotification.
