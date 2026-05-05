@@ -613,7 +613,7 @@ class SecurityManager:
                            d.depot_id,
                            d.name        AS depot_name,
                            c.charger_id,
-                           c.ocpp_id     AS charger_name
+                           COALESCE(c.display_name, c.ocpp_id) AS charger_name
                       FROM chargers c
                       JOIN depots   d ON d.depot_id = c.depot_id
                      WHERE c.ocpp_id = $1
