@@ -13,6 +13,7 @@
 -- DUPLICATE_SESSION error code for the bulk-import dialog.
 
 ALTER TABLE charging_sessions
+    ADD COLUMN IF NOT EXISTS site_id UUID,
     ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'live',
     ADD COLUMN IF NOT EXISTS import_batch_id UUID,
     ADD COLUMN IF NOT EXISTS import_row_hash CHAR(64),
