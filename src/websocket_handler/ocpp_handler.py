@@ -91,6 +91,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         priority_charging_manager: Optional[Any] = None,
         external_control_manager: Optional[Any] = None,
         certificate_manager: Optional[CertificateManager] = None,
+        rfid_authorization: Optional[RFIDAuthorizationService] = None,
         # v2x_controller removed - out of scope for MVP per PRD Section 1.2
     ):
         """Initialize enhanced charge point with V2G capabilities."""
@@ -127,7 +128,9 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Initialize managers
         self.device_model = DeviceModel(timescale_client)
         self.charging_profile_manager = ChargingProfileManager(timescale_client)
-        self.rfid_authorization = RFIDAuthorizationService(timescale_client, self.logger)
+        self.rfid_authorization = rfid_authorization or RFIDAuthorizationService(
+            timescale_client, self.logger
+        )
         self.transaction_manager = TransactionManager(
             timescale_client,
             rfid_authorization=self.rfid_authorization,

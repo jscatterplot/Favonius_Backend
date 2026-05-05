@@ -27,7 +27,7 @@ from ocpp.v16.enums import AuthorizationStatus
 from src.adapters.ocpp.charge_point import FleetChargePoint
 
 from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
-from .rfid_authorization import RFIDAuthStatus, RFIDAuthorizationService
+from .rfid_authorization import RFIDAuthStatus
 
 # Replay window after a charger reconnects: pending commands enqueued while
 # the charger was offline are flushed within this many seconds of boot.
@@ -94,7 +94,7 @@ class OCPP16Session:
         self._timescale = timescale_client
         self._message_handler = message_handler
         self._connection_manager = connection_manager
-        self._authz = RFIDAuthorizationService(timescale_client, logger)
+        self._authz = message_handler.rfid_authorization
         # Single-slot stash for the most recent accepted StartTransaction so
         # ``_next_transaction_id`` can persist the open ``charging_sessions``
         # row alongside the generated tx_id. Safe because FleetChargePoint

@@ -21,6 +21,14 @@ INVALID_ATTEMPT_THRESHOLD = 8
 INVALID_ATTEMPT_WINDOW_S = 60
 THROTTLE_DURATION_S = 120
 
+# Process-wide throttle / recovery state so every ``RFIDAuthorizationService``
+# shares the same in-memory fallback when durable DB helpers are unavailable.
+_invalid_attempts: dict[tuple[str, str], list[float]] = {}
+_throttled_until: dict[tuple[str, str], float] = {}
+_recovery_logged: set[tuple[str, str]] = set()
+_pending_recovery_audit: set[tuple[str, str]] = set()
+_missing_methods_logged: set[str] = set()
+
 
 class RFIDAuthStatus(str, Enum):
     """Internal status taxonomy for card-based authorization."""
@@ -80,33 +88,17 @@ class RFIDAuthorizationService:
     def __init__(self, timescale_client: Any, logger: Any) -> None:
         self._timescale = timescale_client
         self._logger = logger
-        self._invalid_attempts: dict[tuple[str, str], list[float]] = {}
-        self._throttled_until: dict[tuple[str, str], float] = {}
-        # Tracks (station, tag) pairs for which we've already written a
-        # "rfid_authorization_recovered" audit event since the last invalid.
-        # Without this, every successful Authorize after a recent invalid
-        # attempt would write another recovered row to security_events.
-        self._recovery_logged: set[tuple[str, str]] = set()
-        # (station, tag) pairs that have persisted at least one invalid attempt
-        # since the last successful `clear_invalid_rfid_attempts`. Used to skip
-        # the COUNT round-trip inside ``clear_invalid_rfid_attempts`` on the
-        # common path where a tag has never been denied.
-        self._pending_recovery_audit: set[tuple[str, str]] = set()
-        # One-time WARN log per missing TimescaleClient method so a refactor
-        # that drops a method silently can't disable abuse controls without
-        # leaving a trace in the logs.
-        self._missing_methods_logged: set[str] = set()
 
     async def _call_client_method(self, method_name: str, *args: Any) -> Any:
         method = getattr(self._timescale, method_name, None)
         if method is None:
-            if method_name not in self._missing_methods_logged:
+            if method_name not in _missing_methods_logged:
                 self._logger.warning(
                     "rfid_authorization_method_unavailable method=%s "
                     "(abuse controls degraded — TimescaleClient missing this method)",
                     method_name,
                 )
-                self._missing_methods_logged.add(method_name)
+                _missing_methods_logged.add(method_name)
             return None
         try:
             result = method(*args)
@@ -128,7 +120,7 @@ class RFIDAuthorizationService:
             return True
 
         key = (station_id, id_tag)
-        expires_at = self._throttled_until.get(key)
+        expires_at = _throttled_until.get(key)
         now = time.time()
         return bool(expires_at and expires_at > now)
 
@@ -137,15 +129,15 @@ class RFIDAuthorizationService:
         key = (station_id, id_tag)
         now = time.time()
         window_s = float(INVALID_ATTEMPT_WINDOW_S)
-        attempts = [ts for ts in self._invalid_attempts.get(key, []) if (now - ts) <= window_s]
+        attempts = [ts for ts in _invalid_attempts.get(key, []) if (now - ts) <= window_s]
         attempts.append(now)
-        self._invalid_attempts[key] = attempts
+        _invalid_attempts[key] = attempts
         if len(attempts) >= INVALID_ATTEMPT_THRESHOLD:
-            self._throttled_until[key] = now + THROTTLE_DURATION_S
+            _throttled_until[key] = now + THROTTLE_DURATION_S
         # A new invalid resets the recovery marker — the next success on
         # this (station, tag) pair will write exactly one recovered event.
-        self._recovery_logged.discard(key)
-        self._pending_recovery_audit.add(key)
+        _recovery_logged.discard(key)
+        _pending_recovery_audit.add(key)
 
     async def authorize(self, station_id: str, id_tag: str, source: str) -> RFIDAuthDecision:
         """Authorize an idTag using canonical DB-backed fleet lookup."""
@@ -217,19 +209,19 @@ class RFIDAuthorizationService:
             depot_id=row.get("depot_id"),
         )
         key = (station_id, id_tag)
-        self._invalid_attempts.pop(key, None)
-        self._throttled_until.pop(key, None)
+        _invalid_attempts.pop(key, None)
+        _throttled_until.pop(key, None)
         # Only emit a recovery event the first time we succeed after a streak of
         # invalid attempts. Subsequent successes are suppressed until another
         # invalid arrives (which clears the marker in `_record_invalid_attempt`).
         # Skip ``clear_invalid_rfid_attempts`` when this tag has never hit
         # `_record_invalid_attempt` in this process — that path persists an
         # invalid row and sets ``_pending_recovery_audit``.
-        if key not in self._recovery_logged:
-            if key in self._pending_recovery_audit:
+        if key not in _recovery_logged:
+            if key in _pending_recovery_audit:
                 await self._call_client_method("clear_invalid_rfid_attempts", station_id, id_tag)
-                self._pending_recovery_audit.discard(key)
-            self._recovery_logged.add(key)
+                _pending_recovery_audit.discard(key)
+            _recovery_logged.add(key)
         RFID_AUTH_ATTEMPTS_TOTAL.labels(source=source, outcome=RFIDAuthStatus.ACCEPTED.value).inc()
         self._logger.info(
             "rfid_authorize_accepted source=%s station_id=%s id_tag=%s identity_source=%s vehicle_id=%s card_id=%s",

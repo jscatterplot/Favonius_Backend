@@ -724,6 +724,7 @@ class OCPPWebSocketServer:
                 priority_charging_manager=self.priority_charging_manager,
                 external_control_manager=self.external_control_manager,
                 certificate_manager=self.certificate_manager,
+                rfid_authorization=self.message_handler.rfid_authorization,
             )
         self.charge_points[station_id] = charge_point
 

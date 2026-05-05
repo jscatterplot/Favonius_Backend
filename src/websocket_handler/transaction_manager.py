@@ -3,7 +3,7 @@
 import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -116,9 +116,6 @@ class TransactionManager:
         self.rfid_authorization = rfid_authorization or RFIDAuthorizationService(
             timescale_client, self.logger
         )
-
-        # Authorization cache
-        self.auth_cache: Dict[str, Dict[str, Any]] = {}
 
         # Active transactions cache
         self.active_transactions: Dict[str, TransactionInfo] = {}
@@ -332,56 +329,6 @@ class TransactionManager:
                 "status": "Rejected",
                 "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
             }
-
-    async def authorize_id_token(self, id_token: IdToken) -> Dict[str, Any]:
-        """Authorize ID token."""
-        try:
-            # Check cache first
-            cache_key = f"{id_token.type}:{id_token.id_token}"
-            if cache_key in self.auth_cache:
-                cached_auth = self.auth_cache[cache_key]
-                if datetime.now(timezone.utc) < cached_auth["expires_at"]:
-                    return cached_auth["result"]
-
-            # Check database for token
-            token_info = await self.timescale_client.get_id_token_info(
-                id_token.id_token, id_token.type
-            )
-
-            if token_info:
-                # Token found and valid
-                auth_result = {
-                    "status": "Accepted",
-                    "cacheTimeout": token_info.get("cache_timeout", 300),
-                    "chargingPriority": token_info.get("charging_priority"),
-                    "language1": token_info.get("language1", "en"),
-                    "language2": token_info.get("language2"),
-                    "groupIdToken": token_info.get("group_id_token"),
-                    "personalMessage": token_info.get("personal_message"),
-                }
-
-                # Cache result
-                self.auth_cache[cache_key] = {
-                    "result": auth_result,
-                    "expires_at": datetime.now(timezone.utc) + timedelta(seconds=300),
-                }
-
-                return auth_result
-            else:
-                # Token not found
-                auth_result = {"status": "Unknown", "cacheTimeout": 300}
-
-                # Cache negative result
-                self.auth_cache[cache_key] = {
-                    "result": auth_result,
-                    "expires_at": datetime.now(timezone.utc) + timedelta(seconds=60),
-                }
-
-                return auth_result
-
-        except Exception as e:
-            self.logger.error(f"Error authorizing token: {e}")
-            return {"status": "Rejected", "additional_info": str(e)}
 
     async def handle_transaction_event(
         self,
