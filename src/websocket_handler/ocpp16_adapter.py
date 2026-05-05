@@ -556,7 +556,7 @@ class OCPP16Session:
         """
         try:
             event_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        except (TypeError, ValueError):
+        except (ValueError, AttributeError):
             event_ts = datetime.now(timezone.utc)
             logger.warning(
                 "SecurityEventNotification timestamp unparseable for station=%s: %r",
