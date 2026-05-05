@@ -184,9 +184,13 @@ INSERT INTO drivers VALUES
 INSERT INTO charging_sessions (session_id, station_id, driver_id, start_time, end_time, energy_delivered_kwh, cost_total)
 VALUES
     (gen_random_uuid(), 'CP001', '{_DRIVER_JOHN}',
-     NOW() - INTERVAL '40 days', NOW() - INTERVAL '39 days 22 hours', 45.2, 9.94),
+     date_trunc('month', NOW()) - INTERVAL '1 month' + INTERVAL '5 days',
+     date_trunc('month', NOW()) - INTERVAL '1 month' + INTERVAL '5 days 2 hours',
+     45.2, 9.94),
     (gen_random_uuid(), 'CP001', '{_DRIVER_JOHN}',
-     NOW() - INTERVAL '38 days', NOW() - INTERVAL '37 days 23 hours', 38.7, 8.51);
+     date_trunc('month', NOW()) - INTERVAL '1 month' + INTERVAL '12 days',
+     date_trunc('month', NOW()) - INTERVAL '1 month' + INTERVAL '12 days 1 hour',
+     38.7, 8.51);
 """
 
 
