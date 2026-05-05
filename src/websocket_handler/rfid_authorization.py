@@ -87,6 +87,11 @@ class RFIDAuthorizationService:
         # Without this, every successful Authorize after a recent invalid
         # attempt would write another recovered row to security_events.
         self._recovery_logged: set[tuple[str, str]] = set()
+        # (station, tag) pairs that have persisted at least one invalid attempt
+        # since the last successful `clear_invalid_rfid_attempts`. Used to skip
+        # the COUNT round-trip inside ``clear_invalid_rfid_attempts`` on the
+        # common path where a tag has never been denied.
+        self._pending_recovery_audit: set[tuple[str, str]] = set()
         # One-time WARN log per missing TimescaleClient method so a refactor
         # that drops a method silently can't disable abuse controls without
         # leaving a trace in the logs.
@@ -140,6 +145,7 @@ class RFIDAuthorizationService:
         # A new invalid resets the recovery marker — the next success on
         # this (station, tag) pair will write exactly one recovered event.
         self._recovery_logged.discard(key)
+        self._pending_recovery_audit.add(key)
 
     async def authorize(self, station_id: str, id_tag: str, source: str) -> RFIDAuthDecision:
         """Authorize an idTag using canonical DB-backed fleet lookup."""
@@ -216,8 +222,13 @@ class RFIDAuthorizationService:
         # Only emit a recovery event the first time we succeed after a streak of
         # invalid attempts. Subsequent successes are suppressed until another
         # invalid arrives (which clears the marker in `_record_invalid_attempt`).
+        # Skip ``clear_invalid_rfid_attempts`` when this tag has never hit
+        # `_record_invalid_attempt` in this process — that path persists an
+        # invalid row and sets ``_pending_recovery_audit``.
         if key not in self._recovery_logged:
-            await self._call_client_method("clear_invalid_rfid_attempts", station_id, id_tag)
+            if key in self._pending_recovery_audit:
+                await self._call_client_method("clear_invalid_rfid_attempts", station_id, id_tag)
+                self._pending_recovery_audit.discard(key)
             self._recovery_logged.add(key)
         RFID_AUTH_ATTEMPTS_TOTAL.labels(source=source, outcome=RFIDAuthStatus.ACCEPTED.value).inc()
         self._logger.info(

@@ -275,9 +275,6 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                     self._validate_started_transaction_token(id_token),
                     f"validate_started_tx:{transaction_id}",
                 )
-
-        # Update active transactions
-        if event_type == TransactionEventEnumType.started:
             self.active_transactions[connector_id] = transaction_id
         elif event_type == TransactionEventEnumType.ended:
             self.active_transactions.pop(connector_id, None)

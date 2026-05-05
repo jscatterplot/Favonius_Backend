@@ -39,6 +39,25 @@ async def test_rfid_authorization_accepts_known_tag() -> None:
 
 
 @pytest.mark.asyncio
+async def test_first_accepted_authorize_skips_clear_invalid_rfid_attempts() -> None:
+    """No DB round-trip for recovery when the tag has never been denied this process."""
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(
+        return_value={
+            "vehicle_id": "veh-1",
+            "card_id": "card-1",
+            "source": "rfid_card",
+        }
+    )
+    timescale.clear_invalid_rfid_attempts = AsyncMock()
+    service = RFIDAuthorizationService(timescale, MagicMock())
+
+    await service.authorize("CP-1", "TAG-NEW", "Authorize")
+
+    timescale.clear_invalid_rfid_attempts.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_rfid_authorization_throttles_repeated_invalid_tags() -> None:
     timescale = MagicMock()
     timescale.lookup_id_tag = AsyncMock(return_value=None)
