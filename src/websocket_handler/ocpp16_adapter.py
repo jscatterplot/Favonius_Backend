@@ -264,6 +264,26 @@ class OCPP16Session:
             )
         return False
 
+    async def send_reset(self, reset_type: str = "Soft") -> bool:
+        """Send OCPP 1.6 Reset to the charger.
+
+        Returns True if the charger responded ``Accepted``. Reset is irreversible
+        on the device side, so the queue consumer marks the row terminal on the
+        first attempt regardless of outcome — we do NOT enqueue on failure here
+        and the boot-replay path explicitly skips ``remote_reset`` rows.
+        """
+        try:
+            status = await self._cp.reset(reset_type=reset_type)
+        except Exception as exc:
+            logger.warning(
+                "Reset raised for station=%s type=%s: %s",
+                self._station_id,
+                reset_type,
+                exc,
+            )
+            return False
+        return status == "Accepted"
+
     async def replay_queued_commands(self) -> int:
         """Flush ``charging_command_queue`` rows for this station.
 
@@ -272,6 +292,10 @@ class OCPP16Session:
         ``allow_enqueue=False`` so a transient failure during replay does not
         re-enqueue an already-queued row. Returns the number of rows that
         were marked ``acked``.
+
+        Only ``set_charging_profile`` rows are replayed. Other command types
+        (e.g. ``remote_reset``) are intentionally skipped — replaying a reset
+        on every reconnect would loop a stuck charger.
         """
         try:
             rows = await self._timescale.fetch_pending_commands(self._station_id)
@@ -285,6 +309,8 @@ class OCPP16Session:
 
         sent = 0
         for row in rows:
+            if row.get("command_type", "set_charging_profile") != "set_charging_profile":
+                continue
             queue_id = row["queue_id"]
             payload = row["payload"]
             if isinstance(payload, str):

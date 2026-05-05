@@ -569,6 +569,146 @@ class TestHealthEndpoint:
         assert data["components"]["database"] == "healthy"
 
 
+class TestChargerRestartCommand:
+    """fleet.charger.restart enqueues into charging_command_queue.
+
+    Production runs the API service with ``OCPP_SERVER_ENABLED=false``, so
+    these tests verify that the handler does NOT depend on an in-process
+    OCPP server and instead writes a queue row that the legacy WS handler
+    drains.
+    """
+
+    def _prepare_pool(self, mock_db_pool, ocpp_id: str | None, queue_id: int = 42):
+        """Wire mock_db_pool to return a charger lookup row + queue insert id."""
+        pool, conn = mock_db_pool
+
+        async def fake_fetchrow(sql, *args):
+            if "FROM charging_stations" in sql:
+                return {"ocpp_id": ocpp_id} if ocpp_id is not None else None
+            return None
+
+        async def fake_fetchval(sql, *args):
+            if "INSERT INTO charging_command_queue" in sql:
+                return queue_id
+            if sql.strip().startswith("SELECT 1"):
+                return True
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=fake_fetchrow)
+        conn.fetchval = AsyncMock(side_effect=fake_fetchval)
+        return pool, conn
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_charger_restart_enqueues_when_ocpp_server_disabled(
+        self, _mock_audit, client, mock_db_pool
+    ):
+        """No in-process OCPP server is required — handler writes a queue row."""
+        depot_id = str(uuid4())
+        charger_id = str(uuid4())
+        ocpp_id = "CHARGER_001"
+        pool, conn = self._prepare_pool(mock_db_pool, ocpp_id, queue_id=99)
+
+        with patch("src.api.main.db_pools", pool), patch("src.api.main.ocpp_server", None):
+            response = client.post(
+                "/commands/execute",
+                json={
+                    "command": "fleet.charger.restart",
+                    "depot_id": depot_id,
+                    "params": {"charger_id": charger_id, "reset_type": "Soft"},
+                    "dry_run": False,
+                },
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK, response.text
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["command"] == "fleet.charger.restart"
+        result = body["result"]
+        assert result["charger_id"] == charger_id
+        assert result["ocpp_id"] == ocpp_id
+        assert result["queue_id"] == 99
+        assert result["reset_type"] == "Soft"
+        assert result["status"] == "enqueued"
+
+        # Confirm the INSERT was issued with the right command_type/payload.
+        insert_calls = [
+            c for c in conn.fetchval.call_args_list if "charging_command_queue" in c.args[0]
+        ]
+        assert len(insert_calls) == 1
+        sql, ocpp_arg, payload_arg = insert_calls[0].args
+        assert "'remote_reset'" in sql
+        assert ocpp_arg == ocpp_id
+        assert '"type": "Soft"' in payload_arg
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_charger_restart_returns_404_when_charger_not_in_depot(
+        self, _mock_audit, client, mock_db_pool
+    ):
+        depot_id = str(uuid4())
+        charger_id = str(uuid4())
+        pool, _ = self._prepare_pool(mock_db_pool, ocpp_id=None)
+
+        with patch("src.api.main.db_pools", pool):
+            response = client.post(
+                "/commands/execute",
+                json={
+                    "command": "fleet.charger.restart",
+                    "depot_id": depot_id,
+                    "params": {"charger_id": charger_id},
+                    "dry_run": False,
+                },
+            )
+
+        assert response.status_code == http_status.HTTP_404_NOT_FOUND
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_charger_restart_rejects_invalid_reset_type(self, _mock_audit, client, mock_db_pool):
+        depot_id = str(uuid4())
+        charger_id = str(uuid4())
+        pool, _ = self._prepare_pool(mock_db_pool, ocpp_id="CHARGER_001")
+
+        with patch("src.api.main.db_pools", pool):
+            response = client.post(
+                "/commands/execute",
+                json={
+                    "command": "fleet.charger.restart",
+                    "depot_id": depot_id,
+                    "params": {"charger_id": charger_id, "reset_type": "Nuclear"},
+                    "dry_run": False,
+                },
+            )
+
+        assert response.status_code == http_status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_charger_restart_dry_run_does_not_query_db(self, _mock_audit, client, mock_db_pool):
+        """dry_run short-circuits before any DB read, returning 'simulated'."""
+        depot_id = str(uuid4())
+        charger_id = str(uuid4())
+        pool, conn = self._prepare_pool(mock_db_pool, ocpp_id="CHARGER_001")
+
+        with patch("src.api.main.db_pools", pool):
+            response = client.post(
+                "/commands/execute",
+                json={
+                    "command": "fleet.charger.restart",
+                    "depot_id": depot_id,
+                    "params": {"charger_id": charger_id},
+                    "dry_run": True,
+                },
+            )
+
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert body["status"] == "dry_run"
+        assert body["result"]["simulated"] is True
+        # The dry-run path returns before fetchrow against charging_stations.
+        assert all(
+            "charging_stations" not in (c.args[0] if c.args else "")
+            for c in conn.fetchrow.call_args_list
+        )
+
+
 class TestErrorHandling:
     """Test error handling and exception handlers."""
 
