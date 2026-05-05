@@ -16,6 +16,7 @@ from .monitoring import get_logger
 from .rfid_authorization import (
     RFIDAuthorizationService,
     map_auth_status_to_ocpp201,
+    user_message_for,
 )
 from .timescale_client import TimescaleClient
 
@@ -429,7 +430,7 @@ class MessageHandler:
                 "Authorize",
             )
             status = map_auth_status_to_ocpp201(decision.status)
-            reason = "Authorized" if status == "Accepted" else decision.reason
+            reason = user_message_for(decision)
 
         return {
             "idTokenInfo": {

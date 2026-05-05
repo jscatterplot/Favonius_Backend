@@ -1820,7 +1820,7 @@ class TimescaleClient:
                  WHERE station_id = $1
                    AND event_type = 'rfid_authorization_invalid'
                    AND timestamp >= $2
-                   AND COALESCE((additional_info ->> 'id_tag'), '') = $3
+                   AND (additional_info ->> 'id_tag') = $3
                 """,
                 station_id,
                 cutoff,
