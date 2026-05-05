@@ -1356,6 +1356,13 @@ class StateAssembler:
         async with pool.acquire() as conn:
             vehicle_rows = await conn.fetch(vehicles_query, depot_id_str)
 
+        # An empty fleet is a valid state for a freshly-onboarded depot — the
+        # config still loads, downstream callers (state, optimize) decide how
+        # to handle no vehicles. Previously raised, surfacing as HTTP 500 on
+        # GET /depots/{id}/state.
+        if not vehicle_rows:
+            logger.info(f"Depot {depot_id_str} has no vehicles configured")
+
         vehicle_capacities = {}
         vehicle_to_ocpp = {}
         for row in vehicle_rows:
