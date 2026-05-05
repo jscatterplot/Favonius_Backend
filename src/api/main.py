@@ -2325,14 +2325,14 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
         try:
             config, _ = await StateAssembler.load_depot_config(db_pools, depot_id)
 
+            # Empty fleets and chargerless depots are valid for freshly-onboarded
+            # depots; GET /state should still succeed with empty payloads. The
+            # /optimize endpoint enforces the not-empty precondition at its own
+            # layer (see line ~4160), so empty configs here are not an error.
             if not config.vehicle_capacities:
-                raise HTTPException(
-                    status_code=400, detail=f"Depot {depot_id} has no vehicles configured"
-                )
+                logger.info(f"Depot {depot_id} has no vehicles configured yet")
             if config.n_chargers == 0:
-                logger.warning(
-                    f"Depot {depot_id} has no chargers configured, optimization may fail"
-                )
+                logger.info(f"Depot {depot_id} has no chargers configured yet")
 
             _depot_config_cache[depot_id] = (config, time.time())
             logger.info(
