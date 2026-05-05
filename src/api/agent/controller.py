@@ -144,7 +144,9 @@ class AgentReply(BaseModel):
         return cls(run_id=run_id, status="success", text=text, intent=intent)
 
     @classmethod
-    def disambiguation(cls, *, run_id: UUID, ambiguous: list[ResolvedEntity]) -> "AgentReply":
+    def disambiguation(
+        cls, *, run_id: UUID, intent: str, ambiguous: list[ResolvedEntity]
+    ) -> "AgentReply":
         candidates: list[_CandidateOption] = []
         for entity in ambiguous:
             for cand in entity.candidates or [entity]:
@@ -163,17 +165,25 @@ class AgentReply(BaseModel):
             # this branch when ``ambiguous`` has at least one entry, but
             # an empty candidates list would otherwise yield a stub reply.
             text = "I found multiple matches. Please clarify which one you mean."
-        return cls(run_id=run_id, status="disambiguation", text=text, candidates=candidates)
+        return cls(
+            run_id=run_id,
+            status="disambiguation",
+            text=text,
+            intent=intent,
+            candidates=candidates,
+        )
 
     @classmethod
-    def not_found_reply(cls, *, run_id: UUID, missing: list[ResolvedEntity]) -> "AgentReply":
+    def not_found_reply(
+        cls, *, run_id: UUID, intent: str, missing: list[ResolvedEntity]
+    ) -> "AgentReply":
         labels = [m.display for m in missing]
         text = (
             "I couldn't find " + ", ".join(repr(label) for label in labels) + " "
             "in your depots. Double-check the spelling, or try the person's "
             "employee ID or a vehicle's license plate."
         )
-        return cls(run_id=run_id, status="not_found", text=text, not_found=labels)
+        return cls(run_id=run_id, status="not_found", text=text, intent=intent, not_found=labels)
 
     @classmethod
     def error(cls, *, run_id: UUID, message: Optional[str] = None) -> "AgentReply":
@@ -285,7 +295,7 @@ async def run_turn(
         if ambiguous:
             for _entity in ambiguous:
                 AGENT_RESOLVER_MISSES.labels(kind="ambiguous").inc()
-            reply = AgentReply.disambiguation(run_id=run_id, ambiguous=ambiguous)
+            reply = AgentReply.disambiguation(run_id=run_id, intent=plan.intent, ambiguous=ambiguous)
             await agent_runs_close(ts_pool, run_id, "disambiguation", reply)
             if sse is not None:
                 await sse.emit("answer", reply.model_dump(mode="json"))
@@ -296,7 +306,7 @@ async def run_turn(
         if missing:
             for _entity in missing:
                 AGENT_RESOLVER_MISSES.labels(kind="not_found").inc()
-            reply = AgentReply.not_found_reply(run_id=run_id, missing=missing)
+            reply = AgentReply.not_found_reply(run_id=run_id, intent=plan.intent, missing=missing)
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
             if sse is not None:
                 await sse.emit("answer", reply.model_dump(mode="json"))
