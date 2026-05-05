@@ -2265,7 +2265,8 @@ async def latest_connector_status_by_stations(db, station_ids: list[str]) -> dic
 async def open_sessions_by_stations(db, station_ids: list[str]) -> dict[str, dict]:
     """Latest open ``charging_sessions`` row per station_id.
 
-    Open = ``end_time IS NULL``. Returns mapping ``ocpp_id -> session dict``.
+    Open live session = ``end_time IS NULL AND source='live'``.
+    Returns mapping ``ocpp_id -> session dict``.
     Multiple open sessions on the same station should not happen but we pick
     the most recent ``start_time`` defensively.
     """
@@ -2282,7 +2283,9 @@ async def open_sessions_by_stations(db, station_ids: list[str]) -> dict[str, dic
                target_soc,
                estimated_end_time AS estimated_end_at
         FROM charging_sessions
-        WHERE station_id = ANY($1) AND end_time IS NULL
+        WHERE station_id = ANY($1)
+          AND end_time IS NULL
+          AND source = 'live'
         ORDER BY station_id, start_time DESC
     """
     rows = await db.fetch(query, station_ids)
@@ -2328,7 +2331,9 @@ async def open_session_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict
                start_time       AS started_at,
                current_power_kw
         FROM charging_sessions
-        WHERE vehicle_id = ANY($1::uuid[]) AND end_time IS NULL
+        WHERE vehicle_id = ANY($1::uuid[])
+          AND end_time IS NULL
+          AND source = 'live'
         ORDER BY vehicle_id, start_time DESC
     """
     rows = await db.fetch(query, vehicle_ids)
