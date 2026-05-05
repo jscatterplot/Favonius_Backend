@@ -286,6 +286,15 @@ class FleetChargePoint(CP16):
 
     async def route_message(self, message: str) -> None:
         """Route incoming OCPP message with bound structured logging context."""
+        # TEMP diagnostic for hrx-vilnius silent-charger investigation. Logs raw
+        # frame bytes (truncated) before any parsing so malformed/non-JSON frames
+        # are visible too. Remove once root cause is identified.
+        logger.info(
+            "ocpp_raw_frame station=%s len=%d head=%.200s",
+            self.id,
+            len(message),
+            message,
+        )
         call_id = None
         action = None
         try:
