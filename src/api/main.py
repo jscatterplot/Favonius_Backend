@@ -7204,7 +7204,6 @@ async def manual_authorize_charger_endpoint(
                   FROM operator_authorization_overrides
                  WHERE station_id = $1
                    AND connector_id = $2
-                   AND consumed_at IS NULL
                    AND created_at >= NOW() - INTERVAL '60 seconds'
                 ORDER BY created_at DESC
                  LIMIT 1
@@ -7221,7 +7220,7 @@ async def manual_authorize_charger_endpoint(
                     status_code=409,
                     detail={
                         "error_code": "RECENT_OVERRIDE_EXISTS",
-                        "message": "An unconsumed override exists for this connector",
+                        "message": "A recent override exists for this connector",
                         "retry_after_seconds": retry_after,
                         "active_override_id": str(recent["id"]),
                         "expires_at": recent["expires_at"].isoformat(),
