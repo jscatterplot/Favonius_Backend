@@ -132,6 +132,35 @@ async def test_request_start_transaction_rejects_invalid_profile_purpose() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "charging_profile",
+    [
+        {"chargingProfilePurpose": "TxProfile", "transactionId": ""},
+        {"chargingProfilePurpose": "TxProfile", "transactionId": 0},
+        {"chargingProfilePurpose": "TxProfile", "transaction_id": None},
+    ],
+)
+async def test_request_start_transaction_rejects_profile_with_transaction_id_key(
+    charging_profile: dict,
+) -> None:
+    """transactionId must be omitted; falsy values still violate OCPP 2.0.1 semantics."""
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(return_value={"source": "rfid_card"})
+    manager = TransactionManager(timescale)
+
+    result = await manager.request_start_transaction(
+        "CP-1",
+        1,
+        None,
+        IdToken(id_token="KNOWN", type=IdTokenType.ISO14443),
+        charging_profile,
+    )
+
+    assert result["status"] == "Rejected"
+    assert result["statusInfo"]["reasonCode"] == "InvalidChargingProfile"
+
+
+@pytest.mark.asyncio
 async def test_request_start_transaction_rejects_concurrent_evse_session() -> None:
     timescale = MagicMock()
     timescale.lookup_id_tag = AsyncMock(return_value={"source": "rfid_card"})
