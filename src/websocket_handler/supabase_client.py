@@ -172,8 +172,8 @@ class SupabaseClient:
         if not row:
             return None
         return {
-            "organization_id": str(row["organization_id"]) if row.get("organization_id") else None,
-            "depot_id": str(row["depot_id"]) if row.get("depot_id") else None,
+            "organization_id": row.get("organization_id"),
+            "depot_id": row.get("depot_id"),
         }
 
     async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
