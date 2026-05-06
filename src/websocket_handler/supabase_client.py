@@ -176,6 +176,40 @@ class SupabaseClient:
             "depot_id": row.get("depot_id"),
         }
 
+    async def lookup_charger_context(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Return the richer tenant + display context for a charger or None.
+
+        Superset of ``lookup_tenant_context`` — also returns the charger UUID,
+        a human-friendly charger label, and the site's display name. Used by
+        ``security_manager`` to emit/resolve ``charger_auth_failure`` alerts
+        with proper context fields. Replaces the legacy ``chargers JOIN
+        depots`` query that was killed by migration 029.
+        """
+        query = """
+            SELECT
+                cs.id            AS charger_id,
+                cs.site_id       AS depot_id,
+                cs.station_id    AS ocpp_id,
+                COALESCE(cs.display_name, cs.station_id) AS charger_name,
+                s.organization_id,
+                s.name           AS depot_name
+            FROM charging_stations cs
+            LEFT JOIN sites s ON s.id = cs.site_id
+            WHERE cs.station_id = $1
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id)
+        if not row:
+            return None
+        return {
+            "charger_id": row.get("charger_id"),
+            "depot_id": row.get("depot_id"),
+            "ocpp_id": row.get("ocpp_id"),
+            "charger_name": row.get("charger_name"),
+            "organization_id": row.get("organization_id"),
+            "depot_name": row.get("depot_name"),
+        }
+
     async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
         """Return True when username is the canonical station id or an active alias."""
         if hmac.compare_digest(username, station_id):

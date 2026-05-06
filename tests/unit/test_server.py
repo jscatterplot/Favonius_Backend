@@ -324,9 +324,7 @@ class TestOCPPWebSocketServer:
         self, mock_config, mock_timescale_client, mock_connection_manager
     ):
         """When supabase_client is absent, alias resolution uses timescale_client."""
-        mock_timescale_client.resolve_station_id = AsyncMock(
-            return_value="hrx-uab_hrx-vilnius-001"
-        )
+        mock_timescale_client.resolve_station_id = AsyncMock(return_value="hrx-uab_hrx-vilnius-001")
         server = OCPPWebSocketServer(mock_config, mock_timescale_client)
         server.connection_manager = mock_connection_manager
         mock_task = Mock()
@@ -369,14 +367,10 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(
-            websocket, "/ocpp/hrx-uab_hrx-vilnius-001/TACW1141622G1433"
-        )
+        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-001/TACW1141622G1433")
 
         # Alias lookup MUST target the charger serial, not the depot id.
-        server.supabase_client.resolve_station_id.assert_awaited_once_with(
-            "TACW1141622G1433"
-        )
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
         # Auth MUST receive the charger serial too.
         server.security_manager.authenticate_station.assert_awaited_once_with(
             "TACW1141622G1433",
@@ -399,9 +393,7 @@ class TestOCPPWebSocketServer:
 
         await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
 
-        server.supabase_client.resolve_station_id.assert_awaited_once_with(
-            "TACW1141622G1433"
-        )
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
 
     def test_cgnat_peer_is_trusted_proxy(self, server):
         """RFC 6598 100.64.0.0/10 peers are trusted when private-proxy headers are on.
@@ -811,6 +803,113 @@ class TestProcessRequest:
 
         assert result is None
         connection.respond.assert_not_called()
+
+
+class TestServerCleanupConnectionRace:
+    """Server-side guard against the late-cleanup race that fed the
+    hrx-vilnius reconnect cycle: connection A's _handle_connection task
+    finishing long after A was replaced by B must not pop the station
+    routing that now points at B."""
+
+    @pytest.fixture
+    def server(self):
+        from src.websocket_handler.config import Config
+        from src.websocket_handler.server import OCPPWebSocketServer
+
+        config = Mock(spec=Config)
+        config.websocket = Mock()
+        config.websocket.host = "localhost"
+        config.websocket.port = 9000
+        config.websocket.max_message_size = 65536
+        config.websocket.max_connections = 100
+        config.websocket.heartbeat_interval = 30
+        config.websocket.message_timeout = 60
+        config.websocket.rate_limit_per_minute = 100
+        config.tls = Mock()
+        config.tls.cert_path = None
+        config.tls.key_path = None
+        config.tls.ca_path = None
+        config.tls.verify_client = False
+        timescale = Mock()
+        timescale.mark_connectors_unavailable = AsyncMock()
+        timescale.mark_sessions_seen = AsyncMock()
+        s = OCPPWebSocketServer(config, timescale)
+        cm = Mock()
+        cm.unregister_connection = AsyncMock()
+        s.connection_manager = cm
+        return s
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_late_cleanup_preserves_successor_station_mapping(self, server):
+        """A's late _cleanup_connection must NOT pop station→B mapping."""
+        station = "hrx-uab_hrx-vilnius-001"
+        old_id = "old-conn"
+        new_id = "new-conn"
+
+        # Register A.
+        server.connections[old_id] = Mock()
+        server.charge_points[station] = Mock(name="A_charge_point")
+        server.station_connections[station] = old_id
+
+        # B takes over (this is what the synchronous "Station already
+        # connected" branch in _handle_connection would do via cleanup):
+        server.connections.pop(old_id, None)
+        b_cp = Mock(name="B_charge_point")
+        server.charge_points[station] = b_cp
+        server.connections[new_id] = Mock()
+        server.station_connections[station] = new_id
+
+        # Now A's recv loop finishes — its _handle_connection's finally
+        # runs _cleanup_connection(old_id, ws, station_id=station).
+        await server._cleanup_connection(old_id, Mock(), station_id=station)
+
+        # Successor's routing must survive intact.
+        assert server.station_connections[station] == new_id
+        assert server.charge_points[station] is b_cp
+        assert new_id in server.connections
+
+        # connection_manager must still be told about A's connection_id —
+        # it has its own guarded unregister.
+        server.connection_manager.unregister_connection.assert_awaited_once_with(station, old_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_cleanup_when_current_pops_station_mapping(self, server):
+        """The normal case: cleanup of the current connection clears state."""
+        station = "hrx-uab_hrx-vilnius-001"
+        conn_id = "current-conn"
+
+        server.connections[conn_id] = Mock()
+        server.charge_points[station] = Mock()
+        server.station_connections[station] = conn_id
+
+        await server._cleanup_connection(conn_id, Mock(), station_id=station)
+
+        assert station not in server.station_connections
+        assert station not in server.charge_points
+        # And mark_connectors_unavailable / mark_sessions_seen DID get called
+        # (the charger is genuinely gone in this branch).
+        server.timescale_client.mark_connectors_unavailable.assert_awaited_once_with(station)
+        server.timescale_client.mark_sessions_seen.assert_awaited_once_with(station)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_late_cleanup_does_not_mark_successor_connectors_unavailable(self, server):
+        """Late cleanup must NOT mark connectors Unavailable for the live successor."""
+        station = "hrx-uab_hrx-vilnius-001"
+        old_id = "old-conn"
+        new_id = "new-conn"
+
+        # Successor is the active connection.
+        server.connections[new_id] = Mock()
+        server.charge_points[station] = Mock()
+        server.station_connections[station] = new_id
+
+        await server._cleanup_connection(old_id, Mock(), station_id=station)
+
+        server.timescale_client.mark_connectors_unavailable.assert_not_called()
+        server.timescale_client.mark_sessions_seen.assert_not_called()
 
 
 if __name__ == "__main__":
