@@ -118,6 +118,15 @@ class LivenessHub:
         if not bucket:
             self._subscribers.pop(organization_id, None)
 
+    async def _release_conn(self, conn: Any, on_connection_terminated: Any) -> None:
+        """Best-effort listener/connection cleanup for the LISTEN loop."""
+        with contextlib.suppress(Exception):
+            conn.remove_termination_listener(on_connection_terminated)
+        with contextlib.suppress(Exception):
+            await conn.remove_listener(LIVENESS_CHANNEL, self._on_notify)
+        with contextlib.suppress(Exception):
+            await self._pool.release(conn)
+
     async def _listen_loop(self) -> None:
         """Hold an asyncpg connection LISTENing on the liveness channel.
 
@@ -166,23 +175,13 @@ class LivenessHub:
                     backoff,
                 )
                 if conn is not None:
-                    with contextlib.suppress(Exception):
-                        conn.remove_termination_listener(_on_connection_terminated)
-                    with contextlib.suppress(Exception):
-                        await conn.remove_listener(LIVENESS_CHANNEL, self._on_notify)
-                    with contextlib.suppress(Exception):
-                        await self._pool.release(conn)
+                    await self._release_conn(conn, _on_connection_terminated)
                     conn = None
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, max_backoff)
             finally:
                 if conn is not None:
-                    with contextlib.suppress(Exception):
-                        conn.remove_termination_listener(_on_connection_terminated)
-                    with contextlib.suppress(Exception):
-                        await conn.remove_listener(LIVENESS_CHANNEL, self._on_notify)
-                    with contextlib.suppress(Exception):
-                        await self._pool.release(conn)
+                    await self._release_conn(conn, _on_connection_terminated)
 
     def _on_notify(self, _conn: Any, _pid: int, _channel: str, payload: str) -> None:
         """asyncpg listener callback — synchronous, must not block.

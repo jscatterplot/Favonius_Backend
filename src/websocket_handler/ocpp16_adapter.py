@@ -195,6 +195,13 @@ class OCPP16Session:
                 self._stop_telemetry_flush.set()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._telemetry_flush_task
+            if self._background_tasks:
+                pending = tuple(self._background_tasks)
+                for task in pending:
+                    task.cancel()
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*pending, return_exceptions=True)
+                self._background_tasks.clear()
 
     async def _force_boot_notification(self) -> None:
         """Nudge spec-violating chargers that skip BootNotification on reconnect.
