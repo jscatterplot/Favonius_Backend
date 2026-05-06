@@ -56,7 +56,7 @@ def _prune_in_memory_state(now: float) -> None:
         _pending_recovery_audit.discard(key)
         _recovery_logged.discard(key)
 
-    _recovery_logged.intersection_update(_pending_recovery_audit)
+    _recovery_logged.clear()
 
 
 class RFIDAuthStatus(str, Enum):
