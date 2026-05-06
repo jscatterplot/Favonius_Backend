@@ -20,7 +20,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from itertools import count
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from ocpp.v16.enums import AuthorizationStatus
 
@@ -41,6 +41,7 @@ BOOT_TRIGGER_GRACE_SECONDS = 5.0
 
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
+    from .liveness_notifier import LivenessNotifier
     from .message_handler import MessageHandler
     from .supabase_client import SupabaseClient
     from .timescale_client import TimescaleClient
@@ -91,6 +92,7 @@ class OCPP16Session:
         message_handler: "MessageHandler",
         connection_manager: Optional["ConnectionManager"] = None,
         supabase_client: Optional["SupabaseClient"] = None,
+        liveness_notifier: Optional["LivenessNotifier"] = None,
     ) -> None:
         """Initialise the session and wire all FleetChargePoint callbacks.
 
@@ -112,6 +114,7 @@ class OCPP16Session:
         self._connection_manager = connection_manager
         self._authz = message_handler.rfid_authorization
         self._supabase_client = supabase_client
+        self._liveness_notifier = liveness_notifier
         # Resolved once on BootNotification and reused for the lifetime of the
         # WS connection — values don't change while the charger is online.
         self._tenant_context: Optional[Dict[str, Optional[str]]] = None
@@ -122,6 +125,7 @@ class OCPP16Session:
         self._pending_start: Optional[Dict[str, Any]] = None
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._boot_trigger_task: Optional[asyncio.Task[None]] = None
+        self._background_tasks: Set[asyncio.Task[Any]] = set()
         self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
         self._telemetry_flush_task: Optional[asyncio.Task[None]] = None
         self._stop_telemetry_flush = asyncio.Event()
@@ -141,20 +145,35 @@ class OCPP16Session:
         )
 
     async def _on_message_received(self) -> None:
-        """Refresh the connection-manager liveness clock on every OCPP frame.
+        """Refresh the connection-manager liveness clock on every OCPP frame
+        and broadcast a rate-limited liveness signal to API replicas.
 
         OCPP 1.6 chargers vary widely in Heartbeat cadence (the spec only
         requires "at least every Heartbeat interval", which BootNotification
-        sets to 300s). Without this hook the websocket handler's stale
-        sweeper kills the socket after ~90s even though MeterValues and
-        StatusNotification are flowing.
+        sets to 300s). Without the connection-manager update the WS handler's
+        stale sweeper kills the socket after ~90s even though MeterValues
+        and StatusNotification are flowing.
+
+        The ``LivenessNotifier`` fan-out goes to API replicas via pg_notify
+        (``charger_liveness`` channel) so the frontend's SSE subscribers
+        get a "last interaction" event per ~10s of frames per charger.
+        Fire-and-forget — a slow notify must not backpressure OCPP
+        message processing.
         """
-        if self._connection_manager is None:
-            return
-        try:
-            await self._connection_manager.update_heartbeat(self._station_id)
-        except Exception:
-            logger.exception("update_heartbeat failed for station=%s", self._station_id)
+        if self._connection_manager is not None:
+            try:
+                await self._connection_manager.update_heartbeat(self._station_id)
+            except Exception:
+                logger.exception("update_heartbeat failed for station=%s", self._station_id)
+
+        if self._liveness_notifier is not None:
+            org_id = (self._tenant_context or {}).get("organization_id")
+            task = asyncio.create_task(
+                self._liveness_notifier.maybe_notify(self._station_id, org_id),
+                name=f"liveness_notify:{self._station_id}",
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -176,6 +195,13 @@ class OCPP16Session:
                 self._stop_telemetry_flush.set()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._telemetry_flush_task
+            if self._background_tasks:
+                pending = tuple(self._background_tasks)
+                for task in pending:
+                    task.cancel()
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*pending, return_exceptions=True)
+                self._background_tasks.clear()
 
     async def _force_boot_notification(self) -> None:
         """Nudge spec-violating chargers that skip BootNotification on reconnect.

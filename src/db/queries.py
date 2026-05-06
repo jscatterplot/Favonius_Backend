@@ -2216,11 +2216,22 @@ async def list_vehicles_for_depot(db, *, depot_id: str) -> list[dict]:
 async def latest_connector_status_by_stations(db, station_ids: list[str]) -> dict[str, dict]:
     """Latest connector_status row per station_id (across all connectors).
 
-    Returns a mapping ``ocpp_id -> {ocpp_status, last_heartbeat_at}`` where:
+    Returns a mapping ``ocpp_id -> {ocpp_status, last_interaction_at,
+    last_heartbeat_at}`` where:
       * ``ocpp_status`` is the StatusNotification value of the most recently
         updated connector on the station (most "interesting" wins for the
         4-state pill: Faulted > Charging > else).
-      * ``last_heartbeat_at`` is the MAX timestamp across all connectors.
+      * ``last_interaction_at`` is the MAX timestamp across all connectors.
+        Canonical field used by the API and frontend going forward. Source:
+        ``connector_status.timestamp`` — only advances on connector state
+        changes (StatusNotification), so for idle chargers it can lag the
+        actual frame cadence. The frontend supersedes this initial value
+        with live data from the SSE stream
+        (``GET /depots/{depot_id}/liveness/stream``) — see
+        ``api.liveness_hub`` and ``websocket_handler.liveness_notifier``.
+      * ``last_heartbeat_at`` is the same value, retained for one
+        transitional release while the frontend migrates to
+        ``last_interaction_at``. Drop after the rollout completes.
     """
     if not station_ids:
         return {}
@@ -2247,7 +2258,7 @@ async def latest_connector_status_by_stations(db, station_ids: list[str]) -> dic
                        ELSE 9
                    END
                ) AS statuses_by_priority,
-               MAX(timestamp) AS last_heartbeat_at
+               MAX(timestamp) AS last_interaction_at
         FROM latest_per_connector
         GROUP BY station_id
     """
@@ -2255,9 +2266,13 @@ async def latest_connector_status_by_stations(db, station_ids: list[str]) -> dic
     out: dict[str, dict] = {}
     for row in rows:
         statuses = row["statuses_by_priority"] or []
+        ts = row["last_interaction_at"]
         out[row["station_id"]] = {
             "ocpp_status": statuses[0] if statuses else None,
-            "last_heartbeat_at": row["last_heartbeat_at"],
+            "last_interaction_at": ts,
+            # Transitional alias — drop after frontend completes the
+            # `lastHeartbeatAt` → `lastInteractionAt` migration.
+            "last_heartbeat_at": ts,
         }
     return out
 

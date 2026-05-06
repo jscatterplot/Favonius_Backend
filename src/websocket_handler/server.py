@@ -125,6 +125,17 @@ class OCPPWebSocketServer:
         self.supabase_client = supabase_client
         self.optimization_engine = optimization_engine
 
+        # Liveness pub/sub (rate-limited pg_notify on every OCPP frame).
+        # Configured via env vars; instance is shared across all
+        # OCPP16Sessions so the rate-limit dict is process-wide.
+        from .liveness_notifier import LivenessNotifier  # noqa: PLC0415
+
+        self.liveness_notifier = LivenessNotifier(
+            timescale_client,
+            interval_s=float(os.getenv("LIVENESS_NOTIFY_INTERVAL_S", "10")),
+            enabled=os.getenv("LIVENESS_NOTIFY_ENABLED", "true").lower() == "true",
+        )
+
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
         self.message_handler: Optional[MessageHandler] = None
@@ -712,6 +723,7 @@ class OCPPWebSocketServer:
                 message_handler=self.message_handler,
                 connection_manager=self.connection_manager,
                 supabase_client=self.supabase_client,
+                liveness_notifier=self.liveness_notifier,
             )
         else:
             charge_point = EnhancedOCPPChargePoint(

@@ -208,6 +208,41 @@ class TestOCPP16SessionLiveness:
         await s._cp._cb_message_received()
         cm.update_heartbeat.assert_awaited_once_with("liveness_004")
 
+    @pytest.mark.asyncio
+    async def test_start_cancels_pending_liveness_background_tasks_on_teardown(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        cancelled = asyncio.Event()
+
+        class _BlockingNotifier:
+            async def maybe_notify(self, *_args, **_kwargs):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+        s = OCPP16Session(
+            station_id="liveness_005",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            liveness_notifier=_BlockingNotifier(),
+        )
+        s._tenant_context = {"organization_id": "org-1"}
+
+        async def _start_and_emit() -> None:
+            await s._on_message_received()
+
+        s._cp.start = AsyncMock(side_effect=_start_and_emit)
+
+        await s.start()
+
+        assert cancelled.is_set()
+        assert not s._background_tasks
+
 
 class TestOCPP16SessionForceBootNotification:
     """Workaround for ABB Terra AC firmware (1.8.x) and similar OCPP 1.6
