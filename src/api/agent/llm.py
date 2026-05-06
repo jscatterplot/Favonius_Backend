@@ -35,6 +35,7 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from src.api.agent.plan import QueryPlan
+from src.monitoring.metrics import AGENT_LLM_TOKENS
 from src.security.secrets import get_secrets_manager
 
 logger = logging.getLogger(__name__)
@@ -338,6 +339,19 @@ def _reset_client_for_tests() -> None:
     _client = None
 
 
+def _record_usage(response: Any, model: str) -> None:
+    """Increment LLM token counters from an Anthropic response's usage block."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    in_tokens = getattr(usage, "input_tokens", 0) or 0
+    out_tokens = getattr(usage, "output_tokens", 0) or 0
+    if in_tokens:
+        AGENT_LLM_TOKENS.labels(model=model, direction="input").inc(in_tokens)
+    if out_tokens:
+        AGENT_LLM_TOKENS.labels(model=model, direction="output").inc(out_tokens)
+
+
 # ── Plan extraction ────────────────────────────────────────────────────────
 
 
@@ -438,6 +452,7 @@ async def extract_plan(message: str, *, model: Optional[str] = None) -> QueryPla
         tool_choice={"type": "tool", "name": _QUERY_PLAN_TOOL_NAME},
         messages=messages,
     )
+    _record_usage(response, chosen_model)
 
     tool_input = _extract_tool_input(response)
     if tool_input is not None:
@@ -504,6 +519,7 @@ async def extract_plan(message: str, *, model: Optional[str] = None) -> QueryPla
         tool_choice={"type": "tool", "name": _QUERY_PLAN_TOOL_NAME},
         messages=retry_messages,
     )
+    _record_usage(retry_response, chosen_model)
 
     retry_input = _extract_tool_input(retry_response)
     if retry_input is None:
@@ -576,6 +592,7 @@ async def format_answer(
         system=system,
         messages=[{"role": "user", "content": user_message}],
     )
+    _record_usage(response, chosen_model)
 
     parts: list[str] = []
     for block in response.content:

@@ -377,6 +377,7 @@ class TestOcpp16SessionAuthorize:
     @pytest.fixture()
     def session(self, mock_websocket):
         from src.websocket_handler.ocpp16_adapter import OCPP16Session
+        from src.websocket_handler.rfid_authorization import RFIDAuthorizationService
 
         ts = MagicMock()
         ts.insert_telemetry_batch = AsyncMock()
@@ -385,6 +386,7 @@ class TestOcpp16SessionAuthorize:
         ts.next_charging_profile_id = AsyncMock(return_value=1)
         mh = MagicMock()
         mh._push_to_main_api = AsyncMock()
+        mh.rfid_authorization = RFIDAuthorizationService(ts, MagicMock())
         return OCPP16Session(
             station_id="PILOT-01",
             websocket=mock_websocket,

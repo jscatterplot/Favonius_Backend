@@ -581,7 +581,12 @@ class TimescaleClient:
             raise
 
     async def insert_connector_status(self, status_data: Dict[str, Any]) -> None:
-        """Insert connector status."""
+        """Insert connector status.
+
+        Populates the optional ``organization_id`` and ``depot_id`` columns
+        (migration 029) when present in ``status_data``; the trigger uses these
+        to create ``notification_alerts`` rows without relying on shadow tables.
+        """
         # Local import keeps this module importable in environments without
         # prometheus_client installed (e.g. some CI shards).
         from .monitoring import DB_WRITE_LATENCY
@@ -592,14 +597,17 @@ class TimescaleClient:
                 await conn.execute(
                     """
                     INSERT INTO connector_status (
-                        station_id, connector_id, status, error_code, timestamp
-                    ) VALUES ($1, $2, $3, $4, $5)
+                        station_id, connector_id, status, error_code,
+                        timestamp, organization_id, depot_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
                     status_data["station_id"],
                     status_data["connector_id"],
                     status_data["status"],
                     status_data["error_code"],
                     status_data["timestamp"],
+                    status_data.get("organization_id"),
+                    status_data.get("depot_id"),
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert connector status: {e}")
@@ -1779,7 +1787,15 @@ class TimescaleClient:
             return [dict(row) for row in rows]
 
     async def record_invalid_rfid_attempt(self, station_id: str, id_tag: str) -> None:
-        """Persist an invalid RFID authorization attempt for abuse controls."""
+        """Persist an invalid RFID authorization attempt for abuse controls.
+
+        Note: ``id_tag`` is a fleet card identifier and may be linkable to a
+        driver. Treat ``security_events`` rows of this type as PII for the
+        purposes of retention and access control — consider scoping any
+        retention policy to keep this event_type for the minimum window the
+        abuse-controls hot path actually needs (currently 60 s) plus whatever
+        compliance window applies (typically 30–90 days).
+        """
         await self.store_security_event(
             {
                 "station_id": station_id,
@@ -1796,7 +1812,13 @@ class TimescaleClient:
         id_tag: str,
         window_seconds: int = 60,
     ) -> int:
-        """Count invalid RFID attempts for a station/tag in a recent window."""
+        """Count invalid RFID attempts for a station/tag in a recent window.
+
+        Backed by ``idx_security_events_rfid_invalid`` (migration 028) — a
+        partial functional index on ``(station_id, additional_info ->> 'id_tag',
+        timestamp)`` scoped to ``event_type = 'rfid_authorization_invalid'``.
+        Update or drop both together if the query shape changes.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
         async with self.pg_pool.acquire() as conn:
             value = await conn.fetchval(
@@ -1806,7 +1828,7 @@ class TimescaleClient:
                  WHERE station_id = $1
                    AND event_type = 'rfid_authorization_invalid'
                    AND timestamp >= $2
-                   AND COALESCE((additional_info::jsonb ->> 'id_tag'), '') = $3
+                   AND (additional_info ->> 'id_tag') = $3
                 """,
                 station_id,
                 cutoff,
@@ -2199,6 +2221,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -2256,6 +2279,7 @@ class TimescaleClient:
                  WHERE station_id = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
                 transaction_id,
@@ -2275,6 +2299,7 @@ class TimescaleClient:
                    SET last_seen_at = NOW()
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
             )
@@ -2505,6 +2530,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -2545,6 +2571,7 @@ class TimescaleClient:
                 SELECT station_id, COUNT(*)::bigint AS n
                   FROM charging_sessions
                  WHERE end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  GROUP BY station_id
                 """)

@@ -69,12 +69,33 @@ class TimescaleSchema:
         await conn.execute(
             """
             ALTER TABLE charging_sessions
+            ADD COLUMN IF NOT EXISTS site_id UUID,
             ADD COLUMN IF NOT EXISTS cost_total DECIMAL(10,2),
             ADD COLUMN IF NOT EXISTS revenue_v2g DECIMAL(10,2),
             ADD COLUMN IF NOT EXISTS current_power_kw DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS current_soc DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS target_soc DOUBLE PRECISION,
-            ADD COLUMN IF NOT EXISTS estimated_end_time TIMESTAMPTZ
+            ADD COLUMN IF NOT EXISTS estimated_end_time TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'live',
+            ADD COLUMN IF NOT EXISTS import_batch_id UUID,
+            ADD COLUMN IF NOT EXISTS import_row_hash CHAR(64),
+            ADD COLUMN IF NOT EXISTS import_user_full_name TEXT,
+            ADD COLUMN IF NOT EXISTS import_station_owner TEXT,
+            ADD COLUMN IF NOT EXISTS import_status TEXT
+            """
+        )
+        await conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS charging_sessions_import_dedup_idx
+                ON charging_sessions (site_id, import_row_hash)
+                WHERE source = 'import'
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS charging_sessions_site_start_idx
+                ON charging_sessions (site_id, start_time DESC)
+                WHERE site_id IS NOT NULL
             """
         )
 

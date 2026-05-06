@@ -47,6 +47,7 @@ def _clear_ocpp_log_context() -> None:
     except Exception:
         pass
 
+
 from .certificate_manager import CertificateManager, CertificateType
 from .charging_profile_manager import ChargingProfileManager
 from .config import Config
@@ -59,7 +60,9 @@ from .monitoring_manager import MonitoringManager
 from .privacy_manager import PrivacyManager
 from .rfid_authorization import (
     RFIDAuthorizationService,
+    RFIDAuthStatus,
     map_auth_status_to_ocpp201,
+    user_message_for,
 )
 from .security_manager import SecurityConfig, SecurityManager
 from .tariff_manager import TariffManager
@@ -88,6 +91,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         priority_charging_manager: Optional[Any] = None,
         external_control_manager: Optional[Any] = None,
         certificate_manager: Optional[CertificateManager] = None,
+        rfid_authorization: Optional[RFIDAuthorizationService] = None,
         # v2x_controller removed - out of scope for MVP per PRD Section 1.2
     ):
         """Initialize enhanced charge point with V2G capabilities."""
@@ -124,7 +128,9 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         # Initialize managers
         self.device_model = DeviceModel(timescale_client)
         self.charging_profile_manager = ChargingProfileManager(timescale_client)
-        self.rfid_authorization = RFIDAuthorizationService(timescale_client, self.logger)
+        self.rfid_authorization = rfid_authorization or RFIDAuthorizationService(
+            timescale_client, self.logger
+        )
         self.transaction_manager = TransactionManager(
             timescale_client,
             rfid_authorization=self.rfid_authorization,
@@ -261,6 +267,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         connector_id = kwargs.get("connectorId", 1)
 
         if event_type == TransactionEventEnumType.started:
+            # python-ocpp snake-cases top-level kwargs (so `id_token`), but the
+            # nested `transaction_info` dict keeps its OCPP 2.0.1 camelCase
+            # keys verbatim. Try both shapes — different library versions
+            # surface idToken at different layers.
             token_payload = kwargs.get("id_token") or transaction_info.get("idToken") or {}
             id_token = self._token_field(token_payload, "idToken")
             if id_token:
@@ -268,9 +278,6 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                     self._validate_started_transaction_token(id_token),
                     f"validate_started_tx:{transaction_id}",
                 )
-
-        # Update active transactions
-        if event_type == TransactionEventEnumType.started:
             self.active_transactions[connector_id] = transaction_id
         elif event_type == TransactionEventEnumType.ended:
             self.active_transactions.pop(connector_id, None)
@@ -292,23 +299,36 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         return call_result.TransactionEvent()
 
     async def _validate_started_transaction_token(self, id_token: str) -> None:
-        """Best-effort validation for started events to detect protocol drift.
+        """Monitor-only drift detection for charger-initiated TransactionEvent.started.
 
-        OCPP 2.0.1 stations should have passed Authorize first; this catches
-        cases where a station starts a session with an unknown token.
+        OCPP 2.0.1 stations should have called Authorize first; this fires
+        a warning when they start a session with an unknown token instead.
+        It does NOT stop the transaction — by the time .started arrives the
+        charger has already energised the EVSE — and is intentionally
+        fire-and-forget via ``_task_supervisor.create_task`` so a slow DB
+        lookup can't delay the OCPP ack.
         """
-        decision = await self.rfid_authorization.authorize(
-            self.id,
-            id_token,
-            "TransactionEventStarted",
-        )
-        if decision.status != RFIDAuthStatus.ACCEPTED:
+        token_known = False
+        try:
+            token_known = bool(
+                await self.timescale_client.lookup_id_tag(id_token, station_id=self.id)
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "transaction_started_token_check_failed station_id=%s id_token=%s error=%s",
+                self.id,
+                id_token,
+                exc,
+            )
+            return
+
+        if not token_known:
             self.logger.warning(
                 "transaction_started_with_nonaccepted_token station_id=%s id_token=%s status=%s reason=%s",
                 self.id,
                 id_token,
-                decision.status.value,
-                decision.reason,
+                RFIDAuthStatus.INVALID.value,
+                "unknown_id_tag",
             )
 
     @on(Action.meter_values)
@@ -351,7 +371,10 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                     },
                 }
             )
-        if self._token_field(id_token, "type") == "NoAuthorization":
+        token_type_raw = self._token_field(id_token, "type")
+        if hasattr(token_type_raw, "value"):
+            token_type_raw = token_type_raw.value
+        if token_type_raw == "NoAuthorization":
             return call_result.Authorize(
                 id_token_info={
                     "status": "Invalid",
@@ -373,7 +396,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
                 "personal_message": {
                     "format": "UTF8",
                     "language": "en",
-                    "content": "Authorized" if status == "Accepted" else "RFID denied",
+                    "content": user_message_for(decision),
                 },
             }
         )

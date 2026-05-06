@@ -97,27 +97,17 @@ async def db_pool():
 
 @pytest_asyncio.fixture
 async def world(db_pool):
-    """Provision org + depot + charger + recipient. Yield IDs and cleanup."""
+    """Provision tenant context + recipient. Yield IDs and cleanup.
+
+    After migration 029 the static shadow tables (organizations, depots,
+    chargers) are gone. Tenant context is passed directly via
+    connector_status.organization_id / depot_id so no shadow rows are needed.
+    """
     org_id = uuid4()
     depot_id = uuid4()
     ocpp_id = f"e2e_{uuid4().hex[:8]}"
 
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO organizations (organization_id, name) VALUES ($1, $2)",
-            org_id, "AT-17 Org",
-        )
-        await conn.execute(
-            """
-            INSERT INTO depots (depot_id, name, latitude, longitude, max_grid_kw, organization_id)
-            VALUES ($1, $2, 37.0, -122.0, 500.0, $3)
-            """,
-            depot_id, "AT-17 Depot", org_id,
-        )
-        await conn.execute(
-            "INSERT INTO chargers (depot_id, ocpp_id, rated_kw) VALUES ($1, $2, $3)",
-            depot_id, ocpp_id, 50.0,
-        )
         recipient = await recipients_repo.create(
             conn, organization_id=org_id, email="ops@example.com"
         )
@@ -133,9 +123,6 @@ async def world(db_pool):
         await conn.execute("DELETE FROM notification_alerts WHERE organization_id = $1", org_id)
         await conn.execute("DELETE FROM notification_recipients WHERE organization_id = $1", org_id)
         await conn.execute("DELETE FROM connector_status WHERE station_id = $1", ocpp_id)
-        await conn.execute("DELETE FROM chargers WHERE ocpp_id = $1", ocpp_id)
-        await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
-        await conn.execute("DELETE FROM organizations WHERE organization_id = $1", org_id)
 
 
 @pytest_asyncio.fixture
@@ -184,10 +171,11 @@ class TestAlertsPipelineE2E:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO connector_status (station_id, connector_id, status, error_code)
-                VALUES ($1, 1, 'Faulted', 'PowerMeterFailure')
+                INSERT INTO connector_status
+                    (station_id, connector_id, status, error_code, organization_id, depot_id)
+                VALUES ($1, 1, 'Faulted', 'PowerMeterFailure', $2, $3)
                 """,
-                ocpp_id,
+                ocpp_id, org_id, depot_id,
             )
             alert_row = await conn.fetchrow(
                 "SELECT id, severity, status FROM notification_alerts WHERE dedup_key = $1",
@@ -257,6 +245,7 @@ class TestAlertsPipelineE2E:
         assert ack_resp.json()["status"] == "acknowledged"
 
         # ── Step 5: charger recovers → trigger resolves ────────────────────
+        # Recovery rows don't need org context; trigger resolves via dedup_key.
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO connector_status (station_id, connector_id, status) "
@@ -287,12 +276,14 @@ class TestAlertsPipelineE2E:
         ocpp_id = world["ocpp_id"]
         disp, fake = dispatcher
 
+        org_id = world["org_id"]
         async with db_pool.acquire() as conn:
             for _ in range(3):
                 await conn.execute(
-                    "INSERT INTO connector_status (station_id, connector_id, status, error_code) "
-                    "VALUES ($1, 1, 'Faulted', 'OverCurrentFailure')",
-                    ocpp_id,
+                    "INSERT INTO connector_status "
+                    "(station_id, connector_id, status, error_code, organization_id) "
+                    "VALUES ($1, 1, 'Faulted', 'OverCurrentFailure', $2)",
+                    ocpp_id, org_id,
                 )
 
         await disp._tick()
@@ -324,9 +315,10 @@ class TestAlertsPipelineE2E:
                 min_severity=Severity.CRITICAL,
             )
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status) "
-                "VALUES ($1, 1, 'Unavailable')",
-                ocpp_id,
+                "INSERT INTO connector_status "
+                "(station_id, connector_id, status, organization_id) "
+                "VALUES ($1, 1, 'Unavailable', $2)",
+                ocpp_id, org_id,
             )
 
         await disp._tick()

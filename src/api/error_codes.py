@@ -53,6 +53,11 @@ class ErrorCode(str, Enum):
     DUPLICATE_ID_TAG = "DUPLICATE_ID_TAG"
     DUPLICATE_VIN = "DUPLICATE_VIN"
     DUPLICATE_EXTERNAL_ID = "DUPLICATE_EXTERNAL_ID"
+    DUPLICATE_SESSION = "DUPLICATE_SESSION"
+    INVALID_TIMESTAMP = "INVALID_TIMESTAMP"
+    INVALID_STATUS = "INVALID_STATUS"
+    INVALID_ENERGY = "INVALID_ENERGY"
+    MISSING_REQUIRED_FIELD = "MISSING_REQUIRED_FIELD"
 
 
 ERROR_MESSAGES: dict[ErrorCode, str] = {
@@ -76,6 +81,11 @@ ERROR_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.DUPLICATE_ID_TAG: "idTag is already registered",
     ErrorCode.DUPLICATE_VIN: "VIN is already registered",
     ErrorCode.DUPLICATE_EXTERNAL_ID: "External identifier is already registered",
+    ErrorCode.DUPLICATE_SESSION: "Charging session has already been imported",
+    ErrorCode.INVALID_TIMESTAMP: "Invalid timestamp format",
+    ErrorCode.INVALID_STATUS: "Invalid charge status value",
+    ErrorCode.INVALID_ENERGY: "Invalid energy value",
+    ErrorCode.MISSING_REQUIRED_FIELD: "Required field is missing",
 }
 
 
@@ -100,6 +110,11 @@ _HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.DUPLICATE_ID_TAG: status.HTTP_409_CONFLICT,
     ErrorCode.DUPLICATE_VIN: status.HTTP_409_CONFLICT,
     ErrorCode.DUPLICATE_EXTERNAL_ID: status.HTTP_409_CONFLICT,
+    ErrorCode.DUPLICATE_SESSION: status.HTTP_409_CONFLICT,
+    ErrorCode.INVALID_TIMESTAMP: status.HTTP_400_BAD_REQUEST,
+    ErrorCode.INVALID_STATUS: status.HTTP_400_BAD_REQUEST,
+    ErrorCode.INVALID_ENERGY: status.HTTP_400_BAD_REQUEST,
+    ErrorCode.MISSING_REQUIRED_FIELD: status.HTTP_400_BAD_REQUEST,
 }
 
 

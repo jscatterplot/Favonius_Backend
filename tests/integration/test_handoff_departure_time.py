@@ -41,97 +41,30 @@ class TestHandoffDepartureTime:
 
     @pytest_asyncio.fixture
     async def depot_a_id(self, test_db_pool):
-        """Create depot_A."""
+        """Yield a depot_A UUID. Shadow table dropped in migration 029."""
         depot_id = uuid4()
-
-        async with test_db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO depots (
-                    depot_id, name, latitude, longitude, timezone,
-                    max_grid_kw, demand_charge_rate_kw
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (depot_id) DO UPDATE
-                SET name = EXCLUDED.name
-                """,
-                depot_id,
-                "Depot A",
-                34.0522,
-                -118.2437,
-                "America/Los_Angeles",
-                1000.0,
-                20.0,
-            )
-
         yield depot_id
-
         async with test_db_pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1",
                 depot_id,
             )
-            await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
     @pytest_asyncio.fixture
     async def depot_b_id(self, test_db_pool):
-        """Create depot_B."""
+        """Yield a depot_B UUID."""
         depot_id = uuid4()
-
-        async with test_db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO depots (
-                    depot_id, name, latitude, longitude, timezone,
-                    max_grid_kw, demand_charge_rate_kw
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (depot_id) DO UPDATE
-                SET name = EXCLUDED.name
-                """,
-                depot_id,
-                "Depot B",
-                37.7749,
-                -122.4194,
-                "America/Los_Angeles",
-                1000.0,
-                20.0,
-            )
-
         yield depot_id
-
         async with test_db_pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM interdepot_messages WHERE origin_depot_id = $1 OR dest_depot_id = $1",
                 depot_id,
             )
-            await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
 
     @pytest_asyncio.fixture
-    async def vehicle_id(self, test_db_pool, depot_a_id):
-        """Create test vehicle."""
-        vehicle_id = uuid4()
-
-        async with test_db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO vehicles (
-                    vehicle_id, depot_id, vehicle_type, battery_capacity_kwh,
-                    max_charge_power_kw
-                )
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                vehicle_id,
-                depot_a_id,
-                "bus",
-                324.0,
-                150.0,
-            )
-
-        yield vehicle_id
-
-        async with test_db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM vehicles WHERE vehicle_id = $1", vehicle_id)
+    async def vehicle_id(self, test_db_pool, depot_a_id):  # noqa: ARG002
+        """Yield a vehicle UUID. Shadow table dropped in migration 029."""
+        return uuid4()
 
     @pytest.mark.asyncio
     async def test_receive_handoff_uses_original_departure_time(

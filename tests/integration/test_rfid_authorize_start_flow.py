@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,7 +11,7 @@ import pytest
 from ocpp.v16.enums import AuthorizationStatus
 
 from src.websocket_handler.ocpp16_adapter import OCPP16Session
-
+from src.websocket_handler.rfid_authorization import RFIDAuthorizationService
 
 pytestmark = pytest.mark.asyncio
 
@@ -19,6 +20,9 @@ def _build_session(timescale_client: object) -> OCPP16Session:
     websocket = SimpleNamespace()
     message_handler = MagicMock()
     message_handler._push_to_main_api = AsyncMock()
+    message_handler.rfid_authorization = RFIDAuthorizationService(
+        timescale_client, logging.getLogger("test_rfid_authorize_start_flow")
+    )
     return OCPP16Session(
         station_id="LEGACY-CP-1",
         websocket=websocket,
