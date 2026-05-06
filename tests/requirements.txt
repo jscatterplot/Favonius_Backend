@@ -55,3 +55,6 @@ mypy==1.7.1
 # Documentation
 sphinx==7.2.6
 sphinx-rtd-theme==1.3.0
+
+# Auth/security runtime deps imported in tests
+bcrypt>=5.0.0
