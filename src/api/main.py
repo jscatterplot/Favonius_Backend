@@ -3505,16 +3505,16 @@ def _platform_import_hash_token(
     energy, and revenue. This helper keeps persisted ``id_token`` stable
     while adding additional request fields to the hash input.
     """
-    return "|".join(
-        [
-            _PLATFORM_IMPORT_ID_TOKEN,
-            end_time_utc.isoformat() if end_time_utc else "",
-            request.transaction_type or "",
-            request.status or "",
-            request.user_full_name or "",
-            request.station_owner_full_name or "",
-        ]
-    )
+    payload = {
+        "id_token": _PLATFORM_IMPORT_ID_TOKEN,
+        "end_time_utc": end_time_utc.isoformat() if end_time_utc else "",
+        "transaction_type": request.transaction_type or "",
+        "status": request.status or "",
+        "user_full_name": request.user_full_name or "",
+        "station_owner_full_name": request.station_owner_full_name or "",
+    }
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"{_PLATFORM_IMPORT_ID_TOKEN}:{hashlib.sha256(canonical_payload.encode('utf-8')).hexdigest()}"
 
 
 async def _resolve_import_id_tag(
@@ -3668,7 +3668,8 @@ async def import_historical_charging_session(
         except Exception:
             tz = ZoneInfo("UTC")
 
-        if _is_platform_initiated_import_row(request):
+        is_platform_initiated = _is_platform_initiated_import_row(request)
+        if is_platform_initiated:
             identity = {"vehicle_id": None, "card_id": None, "driver_id": None}
         else:
             identity = await _resolve_import_id_tag(
@@ -3715,7 +3716,7 @@ async def import_historical_charging_session(
     id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
     hash_id_token = (
         _platform_import_hash_token(request, end_time_utc=end_time_utc)
-        if id_token == _PLATFORM_IMPORT_ID_TOKEN
+        if is_platform_initiated
         else id_token
     )
     row_hash = _compute_import_row_hash(

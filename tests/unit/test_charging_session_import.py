@@ -216,6 +216,34 @@ class TestPureHelpers:
         token_b = _platform_import_hash_token(request_b, end_time_utc=end_time)
         assert token_a != token_b
 
+    def test_platform_import_hash_token_handles_pipe_characters_without_colliding(self):
+        """Free-text fields containing pipes should not collapse into same dedup token."""
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        common = {
+            "import_batch_id": uuid4(),
+            "start_time_local": "2026-05-05 12:56",
+            "end_time_local": "2026-05-11 01:17",
+            "energy_delivered_kwh": 24.044,
+            "revenue": 0.0,
+            "id_tag": None,
+            "rfid_label": None,
+            "status": "Finished",
+            "transaction_type": "Dashboard",
+        }
+        request_a = HistoricalSessionImport(
+            **{**common, "user_full_name": "A|", "station_owner_full_name": "B"}
+        )
+        request_b = HistoricalSessionImport(
+            **{**common, "user_full_name": "A", "station_owner_full_name": "|B"}
+        )
+        end_time = datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)
+
+        token_a = _platform_import_hash_token(request_a, end_time_utc=end_time)
+        token_b = _platform_import_hash_token(request_b, end_time_utc=end_time)
+        assert token_a != token_b
+
 
 # --------------------------------------------------------------------------- #
 # Endpoint integration with mocked DB
@@ -883,3 +911,47 @@ class TestHistoricalChargingSessionImport:
 
         bind = conn.fetchval.await_args.args[1:]
         assert bind[2] == "platform-start"  # $3 id_token marker for platform starts
+
+    def test_literal_platform_start_identifier_is_not_treated_as_platform_initiated(
+        self, client, mock_db_pool
+    ):
+        """Literal id_tag value should keep regular dedup hashing behavior."""
+        from datetime import datetime, timezone
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        vehicle_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("UTC"),
+            vehicle_row=_vehicle_match_row(vehicle_id),
+            card_row=None,
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+        payload = _row_payload(id_tag="platform-start")
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        body = response.json()
+        assert body["matched"]["vehicle_id"] == vehicle_id
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[2] == "platform-start"
+        expected_hash = _compute_import_row_hash(
+            depot_id=depot_id,
+            start_time_utc=datetime(2026, 5, 5, 12, 56, tzinfo=timezone.utc),
+            id_tag="platform-start",
+            energy_delivered_kwh=24.044,
+            revenue=0,
+        )
+        assert bind[11] == expected_hash
