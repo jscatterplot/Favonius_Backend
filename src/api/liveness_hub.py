@@ -165,6 +165,14 @@ class LivenessHub:
                     exc,
                     backoff,
                 )
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.remove_termination_listener(_on_connection_terminated)
+                    with contextlib.suppress(Exception):
+                        await conn.remove_listener(LIVENESS_CHANNEL, self._on_notify)
+                    with contextlib.suppress(Exception):
+                        await self._pool.release(conn)
+                    conn = None
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, max_backoff)
             finally:
