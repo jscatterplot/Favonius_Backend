@@ -142,7 +142,7 @@ class LivenessHub:
             try:
                 conn = await self._pool.acquire()
                 await conn.add_listener(LIVENESS_CHANNEL, self._on_notify)
-                await conn.add_termination_listener(_on_connection_terminated)
+                conn.add_termination_listener(_on_connection_terminated)
                 logger.info("LivenessHub LISTENing on channel '%s'", LIVENESS_CHANNEL)
                 backoff = 1.0  # successful connect resets backoff
                 # Hold the listener open until stop is requested or Postgres drops.
@@ -170,7 +170,7 @@ class LivenessHub:
             finally:
                 if conn is not None:
                     with contextlib.suppress(Exception):
-                        await conn.remove_termination_listener(_on_connection_terminated)
+                        conn.remove_termination_listener(_on_connection_terminated)
                     with contextlib.suppress(Exception):
                         await conn.remove_listener(LIVENESS_CHANNEL, self._on_notify)
                     with contextlib.suppress(Exception):
