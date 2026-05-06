@@ -130,13 +130,33 @@ class LivenessHub:
         max_backoff = 30.0
         while not self._stop_event.is_set():
             conn = None
+            terminated_event = asyncio.Event()
+
+            def _on_connection_terminated(_conn: Any) -> None:
+                logger.warning(
+                    "LivenessHub LISTEN connection terminated; reconnecting channel '%s'",
+                    LIVENESS_CHANNEL,
+                )
+                terminated_event.set()
+
             try:
                 conn = await self._pool.acquire()
                 await conn.add_listener(LIVENESS_CHANNEL, self._on_notify)
+                await conn.add_termination_listener(_on_connection_terminated)
                 logger.info("LivenessHub LISTENing on channel '%s'", LIVENESS_CHANNEL)
                 backoff = 1.0  # successful connect resets backoff
-                # Hold the listener open until stop is requested.
-                await self._stop_event.wait()
+                # Hold the listener open until stop is requested or Postgres drops.
+                stop_wait = asyncio.create_task(self._stop_event.wait())
+                terminated_wait = asyncio.create_task(terminated_event.wait())
+                done, pending = await asyncio.wait(
+                    {stop_wait, terminated_wait}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                if terminated_wait in done and not self._stop_event.is_set():
+                    raise ConnectionError("LISTEN connection terminated")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -149,6 +169,8 @@ class LivenessHub:
                 backoff = min(backoff * 2.0, max_backoff)
             finally:
                 if conn is not None:
+                    with contextlib.suppress(Exception):
+                        await conn.remove_termination_listener(_on_connection_terminated)
                     with contextlib.suppress(Exception):
                         await conn.remove_listener(LIVENESS_CHANNEL, self._on_notify)
                     with contextlib.suppress(Exception):

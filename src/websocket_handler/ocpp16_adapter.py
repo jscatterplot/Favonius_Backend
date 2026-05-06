@@ -20,7 +20,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from itertools import count
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from ocpp.v16.enums import AuthorizationStatus
 
@@ -125,6 +125,7 @@ class OCPP16Session:
         self._pending_start: Optional[Dict[str, Any]] = None
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._boot_trigger_task: Optional[asyncio.Task[None]] = None
+        self._background_tasks: Set[asyncio.Task[Any]] = set()
         self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
         self._telemetry_flush_task: Optional[asyncio.Task[None]] = None
         self._stop_telemetry_flush = asyncio.Event()
@@ -167,10 +168,12 @@ class OCPP16Session:
 
         if self._liveness_notifier is not None:
             org_id = (self._tenant_context or {}).get("organization_id")
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._liveness_notifier.maybe_notify(self._station_id, org_id),
                 name=f"liveness_notify:{self._station_id}",
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     # ------------------------------------------------------------------
     # Lifecycle
