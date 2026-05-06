@@ -17,7 +17,9 @@ from fastapi import HTTPException, status as http_status
 
 from src.api.main import (
     _compute_import_row_hash,
+    _platform_import_hash_token,
     _parse_import_local_timestamp,
+    HistoricalSessionImport,
     app,
 )
 from src.security.tenant_mirror import ensure_tenant_mirrored
@@ -187,6 +189,32 @@ class TestPureHelpers:
             energy_delivered_kwh=24.044,
             revenue=1.5,
         )
+
+    def test_platform_import_hash_token_changes_with_row_content(self):
+        """Platform-start dedup token should distinguish materially different rows."""
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        common = {
+            "import_batch_id": uuid4(),
+            "start_time_local": "2026-05-05 12:56",
+            "end_time_local": "2026-05-11 01:17",
+            "energy_delivered_kwh": 24.044,
+            "revenue": 0.0,
+            "id_tag": None,
+            "rfid_label": None,
+            "status": "Finished",
+            "transaction_type": "Dashboard",
+            "user_full_name": "HRX Transport",
+            "station_owner_full_name": "Gustas Diksa",
+        }
+        request_a = HistoricalSessionImport(**common)
+        request_b = HistoricalSessionImport(**{**common, "transaction_type": "IOS"})
+
+        end_time = datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)
+        token_a = _platform_import_hash_token(request_a, end_time_utc=end_time)
+        token_b = _platform_import_hash_token(request_b, end_time_utc=end_time)
+        assert token_a != token_b
 
 
 # --------------------------------------------------------------------------- #

@@ -3491,6 +3491,32 @@ def _is_platform_initiated_import_row(request: HistoricalSessionImport) -> bool:
     return not (request.rfid_label or request.id_tag)
 
 
+def _platform_import_hash_token(
+    request: HistoricalSessionImport,
+    *,
+    end_time_utc: Optional[datetime],
+) -> str:
+    """Build a richer dedup token for platform-initiated import rows.
+
+    Platform-start imports intentionally store a constant id_token
+    (``platform-start``) in ``charging_sessions.id_token`` so reports can
+    classify their origin. Using only that constant in ``import_row_hash``
+    can falsely dedup distinct sessions that share minute-level start time,
+    energy, and revenue. This helper keeps persisted ``id_token`` stable
+    while adding additional request fields to the hash input.
+    """
+    return "|".join(
+        [
+            _PLATFORM_IMPORT_ID_TOKEN,
+            end_time_utc.isoformat() if end_time_utc else "",
+            request.transaction_type or "",
+            request.status or "",
+            request.user_full_name or "",
+            request.station_owner_full_name or "",
+        ]
+    )
+
+
 async def _resolve_import_id_tag(
     conn: asyncpg.Connection,
     *,
@@ -3687,10 +3713,15 @@ async def import_historical_charging_session(
     # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
     # When both identifiers are absent, classify as platform-initiated import.
     id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
+    hash_id_token = (
+        _platform_import_hash_token(request, end_time_utc=end_time_utc)
+        if id_token == _PLATFORM_IMPORT_ID_TOKEN
+        else id_token
+    )
     row_hash = _compute_import_row_hash(
         depot_id=depot_id,
         start_time_utc=start_time_utc,
-        id_tag=id_token,
+        id_tag=hash_id_token,
         energy_delivered_kwh=request.energy_delivered_kwh,
         revenue=request.revenue,
     )

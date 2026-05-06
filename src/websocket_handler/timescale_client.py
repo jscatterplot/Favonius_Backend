@@ -2178,7 +2178,9 @@ class TimescaleClient:
             async with conn.transaction():
                 await conn.execute(
                     """
-                    SELECT pg_advisory_xact_lock(hashtext($1), $2)
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended($1 || ':' || $2::text, 0)
+                    )
                     """,
                     station_id,
                     transaction_id,

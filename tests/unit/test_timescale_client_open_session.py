@@ -48,6 +48,9 @@ async def test_insert_open_session_skips_existing_open_row():
 
     conn.fetchval.assert_awaited_once()
     conn.execute.assert_awaited_once()
+    lock_query = conn.execute.await_args_list[0].args[0]
+    assert "hashtextextended" in lock_query
+    assert "pg_advisory_xact_lock" in lock_query
 
 
 @pytest.mark.asyncio
@@ -68,3 +71,6 @@ async def test_insert_open_session_inserts_when_no_existing_row():
 
     conn.fetchval.assert_awaited_once()
     assert conn.execute.await_count == 2
+    lock_query = conn.execute.await_args_list[0].args[0]
+    assert "hashtextextended" in lock_query
+    assert "pg_advisory_xact_lock" in lock_query
