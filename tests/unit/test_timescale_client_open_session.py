@@ -23,6 +23,9 @@ def _client_with_conn(conn):
     pool = MagicMock()
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
+    conn.transaction = MagicMock()
+    conn.transaction.return_value.__aenter__.return_value = None
+    conn.transaction.return_value.__aexit__.return_value = None
     client.pg_pool = pool
     return client, conn
 
@@ -44,7 +47,7 @@ async def test_insert_open_session_skips_existing_open_row():
     )
 
     conn.fetchval.assert_awaited_once()
-    conn.execute.assert_not_awaited()
+    conn.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -64,4 +67,4 @@ async def test_insert_open_session_inserts_when_no_existing_row():
     )
 
     conn.fetchval.assert_awaited_once()
-    conn.execute.assert_awaited_once()
+    assert conn.execute.await_count == 2
