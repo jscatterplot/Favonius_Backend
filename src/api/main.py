@@ -1971,6 +1971,11 @@ class HistoricalSessionImport(_CamelOrSnakeModel):
     one row per call. Timestamps are accepted as naive strings interpreted in
     the depot's local timezone (``sites.timezone``); the server converts to
     UTC before persisting.
+
+    Identity resolution priority:
+      1. ``rfid_label`` matched against ``rfid_cards.label`` (case-insensitive)
+      2. ``id_tag`` matched against ``vehicles.id_tag``, then ``rfid_cards.id_tag``
+      3. Unmatched — session is stored with all identity fields null
     """
 
     import_batch_id: UUID
@@ -1978,11 +1983,19 @@ class HistoricalSessionImport(_CamelOrSnakeModel):
     end_time_local: Optional[str] = Field(default=None, max_length=64)
     energy_delivered_kwh: float = Field(..., ge=0)
     revenue: float = Field(default=0.0, ge=0)
-    id_tag: str = Field(..., min_length=1, max_length=255)
+    rfid_label: Optional[str] = Field(default=None, max_length=255)
+    id_tag: Optional[str] = Field(default=None, min_length=1, max_length=255)
     status: Literal["Charging", "Finished"]
     transaction_type: str = Field(default="RFID", max_length=64)
     user_full_name: Optional[str] = Field(default=None, max_length=255)
     station_owner_full_name: Optional[str] = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def require_rfid_identifier(self) -> "HistoricalSessionImport":
+        """Require at least one of rfid_label or id_tag."""
+        if not self.rfid_label and not self.id_tag:
+            raise ValueError("At least one of rfid_label or id_tag must be provided")
+        return self
 
 
 class HistoricalSessionImportMatched(BaseModel):
@@ -3463,72 +3476,103 @@ def _compute_import_row_hash(
 
 
 async def _resolve_import_id_tag(
-    conn: asyncpg.Connection, *, depot_id: str, id_tag: str
+    conn: asyncpg.Connection,
+    *,
+    depot_id: str,
+    id_tag: Optional[str],
+    rfid_label: Optional[str] = None,
 ) -> dict[str, Optional[str]]:
-    """Resolve raw id_tag against vehicles + rfid_cards scoped to this depot.
+    """Resolve RFID identity against vehicles + rfid_cards scoped to this depot.
 
-    Returns a dict with vehicle_id / card_id / driver_id (any may be None).
-    Unknown tags resolve to all-None — the row is still imported with the raw
-    id_tag stored in id_token so the FE can surface an "unmatched" badge.
+    Resolution order:
+      1. ``rfid_label`` matched against ``rfid_cards.label`` (case-insensitive)
+      2. ``id_tag`` matched against ``vehicles.id_tag``
+      3. ``id_tag`` matched against ``rfid_cards.id_tag``
+      4. Returns all-None — the row is imported unmatched so the FE can surface
+         an "unmatched" badge.
     """
-    vehicle_row = await conn.fetchrow(
-        """
-        SELECT id::text AS vehicle_id
-        FROM vehicles
-        WHERE id_tag = $1
-          AND site_id = $2::uuid
-          AND COALESCE(status, 'active') = 'active'
-        LIMIT 1
-        """,
-        id_tag,
-        depot_id,
-    )
-    if vehicle_row:
-        return {
-            "vehicle_id": vehicle_row["vehicle_id"],
-            "card_id": None,
-            "driver_id": None,
-        }
+    _CARD_ASSIGNMENT_SUBQUERIES = """
+        (
+            SELECT cva.vehicle_id::text
+            FROM rfid_card_vehicle_assignments cva
+            JOIN vehicles v ON v.id = cva.vehicle_id
+            WHERE cva.card_id = c.id
+              AND v.site_id = c.site_id
+              AND COALESCE(v.status, 'active') = 'active'
+            ORDER BY v.external_id
+            LIMIT 1
+        ) AS vehicle_id,
+        (
+            SELECT cda.driver_id::text
+            FROM rfid_card_driver_assignments cda
+            JOIN drivers dr ON dr.id = cda.driver_id
+            WHERE cda.card_id = c.id
+              AND dr.site_id = c.site_id
+              AND dr.status = 'active'
+            ORDER BY dr.display_name
+            LIMIT 1
+        ) AS driver_id
+    """
 
-    card_row = await conn.fetchrow(
-        """
-        SELECT
-            c.id::text AS card_id,
-            (
-                SELECT cva.vehicle_id::text
-                FROM rfid_card_vehicle_assignments cva
-                JOIN vehicles v ON v.id = cva.vehicle_id
-                WHERE cva.card_id = c.id
-                  AND v.site_id = c.site_id
-                  AND COALESCE(v.status, 'active') = 'active'
-                ORDER BY v.external_id
-                LIMIT 1
-            ) AS vehicle_id,
-            (
-                SELECT cda.driver_id::text
-                FROM rfid_card_driver_assignments cda
-                JOIN drivers dr ON dr.id = cda.driver_id
-                WHERE cda.card_id = c.id
-                  AND dr.site_id = c.site_id
-                  AND dr.status = 'active'
-                ORDER BY dr.display_name
-                LIMIT 1
-            ) AS driver_id
-        FROM rfid_cards c
-        WHERE c.id_tag = $1
-          AND c.site_id = $2::uuid
-          AND c.status = 'active'
-        LIMIT 1
-        """,
-        id_tag,
-        depot_id,
-    )
-    if card_row:
-        return {
-            "vehicle_id": card_row["vehicle_id"],
-            "card_id": card_row["card_id"],
-            "driver_id": card_row["driver_id"],
-        }
+    if rfid_label:
+        label_row = await conn.fetchrow(
+            f"""
+            SELECT c.id::text AS card_id, {_CARD_ASSIGNMENT_SUBQUERIES}
+            FROM rfid_cards c
+            WHERE LOWER(c.label) = LOWER($1)
+              AND c.site_id = $2::uuid
+              AND c.status = 'active'
+            LIMIT 1
+            """,
+            rfid_label,
+            depot_id,
+        )
+        if label_row:
+            return {
+                "vehicle_id": label_row["vehicle_id"],
+                "card_id": label_row["card_id"],
+                "driver_id": label_row["driver_id"],
+            }
+
+    if id_tag:
+        vehicle_row = await conn.fetchrow(
+            """
+            SELECT id::text AS vehicle_id
+            FROM vehicles
+            WHERE id_tag = $1
+              AND site_id = $2::uuid
+              AND COALESCE(status, 'active') = 'active'
+            LIMIT 1
+            """,
+            id_tag,
+            depot_id,
+        )
+        if vehicle_row:
+            return {
+                "vehicle_id": vehicle_row["vehicle_id"],
+                "card_id": None,
+                "driver_id": None,
+            }
+
+        card_row = await conn.fetchrow(
+            f"""
+            SELECT c.id::text AS card_id, {_CARD_ASSIGNMENT_SUBQUERIES}
+            FROM rfid_cards c
+            WHERE c.id_tag = $1
+              AND c.site_id = $2::uuid
+              AND c.status = 'active'
+            LIMIT 1
+            """,
+            id_tag,
+            depot_id,
+        )
+        if card_row:
+            return {
+                "vehicle_id": card_row["vehicle_id"],
+                "card_id": card_row["card_id"],
+                "driver_id": card_row["driver_id"],
+            }
+
     return {"vehicle_id": None, "card_id": None, "driver_id": None}
 
 
@@ -3583,7 +3627,10 @@ async def import_historical_charging_session(
             tz = ZoneInfo("UTC")
 
         identity = await _resolve_import_id_tag(
-            static_conn, depot_id=depot_id, id_tag=request.id_tag
+            static_conn,
+            depot_id=depot_id,
+            id_tag=request.id_tag,
+            rfid_label=request.rfid_label,
         )
 
     start_time_utc = _parse_import_local_timestamp(
@@ -3612,10 +3659,12 @@ async def import_historical_charging_session(
             },
         )
 
+    # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
+    id_token = request.rfid_label or request.id_tag or ""
     row_hash = _compute_import_row_hash(
         depot_id=depot_id,
         start_time_utc=start_time_utc,
-        id_tag=request.id_tag,
+        id_tag=id_token,
         energy_delivered_kwh=request.energy_delivered_kwh,
         revenue=request.revenue,
     )
@@ -3647,7 +3696,7 @@ async def import_historical_charging_session(
                 """,
                 placeholder_station_id,
                 identity["vehicle_id"],
-                request.id_tag,
+                id_token,
                 identity["driver_id"],
                 identity["card_id"],
                 start_time_utc,

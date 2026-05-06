@@ -543,3 +543,136 @@ class TestHistoricalChargingSessionImport:
 
         assert response.status_code == http_status.HTTP_404_NOT_FOUND
         assert response.json()["error_code"] == "DEPOT_NOT_FOUND"
+
+    # ---------------------------------------------------------------------- #
+    # rfid_label resolution (TOKS export flow)
+    # ---------------------------------------------------------------------- #
+
+    def test_rfid_label_matches_card_label_case_insensitive(self, client, mock_db_pool):
+        """rfid_label hit on rfid_cards.label skips all id_tag lookups."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        card_id = str(uuid4())
+        vehicle_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = mock_db_pool
+        # fetchrow sequence: 1) sites  2) rfid_cards.label hit (stops here)
+        _set_fetchrow_sequence(
+            conn,
+            _depot_row("Europe/Vilnius"),
+            _card_match_row(card_id=card_id, vehicle_id=vehicle_id, driver_id=None),
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(rfid_label="Opel Mokka", id_tag="ED8503"),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        body = response.json()
+        assert body["matched"]["card_id"] == card_id
+        assert body["matched"]["vehicle_id"] == vehicle_id
+        assert body["matched"]["driver_id"] is None
+        # Label matched on the 2nd fetchrow — no vehicle/card id_tag queries ran
+        assert conn.fetchrow.await_count == 2
+        # id_token stores rfid_label (preferred over id_tag)
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[2] == "Opel Mokka"  # $3 id_token
+
+    def test_rfid_label_miss_falls_back_to_id_tag_path(self, client, mock_db_pool):
+        """When rfid_label finds no card, resolution continues with id_tag."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        vehicle_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = mock_db_pool
+        # fetchrow sequence: 1) sites  2) label miss  3) vehicle hit
+        _set_fetchrow_sequence(
+            conn,
+            _depot_row("UTC"),
+            None,  # rfid_cards.label -> no match
+            _vehicle_match_row(vehicle_id),  # vehicles.id_tag -> hit
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(rfid_label="Unknown Label", id_tag="ED8503"),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        body = response.json()
+        assert body["matched"]["vehicle_id"] == vehicle_id
+        assert body["matched"]["card_id"] is None
+        # id_token stores rfid_label (it was provided)
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[2] == "Unknown Label"  # $3 id_token
+
+    def test_rfid_label_only_no_match_stores_unmatched(self, client, mock_db_pool):
+        """rfid_label with no match and no id_tag → 201, all identity fields null."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = mock_db_pool
+        # fetchrow sequence: 1) sites  2) label miss  (no id_tag → stops)
+        _set_fetchrow_sequence(conn, _depot_row("UTC"), None)
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json={
+                    **_row_payload(rfid_label="Opel Mokka"),
+                    "id_tag": None,  # explicitly absent
+                },
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        body = response.json()
+        assert body["matched"]["vehicle_id"] is None
+        assert body["matched"]["card_id"] is None
+        assert body["matched"]["driver_id"] is None
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[2] == "Opel Mokka"  # $3 id_token = rfid_label
+
+    def test_neither_rfid_label_nor_id_tag_returns_validation_error(
+        self, client, mock_db_pool
+    ):
+        """At least one of rfid_label / id_tag must be provided."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, _ = mock_db_pool
+
+        payload = _row_payload()
+        del payload["id_tag"]  # omit id_tag; rfid_label absent → validator fires
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert response.json()["error_code"] == "VALIDATION_ERROR"

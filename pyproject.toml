@@ -65,8 +65,8 @@ dependencies = [
     # Optimization (MILP solver)
     # Per PRD_v2.md Section 8.2: Gurobi primary, HiGHS fallback
     "pyomo>=6.7.0",
-    "gurobipy>=11.0.0",  # Primary solver (requires license)
-    "highspy>=1.5.0",  # Fallback solver (open-source)
+    "gurobipy>=11.0.0", # Primary solver (requires license)
+    "highspy>=1.5.0", # Fallback solver (open-source)
     # Machine Learning (Surrogate Model)
     "scikit-learn>=1.3.0",
     # API framework
