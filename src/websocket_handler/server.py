@@ -711,6 +711,7 @@ class OCPPWebSocketServer:
                 timescale_client=self.timescale_client,
                 message_handler=self.message_handler,
                 connection_manager=self.connection_manager,
+                supabase_client=self.supabase_client,
             )
         else:
             charge_point = EnhancedOCPPChargePoint(

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+
 try:
     from supabase import Client, create_client
 except ImportError:  # pragma: no cover - keep test imports working without optional deps
@@ -16,6 +17,7 @@ except ImportError:  # pragma: no cover - keep test imports working without opti
         raise RuntimeError(
             "supabase package is unavailable. Install optional dependencies to enable Supabase access."
         )
+
 
 from .config import SupabaseConfig
 from .monitoring import get_logger
@@ -148,6 +150,31 @@ class SupabaseClient:
         """
         row = await self.fetch_one(query, station_id)
         return str(row["canonical_station_id"]) if row else station_id
+
+    async def lookup_tenant_context(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Return ``{"organization_id", "depot_id"}`` for a charger or None.
+
+        Used by the OCPP handlers to label time-series rows (e.g.
+        ``connector_status`` after migration 029) with tenant context so the
+        alerts trigger can route notifications without joining the dropped
+        TimescaleDB shadow tables. Returns None when the station is not
+        registered or has no site assigned — callers persist a NULL-context
+        row in that case and the trigger silently bails.
+        """
+        query = """
+            SELECT cs.site_id AS depot_id, s.organization_id
+            FROM charging_stations cs
+            LEFT JOIN sites s ON s.id = cs.site_id
+            WHERE cs.station_id = $1
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id)
+        if not row:
+            return None
+        return {
+            "organization_id": str(row["organization_id"]) if row.get("organization_id") else None,
+            "depot_id": str(row["depot_id"]) if row.get("depot_id") else None,
+        }
 
     async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
         """Return True when username is the canonical station id or an active alias."""
