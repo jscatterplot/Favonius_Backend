@@ -281,7 +281,7 @@ class TransactionManager:
                 "additionalInfo": "RequestStartTransaction requires TxProfile purpose",
             }
 
-        if charging_profile.get("transactionId") or charging_profile.get("transaction_id"):
+        if "transactionId" in charging_profile or "transaction_id" in charging_profile:
             return {
                 "reasonCode": "InvalidChargingProfile",
                 "additionalInfo": "New RequestStartTransaction profiles must not include transactionId",
