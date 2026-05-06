@@ -186,31 +186,29 @@ class LivenessHub:
         """
         try:
             event = json.loads(payload)
-        except (TypeError, ValueError) as exc:
-            logger.warning("liveness_hub_invalid_payload error=%s", exc)
-            return
+            org_id = event.get("organization_id")
+            if not org_id:
+                return
 
-        org_id = event.get("organization_id")
-        if not org_id:
-            return
+            bucket = self._subscribers.get(str(org_id))
+            if not bucket:
+                return
 
-        bucket = self._subscribers.get(str(org_id))
-        if not bucket:
-            return
-
-        # Strip organization_id before fanning out — subscribers are
-        # already scoped to their org and the front-end doesn't need it.
-        outbound = {
-            "station_id": event.get("station_id"),
-            "last_interaction_at": event.get("last_interaction_at"),
-        }
-        for q in bucket:
-            try:
-                q.put_nowait(outbound)
-            except asyncio.QueueFull:
-                # Drop the oldest entry to make room — "last interaction"
-                # is monotonic, the newer event always supersedes.
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    q.get_nowait()
-                with contextlib.suppress(asyncio.QueueFull):
+            # Strip organization_id before fanning out — subscribers are
+            # already scoped to their org and the front-end doesn't need it.
+            outbound = {
+                "station_id": event.get("station_id"),
+                "last_interaction_at": event.get("last_interaction_at"),
+            }
+            for q in bucket:
+                try:
                     q.put_nowait(outbound)
+                except asyncio.QueueFull:
+                    # Drop the oldest entry to make room — "last interaction"
+                    # is monotonic, the newer event always supersedes.
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        q.get_nowait()
+                    with contextlib.suppress(asyncio.QueueFull):
+                        q.put_nowait(outbound)
+        except Exception as exc:
+            logger.warning("liveness_hub_dispatch_failed error=%s", exc)

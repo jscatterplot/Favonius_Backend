@@ -93,6 +93,17 @@ async def test_invalid_json_payload_is_logged_and_dropped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_valid_json_non_object_payload_is_dropped() -> None:
+    hub = _make_hub()
+    q = hub.subscribe("org-A")
+
+    # Must not raise even though JSON is valid but not an object.
+    hub._on_notify(MagicMock(), 0, "charger_liveness", '["not", "an", "object"]')
+
+    assert q.empty()
+
+
+@pytest.mark.asyncio
 async def test_payload_missing_organization_id_is_dropped() -> None:
     hub = _make_hub()
     q = hub.subscribe("org-A")
