@@ -1854,121 +1854,48 @@ class TimescaleClient:
             }
         )
 
-    async def create_operator_override(
-        self,
-        *,
-        station_id: str,
-        id_tag: str,
-        connector_id: int,
-        organization_id: str,
-        depot_id: str,
-        expires_at: datetime,
-        created_by: str,
-        reason: Optional[str] = None,
-        audit_metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Insert a one-shot operator authorization override (migration 031).
-
-        See ``operator_authorization_overrides`` table — synthetic id_tag
-        minted by ``POST /admin/.../manual_authorize``, consumed exactly
-        once by ``RFIDAuthorizationService.authorize`` when the charger
-        sends Authorize/StartTransaction with this tag.
-        """
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO operator_authorization_overrides (
-                    station_id, id_tag, connector_id, organization_id, depot_id,
-                    expires_at, created_by, reason, audit_metadata
-                ) VALUES ($1, $2, $3, $4::uuid, $5::uuid, $6, $7::uuid, $8, $9::jsonb)
-                RETURNING id, station_id, id_tag, connector_id, expires_at, created_at
-                """,
-                station_id,
-                id_tag,
-                connector_id,
-                organization_id,
-                depot_id,
-                expires_at,
-                created_by,
-                reason,
-                json.dumps(audit_metadata or {}),
-            )
-            return dict(row)
-
     async def consume_operator_override(
         self, station_id: str, id_tag: str
     ) -> Optional[Dict[str, Any]]:
-        """Atomically claim an unconsumed, unexpired override or return None.
+        """Claim or reuse a recent unexpired override for StartTransaction flow.
 
         Used by ``RFIDAuthorizationService.authorize`` after ``lookup_id_tag``
-        misses but before the invalid-attempt audit row is written. The
-        partial unique index ``operator_overrides_active_uniq`` guarantees
-        at most one matching row, so the UPDATE either claims it (consumed)
-        or finds nothing.
+        misses but before the invalid-attempt audit row is written.
+
+        Why this is not strictly single-use:
+        many OCPP 1.6 chargers send both ``Authorize`` and ``StartTransaction``
+        for the same RemoteStart idTag. The first call should consume the row,
+        and the immediately following second call should still pass. We allow
+        reuse only for already-consumed rows from the last 120 seconds.
         """
         async with self.pg_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                UPDATE operator_authorization_overrides
-                   SET consumed_at = NOW()
+                WITH claimed AS (
+                    UPDATE operator_authorization_overrides
+                       SET consumed_at = NOW()
+                     WHERE station_id = $1
+                       AND id_tag = $2
+                       AND consumed_at IS NULL
+                       AND expires_at > NOW()
+                    RETURNING id, station_id, connector_id, organization_id, depot_id,
+                              created_by, reason, expires_at, consumed_at
+                )
+                SELECT * FROM claimed
+                UNION ALL
+                SELECT id, station_id, connector_id, organization_id, depot_id,
+                       created_by, reason, expires_at, consumed_at
+                  FROM operator_authorization_overrides
                  WHERE station_id = $1
                    AND id_tag = $2
-                   AND consumed_at IS NULL
+                   AND consumed_at IS NOT NULL
+                   AND consumed_at > NOW() - INTERVAL '120 seconds'
                    AND expires_at > NOW()
-                RETURNING id, station_id, connector_id, organization_id, depot_id,
-                          created_by, reason, expires_at, consumed_at
+                   AND NOT EXISTS (SELECT 1 FROM claimed)
+                 LIMIT 1
                 """,
                 station_id,
                 id_tag,
-            )
-            return dict(row) if row else None
-
-    async def recent_unconsumed_override_for_connector(
-        self, station_id: str, connector_id: int, within_seconds: int = 60
-    ) -> Optional[Dict[str, Any]]:
-        """Return the most recent unconsumed override created in the last N s.
-
-        Backs the API endpoint's per-connector cooldown — prevents an operator
-        accidentally double-clicking the manual-authorize button. ``NULL``
-        when no recent override exists for this connector.
-        """
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=within_seconds)
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, id_tag, expires_at, created_at, created_by
-                  FROM operator_authorization_overrides
-                 WHERE station_id = $1
-                   AND connector_id = $2
-                   AND consumed_at IS NULL
-                   AND created_at >= $3
-                ORDER BY created_at DESC
-                 LIMIT 1
-                """,
-                station_id,
-                connector_id,
-                cutoff,
-            )
-            return dict(row) if row else None
-
-    async def get_last_manual_override(self, station_id: str) -> Optional[Dict[str, Any]]:
-        """Return the most recent override for this charger (any state).
-
-        Used by the admin "Last manual override" panel on the charger detail
-        page so operators can see who overrode authorization most recently
-        and avoid duplicate manual auths on the same connector.
-        """
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, connector_id, created_at, created_by, reason,
-                       expires_at, consumed_at
-                  FROM operator_authorization_overrides
-                 WHERE station_id = $1
-                ORDER BY created_at DESC
-                 LIMIT 1
-                """,
-                station_id,
             )
             return dict(row) if row else None
 
