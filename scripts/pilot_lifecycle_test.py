@@ -64,7 +64,10 @@ logger = logging.getLogger("pilot")
 
 
 def _action(name_pascal: str, name_snake: str):
-    return getattr(Action, name_pascal, getattr(Action, name_snake))
+    action = getattr(Action, name_pascal, None)
+    if action is not None:
+        return action
+    return getattr(Action, name_snake)
 
 
 def _now_iso() -> str:
