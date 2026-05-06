@@ -7177,7 +7177,7 @@ async def manual_authorize_charger_endpoint(
         )
     ocpp_id = charger_row["ocpp_id"]
 
-    synthetic_tag = f"OP-{uuid.uuid4()}"
+    synthetic_tag = f"OP-{uuid.uuid4().hex[:17]}"
     audit_metadata = {
         "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
         "ocpp_id": ocpp_id,
