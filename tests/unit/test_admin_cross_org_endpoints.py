@@ -544,6 +544,66 @@ class TestRotateCredentialsRBAC:
         audit.assert_not_awaited()
 
 
+# ── POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize ───
+
+
+class TestManualAuthorizeCooldown:
+    """manual_authorize cooldown is per-connector for a full 60 seconds."""
+
+    URL = f"/admin/depots/{DEPOT_ID}/chargers/{CHARGER_ID}/manual_authorize"
+
+    def _hit(self, client):
+        return client.post(
+            self.URL,
+            headers=AUTH_HDR,
+            json={"connector_id": 1, "expires_in_seconds": 60},
+        )
+
+    def test_cooldown_blocks_even_when_recent_override_is_consumed(self, client, mock_pool):
+        """A consumed override from the last 60s still returns 409.
+
+        Regression guard: the cooldown query must not require ``consumed_at IS NULL``,
+        otherwise fast charger consumption bypasses double-click protection.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        pool, conn = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+
+        now = datetime.now(timezone.utc)
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                {"ocpp_id": "acme-berlin-001"},
+                {
+                    "id": uuid4(),
+                    "created_at": now - timedelta(seconds=10),
+                    "expires_at": now + timedelta(seconds=50),
+                },
+            ]
+        )
+        conn.execute = AsyncMock(return_value=None)
+        conn.fetchval = AsyncMock()
+
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main._resolve_depot_for_admin",
+                new_callable=AsyncMock,
+                return_value=({"organization_id": ORG_ID}, None),
+            ),
+        ):
+            response = self._hit(client)
+
+        assert response.status_code == http_status.HTTP_409_CONFLICT
+        body = response.json()["detail"]
+        assert body["error_code"] == "RECENT_OVERRIDE_EXISTS"
+        assert body["retry_after_seconds"] > 0
+
+        cooldown_query = conn.fetchrow.await_args_list[1].args[0]
+        assert "consumed_at IS NULL" not in cooldown_query
+        conn.fetchval.assert_not_awaited()
+
+
 # ── Plaintext non-retrievability ───────────────────────────────────────────
 
 

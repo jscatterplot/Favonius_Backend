@@ -1854,6 +1854,50 @@ class TimescaleClient:
             }
         )
 
+    async def consume_operator_override(
+        self, station_id: str, id_tag: str
+    ) -> Optional[Dict[str, Any]]:
+        """Claim or reuse a recent unexpired override for StartTransaction flow.
+
+        Used by ``RFIDAuthorizationService.authorize`` after ``lookup_id_tag``
+        misses but before the invalid-attempt audit row is written.
+
+        Why this is not strictly single-use:
+        many OCPP 1.6 chargers send both ``Authorize`` and ``StartTransaction``
+        for the same RemoteStart idTag. The first call should consume the row,
+        and the immediately following second call should still pass. We allow
+        reuse only for already-consumed rows from the last 120 seconds.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                WITH claimed AS (
+                    UPDATE operator_authorization_overrides
+                       SET consumed_at = NOW()
+                     WHERE station_id = $1
+                       AND id_tag = $2
+                       AND consumed_at IS NULL
+                       AND expires_at > NOW()
+                    RETURNING id, station_id, connector_id, organization_id, depot_id,
+                              created_by, reason, expires_at, consumed_at
+                )
+                SELECT * FROM claimed
+                UNION ALL
+                SELECT id, station_id, connector_id, organization_id, depot_id,
+                       created_by, reason, expires_at, consumed_at
+                  FROM operator_authorization_overrides
+                 WHERE station_id = $1
+                   AND id_tag = $2
+                   AND consumed_at IS NOT NULL
+                   AND consumed_at > NOW() - INTERVAL '120 seconds'
+                   AND NOT EXISTS (SELECT 1 FROM claimed)
+                 LIMIT 1
+                """,
+                station_id,
+                id_tag,
+            )
+            return dict(row) if row else None
+
     async def validate_api_key(self, station_id: str, api_key: str) -> bool:
         """Validate API key."""
         api_key_hash = self._hash_secret(api_key)
