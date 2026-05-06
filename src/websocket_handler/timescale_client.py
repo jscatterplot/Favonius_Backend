@@ -1890,7 +1890,6 @@ class TimescaleClient:
                    AND id_tag = $2
                    AND consumed_at IS NOT NULL
                    AND consumed_at > NOW() - INTERVAL '120 seconds'
-                   AND expires_at > NOW()
                    AND NOT EXISTS (SELECT 1 FROM claimed)
                  LIMIT 1
                 """,

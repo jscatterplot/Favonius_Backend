@@ -7177,43 +7177,7 @@ async def manual_authorize_charger_endpoint(
         )
     ocpp_id = charger_row["ocpp_id"]
 
-    # Cooldown: per-connector dedupe. The partial unique index on the
-    # override table also guarantees only one unconsumed (station, tag)
-    # but the per-connector lookup makes the 409 message meaningful.
-    async with db_pools.ts.acquire() as conn:
-        recent = await conn.fetchrow(
-            """
-            SELECT id, expires_at, created_at
-              FROM operator_authorization_overrides
-             WHERE station_id = $1
-               AND connector_id = $2
-               AND consumed_at IS NULL
-               AND created_at >= NOW() - INTERVAL '60 seconds'
-            ORDER BY created_at DESC
-             LIMIT 1
-            """,
-            ocpp_id,
-            connector_id,
-        )
-    now = datetime.now(timezone.utc)
-    if recent is not None:
-        retry_after = max(
-            int((recent["created_at"] + timedelta(seconds=60) - now).total_seconds()),
-            1,
-        )
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_code": "RECENT_OVERRIDE_EXISTS",
-                "message": "An unconsumed override exists for this connector",
-                "retry_after_seconds": retry_after,
-                "active_override_id": str(recent["id"]),
-                "expires_at": recent["expires_at"].isoformat(),
-            },
-        )
-
     synthetic_tag = f"OP-{uuid.uuid4()}"
-    expires_at = now + timedelta(seconds=expires_in_seconds)
     audit_metadata = {
         "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
         "ocpp_id": ocpp_id,
@@ -7225,6 +7189,44 @@ async def manual_authorize_charger_endpoint(
     # crash mid-call can't leave a queue row pointing at a missing override.
     async with db_pools.ts.acquire() as conn:
         async with conn.transaction():
+            # Serialize manual authorization attempts per connector so the
+            # cooldown check and inserts are effectively atomic.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1), $2)",
+                ocpp_id,
+                connector_id,
+            )
+            now = datetime.now(timezone.utc)
+            expires_at = now + timedelta(seconds=expires_in_seconds)
+            recent = await conn.fetchrow(
+                """
+                SELECT id, expires_at, created_at
+                  FROM operator_authorization_overrides
+                 WHERE station_id = $1
+                   AND connector_id = $2
+                   AND consumed_at IS NULL
+                   AND created_at >= NOW() - INTERVAL '60 seconds'
+                ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                ocpp_id,
+                connector_id,
+            )
+            if recent is not None:
+                retry_after = max(
+                    int((recent["created_at"] + timedelta(seconds=60) - now).total_seconds()),
+                    1,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": "RECENT_OVERRIDE_EXISTS",
+                        "message": "An unconsumed override exists for this connector",
+                        "retry_after_seconds": retry_after,
+                        "active_override_id": str(recent["id"]),
+                        "expires_at": recent["expires_at"].isoformat(),
+                    },
+                )
             override_row = await conn.fetchrow(
                 """
                 INSERT INTO operator_authorization_overrides (
