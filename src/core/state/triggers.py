@@ -107,7 +107,12 @@ class TriggerMonitor:
         self.on_trigger = on_trigger
         self.assembler = assembler
         self.pool = pool
-        self.depot_id = depot_id
+        # Prefer the assembler's depot_id when not given explicitly so
+        # static-pool queries (schedules) and ts-pool queries (vdv463) can
+        # resolve it without the caller wiring it twice.
+        self.depot_id = depot_id or (
+            getattr(assembler, "depot_id", None) if assembler is not None else None
+        )
         self.last_prices: dict[datetime, float] = {}
         self.expected_socs: dict[str, float] = {}
         self.expected_return_times: dict[str, datetime] = {}
@@ -124,6 +129,16 @@ class TriggerMonitor:
             raise ValueError("Either assembler or (pool + depot_id) must be provided")
 
         logger.info("Initialized TriggerMonitor")
+
+    def _static_pool(self) -> Optional[asyncpg.Pool]:
+        """Resolve the Supabase (reference) pool, preferring the assembler's
+        DatabasePools when available; falls back to the legacy single ``pool``.
+        """
+        if self.assembler is not None:
+            pools = getattr(self.assembler, "pools", None)
+            if pools is not None:
+                return pools.static
+        return self.pool
 
     def update_expected_state(
         self,
@@ -352,23 +367,27 @@ class TriggerMonitor:
         Note:
             Returns empty dict on error to allow monitoring to continue.
         """
-        if not self.pool or not self.depot_id:
-            logger.warning("Cannot fetch return times: missing pool or depot_id")
+        # schedules + vehicles live in Supabase (static pool). The legacy
+        # single-pool init path (self.pool) is kept for backward compat.
+        pool = self._static_pool()
+        if pool is None or not self.depot_id:
+            logger.debug("Cannot fetch return times: missing static pool or depot_id")
             return {}
 
-        # Query schedules where return_time has passed recently
+        # Supabase column names: vehicles.id is the PK, vehicles.site_id is
+        # the depot FK. schedules.vehicle_id continues to reference vehicles.id.
         query = """
         SELECT DISTINCT ON (s.vehicle_id)
             s.vehicle_id::text, s.return_time
         FROM schedules s
-        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
-        WHERE v.depot_id = $1
+        JOIN vehicles v ON s.vehicle_id = v.id
+        WHERE v.site_id = $1
           AND s.return_time <= NOW()
           AND s.return_time >= NOW() - INTERVAL '1 hour'
         ORDER BY s.vehicle_id, s.return_time DESC
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with pool.acquire() as conn:
                 rows = await conn.fetch(query, self.depot_id)
             return {str(row["vehicle_id"]): row["return_time"] for row in rows}
         except asyncio.TimeoutError as e:

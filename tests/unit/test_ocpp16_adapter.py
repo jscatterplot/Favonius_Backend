@@ -84,6 +84,7 @@ def mock_timescale() -> MagicMock:
     )
     tc.next_transaction_id = AsyncMock(return_value=4242)
     tc.next_charging_profile_id = AsyncMock(return_value=123456)
+    tc.store_security_event = AsyncMock()
     return tc
 
 
@@ -238,6 +239,176 @@ class TestOCPP16SessionForceBootNotification:
         session._cp.trigger_message = AsyncMock(side_effect=RuntimeError("boom"))
         monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
         await session._force_boot_notification()  # must not raise
+
+
+class TestOCPP16SessionSecurityEventPersistence:
+    """Persist OCPP 1.6 SecurityEventNotification frames to ``security_events``."""
+
+    @pytest.mark.asyncio
+    async def test_persists_event_with_parsed_timestamp(self, session, mock_timescale) -> None:
+        from datetime import datetime, timezone
+
+        await session._on_security_event(
+            cp_id="test_station_001",
+            event_type="StartupOfTheDevice",
+            timestamp="2026-05-04T15:43:41.000Z",
+            tech_info=None,
+        )
+        mock_timescale.store_security_event.assert_awaited_once()
+        payload = mock_timescale.store_security_event.await_args.args[0]
+        assert payload["station_id"] == "test_station_001"
+        assert payload["event_type"] == "StartupOfTheDevice"
+        assert payload["tech_info"] is None
+        assert payload["timestamp"] == datetime(2026, 5, 4, 15, 43, 41, tzinfo=timezone.utc)
+        assert payload["additional_info"]["source"] == "ocpp1.6.SecurityEventNotification"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_timestamp_falls_back_to_now(self, session, mock_timescale) -> None:
+        from datetime import datetime, timezone
+
+        before = datetime.now(timezone.utc)
+        await session._on_security_event(
+            cp_id="test_station_001",
+            event_type="SettingSystemTime",
+            timestamp="not-a-timestamp",
+            tech_info="ocppBoot",
+        )
+        after = datetime.now(timezone.utc)
+        mock_timescale.store_security_event.assert_awaited_once()
+        payload = mock_timescale.store_security_event.await_args.args[0]
+        assert before <= payload["timestamp"] <= after
+
+
+class TestOCPP16SessionTenantContext:
+    """Tenant context (organization_id, depot_id) is resolved once on boot
+    and passed through to ``insert_connector_status`` so the alerts trigger
+    can fire on Faulted/Unavailable transitions (migration 029)."""
+
+    @pytest.mark.asyncio
+    async def test_on_boot_resolves_and_caches_tenant_context(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(
+            return_value={"organization_id": "org-1", "depot_id": "dep-1"}
+        )
+        mock_timescale.fetch_open_sessions = AsyncMock(return_value=[])
+        mock_timescale.fetch_pending_commands = AsyncMock(return_value=[])
+        s = OCPP16Session(
+            station_id="ctx_001",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            supabase_client=supabase,
+        )
+
+        await s._on_boot(
+            cp_id="ctx_001",
+            vendor="ABB",
+            model="TerraAC",
+            serial_number="SN-001",
+            firmware_version="1.8.36",
+        )
+
+        supabase.lookup_tenant_context.assert_awaited_once_with("ctx_001")
+        assert s._tenant_context == {"organization_id": "org-1", "depot_id": "dep-1"}
+
+    @pytest.mark.asyncio
+    async def test_status_change_propagates_cached_tenant_context(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        mock_timescale.insert_connector_status = AsyncMock()
+        s = OCPP16Session(
+            station_id="ctx_002",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+        )
+        s._tenant_context = {"organization_id": "org-X", "depot_id": "dep-X"}
+
+        await s._on_status_change(
+            cp_id="ctx_002",
+            connector_id=1,
+            status="Faulted",
+            error_code="OverCurrentFailure",
+            timestamp="2026-05-05T22:30:00.000Z",
+        )
+
+        mock_timescale.insert_connector_status.assert_awaited_once()
+        payload = mock_timescale.insert_connector_status.await_args.args[0]
+        assert payload["organization_id"] == "org-X"
+        assert payload["depot_id"] == "dep-X"
+        assert payload["status"] == "Faulted"
+
+    @pytest.mark.asyncio
+    async def test_status_change_passes_null_context_when_unresolved(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """Charger booted before resolution succeeded → write NULL context.
+
+        The post-mig-029 alerts trigger bails silently on NULL org_id,
+        so this matches the legacy behavior — but we still want to
+        persist the connector_status row (for `GET /depots/{id}/alerts`).
+        """
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        mock_timescale.insert_connector_status = AsyncMock()
+        s = OCPP16Session(
+            station_id="ctx_003",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+        )
+        # _tenant_context never resolved (still None)
+
+        await s._on_status_change(
+            cp_id="ctx_003",
+            connector_id=0,
+            status="Available",
+            error_code="NoError",
+            timestamp="2026-05-05T22:31:00.000Z",
+        )
+
+        payload = mock_timescale.insert_connector_status.await_args.args[0]
+        assert payload["organization_id"] is None
+        assert payload["depot_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_resolve_falls_back_to_none_on_lookup_failure(
+        self, mock_websocket, mock_timescale, mock_message_handler, caplog
+    ) -> None:
+        """Supabase lookup raises → log warning, leave cache None, don't crash boot."""
+        import logging
+
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(side_effect=RuntimeError("supabase down"))
+        mock_timescale.fetch_open_sessions = AsyncMock(return_value=[])
+        mock_timescale.fetch_pending_commands = AsyncMock(return_value=[])
+        s = OCPP16Session(
+            station_id="ctx_004",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            supabase_client=supabase,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await s._on_boot(
+                cp_id="ctx_004",
+                vendor="ABB",
+                model="TerraAC",
+                serial_number="SN",
+                firmware_version="1.8.36",
+            )
+
+        assert s._tenant_context is None
+        assert any("tenant_context_lookup_failed" in r.getMessage() for r in caplog.records)
 
 
 class TestOCPP16SessionCallbacks:

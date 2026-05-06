@@ -8,8 +8,7 @@ import os
 def is_agent_search_enabled() -> bool:
     """Return True iff the agent router should be mounted.
 
-    Flipping the env var requires a redeploy. Default is **off** for v0 —
-    flipped to default-on in B6 after the golden test suite passes per
-    architecture doc §11 step 8.
+    Default is **on** as of B6 (golden test suite passed, AT-18 green).
+    Set ``AGENT_SEARCH_ENABLED=false`` to disable without redeploying code.
     """
-    return os.environ.get("AGENT_SEARCH_ENABLED", "false").lower() == "true"
+    return os.environ.get("AGENT_SEARCH_ENABLED", "true").lower() == "true"

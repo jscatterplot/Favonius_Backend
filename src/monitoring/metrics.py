@@ -83,6 +83,33 @@ OCPP_DISPATCH_FAILURES = Counter(
     ["depot_id", "error_type"],
 )
 
+# Agent chat metrics
+# Per architecture doc §8.3: four mandatory metrics for the depot chat agent.
+AGENT_TURNS = Counter(
+    "favonius_agent_turns_total",
+    "Total depot chat agent turns by outcome and intent",
+    ["status", "intent"],  # status: success|disambiguation|not_found|error
+)
+
+AGENT_TURN_DURATION = Histogram(
+    "favonius_agent_turn_duration_seconds",
+    "End-to-end latency per agent turn (p95 target ≤ 8 s per PRD §7)",
+    ["intent"],
+    buckets=[0.5, 1, 2, 4, 6, 8, 12, 20],
+)
+
+AGENT_LLM_TOKENS = Counter(
+    "favonius_agent_llm_tokens_total",
+    "LLM tokens consumed by the agent, split by model and direction",
+    ["model", "direction"],  # direction: input | output
+)
+
+AGENT_RESOLVER_MISSES = Counter(
+    "favonius_agent_resolver_misses_total",
+    "Entity resolution failures by failure kind",
+    ["kind"],  # kind: not_found | ambiguous
+)
+
 # Control loop metrics
 # Per PRD Section 10.2: System availability ≥ 99.5%
 CONTROL_LOOP_UPTIME = Gauge(

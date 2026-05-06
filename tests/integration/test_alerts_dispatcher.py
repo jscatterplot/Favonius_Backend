@@ -41,34 +41,20 @@ async def db_pool():
 
 @pytest_asyncio.fixture
 async def org_depot_charger(db_pool):
+    """Yield (org_id, depot_id, ocpp_id) as plain UUIDs.
+
+    After migration 029 the static shadow tables are gone. Tenant context is
+    carried directly in connector_status.organization_id / depot_id, so no
+    shadow rows are needed.
+    """
     org_id = uuid4()
     depot_id = uuid4()
     ocpp_id = f"disp_{uuid4().hex[:8]}"
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO organizations (organization_id, name) VALUES ($1, $2)",
-            org_id,
-            "Disp Test Org",
-        )
-        await conn.execute(
-            """
-            INSERT INTO depots (depot_id, name, latitude, longitude, max_grid_kw, organization_id)
-            VALUES ($1, $2, 37.0, -122.0, 500.0, $3)
-            """,
-            depot_id, "Disp Test Depot", org_id,
-        )
-        await conn.execute(
-            "INSERT INTO chargers (depot_id, ocpp_id, rated_kw) VALUES ($1, $2, $3)",
-            depot_id, ocpp_id, 50.0,
-        )
     yield org_id, depot_id, ocpp_id
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM notification_alerts WHERE organization_id = $1", org_id)
         await conn.execute("DELETE FROM notification_recipients WHERE organization_id = $1", org_id)
         await conn.execute("DELETE FROM connector_status WHERE station_id = $1", ocpp_id)
-        await conn.execute("DELETE FROM chargers WHERE ocpp_id = $1", ocpp_id)
-        await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
-        await conn.execute("DELETE FROM organizations WHERE organization_id = $1", org_id)
 
 
 @pytest_asyncio.fixture
@@ -100,9 +86,10 @@ class TestSingleAlertFlow:
                 min_severity=Severity.WARNING,
             )
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status, error_code) "
-                "VALUES ($1, 1, 'Faulted', 'PowerMeterFailure')",
-                ocpp_id,
+                "INSERT INTO connector_status "
+                "(station_id, connector_id, status, error_code, organization_id) "
+                "VALUES ($1, 1, 'Faulted', 'PowerMeterFailure', $2)",
+                ocpp_id, org_id,
             )
 
         processed = await disp._tick()
@@ -142,9 +129,9 @@ class TestRecipientFanout:
             for email in ("a@x.com", "b@x.com", "c@x.com"):
                 await recipients_repo.create(conn, organization_id=org_id, email=email)
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status) "
-                "VALUES ($1, 1, 'Faulted')",
-                ocpp_id,
+                "INSERT INTO connector_status (station_id, connector_id, status, organization_id) "
+                "VALUES ($1, 1, 'Faulted', $2)",
+                ocpp_id, org_id,
             )
 
         await disp._tick()
@@ -181,9 +168,9 @@ class TestSeverityGating:
             )
             # Unavailable → warning per the trigger
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status) "
-                "VALUES ($1, 1, 'Unavailable')",
-                ocpp_id,
+                "INSERT INTO connector_status (station_id, connector_id, status, organization_id) "
+                "VALUES ($1, 1, 'Unavailable', $2)",
+                ocpp_id, org_id,
             )
 
         await disp._tick()
@@ -215,9 +202,9 @@ class TestAlertTypeFilter:
                 alert_types=("optimization_failed",),
             )
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status) "
-                "VALUES ($1, 1, 'Faulted')",
-                ocpp_id,
+                "INSERT INTO connector_status (station_id, connector_id, status, organization_id) "
+                "VALUES ($1, 1, 'Faulted', $2)",
+                ocpp_id, org_id,
             )
 
         await disp._tick()
@@ -235,9 +222,9 @@ class TestResendInterval:
         async with db_pool.acquire() as conn:
             await recipients_repo.create(conn, organization_id=org_id, email="o@x.com")
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status) "
-                "VALUES ($1, 1, 'Faulted')",
-                ocpp_id,
+                "INSERT INTO connector_status (station_id, connector_id, status, organization_id) "
+                "VALUES ($1, 1, 'Faulted', $2)",
+                ocpp_id, org_id,
             )
 
         first = await disp._tick()
@@ -258,9 +245,9 @@ class TestNoRecipients:
 
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status) "
-                "VALUES ($1, 1, 'Faulted')",
-                ocpp_id,
+                "INSERT INTO connector_status (station_id, connector_id, status, organization_id) "
+                "VALUES ($1, 1, 'Faulted', $2)",
+                ocpp_id, org_id,
             )
 
         await disp._tick()
@@ -303,9 +290,10 @@ class TestSendFailure:
             async with db_pool.acquire() as conn:
                 await recipients_repo.create(conn, organization_id=org_id, email="o@x.com")
                 await conn.execute(
-                    "INSERT INTO connector_status (station_id, connector_id, status) "
-                    "VALUES ($1, 1, 'Faulted')",
-                    ocpp_id,
+                    "INSERT INTO connector_status "
+                    "(station_id, connector_id, status, organization_id) "
+                    "VALUES ($1, 1, 'Faulted', $2)",
+                    ocpp_id, org_id,
                 )
 
             await disp._tick()
@@ -354,9 +342,10 @@ class TestNotifyWakeup:
 
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO connector_status (station_id, connector_id, status) "
-                    "VALUES ($1, 1, 'Faulted')",
-                    ocpp_id,
+                    "INSERT INTO connector_status "
+                    "(station_id, connector_id, status, organization_id) "
+                    "VALUES ($1, 1, 'Faulted', $2)",
+                    ocpp_id, org_id,
                 )
 
             for _ in range(20):
@@ -382,9 +371,9 @@ class TestCurrentlySendingDedup:
         async with db_pool.acquire() as conn:
             await recipients_repo.create(conn, organization_id=org_id, email="o@x.com")
             await conn.execute(
-                "INSERT INTO connector_status (station_id, connector_id, status) "
-                "VALUES ($1, 1, 'Faulted')",
-                ocpp_id,
+                "INSERT INTO connector_status (station_id, connector_id, status, organization_id) "
+                "VALUES ($1, 1, 'Faulted', $2)",
+                ocpp_id, org_id,
             )
 
         # Run two ticks concurrently. The second one must observe an empty

@@ -221,6 +221,7 @@ class FleetChargePoint(CP16):
         on_diagnostics_status: Optional[Callable] = None,
         on_firmware_status: Optional[Callable] = None,
         on_data_transfer: Optional[Callable] = None,
+        on_security_event: Optional[Callable] = None,
         on_message_received: Optional[Callable[[], Awaitable[None]]] = None,
         tx_id_provider: Optional[Callable[[], Awaitable[int]]] = None,
     ):
@@ -256,6 +257,7 @@ class FleetChargePoint(CP16):
         self._cb_diagnostics = on_diagnostics_status
         self._cb_firmware = on_firmware_status
         self._cb_data_transfer = on_data_transfer
+        self._cb_security_event = on_security_event
         self._cb_message_received = on_message_received
         self._tx_id_provider = tx_id_provider
 
@@ -763,6 +765,11 @@ class FleetChargePoint(CP16):
             tech_info,
         )
         _record_ocpp_metric("inbound", "SecurityEventNotification", type)
+        if self._cb_security_event:
+            try:
+                await self._cb_security_event(self.id, type, timestamp, tech_info)
+            except Exception as e:
+                logger.error(f"Error in security_event callback: {e}")
         return call_result.SecurityEventNotification()
 
     # ===================================================================

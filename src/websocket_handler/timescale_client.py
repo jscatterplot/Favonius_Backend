@@ -581,7 +581,12 @@ class TimescaleClient:
             raise
 
     async def insert_connector_status(self, status_data: Dict[str, Any]) -> None:
-        """Insert connector status."""
+        """Insert connector status.
+
+        Populates the optional ``organization_id`` and ``depot_id`` columns
+        (migration 029) when present in ``status_data``; the trigger uses these
+        to create ``notification_alerts`` rows without relying on shadow tables.
+        """
         # Local import keeps this module importable in environments without
         # prometheus_client installed (e.g. some CI shards).
         from .monitoring import DB_WRITE_LATENCY
@@ -592,14 +597,17 @@ class TimescaleClient:
                 await conn.execute(
                     """
                     INSERT INTO connector_status (
-                        station_id, connector_id, status, error_code, timestamp
-                    ) VALUES ($1, $2, $3, $4, $5)
+                        station_id, connector_id, status, error_code,
+                        timestamp, organization_id, depot_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
                     status_data["station_id"],
                     status_data["connector_id"],
                     status_data["status"],
                     status_data["error_code"],
                     status_data["timestamp"],
+                    status_data.get("organization_id"),
+                    status_data.get("depot_id"),
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert connector status: {e}")
@@ -2095,6 +2103,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -2152,6 +2161,7 @@ class TimescaleClient:
                  WHERE station_id = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
                 transaction_id,
@@ -2171,6 +2181,7 @@ class TimescaleClient:
                    SET last_seen_at = NOW()
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
             )
@@ -2401,6 +2412,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -2441,6 +2453,7 @@ class TimescaleClient:
                 SELECT station_id, COUNT(*)::bigint AS n
                   FROM charging_sessions
                  WHERE end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  GROUP BY station_id
                 """)

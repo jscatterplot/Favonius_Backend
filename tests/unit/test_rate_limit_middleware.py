@@ -304,6 +304,9 @@ async def test_healthz_bypasses_rate_limit(middleware, fresh_limiter):
         ("PATCH", f"/admin/depots/{uuid4()}/vehicles/{uuid4()}"),
         ("POST", f"/admin/depots/{uuid4()}/drivers"),
         ("PATCH", f"/admin/depots/{uuid4()}/drivers/{uuid4()}"),
+        # Reports → Energy accounting bulk XLSX import: same per-row pattern
+        # as the RFID bulk dialog, so it shares the admin-write bucket.
+        ("POST", f"/admin/depots/{uuid4()}/charging-sessions/import"),
     ],
 )
 async def test_admin_bulk_writes_use_admin_write_bucket(

@@ -263,3 +263,37 @@ class TestTimescaleClient:
         # This method doesn't exist, so we'll test basic properties
         assert timescale_client.connected is False
         assert timescale_client.pg_pool is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_fetch_open_sessions_filters_to_live_source(self, timescale_client):
+        """Open-session recovery must ignore imported NULL-end_time rows."""
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_pool = AsyncMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        await timescale_client.fetch_open_sessions("CP-1")
+
+        query = mock_conn.fetch.await_args.args[0]
+        assert "end_time IS NULL" in query
+        assert "source = 'live'" in query
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_mark_sessions_seen_filters_to_live_source(self, timescale_client):
+        """last_seen stamping must not touch imported rows."""
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock()
+        mock_pool = AsyncMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        await timescale_client.mark_sessions_seen("CP-1")
+
+        query = mock_conn.execute.await_args.args[0]
+        assert "end_time IS NULL" in query
+        assert "source = 'live'" in query

@@ -238,6 +238,10 @@ src/api/main.py (FastAPI, middleware: rate-limiting, logging, CORS)
         └── WebSocket: /ocpp/{charge_point_id} → OCPPServer → FleetChargePoint
 ```
 
+### Depot Chat Agent (Agent Search)
+
+`src/api/agent/` is a self-contained module that adds a plain-English query interface for depot operators. The module is mounted into the FastAPI app behind the `AGENT_SEARCH_ENABLED` feature flag (now default `true` since B6 golden-test gate passed). A user message goes through three server-side stages: (1) **LLM extraction** (`llm.py`) converts the message into a strict `QueryPlan` via Anthropic's tool-use API — the model never sees UUIDs or raw SQL; (2) **entity resolution** (`resolve.py`) maps the plan's subject names to real database UUIDs, scoped to the caller's `visible_depot_ids` from their JWT — this is the auth boundary; and (3) **deterministic compilation** (`intents/consumption_by_user.py`) turns the resolved plan into a parameterised SQL query that executes against TimescaleDB. Every turn is audited in `agent_runs` (full step trace) and `audit_log` (action `agent.query`). Prometheus metrics (`favonius_agent_turns_total`, `favonius_agent_turn_duration_seconds`, `favonius_agent_llm_tokens_total`, `favonius_agent_resolver_misses_total`) are incremented from `router.py`, `llm.py`, and `controller.py`. The golden test suite in `tests/golden/agent_consumption.yaml` (50 Q&A pairs) gates every deploy; AT-18 (`tests/e2e/test_agent_search.py`) is the end-to-end acceptance test. See `docs/plans/agent_search_architecture_v0.md` for the full design and `docs/API.md` for the endpoint reference.
+
 ### Optimization Control Loop
 
 ```
@@ -406,6 +410,9 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `PATCH` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Patch a recipient |
 | `DELETE` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Hard-delete a recipient (cascades deliveries). |
 | `POST` | `/webhooks/resend` | Public, signature-verified Resend webhook for delivery status updates (alerts pipeline) |
+| `POST` | `/agent/turn` | Depot chat agent — synchronous turn; returns `AgentReply` (10 req/min; requires `AGENT_SEARCH_ENABLED=true`) |
+| `POST` | `/agent/turn/stream` | Depot chat agent — SSE streaming turn; emits `step` events then `answer` (10 req/min; same gate) |
+| `GET` | `/agent/runs/{run_id}` | Fetch stored agent run trace (ownership-gated; `favonius_admin` may access any run) |
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)
@@ -858,6 +865,7 @@ Before marking any feature complete, verify:
 | AT-06 | Inter-Depot Handoff — vehicle seamlessly handed off between depots |
 | AT-07 | Building Load Integration — grid power calc includes building load |
 | AT-17 | Alerts Pipeline End-to-End — Faulted → trigger → dispatcher email → Resend webhook → ack via API → recovery → resolve. See `tests/e2e/test_alerts_pipeline_e2e.py` and `docs/plans/alerts-pipeline.md`. |
+| AT-18 | Agent Search End-to-End — Authenticated user submits "How much did John charge last month?" via `POST /agent/turn/stream`; agent resolves driver, computes UTC bounds, executes aggregation, writes `agent_runs` + `audit_log` rows, returns natural-language reply; cross-org user gets `not_found`. See `tests/e2e/test_agent_search.py` and `docs/plans/agent_search_prd_v1.md`. |
 
 ---
 

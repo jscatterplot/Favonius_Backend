@@ -53,6 +53,11 @@ ALTER TABLE optimization_input_snapshots
     ADD COLUMN IF NOT EXISTS recent_telemetry JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 -- 4. Foreign keys (only add when the referenced table exists in this DB).
+-- NOT VALID skips validation of pre-existing rows. Production has orphaned
+-- depot_ids in optimization_input_snapshots because the depots/organizations
+-- shadow tables were never populated (Supabase owns canonical static data).
+-- These FKs are dropped immediately by 028_drop_static_shadow_fks.sql, so
+-- the relaxed validation only matters for the moments between 020 and 028.
 DO $$
 BEGIN
     IF EXISTS (
@@ -65,7 +70,8 @@ BEGIN
     ) THEN
         ALTER TABLE optimization_input_snapshots
             ADD CONSTRAINT fk_opt_input_snapshots_depot
-            FOREIGN KEY (depot_id) REFERENCES depots(depot_id) ON DELETE CASCADE;
+            FOREIGN KEY (depot_id) REFERENCES depots(depot_id) ON DELETE CASCADE
+            NOT VALID;
     END IF;
 
     IF EXISTS (
@@ -78,7 +84,8 @@ BEGIN
     ) THEN
         ALTER TABLE optimization_input_snapshots
             ADD CONSTRAINT fk_opt_input_snapshots_org
-            FOREIGN KEY (organization_id) REFERENCES organizations(organization_id) ON DELETE SET NULL;
+            FOREIGN KEY (organization_id) REFERENCES organizations(organization_id) ON DELETE SET NULL
+            NOT VALID;
     END IF;
 END$$;
 

@@ -141,6 +141,48 @@ async def test_security_event_notification_handler(mock_websocket, sample_charge
 
 
 @pytest.mark.asyncio
+async def test_security_event_notification_invokes_callback(mock_websocket, sample_charge_point_id):
+    """The callback receives (cp_id, event_type, timestamp, tech_info)."""
+    captured = {}
+
+    async def cb(cp_id, event_type, timestamp, tech_info):
+        captured.update(
+            cp_id=cp_id, event_type=event_type, timestamp=timestamp, tech_info=tech_info
+        )
+
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket, on_security_event=cb)
+    await cp.on_security_event_notification(
+        type="SettingSystemTime",
+        timestamp="2026-05-05T14:23:42.000Z",
+        tech_info="ocppBoot",
+    )
+    assert captured == {
+        "cp_id": sample_charge_point_id,
+        "event_type": "SettingSystemTime",
+        "timestamp": "2026-05-05T14:23:42.000Z",
+        "tech_info": "ocppBoot",
+    }
+
+
+@pytest.mark.asyncio
+async def test_security_event_callback_failure_does_not_break_ack(
+    mock_websocket, sample_charge_point_id
+):
+    """A failing callback (e.g. DB outage) must not stop the OCPP ack."""
+
+    async def cb(*_args, **_kwargs):
+        raise RuntimeError("db down")
+
+    cp = FleetChargePoint(sample_charge_point_id, mock_websocket, on_security_event=cb)
+    response = await cp.on_security_event_notification(
+        type="StartupOfTheDevice",
+        timestamp="2026-05-04T15:43:41.000Z",
+        tech_info=None,
+    )
+    assert isinstance(response, call_result.SecurityEventNotification)
+
+
+@pytest.mark.asyncio
 async def test_status_notification_handler(mock_websocket, sample_charge_point_id):
     """Test StatusNotification handler with callback."""
     callback_called = False
