@@ -2175,6 +2175,27 @@ class TimescaleClient:
         ``ocpp_transaction_id`` sequence.
         """
         async with self.pg_pool.acquire() as conn:
+            existing_open = await conn.fetchval(
+                """
+                SELECT session_id::text
+                FROM charging_sessions
+                WHERE station_id = $1
+                  AND transaction_id = $2
+                  AND end_time IS NULL
+                  AND source = 'live'
+                LIMIT 1
+                """,
+                station_id,
+                transaction_id,
+            )
+            if existing_open:
+                self.logger.info(
+                    "Skipping duplicate open session insert for station=%s tx_id=%s session_id=%s",
+                    station_id,
+                    transaction_id,
+                    existing_open,
+                )
+                return
             await conn.execute(
                 """
                 INSERT INTO charging_sessions (

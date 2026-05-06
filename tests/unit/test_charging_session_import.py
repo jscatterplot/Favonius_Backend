@@ -818,17 +818,24 @@ class TestHistoricalChargingSessionImport:
         bind = conn.fetchval.await_args.args[1:]
         assert bind[2] == "Opel Mokka"  # $3 id_token = rfid_label
 
-    def test_neither_rfid_label_nor_id_tag_returns_validation_error(
+    def test_neither_rfid_label_nor_id_tag_imports_as_platform_started(
         self, client, mock_db_pool
     ):
-        """At least one of rfid_label / id_tag must be provided."""
+        """Rows without RFID identifiers are imported as platform-initiated."""
         depot_id = str(uuid4())
         org_id = str(uuid4())
+        session_id = str(uuid4())
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
-        pool, _ = mock_db_pool
 
-        payload = _row_payload()
-        del payload["id_tag"]  # omit id_tag; rfid_label absent → validator fires
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("UTC"),
+            vehicle_row=None,
+            card_row=None,
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        payload = _row_payload(id_tag=None, transaction_type="IOS")
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -839,5 +846,12 @@ class TestHistoricalChargingSessionImport:
                 json=payload,
             )
 
-        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
-        assert response.json()["error_code"] == "VALIDATION_ERROR"
+        assert response.status_code == http_status.HTTP_201_CREATED
+        body = response.json()
+        assert body["session_id"] == session_id
+        assert body["matched"]["vehicle_id"] is None
+        assert body["matched"]["card_id"] is None
+        assert body["matched"]["driver_id"] is None
+
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[2] == "platform-start"  # $3 id_token marker for platform starts
