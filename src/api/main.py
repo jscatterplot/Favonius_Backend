@@ -2003,14 +2003,6 @@ class HistoricalSessionImport(_CamelOrSnakeModel):
     user_full_name: Optional[str] = Field(default=None, max_length=255)
     station_owner_full_name: Optional[str] = Field(default=None, max_length=255)
 
-    @model_validator(mode="after")
-    def require_rfid_identifier(self) -> "HistoricalSessionImport":
-        """Require at least one of rfid_label or id_tag."""
-        if not self.rfid_label and not self.id_tag:
-            raise ValueError("At least one of rfid_label or id_tag must be provided")
-        return self
-
-
 class HistoricalSessionImportMatched(BaseModel):
     """Identity resolution outcome for an imported session row."""
 
@@ -3491,6 +3483,40 @@ def _compute_import_row_hash(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+_PLATFORM_IMPORT_ID_TOKEN = "platform-start"
+
+
+def _is_platform_initiated_import_row(request: HistoricalSessionImport) -> bool:
+    """Return True when import row has no RFID/card identifier data."""
+    return not (request.rfid_label or request.id_tag)
+
+
+def _platform_import_hash_token(
+    request: HistoricalSessionImport,
+    *,
+    end_time_utc: Optional[datetime],
+) -> str:
+    """Build a richer dedup token for platform-initiated import rows.
+
+    Platform-start imports intentionally store a constant id_token
+    (``platform-start``) in ``charging_sessions.id_token`` so reports can
+    classify their origin. Using only that constant in ``import_row_hash``
+    can falsely dedup distinct sessions that share minute-level start time,
+    energy, and revenue. This helper keeps persisted ``id_token`` stable
+    while adding additional request fields to the hash input.
+    """
+    payload = {
+        "id_token": _PLATFORM_IMPORT_ID_TOKEN,
+        "end_time_utc": end_time_utc.isoformat() if end_time_utc else "",
+        "transaction_type": request.transaction_type or "",
+        "status": request.status or "",
+        "user_full_name": request.user_full_name or "",
+        "station_owner_full_name": request.station_owner_full_name or "",
+    }
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"{_PLATFORM_IMPORT_ID_TOKEN}:{hashlib.sha256(canonical_payload.encode('utf-8')).hexdigest()}"
+
+
 async def _resolve_import_id_tag(
     conn: asyncpg.Connection,
     *,
@@ -3642,12 +3668,16 @@ async def import_historical_charging_session(
         except Exception:
             tz = ZoneInfo("UTC")
 
-        identity = await _resolve_import_id_tag(
-            static_conn,
-            depot_id=depot_id,
-            id_tag=request.id_tag,
-            rfid_label=request.rfid_label,
-        )
+        is_platform_initiated = _is_platform_initiated_import_row(request)
+        if is_platform_initiated:
+            identity = {"vehicle_id": None, "card_id": None, "driver_id": None}
+        else:
+            identity = await _resolve_import_id_tag(
+                static_conn,
+                depot_id=depot_id,
+                id_tag=request.id_tag,
+                rfid_label=request.rfid_label,
+            )
 
     start_time_utc = _parse_import_local_timestamp(
         request.start_time_local, tz, field="start_time_local"
@@ -3682,11 +3712,17 @@ async def import_historical_charging_session(
         )
 
     # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
-    id_token = request.rfid_label or request.id_tag or ""
+    # When both identifiers are absent, classify as platform-initiated import.
+    id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
+    hash_id_token = (
+        _platform_import_hash_token(request, end_time_utc=end_time_utc)
+        if is_platform_initiated
+        else id_token
+    )
     row_hash = _compute_import_row_hash(
         depot_id=depot_id,
         start_time_utc=start_time_utc,
-        id_tag=id_token,
+        id_tag=hash_id_token,
         energy_delivered_kwh=request.energy_delivered_kwh,
         revenue=request.revenue,
     )

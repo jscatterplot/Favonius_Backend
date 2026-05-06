@@ -549,3 +549,55 @@ def test_imported_rows_outside_window_are_excluded(client):
 
     assert report.status_code == status.HTTP_200_OK
     assert report.json()["rows"] == []
+
+
+def test_platform_initiated_import_without_rfid_fields_is_reported(client):
+    """Rows with no RFID/id_tag import as platform-start and appear in reports."""
+    depot_id = str(uuid4())
+    org_id = str(uuid4())
+    tz = "Europe/Vilnius"
+    store = _SessionStore()
+
+    pools, *_ = _build_shared_pool(
+        store=store,
+        depot_id=depot_id,
+        org_id=org_id,
+        timezone_name=tz,
+        currency="EUR",
+        charger_rows=[],
+    )
+
+    app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+    with patch("src.api.main.db_pools", pools), patch(
+        "src.api.main.verify_depot_access", new_callable=AsyncMock
+    ), patch("src.api.main._audit_identity_write", new_callable=AsyncMock):
+        post_resp = client.post(
+            f"/admin/depots/{depot_id}/charging-sessions/import",
+            headers=AUTH_HDR,
+            json={
+                "import_batch_id": str(uuid4()),
+                "start_time_local": "2026-05-05 12:56",
+                "end_time_local": "2026-05-11 01:17",
+                "energy_delivered_kwh": 24.044,
+                "revenue": 0.0,
+                "id_tag": None,
+                "rfid_label": None,
+                "status": "Finished",
+                "transaction_type": "Dashboard",
+                "user_full_name": "HRX Transport",
+                "station_owner_full_name": "Gustas Diksa",
+            },
+        )
+        assert post_resp.status_code == status.HTTP_201_CREATED, post_resp.text
+
+        report = client.get(
+            f"/reports/depots/{depot_id}/energy/monthly",
+            params={"from": "2026-05-01", "to": "2026-05-31"},
+        )
+
+    assert report.status_code == status.HTTP_200_OK, report.text
+    body = report.json()
+    assert len(body["rows"]) == 1
+    assert body["rows"][0]["session_count"] == 1
+    assert body["rows"][0]["energy_kwh"] == pytest.approx(24.044)

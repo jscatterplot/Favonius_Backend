@@ -2175,23 +2175,54 @@ class TimescaleClient:
         ``ocpp_transaction_id`` sequence.
         """
         async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO charging_sessions (
-                    station_id, transaction_id, evse_id, connector_id,
-                    id_token, start_time, vehicle_id, driver_id, card_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
-                """,
-                station_id,
-                transaction_id,
-                evse_id,
-                connector_id,
-                id_token,
-                start_time,
-                vehicle_id,
-                driver_id,
-                card_id,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended($1 || ':' || $2::text, 0)
+                    )
+                    """,
+                    station_id,
+                    transaction_id,
+                )
+                existing_open = await conn.fetchval(
+                    """
+                    SELECT session_id::text
+                    FROM charging_sessions
+                    WHERE station_id = $1
+                      AND transaction_id = $2
+                      AND end_time IS NULL
+                      AND source = 'live'
+                    LIMIT 1
+                    """,
+                    station_id,
+                    transaction_id,
+                )
+                if existing_open:
+                    self.logger.info(
+                        "Skipping duplicate open session insert for station=%s tx_id=%s session_id=%s",
+                        station_id,
+                        transaction_id,
+                        existing_open,
+                    )
+                    return
+                await conn.execute(
+                    """
+                    INSERT INTO charging_sessions (
+                        station_id, transaction_id, evse_id, connector_id,
+                        id_token, start_time, vehicle_id, driver_id, card_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
+                    """,
+                    station_id,
+                    transaction_id,
+                    evse_id,
+                    connector_id,
+                    id_token,
+                    start_time,
+                    vehicle_id,
+                    driver_id,
+                    card_id,
+                )
 
     async def close_open_session(
         self, station_id: str, transaction_id: int, end_time: datetime
