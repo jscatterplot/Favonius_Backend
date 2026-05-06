@@ -472,6 +472,31 @@ class OCPP16Session:
             )
             return AuthorizationStatus.invalid
 
+    async def send_remote_start_transaction(self, connector_id: int, id_tag: str) -> bool:
+        """Send OCPP 1.6 RemoteStartTransaction with a synthetic id_tag.
+
+        Used by the operator-override flow (manual_authorize endpoint): the
+        caller has already minted an entry in
+        ``operator_authorization_overrides`` so when the charger sends
+        Authorize/StartTransaction with this tag,
+        ``RFIDAuthorizationService.authorize`` will atomically consume the
+        override and return Accepted. Returns ``True`` if the charger
+        accepted the RemoteStart request.
+        """
+        try:
+            return await self._cp.remote_start_transaction(
+                connector_id=connector_id,
+                id_tag=id_tag,
+            )
+        except Exception as exc:
+            logger.warning(
+                "send_remote_start_transaction failed for station=%s connector=%s: %s",
+                self._station_id,
+                connector_id,
+                exc,
+            )
+            return False
+
     async def send_der_control(self, der_control: Dict) -> bool:  # noqa: ARG002
         """DER control is an OCPP 2.x feature; no-op for OCPP 1.6 chargers."""
         logger.debug("send_der_control called on OCPP 1.6 session — skipping")

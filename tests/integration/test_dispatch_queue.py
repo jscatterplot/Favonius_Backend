@@ -511,3 +511,86 @@ def _collect_profile_push_count(station_id: str, outcome: str) -> int:
             ):
                 return int(sample.value)
     return 0
+
+
+async def test_queue_consumer_dispatches_remote_start_transaction(
+    fake_queue: "FakeQueue",
+) -> None:
+    """remote_start_transaction routes to send_remote_start_transaction."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    fake_queue.insert(
+        "CP-1",
+        connector_id=1,
+        payload={"id_tag": "OP-deadbeef"},
+        command_type="remote_start_transaction",
+    )
+
+    fake_session = MagicMock()
+    fake_session.send_remote_start_transaction = AsyncMock(return_value=True)
+
+    consumer = ChargingCommandQueueConsumer(
+        FakeTimescaleClient(fake_queue), lambda _cp: fake_session
+    )
+
+    await consumer.drain_once()
+
+    fake_session.send_remote_start_transaction.assert_awaited_once_with(1, "OP-deadbeef")
+    assert fake_queue.rows[0]["status"] == "sent"
+
+
+async def test_queue_consumer_marks_failed_on_remote_start_reject(
+    fake_queue: "FakeQueue",
+) -> None:
+    """Charger Rejects RemoteStart → row goes terminal as failed."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    fake_queue.insert(
+        "CP-2",
+        connector_id=1,
+        payload={"id_tag": "OP-deadbeef"},
+        command_type="remote_start_transaction",
+    )
+    fake_session = MagicMock()
+    fake_session.send_remote_start_transaction = AsyncMock(return_value=False)
+
+    consumer = ChargingCommandQueueConsumer(
+        FakeTimescaleClient(fake_queue), lambda _cp: fake_session
+    )
+
+    await consumer.drain_once()
+
+    assert fake_queue.rows[0]["status"] == "failed"
+    assert "Rejected" in (fake_queue.rows[0]["last_error"] or "")
+
+
+async def test_queue_consumer_remote_start_missing_id_tag_marks_failed(
+    fake_queue: "FakeQueue",
+) -> None:
+    """Malformed payload (no id_tag) — fail terminal, do not call charger."""
+    from src.websocket_handler.charging_profile_manager import (
+        ChargingCommandQueueConsumer,
+    )
+
+    fake_queue.insert(
+        "CP-3",
+        connector_id=1,
+        payload={},
+        command_type="remote_start_transaction",
+    )
+    fake_session = MagicMock()
+    fake_session.send_remote_start_transaction = AsyncMock()
+
+    consumer = ChargingCommandQueueConsumer(
+        FakeTimescaleClient(fake_queue), lambda _cp: fake_session
+    )
+    consumer.logger = MagicMock()
+
+    await consumer.drain_once()
+
+    fake_session.send_remote_start_transaction.assert_not_awaited()
+    assert fake_queue.rows[0]["status"] == "failed"

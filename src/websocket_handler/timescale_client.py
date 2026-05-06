@@ -1832,6 +1832,124 @@ class TimescaleClient:
             }
         )
 
+    async def create_operator_override(
+        self,
+        *,
+        station_id: str,
+        id_tag: str,
+        connector_id: int,
+        organization_id: str,
+        depot_id: str,
+        expires_at: datetime,
+        created_by: str,
+        reason: Optional[str] = None,
+        audit_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Insert a one-shot operator authorization override (migration 031).
+
+        See ``operator_authorization_overrides`` table — synthetic id_tag
+        minted by ``POST /admin/.../manual_authorize``, consumed exactly
+        once by ``RFIDAuthorizationService.authorize`` when the charger
+        sends Authorize/StartTransaction with this tag.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO operator_authorization_overrides (
+                    station_id, id_tag, connector_id, organization_id, depot_id,
+                    expires_at, created_by, reason, audit_metadata
+                ) VALUES ($1, $2, $3, $4::uuid, $5::uuid, $6, $7::uuid, $8, $9::jsonb)
+                RETURNING id, station_id, id_tag, connector_id, expires_at, created_at
+                """,
+                station_id,
+                id_tag,
+                connector_id,
+                organization_id,
+                depot_id,
+                expires_at,
+                created_by,
+                reason,
+                json.dumps(audit_metadata or {}),
+            )
+            return dict(row)
+
+    async def consume_operator_override(
+        self, station_id: str, id_tag: str
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim an unconsumed, unexpired override or return None.
+
+        Used by ``RFIDAuthorizationService.authorize`` after ``lookup_id_tag``
+        misses but before the invalid-attempt audit row is written. The
+        partial unique index ``operator_overrides_active_uniq`` guarantees
+        at most one matching row, so the UPDATE either claims it (consumed)
+        or finds nothing.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE operator_authorization_overrides
+                   SET consumed_at = NOW()
+                 WHERE station_id = $1
+                   AND id_tag = $2
+                   AND consumed_at IS NULL
+                   AND expires_at > NOW()
+                RETURNING id, station_id, connector_id, organization_id, depot_id,
+                          created_by, reason, expires_at, consumed_at
+                """,
+                station_id,
+                id_tag,
+            )
+            return dict(row) if row else None
+
+    async def recent_unconsumed_override_for_connector(
+        self, station_id: str, connector_id: int, within_seconds: int = 60
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent unconsumed override created in the last N s.
+
+        Backs the API endpoint's per-connector cooldown — prevents an operator
+        accidentally double-clicking the manual-authorize button. ``NULL``
+        when no recent override exists for this connector.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=within_seconds)
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, id_tag, expires_at, created_at, created_by
+                  FROM operator_authorization_overrides
+                 WHERE station_id = $1
+                   AND connector_id = $2
+                   AND consumed_at IS NULL
+                   AND created_at >= $3
+                ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                station_id,
+                connector_id,
+                cutoff,
+            )
+            return dict(row) if row else None
+
+    async def get_last_manual_override(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Return the most recent override for this charger (any state).
+
+        Used by the admin "Last manual override" panel on the charger detail
+        page so operators can see who overrode authorization most recently
+        and avoid duplicate manual auths on the same connector.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, connector_id, created_at, created_by, reason,
+                       expires_at, consumed_at
+                  FROM operator_authorization_overrides
+                 WHERE station_id = $1
+                ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                station_id,
+            )
+            return dict(row) if row else None
+
     async def validate_api_key(self, station_id: str, api_key: str) -> bool:
         """Validate API key."""
         api_key_hash = self._hash_secret(api_key)
@@ -2220,9 +2338,7 @@ class TimescaleClient:
             )
             return int(queue_id)
 
-    async def fetch_pending_commands(
-        self, charge_point_id: str
-    ) -> List[Dict[str, Any]]:
+    async def fetch_pending_commands(self, charge_point_id: str) -> List[Dict[str, Any]]:
         """Return non-expired pending commands for a cp_id, oldest first."""
         async with self.pg_pool.acquire() as conn:
             rows = await conn.fetch(
@@ -2335,14 +2451,12 @@ class TimescaleClient:
     async def expire_overdue_commands(self) -> int:
         """Move expired ``pending`` rows to ``expired``. Returns rowcount."""
         async with self.pg_pool.acquire() as conn:
-            result = await conn.execute(
-                """
+            result = await conn.execute("""
                 UPDATE charging_command_queue
                    SET status = 'expired'
                  WHERE status = 'pending'
                    AND expires_at <= NOW()
-                """
-            )
+                """)
             # asyncpg returns "UPDATE n"
             try:
                 return int(result.split()[-1])
@@ -2356,18 +2470,14 @@ class TimescaleClient:
         Returns a dict like ``{'pending': 3, 'sent': 17, 'failed': 0, ...}``.
         """
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT status, COUNT(*)::bigint AS n
                   FROM charging_command_queue
                  GROUP BY status
-                """
-            )
+                """)
         return {r["status"]: int(r["n"]) for r in rows}
 
-    async def fetch_admin_state(
-        self, charge_point_id: str
-    ) -> Dict[str, Any]:
+    async def fetch_admin_state(self, charge_point_id: str) -> Dict[str, Any]:
         """Aggregate state for ``/admin/ocpp/{cp_id}/state``.
 
         Reads:
@@ -2431,15 +2541,13 @@ class TimescaleClient:
     async def count_active_transactions_by_station(self) -> Dict[str, int]:
         """Return open-transaction counts grouped by station (for metrics)."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT station_id, COUNT(*)::bigint AS n
                   FROM charging_sessions
                  WHERE end_time IS NULL
                    AND transaction_id IS NOT NULL
                  GROUP BY station_id
-                """
-            )
+                """)
         return {r["station_id"]: int(r["n"]) for r in rows}
 
     # ===== PLUG & CHARGE METHODS =====

@@ -123,3 +123,74 @@ async def test_request_start_transaction_rejects_concurrent_evse_session() -> No
 
     assert result["status"] == "Rejected"
     assert result["statusInfo"]["reasonCode"] == "ConcurrentTx"
+
+
+# ----- Operator override tests (manual_authorize feature) -----
+
+
+@pytest.mark.asyncio
+async def test_authorize_accepts_operator_override_when_id_tag_unknown() -> None:
+    """Synthetic OP- tag with a matching unconsumed override → Accepted."""
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(return_value=None)
+    timescale.consume_operator_override = AsyncMock(
+        return_value={
+            "id": "00000000-0000-0000-0000-000000000001",
+            "station_id": "CP-1",
+            "connector_id": 1,
+            "organization_id": "11111111-1111-1111-1111-111111111111",
+            "depot_id": "22222222-2222-2222-2222-222222222222",
+            "created_by": "33333333-3333-3333-3333-333333333333",
+            "reason": None,
+            "expires_at": None,
+            "consumed_at": "2026-05-05T00:00:00+00:00",
+        }
+    )
+    service = RFIDAuthorizationService(timescale, MagicMock())
+
+    decision = await service.authorize("CP-1", "OP-deadbeef", "Authorize")
+
+    assert decision.status == RFIDAuthStatus.ACCEPTED
+    assert decision.reason == "operator_override"
+    assert decision.depot_id == "22222222-2222-2222-2222-222222222222"
+    timescale.consume_operator_override.assert_awaited_once_with("CP-1", "OP-deadbeef")
+
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_when_override_already_consumed() -> None:
+    """consume_operator_override returns None → fall through to invalid path."""
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(return_value=None)
+    timescale.consume_operator_override = AsyncMock(return_value=None)
+    timescale.record_invalid_rfid_attempt = AsyncMock()
+    timescale.count_recent_invalid_rfid_attempts = AsyncMock(return_value=0)
+    service = RFIDAuthorizationService(timescale, MagicMock())
+
+    decision = await service.authorize("CP-1", "OP-stale", "Authorize")
+
+    assert decision.status == RFIDAuthStatus.INVALID
+    assert decision.reason == "unknown_id_tag"
+    timescale.record_invalid_rfid_attempt.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authorize_does_not_consume_override_when_id_tag_known() -> None:
+    """Real RFID card lookup hits → fast-path success, no override fallback."""
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(
+        return_value={
+            "vehicle_id": "veh-1",
+            "card_id": "card-1",
+            "source": "rfid_card",
+        }
+    )
+    timescale.consume_operator_override = AsyncMock()
+    timescale.clear_invalid_rfid_attempts = AsyncMock()
+    timescale.count_recent_invalid_rfid_attempts = AsyncMock(return_value=0)
+    service = RFIDAuthorizationService(timescale, MagicMock())
+
+    decision = await service.authorize("CP-1", "RFID-123", "Authorize")
+
+    assert decision.status == RFIDAuthStatus.ACCEPTED
+    assert decision.reason == "identity_matched"
+    timescale.consume_operator_override.assert_not_called()

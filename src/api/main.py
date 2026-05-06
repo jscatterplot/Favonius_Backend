@@ -25,6 +25,7 @@ import asyncpg
 import bcrypt
 import httpx
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     Header,
@@ -6681,6 +6682,329 @@ async def rotate_charger_credentials_endpoint(
             "shown_once": True,
         },
         "rotated_at": result["last_rotated_at"],
+    }
+
+
+@app.post(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize",
+    tags=["admin"],
+    summary="Authorize a charging session at a charger without an RFID scan",
+)
+async def manual_authorize_charger_endpoint(
+    depot_id: str,
+    charger_id: str,
+    body: dict = Body(...),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Mint a one-shot operator authorization override + dispatch RemoteStartTransaction.
+
+    Use case: an operator wants to start a charging session when the RFID
+    reader is broken or the driver has no card. Flow:
+
+      1. Validate caller is customer_admin (or favonius_admin) with tenant
+         access to the depot.
+      2. Reject if a recent unconsumed override already exists for this
+         connector (60 s cooldown — the de-facto idempotency).
+      3. Mint synthetic id_tag ``OP-<uuid>`` + insert a row into
+         ``operator_authorization_overrides`` (migration 031).
+      4. Enqueue a ``remote_start_transaction`` row in
+         ``charging_command_queue``; the WS handler's
+         ``ChargingCommandQueueConsumer`` drains it within ~2 s.
+      5. When the charger sends Authorize/StartTransaction with the
+         synthetic tag, ``RFIDAuthorizationService.authorize`` atomically
+         consumes the override and returns Accepted.
+      6. ``charger.manual_authorize`` audit_log row written.
+
+    Body:
+      - ``connector_id`` (int, required): 1-based connector to authorize.
+      - ``expires_in_seconds`` (int, optional, default 60, max 300): how
+        long the synthetic tag stays valid.
+      - ``reason`` (string, optional, max 200 chars): operator note for
+        the audit trail.
+
+    Idempotency: an ``Idempotency-Key`` header is accepted and recorded in
+    the audit metadata but the natural dedupe is the per-connector
+    cooldown — a second POST within 60 s returns 409 RECENT_OVERRIDE_EXISTS
+    regardless of whether the same key is sent.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin"):
+        raise _forbidden("FORBIDDEN_ROLE", "favonius_admin or customer_admin role required")
+
+    connector_id = body.get("connector_id")
+    if not isinstance(connector_id, int) or connector_id < 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "VALIDATION_ERROR",
+                "message": "connector_id must be a positive integer",
+            },
+        )
+
+    expires_in_seconds = body.get("expires_in_seconds", 60)
+    if not isinstance(expires_in_seconds, int) or not (1 <= expires_in_seconds <= 300):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "VALIDATION_ERROR",
+                "message": "expires_in_seconds must be an integer between 1 and 300",
+            },
+        )
+
+    reason = body.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str) or len(reason) > 200:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_code": "VALIDATION_ERROR",
+                    "message": "reason must be a string of at most 200 characters",
+                },
+            )
+
+    depot_row, _ = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name=("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
+    )
+    organization_id = depot_row.get("organization_id")
+    if not organization_id:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": "DEPOT_MISSING_ORG",
+                "message": "Depot has no organization assigned",
+            },
+        )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    # Resolve charger UUID → OCPP id for the queue dispatch.
+    async with db_pools.static.acquire() as conn:
+        charger_row = await conn.fetchrow(
+            """
+            SELECT station_id AS ocpp_id
+              FROM charging_stations
+             WHERE id = $1::uuid
+               AND site_id = $2::uuid
+            """,
+            charger_id,
+            depot_id,
+        )
+    if charger_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "CHARGER_NOT_FOUND",
+                "message": f"Charger {charger_id} not found in depot {depot_id}",
+            },
+        )
+    ocpp_id = charger_row["ocpp_id"]
+
+    # Cooldown: per-connector dedupe. The partial unique index on the
+    # override table also guarantees only one unconsumed (station, tag)
+    # but the per-connector lookup makes the 409 message meaningful.
+    async with db_pools.ts.acquire() as conn:
+        recent = await conn.fetchrow(
+            """
+            SELECT id, expires_at, created_at
+              FROM operator_authorization_overrides
+             WHERE station_id = $1
+               AND connector_id = $2
+               AND consumed_at IS NULL
+               AND created_at >= NOW() - INTERVAL '60 seconds'
+            ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            ocpp_id,
+            connector_id,
+        )
+    now = datetime.now(timezone.utc)
+    if recent is not None:
+        retry_after = max(
+            int((recent["created_at"] + timedelta(seconds=60) - now).total_seconds()),
+            1,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "RECENT_OVERRIDE_EXISTS",
+                "message": "An unconsumed override exists for this connector",
+                "retry_after_seconds": retry_after,
+                "active_override_id": str(recent["id"]),
+                "expires_at": recent["expires_at"].isoformat(),
+            },
+        )
+
+    synthetic_tag = f"OP-{uuid.uuid4()}"
+    expires_at = now + timedelta(seconds=expires_in_seconds)
+    audit_metadata = {
+        "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
+        "ocpp_id": ocpp_id,
+        "expires_in_seconds": expires_in_seconds,
+        "idempotency_key": idempotency_key,
+    }
+
+    # Atomic insert of override + queue row in the same TS transaction so a
+    # crash mid-call can't leave a queue row pointing at a missing override.
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            override_row = await conn.fetchrow(
+                """
+                INSERT INTO operator_authorization_overrides (
+                    station_id, id_tag, connector_id,
+                    organization_id, depot_id, expires_at, created_by,
+                    reason, audit_metadata
+                ) VALUES (
+                    $1, $2, $3, $4::uuid, $5::uuid, $6, $7::uuid, $8, $9::jsonb
+                )
+                RETURNING id, expires_at
+                """,
+                ocpp_id,
+                synthetic_tag,
+                connector_id,
+                str(organization_id),
+                depot_id,
+                expires_at,
+                user["sub"],
+                reason,
+                json.dumps(audit_metadata),
+            )
+            queue_id = int(
+                await conn.fetchval(
+                    """
+                    INSERT INTO charging_command_queue (
+                        charge_point_id, connector_id, command_type,
+                        payload, expires_at
+                    ) VALUES (
+                        $1, $2, 'remote_start_transaction',
+                        $3::jsonb,
+                        $4
+                    )
+                    RETURNING queue_id
+                    """,
+                    ocpp_id,
+                    connector_id,
+                    json.dumps({"id_tag": synthetic_tag}),
+                    expires_at,
+                )
+            )
+
+    await _record_admin_action(
+        user=user,
+        action="charger.manual_authorize",
+        depot_id=depot_id,
+        organization_id_override=str(organization_id),
+        target_type="charger",
+        target_id=str(charger_id),
+        metadata={
+            "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
+            "ocpp_id": ocpp_id,
+            "connector_id": connector_id,
+            "override_id": str(override_row["id"]),
+            "queue_id": queue_id,
+            "expires_at": override_row["expires_at"].isoformat(),
+            "reason": reason,
+        },
+    )
+
+    return {
+        "status": "Accepted",
+        "override_id": str(override_row["id"]),
+        "expires_at": override_row["expires_at"].isoformat(),
+        "queue_id": queue_id,
+        "transaction_started": False,
+    }
+
+
+@app.get(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/last_manual_override",
+    tags=["admin"],
+    summary="Most recent manual authorization for a charger (for the admin panel)",
+)
+async def get_last_manual_override_endpoint(
+    depot_id: str,
+    charger_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return the most recent manual authorize event for this charger.
+
+    Used by the charger detail page's "Last manual override" panel so the
+    operator can see who overrode authorization most recently. Returns
+    404 when no override has ever been issued for this charger.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin", "customer_operator"):
+        raise _forbidden(
+            "FORBIDDEN_ROLE",
+            "favonius_admin, customer_admin, or customer_operator role required",
+        )
+
+    await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name=("GET /admin/depots/{depot_id}/chargers/{charger_id}/last_manual_override"),
+    )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        charger_row = await conn.fetchrow(
+            """
+            SELECT station_id AS ocpp_id
+              FROM charging_stations
+             WHERE id = $1::uuid
+               AND site_id = $2::uuid
+            """,
+            charger_id,
+            depot_id,
+        )
+    if charger_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "CHARGER_NOT_FOUND",
+                "message": f"Charger {charger_id} not found in depot {depot_id}",
+            },
+        )
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, connector_id, created_at, created_by, reason,
+                   expires_at, consumed_at
+              FROM operator_authorization_overrides
+             WHERE station_id = $1
+            ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            charger_row["ocpp_id"],
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "NO_MANUAL_OVERRIDE",
+                "message": "No manual authorization has been issued for this charger",
+            },
+        )
+    return {
+        "id": str(row["id"]),
+        "connector_id": row["connector_id"],
+        "created_at": row["created_at"].isoformat(),
+        "created_by": str(row["created_by"]),
+        "reason": row["reason"],
+        "expires_at": row["expires_at"].isoformat(),
+        "consumed_at": row["consumed_at"].isoformat() if row["consumed_at"] else None,
     }
 
 

@@ -100,7 +100,9 @@ class RFIDAuthorizationService:
     async def authorize(self, station_id: str, id_tag: str, source: str) -> RFIDAuthDecision:
         """Authorize an idTag using canonical DB-backed fleet lookup."""
         if not id_tag or not id_tag.strip():
-            RFID_AUTH_ATTEMPTS_TOTAL.labels(source=source, outcome=RFIDAuthStatus.INVALID.value).inc()
+            RFID_AUTH_ATTEMPTS_TOTAL.labels(
+                source=source, outcome=RFIDAuthStatus.INVALID.value
+            ).inc()
             return RFIDAuthDecision(
                 status=RFIDAuthStatus.INVALID,
                 source=source,
@@ -108,7 +110,9 @@ class RFIDAuthorizationService:
             )
 
         if await self._is_throttled(station_id, id_tag):
-            RFID_AUTH_ATTEMPTS_TOTAL.labels(source=source, outcome=RFIDAuthStatus.BLOCKED.value).inc()
+            RFID_AUTH_ATTEMPTS_TOTAL.labels(
+                source=source, outcome=RFIDAuthStatus.BLOCKED.value
+            ).inc()
             return RFIDAuthDecision(
                 status=RFIDAuthStatus.BLOCKED,
                 source=source,
@@ -118,7 +122,9 @@ class RFIDAuthorizationService:
         try:
             row = await self._timescale.lookup_id_tag(id_tag, station_id=station_id)
         except Exception as exc:
-            RFID_AUTH_ATTEMPTS_TOTAL.labels(source=source, outcome=RFIDAuthStatus.INVALID.value).inc()
+            RFID_AUTH_ATTEMPTS_TOTAL.labels(
+                source=source, outcome=RFIDAuthStatus.INVALID.value
+            ).inc()
             self._logger.error(
                 "rfid_authorize_error source=%s station_id=%s id_tag=%s error=%s",
                 source,
@@ -133,8 +139,38 @@ class RFIDAuthorizationService:
             )
 
         if not row:
+            # Check the operator override path before recording an invalid
+            # attempt — a customer_admin who pressed "Manual Authorize" in
+            # the platform UI minted a one-shot synthetic id_tag in
+            # ``operator_authorization_overrides`` (migration 031). Atomic
+            # consume: at most one charger Authorize/StartTransaction
+            # claims the row.
+            override = await self._call_client_method(
+                "consume_operator_override", station_id, id_tag
+            )
+            if isinstance(override, dict):
+                RFID_AUTH_ATTEMPTS_TOTAL.labels(
+                    source=source, outcome=RFIDAuthStatus.ACCEPTED.value
+                ).inc()
+                self._logger.info(
+                    "rfid_authorize_accepted_via_operator_override "
+                    "source=%s station_id=%s id_tag=%s override_id=%s created_by=%s",
+                    source,
+                    station_id,
+                    id_tag,
+                    override.get("id"),
+                    override.get("created_by"),
+                )
+                return RFIDAuthDecision(
+                    status=RFIDAuthStatus.ACCEPTED,
+                    source=source,
+                    reason="operator_override",
+                    depot_id=str(override["depot_id"]) if override.get("depot_id") else None,
+                )
             await self._record_invalid_attempt(station_id, id_tag)
-            RFID_AUTH_ATTEMPTS_TOTAL.labels(source=source, outcome=RFIDAuthStatus.INVALID.value).inc()
+            RFID_AUTH_ATTEMPTS_TOTAL.labels(
+                source=source, outcome=RFIDAuthStatus.INVALID.value
+            ).inc()
             self._logger.info(
                 "rfid_authorize_denied source=%s station_id=%s id_tag=%s status=%s reason=%s",
                 source,

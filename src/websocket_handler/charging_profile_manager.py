@@ -1182,6 +1182,11 @@ class ChargingCommandQueueConsumer:
         if command_type == "remote_reset":
             return await self._handle_remote_reset(queue_id, cp_id, cp, payload)
 
+        if command_type == "remote_start_transaction":
+            return await self._handle_remote_start_transaction(
+                queue_id, cp_id, cp, connector_id, payload
+            )
+
         if command_type != "set_charging_profile":
             self.logger.warning(
                 "Unknown command_type=%s for queue_id=%s cp=%s — marking failed",
@@ -1324,6 +1329,95 @@ class ChargingCommandQueueConsumer:
                 await self.timescale_client.mark_command_sent(queue_id)
             else:
                 await self.timescale_client.mark_command_failed(queue_id, "charger Rejected Reset")
+        except Exception as exc:
+            self.logger.error(
+                "Failed to update queue row queue_id=%s outcome=%s: %s",
+                queue_id,
+                "sent" if ok else "failed",
+                exc,
+            )
+        return True
+
+    async def _handle_remote_start_transaction(
+        self,
+        queue_id: int,
+        cp_id: str,
+        cp: Any,
+        connector_id: int,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Push an OCPP 1.6 RemoteStartTransaction with an operator-minted id_tag.
+
+        Enqueued by ``POST /admin/.../manual_authorize`` together with a row
+        in ``operator_authorization_overrides``. The synthetic id_tag in
+        ``payload`` is consumed exactly once by ``RFIDAuthorizationService``
+        when the charger sends Authorize/StartTransaction back to us.
+
+        Like ``_handle_remote_reset``, the row goes terminal on the first
+        attempt: a Rejected RemoteStart shouldn't be retried on every
+        BootNotification because the override may have already expired.
+        """
+        send = getattr(cp, "send_remote_start_transaction", None)
+        if send is None:
+            self.logger.warning(
+                "cp_id=%s session has no send_remote_start_transaction; marking failed",
+                cp_id,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "session does not support send_remote_start_transaction"
+                )
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        id_tag = (payload or {}).get("id_tag") or (payload or {}).get("idTag")
+        if not id_tag:
+            self.logger.warning(
+                "remote_start_transaction queue_id=%s cp=%s missing id_tag in payload — marking failed",
+                queue_id,
+                cp_id,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(queue_id, "payload missing id_tag")
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        try:
+            ok = await send(connector_id, id_tag)
+        except Exception as exc:
+            self.logger.warning(
+                "send_remote_start_transaction raised for cp=%s queue_id=%s: %s",
+                cp_id,
+                queue_id,
+                exc,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(queue_id, str(exc))
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        try:
+            if ok:
+                await self.timescale_client.mark_command_sent(queue_id)
+            else:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "charger Rejected RemoteStartTransaction"
+                )
         except Exception as exc:
             self.logger.error(
                 "Failed to update queue row queue_id=%s outcome=%s: %s",
