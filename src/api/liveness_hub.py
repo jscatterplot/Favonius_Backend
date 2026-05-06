@@ -92,7 +92,12 @@ class LivenessHub:
                 try:
                     q.put_nowait(None)  # sentinel for "stream closing"
                 except asyncio.QueueFull:
-                    pass
+                    # Mirror _on_notify semantics: evict one stale item so
+                    # shutdown sentinel is not lost for slow subscribers.
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        q.get_nowait()
+                    with contextlib.suppress(asyncio.QueueFull):
+                        q.put_nowait(None)
         self._subscribers.clear()
         logger.info("LivenessHub stopped")
 

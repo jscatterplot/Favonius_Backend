@@ -158,3 +158,20 @@ async def test_notification_with_no_matching_subscribers_is_silent() -> None:
     )
     # Must not raise.
     hub._on_notify(MagicMock(), 0, "charger_liveness", payload)
+
+
+@pytest.mark.asyncio
+async def test_stop_enqueues_shutdown_sentinel_even_when_queue_is_full() -> None:
+    hub = _make_hub()
+    q = hub.subscribe("org-A")
+    # Saturate queue so stop() must evict to enqueue sentinel.
+    for _ in range(50):
+        q.put_nowait("filler")
+
+    hub._running = True
+    await hub.stop()
+
+    drained = []
+    while not q.empty():
+        drained.append(q.get_nowait())
+    assert drained[-1] is None
