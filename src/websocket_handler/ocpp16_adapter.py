@@ -68,6 +68,7 @@ _OCPP16_AUTH_FROM_OUTCOME: dict[RFIDAuthOutcome, AuthorizationStatus] = {
     RFIDAuthOutcome.ACCEPTED: AuthorizationStatus.accepted,
     RFIDAuthOutcome.EXPIRED: AuthorizationStatus.expired,
     RFIDAuthOutcome.BLOCKED: AuthorizationStatus.blocked,
+    RFIDAuthOutcome.CONCURRENT_TX: AuthorizationStatus.concurrent_tx,
     RFIDAuthOutcome.INVALID: AuthorizationStatus.invalid,
 }
 
@@ -762,7 +763,7 @@ class OCPP16Session:
                 cp_id,
                 connector_id,
             )
-            return AuthorizationStatus.blocked
+            return AuthorizationStatus.concurrent_tx
 
         decision = await self._authz.authorize(cp_id, id_tag, "StartTransaction")
         auth_status = self._map_auth_status(decision.status)

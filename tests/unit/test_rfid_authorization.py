@@ -11,6 +11,7 @@ from src.websocket_handler.rfid_authorization import (
     RFIDAuthDecision,
     RFIDAuthorizationService,
     RFIDAuthStatus,
+    map_auth_status_to_ocpp201,
     user_message_for,
 )
 from src.websocket_handler.transaction_manager import IdToken, IdTokenType, TransactionManager
@@ -255,6 +256,10 @@ async def test_throttle_threshold_uses_module_constant() -> None:
 
     blocked = await service.authorize("CP-X", "TAG-BAD", "Authorize")
     assert blocked.status == RFIDAuthStatus.BLOCKED
+
+
+def test_map_auth_concurrent_tx_matches_ocpp201_concurrent_tx() -> None:
+    assert map_auth_status_to_ocpp201(RFIDAuthStatus.CONCURRENT_TX) == "ConcurrentTx"
 
 
 def test_user_message_for_distinguishes_failure_modes() -> None:

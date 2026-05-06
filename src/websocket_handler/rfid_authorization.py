@@ -46,6 +46,7 @@ class RFIDAuthOutcome(str, Enum):
     ACCEPTED = "accepted"
     EXPIRED = "expired"
     BLOCKED = "blocked"
+    CONCURRENT_TX = "concurrent_tx"
     INVALID = "invalid"
 
 
@@ -55,7 +56,9 @@ def rfid_auth_outcome(status: RFIDAuthStatus) -> RFIDAuthOutcome:
         return RFIDAuthOutcome.ACCEPTED
     if status == RFIDAuthStatus.EXPIRED:
         return RFIDAuthOutcome.EXPIRED
-    if status in {RFIDAuthStatus.BLOCKED, RFIDAuthStatus.CONCURRENT_TX}:
+    if status == RFIDAuthStatus.CONCURRENT_TX:
+        return RFIDAuthOutcome.CONCURRENT_TX
+    if status == RFIDAuthStatus.BLOCKED:
         return RFIDAuthOutcome.BLOCKED
     return RFIDAuthOutcome.INVALID
 
@@ -64,6 +67,7 @@ _OCPP201_OUTCOME_STR: dict[RFIDAuthOutcome, str] = {
     RFIDAuthOutcome.ACCEPTED: "Accepted",
     RFIDAuthOutcome.EXPIRED: "Expired",
     RFIDAuthOutcome.BLOCKED: "Blocked",
+    RFIDAuthOutcome.CONCURRENT_TX: "ConcurrentTx",
     RFIDAuthOutcome.INVALID: "Invalid",
 }
 
