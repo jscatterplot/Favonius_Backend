@@ -82,6 +82,7 @@ class LivenessHub:
         self._running = False
         self._stop_event.set()
         if self._listener_task is not None:
+            self._listener_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._listener_task
             self._listener_task = None
