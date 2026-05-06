@@ -3156,11 +3156,11 @@ async def depot_liveness_stream(
     depot_id: str = Depends(_require_depot_access),
     user: dict = Depends(ensure_tenant_mirrored),
 ):
-    """Subscribe to the liveness fan-out for the caller's organisation.
+    """Subscribe to depot-scoped liveness events for the caller.
 
-    The hub is process-wide; this endpoint just attaches a per-request
-    queue to it. On client disconnect (or app shutdown via the lifespan
-    handler), the queue is unsubscribed and drops cleanly out of scope.
+    The hub is process-wide and fans out by organisation; this endpoint
+    applies a depot-level station filter before emitting SSE frames so
+    callers only receive chargers that belong to ``depot_id``.
     """
     if liveness_hub is None:
         raise HTTPException(
@@ -3182,6 +3182,15 @@ async def depot_liveness_stream(
             },
         )
 
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.static.acquire() as conn:
+        station_rows = await conn.fetch(
+            "SELECT station_id FROM charging_stations WHERE site_id = $1::uuid",
+            depot_id,
+        )
+    depot_station_ids = {row["station_id"] for row in station_rows if row["station_id"]}
+
     queue = liveness_hub.subscribe(str(organization_id))
 
     async def _iterator() -> AsyncIterator[bytes]:
@@ -3200,6 +3209,8 @@ async def depot_liveness_stream(
                 if event is None:
                     # Hub-stopped sentinel.
                     return
+                if event.get("station_id") not in depot_station_ids:
+                    continue
                 yield (f"data: {json.dumps(event, default=str)}\n\n").encode("utf-8")
         finally:
             liveness_hub.unsubscribe(str(organization_id), queue)

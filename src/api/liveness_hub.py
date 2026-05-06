@@ -76,13 +76,12 @@ class LivenessHub:
         logger.info("LivenessHub started")
 
     async def stop(self) -> None:
-        """Cancel the LISTEN task and clear subscriber state."""
+        """Stop the LISTEN task and clear subscriber state."""
         if not self._running:
             return
         self._running = False
         self._stop_event.set()
         if self._listener_task is not None:
-            self._listener_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._listener_task
             self._listener_task = None
