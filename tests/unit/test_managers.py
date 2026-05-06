@@ -208,6 +208,14 @@ class TestTransactionManager:
         client.update_transaction = AsyncMock()
         client.store_transaction_event = AsyncMock()
         client.get_id_token_info = AsyncMock()
+        client.lookup_id_tag = AsyncMock(
+            return_value={
+                "source": "rfid_card",
+                "vehicle_id": "vehicle-1",
+                "card_id": "card-1",
+                "depot_id": "depot-1",
+            }
+        )
         return client
 
     @pytest.fixture
@@ -221,12 +229,6 @@ class TestTransactionManager:
         from ocpp.v21.datatypes import IdTokenType
 
         # Mock authorization
-        mock_timescale_client.get_id_token_info = AsyncMock(
-            return_value={
-                "status": "Accepted",
-                "cache_timeout": datetime.now(timezone.utc) + timedelta(hours=1),
-            }
-        )
         mock_timescale_client.store_transaction = AsyncMock()
         mock_timescale_client.get_evse_status = AsyncMock(return_value={"status": "Available"})
 

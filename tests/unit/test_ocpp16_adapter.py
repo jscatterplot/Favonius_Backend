@@ -89,9 +89,12 @@ def mock_timescale() -> MagicMock:
 
 
 @pytest.fixture()
-def mock_message_handler() -> MagicMock:
+def mock_message_handler(mock_timescale) -> MagicMock:
+    from src.websocket_handler.rfid_authorization import RFIDAuthorizationService
+
     mh = MagicMock()
     mh._push_to_main_api = AsyncMock()
+    mh.rfid_authorization = RFIDAuthorizationService(mock_timescale, MagicMock())
     return mh
 
 
@@ -521,6 +524,25 @@ class TestOCPP16SessionCallbacks:
         payload = mock_message_handler._push_to_main_api.await_args.args[2]
         assert payload["driver_id"] == "driver-1"
         assert payload["card_id"] == "card-1"
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_rejects_active_connector_with_concurrent_tx(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        """OCPP 1.6 ConcurrentTx: EVSE already in transaction (not card Blocked)."""
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = MagicMock()
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        assert result == AuthorizationStatus.concurrent_tx
+        mock_timescale.lookup_id_tag.assert_not_awaited()
+        mock_message_handler._push_to_main_api.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_on_transaction_start_rejects_unknown_id_tag(

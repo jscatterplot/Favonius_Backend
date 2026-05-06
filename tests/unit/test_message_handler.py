@@ -45,6 +45,14 @@ class TestMessageHandler:
         client.store_transaction_event = AsyncMock()
         client.store_meter_value = AsyncMock()
         client.store_charging_profile = AsyncMock()
+        client.lookup_id_tag = AsyncMock(
+            return_value={
+                "source": "rfid_card",
+                "vehicle_id": "vehicle-1",
+                "card_id": "card-1",
+                "depot_id": "depot-1",
+            }
+        )
         return client
 
     @pytest.fixture

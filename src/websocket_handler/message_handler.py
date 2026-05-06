@@ -13,6 +13,11 @@ import aiohttp
 
 from .config import Config
 from .monitoring import get_logger
+from .rfid_authorization import (
+    RFIDAuthorizationService,
+    map_auth_status_to_ocpp201,
+    user_message_for,
+)
 from .timescale_client import TimescaleClient
 
 if TYPE_CHECKING:
@@ -36,6 +41,7 @@ class MessageHandler:
         self.timescale_client = timescale_client
         self.optimization_engine = optimization_engine
         self.logger = get_logger(__name__)
+        self.rfid_authorization = RFIDAuthorizationService(timescale_client, self.logger)
 
         # Message handlers mapping
         self.handlers = {
@@ -408,19 +414,32 @@ class MessageHandler:
     ) -> Dict[str, Any]:
         """Handle Authorize message."""
         id_token = payload.get("idToken", {})
-        id_token.get("idToken")
-        id_token.get("type", "ISO14443")
+        token_value = id_token.get("idToken")
+        token_type = id_token.get("type", "ISO14443")
 
-        # For now, accept all authorizations
-        # In production, this would check against user database
+        if not token_value:
+            status = "Invalid"
+            reason = "Missing RFID token"
+        elif token_type == "NoAuthorization":
+            status = "Invalid"
+            reason = "Unsupported RFID token type"
+        else:
+            decision = await self.rfid_authorization.authorize(
+                station_id,
+                token_value,
+                "Authorize",
+            )
+            status = map_auth_status_to_ocpp201(decision.status)
+            reason = user_message_for(decision)
+
         return {
             "idTokenInfo": {
-                "status": "Accepted",
+                "status": status,
                 "expiryDate": None,
                 "groupIdToken": None,
                 "language1": "en",
                 "language2": None,
-                "personalMessage": {"format": "UTF8", "language": "en", "content": "Authorized"},
+                "personalMessage": {"format": "UTF8", "language": "en", "content": reason},
             }
         }
 

@@ -324,6 +324,7 @@ async def lifespan(app: FastAPI):
 
     # ── OCPP server ───────────────────────────────────────────────────────────
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
+    ocpp_emergency_only = os.getenv("OCPP_EMERGENCY_FALLBACK_ONLY", "true").lower() == "true"
     ocpp_use_same_port = os.getenv("OCPP_USE_SAME_PORT", "false").lower() == "true"
     if ocpp_enabled:
         try:
@@ -337,6 +338,11 @@ async def lifespan(app: FastAPI):
                 port=ocpp_port,
                 pools=db_pools,
             )
+            if ocpp_emergency_only:
+                logger.warning(
+                    "Main API OCPP adapter is running in EMERGENCY_FALLBACK_ONLY mode. "
+                    "Primary production path remains src/websocket_handler."
+                )
 
             if ocpp_use_same_port:
                 logger.info("OCPP served on same port as REST (path /ocpp/{charge_point_id})")
@@ -2922,7 +2928,10 @@ async def _build_depot_readiness_checklist(
 
 @app.websocket("/ocpp/{charge_point_id}")
 async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
-    """OCPP 1.6 WebSocket endpoint (same port as REST when OCPP_USE_SAME_PORT=true).
+    """Emergency-fallback OCPP 1.6 endpoint on the API service.
+
+    This endpoint is not the primary production runtime. The legacy
+    ``src/websocket_handler`` service is the canonical OCPP path.
 
     Security (C1): the upgrade is gated by OCPP-J Security Profile 1 Basic Auth.
     The Authorization header is verified against ``station_credentials`` BEFORE

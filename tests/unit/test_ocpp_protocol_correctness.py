@@ -377,6 +377,7 @@ class TestOcpp16SessionAuthorize:
     @pytest.fixture()
     def session(self, mock_websocket):
         from src.websocket_handler.ocpp16_adapter import OCPP16Session
+        from src.websocket_handler.rfid_authorization import RFIDAuthorizationService
 
         ts = MagicMock()
         ts.insert_telemetry_batch = AsyncMock()
@@ -385,6 +386,7 @@ class TestOcpp16SessionAuthorize:
         ts.next_charging_profile_id = AsyncMock(return_value=1)
         mh = MagicMock()
         mh._push_to_main_api = AsyncMock()
+        mh.rfid_authorization = RFIDAuthorizationService(ts, MagicMock())
         return OCPP16Session(
             station_id="PILOT-01",
             websocket=mock_websocket,
@@ -400,7 +402,7 @@ class TestOcpp16SessionAuthorize:
         }
         result = await session._on_authorize("PILOT-01", "DEADBEEF01")
         assert result == AuthorizationStatus.accepted
-        session._timescale.lookup_id_tag.assert_awaited_once_with("DEADBEEF01")
+        session._timescale.lookup_id_tag.assert_awaited_once_with("DEADBEEF01", station_id="PILOT-01")
 
     @pytest.mark.asyncio
     async def test_unknown_id_tag_returns_invalid(self, session) -> None:

@@ -9,7 +9,7 @@ import json
 import os
 import random
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -1786,6 +1786,74 @@ class TimescaleClient:
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
 
+    async def record_invalid_rfid_attempt(self, station_id: str, id_tag: str) -> None:
+        """Persist an invalid RFID authorization attempt for abuse controls.
+
+        Note: ``id_tag`` is a fleet card identifier and may be linkable to a
+        driver. Treat ``security_events`` rows of this type as PII for the
+        purposes of retention and access control — consider scoping any
+        retention policy to keep this event_type for the minimum window the
+        abuse-controls hot path actually needs (currently 60 s) plus whatever
+        compliance window applies (typically 30–90 days).
+        """
+        await self.store_security_event(
+            {
+                "station_id": station_id,
+                "event_type": "rfid_authorization_invalid",
+                "timestamp": datetime.now(timezone.utc),
+                "tech_info": "RFID/idTag authorization denied",
+                "additional_info": {"id_tag": id_tag},
+            }
+        )
+
+    async def count_recent_invalid_rfid_attempts(
+        self,
+        station_id: str,
+        id_tag: str,
+        window_seconds: int = 60,
+    ) -> int:
+        """Count invalid RFID attempts for a station/tag in a recent window.
+
+        Backed by ``idx_security_events_rfid_invalid`` (migration 028) — a
+        partial functional index on ``(station_id, additional_info ->> 'id_tag',
+        timestamp)`` scoped to ``event_type = 'rfid_authorization_invalid'``.
+        Update or drop both together if the query shape changes.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        async with self.pg_pool.acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                  FROM security_events
+                 WHERE station_id = $1
+                   AND event_type = 'rfid_authorization_invalid'
+                   AND timestamp >= $2
+                   AND (additional_info ->> 'id_tag') = $3
+                """,
+                station_id,
+                cutoff,
+                id_tag,
+            )
+            return int(value or 0)
+
+    async def clear_invalid_rfid_attempts(self, station_id: str, id_tag: str) -> None:
+        """Record successful recovery after previous invalid attempts.
+
+        The invalid-attempt rows are append-only audit data. This marker keeps
+        the trail intact while giving operators a visible recovery signal.
+        """
+        if await self.count_recent_invalid_rfid_attempts(station_id, id_tag, 300) == 0:
+            return
+        await self.store_security_event(
+            {
+                "station_id": station_id,
+                "event_type": "rfid_authorization_recovered",
+                "timestamp": datetime.now(timezone.utc),
+                "tech_info": "RFID/idTag authorized after previous invalid attempts",
+                "additional_info": {"id_tag": id_tag},
+            }
+        )
+
     async def validate_api_key(self, station_id: str, api_key: str) -> bool:
         """Validate API key."""
         api_key_hash = self._hash_secret(api_key)
@@ -2177,9 +2245,7 @@ class TimescaleClient:
             )
             return int(queue_id)
 
-    async def fetch_pending_commands(
-        self, charge_point_id: str
-    ) -> List[Dict[str, Any]]:
+    async def fetch_pending_commands(self, charge_point_id: str) -> List[Dict[str, Any]]:
         """Return non-expired pending commands for a cp_id, oldest first."""
         async with self.pg_pool.acquire() as conn:
             rows = await conn.fetch(
@@ -2292,14 +2358,12 @@ class TimescaleClient:
     async def expire_overdue_commands(self) -> int:
         """Move expired ``pending`` rows to ``expired``. Returns rowcount."""
         async with self.pg_pool.acquire() as conn:
-            result = await conn.execute(
-                """
+            result = await conn.execute("""
                 UPDATE charging_command_queue
                    SET status = 'expired'
                  WHERE status = 'pending'
                    AND expires_at <= NOW()
-                """
-            )
+                """)
             # asyncpg returns "UPDATE n"
             try:
                 return int(result.split()[-1])
@@ -2313,18 +2377,14 @@ class TimescaleClient:
         Returns a dict like ``{'pending': 3, 'sent': 17, 'failed': 0, ...}``.
         """
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT status, COUNT(*)::bigint AS n
                   FROM charging_command_queue
                  GROUP BY status
-                """
-            )
+                """)
         return {r["status"]: int(r["n"]) for r in rows}
 
-    async def fetch_admin_state(
-        self, charge_point_id: str
-    ) -> Dict[str, Any]:
+    async def fetch_admin_state(self, charge_point_id: str) -> Dict[str, Any]:
         """Aggregate state for ``/admin/ocpp/{cp_id}/state``.
 
         Reads:
@@ -2389,16 +2449,14 @@ class TimescaleClient:
     async def count_active_transactions_by_station(self) -> Dict[str, int]:
         """Return open-transaction counts grouped by station (for metrics)."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT station_id, COUNT(*)::bigint AS n
                   FROM charging_sessions
                  WHERE end_time IS NULL
                    AND source = 'live'
                    AND transaction_id IS NOT NULL
                  GROUP BY station_id
-                """
-            )
+                """)
         return {r["station_id"]: int(r["n"]) for r in rows}
 
     # ===== PLUG & CHARGE METHODS =====

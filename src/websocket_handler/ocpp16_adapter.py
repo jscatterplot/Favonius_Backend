@@ -27,6 +27,7 @@ from ocpp.v16.enums import AuthorizationStatus
 from src.adapters.ocpp.charge_point import FleetChargePoint
 
 from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
+from .rfid_authorization import RFIDAuthStatus
 
 # Replay window after a charger reconnects: pending commands enqueued while
 # the charger was offline are flushed within this many seconds of boot.
@@ -63,6 +64,14 @@ def _new_profile_id_fallback_counter() -> count:
 
 
 _profile_id_fallback_counter = _new_profile_id_fallback_counter()
+
+_OCPP16_AUTH_FROM_STATUS: dict[RFIDAuthStatus, AuthorizationStatus] = {
+    RFIDAuthStatus.ACCEPTED: AuthorizationStatus.accepted,
+    RFIDAuthStatus.EXPIRED: AuthorizationStatus.expired,
+    RFIDAuthStatus.BLOCKED: AuthorizationStatus.blocked,
+    RFIDAuthStatus.CONCURRENT_TX: AuthorizationStatus.concurrent_tx,
+    RFIDAuthStatus.INVALID: AuthorizationStatus.invalid,
+}
 
 
 class OCPP16Session:
@@ -101,6 +110,7 @@ class OCPP16Session:
         self._timescale = timescale_client
         self._message_handler = message_handler
         self._connection_manager = connection_manager
+        self._authz = message_handler.rfid_authorization
         self._supabase_client = supabase_client
         # Resolved once on BootNotification and reused for the lifetime of the
         # WS connection — values don't change while the charger is online.
@@ -456,18 +466,13 @@ class OCPP16Session:
         ``Expired`` here — those require richer tag metadata which is out
         of scope for the pilot.
         """
-        try:
-            row = await self._timescale.lookup_id_tag(id_tag, station_id=cp_id)
-        except Exception as exc:
-            logger.error(
-                "%s lookup failed for station=%s id_tag=%s: %s",
-                source,
-                cp_id,
-                id_tag,
-                exc,
-            )
-            return AuthorizationStatus.invalid
-        return AuthorizationStatus.accepted if row else AuthorizationStatus.invalid
+        decision = await self._authz.authorize(cp_id, id_tag, source)
+        return self._map_auth_status(decision.status)
+
+    @staticmethod
+    def _map_auth_status(status: RFIDAuthStatus) -> AuthorizationStatus:
+        """Map RFID authorization status to OCPP 1.6 AuthorizationStatus."""
+        return _OCPP16_AUTH_FROM_STATUS[status]
 
     async def _on_authorize(self, cp_id: str, id_tag: str) -> AuthorizationStatus:
         """Handle Authorize by failing closed on unknown fleet idTags."""
@@ -842,7 +847,16 @@ class OCPP16Session:
         meter_start: int,
         timestamp: str,
     ) -> AuthorizationStatus:
-        auth_status = await self._validate_id_tag(cp_id, id_tag, "StartTransaction")
+        if connector_id in self._cp.transactions:
+            logger.warning(
+                "Rejecting StartTransaction for station=%s connector=%s: active transaction already exists",
+                cp_id,
+                connector_id,
+            )
+            return AuthorizationStatus.concurrent_tx
+
+        decision = await self._authz.authorize(cp_id, id_tag, "StartTransaction")
+        auth_status = self._map_auth_status(decision.status)
         if auth_status != AuthorizationStatus.accepted:
             return auth_status
 
@@ -859,18 +873,13 @@ class OCPP16Session:
             "id_tag": id_tag,
             "start_time": start_time,
         }
-        try:
-            identity = await self._timescale.lookup_id_tag(id_tag, station_id=cp_id)
-        except Exception:
-            identity = None
-        if identity:
-            self._pending_start.update(
-                {
-                    "vehicle_id": identity.get("vehicle_id"),
-                    "driver_id": identity.get("driver_id"),
-                    "card_id": identity.get("card_id"),
-                }
-            )
+        self._pending_start.update(
+            {
+                "vehicle_id": decision.vehicle_id,
+                "driver_id": decision.driver_id,
+                "card_id": decision.card_id,
+            }
+        )
 
         # Inline gauge bump; reconciler in main.py corrects drift every 30 s.
         try:

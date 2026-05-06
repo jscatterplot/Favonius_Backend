@@ -1,12 +1,18 @@
 """OCPP 2.0.1 Transaction Manager with authorization caching and tariff calculations."""
 
+import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from .monitoring import get_logger
+from .rfid_authorization import (
+    RFIDAuthStatus,
+    RFIDAuthorizationService,
+    map_auth_status_to_ocpp201,
+)
 from .timescale_client import TimescaleClient
 
 
@@ -100,21 +106,42 @@ class Tariff:
 class TransactionManager:
     """Manages OCPP transactions with authorization and tariff support."""
 
-    def __init__(self, timescale_client: TimescaleClient):
+    def __init__(
+        self,
+        timescale_client: TimescaleClient,
+        rfid_authorization: Optional[RFIDAuthorizationService] = None,
+    ):
         self.timescale_client = timescale_client
         self.logger = get_logger(__name__)
-
-        # Authorization cache
-        self.auth_cache: Dict[str, Dict[str, Any]] = {}
+        self.rfid_authorization = rfid_authorization or RFIDAuthorizationService(
+            timescale_client, self.logger
+        )
 
         # Active transactions cache
         self.active_transactions: Dict[str, TransactionInfo] = {}
+
+        # Per-EVSE locks serialise concurrent RequestStartTransaction calls so
+        # the active-transaction check-and-set is atomic. Without this, two
+        # concurrent starts for the same EVSE both pass the "is it free?"
+        # check (the gap is the await on rfid_authorization.authorize) and
+        # the second silently overwrites the first.
+        self._evse_locks: Dict[str, asyncio.Lock] = {}
 
         # Tariff cache
         self.tariff_cache: Dict[str, Tariff] = {}
 
         # Transaction costs cache
         self.transaction_costs: Dict[str, Dict[str, Any]] = {}
+
+    def _evse_lock(self, station_id: str, evse_id: int) -> asyncio.Lock:
+        """Return the per-EVSE Lock, lazily creating it on first use.
+
+        ``dict.setdefault`` is atomic under the GIL so concurrent callers
+        observe the same Lock instance — required for the check-and-set in
+        ``request_start_transaction`` to serialise correctly.
+        """
+        key = f"{station_id}:{evse_id}"
+        return self._evse_locks.setdefault(key, asyncio.Lock())
 
     async def request_start_transaction(
         self,
@@ -127,49 +154,82 @@ class TransactionManager:
     ) -> Dict[str, Any]:
         """Request start transaction."""
         try:
-            # Authorize ID token
-            auth_result = await self.authorize_id_token(id_token)
-
-            if auth_result["status"] not in ["Accepted", "Unknown"]:
+            validation_error = self._validate_id_token_shape(id_token)
+            if validation_error is not None:
                 return {
                     "status": "Rejected",
-                    "statusInfo": {
-                        "reasonCode": auth_result["status"],
-                        "additionalInfo": auth_result.get(
-                            "additional_info", "Authorization failed"
-                        ),
-                    },
+                    "statusInfo": validation_error,
                 }
 
-            # Check EVSE availability
-            evse_available = await self._check_evse_availability(station_id, evse_id)
-            if not evse_available:
+            profile_error = self._validate_request_start_profile(charging_profile)
+            if profile_error is not None:
                 return {
                     "status": "Rejected",
-                    "statusInfo": {
-                        "reasonCode": "EVSEUnavailable",
-                        "additionalInfo": "EVSE is not available",
-                    },
+                    "statusInfo": profile_error,
                 }
 
-            # Generate transaction ID
-            transaction_id = str(uuid.uuid4())
-
-            # Create transaction info
-            transaction_info = TransactionInfo(
-                transaction_id=transaction_id,
-                charging_state=ChargingState.EV_CONNECTED,
-                evse_id=evse_id,
-                connector_id=1,  # Default connector
-                remote_start_id=remote_start_id,
-            )
-
-            # Store transaction
-            await self._store_transaction(station_id, transaction_info, id_token)
-
-            # Cache active transaction
             cache_key = f"{station_id}:{evse_id}"
-            self.active_transactions[cache_key] = transaction_info
+            # Hold the per-EVSE lock around the slot check, the auth roundtrip,
+            # and the slot population so two concurrent starts can't both
+            # observe an empty slot before either claims it.
+            async with self._evse_lock(station_id, evse_id):
+                if cache_key in self.active_transactions:
+                    return {
+                        "status": "Rejected",
+                        "statusInfo": {
+                            "reasonCode": "ConcurrentTx",
+                            "additionalInfo": "EVSE already has an active transaction",
+                        },
+                        "idTokenInfo": {"status": "Blocked"},
+                    }
+
+                auth_decision = await self.rfid_authorization.authorize(
+                    station_id,
+                    id_token.id_token,
+                    "RequestStartTransaction",
+                )
+                id_token_info = {
+                    "status": map_auth_status_to_ocpp201(auth_decision.status),
+                    "cacheTimeout": 300,
+                }
+                if auth_decision.status != RFIDAuthStatus.ACCEPTED:
+                    return {
+                        "status": "Rejected",
+                        "statusInfo": {
+                            "reasonCode": id_token_info["status"],
+                            "additionalInfo": auth_decision.reason,
+                        },
+                        "idTokenInfo": id_token_info,
+                    }
+
+                # Check EVSE availability
+                evse_available = await self._check_evse_availability(station_id, evse_id)
+                if not evse_available:
+                    return {
+                        "status": "Rejected",
+                        "statusInfo": {
+                            "reasonCode": "EVSEUnavailable",
+                            "additionalInfo": "EVSE is not available",
+                        },
+                    }
+
+                # Generate transaction ID
+                transaction_id = str(uuid.uuid4())
+
+                # Create transaction info
+                transaction_info = TransactionInfo(
+                    transaction_id=transaction_id,
+                    charging_state=ChargingState.EV_CONNECTED,
+                    evse_id=evse_id,
+                    connector_id=1,  # Default connector
+                    remote_start_id=remote_start_id,
+                )
+
+                # Store transaction
+                await self._store_transaction(station_id, transaction_info, id_token)
+
+                # Cache active transaction (under the lock, atomic with the check above)
+                self.active_transactions[cache_key] = transaction_info
 
             # Apply charging profile if provided
             if charging_profile:
@@ -182,7 +242,7 @@ class TransactionManager:
             return {
                 "status": "Accepted",
                 "transactionId": transaction_id,
-                "idTokenInfo": auth_result,
+                "idTokenInfo": id_token_info,
             }
 
         except Exception as e:
@@ -191,6 +251,43 @@ class TransactionManager:
                 "status": "Rejected",
                 "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
             }
+
+    @staticmethod
+    def _validate_id_token_shape(id_token: IdToken) -> Optional[Dict[str, str]]:
+        """Validate OCPP token type/value before business lookup."""
+        if not id_token.id_token or not id_token.id_token.strip():
+            return {"reasonCode": "InvalidToken", "additionalInfo": "idToken is required"}
+        if id_token.type == IdTokenType.NO_AUTHORIZATION:
+            return {
+                "reasonCode": "InvalidTokenType",
+                "additionalInfo": "NoAuthorization is not valid for RFID start",
+            }
+        return None
+
+    @staticmethod
+    def _validate_request_start_profile(
+        charging_profile: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        """Validate CitrineOS-critical RequestStartTransaction profile semantics."""
+        if not charging_profile:
+            return None
+
+        purpose = charging_profile.get("chargingProfilePurpose") or charging_profile.get(
+            "charging_profile_purpose"
+        )
+        if purpose and purpose != "TxProfile":
+            return {
+                "reasonCode": "InvalidChargingProfile",
+                "additionalInfo": "RequestStartTransaction requires TxProfile purpose",
+            }
+
+        if "transactionId" in charging_profile or "transaction_id" in charging_profile:
+            return {
+                "reasonCode": "InvalidChargingProfile",
+                "additionalInfo": "New RequestStartTransaction profiles must not include transactionId",
+            }
+
+        return None
 
     async def request_stop_transaction(
         self, station_id: str, transaction_id: str, reason: Optional[str] = None
@@ -232,56 +329,6 @@ class TransactionManager:
                 "status": "Rejected",
                 "statusInfo": {"reasonCode": "InternalError", "additionalInfo": str(e)},
             }
-
-    async def authorize_id_token(self, id_token: IdToken) -> Dict[str, Any]:
-        """Authorize ID token."""
-        try:
-            # Check cache first
-            cache_key = f"{id_token.type}:{id_token.id_token}"
-            if cache_key in self.auth_cache:
-                cached_auth = self.auth_cache[cache_key]
-                if datetime.now(timezone.utc) < cached_auth["expires_at"]:
-                    return cached_auth["result"]
-
-            # Check database for token
-            token_info = await self.timescale_client.get_id_token_info(
-                id_token.id_token, id_token.type
-            )
-
-            if token_info:
-                # Token found and valid
-                auth_result = {
-                    "status": "Accepted",
-                    "cacheTimeout": token_info.get("cache_timeout", 300),
-                    "chargingPriority": token_info.get("charging_priority"),
-                    "language1": token_info.get("language1", "en"),
-                    "language2": token_info.get("language2"),
-                    "groupIdToken": token_info.get("group_id_token"),
-                    "personalMessage": token_info.get("personal_message"),
-                }
-
-                # Cache result
-                self.auth_cache[cache_key] = {
-                    "result": auth_result,
-                    "expires_at": datetime.now(timezone.utc) + timedelta(seconds=300),
-                }
-
-                return auth_result
-            else:
-                # Token not found
-                auth_result = {"status": "Unknown", "cacheTimeout": 300}
-
-                # Cache negative result
-                self.auth_cache[cache_key] = {
-                    "result": auth_result,
-                    "expires_at": datetime.now(timezone.utc) + timedelta(seconds=60),
-                }
-
-                return auth_result
-
-        except Exception as e:
-            self.logger.error(f"Error authorizing token: {e}")
-            return {"status": "Rejected", "additional_info": str(e)}
 
     async def handle_transaction_event(
         self,
