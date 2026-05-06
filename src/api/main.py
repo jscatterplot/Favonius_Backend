@@ -1992,7 +1992,13 @@ class HistoricalSessionImport(_CamelOrSnakeModel):
     revenue: float = Field(default=0.0, ge=0)
     rfid_label: Optional[str] = Field(default=None, max_length=255)
     id_tag: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    status: Literal["Charging", "Finished"]
+    # Open-text rather than a Literal[...] enum because the upstream export
+    # emits at least Charging / Finished / ConnectedStoppedByEv today and
+    # additional codes (e.g. Faulted, Available) appear in the wild. We
+    # preserve the raw string verbatim in charging_sessions.import_status so
+    # any future state round-trips without a backend deploy. Length is capped
+    # to keep the column predictable.
+    status: str = Field(..., min_length=1, max_length=64)
     transaction_type: str = Field(default="RFID", max_length=64)
     user_full_name: Optional[str] = Field(default=None, max_length=255)
     station_owner_full_name: Optional[str] = Field(default=None, max_length=255)
@@ -3646,8 +3652,14 @@ async def import_historical_charging_session(
     start_time_utc = _parse_import_local_timestamp(
         request.start_time_local, tz, field="start_time_local"
     )
+    # Persist end_time for any caller-supplied value, not just status="Finished".
+    # The source export emits multiple terminal/non-terminal statuses (Finished,
+    # ConnectedStoppedByEv, Charging, ...) and we let them all round-trip the
+    # `end_time` cell when present. Status semantics live on `import_status`
+    # (free text); the only timestamp invariant we still enforce is monotonic
+    # ordering relative to start.
     end_time_utc: Optional[datetime] = None
-    if request.status == "Finished" and request.end_time_local:
+    if request.end_time_local:
         end_time_utc = _parse_import_local_timestamp(
             request.end_time_local, tz, field="end_time_local"
         )

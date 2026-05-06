@@ -276,7 +276,67 @@ class TestHistoricalChargingSessionImport:
         assert bind[9] == depot_id  # $10 site_id
         assert bind[14] == "Finished"  # $15 import_status
 
-    def test_charging_status_stores_null_end_time(self, client, mock_db_pool):
+    def test_insert_targets_columns_added_by_migration_032(
+        self, client, mock_db_pool
+    ):
+        """Pin the INSERT contract to the columns migration 032 backfills.
+
+        Production traceback that motivated migration 032:
+
+            asyncpg.exceptions.UndefinedColumnError: column "energy_delivered_kwh"
+                of relation "charging_sessions" does not exist
+
+        This test fails loudly if someone drops these columns from the INSERT
+        or renames them out of sync with migrations/. It is the first line of
+        defence against the schema drift between
+        src/websocket_handler/timescale_schema.py (which originally created
+        the columns) and migrations/ (which now must own them).
+        """
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("UTC"),
+            vehicle_row=None,
+            card_row=None,
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        sql = conn.fetchval.await_args.args[0]
+        # Both columns must appear in the column list, not just in a comment.
+        # Extract the column list to be robust to whitespace.
+        col_list_start = sql.index("INSERT INTO charging_sessions (") + len(
+            "INSERT INTO charging_sessions ("
+        )
+        col_list_end = sql.index(")", col_list_start)
+        col_list = sql[col_list_start:col_list_end]
+        cols = {c.strip() for c in col_list.split(",")}
+        assert "energy_delivered_kwh" in cols
+        assert "cost_total" in cols
+
+    def test_charging_status_persists_end_time_when_supplied(
+        self, client, mock_db_pool
+    ):
+        """Non-Finished statuses persist end_time when the FE supplies one.
+
+        The export emits multiple terminal/non-terminal statuses; the only
+        timestamp invariant we enforce is end >= start (covered separately).
+        Status semantics live in import_status (free text), not in any
+        backend state machine.
+        """
         depot_id = str(uuid4())
         org_id = str(uuid4())
         session_id = str(uuid4())
@@ -300,9 +360,79 @@ class TestHistoricalChargingSessionImport:
             )
 
         assert response.status_code == http_status.HTTP_201_CREATED
+        from datetime import datetime, timezone
+
         bind = conn.fetchval.await_args.args[1:]
-        assert bind[6] is None  # $7 end_time must be NULL for "Charging" rows
+        # end_time_local 2026-05-11 01:17 Vilnius (UTC+3 DST) -> 22:17 UTC on 2026-05-10
+        assert bind[6] == datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)  # $7
         assert bind[14] == "Charging"  # $15 raw import_status preserved
+
+    def test_connected_stopped_by_ev_status_persists_end_time(
+        self, client, mock_db_pool
+    ):
+        """Non-Literal status from the upstream export round-trips end_time."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(status="ConnectedStoppedByEv"),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        from datetime import datetime, timezone
+
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[6] == datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)  # $7
+        assert bind[14] == "ConnectedStoppedByEv"  # $15 raw import_status preserved
+
+    def test_status_with_no_end_time_local_stores_null_end_time(
+        self, client, mock_db_pool
+    ):
+        """Without end_time_local, end_time is NULL regardless of status."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        payload = _row_payload(status="Charging")
+        payload["end_time_local"] = None  # FE may suppress for ongoing sessions
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[6] is None  # $7 end_time NULL when omitted
+        assert bind[14] == "Charging"
 
     def test_vehicle_id_tag_match_skips_card_lookup(self, client, mock_db_pool):
         depot_id = str(uuid4())
@@ -432,7 +562,44 @@ class TestHistoricalChargingSessionImport:
         # No INSERT issued when validation fails.
         conn.fetchval.assert_not_awaited()
 
-    def test_invalid_status_rejected_by_pydantic(self, client, mock_db_pool):
+    def test_arbitrary_status_string_round_trips_to_import_status(
+        self, client, mock_db_pool
+    ):
+        """status is open-text (no closed Literal) so any upstream code persists.
+
+        The source export has emitted Charging / Finished / ConnectedStoppedByEv
+        in the wild. Refusing unknown codes at the validation layer would
+        silently drop rows from the bulk-import dialog with VALIDATION_ERROR
+        instead of recording the truth — see commit history for migration 032.
+        """
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+        )
+        conn.fetchval = AsyncMock(return_value=session_id)
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(status="Faulted"),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        bind = conn.fetchval.await_args.args[1:]
+        assert bind[14] == "Faulted"  # $15 raw status persisted verbatim
+
+    def test_blank_status_rejected_by_pydantic(self, client, mock_db_pool):
+        """Empty string is still rejected; only known-bad payloads are kept out."""
         depot_id = str(uuid4())
         org_id = str(uuid4())
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
@@ -444,11 +611,9 @@ class TestHistoricalChargingSessionImport:
             response = client.post(
                 f"/admin/depots/{depot_id}/charging-sessions/import",
                 headers=AUTH_HDR,
-                json=_row_payload(status="Pending"),
+                json=_row_payload(status=""),
             )
 
-        # Literal[...] mismatch routes through the app-wide
-        # validation_exception_handler, which standardizes to 400 + VALIDATION_ERROR.
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
         assert response.json()["error_code"] == "VALIDATION_ERROR"
 
