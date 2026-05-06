@@ -41,6 +41,7 @@ BOOT_TRIGGER_GRACE_SECONDS = 5.0
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
     from .message_handler import MessageHandler
+    from .supabase_client import SupabaseClient
     from .timescale_client import TimescaleClient
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ class OCPP16Session:
         timescale_client: "TimescaleClient",
         message_handler: "MessageHandler",
         connection_manager: Optional["ConnectionManager"] = None,
+        supabase_client: Optional["SupabaseClient"] = None,
     ) -> None:
         """Initialise the session and wire all FleetChargePoint callbacks.
 
@@ -88,11 +90,21 @@ class OCPP16Session:
         Production wiring (``OCPPWebSocketServer``) always passes one — it
         is required for the stale-connection sweeper to see incoming OCPP
         traffic on this socket.
+
+        ``supabase_client`` resolves tenant context (organization_id / depot_id)
+        once on BootNotification so ``insert_connector_status`` can label rows
+        for the alerts trigger (post-migration 029). Optional for the same
+        reason as above; when None the connector_status writes carry NULL
+        context and the trigger bails silently.
         """
         self._station_id = station_id
         self._timescale = timescale_client
         self._message_handler = message_handler
         self._connection_manager = connection_manager
+        self._supabase_client = supabase_client
+        # Resolved once on BootNotification and reused for the lifetime of the
+        # WS connection — values don't change while the charger is online.
+        self._tenant_context: Optional[Dict[str, Optional[str]]] = None
         # Single-slot stash for the most recent accepted StartTransaction so
         # ``_next_transaction_id`` can persist the open ``charging_sessions``
         # row alongside the generated tx_id. Safe because FleetChargePoint
@@ -484,6 +496,37 @@ class OCPP16Session:
     # FleetChargePoint callbacks
     # ------------------------------------------------------------------
 
+    async def _resolve_tenant_context(self) -> None:
+        """Look up (organization_id, depot_id) once per WS connection.
+
+        Fired from ``_on_boot``; the result is cached on the session so every
+        subsequent ``_on_status_change`` can label the ``connector_status``
+        row without an extra DB roundtrip. If the lookup fails (or no
+        supabase_client is wired) we leave the cache as ``None`` and the
+        insert proceeds with NULL context — the alerts trigger added by
+        migration 029 bails silently in that case, matching the legacy
+        behavior.
+        """
+        if self._supabase_client is None:
+            return
+        try:
+            self._tenant_context = await self._supabase_client.lookup_tenant_context(
+                self._station_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "tenant_context_lookup_failed station=%s error=%s",
+                self._station_id,
+                exc,
+            )
+            self._tenant_context = None
+        if self._tenant_context is None:
+            logger.info(
+                "tenant_context_not_found station=%s "
+                "(connector_status writes will be NULL-labelled; alerts trigger will bail)",
+                self._station_id,
+            )
+
     async def _on_boot(
         self,
         cp_id: str,
@@ -501,6 +544,10 @@ class OCPP16Session:
             serial_number,
             firmware_version,
         )
+        # Resolve tenant context once for the lifetime of this WS connection.
+        # Cached on the session and reused by _on_status_change to label
+        # connector_status rows for the alerts pipeline (migration 029).
+        await self._resolve_tenant_context()
         # Cross-restart safety:
         #   1. Reload still-open transactions into FleetChargePoint.transactions
         #      so an incoming StopTransaction from the rebooted charger is
@@ -753,6 +800,12 @@ class OCPP16Session:
         elif not isinstance(ts, datetime):
             ts = datetime.now(timezone.utc)
 
+        # Tenant context was resolved once on BootNotification and stashed
+        # on the session. Passing it through lets the alerts trigger fire on
+        # Faulted/Unavailable transitions (migration 029). When None — e.g.
+        # the charger booted before we could resolve, or it isn't onboarded
+        # in Supabase — the trigger bails silently per its own design.
+        tenant = self._tenant_context or {}
         try:
             await self._timescale.insert_connector_status(
                 {
@@ -760,6 +813,8 @@ class OCPP16Session:
                     "connector_id": connector_id,
                     "status": status,
                     "error_code": error_code,
+                    "organization_id": tenant.get("organization_id"),
+                    "depot_id": tenant.get("depot_id"),
                     "timestamp": ts,
                 }
             )
