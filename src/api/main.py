@@ -16,7 +16,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Annotated, Any, Iterator, Literal, Optional, Union
+from typing import Annotated, Any, AsyncIterator, Iterator, Literal, Optional, Union
 from urllib.parse import urlparse
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -112,6 +112,7 @@ db_pools: Optional[DatabasePools] = None
 # Controller manager and OCPP server
 controller_manager: Optional[ControllerManager] = None
 ocpp_server: Optional[object] = None  # OCPPServer type
+liveness_hub: Optional[Any] = None  # api.liveness_hub.LivenessHub
 
 # Depot config cache (to reduce database queries)
 _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (config, timestamp)
@@ -398,10 +399,27 @@ async def lifespan(app: FastAPI):
             _environment,
         )
 
+    # ── Liveness fan-out hub ──────────────────────────────────────────────────
+    # Subscribes to the ``charger_liveness`` Postgres channel and fans
+    # notifications out to per-organisation SSE subscribers. Producer is the
+    # WS handler (src/websocket_handler/liveness_notifier.py).
+    global liveness_hub
+    from .liveness_hub import LivenessHub  # noqa: PLC0415
+
+    liveness_hub = LivenessHub(ts_pool)
+    await liveness_hub.start()
+
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
     logger.info("Shutting down application...")
+
+    if liveness_hub is not None:
+        try:
+            await liveness_hub.stop()
+            logger.info("Liveness hub stopped")
+        except Exception as e:
+            logger.error(f"Error stopping liveness hub: {e}", exc_info=True)
 
     if controller_manager:
         try:
@@ -1192,9 +1210,27 @@ class ChargerListItem(BaseModel):
     )
     network_notes: Optional[str] = None
     created_at: str
+    last_interaction_at: Optional[str] = Field(
+        None,
+        description=(
+            "Timestamp of the charger's most recent activity from this API's "
+            "perspective. Initial-load value is "
+            "``MAX(connector_status.timestamp)`` across this station's "
+            "connectors — a lower bound (the charger was at least alive then). "
+            "Live updates flow via the SSE stream at "
+            "``GET /depots/{depot_id}/liveness/stream`` which the WS handler "
+            "feeds on every received OCPP frame, rate-limited to ~10s per "
+            "station. Null if the charger has never connected."
+        ),
+    )
     last_heartbeat_at: Optional[str] = Field(
         None,
-        description="MAX(connector_status.timestamp) across this station's connectors. Null if never connected.",
+        description=(
+            "**Deprecated.** Same value as ``last_interaction_at`` for one "
+            "transitional release while the frontend migrates. Drop after "
+            "the rollout completes."
+        ),
+        deprecated=True,
     )
     current_session: Optional[ChargerCurrentSession] = None
 
@@ -3095,6 +3131,91 @@ async def get_depot_metadata(
 
 
 @app.get(
+    "/depots/{depot_id}/liveness/stream",
+    tags=["depots"],
+    summary="SSE stream of charger liveness signals",
+    description="""
+    Long-lived Server-Sent Events stream that pushes one event per
+    received OCPP frame from any charger in the caller's organisation,
+    rate-limited at the source to one per ~10s per charger.
+
+    Event payload:
+    ```
+    data: {"station_id": "<ocpp_id>", "last_interaction_at": "<iso8601>"}
+    ```
+
+    Plus a ``:keepalive`` SSE comment every 25s so intermediate proxies
+    (Railway, nginx, etc.) don't reap the connection on idle days.
+
+    **Authentication:** same JWT + depot-access tier as
+    ``GET /depots/{depot_id}/state``. Subscribers are scoped to their
+    organisation — events for other tenants never reach this stream.
+    """,
+)
+async def depot_liveness_stream(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Subscribe to the liveness fan-out for the caller's organisation.
+
+    The hub is process-wide; this endpoint just attaches a per-request
+    queue to it. On client disconnect (or app shutdown via the lifespan
+    handler), the queue is unsubscribed and drops cleanly out of scope.
+    """
+    if liveness_hub is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "LIVENESS_HUB_UNAVAILABLE",
+                "message": "Liveness stream not initialised",
+            },
+        )
+    organization_id = (user.get("app_metadata") or {}).get("organization_id")
+    # favonius_admin without an org claim: surface the requirement clearly
+    # rather than returning a stream that can never receive events.
+    if not organization_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "ORG_SCOPE_REQUIRED",
+                "message": "Liveness stream requires organization_id in the token",
+            },
+        )
+
+    queue = liveness_hub.subscribe(str(organization_id))
+
+    async def _iterator() -> AsyncIterator[bytes]:
+        # Keepalive cadence in seconds; long enough that we don't waste
+        # bandwidth, short enough to outpace common proxy idle reapers.
+        keepalive_s = 25.0
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=keepalive_s)
+                except asyncio.TimeoutError:
+                    # Idle — emit a comment line so the proxy keeps the
+                    # connection open. Browser EventSource ignores comments.
+                    yield b": keepalive\n\n"
+                    continue
+                if event is None:
+                    # Hub-stopped sentinel.
+                    return
+                yield (f"data: {json.dumps(event, default=str)}\n\n").encode("utf-8")
+        finally:
+            liveness_hub.unsubscribe(str(organization_id), queue)
+
+    return StreamingResponse(
+        _iterator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get(
     "/admin/depots/{depot_id}/identity",
     response_model=FleetIdentityResponse,
     tags=["admin"],
@@ -3735,9 +3856,7 @@ async def import_historical_charging_session(
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
 
-    await _audit_identity_write(
-        user, depot_id, "charging_session.import", str(session_id)
-    )
+    await _audit_identity_write(user, depot_id, "charging_session.import", str(session_id))
     return HistoricalSessionImportResponse(
         session_id=str(session_id),
         matched=HistoricalSessionImportMatched(
@@ -5015,9 +5134,7 @@ async def _fetch_session_rows(
         """
 
     async with db_pools.ts.acquire() as conn:
-        records = await conn.fetch(
-            query, ocpp_ids, from_date, to_date, timezone_name, depot_id
-        )
+        records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name, depot_id)
 
     rows: list[SessionRow] = []
     for r in records:
@@ -7288,7 +7405,9 @@ async def manual_authorize_charger_endpoint(
             target_type="charger",
             target_id=str(charger_id),
             metadata={
-                "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
+                "endpoint": (
+                    "POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"
+                ),
                 "ocpp_id": ocpp_id,
                 "connector_id": connector_id,
                 "override_id": str(override_row["id"]),

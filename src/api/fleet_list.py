@@ -143,14 +143,21 @@ def format_charger_item(
 ) -> dict:
     """Build one charger response item from static + runtime data."""
     ocpp_status = connector_status.get("ocpp_status") if connector_status else None
-    last_heartbeat = connector_status.get("last_heartbeat_at") if connector_status else None
+    # Prefer the new ``last_interaction_at`` key; fall through to the
+    # transitional ``last_heartbeat_at`` alias the query also returns.
+    last_interaction = (
+        (connector_status.get("last_interaction_at") or connector_status.get("last_heartbeat_at"))
+        if connector_status
+        else None
+    )
     status = derive_charger_status(
         ocpp_status=ocpp_status,
-        last_heartbeat_at=last_heartbeat,
+        last_heartbeat_at=last_interaction,
         has_open_session=open_session is not None,
         now=now,
     )
 
+    last_interaction_iso = _isoformat(last_interaction)
     return {
         "id": static_row["id"],
         "depot_id": static_row["depot_id"],
@@ -170,7 +177,13 @@ def format_charger_item(
         "ocpp_connector_status": ocpp_status,
         "network_notes": static_row.get("network_notes"),
         "created_at": _isoformat(static_row.get("created_at")) or "",
-        "last_heartbeat_at": _isoformat(last_heartbeat),
+        # Canonical field — frontend should read this. Source: most
+        # recent connector_status.timestamp at API-response time;
+        # superseded live by the `/depots/{id}/liveness/stream` SSE
+        # stream once the WS handler emits a notification.
+        "last_interaction_at": last_interaction_iso,
+        # Transitional alias — drop after frontend rollout.
+        "last_heartbeat_at": last_interaction_iso,
         "current_session": format_charger_session(open_session),
     }
 
