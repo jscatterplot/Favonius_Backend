@@ -13,7 +13,7 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- Depots: Physical locations with charging infrastructure
 -- Per PRD Section 3.1.1: Each depot runs its own optimization independently
-CREATE TABLE depots (
+CREATE TABLE IF NOT EXISTS depots (
     depot_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name            VARCHAR(255) NOT NULL,
     latitude        DOUBLE PRECISION NOT NULL,
@@ -28,7 +28,7 @@ CREATE TABLE depots (
 
 -- Vehicles: Fleet vehicles with battery specs
 -- Per PRD Section 6.1: max_charge_kw can be updated by OCPP MeterValues
-CREATE TABLE vehicles (
+CREATE TABLE IF NOT EXISTS vehicles (
     vehicle_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     depot_id        UUID NOT NULL REFERENCES depots(depot_id),
     external_id     VARCHAR(100) UNIQUE NOT NULL,  -- customer's vehicle ID (e.g., 'bus_101')
@@ -41,7 +41,7 @@ CREATE TABLE vehicles (
 
 -- Chargers: EVSE/charging stations
 -- Per PRD Section 3.2: CCS only for MVP
-CREATE TABLE chargers (
+CREATE TABLE IF NOT EXISTS chargers (
     charger_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     depot_id        UUID NOT NULL REFERENCES depots(depot_id),
     ocpp_id         VARCHAR(100) UNIQUE NOT NULL,  -- OCPP charge point identifier
@@ -54,7 +54,7 @@ CREATE TABLE chargers (
 
 -- Physical accessibility: which vehicles can use which chargers
 -- Per PRD Section 2.3: Not all chargers physically reachable by all vehicles
-CREATE TABLE charger_vehicle_access (
+CREATE TABLE IF NOT EXISTS charger_vehicle_access (
     charger_id      UUID NOT NULL REFERENCES chargers(charger_id),
     vehicle_id      UUID NOT NULL REFERENCES vehicles(vehicle_id),
     is_accessible   BOOLEAN DEFAULT TRUE,
@@ -64,7 +64,7 @@ CREATE TABLE charger_vehicle_access (
 
 -- Battery storage: Stationary battery systems
 -- Per PRD Section 8.1 Constraint 11: Battery dynamics with SoC limits
-CREATE TABLE battery_storage (
+CREATE TABLE IF NOT EXISTS battery_storage (
     battery_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     depot_id        UUID NOT NULL REFERENCES depots(depot_id),
     capacity_kwh    DOUBLE PRECISION NOT NULL CHECK (capacity_kwh > 0),
@@ -80,7 +80,7 @@ CREATE TABLE battery_storage (
 
 -- Telemetry: Vehicle state data from OCPP MeterValues
 -- Per PRD Section 5.3: Vehicle SoC max age 15 minutes
-CREATE TABLE telemetry (
+CREATE TABLE IF NOT EXISTS telemetry (
     time            TIMESTAMPTZ NOT NULL,
     vehicle_id      UUID NOT NULL,
     charger_id      UUID REFERENCES chargers(charger_id),  -- Which charger reported this telemetry
@@ -98,7 +98,7 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_charger ON telemetry (charger_id, time 
 
 -- Prices: Energy and demand pricing data
 -- Per PRD Section 5.3: Prices max age 24 hours
-CREATE TABLE prices (
+CREATE TABLE IF NOT EXISTS prices (
     time            TIMESTAMPTZ NOT NULL,
     depot_id        UUID NOT NULL,
     energy_kwh      DOUBLE PRECISION NOT NULL,  -- $/kWh
@@ -110,7 +110,7 @@ SELECT create_hypertable('prices', 'time', if_not_exists => TRUE);
 
 -- Weather forecasts: Weather data for surrogate model
 -- Per PRD Section 5.3: Weather forecast max age 6 hours
-CREATE TABLE weather_forecasts (
+CREATE TABLE IF NOT EXISTS weather_forecasts (
     time            TIMESTAMPTZ NOT NULL,
     depot_id        UUID NOT NULL,
     temp_f          DOUBLE PRECISION,
@@ -125,7 +125,7 @@ SELECT create_hypertable('weather_forecasts', 'time', if_not_exists => TRUE);
 
 -- Building load: Non-EV building power consumption
 -- Per PRD Section 3.2: Building load required for accurate grid power calculation
-CREATE TABLE building_load (
+CREATE TABLE IF NOT EXISTS building_load (
     time            TIMESTAMPTZ NOT NULL,
     depot_id        UUID NOT NULL,
     power_kw        DOUBLE PRECISION NOT NULL,  -- Building load (kW)
@@ -138,7 +138,7 @@ SELECT create_hypertable('building_load', 'time', if_not_exists => TRUE);
 
 -- Schedules: Vehicle route schedules
 -- Per PRD Section 2.3: Routes/schedules are input, not decision variables
-CREATE TABLE schedules (
+CREATE TABLE IF NOT EXISTS schedules (
     schedule_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     vehicle_id      UUID NOT NULL REFERENCES vehicles(vehicle_id),
     route_id        VARCHAR(100),
@@ -154,7 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_schedules_vehicle_depart ON schedules (vehicle_id
 
 -- Optimization runs: Records of optimization executions
 -- Per PRD Section 8.5.1: Status includes 'optimal', 'feasible', 'degraded', 'infeasible'
-CREATE TABLE optimization_runs (
+CREATE TABLE IF NOT EXISTS optimization_runs (
     run_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     depot_id        UUID NOT NULL REFERENCES depots(depot_id),
     run_time        TIMESTAMPTZ DEFAULT NOW(),
@@ -171,7 +171,7 @@ CREATE TABLE optimization_runs (
 CREATE INDEX IF NOT EXISTS idx_opt_runs_depot ON optimization_runs (depot_id, run_time DESC);
 
 -- Charging commands: OCPP SetChargingProfile commands sent to chargers
-CREATE TABLE charging_commands (
+CREATE TABLE IF NOT EXISTS charging_commands (
     command_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id          UUID REFERENCES optimization_runs(run_id),
     charger_id      UUID NOT NULL REFERENCES chargers(charger_id),
@@ -185,7 +185,7 @@ CREATE INDEX IF NOT EXISTS idx_commands_run ON charging_commands (run_id);
 
 -- Inter-depot messages: Vehicle handoff coordination
 -- Per PRD Section 5.4: Inter-depot handoff flow
-CREATE TABLE interdepot_messages (
+CREATE TABLE IF NOT EXISTS interdepot_messages (
     message_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     origin_depot_id UUID NOT NULL REFERENCES depots(depot_id),
     dest_depot_id   UUID NOT NULL REFERENCES depots(depot_id),
@@ -206,7 +206,7 @@ CREATE INDEX IF NOT EXISTS idx_interdepot_dest_status ON interdepot_messages (de
 
 -- Trigger log: Records of re-optimization triggers
 -- Per PRD Section 5.1: Event-driven and periodic triggers
-CREATE TABLE trigger_log (
+CREATE TABLE IF NOT EXISTS trigger_log (
     trigger_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     depot_id        UUID NOT NULL REFERENCES depots(depot_id),
     trigger_type    VARCHAR(50) NOT NULL,  -- 'soc_deviation', 'price_change', 'return_time_deviation', 'interdepot_handoff', 'scheduled'

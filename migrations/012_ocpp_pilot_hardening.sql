@@ -36,10 +36,20 @@ CREATE SEQUENCE IF NOT EXISTS ocpp_charging_profile_id
 -- ---------------------------------------------------------------------------
 -- 2. vehicles.id_tag index — required by Authorize handler lookup
 -- ---------------------------------------------------------------------------
+-- Guard: vehicles is a Supabase-owned shadow table that migration 029 drops;
+-- if 001 was interrupted before creating it, skip gracefully (same pattern
+-- as migrations 006 and 011).
 
-CREATE INDEX IF NOT EXISTS vehicles_id_tag_idx
-    ON vehicles (id_tag)
-    WHERE id_tag IS NOT NULL;
+DO $$
+BEGIN
+    IF to_regclass('public.vehicles') IS NULL THEN
+        RAISE NOTICE 'Skipping vehicles_id_tag_idx: table public.vehicles does not exist';
+        RETURN;
+    END IF;
+    CREATE INDEX IF NOT EXISTS vehicles_id_tag_idx
+        ON vehicles (id_tag)
+        WHERE id_tag IS NOT NULL;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- 3. station_credentials — Basic Auth lookup target for OCPPWebSocketServer
