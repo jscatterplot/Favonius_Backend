@@ -20,6 +20,7 @@ from .monitoring import RFID_AUTH_ATTEMPTS_TOTAL
 INVALID_ATTEMPT_THRESHOLD = 8
 INVALID_ATTEMPT_WINDOW_S = 60
 THROTTLE_DURATION_S = 120
+IN_MEMORY_STATE_RETENTION_S = INVALID_ATTEMPT_WINDOW_S + THROTTLE_DURATION_S
 
 # Process-wide throttle / recovery state so every ``RFIDAuthorizationService``
 # shares the same in-memory fallback when durable DB helpers are unavailable.
@@ -28,6 +29,34 @@ _throttled_until: dict[tuple[str, str], float] = {}
 _recovery_logged: set[tuple[str, str]] = set()
 _pending_recovery_audit: set[tuple[str, str]] = set()
 _missing_methods_logged: set[str] = set()
+
+
+def _prune_in_memory_state(now: float) -> None:
+    """Drop stale in-memory throttle state to keep memory bounded."""
+    window_s = float(INVALID_ATTEMPT_WINDOW_S)
+    active_keys: set[tuple[str, str]] = set()
+
+    for key, timestamps in list(_invalid_attempts.items()):
+        fresh_attempts = [ts for ts in timestamps if (now - ts) <= window_s]
+        if fresh_attempts:
+            _invalid_attempts[key] = fresh_attempts
+            active_keys.add(key)
+        else:
+            _invalid_attempts.pop(key, None)
+
+    for key, expires_at in list(_throttled_until.items()):
+        if expires_at > now:
+            active_keys.add(key)
+            continue
+        _throttled_until.pop(key, None)
+
+    for key in list(_pending_recovery_audit):
+        if key in active_keys:
+            continue
+        _pending_recovery_audit.discard(key)
+        _recovery_logged.discard(key)
+
+    _recovery_logged.intersection_update(_pending_recovery_audit)
 
 
 class RFIDAuthStatus(str, Enum):
@@ -113,6 +142,8 @@ class RFIDAuthorizationService:
         return None
 
     async def _is_throttled(self, station_id: str, id_tag: str) -> bool:
+        now = time.time()
+        _prune_in_memory_state(now)
         durable_count = await self._call_client_method(
             "count_recent_invalid_rfid_attempts",
             station_id,
@@ -124,13 +155,13 @@ class RFIDAuthorizationService:
 
         key = (station_id, id_tag)
         expires_at = _throttled_until.get(key)
-        now = time.time()
         return bool(expires_at and expires_at > now)
 
     async def _record_invalid_attempt(self, station_id: str, id_tag: str) -> None:
         await self._call_client_method("record_invalid_rfid_attempt", station_id, id_tag)
         key = (station_id, id_tag)
         now = time.time()
+        _prune_in_memory_state(now)
         window_s = float(INVALID_ATTEMPT_WINDOW_S)
         attempts = [ts for ts in _invalid_attempts.get(key, []) if (now - ts) <= window_s]
         attempts.append(now)

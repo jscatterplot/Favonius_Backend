@@ -5,8 +5,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import src.websocket_handler.rfid_authorization as rfid_module
 from src.websocket_handler.ocpp_handler import EnhancedOCPPChargePoint
 from src.websocket_handler.rfid_authorization import (
+    IN_MEMORY_STATE_RETENTION_S,
     INVALID_ATTEMPT_THRESHOLD,
     RFIDAuthDecision,
     RFIDAuthorizationService,
@@ -256,6 +258,36 @@ async def test_throttle_threshold_uses_module_constant() -> None:
 
     blocked = await service.authorize("CP-X", "TAG-BAD", "Authorize")
     assert blocked.status == RFIDAuthStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_stale_invalid_keys_are_pruned_from_in_memory_state(monkeypatch) -> None:
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(return_value=None)
+    timescale.record_invalid_rfid_attempt = AsyncMock()
+    timescale.count_recent_invalid_rfid_attempts = AsyncMock(return_value=0)
+    service = RFIDAuthorizationService(timescale, MagicMock())
+    key = ("CP-LEAK", "TAG-FAKE")
+    for state in (
+        rfid_module._invalid_attempts,
+        rfid_module._throttled_until,
+        rfid_module._pending_recovery_audit,
+        rfid_module._recovery_logged,
+    ):
+        state.clear()
+
+    now = 1_000_000.0
+    monkeypatch.setattr(rfid_module.time, "time", lambda: now)
+    await service.authorize(*key, "Authorize")
+    assert key in rfid_module._invalid_attempts
+    assert key in rfid_module._pending_recovery_audit
+
+    now += IN_MEMORY_STATE_RETENTION_S + 1
+    await service.authorize("CP-OTHER", "TAG-OTHER", "Authorize")
+    assert key not in rfid_module._invalid_attempts
+    assert key not in rfid_module._throttled_until
+    assert key not in rfid_module._pending_recovery_audit
+    assert key not in rfid_module._recovery_logged
 
 
 def test_map_auth_concurrent_tx_matches_ocpp201_concurrent_tx() -> None:
