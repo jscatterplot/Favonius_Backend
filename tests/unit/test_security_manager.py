@@ -625,39 +625,43 @@ class TestSecurityEnums:
 
 
 class TestChargerAuthFailureAlertSql:
-    """Regression test: alert helpers must query the local TimescaleDB
-    schema (chargers/depots), not the Supabase static-data schema
-    (charging_stations/sites). The legacy WS handler's pg_pool only
-    sees TimescaleDB, so the wrong table names raise UndefinedTableError
-    on every successful auth and spam the logs (see incident 2026-05-05)."""
+    """Tenant-context resolution for charger_auth_failure alerts must go
+    through Supabase (``charging_stations``/``sites``). Migration 029 dropped
+    the local TimescaleDB shadow tables (``chargers``/``depots``); querying
+    them raises UndefinedTableError on every auth event (see incident
+    2026-05-06: charger reconnect cycle log spam)."""
 
     @pytest.fixture
-    def security_manager(self):
+    def static_auth_client(self):
+        """SupabaseClient stand-in exposing lookup_charger_context."""
+        client = Mock()
+        client.lookup_charger_context = AsyncMock(
+            return_value={
+                "charger_id": "11111111-1111-1111-1111-111111111111",
+                "depot_id": "22222222-2222-2222-2222-222222222222",
+                "ocpp_id": "hrx-uab_hrx-vilnius-001",
+                "charger_name": "HRX Vilnius #1",
+                "organization_id": "33333333-3333-3333-3333-333333333333",
+                "depot_name": "HRX Vilnius",
+            }
+        )
+        return client
+
+    @pytest.fixture
+    def security_manager(self, static_auth_client):
         from src.websocket_handler.security_manager import SecurityConfig, SecurityManager
 
         tc = Mock()
-        # The pool is read directly off the timescale_client.
-        return SecurityManager(tc, SecurityConfig())
+        # The notifications pool is still the TimescaleDB one; static lookups
+        # now route through Supabase.
+        return SecurityManager(tc, SecurityConfig(), static_auth_client=static_auth_client)
 
-    def _make_pool_with_capture(self, fetchrow_return=None, fetchval_return=None):
-        """Build an asyncpg-style pool whose acquire() yields a connection
-        that records the SQL passed to ``fetchrow`` / ``fetchval``."""
-        captured: dict[str, str] = {}
-
+    def _make_pool(self):
+        """asyncpg-style pool that records calls but otherwise no-ops."""
         conn = Mock()
-
-        async def fetchrow(sql, *args):
-            captured["sql"] = sql
-            captured["args"] = args
-            return fetchrow_return
-
-        async def fetchval(sql, *args):
-            captured["sql"] = sql
-            captured["args"] = args
-            return fetchval_return
-
-        conn.fetchrow = fetchrow
-        conn.fetchval = fetchval
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.fetchrow = AsyncMock(return_value=None)
+        conn.fetchval = AsyncMock(return_value=None)
 
         class _Acquire:
             async def __aenter__(self_inner):
@@ -668,61 +672,66 @@ class TestChargerAuthFailureAlertSql:
 
         pool = Mock()
         pool.acquire = lambda: _Acquire()
-        return pool, captured
+        return pool, conn
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
-    async def test_emit_uses_local_schema_names(self, security_manager):
-        pool, captured = self._make_pool_with_capture(fetchrow_return=None)
+    async def test_emit_resolves_context_via_supabase_not_dropped_tables(
+        self, security_manager, static_auth_client
+    ):
+        """Emit path must call lookup_charger_context, not query chargers/depots."""
+        pool, _conn = self._make_pool()
         security_manager.timescale_client.pg_pool = pool
 
-        await security_manager._emit_charger_auth_failure_alert(
-            "hrx-uab_hrx-vilnius-001", "wrong_password"
+        with patch("src.notifications.alerts.upsert_alert", new=AsyncMock(return_value=None)):
+            await security_manager._emit_charger_auth_failure_alert(
+                "hrx-uab_hrx-vilnius-001", "wrong_password"
+            )
+
+        static_auth_client.lookup_charger_context.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001"
         )
 
-        sql = captured["sql"]
-        assert "FROM chargers c" in sql
-        assert "JOIN depots" in sql
-        assert "c.ocpp_id = $1" in sql
-        # Must not regress to Supabase-only names.
-        assert "charging_stations" not in sql
-        assert "FROM sites" not in sql
-        assert " sites " not in sql
-        assert captured["args"] == ("hrx-uab_hrx-vilnius-001",)
-
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
-    async def test_resolve_uses_local_schema_names(self, security_manager):
-        pool, captured = self._make_pool_with_capture(fetchval_return=None)
+    async def test_resolve_resolves_context_via_supabase_not_dropped_tables(
+        self, security_manager, static_auth_client
+    ):
+        """Resolve path must call lookup_charger_context — never query chargers/depots."""
+        pool, _conn = self._make_pool()
         security_manager.timescale_client.pg_pool = pool
 
-        await security_manager._resolve_charger_auth_failure_alert("hrx-uab_hrx-vilnius-001")
+        with patch("src.notifications.alerts.resolve_alert", new=AsyncMock(return_value=None)):
+            await security_manager._resolve_charger_auth_failure_alert("hrx-uab_hrx-vilnius-001")
 
-        sql = captured["sql"]
-        assert "FROM chargers c" in sql
-        assert "JOIN depots" in sql
-        assert "c.ocpp_id = $1" in sql
-        assert "charging_stations" not in sql
-        assert "FROM sites" not in sql
-        assert captured["args"] == ("hrx-uab_hrx-vilnius-001",)
+        static_auth_client.lookup_charger_context.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
-    async def test_resolve_swallows_query_failures(self, security_manager):
-        """Any DB error in the alert path must stay silent — the OCPP auth
-        request must not be blocked by an alert-pipeline outage."""
-        conn = Mock()
-        conn.fetchval = AsyncMock(side_effect=RuntimeError("DB down"))
+    async def test_emit_skips_when_station_not_onboarded(
+        self, security_manager, static_auth_client
+    ):
+        """Unknown station → no alert emitted (no organization to scope to)."""
+        static_auth_client.lookup_charger_context = AsyncMock(return_value=None)
+        pool, conn = self._make_pool()
+        security_manager.timescale_client.pg_pool = pool
 
-        class _Acquire:
-            async def __aenter__(self_inner):
-                return conn
+        with patch("src.notifications.alerts.upsert_alert", new=AsyncMock()) as upsert:
+            await security_manager._emit_charger_auth_failure_alert(
+                "unknown-station", "wrong_password"
+            )
+            upsert.assert_not_awaited()
 
-            async def __aexit__(self_inner, *exc):
-                return False
-
-        pool = Mock()
-        pool.acquire = lambda: _Acquire()
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_resolve_swallows_lookup_failures(self, security_manager, static_auth_client):
+        """Supabase lookup failure → log warning, do not raise into the auth path."""
+        static_auth_client.lookup_charger_context = AsyncMock(
+            side_effect=RuntimeError("supabase down")
+        )
+        pool, _conn = self._make_pool()
         security_manager.timescale_client.pg_pool = pool
 
         # Must not raise.
@@ -734,3 +743,19 @@ class TestChargerAuthFailureAlertSql:
         security_manager.timescale_client.pg_pool = None
         # Must not raise even without a configured pool.
         await security_manager._resolve_charger_auth_failure_alert("station-x")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_lookup_context_returns_none_when_client_lacks_method(self):
+        """Backward-compat: pre-Supabase deploys (or test setups) where
+        static_auth_client falls back to TimescaleClient must skip the
+        lookup cleanly without raising."""
+        from src.websocket_handler.security_manager import SecurityConfig, SecurityManager
+
+        # static_auth_client without lookup_charger_context — simulates the
+        # legacy fallback in __init__: ``static_auth_client = static_auth_client or timescale_client``
+        legacy_client = Mock(spec=["pg_pool"])
+        sm = SecurityManager(Mock(), SecurityConfig(), static_auth_client=legacy_client)
+
+        result = await sm._lookup_charger_context("station-x")
+        assert result is None

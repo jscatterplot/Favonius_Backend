@@ -587,6 +587,30 @@ class SecurityManager:
         """Clear failed authentication attempts."""
         self.failed_auth_attempts.pop(station_id, None)
 
+    async def _lookup_charger_context(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve org/depot/charger context for ``station_id`` via Supabase.
+
+        Migration 029 dropped the TimescaleDB shadow ``chargers`` and
+        ``depots`` tables — the canonical static data lives in Supabase
+        (``charging_stations``/``sites``). Both alert emit and resolve
+        paths share this helper. Returns ``None`` when the station isn't
+        onboarded or the static-auth client doesn't expose
+        ``lookup_charger_context`` (e.g. pure-TimescaleDB tests where the
+        SecurityManager fell back to ``timescale_client``).
+        """
+        client = self.static_auth_client
+        if client is None or not hasattr(client, "lookup_charger_context"):
+            return None
+        try:
+            return await client.lookup_charger_context(station_id)
+        except Exception:
+            self.logger.warning(
+                "lookup_charger_context failed for station %s",
+                station_id,
+                exc_info=True,
+            )
+            return None
+
     async def _emit_charger_auth_failure_alert(self, station_id: str, reason: str) -> None:
         """Best-effort: insert/bump a charger_auth_failure notification_alert.
 
@@ -598,59 +622,47 @@ class SecurityManager:
         if pool is None:
             return
         try:
-            # Resolve org / depot from the station's ocpp_id. Unknown station
-            # (test setup, charger not yet onboarded) → silently skip; we
-            # can't write a tenant-scoped alert without an organization.
             from uuid import UUID  # noqa: PLC0415
 
             from src.notifications.alerts import upsert_alert  # noqa: PLC0415
             from src.notifications.severity import Severity  # noqa: PLC0415
 
+            ctx = await self._lookup_charger_context(station_id)
+            if ctx is None or ctx.get("organization_id") is None:
+                # Unknown station (test setup, charger not yet onboarded, or
+                # the lookup just failed) → silently skip; we can't write a
+                # tenant-scoped alert without an organization.
+                return
+
+            charger_name = ctx.get("charger_name") or station_id
+            detail = {
+                "description": (
+                    f"Charger {charger_name} failed to authenticate "
+                    f"({reason}). Repeated failures lock the station out for "
+                    f"{self.config.lockout_duration_minutes} minutes."
+                ),
+                "suggestedAction": (
+                    "Verify the charger's Basic Auth credentials match the "
+                    "values stored on this station. Rotate the credential "
+                    "from the admin panel if it may have been compromised."
+                ),
+                "context": {
+                    "kind": "charger",
+                    "id": str(ctx.get("charger_id")) if ctx.get("charger_id") else None,
+                    "label": charger_name,
+                },
+                "station_id": station_id,
+                "reason": reason,
+            }
+
             async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT d.organization_id,
-                           d.depot_id,
-                           d.name        AS depot_name,
-                           c.charger_id,
-                           COALESCE(c.display_name, c.ocpp_id) AS charger_name
-                      FROM chargers c
-                      JOIN depots   d ON d.depot_id = c.depot_id
-                     WHERE c.ocpp_id = $1
-                     LIMIT 1
-                    """,
-                    station_id,
-                )
-                if row is None:
-                    return
-
-                detail = {
-                    "description": (
-                        f"Charger {row['charger_name']} failed to authenticate "
-                        f"({reason}). Repeated failures lock the station out for "
-                        f"{self.config.lockout_duration_minutes} minutes."
-                    ),
-                    "suggestedAction": (
-                        "Verify the charger's Basic Auth credentials match the "
-                        "values stored on this station. Rotate the credential "
-                        "from the admin panel if it may have been compromised."
-                    ),
-                    "context": {
-                        "kind": "charger",
-                        "id": str(row["charger_id"]),
-                        "label": row["charger_name"],
-                    },
-                    "station_id": station_id,
-                    "reason": reason,
-                }
-
                 await upsert_alert(
                     conn,
-                    organization_id=UUID(str(row["organization_id"])),
-                    depot_id=UUID(str(row["depot_id"])),
+                    organization_id=UUID(str(ctx["organization_id"])),
+                    depot_id=UUID(str(ctx["depot_id"])) if ctx.get("depot_id") else None,
                     alert_type="charger_auth_failure",
                     severity=Severity.CRITICAL,
-                    title=f"Charger {row['charger_name']} authentication failed",
+                    title=f"Charger {charger_name} authentication failed",
                     detail=detail,
                     dedup_key=f"charger_auth_failure:{station_id}",
                 )
@@ -675,22 +687,14 @@ class SecurityManager:
 
             from src.notifications.alerts import resolve_alert  # noqa: PLC0415
 
+            ctx = await self._lookup_charger_context(station_id)
+            if ctx is None or ctx.get("organization_id") is None:
+                return
+
             async with pool.acquire() as conn:
-                org_id = await conn.fetchval(
-                    """
-                    SELECT d.organization_id
-                      FROM chargers c
-                      JOIN depots   d ON d.depot_id = c.depot_id
-                     WHERE c.ocpp_id = $1
-                     LIMIT 1
-                    """,
-                    station_id,
-                )
-                if org_id is None:
-                    return
                 await resolve_alert(
                     conn,
-                    organization_id=UUID(str(org_id)),
+                    organization_id=UUID(str(ctx["organization_id"])),
                     dedup_key=f"charger_auth_failure:{station_id}",
                 )
         except Exception:

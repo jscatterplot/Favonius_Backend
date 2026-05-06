@@ -125,6 +125,52 @@ class TestConnectionManager:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_unregister_stale_connection_does_not_evict_successor(
+        self, connection_manager, mock_websocket
+    ):
+        """Late unregister(A) must not nuke the station→B mapping after B took over.
+
+        Regression for the "charger keeps reconnecting every ~30 s" cycle
+        observed on hrx-vilnius: connection A's _handle_connection task
+        finishes long after A was already replaced by B via the
+        ``Station already connected`` branch. Without the connection_id
+        guard, that late unregister(A, station, A_id) was unconditionally
+        popping station_connections[station] — which by then pointed to B.
+        """
+        station_id = "STATION_X"
+        old_id = "old_conn"
+        new_id = "new_conn"
+
+        # Register A.
+        await connection_manager.register_connection(
+            station_id, old_id, "127.0.0.1", mock_websocket
+        )
+
+        # Simulate the "Station already connected" branch: A is replaced by B.
+        # _handle_connection in server.py would call _cleanup_connection(A,...)
+        # synchronously, which translates to unregister_connection(station, A_id).
+        await connection_manager.unregister_connection(station_id, old_id)
+        # Now register B.
+        new_ws = Mock()
+        new_ws.send = AsyncMock()
+        new_ws.close = AsyncMock()
+        new_ws.closed = False
+        await connection_manager.register_connection(station_id, new_id, "127.0.0.1", new_ws)
+
+        assert connection_manager.station_connections[station_id] == new_id
+
+        # Now A's *late* cleanup arrives — its WS recv finally got
+        # ConnectionClosed and the finally block re-runs unregister(A, station).
+        # This used to nuke the station→B mapping. With the guard it must not.
+        await connection_manager.unregister_connection(station_id, old_id)
+
+        assert (
+            connection_manager.station_connections.get(station_id) == new_id
+        ), "Late unregister of replaced connection must not erase successor's mapping"
+        assert new_id in connection_manager.connections
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_send_message(self, connection_manager, mock_websocket):
         """Test sending message to connection."""
         station_id = "TEST_STATION_001"

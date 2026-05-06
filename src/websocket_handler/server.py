@@ -756,10 +756,22 @@ class OCPPWebSocketServer:
     async def _cleanup_connection(
         self, connection_id: str, websocket: WebSocketServerProtocol, station_id: str = None
     ) -> None:
-        """Cleanup connection resources."""
+        """Cleanup connection resources.
+
+        Guards against the "late stale cleanup" race: when connection A is
+        replaced by B via the ``Station already connected`` branch in
+        ``_handle_connection``, A's recv loop only ends when its WebSocket
+        actually closes — possibly long after B has taken over. This second,
+        deferred ``_cleanup_connection(A, …, station_id)`` must NOT pop the
+        station-level mappings, because they now point to B. Without the
+        guard, B is silently orphaned and the charger ends up reconnecting
+        on a loop. The connection-level pops (``connections``,
+        ``_connection_client_ips``) are always safe — they're keyed by
+        connection_id.
+        """
         client_ip = self._connection_client_ips.pop(connection_id, None)
 
-        # Remove from connections
+        # Remove from connections (always safe — connection-id keyed)
         self.connections.pop(connection_id, None)
         CONNECTIONS_TOTAL.set(len(self.connections))
 
@@ -771,16 +783,32 @@ class OCPPWebSocketServer:
                     break
 
         if station_id:
-            self.station_connections.pop(station_id, None)
-            self.charge_points.pop(station_id, None)
-            CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
+            # Only erase the station-level routing if it still points at
+            # *this* connection. A late-finishing handler for a replaced
+            # connection must not nuke the successor's mapping.
+            current = self.station_connections.get(station_id)
+            is_current = current == connection_id
+
+            if is_current:
+                self.station_connections.pop(station_id, None)
+                self.charge_points.pop(station_id, None)
+                CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
+
+            # Always tell the connection_manager which connection_id we're
+            # cleaning up so its own guarded unregister can do the right
+            # thing per-connection, even when the station mapping has
+            # already moved on.
             if self.connection_manager:
-                await self.connection_manager.unregister_connection(station_id)
+                await self.connection_manager.unregister_connection(station_id, connection_id)
+
             # Persist that the charger is gone so reads (alerts, state) and
             # the boot-replay path can distinguish a stale-but-open session
-            # from a live one. Both calls are best-effort; the connection is
+            # from a live one. Only do this when this cleanup actually
+            # represents the active session ending — otherwise we'd mark
+            # connectors Unavailable while the successor is happily
+            # connected. Both calls are best-effort; the connection is
             # already torn down.
-            if self.timescale_client is not None:
+            if is_current and self.timescale_client is not None:
                 try:
                     await self.timescale_client.mark_connectors_unavailable(station_id)
                 except Exception as exc:

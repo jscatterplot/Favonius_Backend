@@ -179,7 +179,20 @@ class ConnectionManager:
     async def unregister_connection(
         self, station_id: str, connection_id: Optional[str] = None
     ) -> None:
-        """Unregister a WebSocket connection."""
+        """Unregister a WebSocket connection.
+
+        ``connection_id`` is treated as a guard: when supplied, the
+        ``station_connections`` mapping (and its derived ``last_heartbeats``)
+        is only popped if it currently points to this exact connection.
+
+        Without this guard, a "stale" cleanup — the original
+        ``_handle_connection`` task for connection A finishing late, after A
+        was already replaced by B via the ``station already connected``
+        path — would unconditionally remove the station→B mapping, leaving
+        B orphaned. Symptom: charger keeps reconnecting because every
+        existing session has its routing erased ~30 s after the next
+        connection arrives.
+        """
         try:
             # Find connection ID if not provided
             if not connection_id:
@@ -189,11 +202,19 @@ class ConnectionManager:
                 self.logger.warning(f"No connection found for station {station_id}")
                 return
 
-            # Remove from local storage
+            # Always remove the per-connection records — those are keyed by
+            # connection_id and never confused across two connections.
             self.connections.pop(connection_id, None)
-            self.station_connections.pop(station_id, None)
-            self.last_heartbeats.pop(station_id, None)
             stats = self.connection_stats.pop(connection_id, None)
+
+            # The station-level mapping must only be cleared if it still
+            # points to *this* connection. A late-finishing handler for a
+            # replaced connection must not erase the routing for the
+            # successor that took over.
+            current_connection_id = self.station_connections.get(station_id)
+            if current_connection_id == connection_id:
+                self.station_connections.pop(station_id, None)
+                self.last_heartbeats.pop(station_id, None)
 
             # PRD §10.5: observability metric for charger connectivity
             try:
