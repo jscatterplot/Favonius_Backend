@@ -7267,23 +7267,32 @@ async def manual_authorize_charger_endpoint(
                 )
             )
 
-    await _record_admin_action(
-        user=user,
-        action="charger.manual_authorize",
-        depot_id=depot_id,
-        organization_id_override=str(organization_id),
-        target_type="charger",
-        target_id=str(charger_id),
-        metadata={
-            "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
-            "ocpp_id": ocpp_id,
-            "connector_id": connector_id,
-            "override_id": str(override_row["id"]),
-            "queue_id": queue_id,
-            "expires_at": override_row["expires_at"].isoformat(),
-            "reason": reason,
-        },
-    )
+    try:
+        await _record_admin_action(
+            user=user,
+            action="charger.manual_authorize",
+            depot_id=depot_id,
+            organization_id_override=str(organization_id),
+            target_type="charger",
+            target_id=str(charger_id),
+            metadata={
+                "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
+                "ocpp_id": ocpp_id,
+                "connector_id": connector_id,
+                "override_id": str(override_row["id"]),
+                "queue_id": queue_id,
+                "expires_at": override_row["expires_at"].isoformat(),
+                "reason": reason,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "manual authorize audit write failed for depot=%s charger=%s override=%s",
+            depot_id,
+            charger_id,
+            override_row["id"],
+            exc_info=True,
+        )
 
     return {
         "status": "Accepted",
