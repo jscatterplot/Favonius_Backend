@@ -74,7 +74,7 @@ class LivenessNotifier:
         scope anyway. Any DB / serialization error is logged WARN and
         swallowed; this path must never break OCPP frame handling.
         """
-        if not self._enabled or not organization_id:
+        if not organization_id:
             return
 
         now = time.monotonic()
@@ -86,6 +86,9 @@ class LivenessNotifier:
         # call hangs, we don't queue a stampede of duplicate attempts
         # behind it.
         self._last_notified[station_id] = now
+
+        if not self._enabled:
+            return
 
         try:
             payload = json.dumps(
