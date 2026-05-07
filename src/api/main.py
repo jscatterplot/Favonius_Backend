@@ -5620,7 +5620,7 @@ async def export_report(
 
     stored = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
     agg_rows: list[dict] = stored.get("rows", [])
-    group_by: Optional[str] = stored.get("group_by")
+    group_by: Optional[str] = row["group_by"]
 
     filename = f"report_{report_id}.csv"
     headers_resp = {"Content-Disposition": f'attachment; filename="{filename}"'}
@@ -8439,7 +8439,7 @@ async def _handle_agent_action_approve(
                 user=user,
             )
 
-        result: dict = {"actionId": action_id, "actionStatus": "pending"}
+        result: dict = {"actionId": action_id, "actionStatus": "executed"}
         if report_result:
             result["report"] = report_result
         return result
