@@ -409,6 +409,14 @@ async def lifespan(app: FastAPI):
     liveness_hub = LivenessHub(ts_pool)
     await liveness_hub.start()
 
+    # ── Monthly report-draft scheduler ───────────────────────────────────────
+    # Emits one agent_action(action_class='report_draft') per depot on day 1
+    # of each calendar month in the depot's local timezone.
+    from .monthly_scheduler import run_monthly_scheduler  # noqa: PLC0415
+
+    asyncio.create_task(run_monthly_scheduler(ts_pool))
+    logger.info("Monthly report-draft scheduler started")
+
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
@@ -5038,6 +5046,57 @@ class EnergyReportResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# ── Report & AgentAction models ───────────────────────────────────────────────
+
+
+class ReportKind(str):
+    """Allowed kind values for a Report row."""
+
+    WEEKLY_OPS = "weekly_ops"
+    MONTHLY_SAVINGS = "monthly_savings"
+    MONTHLY_CONSUMPTION = "monthly_consumption"
+    INCIDENT = "incident"
+    COMPLIANCE = "compliance"
+
+
+class Report(BaseModel):
+    """A persisted report row."""
+
+    id: str
+    depot_id: str
+    title: str
+    kind: str = Field(..., description="weekly_ops | monthly_savings | monthly_consumption | incident | compliance")
+    status: str = Field(..., description="draft | pending | approved")
+    period_start: datetime
+    period_end: datetime
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    export_url: Optional[str] = None
+    group_by: Optional[str] = Field(None, description="card | vehicle — only set for monthly_consumption")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AgentAction(BaseModel):
+    """A proposed / shadow / executed agent-generated action."""
+
+    id: str
+    depot_id: str
+    agent_type: str
+    action_class: str
+    mode: str = Field(..., description="shadow | proposed | auto_notify | auto_silent")
+    status: str = Field(..., description="pending | executed | rejected | rolled_back | failed | shadow")
+    summary: str
+    entity_type: Optional[str] = Field(None, description="charger | vehicle | site | session")
+    entity_id: Optional[str] = None
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+    payload: Optional[dict] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 def _parse_report_date(value: str, field_name: str) -> date:
     """Parse an ISO 8601 calendar date for the from/to query parameters."""
     try:
@@ -5202,11 +5261,21 @@ async def _fetch_session_rows(
     return rows
 
 
+def _session_matches_search(row: SessionRow, search_lower: str) -> bool:
+    """Return True if any ID field of the session contains ``search_lower``."""
+    return any(
+        f is not None and search_lower in f.lower()
+        for f in (row.vehicle_id, row.charger_id, row.driver_id, row.card_id)
+    )
+
+
 async def _build_energy_report(
     depot_id: str,
     from_str: str,
     to_str: str,
     group_by: Optional[str],
+    *,
+    search: Optional[str] = None,
 ) -> tuple[dict, list[dict], str]:
     """Run the full report pipeline and return (metadata, rows, currency)."""
     from_date = _parse_report_date(from_str, "from")
@@ -5223,6 +5292,9 @@ async def _build_energy_report(
     sessions = await _fetch_session_rows(
         depot_id, timezone_name, ocpp_ids, charger_id_by_ocpp_id, from_date, to_date
     )
+    if search:
+        search_lower = search.lower()
+        sessions = [s for s in sessions if _session_matches_search(s, search_lower)]
     rows = aggregate_energy_rows(
         sessions,
         timezone=timezone_name,
@@ -5270,6 +5342,13 @@ async def get_energy_report_monthly(
         None,
         description="Optional grouping dimension: vehicle | charger | driver | card",
     ),
+    search: Optional[str] = Query(
+        None,
+        description=(
+            "Case-insensitive substring filter applied to vehicle_id, charger_id, "
+            "driver_id, and card_id before aggregation."
+        ),
+    ),
     user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Monthly energy + cost rollup for a depot."""
@@ -5278,7 +5357,7 @@ async def get_energy_report_monthly(
     grouping = _validate_report_group_by(group_by)
 
     try:
-        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping, search=search)
     except DepotNotFoundError:
         raise
     except asyncpg.PostgresError as exc:
@@ -5369,6 +5448,7 @@ async def get_energy_report_monthly_csv(
     from_: str = Query(..., alias="from"),
     to: str = Query(...),
     group_by: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Stream the monthly energy report as CSV."""
@@ -5377,7 +5457,7 @@ async def get_energy_report_monthly_csv(
     grouping = _validate_report_group_by(group_by)
 
     try:
-        _, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+        _, rows, _ = await _build_energy_report(depot_id, from_, to, grouping, search=search)
     except DepotNotFoundError:
         raise
     except asyncpg.PostgresError as exc:
@@ -5399,6 +5479,228 @@ async def get_energy_report_monthly_csv(
         yield from stream_rows_as_csv(rows_for_stream, group_by=grouping)
 
     return StreamingResponse(_generate(), media_type="text/csv", headers=headers)
+
+
+# ── Reports CRUD endpoints ────────────────────────────────────────────────────
+
+
+def _row_to_report(row: asyncpg.Record) -> Report:
+    """Convert an asyncpg Record from the reports table to a Report model."""
+    return Report(
+        id=str(row["id"]),
+        depot_id=str(row["depot_id"]),
+        title=row["title"],
+        kind=row["kind"],
+        status=row["status"],
+        period_start=row["period_start"],
+        period_end=row["period_end"],
+        created_at=row["created_at"],
+        approved_at=row["approved_at"],
+        approved_by=row["approved_by"],
+        export_url=row["export_url"],
+        group_by=row["group_by"],
+    )
+
+
+@app.get(
+    "/depots/{depot_id}/reports",
+    response_model=list[Report],
+    tags=["depots"],
+    summary="List reports for a depot",
+    description="Returns all reports for the depot, ordered by created_at descending.",
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_reports(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> list[Report]:
+    """GET /depots/{depot_id}/reports — list reports ordered by created_at desc."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, depot_id, title, kind, status, period_start, period_end,
+                   created_at, approved_at, approved_by, export_url, group_by
+            FROM reports
+            WHERE depot_id = $1::uuid
+            ORDER BY created_at DESC
+            """,
+            depot_id,
+        )
+
+    return [_row_to_report(r) for r in rows]
+
+
+@app.get(
+    "/depots/{depot_id}/reports/{report_id}",
+    response_model=Report,
+    tags=["depots"],
+    summary="Get a single report",
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Report not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_report(
+    report_id: str,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> Report:
+    """GET /depots/{depot_id}/reports/{report_id}."""
+    validate_uuid(report_id, "report_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, depot_id, title, kind, status, period_start, period_end,
+                   created_at, approved_at, approved_by, export_url, group_by
+            FROM reports
+            WHERE id = $1::uuid AND depot_id = $2::uuid
+            """,
+            report_id,
+            depot_id,
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+
+    return _row_to_report(row)
+
+
+@app.get(
+    "/depots/{depot_id}/reports/{report_id}/export",
+    tags=["depots"],
+    summary="Export an approved report as CSV",
+    description=(
+        "Streams the report as CSV. Only available for approved reports with stored data. "
+        "Returns 404 for draft/pending reports or kinds without stored data."
+    ),
+    responses={
+        200: {"content": {"text/csv": {}}, "description": "CSV export"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Report not found or not yet approved"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def export_report(
+    report_id: str,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> StreamingResponse:
+    """GET /depots/{depot_id}/reports/{report_id}/export — stream report as CSV."""
+    validate_uuid(report_id, "report_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT kind, status, group_by, data FROM reports WHERE id = $1::uuid AND depot_id = $2::uuid",
+            report_id,
+            depot_id,
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+    if row["status"] != "approved":
+        raise HTTPException(
+            status_code=404,
+            detail="Report is not yet approved; export is only available for approved reports",
+        )
+    if row["data"] is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No export data available for {row['kind']} reports",
+        )
+
+    stored = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
+    agg_rows: list[dict] = stored.get("rows", [])
+    group_by: Optional[str] = stored.get("group_by")
+
+    filename = f"report_{report_id}.csv"
+    headers_resp = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    rows_for_stream = agg_rows
+
+    def _generate() -> Iterator[str]:
+        yield from stream_rows_as_csv(rows_for_stream, group_by=group_by)
+
+    return StreamingResponse(_generate(), media_type="text/csv", headers=headers_resp)
+
+
+# ── Agent Actions endpoint ─────────────────────────────────────────────────────
+
+
+def _row_to_agent_action(row: asyncpg.Record) -> AgentAction:
+    """Convert an asyncpg Record from agent_actions to an AgentAction model."""
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            payload = None
+    return AgentAction(
+        id=str(row["id"]),
+        depot_id=str(row["depot_id"]),
+        agent_type=row["agent_type"],
+        action_class=row["action_class"],
+        mode=row["mode"],
+        status=row["status"],
+        summary=row["summary"],
+        entity_type=row["entity_type"],
+        entity_id=row["entity_id"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+        payload=payload,
+    )
+
+
+@app.get(
+    "/depots/{depot_id}/agent-actions",
+    response_model=list[AgentAction],
+    tags=["depots"],
+    summary="List agent actions for a depot",
+    description=(
+        "Returns agent-proposed actions for the depot ordered by created_at descending. "
+        "Polled every 10 seconds by the frontend to surface new proposals."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_agent_actions(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> list[AgentAction]:
+    """GET /depots/{depot_id}/agent-actions — list actions ordered by created_at desc."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, depot_id, agent_type, action_class, mode, status, summary,
+                   entity_type, entity_id, created_at, resolved_at, payload
+            FROM agent_actions
+            WHERE depot_id = $1::uuid
+            ORDER BY created_at DESC
+            """,
+            depot_id,
+        )
+
+    return [_row_to_agent_action(r) for r in rows]
 
 
 @app.get(
@@ -7587,6 +7889,7 @@ async def _handle_charger_restart(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Restart a charger via OCPP RemoteReset.
 
@@ -7688,6 +7991,7 @@ async def _handle_schedule_adjust(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Adjust a vehicle's charging schedule target.
 
@@ -7765,6 +8069,7 @@ async def _handle_depot_config_update(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Update mutable depot configuration (e.g. max_grid_kw).
 
@@ -7823,6 +8128,7 @@ async def _handle_optimization_run(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Trigger an immediate MILP optimization run.
 
@@ -7851,6 +8157,361 @@ async def _handle_optimization_run(
     return {"depot_id": depot_id, "horizon_hours": horizon_hours, "triggered": True}
 
 
+_VALID_REPORT_KINDS = frozenset(
+    {"weekly_ops", "monthly_savings", "monthly_consumption", "incident", "compliance"}
+)
+_VALID_REPORT_GROUP_BY = frozenset({"card", "vehicle"})
+
+
+async def _handle_reports_generate(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Create a draft Report row.
+
+    For kind='monthly_consumption' the aggregation runs inline and is stored
+    as JSONB in reports.data so the export endpoint can stream without
+    re-querying.
+    """
+    kind = params.get("kind") or params.get("Kind")
+    if not kind:
+        raise HTTPException(status_code=400, detail="params.kind is required")
+    if kind not in _VALID_REPORT_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind '{kind}'. Valid: {sorted(_VALID_REPORT_KINDS)}",
+        )
+
+    title = params.get("title") or f"Report — {kind}"
+    group_by = params.get("groupBy") or params.get("group_by")
+
+    if kind == "monthly_consumption" and not group_by:
+        raise HTTPException(
+            status_code=400,
+            detail="params.groupBy is required for kind='monthly_consumption'",
+        )
+    if group_by and group_by not in _VALID_REPORT_GROUP_BY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown groupBy '{group_by}'. Valid: {sorted(_VALID_REPORT_GROUP_BY)}",
+        )
+
+    # Load depot timezone to resolve defaults and for UTC conversion.
+    timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
+        await _load_report_context(depot_id)
+    )
+    tz = ZoneInfo(timezone_name)
+
+    period_start_str = params.get("periodStart") or params.get("period_start")
+    period_end_str = params.get("periodEnd") or params.get("period_end")
+
+    if not period_start_str or not period_end_str:
+        now_local = datetime.now(tz)
+        first_of_this = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_of_prev = first_of_this - timedelta(days=1)
+        first_of_prev = last_of_prev.replace(day=1)
+        period_start_str = first_of_prev.strftime("%Y-%m-%d")
+        period_end_str = last_of_prev.strftime("%Y-%m-%d")
+
+    try:
+        period_start_date = date.fromisoformat(period_start_str)
+        period_end_date = date.fromisoformat(period_end_str)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid period date: {exc}",
+        ) from exc
+
+    if period_end_date < period_start_date:
+        raise HTTPException(status_code=400, detail="periodEnd must be on or after periodStart")
+
+    # Convert local calendar dates → UTC datetimes for storage.
+    # period_start = midnight at start of first day in depot TZ.
+    # period_end   = last microsecond of last day in depot TZ (midnight of next day - 1µs).
+    period_start_utc = datetime(
+        period_start_date.year, period_start_date.month, period_start_date.day,
+        0, 0, 0, tzinfo=tz,
+    ).astimezone(timezone.utc)
+    _next_day = period_end_date + timedelta(days=1)
+    period_end_utc = (
+        datetime(
+            _next_day.year, _next_day.month, _next_day.day, 0, 0, 0, tzinfo=tz,
+        ) - timedelta(microseconds=1)
+    ).astimezone(timezone.utc)
+
+    if dry_run:
+        return {
+            "kind": kind,
+            "periodStart": period_start_str,
+            "periodEnd": period_end_str,
+            "title": title,
+            "groupBy": group_by,
+        }
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    # For monthly_consumption: run aggregation and persist result.
+    stored_data: Optional[str] = None
+    if kind == "monthly_consumption":
+        sessions = await _fetch_session_rows(
+            depot_id,
+            timezone_name,
+            ocpp_ids,
+            charger_id_by_ocpp_id,
+            period_start_date,
+            period_end_date,
+        )
+        agg_rows = aggregate_energy_rows(
+            sessions,
+            timezone=timezone_name,
+            group_by=group_by,
+            under_cap_rate=under_cap_rate,
+            currency=currency,
+            from_date=period_start_date,
+            to_date=period_end_date,
+        )
+        stored_data = json.dumps(
+            {"rows": agg_rows, "currency": currency, "group_by": group_by}
+        )
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO reports
+                (depot_id, title, kind, status, period_start, period_end, group_by, data)
+            VALUES
+                ($1::uuid, $2, $3, 'draft', $4, $5, $6, $7::jsonb)
+            RETURNING id::text, created_at
+            """,
+            depot_id,
+            title,
+            kind,
+            period_start_utc,
+            period_end_utc,
+            group_by,
+            stored_data,
+        )
+
+    return {
+        "reportId": str(row["id"]),
+        "status": "draft",
+        "createdAt": row["created_at"].isoformat(),
+        "title": title,
+        "kind": kind,
+        "groupBy": group_by,
+        "periodStart": period_start_str,
+        "periodEnd": period_end_str,
+    }
+
+
+async def _handle_reports_approve(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Approve a draft report: set status='approved', stamp approved_at/by, set export_url."""
+    report_id = params.get("reportId") or params.get("report_id")
+    if not report_id:
+        raise HTTPException(status_code=400, detail="params.reportId is required")
+    validate_uuid(report_id, "reportId")
+
+    if dry_run:
+        return {"reportId": report_id, "status": "approved"}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    approved_by = (user or {}).get("email") or (user or {}).get("sub")
+    export_url = f"/depots/{depot_id}/reports/{report_id}/export"
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await conn.fetchrow(
+            """
+            UPDATE reports
+            SET status      = 'approved',
+                approved_at = NOW(),
+                approved_by = $3,
+                export_url  = $4
+            WHERE id = $1::uuid
+              AND depot_id = $2::uuid
+              AND status = 'draft'
+            RETURNING id::text, approved_at
+            """,
+            report_id,
+            depot_id,
+            approved_by,
+            export_url,
+        )
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Report {report_id} not found or not in draft status",
+        )
+
+    return {
+        "reportId": report_id,
+        "status": "approved",
+        "exportUrl": export_url,
+        "approvedAt": updated["approved_at"].isoformat(),
+    }
+
+
+async def _handle_agent_action_approve(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Approve a pending agent action.
+
+    When the action is a report_draft, this triggers the same effect as
+    reports.generate using the payload embedded in the action, then sets
+    the action status to 'executed'.
+    """
+    action_id = params.get("actionId") or params.get("action_id")
+    if not action_id:
+        raise HTTPException(status_code=400, detail="params.actionId is required")
+    validate_uuid(action_id, "actionId")
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        action_row = await conn.fetchrow(
+            "SELECT * FROM agent_actions WHERE id = $1::uuid AND depot_id = $2::uuid",
+            action_id,
+            depot_id,
+        )
+        if not action_row:
+            raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+        current_status = action_row["status"]
+        if current_status not in ("pending", "shadow"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Action is already '{current_status}' and cannot be approved",
+            )
+
+        action_class = action_row["action_class"]
+        report_result: Optional[dict] = None
+
+        if action_class == "report_draft":
+            payload = action_row["payload"] or {}
+            report_params = {
+                "kind": payload.get("kind"),
+                "title": payload.get("title"),
+                "groupBy": payload.get("groupBy"),
+                "periodStart": payload.get("periodStart"),
+                "periodEnd": payload.get("periodEnd"),
+            }
+            report_result = await _handle_reports_generate(
+                report_params,
+                depot_id,
+                dry_run=dry_run,
+                user=user,
+            )
+
+        if not dry_run:
+            await conn.execute(
+                """
+                UPDATE agent_actions
+                SET status = 'executed', resolved_at = NOW()
+                WHERE id = $1::uuid
+                """,
+                action_row["id"],
+            )
+
+    result: dict = {"actionId": action_id, "actionStatus": "executed" if not dry_run else "pending"}
+    if report_result:
+        result["report"] = report_result
+    return result
+
+
+async def _handle_agent_action_reject(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Reject a pending agent action."""
+    action_id = params.get("actionId") or params.get("action_id")
+    if not action_id:
+        raise HTTPException(status_code=400, detail="params.actionId is required")
+    validate_uuid(action_id, "actionId")
+
+    if dry_run:
+        return {"actionId": action_id, "actionStatus": "rejected"}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await conn.fetchrow(
+            """
+            UPDATE agent_actions
+            SET status = 'rejected', resolved_at = NOW()
+            WHERE id = $1::uuid
+              AND depot_id = $2::uuid
+              AND status IN ('pending', 'shadow')
+            RETURNING id::text
+            """,
+            action_id,
+            depot_id,
+        )
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Action {action_id} not found or not in a rejectable state",
+        )
+    return {"actionId": action_id, "actionStatus": "rejected"}
+
+
+async def _handle_agent_action_rollback(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Roll back an executed agent action."""
+    action_id = params.get("actionId") or params.get("action_id")
+    if not action_id:
+        raise HTTPException(status_code=400, detail="params.actionId is required")
+    validate_uuid(action_id, "actionId")
+
+    if dry_run:
+        return {"actionId": action_id, "actionStatus": "rolled_back"}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await conn.fetchrow(
+            """
+            UPDATE agent_actions
+            SET status = 'rolled_back', resolved_at = NOW()
+            WHERE id = $1::uuid
+              AND depot_id = $2::uuid
+              AND status = 'executed'
+            RETURNING id::text
+            """,
+            action_id,
+            depot_id,
+        )
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Action {action_id} not found or not in 'executed' state",
+        )
+    return {"actionId": action_id, "actionStatus": "rolled_back"}
+
+
 class _CommandSpec:
     """Registry entry for a dispatchable command."""
 
@@ -7876,6 +8537,26 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
         required_permission=Permission.OPTIMIZE_TRIGGER,
         handler=_handle_optimization_run,
     ),
+    "reports.generate": _CommandSpec(
+        required_permission=Permission.DEPOT_VIEW,
+        handler=_handle_reports_generate,
+    ),
+    "reports.approve": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_reports_approve,
+    ),
+    "agents.action.approve": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_agent_action_approve,
+    ),
+    "agents.action.reject": _CommandSpec(
+        required_permission=Permission.DEPOT_VIEW,
+        handler=_handle_agent_action_reject,
+    ),
+    "agents.action.rollback": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_agent_action_rollback,
+    ),
 }
 
 
@@ -7895,6 +8576,11 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
     | `fleet.vehicle.schedule_adjust` | `depot:manage` (operator+) | `vehicle_id`, `target_soc`, `by_time` |
     | `depot.config.update` | `admin:config` (admin) | `max_grid_kw` |
     | `optimization.run` | `optimize:trigger` (operator+) | `horizon_hours` |
+    | `reports.generate` | `depot:view` (viewer+) | `kind`, `title`, `groupBy`, `periodStart`, `periodEnd` |
+    | `reports.approve` | `depot:manage` (operator+) | `reportId` |
+    | `agents.action.approve` | `depot:manage` (operator+) | `actionId` |
+    | `agents.action.reject` | `depot:view` (viewer+) | `actionId` |
+    | `agents.action.rollback` | `depot:manage` (operator+) | `actionId` |
 
     Set `dry_run: true` to validate and simulate the command without side effects.
     Every execution (real or dry-run) is written to the security audit log.
@@ -7940,7 +8626,7 @@ async def execute_command(
             detail=f"Insufficient permissions. Required: {spec.required_permission.value}",
         )
 
-    result = await spec.handler(body.params, body.depot_id, dry_run=body.dry_run)
+    result = await spec.handler(body.params, body.depot_id, dry_run=body.dry_run, user=user)
 
     audit = get_audit_logger()
     if audit is not None:
