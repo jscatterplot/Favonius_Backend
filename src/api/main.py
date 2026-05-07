@@ -8202,13 +8202,15 @@ async def _handle_reports_generate(
     period_start_str = params.get("periodStart") or params.get("period_start")
     period_end_str = params.get("periodEnd") or params.get("period_end")
 
-    if not period_start_str or not period_end_str:
-        now_local = datetime.now(tz)
-        first_of_this = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        last_of_prev = first_of_this - timedelta(days=1)
-        first_of_prev = last_of_prev.replace(day=1)
-        period_start_str = first_of_prev.strftime("%Y-%m-%d")
-        period_end_str = last_of_prev.strftime("%Y-%m-%d")
+    if bool(period_start_str) != bool(period_end_str):
+        raise HTTPException(
+            status_code=400,
+            detail="periodStart and periodEnd must both be provided together",
+        )
+    if not period_start_str and not period_end_str:
+        from .monthly_scheduler import _prev_month_bounds  # noqa: PLC0415
+
+        period_start_str, period_end_str, _ = _prev_month_bounds(datetime.now(tz))
 
     try:
         period_start_date = date.fromisoformat(period_start_str)
