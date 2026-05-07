@@ -8330,45 +8330,46 @@ async def _handle_reports_approve(
     approved_by = (user or {}).get("email") or (user or {}).get("sub")
 
     async with db_pools.ts.acquire() as conn:
-        report_row = await conn.fetchrow(
-            """
-            SELECT kind, data
-            FROM reports
-            WHERE id = $1::uuid
-              AND depot_id = $2::uuid
-              AND status IN ('draft', 'pending')
-            FOR UPDATE
-            """,
-            report_id,
-            depot_id,
-        )
-        if not report_row:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Report {report_id} not found or not in approvable status",
+        async with conn.transaction():
+            report_row = await conn.fetchrow(
+                """
+                SELECT kind, data
+                FROM reports
+                WHERE id = $1::uuid
+                  AND depot_id = $2::uuid
+                  AND status IN ('draft', 'pending')
+                FOR UPDATE
+                """,
+                report_id,
+                depot_id,
             )
+            if not report_row:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Report {report_id} not found or not in approvable status",
+                )
 
-        export_url: Optional[str] = None
-        if report_row["kind"] == "monthly_consumption" and report_row["data"] is not None:
-            export_url = f"/depots/{depot_id}/reports/{report_id}/export"
+            export_url: Optional[str] = None
+            if report_row["kind"] == "monthly_consumption" and report_row["data"] is not None:
+                export_url = f"/depots/{depot_id}/reports/{report_id}/export"
 
-        updated = await conn.fetchrow(
-            """
-            UPDATE reports
-            SET status      = 'approved',
-                approved_at = NOW(),
-                approved_by = $3,
-                export_url  = $4
-            WHERE id = $1::uuid
-              AND depot_id = $2::uuid
-              AND status IN ('draft', 'pending')
-            RETURNING id::text, approved_at
-            """,
-            report_id,
-            depot_id,
-            approved_by,
-            export_url,
-        )
+            updated = await conn.fetchrow(
+                """
+                UPDATE reports
+                SET status      = 'approved',
+                    approved_at = NOW(),
+                    approved_by = $3,
+                    export_url  = $4
+                WHERE id = $1::uuid
+                  AND depot_id = $2::uuid
+                  AND status IN ('draft', 'pending')
+                RETURNING id::text, approved_at
+                """,
+                report_id,
+                depot_id,
+                approved_by,
+                export_url,
+            )
 
     return {
         "reportId": report_id,
