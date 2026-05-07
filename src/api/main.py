@@ -5818,17 +5818,30 @@ async def get_depot_chargers(
                 )
 
             now = datetime.now(timezone.utc)
+            # Consult the LivenessHub in-memory cache for the freshest
+            # ``last_interaction_at`` per station — the cache is fed by
+            # every OCPP frame via pg_notify, including Heartbeats which
+            # the connector_status MAX query would miss.
+            def _live_lookup(ocpp_id: str):
+                if liveness_hub is None:
+                    return None
+                return liveness_hub.get_last_interaction(ocpp_id)
+
             items = [
                 _fleet_list.format_charger_item(
                     static_row,
                     connector_status=connector_statuses.get(static_row["ocpp_id"]),
                     open_session=open_sessions.get(static_row["ocpp_id"]),
                     now=now,
+                    last_interaction_override=_live_lookup(static_row["ocpp_id"]),
                 )
                 for static_row in static_rows
             ]
 
             payload = {"items": items, "fetched_at": now.isoformat()}
+            # NOTE: do not cache liveness-augmented payloads aggressively —
+            # the override only changes when an OCPP frame arrives, and
+            # the existing 2 s TTL is short enough that staleness is bounded.
             _fleet_list_cache_set(depot_id, "chargers", payload)
             return _fleet_list_response(payload)
 

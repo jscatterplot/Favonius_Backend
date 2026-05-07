@@ -28,6 +28,7 @@ import contextlib
 import json
 import logging
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,14 @@ class LivenessHub:
         self._pool = ts_pool
         # organization_id (str) -> set of subscriber queues.
         self._subscribers: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
+        # Per-station last-interaction cache, populated from every NOTIFY.
+        # Read by the chargers REST endpoint so the field returned on
+        # initial page load reflects the *actual* most-recent OCPP frame
+        # (including Heartbeats), not the stale ``MAX(connector_status.
+        # timestamp)`` which only advances on state changes. Multi-replica
+        # safe: every replica receives every NOTIFY, so caches stay
+        # eventually consistent within ~10 s of any frame.
+        self._last_interaction: Dict[str, datetime] = {}
         self._listener_task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
         self._running = False
@@ -188,16 +197,48 @@ class LivenessHub:
                 if conn is not None:
                     await self._release_conn(conn, _on_connection_terminated)
 
+    def get_last_interaction(self, station_id: str) -> Optional[datetime]:
+        """Return the most recent ``last_interaction_at`` for ``station_id``.
+
+        Backed by the in-memory cache populated from every NOTIFY received
+        on the ``charger_liveness`` channel. Used by the chargers REST
+        endpoint to return a fresh ``last_interaction_at`` field on initial
+        page load — the connector_status MAX query alone misses Heartbeats,
+        which would mislead the frontend's offline check until the SSE
+        stream catches up.
+
+        Returns ``None`` for stations the hub has never seen since process
+        start (cache cold) — the caller falls back to the DB-derived value.
+        """
+        return self._last_interaction.get(station_id)
+
     def _on_notify(self, _conn: Any, _pid: int, _channel: str, payload: str) -> None:
         """asyncpg listener callback — synchronous, must not block.
 
-        Parse the JSON payload, find the per-org subscriber bucket, and
-        push to each queue. Slow subscribers get the oldest event
-        evicted (we drop one entry from a full queue and re-put). Any
-        parse / dispatch error is logged WARN and dropped.
+        Parse the JSON payload, populate the per-station cache, find the
+        per-org subscriber bucket, and push to each queue. Slow
+        subscribers get the oldest event evicted (we drop one entry from
+        a full queue and re-put). Any parse / dispatch error is logged
+        WARN and dropped.
         """
         try:
             event = json.loads(payload)
+            station_id = event.get("station_id")
+            interaction_iso = event.get("last_interaction_at")
+            # Cache the interaction timestamp BEFORE the fan-out — the
+            # cache is what the REST endpoint reads for the initial-load
+            # ``last_interaction_at`` field, so even if there are no SSE
+            # subscribers (no UI open), we still want subsequent REST
+            # calls to see the freshest value.
+            if station_id and interaction_iso:
+                try:
+                    parsed = datetime.fromisoformat(interaction_iso)
+                except ValueError:
+                    parsed = datetime.now(timezone.utc)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                self._last_interaction[str(station_id)] = parsed
+
             org_id = event.get("organization_id")
             if not org_id:
                 return

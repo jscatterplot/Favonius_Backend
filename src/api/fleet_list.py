@@ -149,16 +149,30 @@ def format_charger_item(
     connector_status: Optional[dict],
     open_session: Optional[dict],
     now: datetime,
+    last_interaction_override: Optional[datetime] = None,
 ) -> dict:
-    """Build one charger response item from static + runtime data."""
+    """Build one charger response item from static + runtime data.
+
+    ``last_interaction_override`` is the freshest in-memory liveness
+    timestamp from ``LivenessHub`` (fed by every received OCPP frame
+    via pg_notify). When supplied and non-None, it wins over the
+    ``connector_status`` MAX — which only advances on state changes,
+    not Heartbeats — so the response reflects actual recent activity
+    instead of "the last time the connector changed state ~50 min ago".
+    Both ``last_interaction_at`` and the derived ``status`` are
+    computed from the same source so REST stays self-consistent.
+    """
     ocpp_status = connector_status.get("ocpp_status") if connector_status else None
-    # Prefer the new ``last_interaction_at`` key; fall through to the
-    # transitional ``last_heartbeat_at`` alias the query also returns.
-    last_interaction = (
+    # Pick the freshest signal we have:
+    #   1. LivenessHub cache (any OCPP frame, including Heartbeats),
+    #   2. connector_status MAX (state changes only — fallback when
+    #      the cache is cold, e.g. right after API replica restart).
+    db_last_interaction = (
         (connector_status.get("last_interaction_at") or connector_status.get("last_heartbeat_at"))
         if connector_status
         else None
     )
+    last_interaction = last_interaction_override or db_last_interaction
     status = derive_charger_status(
         ocpp_status=ocpp_status,
         last_heartbeat_at=last_interaction,

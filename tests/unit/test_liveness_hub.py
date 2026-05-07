@@ -203,3 +203,74 @@ async def test_stop_enqueues_shutdown_sentinel_even_when_queue_is_full() -> None
     while not q.empty():
         drained.append(q.get_nowait())
     assert drained[-1] is None
+
+
+# ----- Per-station last_interaction cache (REST initial-load fix) -----
+
+
+@pytest.mark.asyncio
+async def test_get_last_interaction_returns_none_for_unknown_station() -> None:
+    """Cache cold: REST endpoint falls back to connector_status MAX."""
+    hub = _make_hub()
+    assert hub.get_last_interaction("unknown-cp") is None
+
+
+@pytest.mark.asyncio
+async def test_notify_populates_last_interaction_cache() -> None:
+    """Every NOTIFY updates the per-station cache as a parsed datetime."""
+    from datetime import datetime, timezone
+
+    hub = _make_hub()
+    payload = json.dumps(
+        {
+            "station_id": "CP-7",
+            "organization_id": "org-A",
+            "last_interaction_at": "2026-05-06T12:34:56.789+00:00",
+            "server_time": "2026-05-06T12:34:56.789+00:00",
+        }
+    )
+    hub._on_notify(MagicMock(), 0, "charger_liveness", payload)
+
+    cached = hub.get_last_interaction("CP-7")
+    assert cached == datetime(2026, 5, 6, 12, 34, 56, 789000, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_cache_overwrites_with_newer_notify() -> None:
+    """Subsequent NOTIFYs replace the cached value."""
+    from datetime import datetime, timezone
+
+    hub = _make_hub()
+    for ts in ("2026-05-06T12:00:00+00:00", "2026-05-06T12:05:00+00:00"):
+        payload = json.dumps(
+            {
+                "station_id": "CP-7",
+                "organization_id": "org-A",
+                "last_interaction_at": ts,
+                "server_time": ts,
+            }
+        )
+        hub._on_notify(MagicMock(), 0, "charger_liveness", payload)
+
+    cached = hub.get_last_interaction("CP-7")
+    assert cached == datetime(2026, 5, 6, 12, 5, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_cache_populated_even_without_subscribers() -> None:
+    """REST initial-load works even when no SSE clients are connected."""
+    from datetime import datetime, timezone
+
+    hub = _make_hub()
+    # No subscribe() call — cache should still populate from NOTIFYs.
+    payload = json.dumps(
+        {
+            "station_id": "CP-7",
+            "organization_id": "org-A",
+            "last_interaction_at": "2026-05-06T12:00:00+00:00",
+            "server_time": "2026-05-06T12:00:00+00:00",
+        }
+    )
+    hub._on_notify(MagicMock(), 0, "charger_liveness", payload)
+
+    assert hub.get_last_interaction("CP-7") == datetime(2026, 5, 6, 12, 0, 0, tzinfo=timezone.utc)
