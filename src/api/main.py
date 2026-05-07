@@ -4,6 +4,8 @@ Reference: PRD_v2.md#7-api-specifications
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -1315,6 +1317,97 @@ class VehicleListResponse(BaseModel):
     """Response envelope for ``GET /depots/{id}/vehicles``."""
 
     items: list[VehicleListItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+# ===== Live Sessions / Realtime State (replaces Supabase mirror tables) =====
+#
+# These three endpoints replace direct frontend reads of the Supabase tables
+# `charging_sessions_active`, `charging_sessions_summary`, and
+# `vehicle_realtime_state`. The canonical store is TimescaleDB
+# (`charging_sessions`, `telemetry`); Supabase keeps only static reference
+# data (sites, charging_stations, vehicles, organizations).
+
+
+class ActiveSessionItem(BaseModel):
+    """One open live charging session, returned by ``GET /depots/{id}/sessions/active``."""
+
+    session_id: str
+    ocpp_id: str = Field(..., description="OCPP station id (charging_stations.station_id)")
+    connector_id: int
+    vehicle_id: Optional[str] = None
+    started_at: str = Field(..., description="ISO 8601")
+    current_power_kw: Optional[float] = None
+    current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    target_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    estimated_end_at: Optional[str] = None
+    last_sample_at: Optional[str] = Field(
+        None,
+        description=(
+            "Server-side updated_at on the charging_sessions row; bumped on every "
+            "MeterValues. Use to detect stalled sessions."
+        ),
+    )
+
+
+class ActiveSessionsResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/sessions/active``."""
+
+    items: list[ActiveSessionItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+class CompletedSessionItem(BaseModel):
+    """One completed charging session, returned by ``GET /depots/{id}/sessions``."""
+
+    session_id: str
+    ocpp_id: Optional[str] = Field(
+        None, description="OCPP station id; null for imported rows with no live charger."
+    )
+    connector_id: Optional[int] = None
+    vehicle_id: Optional[str] = None
+    driver_id: Optional[str] = None
+    started_at: str = Field(..., description="ISO 8601")
+    ended_at: str = Field(..., description="ISO 8601")
+    energy_delivered_kwh: Optional[float] = None
+    energy_received_kwh: Optional[float] = None
+    cost_total: Optional[float] = None
+    start_soc_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    end_soc_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    source: Literal["live", "import"] = "live"
+
+
+class CompletedSessionsResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/sessions``."""
+
+    items: list[CompletedSessionItem] = Field(default_factory=list)
+    next_cursor: Optional[str] = Field(
+        None,
+        description=(
+            "Opaque cursor for the next page. Pass back as the ``cursor`` query "
+            "parameter; null when no more rows are available."
+        ),
+    )
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+class VehicleRealtimeStateItem(BaseModel):
+    """Latest telemetry per vehicle, for ``GET /depots/{id}/vehicles/state``."""
+
+    vehicle_id: str
+    charger_id: Optional[str] = Field(
+        None, description="charging_stations.id (UUID) of the connected charger, if any."
+    )
+    soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    power_kw: Optional[float] = None
+    is_plugged: Optional[bool] = None
+    last_seen_at: str = Field(..., description="Latest telemetry timestamp (ISO 8601)")
+
+
+class VehicleRealtimeStateResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/vehicles/state``."""
+
+    items: list[VehicleRealtimeStateItem] = Field(default_factory=list)
     fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
 
 
@@ -6246,6 +6339,337 @@ async def get_depot_vehicles(
         except asyncpg.PostgresError as exc:
             logger.error(
                 "Database error listing vehicles for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
+
+
+# ===== Live Sessions / Realtime State Endpoints =====
+
+
+def _isoformat(value: Any) -> Optional[str]:
+    """Render a datetime as ISO 8601, or return None if value is falsy."""
+    return value.isoformat() if value else None
+
+
+def _encode_session_cursor(end_time: datetime, session_id: str) -> str:
+    """Opaque base64 cursor over ``(end_time_iso, session_id)``."""
+    raw = f"{end_time.isoformat()}|{session_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_session_cursor(cursor: str) -> tuple[datetime, str]:
+    """Inverse of :func:`_encode_session_cursor`. Raises HTTPException(400) on bad input."""
+    try:
+        decoded = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        ts_str, session_id = decoded.split("|", 1)
+        ts = datetime.fromisoformat(ts_str)
+        UUID(session_id)  # validate
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail="Invalid cursor") from exc
+    return ts, session_id
+
+
+@app.get(
+    "/depots/{depot_id}/sessions/active",
+    response_model=ActiveSessionsResponse,
+    tags=["depots"],
+    summary="List currently-open charging sessions for a depot",
+    description=(
+        "Replaces frontend reads of the Supabase `charging_sessions_active` "
+        "mirror table. Returns one row per open `charging_sessions` row "
+        "(`end_time IS NULL AND source='live'`) for any OCPP station belonging "
+        "to this depot. Live `current_power_kw` and `current_soc` are kept "
+        "fresh on the row by every MeterValues; poll this endpoint at the "
+        "same cadence the UI refreshes (5–15 s)."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_active_sessions(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """List currently-open charging sessions for a depot."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "sessions_active")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "sessions_active"):
+        cached = _fleet_list_cache_get(depot_id, "sessions_active")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                ocpp_id_map = await db_queries.charger_id_by_ocpp_id(
+                    static_conn, depot_id=depot_id
+                )
+            ocpp_ids = list(ocpp_id_map.keys())
+
+            rows: list[dict] = []
+            if ocpp_ids:
+                async def _fetch():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.list_active_sessions_for_depot(
+                            ts_conn, station_ids=ocpp_ids
+                        )
+
+                rows = await _safe_runtime_fetch(
+                    _fetch, label="active sessions", fallback_value=[]
+                )
+
+            items = [
+                {
+                    "session_id": r["session_id"],
+                    "ocpp_id": r["ocpp_id"],
+                    "connector_id": r["connector_id"],
+                    "vehicle_id": r.get("vehicle_id"),
+                    "started_at": _isoformat(r["started_at"]),
+                    "current_power_kw": (
+                        float(r["current_power_kw"])
+                        if r.get("current_power_kw") is not None
+                        else None
+                    ),
+                    "current_soc": (
+                        float(r["current_soc"])
+                        if r.get("current_soc") is not None
+                        else None
+                    ),
+                    "target_soc": (
+                        float(r["target_soc"]) if r.get("target_soc") is not None else None
+                    ),
+                    "estimated_end_at": _isoformat(r.get("estimated_end_at")),
+                    "last_sample_at": _isoformat(r.get("last_sample_at")),
+                }
+                for r in rows
+            ]
+
+            now = datetime.now(timezone.utc)
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            _fleet_list_cache_set(depot_id, "sessions_active", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing active sessions for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
+
+
+@app.get(
+    "/depots/{depot_id}/sessions",
+    response_model=CompletedSessionsResponse,
+    tags=["depots"],
+    summary="Paginated completed charging sessions for a depot",
+    description=(
+        "Replaces frontend reads of the Supabase `charging_sessions_summary` "
+        "mirror table. Keyset pagination over `(end_time DESC, session_id "
+        "DESC)` so concurrent inserts don't shift pages. Includes both `live` "
+        "(OCPP-derived) and `import` (XLSX-backfilled) rows."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_sessions(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+    from_ts: Optional[datetime] = Query(
+        None, alias="from", description="Filter end_time >= this ISO 8601 timestamp"
+    ),
+    to_ts: Optional[datetime] = Query(
+        None, alias="to", description="Filter end_time < this ISO 8601 timestamp"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    cursor: Optional[str] = Query(
+        None, description="Opaque cursor returned in `next_cursor` from the prior page"
+    ),
+) -> CompletedSessionsResponse:
+    """Paginated completed charging sessions for a depot."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    if from_ts is not None and to_ts is not None and from_ts >= to_ts:
+        raise HTTPException(status_code=400, detail="`from` must be earlier than `to`")
+
+    cursor_tuple = _decode_session_cursor(cursor) if cursor else None
+
+    try:
+        async with db_pools.static.acquire() as static_conn:
+            ocpp_id_map = await db_queries.charger_id_by_ocpp_id(
+                static_conn, depot_id=depot_id
+            )
+        ocpp_ids = list(ocpp_id_map.keys())
+
+        async with db_pools.ts.acquire() as ts_conn:
+            rows = await db_queries.list_completed_sessions_for_depot(
+                ts_conn,
+                depot_id=depot_id,
+                station_ids=ocpp_ids,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                cursor=cursor_tuple,
+            )
+
+        items = [
+            CompletedSessionItem(
+                session_id=r["session_id"],
+                ocpp_id=r.get("ocpp_id"),
+                connector_id=r.get("connector_id"),
+                vehicle_id=r.get("vehicle_id"),
+                driver_id=r.get("driver_id"),
+                started_at=_isoformat(r["started_at"]),
+                ended_at=_isoformat(r["ended_at"]),
+                energy_delivered_kwh=(
+                    float(r["energy_delivered_kwh"])
+                    if r.get("energy_delivered_kwh") is not None
+                    else None
+                ),
+                energy_received_kwh=(
+                    float(r["energy_received_kwh"])
+                    if r.get("energy_received_kwh") is not None
+                    else None
+                ),
+                cost_total=(
+                    float(r["cost_total"]) if r.get("cost_total") is not None else None
+                ),
+                start_soc_percent=(
+                    float(r["start_soc_percent"])
+                    if r.get("start_soc_percent") is not None
+                    else None
+                ),
+                end_soc_percent=(
+                    float(r["end_soc_percent"])
+                    if r.get("end_soc_percent") is not None
+                    else None
+                ),
+                source=r.get("source") or "live",
+            )
+            for r in rows
+        ]
+
+        next_cursor = (
+            _encode_session_cursor(rows[-1]["ended_at"], rows[-1]["session_id"])
+            if len(rows) == limit
+            else None
+        )
+        return CompletedSessionsResponse(
+            items=items,
+            next_cursor=next_cursor,
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    except HTTPException:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error listing sessions for depot %s: %s",
+            depot_id,
+            exc,
+            exc_info=True,
+        )
+        raise DatabaseError() from exc
+
+
+@app.get(
+    "/depots/{depot_id}/vehicles/state",
+    response_model=VehicleRealtimeStateResponse,
+    tags=["depots"],
+    summary="Latest telemetry per vehicle in a depot",
+    description=(
+        "Replaces frontend reads of the Supabase `vehicle_realtime_state` "
+        "mirror table. Returns one row per vehicle in the depot that has at "
+        "least one telemetry sample. Lightweight by design — for the richer "
+        "vehicle list with schedule/state derivation, use "
+        "`GET /depots/{id}/vehicles`."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_vehicles_state(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """Latest telemetry per vehicle for a depot."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "vehicles_state")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "vehicles_state"):
+        cached = _fleet_list_cache_get(depot_id, "vehicles_state")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                static_rows = await db_queries.list_vehicles_for_depot(
+                    static_conn, depot_id=depot_id
+                )
+            vehicle_ids = [row["id"] for row in static_rows]
+
+            rows: list[dict] = []
+            if vehicle_ids:
+                async def _fetch():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.latest_telemetry_for_depot_vehicles(
+                            ts_conn, vehicle_ids=vehicle_ids
+                        )
+
+                rows = await _safe_runtime_fetch(
+                    _fetch, label="vehicle realtime state", fallback_value=[]
+                )
+
+            items = [
+                {
+                    "vehicle_id": r["vehicle_id"],
+                    "charger_id": r.get("charger_id"),
+                    "soc": float(r["soc"]) if r.get("soc") is not None else None,
+                    "power_kw": (
+                        float(r["power_kw"]) if r.get("power_kw") is not None else None
+                    ),
+                    "is_plugged": r.get("is_plugged"),
+                    "last_seen_at": _isoformat(r["last_seen_at"]),
+                }
+                for r in rows
+            ]
+
+            now = datetime.now(timezone.utc)
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            _fleet_list_cache_set(depot_id, "vehicles_state", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing vehicle state for depot %s: %s",
                 depot_id,
                 exc,
                 exc_info=True,
