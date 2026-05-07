@@ -127,6 +127,12 @@ class DataSyncService:
         """Return True if this table is on the skip-list for this process run."""
         return table_name in self._missing_relations
 
+
+    @staticmethod
+    def _string_or_none(value: Any) -> Optional[str]:
+        """Return a JSON-safe string for identifier values."""
+        return str(value) if value is not None else None
+
     def _handle_missing_relation(
         self, table_name: str, exc: BaseException, sync_label: str
     ) -> None:
@@ -207,10 +213,10 @@ class DataSyncService:
                     for session in sessions:
                         session_data.append(
                             {
-                                "session_id": session["session_id"],
-                                "station_id": session["station_id"],
-                                "vehicle_id": session["vehicle_id"],
-                                "organization_id": session["fleet_operator_id"],
+                                "session_id": self._string_or_none(session["session_id"]),
+                                "station_id": self._string_or_none(session.get("station_id")),
+                                "vehicle_id": self._string_or_none(session.get("vehicle_id")),
+                                "organization_id": self._string_or_none(session.get("fleet_operator_id")),
                                 "start_time": session["start_time"].isoformat(),
                                 "end_time": (
                                     session["end_time"].isoformat() if session["end_time"] else None
@@ -515,10 +521,10 @@ class DataSyncService:
             for session in sessions:
                 session_data.append(
                     {
-                        "session_id": session["session_id"],
-                        "station_id": session["station_id"],
-                        "vehicle_id": session["vehicle_id"],
-                        "organization_id": session["organization_id"],
+                        "session_id": self._string_or_none(session["session_id"]),
+                        "station_id": self._string_or_none(session.get("station_id")),
+                        "vehicle_id": self._string_or_none(session.get("vehicle_id")),
+                        "organization_id": self._string_or_none(session.get("organization_id")),
                         "start_time": session["start_time"].isoformat(),
                         "current_power_kw": float(session.get("current_power_kw", 0)),
                         "current_soc": float(session.get("current_soc", 0)),
