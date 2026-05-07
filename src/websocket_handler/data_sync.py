@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import asyncpg
 
@@ -13,6 +13,10 @@ from .supabase_client import SupabaseClient
 
 class DataSyncService:
     """Service for synchronizing data between TimescaleDB and Supabase."""
+
+    _CHARGING_SESSIONS_TABLE_KEY = "charging_sessions"
+    _CHARGING_SESSIONS_SYNC_COLUMN_KEY = "charging_sessions:sync_charging_sessions"
+    _ENERGY_METRICS_SYNC_COLUMN_KEY = "charging_sessions:sync_energy_metrics"
 
     def __init__(
         self,
@@ -38,6 +42,15 @@ class DataSyncService:
         self.last_sync_times: Dict[str, datetime] = {}
         self.sync_running = False
         self._sync_task: Optional[asyncio.Task] = None
+
+        # Tables that the legacy bootstrap schema (timescale_schema.py) creates
+        # but the migration runner does not. Production runs the migration
+        # runner only, so these may be permanently missing on a given
+        # deployment. We log "missing relation" once per table at WARNING and
+        # then short-circuit subsequent sync ticks for that table to avoid
+        # spamming errors every cycle. Cleared on stop() so a process restart
+        # re-checks (the operator may have backfilled in the meantime).
+        self._missing_relations: Set[str] = set()
 
     async def start(self) -> None:
         """Start the data synchronization service."""
@@ -81,6 +94,10 @@ class DataSyncService:
         if self.timescale_pool:
             await self.timescale_pool.close()
 
+        # Re-check missing relations on next start; the operator may have
+        # added them while we were stopped.
+        self._missing_relations.clear()
+
         self.logger.info("Data sync service stopped")
 
     async def _sync_loop(self) -> None:
@@ -106,8 +123,42 @@ class DataSyncService:
 
         await asyncio.gather(*sync_tasks, return_exceptions=True)
 
+    def _is_known_missing(self, table_name: str) -> bool:
+        """Return True if this table is on the skip-list for this process run."""
+        return table_name in self._missing_relations
+
+    def _handle_missing_relation(
+        self, table_name: str, exc: BaseException, sync_label: str
+    ) -> None:
+        """Log a missing source table once and short-circuit subsequent ticks.
+
+        The legacy bootstrap (timescale_schema.py) creates several tables that
+        the migration runner does not (vehicle_telemetry, optimization_decisions).
+        On migration-only deployments those tables never exist, and the sync
+        loop would otherwise log a fresh ERROR every 5 minutes forever. We log
+        once at WARNING and stop attempting until the process is restarted.
+        """
+        if table_name in self._missing_relations:
+            return
+        self._missing_relations.add(table_name)
+        relation_name = table_name.split(":", 1)[0]
+        missing_target = (
+            f"required source column(s) in table '{relation_name}'"
+            if isinstance(exc, asyncpg.UndefinedColumnError)
+            else f"source table '{relation_name}'"
+        )
+        self.logger.warning(
+            f"Skipping {sync_label}: {missing_target} does not exist on this "
+            f"deployment (migration-only schema). Suppressing further errors until restart. "
+            f"Underlying error: {exc}"
+        )
+
     async def sync_charging_sessions(self) -> None:
         """Sync completed charging sessions from TimescaleDB to Supabase."""
+        if self._is_known_missing(self._CHARGING_SESSIONS_TABLE_KEY) or self._is_known_missing(
+            self._CHARGING_SESSIONS_SYNC_COLUMN_KEY
+        ):
+            return
         try:
             if not self.timescale_pool:
                 return
@@ -118,7 +169,13 @@ class DataSyncService:
             )
 
             async with self.timescale_pool.acquire() as conn:
-                # Query completed sessions
+                # charging_sessions has no `status` column in the migrated
+                # schema (see migrations/013_recovery.sql, 027, 030, 032). The
+                # destination Supabase table charging_sessions_summary has a
+                # `status VARCHAR(50) DEFAULT 'active'` column, so we derive
+                # the value from end_time. The WHERE clause already excludes
+                # open sessions, but the CASE keeps the mapping correct if the
+                # filter is ever loosened.
                 query = """
                     SELECT
                         session_id,
@@ -133,7 +190,8 @@ class DataSyncService:
                             AS session_duration_minutes,
                         cost_total,
                         revenue_v2g,
-                        status
+                        CASE WHEN end_time IS NULL THEN 'active' ELSE 'completed' END
+                            AS derived_status
                     FROM charging_sessions
                     WHERE end_time > $1
                         AND sync_status = 'pending'
@@ -174,7 +232,7 @@ class DataSyncService:
                                 "revenue_v2g": (
                                     float(session["revenue_v2g"]) if session["revenue_v2g"] else 0
                                 ),
-                                "status": session["status"],
+                                "status": session["derived_status"],
                             }
                         )
 
@@ -185,7 +243,7 @@ class DataSyncService:
                     session_ids = [s["session_id"] for s in sessions]
                     await conn.execute(
                         """
-                        UPDATE charging_sessions 
+                        UPDATE charging_sessions
                         SET sync_status = 'completed'
                         WHERE session_id = ANY($1)
                         """,
@@ -197,11 +255,24 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(sessions)} charging sessions")
 
+        except asyncpg.UndefinedColumnError as e:
+            # Defence in depth: if a deployment is somehow on a charging_sessions
+            # variant we do not recognise (e.g. a future column rename), log
+            # loudly once and stop retrying until restart.
+            self._handle_missing_relation(
+                self._CHARGING_SESSIONS_SYNC_COLUMN_KEY, e, "charging session sync (column missing)"
+            )
+        except asyncpg.UndefinedTableError as e:
+            self._handle_missing_relation(
+                self._CHARGING_SESSIONS_TABLE_KEY, e, "charging session sync"
+            )
         except Exception as e:
             self.logger.error(f"Failed to sync charging sessions: {e}")
 
     async def sync_vehicle_states(self) -> None:
         """Sync vehicle real-time states to Supabase."""
+        if self._is_known_missing("vehicle_telemetry"):
+            return
         try:
             if not self.timescale_pool:
                 return
@@ -265,11 +336,19 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(states)} vehicle states")
 
+        except asyncpg.UndefinedTableError as e:
+            self._handle_missing_relation("vehicle_telemetry", e, "vehicle state sync")
+        except asyncpg.UndefinedColumnError as e:
+            self._handle_missing_relation(
+                "vehicle_telemetry", e, "vehicle state sync (column missing)"
+            )
         except Exception as e:
             self.logger.error(f"Failed to sync vehicle states: {e}")
 
     async def sync_optimization_decisions(self) -> None:
         """Sync optimization decisions to Supabase."""
+        if self._is_known_missing("optimization_decisions"):
+            return
         try:
             if not self.timescale_pool:
                 return
@@ -330,11 +409,21 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(decisions)} optimization decisions")
 
+        except asyncpg.UndefinedTableError as e:
+            self._handle_missing_relation("optimization_decisions", e, "optimization decision sync")
+        except asyncpg.UndefinedColumnError as e:
+            self._handle_missing_relation(
+                "optimization_decisions", e, "optimization decision sync (column missing)"
+            )
         except Exception as e:
             self.logger.error(f"Failed to sync optimization decisions: {e}")
 
     async def sync_energy_metrics(self) -> None:
         """Sync energy metrics and analytics to Supabase."""
+        if self._is_known_missing(self._CHARGING_SESSIONS_TABLE_KEY) or self._is_known_missing(
+            self._ENERGY_METRICS_SYNC_COLUMN_KEY
+        ):
+            return
         try:
             if not self.timescale_pool:
                 return
@@ -406,6 +495,12 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(metrics)} energy metrics")
 
+        except asyncpg.UndefinedTableError as e:
+            self._handle_missing_relation(self._CHARGING_SESSIONS_TABLE_KEY, e, "energy metrics sync")
+        except asyncpg.UndefinedColumnError as e:
+            self._handle_missing_relation(
+                self._ENERGY_METRICS_SYNC_COLUMN_KEY, e, "energy metrics sync (column missing)"
+            )
         except Exception as e:
             self.logger.error(f"Failed to sync energy metrics: {e}")
 
