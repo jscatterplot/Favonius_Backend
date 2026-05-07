@@ -730,8 +730,14 @@ class OCPP16Session:
         try:
             replay_task = self._replay_task
             if replay_task is not None:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
+                try:
                     await replay_task
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                except Exception:
+                    pass
             pool = getattr(self._timescale, "pg_pool", None)
             if pool is None:
                 logger.debug(

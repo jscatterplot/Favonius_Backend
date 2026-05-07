@@ -1434,30 +1434,35 @@ async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
                   )
               )
         )
-        SELECT id_tag, 'vehicle'::text AS source
-        FROM accessible_vehicles
-        UNION
-        SELECT c.id_tag, 'rfid_card_vehicle'::text AS source
-        FROM rfid_cards c, station_info si
-        WHERE c.site_id = si.site_id
-          AND c.status = 'active'
-          AND EXISTS (
-              SELECT 1 FROM rfid_card_vehicle_assignments cva
-              JOIN accessible_vehicles av ON av.vehicle_id = cva.vehicle_id
-              WHERE cva.card_id = c.id
-          )
-        UNION
-        SELECT c.id_tag, 'rfid_card_driver'::text AS source
-        FROM rfid_cards c, station_info si
-        WHERE c.site_id = si.site_id
-          AND c.status = 'active'
-          AND EXISTS (
-              SELECT 1 FROM rfid_card_driver_assignments cda
-              JOIN drivers dr ON dr.id = cda.driver_id
-              WHERE cda.card_id = c.id
-                AND dr.status = 'active'
-          )
-        ORDER BY id_tag
+        ,
+        all_tags AS (
+            SELECT id_tag, 'vehicle'::text AS source, 1 AS source_priority
+            FROM accessible_vehicles
+            UNION ALL
+            SELECT c.id_tag, 'rfid_card_vehicle'::text AS source, 2 AS source_priority
+            FROM rfid_cards c, station_info si
+            WHERE c.site_id = si.site_id
+              AND c.status = 'active'
+              AND EXISTS (
+                  SELECT 1 FROM rfid_card_vehicle_assignments cva
+                  JOIN accessible_vehicles av ON av.vehicle_id = cva.vehicle_id
+                  WHERE cva.card_id = c.id
+              )
+            UNION ALL
+            SELECT c.id_tag, 'rfid_card_driver'::text AS source, 3 AS source_priority
+            FROM rfid_cards c, station_info si
+            WHERE c.site_id = si.site_id
+              AND c.status = 'active'
+              AND EXISTS (
+                  SELECT 1 FROM rfid_card_driver_assignments cda
+                  JOIN drivers dr ON dr.id = cda.driver_id
+                  WHERE cda.card_id = c.id
+                    AND dr.status = 'active'
+              )
+        )
+        SELECT DISTINCT ON (id_tag) id_tag, source
+        FROM all_tags
+        ORDER BY id_tag, source_priority
     """
     rows = await db.fetch(query, station_id)
     return [dict(row) for row in rows]

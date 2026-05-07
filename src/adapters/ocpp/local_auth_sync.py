@@ -234,8 +234,7 @@ async def sync_charger(
             await db.execute(
                 """
                 UPDATE charging_stations
-                SET local_list_synced_at = NOW(),
-                    local_list_last_status = $1
+                SET local_list_last_status = $1
                 WHERE id = $2
                 """,
                 status,

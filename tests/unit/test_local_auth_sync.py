@@ -280,9 +280,10 @@ class TestSyncChargerFailureModes:
         # Version held at current.
         assert result.version == 4
         # DB UPDATE was the "stamp last_status only" variant — does NOT mention
-        # local_list_version assignment.
+        # local_list_version or local_list_synced_at assignment.
         update_call = db.execute.await_args_list[-1]
         assert "local_list_version" not in update_call.args[0]
+        assert "local_list_synced_at" not in update_call.args[0]
         assert "local_list_last_status" in update_call.args[0]
         assert update_call.args[1] == "NotSupported"
 
@@ -487,3 +488,33 @@ class TestBootSchedulesLocalAuthSync:
         )
         await session._delayed_local_auth_sync()
         assert called["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_delayed_local_auth_sync_propagates_own_cancellation(
+        self, _session_factory, monkeypatch
+    ) -> None:
+        session = _session_factory(pg_pool=MagicMock())
+        replay_gate = asyncio.Event()
+
+        async def _slow_replay() -> None:
+            await replay_gate.wait()
+
+        session._replay_task = asyncio.create_task(_slow_replay())
+
+        sync_called = {"count": 0}
+
+        async def _fake_sync(*args: Any, **kwargs: Any) -> SyncResult:
+            sync_called["count"] += 1
+            return SyncResult(status="Accepted", version=1, entries=0)
+
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.sync_local_auth_list", _fake_sync)
+
+        task = asyncio.create_task(session._delayed_local_auth_sync())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sync_called["count"] == 0
+        replay_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await session._replay_task
