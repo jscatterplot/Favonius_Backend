@@ -141,8 +141,14 @@ class DataSyncService:
         if table_name in self._missing_relations:
             return
         self._missing_relations.add(table_name)
+        relation_name = table_name.split(":", 1)[0]
+        missing_target = (
+            f"required source column(s) in table '{relation_name}'"
+            if isinstance(exc, asyncpg.UndefinedColumnError)
+            else f"source table '{relation_name}'"
+        )
         self.logger.warning(
-            f"Skipping {sync_label}: source table '{table_name}' does not exist on this "
+            f"Skipping {sync_label}: {missing_target} does not exist on this "
             f"deployment (migration-only schema). Suppressing further errors until restart. "
             f"Underlying error: {exc}"
         )
