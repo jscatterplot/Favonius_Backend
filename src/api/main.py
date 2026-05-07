@@ -414,7 +414,7 @@ async def lifespan(app: FastAPI):
     # of each calendar month in the depot's local timezone.
     from .monthly_scheduler import run_monthly_scheduler  # noqa: PLC0415
 
-    asyncio.create_task(run_monthly_scheduler(ts_pool))
+    _create_background_task(run_monthly_scheduler(ts_pool))
     logger.info("Monthly report-draft scheduler started")
 
     yield
@@ -5049,16 +5049,6 @@ class EnergyReportResponse(BaseModel):
 # ── Report & AgentAction models ───────────────────────────────────────────────
 
 
-class ReportKind(str):
-    """Allowed kind values for a Report row."""
-
-    WEEKLY_OPS = "weekly_ops"
-    MONTHLY_SAVINGS = "monthly_savings"
-    MONTHLY_CONSUMPTION = "monthly_consumption"
-    INCIDENT = "incident"
-    COMPLIANCE = "compliance"
-
-
 class Report(BaseModel):
     """A persisted report row."""
 
@@ -8362,7 +8352,7 @@ async def _handle_reports_approve(
                 export_url  = $4
             WHERE id = $1::uuid
               AND depot_id = $2::uuid
-              AND status = 'draft'
+              AND status IN ('draft', 'pending')
             RETURNING id::text, approved_at
             """,
             report_id,
@@ -8374,7 +8364,7 @@ async def _handle_reports_approve(
     if not updated:
         raise HTTPException(
             status_code=404,
-            detail=f"Report {report_id} not found or not in draft status",
+            detail=f"Report {report_id} not found or not in approvable status",
         )
 
     return {
