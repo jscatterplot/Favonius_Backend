@@ -8226,16 +8226,14 @@ async def _handle_reports_generate(
 
     # Convert local calendar dates → UTC datetimes for storage.
     # period_start = midnight at start of first day in depot TZ.
-    # period_end   = last microsecond of last day in depot TZ (midnight of next day - 1µs).
+    # period_end   = exclusive upper bound: midnight of day after last day in depot TZ.
     period_start_utc = datetime(
         period_start_date.year, period_start_date.month, period_start_date.day,
         0, 0, 0, tzinfo=tz,
     ).astimezone(timezone.utc)
     _next_day = period_end_date + timedelta(days=1)
-    period_end_utc = (
-        datetime(
-            _next_day.year, _next_day.month, _next_day.day, 0, 0, 0, tzinfo=tz,
-        ) - timedelta(microseconds=1)
+    period_end_utc = datetime(
+        _next_day.year, _next_day.month, _next_day.day, 0, 0, 0, tzinfo=tz,
     ).astimezone(timezone.utc)
 
     if dry_run:
@@ -8582,7 +8580,7 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
         handler=_handle_agent_action_approve,
     ),
     "agents.action.reject": _CommandSpec(
-        required_permission=Permission.DEPOT_VIEW,
+        required_permission=Permission.DEPOT_MANAGE,
         handler=_handle_agent_action_reject,
     ),
     "agents.action.rollback": _CommandSpec(
@@ -8611,7 +8609,7 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
     | `reports.generate` | `depot:view` (viewer+) | `kind`, `title`, `groupBy`, `periodStart`, `periodEnd` |
     | `reports.approve` | `depot:manage` (operator+) | `reportId` |
     | `agents.action.approve` | `depot:manage` (operator+) | `actionId` |
-    | `agents.action.reject` | `depot:view` (viewer+) | `actionId` |
+    | `agents.action.reject` | `depot:manage` (operator+) | `actionId` |
     | `agents.action.rollback` | `depot:manage` (operator+) | `actionId` |
 
     Set `dry_run: true` to validate and simulate the command without side effects.
