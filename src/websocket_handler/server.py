@@ -592,12 +592,13 @@ class OCPPWebSocketServer:
         # Most chargers send the OCPP-spec single-segment path
         # ``/ocpp/{charge_point_id}``, but some integrations (e.g. the HRX
         # Vilnius pilot's ABB Terra AC wallboxes) embed the depot routing
-        # in the path: ``/ocpp/{depot_id}/{charger_serial}``. The OCPP 1.6
-        # spec treats charge_point_id as opaque, so we accept any number of
-        # segments after ``/ocpp/`` and use the LAST segment as the station
-        # id (the actual charger identity). The intermediate segments are
-        # treated as depot routing context and discarded — the canonical
-        # station id is still resolved through the alias table downstream.
+        # in the path: ``/ocpp/{canonical_station_id}/{charger_serial}``.
+        # The OCPP 1.6 spec treats charge_point_id as opaque, so we accept
+        # any number of segments after ``/ocpp/`` and use the LAST segment
+        # as the station id (the actual charger identity). The penultimate
+        # segment, when it matches a registered charging_stations row, is
+        # used to auto-register an alias so the canonical id is resolved
+        # downstream — see ``ensure_station_alias`` below.
         if protocol == "ocpp" and len(path_parts) > 1:
             station_id = path_parts[-1]
             if len(path_parts) > 2:
@@ -615,6 +616,48 @@ class OCPPWebSocketServer:
             station_id = f"station_{connection_id}"
 
         resolver = self.supabase_client or self.timescale_client
+
+        # Auto-register a station alias for multi-segment OCPP paths.
+        #
+        # When the path is ``/ocpp/{parent}/{serial}`` and ``{parent}`` is a
+        # known charging_stations.station_id, upsert ``serial → parent`` so
+        # the alias table maps the trailing serial (which the charger sends
+        # as its CP id and Basic Auth username target) to the canonical id
+        # the operator provisioned. The DB query enforces that the canonical
+        # already exists; existing alias rows are never overwritten.
+        #
+        # Security: this widens the alias table but not authorization.
+        # Basic Auth still gates every connection — a malicious charger that
+        # crafts ``/ocpp/{real_canonical}/{junk_serial}`` only burns one
+        # alias row before being rejected on password mismatch (DoS bounded
+        # by the geo-block + per-IP connection cap above).
+        if (
+            protocol == "ocpp"
+            and len(path_parts) > 2
+            and resolver
+            and hasattr(resolver, "ensure_station_alias")
+        ):
+            parent_segment = path_parts[-2]
+            try:
+                registered = await resolver.ensure_station_alias(
+                    station_id,
+                    parent_segment,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Auto-alias upsert failed for %s → %s: %s",
+                    station_id,
+                    parent_segment,
+                    exc,
+                )
+            else:
+                if registered:
+                    self.logger.info(
+                        "Auto-registered OCPP station alias %s → %s " "(source=auto-multipath)",
+                        station_id,
+                        parent_segment,
+                    )
+
         if resolver and hasattr(resolver, "resolve_station_id"):
             try:
                 canonical_station_id = await resolver.resolve_station_id(station_id)

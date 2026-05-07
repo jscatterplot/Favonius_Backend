@@ -1948,6 +1948,47 @@ class TimescaleClient:
             )
         return str(canonical) if canonical else station_id
 
+    async def ensure_station_alias(
+        self,
+        alias_station_id: str,
+        canonical_station_id: str,
+        *,
+        source: str = "auto-multipath",
+        notes: str = "Auto-registered from OCPP multi-segment path",
+    ) -> bool:
+        """Best-effort upsert of an OCPP station alias.
+
+        Inserts ``(alias_station_id → canonical_station_id)`` only when the
+        canonical id matches an existing ``charging_stations.station_id`` row
+        and no row already exists for the alias. Idempotent — existing aliases
+        are never overwritten, even if they point at a different canonical.
+        Returns ``True`` iff a new row was actually created.
+
+        The alias only enables resolution; Basic Auth still gates every
+        connection, so an attacker who supplies a real canonical in the path
+        but an unknown serial gets a wasted alias row and a 1008 close — no
+        authorization boundary is crossed.
+        """
+        if alias_station_id == canonical_station_id:
+            return False
+        async with self.pg_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO ocpp_station_aliases
+                    (alias_station_id, canonical_station_id, source, notes)
+                SELECT $1, $2, $3, $4
+                WHERE EXISTS (
+                    SELECT 1 FROM charging_stations WHERE station_id = $2
+                )
+                ON CONFLICT (alias_station_id) DO NOTHING
+                """,
+                alias_station_id,
+                canonical_station_id,
+                source,
+                notes,
+            )
+        return isinstance(result, str) and result.endswith(" 1")
+
     async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
         """Return True when username is the canonical station id or an active alias."""
         if hmac.compare_digest(username, station_id):

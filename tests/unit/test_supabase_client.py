@@ -48,6 +48,77 @@ class TestSupabaseClient:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_inserts_row_when_canonical_exists(self, supabase_client):
+        """A new alias is registered when the canonical row exists in charging_stations."""
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        supabase_client.db_pool = pool
+
+        registered = await supabase_client.ensure_station_alias(
+            "TACW1141622G1438",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is True
+        query = conn.execute.await_args.args[0]
+        assert "INSERT INTO ocpp_station_aliases" in query
+        # WHERE EXISTS gate ensures we don't invent canonical ids the
+        # operator never provisioned.
+        assert "WHERE EXISTS" in query and "charging_stations" in query
+        # Idempotent: re-runs from the same charger must not error.
+        assert "ON CONFLICT (alias_station_id) DO NOTHING" in query
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_returns_false_on_conflict(self, supabase_client):
+        """An existing alias row is not overwritten — return False, do not raise."""
+        conn = AsyncMock()
+        # ON CONFLICT DO NOTHING returns "INSERT 0 0" when the row already exists.
+        conn.execute = AsyncMock(return_value="INSERT 0 0")
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        supabase_client.db_pool = pool
+
+        registered = await supabase_client.ensure_station_alias(
+            "TACW1141622G1438",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_skips_self_referential_alias(self, supabase_client):
+        """``alias == canonical`` would violate the table CHECK; skip without DB call."""
+        supabase_client.db_pool = MagicMock()
+
+        registered = await supabase_client.ensure_station_alias(
+            "hrx-uab_hrx-vilnius-002",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is False
+        supabase_client.db_pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_returns_false_when_pool_unset(self, supabase_client):
+        """Without a DB pool the helper is a no-op rather than crashing."""
+        supabase_client.db_pool = None
+
+        registered = await supabase_client.ensure_station_alias(
+            "TACW1141622G1438",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_validate_basic_auth_prefers_alias_credential(self, supabase_client):
         """Alias logins validate against the alias row when both credentials exist."""
         alias_password_hash = bcrypt.hashpw(
@@ -100,7 +171,9 @@ class TestSupabaseClient:
             b"valid-password",
             bcrypt.gensalt(rounds=4),
         ).decode("utf-8")
-        supabase_client.fetch_one = AsyncMock(return_value={"id": 42, "password_hash": password_hash})
+        supabase_client.fetch_one = AsyncMock(
+            return_value={"id": 42, "password_hash": password_hash}
+        )
         supabase_client.logger = MagicMock()
 
         conn = AsyncMock()

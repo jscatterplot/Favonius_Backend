@@ -1,7 +1,7 @@
 """Unit tests for TimescaleClient."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -297,3 +297,61 @@ class TestTimescaleClient:
         query = mock_conn.execute.await_args.args[0]
         assert "end_time IS NULL" in query
         assert "source = 'live'" in query
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_inserts_when_canonical_exists(self, timescale_client):
+        """A new alias is upserted with the canonical-exists guard + ON CONFLICT."""
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        registered = await timescale_client.ensure_station_alias(
+            "TACW1141622G1438",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is True
+        query = mock_conn.execute.await_args.args[0]
+        assert "INSERT INTO ocpp_station_aliases" in query
+        assert "WHERE EXISTS" in query and "charging_stations" in query
+        assert "ON CONFLICT (alias_station_id) DO NOTHING" in query
+        # Default source label so operators can audit auto-registered rows.
+        positional_args = mock_conn.execute.await_args.args
+        assert "auto-multipath" in positional_args
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_skips_self_referential_alias(self, timescale_client):
+        """``alias == canonical`` would violate the table CHECK; skip without DB call."""
+        mock_pool = MagicMock()
+        timescale_client.pg_pool = mock_pool
+
+        registered = await timescale_client.ensure_station_alias(
+            "hrx-uab_hrx-vilnius-002",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is False
+        mock_pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_returns_false_on_conflict(self, timescale_client):
+        """An existing alias row is not overwritten — return False, do not raise."""
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 0")
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        registered = await timescale_client.ensure_station_alias(
+            "TACW1141622G1438",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is False
