@@ -201,6 +201,14 @@ class TimescaleClient:
             async with self.pg_pool.acquire() as conn:
                 inserted = 0
                 for data in telemetry_data:
+                    station_id = data.get("station_id")
+                    connector_id = data.get("connector_id", 1)
+                    session_id = data.get("session_id")
+                    power_kw = data.get("power_kw")
+                    soc_percent = data.get("soc_percent")
+                    max_charge_kw = data.get("max_charge_power_kw")
+                    transaction_id = self._coerce_transaction_id(session_id)
+
                     raw_sample = data.get("raw_sample")
                     if raw_sample:
                         await conn.execute(
@@ -220,9 +228,9 @@ class TimescaleClient:
                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                             """,
                             raw_sample.get("timestamp", data["time"]),
-                            data.get("station_id"),
-                            data.get("connector_id", 1),
-                            int(data["session_id"]) if data.get("session_id") else None,
+                            station_id,
+                            connector_id,
+                            transaction_id,
                             raw_sample.get("measurand"),
                             raw_sample.get("phase"),
                             raw_sample.get("location"),
@@ -232,32 +240,34 @@ class TimescaleClient:
                             raw_sample.get("value"),
                         )
 
-                    vehicle_id = data.get("vehicle_id")
-                    session_id = data.get("session_id")
-                    station_id = data.get("station_id")
-                    connector_id = data.get("connector_id", 1)
+                    # Live session metrics: keep the open charging_sessions row
+                    # fresh so per-charger power/SoC is observable in real time
+                    # without requiring vehicle attribution.
+                    if station_id and transaction_id is not None:
+                        await self._update_session_live_metrics(
+                            conn, station_id, transaction_id, power_kw, soc_percent, max_charge_kw
+                        )
 
+                    # Vehicle-keyed optimizer view (telemetry table). Only
+                    # populated when the row can be attributed to a vehicle via
+                    # the open charging_sessions row. Rows without a vehicle
+                    # are intentionally skipped — telemetry has vehicle_id
+                    # NOT NULL and is read by the optimizer's StateAssembler.
+                    vehicle_id = data.get("vehicle_id")
                     if not vehicle_id:
                         vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
-                    if not vehicle_id:
-                        vehicle_id = await self._resolve_vehicle_id_from_id_token(
-                            conn, station_id, connector_id
-                        )
 
                     if not vehicle_id:
                         self.logger.debug(
-                            f"Skipping telemetry: no vehicle_id for station_id={station_id}, "
-                            f"connector_id={connector_id}, session_id={session_id}"
+                            f"Skipping vehicle-keyed telemetry insert: no vehicle_id for "
+                            f"station_id={station_id}, connector_id={connector_id}, "
+                            f"session_id={session_id}"
                         )
                         continue
 
                     charger_id = await self._resolve_charger_id(conn, station_id)
-
-                    soc_percent = data.get("soc_percent")
                     soc = (soc_percent / 100.0) if soc_percent is not None else None
-                    charging_kw = data.get("power_kw")
-                    is_plugged = charging_kw is not None and charging_kw > 0.1
-                    max_charge_kw = data.get("max_charge_power_kw")
+                    is_plugged = power_kw is not None and power_kw > 0.1
 
                     await conn.execute(
                         """
@@ -271,7 +281,7 @@ class TimescaleClient:
                         str(vehicle_id),
                         str(charger_id) if charger_id else None,
                         soc,
-                        charging_kw,
+                        power_kw,
                         is_plugged,
                         max_charge_kw,
                     )
@@ -342,38 +352,66 @@ class TimescaleClient:
             )
         return row["vehicle_id"] if row and row["vehicle_id"] else None
 
-    async def _resolve_vehicle_id_from_id_token(
-        self, conn: asyncpg.Connection, station_id: Optional[str], connector_id: int
-    ) -> Optional[str]:
-        if not station_id:
+    @staticmethod
+    def _coerce_transaction_id(value: Any) -> Optional[int]:
+        """Coerce a session_id-like value into an OCPP 1.6 integer transaction id.
+
+        Returns None for UUID session ids and other non-integer inputs so the
+        caller can safely pass it to columns typed BIGINT.
+        """
+        if value is None:
             return None
-        row = await conn.fetchrow(
-            """
-            SELECT id_token
-            FROM transaction_events_v2g
-            WHERE station_id = $1 AND connector_id = $2
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            station_id,
-            connector_id,
-        )
-        if not row or not row["id_token"]:
+        s = str(value).strip()
+        if not s:
             return None
-        id_token = row["id_token"]
-        if isinstance(id_token, str):
-            try:
-                id_token = json.loads(id_token)
-            except json.JSONDecodeError:
-                id_token = {}
-        token_value = id_token.get("idToken") or id_token.get("id_token")
-        if not token_value:
+        try:
+            return int(s)
+        except (TypeError, ValueError):
             return None
-        vehicle_row = await conn.fetchrow(
-            "SELECT id AS vehicle_id FROM vehicles WHERE id_tag = $1 LIMIT 1",
-            token_value,
-        )
-        return vehicle_row["vehicle_id"] if vehicle_row else None
+
+    async def _update_session_live_metrics(
+        self,
+        conn: asyncpg.Connection,
+        station_id: str,
+        transaction_id: int,
+        power_kw: Optional[float],
+        soc_percent: Optional[float],
+        max_charge_kw: Optional[float],
+    ) -> None:
+        """Refresh charging_sessions live fields for the open session.
+
+        Writes per-MeterValues snapshots of charging power and SoC onto the
+        open charging_sessions row so per-charger charging rate is observable
+        without joining telemetry. ``max_charge_power_kw`` is bumped only when
+        the new value is higher so the column captures the session peak.
+        """
+        soc = (soc_percent / 100.0) if soc_percent is not None else None
+        try:
+            await conn.execute(
+                """
+                UPDATE charging_sessions
+                   SET current_power_kw     = COALESCE($3, current_power_kw),
+                       current_soc          = COALESCE($4, current_soc),
+                       max_charge_power_kw  = GREATEST(max_charge_power_kw, $5),
+                       updated_at           = NOW()
+                 WHERE station_id     = $1
+                   AND transaction_id = $2
+                   AND end_time IS NULL
+                   AND source = 'live'
+                """,
+                station_id,
+                transaction_id,
+                power_kw,
+                soc,
+                max_charge_kw,
+            )
+        except Exception as exc:
+            self.logger.debug(
+                "Live session metric update skipped: station=%s tx=%s err=%s",
+                station_id,
+                transaction_id,
+                exc,
+            )
 
     async def _resolve_charger_id(
         self, conn: asyncpg.Connection, station_id: Optional[str]
