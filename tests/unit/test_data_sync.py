@@ -486,7 +486,7 @@ class TestDataSyncSchemaResilience:
 
         await service.sync_charging_sessions()
 
-        assert "charging_sessions" in service._missing_relations
+        assert DataSyncService._CHARGING_SESSIONS_SYNC_COLUMN_KEY in service._missing_relations
         service.logger.error.assert_not_called()
 
     @pytest.mark.asyncio
