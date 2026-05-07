@@ -392,10 +392,7 @@ class TimescaleClient:
                 UPDATE charging_sessions
                    SET current_power_kw     = COALESCE($3, current_power_kw),
                        current_soc          = COALESCE($4, current_soc),
-                       max_charge_power_kw  = GREATEST(
-                           COALESCE(max_charge_power_kw, 0),
-                           COALESCE($5, max_charge_power_kw, 0)
-                       ),
+                       max_charge_power_kw  = GREATEST(max_charge_power_kw, $5),
                        updated_at           = NOW()
                  WHERE station_id     = $1
                    AND transaction_id = $2
