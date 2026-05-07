@@ -50,6 +50,7 @@ class TestOCPPWebSocketServer:
         client.connect = AsyncMock()
         client.disconnect = AsyncMock()
         client.resolve_station_id = AsyncMock(side_effect=lambda station_id: station_id)
+        client.ensure_station_alias = AsyncMock(return_value=False)
         return client
 
     @pytest.fixture
@@ -57,6 +58,7 @@ class TestOCPPWebSocketServer:
         """Create mock Supabase client."""
         client = Mock(spec=SupabaseClient)
         client.resolve_station_id = AsyncMock(side_effect=lambda station_id: station_id)
+        client.ensure_station_alias = AsyncMock(return_value=False)
         return client
 
     @pytest.fixture
@@ -354,12 +356,13 @@ class TestOCPPWebSocketServer:
 
         Some integrations (HRX Vilnius pilot) embed depot routing in the
         WebSocket URL. The server must extract the trailing charger serial
-        as the station id, NOT the intermediate depot id, so alias
-        resolution and Basic Auth lookup target the actual charger row.
+        as the station id; the intermediate segment is used to auto-register
+        an alias so downstream alias resolution targets the canonical row.
         """
         server.supabase_client.resolve_station_id = AsyncMock(
             side_effect=lambda station_id: station_id
         )
+        server.supabase_client.ensure_station_alias = AsyncMock(return_value=False)
         websocket = self._make_websocket("10.0.0.5")
         server.security_manager = Mock()
         server.security_manager.config.require_station_auth = True
@@ -379,8 +382,52 @@ class TestOCPPWebSocketServer:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
-    async def test_ocpp_single_segment_path_unchanged(self, server):
-        """Plain ``/ocpp/{station}`` paths still extract the lone segment."""
+    async def test_ocpp_multi_segment_path_auto_registers_alias(self, server):
+        """Multi-segment OCPP paths upsert ``serial → parent`` before resolution.
+
+        This is the HRX Vilnius onboarding flow: the charger reports the
+        trailing hardware serial as its CP id, but the parent segment is
+        the operator-provisioned canonical station id. The server must
+        ask the resolver to register the alias before resolving, so the
+        first connection from a new charger does not need a manual SQL
+        insert to translate username → canonical.
+        """
+        registered_aliases = []
+
+        async def _ensure_and_resolve(alias, canonical):
+            registered_aliases.append((alias, canonical))
+            return True
+
+        server.supabase_client.ensure_station_alias = AsyncMock(side_effect=_ensure_and_resolve)
+        # Resolver returns canonical AFTER ensure_station_alias has run, mirroring
+        # the production flow (the freshly-inserted row is now visible).
+        server.supabase_client.resolve_station_id = AsyncMock(
+            return_value="hrx-uab_hrx-vilnius-002"
+        )
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-002/TACW1141622G1438")
+
+        assert registered_aliases == [("TACW1141622G1438", "hrx-uab_hrx-vilnius-002")]
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1438")
+        # Once the alias is registered and resolved, auth runs on canonical.
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-002",
+            {},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_multi_segment_alias_failure_does_not_block(self, server):
+        """A DB error from ensure_station_alias must not abort the connection."""
+        server.supabase_client.ensure_station_alias = AsyncMock(
+            side_effect=RuntimeError("pool exhausted")
+        )
         server.supabase_client.resolve_station_id = AsyncMock(
             side_effect=lambda station_id: station_id
         )
@@ -391,9 +438,34 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
+        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-002/TACW1141622G1438")
+
+        # Resolution still ran with the unaliased serial — auth fails as a
+        # natural consequence, not because we crashed the request.
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1438")
+        server.security_manager.authenticate_station.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_single_segment_path_unchanged(self, server):
+        """Plain ``/ocpp/{station}`` paths still extract the lone segment."""
+        server.supabase_client.resolve_station_id = AsyncMock(
+            side_effect=lambda station_id: station_id
+        )
+        server.supabase_client.ensure_station_alias = AsyncMock(return_value=False)
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
         await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
 
         server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        # Single-segment paths must NOT trigger auto-registration; nothing
+        # plausibly maps to a canonical id without a parent segment.
+        server.supabase_client.ensure_station_alias.assert_not_awaited()
 
     def test_cgnat_peer_is_trusted_proxy(self, server):
         """RFC 6598 100.64.0.0/10 peers are trusted when private-proxy headers are on.

@@ -151,6 +151,43 @@ class SupabaseClient:
         row = await self.fetch_one(query, station_id)
         return str(row["canonical_station_id"]) if row else station_id
 
+    async def ensure_station_alias(
+        self,
+        alias_station_id: str,
+        canonical_station_id: str,
+        *,
+        source: str = "auto-multipath",
+        notes: str = "Auto-registered from OCPP multi-segment path",
+    ) -> bool:
+        """Best-effort upsert of an OCPP station alias.
+
+        Mirror of ``TimescaleClient.ensure_station_alias`` for the Supabase-
+        backed pool. Inserts ``(alias → canonical)`` only when the canonical
+        id matches a real ``charging_stations.station_id`` row and no row
+        already exists for the alias. Returns ``True`` iff a row was created.
+        """
+        if alias_station_id == canonical_station_id:
+            return False
+        if not self.db_pool:
+            return False
+        async with self.db_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO ocpp_station_aliases
+                    (alias_station_id, canonical_station_id, source, notes)
+                SELECT $1, $2, $3, $4
+                WHERE EXISTS (
+                    SELECT 1 FROM charging_stations WHERE station_id = $2
+                )
+                ON CONFLICT (alias_station_id) DO NOTHING
+                """,
+                alias_station_id,
+                canonical_station_id,
+                source,
+                notes,
+            )
+        return isinstance(result, str) and result.endswith(" 1")
+
     async def lookup_tenant_context(self, station_id: str) -> Optional[Dict[str, Any]]:
         """Return ``{"organization_id", "depot_id"}`` for a charger or None.
 
