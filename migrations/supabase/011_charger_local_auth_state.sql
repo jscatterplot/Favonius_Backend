@@ -1,4 +1,9 @@
--- Migration 034: track local-authorization-list state per charger.
+-- Supabase migration 011: track local-authorization-list state per charger.
+--
+-- Originally landed as TimescaleDB migration 034 but `charging_stations` is a
+-- Supabase-owned static table (see migrations/029_remove_static_shadows.sql);
+-- running it against TS aborted the migration runner and looped the container.
+-- Apply with: python scripts/run_migrations.py --target supabase
 --
 -- Backs the offline RFID access feature: the WS handler pushes the approved
 -- idTag list to each charger via OCPP 1.6 SendLocalList on BootNotification.
