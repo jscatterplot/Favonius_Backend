@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 from ocpp.v16.enums import AuthorizationStatus
 
 from src.adapters.ocpp.charge_point import FleetChargePoint
+from src.adapters.ocpp.local_auth_sync import sync_charger as sync_local_auth_list
 
 from .monitoring import ACTIVE_TRANSACTIONS, PROFILE_PUSH_LATENCY
 from .rfid_authorization import RFIDAuthStatus
@@ -124,6 +125,7 @@ class OCPP16Session:
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
         self._replay_task: Optional[asyncio.Task[None]] = None
+        self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
         self._boot_trigger_task: Optional[asyncio.Task[None]] = None
         self._background_tasks: Set[asyncio.Task[Any]] = set()
         self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
@@ -642,6 +644,17 @@ class OCPP16Session:
             self._replay_task.cancel()
         self._replay_task = asyncio.create_task(self._delayed_replay())
 
+        # Push the approved idTag list to the charger so it can authorize
+        # RFID tags while offline. Runs after the queued-command replay so
+        # SetChargingProfile and SendLocalList don't race on the same socket
+        # for vendors that mishandle interleaved request/response cycles.
+        if (
+            self._local_auth_sync_task is not None
+            and not self._local_auth_sync_task.done()
+        ):
+            self._local_auth_sync_task.cancel()
+        self._local_auth_sync_task = asyncio.create_task(self._delayed_local_auth_sync())
+
     async def _on_security_event(
         self,
         cp_id: str,
@@ -699,6 +712,56 @@ class OCPP16Session:
             current = asyncio.current_task()
             if current is not None and self._replay_task is current:
                 self._replay_task = None
+
+    async def _delayed_local_auth_sync(self) -> None:
+        """Push the approved idTag list to the charger after BootNotification.
+
+        Awaits the queued-command replay (which itself waits for
+        ``REPLAY_BACKOFF_SECONDS``) so SendLocalList doesn't interleave with
+        SetChargingProfile pushes on chargers that mishandle concurrent
+        request/response cycles. If replay has already finished or was
+        cancelled, the sync runs straight away.
+
+        Errors are caught and logged — a charger that rejects SendLocalList
+        falls back to central Authorize while online and simply has no
+        offline auth coverage. That degradation is acceptable; raising here
+        would tear the WebSocket handler.
+        """
+        try:
+            replay_task = self._replay_task
+            if replay_task is not None:
+                try:
+                    await replay_task
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                except Exception:
+                    pass
+            pool = getattr(self._timescale, "pg_pool", None)
+            if pool is None:
+                logger.debug(
+                    "local_auth_sync station=%s skipped: timescale pg_pool not initialised",
+                    self._station_id,
+                )
+                return
+            await sync_local_auth_list(self._cp, pool, self._station_id)
+        except asyncio.CancelledError:
+            logger.debug(
+                "local_auth_sync cancelled for station=%s",
+                self._station_id,
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "local_auth_sync failed for station=%s: %s",
+                self._station_id,
+                exc,
+            )
+        finally:
+            current = asyncio.current_task()
+            if current is not None and self._local_auth_sync_task is current:
+                self._local_auth_sync_task = None
 
     def _is_connection_open(self) -> bool:
         """Best-effort check whether the charger socket is still open."""
