@@ -360,6 +360,40 @@ class TestFormatChargerItem:
         )
         assert item["status"] == "fault"
 
+    def test_liveness_override_wins_over_stale_connector_status(self):
+        """LivenessHub cache (fresh) supersedes stale connector_status MAX.
+
+        Regression for "frontend says offline despite a heartbeat 1 min ago":
+        connector_status only updates on state changes, so an idle charger
+        with Heartbeats flowing every 5 min has a stale MAX(timestamp).
+        The override carries the actual most-recent OCPP frame timestamp
+        and must drive both ``last_interaction_at`` AND ``status``.
+        """
+        fresh = _ago(30)  # 30 s ago
+        stale = _ago(50 * 60)  # 50 min ago
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={"ocpp_status": "Available", "last_heartbeat_at": stale},
+            open_session=None,
+            now=NOW,
+            last_interaction_override=fresh,
+        )
+        assert item["status"] == "idle", "fresh override → not offline"
+        assert item["last_interaction_at"] == fresh.isoformat()
+
+    def test_no_override_falls_back_to_connector_status(self):
+        """Cache cold → endpoint passes None override → fall back to DB value."""
+        recent = _ago(5)
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={"ocpp_status": "Available", "last_heartbeat_at": recent},
+            open_session=None,
+            now=NOW,
+            last_interaction_override=None,
+        )
+        assert item["status"] == "idle"
+        assert item["last_interaction_at"] == recent.isoformat()
+
 
 class TestFormatVehicleItem:
     def test_vehicle_offline_when_no_telemetry(self):
