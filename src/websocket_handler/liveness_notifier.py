@@ -91,11 +91,17 @@ class LivenessNotifier:
             return
 
         try:
+            now_iso = datetime.now(timezone.utc).isoformat()
             payload = json.dumps(
                 {
                     "station_id": station_id,
                     "organization_id": str(organization_id),
-                    "last_interaction_at": datetime.now(timezone.utc).isoformat(),
+                    # Frame just arrived — interaction and server-time
+                    # timestamps are intentionally equal at the producer.
+                    # Two fields so clients can anchor freshness on event
+                    # arrival time, decoupling from client clock skew.
+                    "last_interaction_at": now_iso,
+                    "server_time": now_iso,
                 }
             )
         except Exception as exc:  # defensive — payload values are simple

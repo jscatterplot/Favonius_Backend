@@ -44,6 +44,7 @@ async def test_notification_fans_out_to_all_subscribers_for_org() -> None:
             "station_id": "CP-1",
             "organization_id": "org-A",
             "last_interaction_at": "2026-05-06T10:00:00Z",
+            "server_time": "2026-05-06T10:00:00Z",
         }
     )
     hub._on_notify(MagicMock(), 0, "charger_liveness", payload)
@@ -56,6 +57,7 @@ async def test_notification_fans_out_to_all_subscribers_for_org() -> None:
         == {
             "station_id": "CP-1",
             "last_interaction_at": "2026-05-06T10:00:00Z",
+            "server_time": "2026-05-06T10:00:00Z",
         }
     )
 
@@ -128,6 +130,7 @@ async def test_full_subscriber_queue_drops_oldest_event() -> None:
             "station_id": "CP-1",
             "organization_id": "org-A",
             "last_interaction_at": "2026-05-06T10:00:00Z",
+            "server_time": "2026-05-06T10:00:00Z",
         }
     )
     hub._on_notify(MagicMock(), 0, "charger_liveness", payload)
@@ -142,7 +145,32 @@ async def test_full_subscriber_queue_drops_oldest_event() -> None:
     assert drained[-1] == {
         "station_id": "CP-1",
         "last_interaction_at": "2026-05-06T10:00:00Z",
+        "server_time": "2026-05-06T10:00:00Z",
     }
+
+
+@pytest.mark.asyncio
+async def test_server_time_field_propagates_to_subscribers() -> None:
+    """Frontend uses ``server_time`` to compute clock-skew offset.
+
+    Producer always emits the field; the hub forwards it verbatim.
+    """
+    hub = _make_hub()
+    q = hub.subscribe("org-A")
+
+    payload = json.dumps(
+        {
+            "station_id": "CP-7",
+            "organization_id": "org-A",
+            "last_interaction_at": "2026-05-06T11:23:45.678+00:00",
+            "server_time": "2026-05-06T11:23:45.678+00:00",
+        }
+    )
+    hub._on_notify(MagicMock(), 0, "charger_liveness", payload)
+
+    event = await asyncio.wait_for(q.get(), timeout=0.1)
+    assert event["server_time"] == "2026-05-06T11:23:45.678+00:00"
+    assert event["last_interaction_at"] == "2026-05-06T11:23:45.678+00:00"
 
 
 @pytest.mark.asyncio

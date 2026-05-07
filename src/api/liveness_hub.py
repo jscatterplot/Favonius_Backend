@@ -208,9 +208,12 @@ class LivenessHub:
 
             # Strip organization_id before fanning out — subscribers are
             # already scoped to their org and the front-end doesn't need it.
+            # ``server_time`` lets clients correct for clock skew (compute
+            # delta = received_at_local - server_time once on connect).
             outbound = {
                 "station_id": event.get("station_id"),
                 "last_interaction_at": event.get("last_interaction_at"),
+                "server_time": event.get("server_time"),
             }
             for q in bucket:
                 try:

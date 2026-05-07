@@ -15,8 +15,17 @@ from typing import Any, Literal, Optional
 # centralized. Re-tune here if production tells us the numbers are wrong.
 
 #: Charger is "offline" if no connector has reported a status in this many
-#: seconds. Two heartbeat intervals (default 30 s) is the rule of thumb.
-CHARGER_OFFLINE_AGE_S: float = 60.0
+#: seconds. Aligned with the frontend's SSE-driven liveness threshold so the
+#: REST-derived ``charger.status`` and the client-side stale-detection give
+#: the same answer. Heartbeat interval is 300 s (negotiated via
+#: BootNotification.conf), so 360 s = one missed heartbeat tolerance.
+#:
+#: NOTE: this is a fallback used at API-response time. The canonical live
+#: signal is the SSE stream at ``GET /depots/{id}/liveness/stream``; the
+#: frontend should treat the SSE-driven Map<stationId, lastInteractionAt>
+#: as authoritative for offline detection. ``charger.status === "offline"``
+#: from this REST response is a starting point on initial page load.
+CHARGER_OFFLINE_AGE_S: float = 360.0
 
 #: Vehicle is "offline" if telemetry hasn't arrived in this many seconds.
 VEHICLE_OFFLINE_AGE_S: float = 30 * 60.0
