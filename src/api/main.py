@@ -5211,6 +5211,7 @@ async def _fetch_session_rows(
     charger_id_by_ocpp_id: dict[str, str],
     from_date: date,
     to_date: date,
+    ts_conn: Optional[asyncpg.Connection] = None,
 ) -> list[SessionRow]:
     """Fetch charging_sessions rows in [from, to] (inclusive) in depot TZ."""
     if not db_pools or db_pools.ts is None:
@@ -5239,8 +5240,11 @@ async def _fetch_session_rows(
         ORDER BY cs.start_time
         """
 
-    async with db_pools.ts.acquire() as conn:
-        records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name, depot_id)
+    if ts_conn is None:
+        async with db_pools.ts.acquire() as conn:
+            records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name, depot_id)
+    else:
+        records = await ts_conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name, depot_id)
 
     rows: list[SessionRow] = []
     for r in records:
@@ -8168,6 +8172,7 @@ async def _handle_reports_generate(
     depot_id: str,
     dry_run: bool,
     user: Optional[dict] = None,
+    ts_conn: Optional[asyncpg.Connection] = None,
 ) -> dict:
     """Create a draft Report row.
 
@@ -8263,6 +8268,7 @@ async def _handle_reports_generate(
             charger_id_by_ocpp_id,
             period_start_date,
             period_end_date,
+            ts_conn=ts_conn,
         )
         agg_rows = aggregate_energy_rows(
             sessions,
@@ -8277,8 +8283,26 @@ async def _handle_reports_generate(
             {"rows": agg_rows, "currency": currency, "group_by": group_by}
         )
 
-    async with db_pools.ts.acquire() as conn:
-        row = await conn.fetchrow(
+    if ts_conn is None:
+        async with db_pools.ts.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO reports
+                    (depot_id, title, kind, status, period_start, period_end, group_by, data)
+                VALUES
+                    ($1::uuid, $2, $3, 'draft', $4, $5, $6, $7::jsonb)
+                RETURNING id::text, created_at
+                """,
+                depot_id,
+                title,
+                kind,
+                period_start_utc,
+                period_end_utc,
+                group_by,
+                stored_data,
+            )
+    else:
+        row = await ts_conn.fetchrow(
             """
             INSERT INTO reports
                 (depot_id, title, kind, status, period_start, period_end, group_by, data)
@@ -8381,50 +8405,66 @@ async def _handle_agent_action_approve(
     if not db_pools:
         raise DatabaseError("Database not available")
 
+    report_result: Optional[dict] = None
     async with db_pools.ts.acquire() as conn:
-        action_row = await conn.fetchrow(
-            "SELECT * FROM agent_actions WHERE id = $1::uuid AND depot_id = $2::uuid",
-            action_id,
-            depot_id,
-        )
-        if not action_row:
-            raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
-
-        current_status = action_row["status"]
-        if current_status not in ("pending", "shadow"):
-            raise HTTPException(
-                status_code=409,
-                detail=f"Action is already '{current_status}' and cannot be approved",
-            )
-
-        action_class = action_row["action_class"]
-        report_result: Optional[dict] = None
-
-        if action_class == "report_draft":
-            payload = action_row["payload"] or {}
-            report_params = {
-                "kind": payload.get("kind"),
-                "title": payload.get("title"),
-                "groupBy": payload.get("groupBy"),
-                "periodStart": payload.get("periodStart"),
-                "periodEnd": payload.get("periodEnd"),
-            }
-            report_result = await _handle_reports_generate(
-                report_params,
-                depot_id,
-                dry_run=dry_run,
-                user=user,
-            )
-
-        if not dry_run:
-            await conn.execute(
+        async with conn.transaction():
+            action_row = await conn.fetchrow(
                 """
-                UPDATE agent_actions
-                SET status = 'executed', resolved_at = NOW()
-                WHERE id = $1::uuid
+                SELECT *
+                FROM agent_actions
+                WHERE id = $1::uuid AND depot_id = $2::uuid
+                FOR UPDATE
                 """,
-                action_row["id"],
+                action_id,
+                depot_id,
             )
+            if not action_row:
+                raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+            current_status = action_row["status"]
+            if current_status not in ("pending", "shadow"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Action is already '{current_status}' and cannot be approved",
+                )
+
+            action_class = action_row["action_class"]
+
+            if action_class == "report_draft":
+                payload = action_row["payload"] or {}
+                report_params = {
+                    "kind": payload.get("kind"),
+                    "title": payload.get("title"),
+                    "groupBy": payload.get("groupBy"),
+                    "periodStart": payload.get("periodStart"),
+                    "periodEnd": payload.get("periodEnd"),
+                }
+                report_result = await _handle_reports_generate(
+                    report_params,
+                    depot_id,
+                    dry_run=dry_run,
+                    user=user,
+                    ts_conn=conn,
+                )
+
+            if not dry_run:
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE agent_actions
+                    SET status = 'executed', resolved_at = NOW()
+                    WHERE id = $1::uuid
+                      AND depot_id = $2::uuid
+                      AND status IN ('pending', 'shadow')
+                    RETURNING id::text
+                    """,
+                    action_row["id"],
+                    depot_id,
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Action could not be approved because its status changed",
+                    )
 
     result: dict = {"actionId": action_id, "actionStatus": "executed" if not dry_run else "pending"}
     if report_result:
