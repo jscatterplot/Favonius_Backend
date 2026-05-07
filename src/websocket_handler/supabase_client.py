@@ -175,9 +175,9 @@ class SupabaseClient:
                 """
                 INSERT INTO ocpp_station_aliases
                     (alias_station_id, canonical_station_id, source, notes)
-                SELECT $1, $2, $3, $4
+                SELECT $1::VARCHAR, $2::VARCHAR, $3::VARCHAR, $4::TEXT
                 WHERE EXISTS (
-                    SELECT 1 FROM charging_stations WHERE station_id = $2
+                    SELECT 1 FROM charging_stations WHERE station_id = $2::VARCHAR
                 )
                 ON CONFLICT (alias_station_id) DO NOTHING
                 """,
