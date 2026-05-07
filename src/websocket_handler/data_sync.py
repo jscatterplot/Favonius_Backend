@@ -213,7 +213,7 @@ class DataSyncService:
                     for session in sessions:
                         session_data.append(
                             {
-                                "session_id": self._string_or_none(session.get("session_id")),
+                                "session_id": self._string_or_none(session["session_id"]),
                                 "station_id": self._string_or_none(session.get("station_id")),
                                 "vehicle_id": self._string_or_none(session.get("vehicle_id")),
                                 "organization_id": self._string_or_none(session.get("fleet_operator_id")),
@@ -521,7 +521,7 @@ class DataSyncService:
             for session in sessions:
                 session_data.append(
                     {
-                        "session_id": self._string_or_none(session.get("session_id")),
+                        "session_id": self._string_or_none(session["session_id"]),
                         "station_id": self._string_or_none(session.get("station_id")),
                         "vehicle_id": self._string_or_none(session.get("vehicle_id")),
                         "organization_id": self._string_or_none(session.get("organization_id")),
