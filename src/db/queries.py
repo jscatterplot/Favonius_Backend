@@ -1369,6 +1369,100 @@ async def resolve_id_tag_identity(
     return dict(card_rows[0]) if card_rows else None
 
 
+async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
+    """Return the approved idTag list for a charger's local authorization list.
+
+    Backs OCPP 1.6 SendLocalList: the charger holds this list locally so it
+    can authorize approved tags when the WebSocket to the backend is down.
+
+    Scoping rules mirror the central ``resolve_id_tag_identity`` path so the
+    set a charger accepts offline is a strict subset of what it would accept
+    online — there is never a tag that works offline but not online.
+
+      * Vehicle id_tags: active vehicles whose ``site_id`` matches the
+        charger's site.
+      * In ``access_mode='restricted'`` sites the per-charger
+        ``charger_vehicle_access`` matrix filters which vehicles count;
+        absent rows fall back to ``sites.charger_vehicle_access_default``.
+      * RFID cards: active cards in the same site that are linked to an
+        accessible vehicle (via ``rfid_card_vehicle_assignments``) **or** to
+        an active driver (via ``rfid_card_driver_assignments``). Drivers are
+        not constrained by the per-charger access matrix — that matrix
+        models physical reach for vehicles, not human authorization.
+      * Orphan cards (no active assignment) are excluded.
+
+    Returns each id_tag at most once, with a ``source`` discriminator
+    (``vehicle`` | ``rfid_card_vehicle`` | ``rfid_card_driver``) for metrics
+    and debug logging. Caller is responsible for shaping into the OCPP 1.6
+    ``AuthorizationData`` wire format.
+
+    Returns an empty list if the station is unknown — the caller should
+    treat that as "skip the push", not "clear the charger's list".
+    """
+    query = """
+        WITH station_info AS (
+            SELECT ch.id::uuid                       AS charging_station_id,
+                   ch.site_id::uuid                  AS site_id,
+                   s.access_mode                     AS access_mode,
+                   s.charger_vehicle_access_default  AS access_default
+            FROM charging_stations ch
+            JOIN sites s ON s.id = ch.site_id
+            WHERE ch.station_id = $1
+        ),
+        accessible_vehicles AS (
+            SELECT v.id AS vehicle_id, v.id_tag
+            FROM vehicles v, station_info si
+            WHERE v.site_id = si.site_id
+              AND v.status = 'active'
+              AND v.id_tag IS NOT NULL
+              AND (
+                  si.access_mode = 'open'
+                  OR EXISTS (
+                      SELECT 1 FROM charger_vehicle_access cva
+                      WHERE cva.charging_station_id = si.charging_station_id
+                        AND cva.vehicle_id = v.id
+                        AND cva.is_accessible = TRUE
+                  )
+                  OR (
+                      si.access_mode = 'restricted'
+                      AND si.access_default = TRUE
+                      AND NOT EXISTS (
+                          SELECT 1 FROM charger_vehicle_access cva
+                          WHERE cva.charging_station_id = si.charging_station_id
+                            AND cva.vehicle_id = v.id
+                      )
+                  )
+              )
+        )
+        SELECT id_tag, 'vehicle'::text AS source
+        FROM accessible_vehicles
+        UNION
+        SELECT c.id_tag, 'rfid_card_vehicle'::text AS source
+        FROM rfid_cards c, station_info si
+        WHERE c.site_id = si.site_id
+          AND c.status = 'active'
+          AND EXISTS (
+              SELECT 1 FROM rfid_card_vehicle_assignments cva
+              JOIN accessible_vehicles av ON av.vehicle_id = cva.vehicle_id
+              WHERE cva.card_id = c.id
+          )
+        UNION
+        SELECT c.id_tag, 'rfid_card_driver'::text AS source
+        FROM rfid_cards c, station_info si
+        WHERE c.site_id = si.site_id
+          AND c.status = 'active'
+          AND EXISTS (
+              SELECT 1 FROM rfid_card_driver_assignments cda
+              JOIN drivers dr ON dr.id = cda.driver_id
+              WHERE cda.card_id = c.id
+                AND dr.status = 'active'
+          )
+        ORDER BY id_tag
+    """
+    rows = await db.fetch(query, station_id)
+    return [dict(row) for row in rows]
+
+
 async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
     """Get depot metadata by depot_id.
 
