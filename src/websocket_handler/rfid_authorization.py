@@ -195,23 +195,18 @@ class RFIDAuthorizationService:
                 reason="too_many_invalid_attempts",
             )
 
+        lookup_failed = False
         try:
             row = await self._timescale.lookup_id_tag(id_tag, station_id=station_id)
         except Exception as exc:
-            RFID_AUTH_ATTEMPTS_TOTAL.labels(
-                source=source, outcome=RFIDAuthStatus.INVALID.value
-            ).inc()
+            lookup_failed = True
+            row = None
             self._logger.error(
                 "rfid_authorize_error source=%s station_id=%s id_tag=%s error=%s",
                 source,
                 station_id,
                 id_tag,
                 exc,
-            )
-            return RFIDAuthDecision(
-                status=RFIDAuthStatus.INVALID,
-                source=source,
-                reason="lookup_error",
             )
 
         if not row:
@@ -242,6 +237,19 @@ class RFIDAuthorizationService:
                     source=source,
                     reason="operator_override",
                     depot_id=str(override["depot_id"]) if override.get("depot_id") else None,
+                )
+            # Lookup raised: don't penalise the tag with an invalid-attempt
+            # row (which would eventually throttle a legitimate card during
+            # a DB outage or schema drift) and surface the lookup_error
+            # reason for observability.
+            if lookup_failed:
+                RFID_AUTH_ATTEMPTS_TOTAL.labels(
+                    source=source, outcome=RFIDAuthStatus.INVALID.value
+                ).inc()
+                return RFIDAuthDecision(
+                    status=RFIDAuthStatus.INVALID,
+                    source=source,
+                    reason="lookup_error",
                 )
             await self._record_invalid_attempt(station_id, id_tag)
             RFID_AUTH_ATTEMPTS_TOTAL.labels(
