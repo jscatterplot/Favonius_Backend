@@ -14,6 +14,10 @@ from .supabase_client import SupabaseClient
 class DataSyncService:
     """Service for synchronizing data between TimescaleDB and Supabase."""
 
+    _CHARGING_SESSIONS_TABLE_KEY = "charging_sessions"
+    _CHARGING_SESSIONS_SYNC_COLUMN_KEY = "charging_sessions:sync_charging_sessions"
+    _ENERGY_METRICS_SYNC_COLUMN_KEY = "charging_sessions:sync_energy_metrics"
+
     def __init__(
         self,
         config: SupabaseConfig,
@@ -145,7 +149,9 @@ class DataSyncService:
 
     async def sync_charging_sessions(self) -> None:
         """Sync completed charging sessions from TimescaleDB to Supabase."""
-        if self._is_known_missing("charging_sessions"):
+        if self._is_known_missing(self._CHARGING_SESSIONS_TABLE_KEY) or self._is_known_missing(
+            self._CHARGING_SESSIONS_SYNC_COLUMN_KEY
+        ):
             return
         try:
             if not self.timescale_pool:
@@ -248,10 +254,12 @@ class DataSyncService:
             # variant we do not recognise (e.g. a future column rename), log
             # loudly once and stop retrying until restart.
             self._handle_missing_relation(
-                "charging_sessions", e, "charging session sync (column missing)"
+                self._CHARGING_SESSIONS_SYNC_COLUMN_KEY, e, "charging session sync (column missing)"
             )
         except asyncpg.UndefinedTableError as e:
-            self._handle_missing_relation("charging_sessions", e, "charging session sync")
+            self._handle_missing_relation(
+                self._CHARGING_SESSIONS_TABLE_KEY, e, "charging session sync"
+            )
         except Exception as e:
             self.logger.error(f"Failed to sync charging sessions: {e}")
 
@@ -406,7 +414,9 @@ class DataSyncService:
 
     async def sync_energy_metrics(self) -> None:
         """Sync energy metrics and analytics to Supabase."""
-        if self._is_known_missing("charging_sessions"):
+        if self._is_known_missing(self._CHARGING_SESSIONS_TABLE_KEY) or self._is_known_missing(
+            self._ENERGY_METRICS_SYNC_COLUMN_KEY
+        ):
             return
         try:
             if not self.timescale_pool:
@@ -480,10 +490,10 @@ class DataSyncService:
                     self.logger.info(f"Synced {len(metrics)} energy metrics")
 
         except asyncpg.UndefinedTableError as e:
-            self._handle_missing_relation("charging_sessions", e, "energy metrics sync")
+            self._handle_missing_relation(self._CHARGING_SESSIONS_TABLE_KEY, e, "energy metrics sync")
         except asyncpg.UndefinedColumnError as e:
             self._handle_missing_relation(
-                "charging_sessions", e, "energy metrics sync (column missing)"
+                self._ENERGY_METRICS_SYNC_COLUMN_KEY, e, "energy metrics sync (column missing)"
             )
         except Exception as e:
             self.logger.error(f"Failed to sync energy metrics: {e}")
