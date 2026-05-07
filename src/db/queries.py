@@ -1457,6 +1457,7 @@ async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
                   SELECT 1 FROM rfid_card_driver_assignments cda
                   JOIN drivers dr ON dr.id = cda.driver_id
                   WHERE cda.card_id = c.id
+                    AND dr.site_id = c.site_id
                     AND dr.status = 'active'
               )
         )
