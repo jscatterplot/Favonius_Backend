@@ -2087,90 +2087,189 @@ class TimescaleClient:
     ) -> Optional[Dict[str, Any]]:
         """Resolve an OCPP idTag to known vehicle/card/driver identity.
 
-        Vehicle primary idTags are authoritative. Active RFID cards are accepted
-        after vehicle lookup; lost/stolen/inactive cards do not match.
+        Vehicle primary idTags are authoritative when ``vehicles.id_tag``
+        matches. Otherwise an active row in ``rfid_cards`` is sufficient on
+        its own — vehicle and driver assignments are best-effort enrichment
+        and a card without either is still a valid authorization.
+
+        Resilient to missing reference tables: deployments that have not
+        provisioned ``vehicles``, ``drivers`` or the assignment join tables
+        (e.g. cards-only fleets) still authorize active cards. Each
+        ``UndefinedTableError`` is logged once per process so schema drift
+        is visible without spamming the log on every Authorize.
         """
         async with self.pg_pool.acquire() as conn:
-            station_filter = ""
-            params: list[Any] = [id_tag]
-            if station_id is not None:
-                station_filter = (
-                    "AND EXISTS (SELECT 1 FROM charging_stations c "
-                    "WHERE c.station_id = $2 AND c.site_id = v.site_id)"
+            # Vehicle-primary tag (e.g. printed on the vehicle itself).
+            # Optional — if the deployment does not provision ``vehicles``,
+            # fall through to the cards lookup rather than failing closed
+            # on the whole authorize flow.
+            try:
+                station_filter = ""
+                params: list[Any] = [id_tag]
+                if station_id is not None:
+                    station_filter = (
+                        "AND EXISTS (SELECT 1 FROM charging_stations c "
+                        "WHERE c.station_id = $2 AND c.site_id = v.site_id)"
+                    )
+                    params.append(station_id)
+                rows = await conn.fetch(
+                    f"""
+                    SELECT v.id::text AS vehicle_id,
+                           v.site_id::text AS depot_id,
+                           NULL::text AS driver_id,
+                           NULL::text AS card_id,
+                           'vehicle'::text AS source
+                    FROM vehicles v
+                    WHERE v.id_tag = $1
+                      AND COALESCE(v.status, 'active') = 'active'
+                      {station_filter}
+                    LIMIT 2
+                    """,
+                    *params,
                 )
-                params.append(station_id)
-            rows = await conn.fetch(
-                f"""
-                SELECT v.id::text AS vehicle_id,
-                       v.site_id::text AS depot_id,
-                       NULL::text AS driver_id,
-                       NULL::text AS card_id,
-                       'vehicle'::text AS source
-                FROM vehicles v
-                WHERE v.id_tag = $1
-                  AND COALESCE(v.status, 'active') = 'active'
-                  {station_filter}
-                LIMIT 2
-                """,
-                *params,
-            )
-            if len(rows) > 1:
-                self.logger.error(
-                    "Rejecting id_tag lookup for %r: multiple vehicles share the same id_tag.",
-                    id_tag,
-                )
-                return None
-            if rows:
-                return dict(rows[0])
+                if len(rows) > 1:
+                    self.logger.error(
+                        "Rejecting id_tag lookup for %r: multiple vehicles share the same id_tag.",
+                        id_tag,
+                    )
+                    return None
+                if rows:
+                    return dict(rows[0])
+            except asyncpg.exceptions.UndefinedTableError as exc:
+                self._log_missing_reference_table_once("vehicles", exc)
 
+            # RFID card lookup. The card row alone is sufficient to
+            # authorize. Vehicle/driver attribution is enriched separately
+            # so a deployment without those reference tables still works.
             card_filter = ""
-            params = [id_tag]
+            card_params: list[Any] = [id_tag]
             if station_id is not None:
                 card_filter = (
                     "AND EXISTS (SELECT 1 FROM charging_stations ch "
                     "WHERE ch.station_id = $2 AND ch.site_id = c.site_id)"
                 )
-                params.append(station_id)
-            rows = await conn.fetch(
-                f"""
-                SELECT c.id::text AS card_id,
-                       c.site_id::text AS depot_id,
-                       (
-                           SELECT cva.vehicle_id::text
-                           FROM rfid_card_vehicle_assignments cva
-                           JOIN vehicles v ON v.id = cva.vehicle_id
-                           WHERE cva.card_id = c.id
-                             AND v.site_id = c.site_id
-                             AND COALESCE(v.status, 'active') = 'active'
-                           ORDER BY v.external_id
-                           LIMIT 1
-                       ) AS vehicle_id,
-                       (
-                           SELECT cda.driver_id::text
-                           FROM rfid_card_driver_assignments cda
-                           JOIN drivers dr ON dr.id = cda.driver_id
-                           WHERE cda.card_id = c.id
-                             AND dr.site_id = c.site_id
-                             AND dr.status = 'active'
-                           ORDER BY dr.display_name
-                           LIMIT 1
-                       ) AS driver_id,
-                       'rfid_card'::text AS source
-                FROM rfid_cards c
-                WHERE c.id_tag = $1
-                  AND c.status = 'active'
-                  {card_filter}
-                LIMIT 2
-                """,
-                *params,
-            )
-            if len(rows) > 1:
+                card_params.append(station_id)
+            try:
+                card_rows = await conn.fetch(
+                    f"""
+                    SELECT c.id::text AS card_id,
+                           c.site_id::text AS depot_id
+                    FROM rfid_cards c
+                    WHERE c.id_tag = $1
+                      AND c.status = 'active'
+                      {card_filter}
+                    LIMIT 2
+                    """,
+                    *card_params,
+                )
+            except asyncpg.exceptions.UndefinedTableError as exc:
+                self._log_missing_reference_table_once("rfid_cards", exc)
+                return None
+
+            if len(card_rows) > 1:
                 self.logger.error(
                     "Rejecting id_tag lookup for %r: multiple active RFID cards share it.",
                     id_tag,
                 )
                 return None
-            return dict(rows[0]) if rows else None
+            if not card_rows:
+                return None
+
+            card_row = dict(card_rows[0])
+            card_id = card_row["card_id"]
+            depot_id = card_row["depot_id"]
+
+            return {
+                "card_id": card_id,
+                "depot_id": depot_id,
+                "vehicle_id": await self._lookup_card_vehicle_assignment(conn, card_id, depot_id),
+                "driver_id": await self._lookup_card_driver_assignment(conn, card_id, depot_id),
+                "source": "rfid_card",
+            }
+
+    async def _lookup_card_vehicle_assignment(
+        self,
+        conn: "asyncpg.Connection",
+        card_id: str,
+        depot_id: str,
+    ) -> Optional[str]:
+        """Return the active vehicle attached to ``card_id``, or None.
+
+        Tolerates missing ``rfid_card_vehicle_assignments`` / ``vehicles``
+        so cards without an attached vehicle still authorize.
+        """
+        try:
+            return await conn.fetchval(
+                """
+                SELECT cva.vehicle_id::text
+                FROM rfid_card_vehicle_assignments cva
+                JOIN vehicles v ON v.id = cva.vehicle_id
+                WHERE cva.card_id = $1::uuid
+                  AND v.site_id = $2::uuid
+                  AND COALESCE(v.status, 'active') = 'active'
+                ORDER BY v.external_id
+                LIMIT 1
+                """,
+                card_id,
+                depot_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError as exc:
+            self._log_missing_reference_table_once("rfid_card_vehicle_assignments", exc)
+            return None
+
+    async def _lookup_card_driver_assignment(
+        self,
+        conn: "asyncpg.Connection",
+        card_id: str,
+        depot_id: str,
+    ) -> Optional[str]:
+        """Return the active driver attached to ``card_id``, or None.
+
+        Tolerates missing ``rfid_card_driver_assignments`` / ``drivers`` so
+        cards without an attached driver still authorize.
+        """
+        try:
+            return await conn.fetchval(
+                """
+                SELECT cda.driver_id::text
+                FROM rfid_card_driver_assignments cda
+                JOIN drivers dr ON dr.id = cda.driver_id
+                WHERE cda.card_id = $1::uuid
+                  AND dr.site_id = $2::uuid
+                  AND dr.status = 'active'
+                ORDER BY dr.display_name
+                LIMIT 1
+                """,
+                card_id,
+                depot_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError as exc:
+            self._log_missing_reference_table_once("rfid_card_driver_assignments", exc)
+            return None
+
+    def _log_missing_reference_table_once(
+        self, table_label: str, exc: BaseException
+    ) -> None:
+        """Log a missing-relation error at WARNING, once per process.
+
+        Schema drift (e.g. a deployment running without ``vehicles``)
+        should be visible to operators but not flood the log on every
+        Authorize attempt.
+        """
+        cache = TimescaleClient._missing_reference_table_logs
+        if table_label in cache:
+            return
+        cache.add(table_label)
+        self.logger.warning(
+            "rfid_lookup_missing_reference_table table=%s error=%s "
+            "(continuing without enrichment from this table)",
+            table_label,
+            exc,
+        )
+
+    # Process-wide cache so each missing reference table is logged once,
+    # not once per ``TimescaleClient`` instance and not once per Authorize.
+    _missing_reference_table_logs: set[str] = set()
 
     # ===== OCPP 1.6 RECOVERY HELPERS (migration 013) =====
 
