@@ -307,11 +307,39 @@ class TimescaleClient:
     async def _resolve_vehicle_id_from_session(
         self, conn: asyncpg.Connection, session_id: Optional[str]
     ) -> Optional[str]:
+        """Resolve an attached vehicle for a charging session.
+
+        Upstream callers pass either the ``charging_sessions.session_id``
+        UUID PK or the OCPP 1.6 integer ``transaction_id`` (legacy adapter,
+        ``ocpp16_adapter.py``). Detect numeric vs UUID and dispatch to the
+        right column rather than letting an int hit the UUID-typed
+        ``session_id`` and fail with "invalid UUID '1'".
+        """
         if not session_id:
             return None
-        row = await conn.fetchrow(
-            "SELECT vehicle_id FROM charging_sessions WHERE session_id = $1 LIMIT 1", session_id
-        )
+        key = str(session_id)
+        try:
+            uuid.UUID(key)
+        except (ValueError, TypeError):
+            try:
+                tx_id = int(key)
+            except (TypeError, ValueError):
+                return None
+            row = await conn.fetchrow(
+                """
+                SELECT vehicle_id
+                  FROM charging_sessions
+                 WHERE transaction_id = $1
+                 ORDER BY start_time DESC
+                 LIMIT 1
+                """,
+                tx_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT vehicle_id FROM charging_sessions WHERE session_id = $1::uuid LIMIT 1",
+                key,
+            )
         return row["vehicle_id"] if row and row["vehicle_id"] else None
 
     async def _resolve_vehicle_id_from_id_token(
@@ -2350,14 +2378,14 @@ class TimescaleClient:
         """
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
+                # Lock key built in Python to avoid asyncpg's prepared-statement
+                # type inference treating $2 as text (via the `||` chain) and
+                # rejecting the integer transaction_id with "expected str, got
+                # int". Single text bind is unambiguous and equivalent in
+                # lock semantics.
                 await conn.execute(
-                    """
-                    SELECT pg_advisory_xact_lock(
-                        hashtextextended($1 || ':' || $2::text, 0)
-                    )
-                    """,
-                    station_id,
-                    transaction_id,
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"{station_id}:{transaction_id}",
                 )
                 existing_open = await conn.fetchval(
                     """
