@@ -41,6 +41,36 @@ class TimescaleClient:
         # Connection state
         self.connected = False
 
+        # Static-table source. RFID/vehicle/charging_stations rows live in
+        # Supabase; ``lookup_id_tag`` routes there when wired by main.py.
+        # Left None during construction so unit tests that build the client
+        # in isolation continue to use ``pg_pool``.
+        self._supabase_client: Any = None
+
+    def set_supabase_client(self, supabase_client: Any) -> None:
+        """Attach a SupabaseClient for static-identity lookups.
+
+        ``lookup_id_tag`` queries ``vehicles`` / ``rfid_cards`` /
+        ``charging_stations`` — those tables live in Supabase. Without
+        this wiring the lookup hits TimescaleDB, where migration 029
+        dropped the static shadows, producing schema errors that the
+        OCPP 1.6 charger interprets as a hard authorization rejection.
+        """
+        self._supabase_client = supabase_client
+
+    def _static_pool(self) -> Any:
+        """Return the connection pool that owns the static identity tables.
+
+        Prefer the wired Supabase pool; fall back to ``pg_pool`` so legacy
+        deployments and existing unit tests (which mock ``pg_pool`` only)
+        continue to work without modification.
+        """
+        if self._supabase_client is not None:
+            pool = getattr(self._supabase_client, "db_pool", None)
+            if pool is not None:
+                return pool
+        return self.pg_pool
+
     async def connect(self) -> None:
         """Establish connections to TimescaleDB with retry logic."""
         await self._connect_with_retry()
@@ -2097,8 +2127,12 @@ class TimescaleClient:
         (e.g. cards-only fleets) still authorize active cards. Each
         ``UndefinedTableError`` is logged once per process so schema drift
         is visible without spamming the log on every Authorize.
+
+        Static identity tables live in Supabase; ``_static_pool`` returns
+        the Supabase pool when wired in, falling back to ``pg_pool``
+        for legacy deployments and unit tests.
         """
-        async with self.pg_pool.acquire() as conn:
+        async with self._static_pool().acquire() as conn:
             # Vehicle-primary tag (e.g. printed on the vehicle itself).
             # Optional — if the deployment does not provision ``vehicles``,
             # fall through to the cards lookup rather than failing closed

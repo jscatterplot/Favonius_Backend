@@ -257,6 +257,68 @@ async def test_authorize_does_not_consume_override_when_id_tag_known() -> None:
     assert decision.status == RFIDAuthStatus.ACCEPTED
     assert decision.reason == "identity_matched"
     timescale.consume_operator_override.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_authorize_falls_through_to_operator_override_on_lookup_exception() -> None:
+    """Lookup raising must not block a valid operator-override.
+
+    Schema drift on the static-table source (e.g. column rename in
+    ``rfid_cards``) caused ``lookup_id_tag`` to raise; before this fix the
+    handler short-circuited to ``Invalid`` and the charger immediately
+    fired ``StopTransaction reason=DeAuthorized``, defeating the manual
+    authorize feature. The override is still atomic via
+    ``consume_operator_override``, so falling through on lookup error is
+    safe.
+    """
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(side_effect=RuntimeError("column c.id does not exist"))
+    timescale.consume_operator_override = AsyncMock(
+        return_value={
+            "id": "00000000-0000-0000-0000-000000000099",
+            "station_id": "CP-1",
+            "connector_id": 1,
+            "organization_id": "11111111-1111-1111-1111-111111111111",
+            "depot_id": "22222222-2222-2222-2222-222222222222",
+            "created_by": "33333333-3333-3333-3333-333333333333",
+            "reason": None,
+            "expires_at": None,
+            "consumed_at": "2026-05-07T14:03:00+00:00",
+        }
+    )
+    service = RFIDAuthorizationService(timescale, MagicMock())
+
+    decision = await service.authorize("CP-1", "OP-broken-db", "StartTransaction")
+
+    assert decision.status == RFIDAuthStatus.ACCEPTED
+    assert decision.reason == "operator_override"
+    assert decision.depot_id == "22222222-2222-2222-2222-222222222222"
+    timescale.consume_operator_override.assert_awaited_once_with("CP-1", "OP-broken-db")
+
+
+@pytest.mark.asyncio
+async def test_authorize_returns_lookup_error_when_no_override_and_lookup_failed() -> None:
+    """Lookup error without a matching override → Invalid lookup_error.
+
+    The reason discriminates the DB-failure path from a clean
+    ``unknown_id_tag`` miss so dashboards can alert on schema drift, and
+    the throttle path is skipped — a real card must not be locked out by
+    repeated lookup_error attempts during a DB outage.
+    """
+    timescale = MagicMock()
+    timescale.lookup_id_tag = AsyncMock(side_effect=RuntimeError("connection reset"))
+    timescale.consume_operator_override = AsyncMock(return_value=None)
+    timescale.record_invalid_rfid_attempt = AsyncMock()
+    timescale.count_recent_invalid_rfid_attempts = AsyncMock(return_value=0)
+    service = RFIDAuthorizationService(timescale, MagicMock())
+
+    decision = await service.authorize("CP-2", "04623AA2861394", "Authorize")
+
+    assert decision.status == RFIDAuthStatus.INVALID
+    assert decision.reason == "lookup_error"
+    timescale.record_invalid_rfid_attempt.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Tests added during code-review cleanup of the RFID auth feature
 # ---------------------------------------------------------------------------

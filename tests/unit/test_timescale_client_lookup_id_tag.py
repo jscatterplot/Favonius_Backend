@@ -210,6 +210,97 @@ async def test_missing_table_logged_once_per_process():
 
 
 @pytest.mark.asyncio
+async def test_lookup_id_tag_routes_to_supabase_pool_when_wired_in():
+    """Static identity tables live in Supabase; the lookup must hit that pool.
+
+    Regression: the lookup previously ran against ``pg_pool`` (TimescaleDB),
+    where migration 029 dropped ``vehicles`` / ``charging_stations`` and the
+    legacy ``rfid_cards`` shadow has the wrong column names. The result was
+    ``column c.id does not exist`` and a hard Invalid for every card.
+    """
+    supabase_conn = AsyncMock()
+    supabase_conn.fetch = AsyncMock(
+        side_effect=[
+            [],  # vehicles: no match
+            [{"card_id": "card-supabase", "depot_id": "depot-1"}],
+        ]
+    )
+    supabase_conn.fetchval = AsyncMock(return_value=None)
+    supabase_pool = MagicMock()
+    supabase_pool.acquire.return_value.__aenter__.return_value = supabase_conn
+    supabase_pool.acquire.return_value.__aexit__.return_value = None
+
+    # The TimescaleDB pool must NOT be touched once Supabase is wired in.
+    timescale_conn = AsyncMock()
+    timescale_pool = MagicMock()
+    timescale_pool.acquire.return_value.__aenter__.return_value = timescale_conn
+    timescale_pool.acquire.return_value.__aexit__.return_value = None
+
+    config = TimescaleConfig(
+        service_url="postgresql://user:pass@localhost:5432/tsdb",
+        host="localhost",
+        user="user",
+        password="pass",
+    )
+    client = TimescaleClient(config)
+    client.pg_pool = timescale_pool
+    supabase_client = MagicMock()
+    supabase_client.db_pool = supabase_pool
+    client.set_supabase_client(supabase_client)
+
+    result = await client.lookup_id_tag("CARD-TAG", station_id="STATION-1")
+
+    assert result is not None
+    assert result["card_id"] == "card-supabase"
+    assert supabase_conn.fetch.await_count == 2
+    timescale_conn.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lookup_id_tag_falls_back_to_pg_pool_when_supabase_not_wired():
+    """Without ``set_supabase_client`` the lookup uses ``pg_pool`` (legacy)."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(
+        side_effect=[
+            [],
+            [{"card_id": "card-legacy", "depot_id": "depot-1"}],
+        ]
+    )
+    conn.fetchval = AsyncMock(return_value=None)
+
+    client = _make_client_with_conn(conn)
+    # No set_supabase_client call → _static_pool() must return pg_pool.
+
+    result = await client.lookup_id_tag("CARD-TAG", station_id="STATION-1")
+
+    assert result is not None
+    assert result["card_id"] == "card-legacy"
+
+
+@pytest.mark.asyncio
+async def test_lookup_id_tag_falls_back_when_supabase_db_pool_is_none():
+    """A SupabaseClient that hasn't connected yet must not break the lookup."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(
+        side_effect=[
+            [],
+            [{"card_id": "card-fallback", "depot_id": "depot-1"}],
+        ]
+    )
+    conn.fetchval = AsyncMock(return_value=None)
+
+    client = _make_client_with_conn(conn)
+    half_wired = MagicMock()
+    half_wired.db_pool = None
+    client.set_supabase_client(half_wired)
+
+    result = await client.lookup_id_tag("CARD-TAG", station_id="STATION-1")
+
+    assert result is not None
+    assert result["card_id"] == "card-fallback"
+
+
+@pytest.mark.asyncio
 async def test_multiple_active_cards_for_same_tag_rejected():
     """Duplicate-tag protection survives the refactor."""
     conn = AsyncMock()

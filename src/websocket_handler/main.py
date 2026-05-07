@@ -590,6 +590,14 @@ class Application:
             self.timescale_client = TimescaleClient(self.config.timescale)
             await self.timescale_client.connect()
 
+            # RFID/vehicle/charging_stations rows live in Supabase, not in
+            # TimescaleDB. Wire the Supabase pool into the timescale client so
+            # ``lookup_id_tag`` queries the right database; without this the
+            # lookup hits the dropped/renamed shadow tables and every
+            # Authorize/StartTransaction is rejected as Invalid.
+            if self.supabase_client is not None:
+                self.timescale_client.set_supabase_client(self.supabase_client)
+
             # Initialize analytics service
             self.analytics_service = AnalyticsService(
                 config=self.config.timescale,
