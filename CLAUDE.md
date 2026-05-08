@@ -84,7 +84,7 @@ For every specific issue (bug, smell, design concern, risk):
 - OCPP 1.6/2.0.1 protocol for charger communication
 - MILP-based optimization (Pyomo + Gurobi primary, HiGHS fallback)
 - VDV 463 transit operations integration (BMS/ITCS interface)
-- CAISO / ENTSO-E electricity price ingestion
+- ENTSO-E day-ahead electricity price ingestion (European depots)
 - Gaussian Process surrogate model for energy consumption prediction
 - TimescaleDB for time-series data storage
 - Prometheus/Grafana observability
@@ -132,7 +132,7 @@ Favonius_Backend/
 │   │   │   ├── depot_state.py   # Depot charging info for VDV responses
 │   │   │   ├── vehicle_resolver.py
 │   │   │   └── charging_point_resolver.py
-│   │   ├── caiso/               # CAISO price ingestion
+│   │   ├── caiso/               # CAISO price ingestion (deprecated — Europe-only feeder; module retained as dead code, see follow-up)
 │   │   ├── entsoe/              # ENTSO-E European price ingestion
 │   │   ├── weather/             # OpenMeteo weather adapter
 │   │   └── handoff/
@@ -159,7 +159,7 @@ Favonius_Backend/
 │   ├── ocpp_handler.py          # OCPP 2.0.1 EnhancedOCPPChargePoint
 │   ├── ocpp16_adapter.py        # OCPP 1.6 OCPP16Session (wraps FleetChargePoint, reload-on-boot + queue replay)
 │   ├── optimization_engine.py   # Heuristic scheduler (legacy)
-│   ├── price_feeder.py          # CAISO price ingestion (legacy)
+│   ├── price_feeder.py          # ENTSO-E day-ahead price ingestion
 │   ├── analytics_service.py     # Aggregated metrics for REST API
 │   ├── security_manager.py      # Auth, TLS, rate limiting
 │   └── ...                      # Many additional managers (cache, cert, DER, etc.)
@@ -335,7 +335,8 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 
 ### Time-series hypertables
 - `telemetry` — Vehicle SoC, charging_kw, is_plugged (from OCPP MeterValues)
-- `prices` — $/kWh by depot and time (CAISO DAM or utility TOU)
+- `prices` — $/kWh by depot and time (utility TOU; new architecture)
+- `electricity_prices` — Per-bidding-zone day-ahead prices written by the WS handler price feeder (migration 034). Schema-compatible with the historical CAISO LMP shape but populated from ENTSO-E in the current deployment.
 - `weather_forecasts` — Temperature, precipitation, solar radiation
 - `building_load` — Non-EV site power draw (**required** for grid calc)
 
@@ -752,12 +753,11 @@ test(api): add coverage for handoff rate limiting
 ### Price feeder
 | Variable | Default | Description |
 |---|---|---|
-| `PRICE_FEEDER_ENABLED` | `true` | Enable CAISO price ingestion |
-| `PRICE_FEEDER_NODES` | `TH_SP15_GEN-APND,...` | CAISO node list |
+| `PRICE_FEEDER_ENABLED` | `true` | Enable ENTSO-E day-ahead price ingestion |
 | `PRICE_FEEDER_FETCH_INTERVAL` | `900` | Fetch interval (seconds) |
 | `PRICE_FEEDER_LOOKAHEAD_HOURS` | `24` | Price horizon |
-| `PRICE_FEEDER_ENTSOE_ZONES` | — | ENTSO-E EIC zone codes (European depots) |
-| `EUROPEAN_ELECTRICITY_API` | — | ENTSO-E API security token |
+| `PRICE_FEEDER_ENTSOE_ZONES` | — | Comma-separated ENTSO-E EIC bidding-zone codes (e.g. `10YLT-1001A0008Q` for Lithuania, `10Y1001A1001A82H` for DE-LU) |
+| `EUROPEAN_ELECTRICITY_API` | — | ENTSO-E Transparency Platform API security token |
 
 ### Supabase (legacy websocket_handler)
 | Variable | Description |

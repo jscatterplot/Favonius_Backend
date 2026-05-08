@@ -9,9 +9,8 @@ import json
 import os
 import random
 import uuid
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import asyncpg
 import pandas as pd
@@ -450,122 +449,49 @@ class TimescaleClient:
             )
         return row["charger_id"] if row else None
 
-    # Electricity Prices — legacy ``electricity_prices`` table vs migration ``prices`` hypertable
-
-    def _default_price_depot_id(self) -> Optional[uuid.UUID]:
-        """Depot UUID for mapping feeder LMP rows into the ``prices`` hypertable."""
-        raw = os.getenv("PRICE_FEEDER_DEFAULT_DEPOT_ID", "").strip()
-        if not raw:
-            return None
-        try:
-            return uuid.UUID(raw)
-        except ValueError:
-            self.logger.warning("Invalid PRICE_FEEDER_DEFAULT_DEPOT_ID; ignoring")
-            return None
-
-    def _price_feeder_node_depot_map(self) -> Dict[str, uuid.UUID]:
-        """Optional JSON map of ISO node / ENTSO-E zone id → depot UUID."""
-        raw = os.getenv("PRICE_FEEDER_NODE_DEPOT_MAP", "").strip()
-        if not raw:
-            return {}
-        try:
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                return {}
-            return {str(k): uuid.UUID(str(v)) for k, v in data.items()}
-        except (json.JSONDecodeError, ValueError, TypeError):
-            self.logger.warning("Invalid PRICE_FEEDER_NODE_DEPOT_MAP JSON; ignoring")
-            return {}
-
-    async def _store_prices_hypertable(
-        self, conn: asyncpg.Connection, price_points: List[Dict[str, Any]]
-    ) -> None:
-        """Upsert into ``prices`` (migrations/001_initial_schema.sql) when legacy table is absent."""
-        node_map = self._price_feeder_node_depot_map()
-        default_depot = self._default_price_depot_id()
-        buckets: Dict[Tuple[datetime, uuid.UUID], List[float]] = defaultdict(list)
-        sources: Dict[Tuple[datetime, uuid.UUID], str] = {}
-        for point in price_points:
-            node = str(point.get("node_id") or "")
-            depot_id = node_map.get(node) or default_depot
-            if depot_id is None:
-                continue
-            lmp = point.get("lmp_price_mwh")
-            if lmp is None:
-                lmp = point.get("energy_component_mwh")
-            if lmp is None:
-                continue
-            key = (point["time"], depot_id)
-            buckets[key].append(float(lmp) / 1000.0)
-            mt = point.get("market_type") or "dam"
-            sources[key] = f"{mt}:{node}"[:50]
-
-        if not buckets:
-            self.logger.warning(
-                "Skipping prices hypertable write: set PRICE_FEEDER_DEFAULT_DEPOT_ID "
-                "or PRICE_FEEDER_NODE_DEPOT_MAP so feeder rows map to a depot UUID"
-            )
-            return
-
-        sql = """
-            INSERT INTO prices (time, depot_id, energy_kwh, demand_kw, source)
-            VALUES ($1, $2, $3, NULL, $4)
-            ON CONFLICT (time, depot_id) DO UPDATE SET
-                energy_kwh = EXCLUDED.energy_kwh,
-                source = EXCLUDED.source
-        """
-        records = []
-        for (ts, depot_id), vals in buckets.items():
-            ekwh = sum(vals) / len(vals)
-            records.append((ts, depot_id, ekwh, sources.get((ts, depot_id), "unknown")))
-        await conn.executemany(sql, records)
-        self.logger.info("Stored %d aggregated rows in prices hypertable", len(records))
+    # Electricity Prices — ``electricity_prices`` hypertable (migration 034)
 
     async def store_electricity_prices(self, price_points: List[Dict[str, Any]]) -> None:
-        """Store electricity price points (legacy table or ``prices`` hypertable fallback)."""
+        """Store electricity price points into the ``electricity_prices`` hypertable."""
         if not price_points:
             return
 
         try:
             async with self.pg_pool.acquire() as conn:
-                try:
-                    await conn.copy_records_to_table(
-                        "electricity_prices",
-                        records=[
-                            (
-                                point["time"],
-                                point["node_id"],
-                                point["market_type"],
-                                point.get("lmp_price_mwh"),
-                                point.get("energy_component_mwh"),
-                                point.get("congestion_component_mwh"),
-                                point.get("loss_component_mwh"),
-                                point.get("ghg_adder_mwh"),
-                                point.get("price_confidence"),
-                                point.get("forecast_horizon_minutes"),
-                            )
-                            for point in price_points
-                        ],
-                        columns=[
-                            "time",
-                            "node_id",
-                            "market_type",
-                            "lmp_price_mwh",
-                            "energy_component_mwh",
-                            "congestion_component_mwh",
-                            "loss_component_mwh",
-                            "ghg_adder_mwh",
-                            "price_confidence",
-                            "forecast_horizon_minutes",
-                        ],
-                    )
-                    self.logger.debug(
-                        "Stored %s electricity price records (electricity_prices)",
-                        len(price_points),
-                    )
-                    return
-                except asyncpg.UndefinedTableError:
-                    await self._store_prices_hypertable(conn, price_points)
+                await conn.copy_records_to_table(
+                    "electricity_prices",
+                    records=[
+                        (
+                            point["time"],
+                            point["node_id"],
+                            point["market_type"],
+                            point.get("lmp_price_mwh"),
+                            point.get("energy_component_mwh"),
+                            point.get("congestion_component_mwh"),
+                            point.get("loss_component_mwh"),
+                            point.get("ghg_adder_mwh"),
+                            point.get("price_confidence"),
+                            point.get("forecast_horizon_minutes"),
+                        )
+                        for point in price_points
+                    ],
+                    columns=[
+                        "time",
+                        "node_id",
+                        "market_type",
+                        "lmp_price_mwh",
+                        "energy_component_mwh",
+                        "congestion_component_mwh",
+                        "loss_component_mwh",
+                        "ghg_adder_mwh",
+                        "price_confidence",
+                        "forecast_horizon_minutes",
+                    ],
+                )
+                self.logger.debug(
+                    "Stored %s electricity price records (electricity_prices)",
+                    len(price_points),
+                )
 
         except Exception as e:
             self.logger.error(f"Failed to store electricity prices: {e}")
@@ -575,59 +501,18 @@ class TimescaleClient:
         """Fetch price data for nodes since a given time."""
         try:
             async with self.pg_pool.acquire() as conn:
-                try:
-                    query = """
-                        SELECT time, node_id, market_type, lmp_price_mwh,
-                               energy_component_mwh, congestion_component_mwh,
-                               loss_component_mwh, ghg_adder_mwh, price_confidence,
-                               forecast_horizon_minutes
-                        FROM electricity_prices
-                        WHERE node_id = ANY($1)
-                          AND time >= $2
-                        ORDER BY time ASC
-                    """
-                    rows = await conn.fetch(query, nodes, start)
-                    return [dict(row) for row in rows]
-                except asyncpg.UndefinedTableError:
-                    pass
-
-                default_depot = self._default_price_depot_id()
-                if default_depot is None:
-                    self.logger.warning(
-                        "electricity_prices table missing and PRICE_FEEDER_DEFAULT_DEPOT_ID unset; "
-                        "returning empty price series"
-                    )
-                    return []
-
-                rows = await conn.fetch(
-                    """
-                    SELECT time, energy_kwh, source
-                    FROM prices
-                    WHERE depot_id = $1 AND time >= $2
+                query = """
+                    SELECT time, node_id, market_type, lmp_price_mwh,
+                           energy_component_mwh, congestion_component_mwh,
+                           loss_component_mwh, ghg_adder_mwh, price_confidence,
+                           forecast_horizon_minutes
+                    FROM electricity_prices
+                    WHERE node_id = ANY($1)
+                      AND time >= $2
                     ORDER BY time ASC
-                    """,
-                    default_depot,
-                    start,
-                )
-                primary_node = nodes[0] if nodes else "unknown"
-                out: List[Dict[str, Any]] = []
-                for row in rows:
-                    mwh = float(row["energy_kwh"]) * 1000.0
-                    out.append(
-                        {
-                            "time": row["time"],
-                            "node_id": primary_node,
-                            "market_type": row["source"] or "prices",
-                            "lmp_price_mwh": mwh,
-                            "energy_component_mwh": mwh,
-                            "congestion_component_mwh": None,
-                            "loss_component_mwh": None,
-                            "ghg_adder_mwh": None,
-                            "price_confidence": None,
-                            "forecast_horizon_minutes": None,
-                        }
-                    )
-                return out
+                """
+                rows = await conn.fetch(query, nodes, start)
+                return [dict(row) for row in rows]
 
         except Exception as e:
             self.logger.error(f"Failed to fetch electricity prices: {e}")

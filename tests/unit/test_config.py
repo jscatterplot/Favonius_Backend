@@ -231,28 +231,25 @@ class TestPriceFeederConfig:
     """Test PriceFeederConfig functionality."""
 
     def test_price_feeder_config_defaults(self):
-        """Test price feeder config defaults."""
+        """Default configuration is the empty Europe-only feeder."""
         config = PriceFeederConfig()
 
         assert config.enabled is True
-        assert config.base_url == "https://oasis.caiso.com/oasisapi/SingleZip"
-        assert config.nodes == ["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"]
+        assert config.entsoe_zones == []
         assert config.fetch_interval_seconds == 900
         assert config.lookahead_hours == 24
 
     def test_price_feeder_config_custom_values(self):
-        """Test price feeder config with custom values."""
+        """ENTSO-E zones, interval, and lookahead can be overridden."""
         config = PriceFeederConfig(
             enabled=False,
-            base_url="https://custom.api.com",
-            nodes=["CUSTOM_NODE_1", "CUSTOM_NODE_2"],
+            entsoe_zones=["10YLT-1001A0008Q", "10Y1001A1001A82H"],
             fetch_interval_seconds=1800,
             lookahead_hours=48,
         )
 
         assert config.enabled is False
-        assert config.base_url == "https://custom.api.com"
-        assert config.nodes == ["CUSTOM_NODE_1", "CUSTOM_NODE_2"]
+        assert config.entsoe_zones == ["10YLT-1001A0008Q", "10Y1001A1001A82H"]
         assert config.fetch_interval_seconds == 1800
         assert config.lookahead_hours == 48
 
@@ -380,7 +377,7 @@ class TestConfig:
             "METRICS_PORT": "9090",
             "HEALTH_CHECK_PORT": "9091",
             "PRICE_FEEDER_ENABLED": "false",
-            "PRICE_FEEDER_NODES": "NODE1,NODE2",
+            "PRICE_FEEDER_ENTSOE_ZONES": "10YLT-1001A0008Q,10Y1001A1001A82H",
             "PRICE_FEEDER_FETCH_INTERVAL": "1800",
             "PRICE_FEEDER_LOOKAHEAD_HOURS": "48",
             "OPTIMIZATION_ENABLED": "false",
@@ -431,7 +428,10 @@ class TestConfig:
 
         # Test price feeder config
         assert config.price_feeder.enabled is False
-        assert config.price_feeder.nodes == ["NODE1", "NODE2"]
+        assert config.price_feeder.entsoe_zones == [
+            "10YLT-1001A0008Q",
+            "10Y1001A1001A82H",
+        ]
         assert config.price_feeder.fetch_interval_seconds == 1800
         assert config.price_feeder.lookahead_hours == 48
 
@@ -549,7 +549,7 @@ class TestConfig:
         assert config.tls.verify_client is False
         assert config.monitoring.metrics_port == 9090
         assert config.monitoring.api_port == 8082
-        assert config.price_feeder.nodes == ["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"]
+        assert config.price_feeder.entsoe_zones == []
         assert config.optimization.horizon_hours == 4
 
     def test_config_immutability(self):

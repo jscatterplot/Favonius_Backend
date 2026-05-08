@@ -474,6 +474,10 @@ class TestBootSchedulesLocalAuthSync:
         log-and-return rather than raising — the WS handler must keep
         accepting OCPP messages on the socket even if pg_pool is None."""
         session = _session_factory(pg_pool=None)
+        # The new static-pool fallback consults ``_static_pool()`` first; on a
+        # bare MagicMock that returns a child MagicMock (i.e. NOT None), so
+        # the skip branch would not fire without this stub.
+        session._timescale._static_pool = MagicMock(return_value=None)
         # Pre-empt the replay sleep so the helper proceeds immediately.
         session._replay_task = None
         # Spy on sync_charger to ensure it is NOT called when pool is None.
