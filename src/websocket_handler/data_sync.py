@@ -2,7 +2,6 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set
 
 import asyncpg
@@ -139,8 +138,6 @@ class DataSyncService:
         """Coerce asyncpg numeric types (e.g. Decimal) for JSON serialization."""
         if value is None:
             return default
-        if isinstance(value, Decimal):
-            return float(value)
         return float(value)
 
     def _handle_missing_relation(
