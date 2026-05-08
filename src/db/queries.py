@@ -2516,3 +2516,139 @@ async def charger_id_by_ocpp_id(db, *, depot_id: str) -> dict[str, str]:
     """
     rows = await db.fetch(query, depot_id)
     return {row["ocpp_id"]: row["charger_id"] for row in rows}
+
+
+async def list_active_sessions_for_depot(
+    db, *, station_ids: list[str]
+) -> list[dict]:
+    """Open live charging sessions across a set of OCPP station ids.
+
+    Backs ``GET /depots/{id}/sessions/active``. Reads from TimescaleDB only;
+    the caller resolves ``station_ids`` from the static charger list on
+    Supabase. Sorted by ``start_time`` so the UI shows newest first.
+    """
+    if not station_ids:
+        return []
+    query = """
+        SELECT session_id::text         AS session_id,
+               station_id               AS ocpp_id,
+               connector_id,
+               vehicle_id::text         AS vehicle_id,
+               start_time               AS started_at,
+               current_power_kw,
+               current_soc,
+               target_soc,
+               estimated_end_time       AS estimated_end_at,
+               updated_at               AS last_sample_at
+        FROM charging_sessions
+        WHERE station_id = ANY($1)
+          AND end_time IS NULL
+          AND source = 'live'
+        ORDER BY start_time DESC
+    """
+    rows = await db.fetch(query, station_ids)
+    return [dict(r) for r in rows]
+
+
+async def list_completed_sessions_for_depot(
+    db,
+    *,
+    depot_id: str,
+    station_ids: list[str],
+    from_ts: Optional[datetime],
+    to_ts: Optional[datetime],
+    limit: int,
+    cursor: Optional[tuple[datetime, str]],
+) -> list[dict]:
+    """Paginated completed sessions for a depot.
+
+    Backs ``GET /depots/{id}/sessions``. Returns rows where ``end_time IS NOT
+    NULL``. A row is in scope if its ``station_id`` is one of the depot's OCPP
+    ids OR its ``site_id`` matches the depot UUID — the OR catches imported
+    rows (``source='import'``) that have ``site_id`` but no live OCPP station.
+
+    Cursor pagination is keyset-based on ``(end_time DESC, session_id DESC)``
+    to avoid duplicate or skipped rows when new sessions close mid-page. The
+    caller passes the last seen ``(end_time, session_id)`` and we return the
+    next ``limit`` rows strictly older than that.
+    """
+    clauses: list[str] = ["end_time IS NOT NULL"]
+    params: list[Any] = []
+
+    # Depot scope: live rows by station_id, imported rows by site_id.
+    if station_ids:
+        params.append(station_ids)
+        params.append(depot_id)
+        clauses.append(f"(station_id = ANY(${len(params) - 1}) OR site_id = ${len(params)}::uuid)")
+    else:
+        params.append(depot_id)
+        clauses.append(f"site_id = ${len(params)}::uuid")
+
+    if from_ts is not None:
+        params.append(from_ts)
+        clauses.append(f"end_time >= ${len(params)}")
+    if to_ts is not None:
+        params.append(to_ts)
+        clauses.append(f"end_time < ${len(params)}")
+
+    if cursor is not None:
+        cursor_ts, cursor_session_id = cursor
+        params.append(cursor_ts)
+        params.append(cursor_session_id)
+        # Keyset: strictly older than the cursor by (end_time, session_id).
+        clauses.append(
+            f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)"
+        )
+
+    params.append(limit)
+    where_sql = " AND ".join(clauses)
+    query = f"""
+        SELECT session_id::text          AS session_id,
+               station_id                AS ocpp_id,
+               connector_id,
+               vehicle_id::text          AS vehicle_id,
+               driver_id::text           AS driver_id,
+               start_time                AS started_at,
+               end_time                  AS ended_at,
+               energy_delivered_kwh,
+               energy_received_kwh,
+               cost_total,
+               start_soc_percent,
+               end_soc_percent,
+               source
+        FROM charging_sessions
+        WHERE {where_sql}
+        ORDER BY end_time DESC, session_id DESC
+        LIMIT ${len(params)}
+    """
+    rows = await db.fetch(query, *params)
+    return [dict(r) for r in rows]
+
+
+async def latest_telemetry_for_depot_vehicles(
+    db, *, vehicle_ids: list[str]
+) -> list[dict]:
+    """Lightweight per-vehicle real-time state for a depot.
+
+    Distinct from :func:`latest_telemetry_by_vehicles` (which keys by
+    vehicle_id and is consumed by the rich /vehicles endpoint): this returns
+    a flat list shaped for the dedicated ``/vehicles/state`` realtime poll,
+    and includes the ``charger_id`` so the UI can show which charger a
+    vehicle is plugged into without a second join.
+    """
+    if not vehicle_ids:
+        return []
+    query = """
+        SELECT DISTINCT ON (vehicle_id)
+               vehicle_id::text  AS vehicle_id,
+               charger_id::text  AS charger_id,
+               time              AS last_seen_at,
+               soc               AS soc,
+               charging_kw       AS power_kw,
+               is_plugged
+        FROM telemetry
+        WHERE vehicle_id = ANY($1::uuid[])
+        ORDER BY vehicle_id, time DESC
+    """
+    rows = await db.fetch(query, vehicle_ids)
+    return [dict(r) for r in rows]
