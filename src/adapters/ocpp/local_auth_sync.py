@@ -34,14 +34,20 @@ from typing import Any, Optional, Protocol
 logger = logging.getLogger(__name__)
 
 
-# Configuration keys to enable on the first successful sync per charger.
-# OCPP 1.6 §9.1 makes these standard config keys; `NotSupported` from a
-# specific charger model just means we silently fall through to whatever
-# default behavior that vendor ships with.
+# Configuration keys to push on the first successful sync per charger.
+# The first three are OCPP 1.6 §9.1 standard keys that turn on the local
+# authorization list + cache + pre-authorize path. `FreevendEnabled` is
+# an ABB Terra AC vendor-specific key (FW ≥ 1.6.6) that defaults to TRUE
+# and silently bypasses Authorize by sending StartTransaction with the
+# charger's serial number as the idTag — see denial pattern in HRX
+# Vilnius logs where `id_tag=TACW1141622G1438` matched the boot serial.
+# `NotSupported` from a non-ABB charger just means we silently fall
+# through to whatever default behavior that vendor ships with.
 _BOOTSTRAP_CONFIG_KEYS: tuple[tuple[str, str], ...] = (
     ("LocalAuthListEnabled", "true"),
     ("LocalPreAuthorize", "true"),
     ("AuthorizationCacheEnabled", "true"),
+    ("FreevendEnabled", "false"),
 )
 
 
