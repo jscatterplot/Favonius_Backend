@@ -781,6 +781,7 @@ class OCPPWebSocketServer:
                 external_control_manager=self.external_control_manager,
                 certificate_manager=self.certificate_manager,
                 rfid_authorization=self.message_handler.rfid_authorization,
+                static_auth_client=self.supabase_client,
             )
         self.charge_points[station_id] = charge_point
 

@@ -265,7 +265,7 @@ class TimescaleClient:
                         )
                         continue
 
-                    charger_id = await self._resolve_charger_id(conn, station_id)
+                    charger_id = await self._resolve_charger_id(station_id)
                     soc = (soc_percent / 100.0) if soc_percent is not None else None
                     is_plugged = power_kw is not None and power_kw > 0.1
 
@@ -413,15 +413,26 @@ class TimescaleClient:
                 exc,
             )
 
-    async def _resolve_charger_id(
-        self, conn: asyncpg.Connection, station_id: Optional[str]
-    ) -> Optional[str]:
+    async def _resolve_charger_id(self, station_id: Optional[str]) -> Optional[str]:
+        """Resolve ``charging_stations.id`` for a given OCPP station_id.
+
+        ``charging_stations`` lives in Supabase (migration 029 dropped the
+        TimescaleDB shadow), so the lookup must go through ``_static_pool``;
+        a direct ``pg_pool`` query trips ``UndefinedTableError`` and would
+        bubble up through ``insert_telemetry_batch``, taking the whole
+        telemetry batch with it. ``_static_pool`` falls back to ``pg_pool``
+        for tests and legacy deployments without a Supabase wiring.
+
+        Returns ``None`` when the station is unknown — telemetry rows are
+        still inserted with a NULL ``charger_id``.
+        """
         if not station_id:
             return None
-        row = await conn.fetchrow(
-            "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
-            station_id,
-        )
+        async with self._static_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                station_id,
+            )
         return row["charger_id"] if row else None
 
     # Electricity Prices
@@ -2067,7 +2078,13 @@ class TimescaleClient:
         """
         if alias_station_id == canonical_station_id:
             return False
-        async with self.pg_pool.acquire() as conn:
+        # The EXISTS subquery references ``charging_stations`` which lives
+        # in Supabase; using ``pg_pool`` directly raises ``UndefinedTableError``
+        # against the real Timescale DB. ``_static_pool`` routes to Supabase
+        # when wired and falls back to ``pg_pool`` for tests. ``ocpp_station_aliases``
+        # exists in both DBs (migration 024 + supabase/008), so the INSERT
+        # half of the statement is correct against either pool.
+        async with self._static_pool().acquire() as conn:
             result = await conn.execute(
                 """
                 INSERT INTO ocpp_station_aliases
@@ -2101,61 +2118,6 @@ class TimescaleClient:
                     LIMIT 1
                     """,
                     username,
-                    station_id,
-                )
-            )
-
-    async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
-        """Validate basic authentication credentials."""
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, password_hash
-                FROM station_credentials
-                WHERE station_id = $1
-                  AND username IN ($1, $2)
-                  AND active = true
-                ORDER BY CASE WHEN username = $2 THEN 0 ELSE 1 END
-                LIMIT 1
-            """,
-                station_id,
-                username,
-            )
-
-            if not row:
-                return False
-
-            # Verify password hash
-            import bcrypt
-
-            password_ok = bcrypt.checkpw(
-                password.encode("utf-8"),
-                row["password_hash"].encode("utf-8"),
-            )
-            if password_ok:
-                try:
-                    await conn.execute(
-                        "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
-                        row["id"],
-                    )
-                except Exception as exc:
-                    self.logger.warning(
-                        "Failed to update station_credentials.last_used for id %s: %s",
-                        row["id"],
-                        exc,
-                    )
-            return password_ok
-
-    async def station_requires_basic_auth(self, station_id: str) -> bool:
-        """Return True when a provisioned production charger requires Basic Auth."""
-        async with self.pg_pool.acquire() as conn:
-            return bool(
-                await conn.fetchval(
-                    """
-                    SELECT COALESCE(auth_required, FALSE)
-                    FROM charging_stations
-                    WHERE station_id = $1
-                    """,
                     station_id,
                 )
             )
