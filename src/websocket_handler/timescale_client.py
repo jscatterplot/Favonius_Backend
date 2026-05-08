@@ -199,93 +199,99 @@ class TimescaleClient:
 
         try:
             async with self.pg_pool.acquire() as conn:
+                static_pool = self._static_pool()
+                static_conn = conn if static_pool is self.pg_pool else await static_pool.acquire()
                 inserted = 0
-                for data in telemetry_data:
-                    station_id = data.get("station_id")
-                    connector_id = data.get("connector_id", 1)
-                    session_id = data.get("session_id")
-                    power_kw = data.get("power_kw")
-                    soc_percent = data.get("soc_percent")
-                    max_charge_kw = data.get("max_charge_power_kw")
-                    transaction_id = self._coerce_transaction_id(session_id)
+                try:
+                    for data in telemetry_data:
+                        station_id = data.get("station_id")
+                        connector_id = data.get("connector_id", 1)
+                        session_id = data.get("session_id")
+                        power_kw = data.get("power_kw")
+                        soc_percent = data.get("soc_percent")
+                        max_charge_kw = data.get("max_charge_power_kw")
+                        transaction_id = self._coerce_transaction_id(session_id)
 
-                    raw_sample = data.get("raw_sample")
-                    if raw_sample:
-                        await conn.execute(
-                            """
-                            INSERT INTO telemetry_samples (
-                                time,
+                        raw_sample = data.get("raw_sample")
+                        if raw_sample:
+                            await conn.execute(
+                                """
+                                INSERT INTO telemetry_samples (
+                                    time,
+                                    station_id,
+                                    connector_id,
+                                    transaction_id,
+                                    measurand,
+                                    phase,
+                                    location,
+                                    unit,
+                                    context,
+                                    format,
+                                    value
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                """,
+                                raw_sample.get("timestamp", data["time"]),
                                 station_id,
                                 connector_id,
                                 transaction_id,
-                                measurand,
-                                phase,
-                                location,
-                                unit,
-                                context,
-                                format,
-                                value
-                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                raw_sample.get("measurand"),
+                                raw_sample.get("phase"),
+                                raw_sample.get("location"),
+                                raw_sample.get("unit"),
+                                raw_sample.get("context"),
+                                raw_sample.get("format"),
+                                raw_sample.get("value"),
+                            )
+
+                        # Live session metrics: keep the open charging_sessions row
+                        # fresh so per-charger power/SoC is observable in real time
+                        # without requiring vehicle attribution.
+                        if station_id and transaction_id is not None:
+                            await self._update_session_live_metrics(
+                                conn, station_id, transaction_id, power_kw, soc_percent, max_charge_kw
+                            )
+
+                        # Vehicle-keyed optimizer view (telemetry table). Only
+                        # populated when the row can be attributed to a vehicle via
+                        # the open charging_sessions row. Rows without a vehicle
+                        # are intentionally skipped — telemetry has vehicle_id
+                        # NOT NULL and is read by the optimizer's StateAssembler.
+                        vehicle_id = data.get("vehicle_id")
+                        if not vehicle_id:
+                            vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
+
+                        if not vehicle_id:
+                            self.logger.debug(
+                                f"Skipping vehicle-keyed telemetry insert: no vehicle_id for "
+                                f"station_id={station_id}, connector_id={connector_id}, "
+                                f"session_id={session_id}"
+                            )
+                            continue
+
+                        charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
+                        soc = (soc_percent / 100.0) if soc_percent is not None else None
+                        is_plugged = power_kw is not None and power_kw > 0.1
+
+                        await conn.execute(
+                            """
+                            INSERT INTO telemetry (
+                                time, vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
+                            )
+                            VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7)
+                            ON CONFLICT (time, vehicle_id) DO NOTHING
                             """,
-                            raw_sample.get("timestamp", data["time"]),
-                            station_id,
-                            connector_id,
-                            transaction_id,
-                            raw_sample.get("measurand"),
-                            raw_sample.get("phase"),
-                            raw_sample.get("location"),
-                            raw_sample.get("unit"),
-                            raw_sample.get("context"),
-                            raw_sample.get("format"),
-                            raw_sample.get("value"),
+                            data["time"],
+                            str(vehicle_id),
+                            str(charger_id) if charger_id else None,
+                            soc,
+                            power_kw,
+                            is_plugged,
+                            max_charge_kw,
                         )
-
-                    # Live session metrics: keep the open charging_sessions row
-                    # fresh so per-charger power/SoC is observable in real time
-                    # without requiring vehicle attribution.
-                    if station_id and transaction_id is not None:
-                        await self._update_session_live_metrics(
-                            conn, station_id, transaction_id, power_kw, soc_percent, max_charge_kw
-                        )
-
-                    # Vehicle-keyed optimizer view (telemetry table). Only
-                    # populated when the row can be attributed to a vehicle via
-                    # the open charging_sessions row. Rows without a vehicle
-                    # are intentionally skipped — telemetry has vehicle_id
-                    # NOT NULL and is read by the optimizer's StateAssembler.
-                    vehicle_id = data.get("vehicle_id")
-                    if not vehicle_id:
-                        vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
-
-                    if not vehicle_id:
-                        self.logger.debug(
-                            f"Skipping vehicle-keyed telemetry insert: no vehicle_id for "
-                            f"station_id={station_id}, connector_id={connector_id}, "
-                            f"session_id={session_id}"
-                        )
-                        continue
-
-                    charger_id = await self._resolve_charger_id(station_id)
-                    soc = (soc_percent / 100.0) if soc_percent is not None else None
-                    is_plugged = power_kw is not None and power_kw > 0.1
-
-                    await conn.execute(
-                        """
-                        INSERT INTO telemetry (
-                            time, vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
-                        )
-                        VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7)
-                        ON CONFLICT (time, vehicle_id) DO NOTHING
-                        """,
-                        data["time"],
-                        str(vehicle_id),
-                        str(charger_id) if charger_id else None,
-                        soc,
-                        power_kw,
-                        is_plugged,
-                        max_charge_kw,
-                    )
-                    inserted += 1
+                        inserted += 1
+                finally:
+                    if static_conn is not conn:
+                        await static_pool.release(static_conn)
 
                 if inserted:
                     self.logger.debug(f"Inserted {inserted} telemetry records into telemetry")
@@ -413,7 +419,9 @@ class TimescaleClient:
                 exc,
             )
 
-    async def _resolve_charger_id(self, station_id: Optional[str]) -> Optional[str]:
+    async def _resolve_charger_id(
+        self, station_id: Optional[str], conn: Optional[asyncpg.Connection] = None
+    ) -> Optional[str]:
         """Resolve ``charging_stations.id`` for a given OCPP station_id.
 
         ``charging_stations`` lives in Supabase (migration 029 dropped the
@@ -428,7 +436,13 @@ class TimescaleClient:
         """
         if not station_id:
             return None
-        async with self._static_pool().acquire() as conn:
+        if conn is None:
+            async with self._static_pool().acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                    station_id,
+                )
+        else:
             row = await conn.fetchrow(
                 "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
                 station_id,
