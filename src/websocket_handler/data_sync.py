@@ -230,26 +230,18 @@ class DataSyncService:
                                 ),
                                 "energy_delivered_kwh": (
                                     self._json_float(session["energy_delivered_kwh"])
-                                    if session["energy_delivered_kwh"] is not None
-                                    else 0
                                 ),
                                 "energy_received_kwh": (
                                     self._json_float(session["energy_received_kwh"])
-                                    if session["energy_received_kwh"] is not None
-                                    else 0
                                 ),
                                 "session_duration_minutes": self._json_float(
                                     session["session_duration_minutes"]
                                 ),
                                 "cost_total": (
                                     self._json_float(session["cost_total"])
-                                    if session["cost_total"] is not None
-                                    else 0
                                 ),
                                 "revenue_v2g": (
                                     self._json_float(session["revenue_v2g"])
-                                    if session["revenue_v2g"] is not None
-                                    else 0
                                 ),
                                 "status": session["derived_status"],
                             }

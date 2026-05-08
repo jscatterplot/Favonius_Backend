@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - fallback when optional dependency is unavailable
     import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List
 
 import aiohttp
 
@@ -264,13 +264,3 @@ class PriceFeederService:
                     )
 
         return points
-
-
-def _safe_float(value: Optional[str]) -> Optional[float]:
-    """Safely coerce a string to float, returning None on empty or invalid input."""
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None

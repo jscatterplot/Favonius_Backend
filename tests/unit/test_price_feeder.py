@@ -15,7 +15,6 @@ from websocket_handler.config import PriceFeederConfig
 from websocket_handler.price_feeder import (
     PriceFeederService,
     _format_entsoe_time,
-    _safe_float,
 )
 
 
@@ -280,22 +279,6 @@ class TestPriceFeederUtilities:
         # timezone-naive — module accepts and formats verbatim.
         naive = datetime(2026, 5, 8, 12, 30, 0)
         assert _format_entsoe_time(naive) == "202605081230"
-
-    def test_safe_float_valid(self):
-        assert _safe_float("100.5") == 100.5
-        assert _safe_float("0") == 0.0
-        assert _safe_float("-50.25") == -50.25
-
-    def test_safe_float_invalid(self):
-        assert _safe_float("") is None
-        assert _safe_float(None) is None
-        assert _safe_float("invalid") is None
-
-    def test_safe_float_edge_cases(self):
-        assert _safe_float("0.0") == 0.0
-        assert _safe_float("1e5") == 100000.0
-        assert _safe_float("1.23e-4") == 0.000123
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
