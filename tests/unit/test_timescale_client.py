@@ -355,3 +355,115 @@ class TestTimescaleClient:
         )
 
         assert registered is False
+
+    # ------------------------------------------------------------------
+    # Static-pool routing — regression guard
+    #
+    # ``charging_stations`` and ``station_credentials`` live in Supabase
+    # (migration 029 dropped the TimescaleDB shadows). Methods that
+    # reference those tables must acquire from ``_static_pool``, which
+    # routes to the wired ``SupabaseClient.db_pool`` and falls back to
+    # ``pg_pool`` for tests that don't provide one.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_resolve_charger_id_uses_supabase_pool_when_wired(
+        self, timescale_client
+    ):
+        """When a SupabaseClient is wired, charger lookup goes there."""
+        mock_supabase_conn = AsyncMock()
+        mock_supabase_conn.fetchrow = AsyncMock(return_value={"charger_id": "uuid-A"})
+        mock_supabase_pool = MagicMock(name="supabase_pool")
+        mock_supabase_pool.acquire.return_value.__aenter__.return_value = mock_supabase_conn
+        mock_supabase_pool.acquire.return_value.__aexit__.return_value = None
+
+        mock_timescale_pool = MagicMock(name="timescale_pool")
+        timescale_client.pg_pool = mock_timescale_pool
+
+        sb_client = MagicMock()
+        sb_client.db_pool = mock_supabase_pool
+        timescale_client.set_supabase_client(sb_client)
+
+        result = await timescale_client._resolve_charger_id("hrx-uab_hrx-vilnius-002")
+
+        assert result == "uuid-A"
+        # Lookup must NOT have hit the timescale pool.
+        mock_timescale_pool.acquire.assert_not_called()
+        mock_supabase_pool.acquire.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_resolve_charger_id_falls_back_to_pg_pool_when_unwired(
+        self, timescale_client
+    ):
+        """No SupabaseClient → use pg_pool (for tests / legacy deployments)."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value={"charger_id": "uuid-B"})
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+        # No set_supabase_client call.
+
+        result = await timescale_client._resolve_charger_id("station-X")
+
+        assert result == "uuid-B"
+        mock_pool.acquire.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_resolve_charger_id_returns_none_for_falsy_station(
+        self, timescale_client
+    ):
+        """Empty/None station_id short-circuits without acquiring any pool."""
+        mock_pool = MagicMock()
+        timescale_client.pg_pool = mock_pool
+
+        assert await timescale_client._resolve_charger_id(None) is None
+        assert await timescale_client._resolve_charger_id("") is None
+        mock_pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ensure_station_alias_uses_supabase_pool_when_wired(
+        self, timescale_client
+    ):
+        """``ensure_station_alias`` references ``charging_stations`` in its
+        EXISTS guard, so it must route through the static pool."""
+        mock_supabase_conn = AsyncMock()
+        mock_supabase_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        mock_supabase_pool = MagicMock(name="supabase_pool")
+        mock_supabase_pool.acquire.return_value.__aenter__.return_value = mock_supabase_conn
+        mock_supabase_pool.acquire.return_value.__aexit__.return_value = None
+
+        mock_timescale_pool = MagicMock(name="timescale_pool")
+        timescale_client.pg_pool = mock_timescale_pool
+
+        sb_client = MagicMock()
+        sb_client.db_pool = mock_supabase_pool
+        timescale_client.set_supabase_client(sb_client)
+
+        registered = await timescale_client.ensure_station_alias(
+            "TACW1141622G1438",
+            "hrx-uab_hrx-vilnius-002",
+        )
+
+        assert registered is True
+        mock_timescale_pool.acquire.assert_not_called()
+        mock_supabase_pool.acquire.assert_called_once()
+
+    def test_validate_basic_auth_no_longer_on_timescale_client(
+        self, timescale_client
+    ):
+        """Removed: it queried ``station_credentials`` against ``pg_pool``,
+        but the table only exists in Supabase. Canonical implementation lives
+        on ``SupabaseClient`` and is reached via ``SecurityManager.static_auth_client``.
+        """
+        assert not hasattr(timescale_client, "validate_basic_auth")
+
+    def test_station_requires_basic_auth_no_longer_on_timescale_client(
+        self, timescale_client
+    ):
+        """Removed for the same reason as ``validate_basic_auth`` above."""
+        assert not hasattr(timescale_client, "station_requires_basic_auth")

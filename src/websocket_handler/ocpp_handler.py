@@ -92,6 +92,7 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         external_control_manager: Optional[Any] = None,
         certificate_manager: Optional[CertificateManager] = None,
         rfid_authorization: Optional[RFIDAuthorizationService] = None,
+        static_auth_client: Optional[Any] = None,
         # v2x_controller removed - out of scope for MVP per PRD Section 1.2
     ):
         """Initialize enhanced charge point with V2G capabilities."""
@@ -137,9 +138,18 @@ class EnhancedOCPPChargePoint(OCPPChargePoint):
         )
         self.certificate_manager = CertificateManager(timescale_client)
 
-        # Initialize security manager
+        # Initialize security manager. ``station_credentials`` /
+        # ``charging_stations`` lookups must hit Supabase — pass
+        # ``static_auth_client`` (the SupabaseClient) so SecurityManager's
+        # Basic Auth path doesn't fall back to ``timescale_client``, which
+        # has no ``validate_basic_auth`` method and would silently allow
+        # connections through.
         security_config = SecurityConfig()
-        self.security_manager = SecurityManager(timescale_client, security_config)
+        self.security_manager = SecurityManager(
+            timescale_client,
+            security_config,
+            static_auth_client=static_auth_client,
+        )
 
         # Initialize diagnostics and firmware managers
         self.diagnostics_manager = DiagnosticsManager(timescale_client)
