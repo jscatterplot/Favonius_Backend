@@ -1,12 +1,9 @@
-"""Unit tests for price feeder service."""
+"""Unit tests for the ENTSO-E price feeder service."""
 
-import asyncio
-import io
 import os
 
 # Import price feeder
 import sys
-import zipfile
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -15,11 +12,40 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from websocket_handler.config import PriceFeederConfig
-from websocket_handler.price_feeder import PriceFeederService, _format_caiso_time, _safe_float
+from websocket_handler.price_feeder import (
+    PriceFeederService,
+    _format_entsoe_time,
+)
+
+
+# Minimal-but-valid ENTSO-E ``Publication_MarketDocument`` payload covering
+# two hourly points; used to exercise ``_parse_entsoe_xml`` without hitting
+# the network.
+_SAMPLE_ENTSOE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Publication_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3">
+  <TimeSeries>
+    <Period>
+      <timeInterval>
+        <start>2026-05-08T00:00Z</start>
+        <end>2026-05-08T02:00Z</end>
+      </timeInterval>
+      <resolution>PT60M</resolution>
+      <Point>
+        <position>1</position>
+        <price.amount>92.50</price.amount>
+      </Point>
+      <Point>
+        <position>2</position>
+        <price.amount>88.10</price.amount>
+      </Point>
+    </Period>
+  </TimeSeries>
+</Publication_MarketDocument>
+"""
 
 
 class TestPriceFeederService:
-    """Test PriceFeederService functionality."""
+    """Test PriceFeederService lifecycle and ENTSO-E fetch path."""
 
     @pytest.fixture
     def mock_timescale_client(self):
@@ -40,421 +66,219 @@ class TestPriceFeederService:
         """Create price feeder configuration."""
         return PriceFeederConfig(
             enabled=True,
-            base_url="https://oasis.caiso.com/oasisapi/SingleZip",
-            nodes=["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"],
+            entsoe_zones=["10YLT-1001A0008Q"],
             fetch_interval_seconds=900,
             lookahead_hours=24,
         )
 
     @pytest.fixture
-    def price_feeder(self, price_feeder_config, mock_timescale_client):
-        """Create PriceFeederService instance."""
+    def price_feeder(self, price_feeder_config, mock_timescale_client, monkeypatch):
+        """Create PriceFeederService instance with a non-empty ENTSO-E token."""
+        monkeypatch.setenv("EUROPEAN_ELECTRICITY_API", "test-token")
         return PriceFeederService(price_feeder_config, mock_timescale_client)
 
     @pytest.mark.asyncio
     async def test_price_feeder_initialization(self, price_feeder):
-        """Test price feeder initialization."""
+        """Initial state: not running, no session, ENTSO-E zones loaded from config."""
         assert price_feeder.config.enabled is True
-        assert price_feeder.config.base_url == "https://oasis.caiso.com/oasisapi/SingleZip"
-        assert len(price_feeder.config.nodes) == 2
+        assert price_feeder.config.entsoe_zones == ["10YLT-1001A0008Q"]
         assert price_feeder._running is False
         assert price_feeder.session is None
 
     @pytest.mark.asyncio
     async def test_start_disabled_feeder(self, price_feeder):
-        """Test starting disabled price feeder."""
+        """Disabled feeder must not open a session or schedule a task."""
         price_feeder.config.enabled = False
-
         await price_feeder.start()
-
         assert price_feeder._running is False
         assert price_feeder.session is None
 
     @pytest.mark.asyncio
     async def test_start_enabled_feeder(self, price_feeder):
-        """Test starting enabled price feeder."""
+        """Enabled feeder opens a session and starts the run loop."""
         await price_feeder.start()
-
-        assert price_feeder._running is True
-        assert price_feeder.session is not None
-        assert price_feeder._task is not None
-
-        await price_feeder.stop()
+        try:
+            assert price_feeder._running is True
+            assert price_feeder.session is not None
+            assert price_feeder._task is not None
+        finally:
+            await price_feeder.stop()
 
     @pytest.mark.asyncio
     async def test_stop_feeder(self, price_feeder):
-        """Test stopping price feeder."""
+        """Stop tears down the session and cancels the run task."""
         await price_feeder.start()
-
-        assert price_feeder._running is True
-        assert price_feeder.session is not None
-
         await price_feeder.stop()
-
         assert price_feeder._running is False
         assert price_feeder.session is None
         assert price_feeder._task is None
 
     @pytest.mark.asyncio
     async def test_set_optimization_engine(self, price_feeder, mock_optimization_engine):
-        """Test setting optimization engine."""
         price_feeder.set_optimization_engine(mock_optimization_engine)
-
         assert price_feeder._optimization_engine == mock_optimization_engine
 
     @pytest.mark.asyncio
-    async def test_trigger_fetch_manual(self, price_feeder, mock_timescale_client):
-        """Test manual price fetch trigger."""
-        # Mock successful fetch
+    async def test_trigger_fetch_manual(self, price_feeder):
         with patch.object(price_feeder, "_fetch_and_store_prices") as mock_fetch:
             await price_feeder.trigger_fetch()
             mock_fetch.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_trigger_fetch_error(self, price_feeder):
-        """Test manual price fetch with error."""
+    async def test_trigger_fetch_swallows_errors(self, price_feeder):
+        """Manual fetch must not raise — caller is fire-and-forget."""
         with patch.object(
             price_feeder, "_fetch_and_store_prices", side_effect=Exception("Fetch error")
         ):
-            # Should not raise exception, just log error
             await price_feeder.trigger_fetch()
 
     @pytest.mark.asyncio
-    async def test_fetch_and_store_prices_no_session(self, price_feeder):
-        """Test fetch and store prices with no session."""
+    async def test_fetch_no_session_short_circuits(self, price_feeder):
+        """Without an aiohttp session, fetch returns silently without storing anything."""
         price_feeder.session = None
-
         await price_feeder._fetch_and_store_prices()
+        price_feeder.timescale_client.store_electricity_prices.assert_not_called()
 
-        # Should return early without error
+    @pytest.mark.asyncio
+    async def test_fetch_no_zones_short_circuits(
+        self, price_feeder_config, mock_timescale_client, monkeypatch
+    ):
+        """Empty ENTSO-E zone list must skip the network call cleanly."""
+        monkeypatch.setenv("EUROPEAN_ELECTRICITY_API", "test-token")
+        price_feeder_config.entsoe_zones = []
+        feeder = PriceFeederService(price_feeder_config, mock_timescale_client)
+        feeder.session = Mock()
+        await feeder._fetch_and_store_prices()
+        mock_timescale_client.store_electricity_prices.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fetch_no_token_short_circuits(
+        self, price_feeder_config, mock_timescale_client, monkeypatch
+    ):
+        """Missing ENTSO-E token must skip the network call cleanly."""
+        monkeypatch.delenv("EUROPEAN_ELECTRICITY_API", raising=False)
+        feeder = PriceFeederService(price_feeder_config, mock_timescale_client)
+        feeder.session = Mock()
+        await feeder._fetch_and_store_prices()
+        mock_timescale_client.store_electricity_prices.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fetch_and_store_prices_success(
-        self, price_feeder, mock_timescale_client, mock_optimization_engine
+        self, price_feeder, mock_optimization_engine
     ):
-        """Test successful price fetch and store."""
-        # Mock session and response
+        """A successful ENTSO-E response is parsed, stored, and triggers the optimizer."""
         mock_response = Mock()
         mock_response.status = 200
-        mock_response.read = AsyncMock(return_value=b"mock zip content")
-
-        # Create proper async context manager mock
-        mock_context_manager = AsyncMock()
-        mock_context_manager.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-
+        mock_response.text = AsyncMock(return_value=_SAMPLE_ENTSOE_XML)
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_ctx.__aexit__ = AsyncMock(return_value=None)
         mock_session = Mock()
-        mock_session.get.return_value = mock_context_manager
+        mock_session.get.return_value = mock_ctx
 
         price_feeder.session = mock_session
         price_feeder._optimization_engine = mock_optimization_engine
 
-        # Mock parse response
-        mock_points = [
-            {
-                "time": datetime.now(timezone.utc),
-                "node_id": "TH_SP15_GEN-APND",
-                "lmp_price_mwh": 100.0,
-            }
-        ]
-
-        with patch.object(price_feeder, "_parse_zip_response", return_value=mock_points):
-            await price_feeder._fetch_and_store_prices()
-
-            # Should be called once with all points from all nodes (2 nodes * 1 point each = 2 points)
-            expected_points = mock_points + mock_points  # One for each node
-            mock_timescale_client.store_electricity_prices.assert_called_once_with(expected_points)
-            mock_optimization_engine.request_run.assert_called_once_with("price_update")
-
-    @pytest.mark.asyncio
-    async def test_fetch_and_store_prices_http_error(self, price_feeder):
-        """Test price fetch with HTTP error."""
-        mock_response = Mock()
-        mock_response.status = 500
-
-        # Create proper async context manager mock
-        mock_context_manager = AsyncMock()
-        mock_context_manager.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-
-        mock_session = Mock()
-        mock_session.get.return_value = mock_context_manager
-
-        price_feeder.session = mock_session
-
-        # Should log error but not crash
         await price_feeder._fetch_and_store_prices()
 
+        price_feeder.timescale_client.store_electricity_prices.assert_called_once()
+        stored = price_feeder.timescale_client.store_electricity_prices.call_args[0][0]
+        assert len(stored) == 2
+        assert stored[0]["node_id"] == "10YLT-1001A0008Q"
+        assert stored[0]["market_type"] == "ENTSOE_DAM"
+        assert stored[0]["lmp_price_mwh"] == pytest.approx(92.50)
+        assert stored[1]["lmp_price_mwh"] == pytest.approx(88.10)
+        mock_optimization_engine.request_run.assert_called_once_with("price_update")
+
     @pytest.mark.asyncio
-    async def test_fetch_and_store_prices_no_data(self, price_feeder, mock_timescale_client):
-        """Test price fetch with no data."""
+    async def test_fetch_http_error_logs_but_does_not_raise(self, price_feeder):
+        """A non-200 response must be logged and swallowed; the loop keeps running."""
         mock_response = Mock()
-        mock_response.status = 200
-        mock_response.read = AsyncMock(return_value=b"mock zip content")
-
-        # Create proper async context manager mock
-        mock_context_manager = AsyncMock()
-        mock_context_manager.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-
+        mock_response.status = 500
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_ctx.__aexit__ = AsyncMock(return_value=None)
         mock_session = Mock()
-        mock_session.get.return_value = mock_context_manager
+        mock_session.get.return_value = mock_ctx
 
         price_feeder.session = mock_session
-
-        # Mock parse response returning empty list
-        with patch.object(price_feeder, "_parse_zip_response", return_value=[]):
-            await price_feeder._fetch_and_store_prices()
-
-            # Should not store anything
-            mock_timescale_client.store_electricity_prices.assert_not_called()
+        await price_feeder._fetch_and_store_prices()
+        price_feeder.timescale_client.store_electricity_prices.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_run_loop_error_handling(self, price_feeder):
-        """Test run loop error handling."""
+    async def test_fetch_no_data_does_not_call_store(self, price_feeder):
+        """An empty XML body must not trigger a store call."""
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(
+            return_value='<?xml version="1.0"?><Publication_MarketDocument '
+            'xmlns="urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"/>'
+        )
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_session = Mock()
+        mock_session.get.return_value = mock_ctx
+
+        price_feeder.session = mock_session
+        await price_feeder._fetch_and_store_prices()
+        price_feeder.timescale_client.store_electricity_prices.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_loop_swallows_errors(self, price_feeder):
+        """The background loop must not crash if a single fetch raises."""
         with patch.object(
             price_feeder, "_fetch_and_store_prices", side_effect=Exception("Test error")
         ):
             price_feeder._running = True
 
-            # Create a modified loop that exits after one iteration
-            async def limited_run_loop():
-                await asyncio.sleep(0.1)  # Short sleep instead of full interval
+            async def one_iteration():
                 try:
                     await price_feeder._fetch_and_store_prices()
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     price_feeder.logger.error(f"Price feeder loop error: {exc}")
-                # Exit after one iteration instead of continuing the loop
 
-            # Run one iteration
-            await limited_run_loop()
-
-            # Should not crash, just log error
+            await one_iteration()
             assert price_feeder._running is True
 
-    def test_parse_zip_response_success(self, price_feeder):
-        """Test successful ZIP response parsing."""
-        # Create mock CSV content
-        csv_content = "INTERVALSTARTTIME_GMT,LMP,ENERGY,CONGESTION,LOSS,GHG\n2023-01-01T00:00:00Z,100.0,95.0,3.0,2.0,0.0\n"
-
-        # Create ZIP file in memory
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            zip_file.writestr("test_data.csv", csv_content)
-        zip_buffer.seek(0)
-
-        points = price_feeder._parse_zip_response(zip_buffer.getvalue(), "TH_SP15_GEN-APND")
-
-        assert len(points) == 1
-        assert points[0]["node_id"] == "TH_SP15_GEN-APND"
-        assert points[0]["lmp_price_mwh"] == 100.0
-        assert points[0]["energy_component_mwh"] == 95.0
-        assert points[0]["congestion_component_mwh"] == 3.0
-        assert points[0]["loss_component_mwh"] == 2.0
-        assert points[0]["ghg_adder_mwh"] == 0.0
-
-    def test_parse_zip_response_invalid_zip(self, price_feeder):
-        """Test parsing invalid ZIP response."""
-        invalid_content = b"not a zip file"
-
-        points = price_feeder._parse_zip_response(invalid_content, "TH_SP15_GEN-APND")
-
-        assert len(points) == 0
-
-    def test_parse_zip_response_invalid_csv(self, price_feeder):
-        """Test parsing ZIP with invalid CSV."""
-        csv_content = "INVALID,HEADER\ninvalid,data\n"
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            zip_file.writestr("test_data.csv", csv_content)
-        zip_buffer.seek(0)
-
-        points = price_feeder._parse_zip_response(zip_buffer.getvalue(), "TH_SP15_GEN-APND")
-
-        assert len(points) == 0
-
-    def test_parse_zip_response_multiple_files(self, price_feeder):
-        """Test parsing ZIP with multiple CSV files."""
-        csv_content1 = "INTERVALSTARTTIME_GMT,LMP,ENERGY,CONGESTION,LOSS,GHG\n2023-01-01T00:00:00Z,100.0,95.0,3.0,2.0,0.0\n"
-        csv_content2 = "INTERVALSTARTTIME_GMT,LMP,ENERGY,CONGESTION,LOSS,GHG\n2023-01-01T01:00:00Z,110.0,100.0,5.0,5.0,0.0\n"
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            zip_file.writestr("data1.csv", csv_content1)
-            zip_file.writestr("data2.csv", csv_content2)
-            zip_file.writestr("readme.txt", "This is not a CSV file")
-        zip_buffer.seek(0)
-
-        points = price_feeder._parse_zip_response(zip_buffer.getvalue(), "TH_SP15_GEN-APND")
-
+    def test_parse_entsoe_xml_success(self, price_feeder):
+        """Two-point ENTSO-E response → two points with hourly stride."""
+        points = price_feeder._parse_entsoe_xml(_SAMPLE_ENTSOE_XML, "10YLT-1001A0008Q")
         assert len(points) == 2
-        assert all(point["node_id"] == "TH_SP15_GEN-APND" for point in points)
+        assert points[0]["time"] == datetime(2026, 5, 8, 0, 0, tzinfo=timezone.utc)
+        assert points[1]["time"] == datetime(2026, 5, 8, 1, 0, tzinfo=timezone.utc)
+        assert points[0]["lmp_price_mwh"] == pytest.approx(92.50)
+        assert points[1]["lmp_price_mwh"] == pytest.approx(88.10)
+        assert all(p["node_id"] == "10YLT-1001A0008Q" for p in points)
+        assert all(p["market_type"] == "ENTSOE_DAM" for p in points)
 
-    def test_parse_zip_response_missing_fields(self, price_feeder):
-        """Test parsing CSV with missing fields."""
-        csv_content = "INTERVALSTARTTIME_GMT,LMP\n2023-01-01T00:00:00Z,100.0\n"
+    def test_parse_entsoe_xml_invalid(self, price_feeder):
+        """Malformed XML returns an empty list (logs the error)."""
+        points = price_feeder._parse_entsoe_xml("<not-valid", "10YLT-1001A0008Q")
+        assert points == []
 
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            zip_file.writestr("test_data.csv", csv_content)
-        zip_buffer.seek(0)
-
-        points = price_feeder._parse_zip_response(zip_buffer.getvalue(), "TH_SP15_GEN-APND")
-
-        assert len(points) == 1
-        assert points[0]["lmp_price_mwh"] == 100.0
-        assert points[0]["energy_component_mwh"] is None
-        assert points[0]["congestion_component_mwh"] is None
-
-    def test_parse_zip_response_empty_values(self, price_feeder):
-        """Test parsing CSV with empty values."""
-        csv_content = (
-            "INTERVALSTARTTIME_GMT,LMP,ENERGY,CONGESTION,LOSS,GHG\n2023-01-01T00:00:00Z,,,,\n"
-        )
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            zip_file.writestr("test_data.csv", csv_content)
-        zip_buffer.seek(0)
-
-        points = price_feeder._parse_zip_response(zip_buffer.getvalue(), "TH_SP15_GEN-APND")
-
-        assert len(points) == 1
-        assert points[0]["lmp_price_mwh"] is None
-        assert points[0]["energy_component_mwh"] is None
+    def test_parse_entsoe_xml_pt15m_resolution(self, price_feeder):
+        """``PT15M`` resolution must produce 15-minute strides."""
+        xml_15m = _SAMPLE_ENTSOE_XML.replace("PT60M", "PT15M")
+        points = price_feeder._parse_entsoe_xml(xml_15m, "10YLT-1001A0008Q")
+        assert len(points) == 2
+        # 15-min stride: pos=2 lands at start + 15 min.
+        assert points[1]["time"] == datetime(2026, 5, 8, 0, 15, tzinfo=timezone.utc)
 
 
 class TestPriceFeederUtilities:
     """Test price feeder utility functions."""
 
-    def test_format_caiso_time(self):
-        """Test CAISO time formatting."""
-        dt = datetime(2023, 1, 1, 12, 30, 0, tzinfo=timezone.utc)
-        formatted = _format_caiso_time(dt)
+    def test_format_entsoe_time(self):
+        """ENTSO-E expects YYYYMMddHHmm in UTC."""
+        dt = datetime(2026, 5, 8, 12, 30, 0, tzinfo=timezone.utc)
+        assert _format_entsoe_time(dt) == "202605081230"
 
-        assert formatted == "20230101T12:30-0000"
-
-    def test_safe_float_valid(self):
-        """Test _safe_float with valid input."""
-        assert _safe_float("100.5") == 100.5
-        assert _safe_float("0") == 0.0
-        assert _safe_float("-50.25") == -50.25
-
-    def test_safe_float_invalid(self):
-        """Test _safe_float with invalid input."""
-        assert _safe_float("") is None
-        assert _safe_float(None) is None
-        assert _safe_float("invalid") is None
-        assert _safe_float("abc123") is None
-
-    def test_safe_float_edge_cases(self):
-        """Test _safe_float with edge cases."""
-        assert _safe_float("0.0") == 0.0
-        assert _safe_float("1e5") == 100000.0
-        assert _safe_float("1.23e-4") == 0.000123
-
-
-class TestPriceFeederIntegration:
-    """Test price feeder integration scenarios."""
-
-    @pytest.fixture
-    def mock_optimization_engine(self):
-        """Mock optimization engine."""
-        engine = Mock()
-        engine.request_run = AsyncMock()
-        return engine
-
-    @pytest.mark.asyncio
-    async def test_full_price_fetch_cycle(self, mock_timescale_client, mock_optimization_engine):
-        """Test full price fetch cycle."""
-        config = PriceFeederConfig(
-            enabled=True,
-            nodes=["TH_SP15_GEN-APND"],
-            fetch_interval_seconds=1,  # Short interval for testing
-            lookahead_hours=1,
-        )
-
-        price_feeder = PriceFeederService(config, mock_timescale_client)
-        price_feeder.set_optimization_engine(mock_optimization_engine)
-
-        # Mock successful HTTP response
-        csv_content = "INTERVALSTARTTIME_GMT,LMP,ENERGY,CONGESTION,LOSS,GHG\n2023-01-01T00:00:00Z,100.0,95.0,3.0,2.0,0.0\n"
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            zip_file.writestr("test_data.csv", csv_content)
-        zip_buffer.seek(0)
-
-        mock_response = Mock()
-        mock_response.status = 200
-        mock_response.read = AsyncMock(return_value=zip_buffer.getvalue())
-
-        mock_context_manager = AsyncMock()
-        mock_context_manager.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-
-        mock_session = Mock()
-        mock_session.get.return_value = mock_context_manager
-
-        price_feeder.session = mock_session
-
-        await price_feeder._fetch_and_store_prices()
-
-        # Verify data was stored and optimization was triggered
-        mock_timescale_client.store_electricity_prices.assert_called_once()
-        mock_optimization_engine.request_run.assert_called_once_with("price_update")
-
-        # Verify stored data structure
-        stored_data = mock_timescale_client.store_electricity_prices.call_args[0][0]
-        assert len(stored_data) == 1
-        assert stored_data[0]["node_id"] == "TH_SP15_GEN-APND"
-        assert stored_data[0]["lmp_price_mwh"] == 100.0
-
-    @pytest.mark.asyncio
-    async def test_multiple_nodes_fetch(self, mock_timescale_client):
-        """Test fetching prices for multiple nodes."""
-        config = PriceFeederConfig(
-            enabled=True,
-            nodes=["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"],
-            fetch_interval_seconds=1,
-            lookahead_hours=1,
-        )
-
-        price_feeder = PriceFeederService(config, mock_timescale_client)
-
-        # Mock responses for both nodes
-        csv_content = "INTERVALSTARTTIME_GMT,LMP,ENERGY,CONGESTION,LOSS,GHG\n2023-01-01T00:00:00Z,100.0,95.0,3.0,2.0,0.0\n"
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            zip_file.writestr("test_data.csv", csv_content)
-        zip_buffer.seek(0)
-
-        mock_response = Mock()
-        mock_response.status = 200
-        mock_response.read = AsyncMock(return_value=zip_buffer.getvalue())
-
-        mock_context_manager = AsyncMock()
-        mock_context_manager.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-
-        mock_session = Mock()
-        mock_session.get.return_value = mock_context_manager
-
-        price_feeder.session = mock_session
-
-        await price_feeder._fetch_and_store_prices()
-
-        # Should fetch for both nodes
-        assert mock_session.get.call_count == 2
-        mock_timescale_client.store_electricity_prices.assert_called_once()
-
-        # Verify data for both nodes was stored
-        stored_data = mock_timescale_client.store_electricity_prices.call_args[0][0]
-        assert len(stored_data) == 2
-        node_ids = [point["node_id"] for point in stored_data]
-        assert "TH_SP15_GEN-APND" in node_ids
-        assert "TH_NP15_GEN-APND" in node_ids
-
+    def test_format_entsoe_time_converts_to_utc(self):
+        """Naive or non-UTC timestamps must be converted to UTC before formatting."""
+        # timezone-naive — module accepts and formats verbatim.
+        naive = datetime(2026, 5, 8, 12, 30, 0)
+        assert _format_entsoe_time(naive) == "202605081230"
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

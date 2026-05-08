@@ -1,17 +1,20 @@
-"""CAISO and ENTSO-E price feeder service."""
+"""ENTSO-E electricity price feeder service.
+
+Fetches day-ahead prices from the ENTSO-E Transparency Platform and stores
+them in TimescaleDB. CAISO support was removed once the project pivoted
+fully to European deployments; see migration 034 for the canonical
+``electricity_prices`` schema.
+"""
 
 import asyncio
 import contextlib
-import csv
-import io
 import os
 try:
     import defusedxml.ElementTree as ET
 except ImportError:  # pragma: no cover - fallback when optional dependency is unavailable
     import xml.etree.ElementTree as ET
-import zipfile
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List
 
 import aiohttp
 
@@ -24,11 +27,6 @@ _ENTSOE_BASE_URL = "https://web-api.tp.entsoe.eu/api"
 _ENTSOE_NS = "urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"
 
 
-def _format_caiso_time(dt: datetime) -> str:
-    """Format datetime for CAISO OASIS (YYYY-MM-DDTHH:MM-0000)."""
-    return dt.strftime("%Y%m%dT%H:%M-0000")
-
-
 def _format_entsoe_time(dt: datetime) -> str:
     """Format datetime for ENTSO-E API (YYYYMMddHHmm in UTC)."""
     if dt.tzinfo is not None:
@@ -37,11 +35,12 @@ def _format_entsoe_time(dt: datetime) -> str:
 
 
 class PriceFeederService:
-    """Fetches electricity price data from CAISO and ENTSO-E, stores in TimescaleDB.
+    """Fetches day-ahead electricity prices from ENTSO-E and stores them in TimescaleDB.
 
-    Handles both US (CAISO) and European (ENTSO-E) price feeds. European
-    depots are detected by their timezone and prices are fetched from the
-    ENTSO-E Transparency Platform.
+    Each configured ENTSO-E bidding zone (EIC code) is polled on the
+    ``fetch_interval_seconds`` cadence. Authentication uses the
+    ``EUROPEAN_ELECTRICITY_API`` security token issued by the ENTSO-E
+    Transparency Platform.
     """
 
     def __init__(
@@ -71,18 +70,24 @@ class PriceFeederService:
         if self._running:
             return
 
+        if not self.config.entsoe_zones:
+            self.logger.warning(
+                "Price feeder started with no PRICE_FEEDER_ENTSOE_ZONES configured; "
+                "no prices will be fetched"
+            )
+        elif not self._entsoe_token:
+            self.logger.warning(
+                "Price feeder started with ENTSO-E zones configured but "
+                "EUROPEAN_ELECTRICITY_API token unset; no prices will be fetched"
+            )
+
         timeout = aiohttp.ClientTimeout(total=60)
         self.session = aiohttp.ClientSession(timeout=timeout)
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
-        sources = []
-        if self.config.nodes:
-            sources.append(f"CAISO nodes: {', '.join(self.config.nodes)}")
-        if self.config.entsoe_zones:
-            sources.append(f"ENTSO-E zones: {', '.join(self.config.entsoe_zones)}")
         self.logger.info(
-            "Price feeder started for %s with interval %ss",
-            "; ".join(sources) if sources else "no configured sources",
+            "Price feeder started for ENTSO-E zones: %s with interval %ss",
+            ", ".join(self.config.entsoe_zones) if self.config.entsoe_zones else "(none)",
             self.config.fetch_interval_seconds,
         )
 
@@ -130,52 +135,22 @@ class PriceFeederService:
             await asyncio.sleep(self.config.fetch_interval_seconds)
 
     async def _fetch_and_store_prices(self) -> None:
-        """Fetch price data for all configured nodes (CAISO + ENTSO-E) and store them."""
+        """Fetch ENTSO-E day-ahead prices for all configured zones and store them."""
         if not self.session:
+            return
+        if not self.config.entsoe_zones or not self._entsoe_token:
             return
 
         end_time = datetime.now(timezone.utc) + timedelta(hours=self.config.lookahead_hours)
         start_time = datetime.now(timezone.utc) - timedelta(hours=1)
 
         all_points: List[dict] = []
-
-        # Fetch CAISO prices for configured US nodes
-        for node in self.config.nodes:
-            params = {
-                "queryname": "PRC_LMP",
-                "market_run_id": "DAM",
-                "version": "12",
-                "resultformat": "6",
-                "node": node,
-                "startdatetime": _format_caiso_time(start_time),
-                "enddatetime": _format_caiso_time(end_time),
-            }
+        for zone_id in self.config.entsoe_zones:
             try:
-                async with self.session.get(self.config.base_url, params=params) as response:
-                    if response.status == 429:
-                        # Rate limited for this node; log and skip until next interval.
-                        self.logger.warning(
-                            "CAISO rate limit hit (429) for node %s; skipping until next fetch window",
-                            node,
-                        )
-                        continue
-                    if response.status != 200:
-                        raise RuntimeError(f"CAISO response code: {response.status}")
-                    body = await response.read()
-                    loop = asyncio.get_running_loop()
-                    points = await loop.run_in_executor(None, self._parse_zip_response, body, node)
-                    all_points.extend(points)
+                points = await self._fetch_entsoe_zone(zone_id, start_time, end_time)
+                all_points.extend(points)
             except Exception as exc:
-                self.logger.error(f"Failed to fetch prices for node {node}: {exc}")
-
-        # Fetch ENTSO-E prices for configured European bidding zones
-        if self.config.entsoe_zones and self._entsoe_token:
-            for zone_id in self.config.entsoe_zones:
-                try:
-                    points = await self._fetch_entsoe_zone(zone_id, start_time, end_time)
-                    all_points.extend(points)
-                except Exception as exc:
-                    self.logger.error(f"Failed to fetch ENTSO-E prices for zone {zone_id}: {exc}")
+                self.logger.error(f"Failed to fetch ENTSO-E prices for zone {zone_id}: {exc}")
 
         if not all_points:
             self.logger.warning("No price data fetched in this interval")
@@ -289,63 +264,3 @@ class PriceFeederService:
                     )
 
         return points
-
-    def _parse_zip_response(self, content: bytes, node_id: str) -> List[dict]:
-        """Parse zipped CSV content returned by CAISO."""
-        points: List[dict] = []
-        # Security: zip bomb protection
-        _MAX_COMPRESSED_SIZE = 10 * 1024 * 1024  # 10 MB
-        _MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024  # 100 MB
-        if len(content) > _MAX_COMPRESSED_SIZE:
-            self.logger.warning("CAISO zip file too large (%d bytes), skipping", len(content))
-            return []
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                # Check decompressed size before extraction
-                total_size = sum(info.file_size for info in zf.infolist())
-                if total_size > _MAX_DECOMPRESSED_SIZE:
-                    self.logger.warning(
-                        "CAISO zip decompressed size too large (%d bytes), skipping", total_size
-                    )
-                    return []
-                for filename in zf.namelist():
-                    if not filename.lower().endswith(".csv"):
-                        continue
-                    with zf.open(filename) as csvfile:
-                        reader = csv.DictReader(io.TextIOWrapper(csvfile, encoding="utf-8"))
-                        for row in reader:
-                            try:
-                                timestamp = datetime.fromisoformat(
-                                    row["INTERVALSTARTTIME_GMT"].replace("Z", "+00:00")
-                                )
-                                points.append(
-                                    {
-                                        "time": timestamp,
-                                        "node_id": node_id,
-                                        "market_type": row.get("MARKET_RUN_ID", "DAM"),
-                                        "lmp_price_mwh": _safe_float(row.get("LMP")),
-                                        "energy_component_mwh": _safe_float(row.get("ENERGY")),
-                                        "congestion_component_mwh": _safe_float(
-                                            row.get("CONGESTION")
-                                        ),
-                                        "loss_component_mwh": _safe_float(row.get("LOSS")),
-                                        "ghg_adder_mwh": _safe_float(row.get("GHG")),
-                                        "price_confidence": None,
-                                        "forecast_horizon_minutes": None,
-                                    }
-                                )
-                            except Exception as exc:  # pragma: no cover - defensive
-                                self.logger.debug(f"Failed to parse price row: {exc}")
-                                continue
-        except zipfile.BadZipFile:
-            self.logger.error("CAISO response was not a valid ZIP archive")
-        return points
-
-
-def _safe_float(value: Optional[str]) -> Optional[float]:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None

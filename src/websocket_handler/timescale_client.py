@@ -449,9 +449,10 @@ class TimescaleClient:
             )
         return row["charger_id"] if row else None
 
-    # Electricity Prices
+    # Electricity Prices — ``electricity_prices`` hypertable (migration 034)
+
     async def store_electricity_prices(self, price_points: List[Dict[str, Any]]) -> None:
-        """Store electricity price points."""
+        """Store electricity price points into the ``electricity_prices`` hypertable."""
         if not price_points:
             return
 
@@ -486,6 +487,10 @@ class TimescaleClient:
                         "price_confidence",
                         "forecast_horizon_minutes",
                     ],
+                )
+                self.logger.debug(
+                    "Stored %s electricity price records (electricity_prices)",
+                    len(price_points),
                 )
 
         except Exception as e:
@@ -933,56 +938,6 @@ class TimescaleClient:
 
         except Exception as e:
             self.logger.error(f"Failed to update schedule execution: {e}")
-            raise
-
-    # Electricity Prices Operations
-    async def store_electricity_prices(  # noqa: F811
-        self, price_data: List[Dict[str, Any]]
-    ) -> None:
-        """Store electricity price data."""
-        if not price_data:
-            return
-
-        try:
-            async with self.pg_pool.acquire() as conn:
-                values = []
-                for data in price_data:
-                    values.append(
-                        (
-                            data["time"],
-                            data["node_id"],
-                            data["market_type"],
-                            data.get("lmp_price_mwh"),
-                            data.get("energy_component_mwh"),
-                            data.get("congestion_component_mwh"),
-                            data.get("loss_component_mwh"),
-                            data.get("ghg_adder_mwh"),
-                            data.get("price_confidence"),
-                            data.get("forecast_horizon_minutes"),
-                        )
-                    )
-
-                await conn.copy_records_to_table(
-                    "electricity_prices",
-                    records=values,
-                    columns=[
-                        "time",
-                        "node_id",
-                        "market_type",
-                        "lmp_price_mwh",
-                        "energy_component_mwh",
-                        "congestion_component_mwh",
-                        "loss_component_mwh",
-                        "ghg_adder_mwh",
-                        "price_confidence",
-                        "forecast_horizon_minutes",
-                    ],
-                )
-
-                self.logger.debug(f"Stored {len(price_data)} electricity price records")
-
-        except Exception as e:
-            self.logger.error(f"Failed to store electricity prices: {e}")
             raise
 
     async def get_electricity_prices(

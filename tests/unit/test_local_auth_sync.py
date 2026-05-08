@@ -474,6 +474,10 @@ class TestBootSchedulesLocalAuthSync:
         log-and-return rather than raising — the WS handler must keep
         accepting OCPP messages on the socket even if pg_pool is None."""
         session = _session_factory(pg_pool=None)
+        # The new static-pool fallback consults ``_static_pool()`` first; on a
+        # bare MagicMock that returns a child MagicMock (i.e. NOT None), so
+        # the skip branch would not fire without this stub.
+        session._timescale._static_pool = MagicMock(return_value=None)
         # Pre-empt the replay sleep so the helper proceeds immediately.
         session._replay_task = None
         # Spy on sync_charger to ensure it is NOT called when pool is None.
@@ -488,6 +492,27 @@ class TestBootSchedulesLocalAuthSync:
         )
         await session._delayed_local_auth_sync()
         assert called["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_delayed_local_auth_sync_uses_static_pool_when_pg_pool_none(
+        self, _session_factory, monkeypatch
+    ) -> None:
+        """Split topology: static identities use Supabase pool; TS pool may differ."""
+        session = _session_factory(pg_pool=None)
+        static_pool = MagicMock()
+        session._timescale._static_pool = MagicMock(return_value=static_pool)
+        session._replay_task = None
+        used: dict[str, Any] = {}
+
+        async def _fake_sync(cp: Any, pool: Any, sid: str) -> SyncResult:
+            used["pool"] = pool
+            return SyncResult(status="skipped", version=0, entries=0)
+
+        monkeypatch.setattr(
+            "src.websocket_handler.ocpp16_adapter.sync_local_auth_list", _fake_sync
+        )
+        await session._delayed_local_auth_sync()
+        assert used["pool"] is static_pool
 
     @pytest.mark.asyncio
     async def test_delayed_local_auth_sync_propagates_own_cancellation(

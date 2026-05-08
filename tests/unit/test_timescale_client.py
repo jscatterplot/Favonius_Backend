@@ -467,3 +467,35 @@ class TestTimescaleClient:
     ):
         """Removed for the same reason as ``validate_basic_auth`` above."""
         assert not hasattr(timescale_client, "station_requires_basic_auth")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_store_electricity_prices_writes_to_table(self, timescale_client):
+        """Happy path: ENTSO-E points are bulk-loaded into ``electricity_prices``."""
+        mock_conn = AsyncMock()
+        mock_conn.copy_records_to_table = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        ts = datetime.now(timezone.utc)
+        await timescale_client.store_electricity_prices(
+            [
+                {
+                    "time": ts,
+                    "node_id": "10YLT-1001A0008Q",
+                    "market_type": "ENTSOE_DAM",
+                    "lmp_price_mwh": 90.0,
+                    "energy_component_mwh": 90.0,
+                    "congestion_component_mwh": None,
+                    "loss_component_mwh": None,
+                    "ghg_adder_mwh": None,
+                    "price_confidence": None,
+                    "forecast_horizon_minutes": None,
+                }
+            ]
+        )
+        mock_conn.copy_records_to_table.assert_awaited_once()
+        # First positional arg is the destination table name.
+        assert mock_conn.copy_records_to_table.await_args.args[0] == "electricity_prices"

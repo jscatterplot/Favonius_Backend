@@ -133,6 +133,13 @@ class DataSyncService:
         """Return a JSON-safe string for identifier values."""
         return str(value) if value is not None else None
 
+    @staticmethod
+    def _json_float(value: Any, default: float = 0.0) -> float:
+        """Coerce asyncpg numeric types (e.g. Decimal) for JSON serialization."""
+        if value is None:
+            return default
+        return float(value)
+
     def _handle_missing_relation(
         self, table_name: str, exc: BaseException, sync_label: str
     ) -> None:
@@ -222,21 +229,19 @@ class DataSyncService:
                                     session["end_time"].isoformat() if session["end_time"] else None
                                 ),
                                 "energy_delivered_kwh": (
-                                    float(session["energy_delivered_kwh"])
-                                    if session["energy_delivered_kwh"]
-                                    else 0
+                                    self._json_float(session["energy_delivered_kwh"])
                                 ),
                                 "energy_received_kwh": (
-                                    float(session["energy_received_kwh"])
-                                    if session["energy_received_kwh"]
-                                    else 0
+                                    self._json_float(session["energy_received_kwh"])
                                 ),
-                                "session_duration_minutes": session["session_duration_minutes"],
+                                "session_duration_minutes": self._json_float(
+                                    session["session_duration_minutes"]
+                                ),
                                 "cost_total": (
-                                    float(session["cost_total"]) if session["cost_total"] else 0
+                                    self._json_float(session["cost_total"])
                                 ),
                                 "revenue_v2g": (
-                                    float(session["revenue_v2g"]) if session["revenue_v2g"] else 0
+                                    self._json_float(session["revenue_v2g"])
                                 ),
                                 "status": session["derived_status"],
                             }
