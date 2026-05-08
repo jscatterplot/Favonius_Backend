@@ -5625,6 +5625,68 @@ async def list_reports(
     return [_row_to_report(r) for r in rows]
 
 
+class CreateReportRequest(BaseModel):
+    """Body for POST /depots/{depot_id}/reports."""
+
+    kind: str = Field(..., description="weekly_ops | monthly_savings | monthly_consumption | incident | compliance")
+    title: Optional[str] = Field(None)
+    group_by: Optional[str] = Field(None, alias="groupBy")
+    period_start: Optional[str] = Field(None, alias="periodStart")
+    period_end: Optional[str] = Field(None, alias="periodEnd")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@app.post(
+    "/depots/{depot_id}/reports",
+    response_model=Report,
+    status_code=201,
+    tags=["depots"],
+    summary="Create a draft report",
+    description=(
+        "Create a draft Report row. For kind='monthly_consumption' the aggregation "
+        "runs inline against charging_sessions data and is stored as JSONB for later export."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def create_report(
+    body: CreateReportRequest,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> Report:
+    """POST /depots/{depot_id}/reports — create a draft report."""
+    params = {
+        "kind": body.kind,
+        "title": body.title,
+        "groupBy": body.group_by,
+        "periodStart": body.period_start,
+        "periodEnd": body.period_end,
+    }
+    result = await _handle_reports_generate(params, depot_id, dry_run=False, user=user)
+
+    # Re-fetch the created row to return a full Report object.
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, depot_id, title, kind, status, period_start, period_end,
+                   created_at, approved_at, approved_by, export_url, group_by
+            FROM reports
+            WHERE id = $1::uuid
+            """,
+            result["reportId"],
+        )
+    if not row:
+        raise HTTPException(status_code=500, detail="Report created but not retrievable")
+    return _row_to_report(row)
+
+
 @app.get(
     "/depots/{depot_id}/reports/{report_id}",
     response_model=Report,
@@ -5788,6 +5850,59 @@ async def list_agent_actions(
         )
 
     return [_row_to_agent_action(r) for r in rows]
+
+
+# ── Autonomy-settings endpoint ─────────────────────────────────────────────────
+# Returns per-depot agent autonomy configuration.  The frontend uses this to
+# render the agents page and gate which action classes are surfaced.
+
+
+class AutonomySettings(BaseModel):
+    """Per-depot autonomous agent configuration."""
+
+    depot_id: str
+    enabled: bool = True
+    mode: str = Field(
+        "proposed",
+        description="Default action mode: shadow | proposed | auto_notify | auto_silent",
+    )
+    enabled_action_classes: list[str] = Field(
+        default_factory=lambda: ["report_draft"],
+        description="Action classes the agent is allowed to propose.",
+    )
+    auto_approve_threshold: Optional[float] = Field(
+        None,
+        description="Confidence threshold above which actions are auto-approved (null = never).",
+    )
+
+
+@app.get(
+    "/depots/{depot_id}/autonomy-settings",
+    response_model=AutonomySettings,
+    tags=["depots"],
+    summary="Get depot agent autonomy settings",
+    description=(
+        "Returns the autonomous agent configuration for the depot. "
+        "Settings are currently depot-level defaults; per-class overrides are not yet stored."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_autonomy_settings(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> AutonomySettings:
+    """GET /depots/{depot_id}/autonomy-settings."""
+    return AutonomySettings(
+        depot_id=depot_id,
+        enabled=True,
+        mode="proposed",
+        enabled_action_classes=["report_draft"],
+        auto_approve_threshold=None,
+    )
 
 
 @app.get(
