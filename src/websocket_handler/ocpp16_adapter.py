@@ -738,10 +738,15 @@ class OCPP16Session:
                         raise
                 except Exception:
                     pass
-            pool = getattr(self._timescale, "pg_pool", None)
+            pool = None
+            static_pool_fn = getattr(self._timescale, "_static_pool", None)
+            if callable(static_pool_fn):
+                pool = static_pool_fn()
+            if pool is None:
+                pool = getattr(self._timescale, "pg_pool", None)
             if pool is None:
                 logger.debug(
-                    "local_auth_sync station=%s skipped: timescale pg_pool not initialised",
+                    "local_auth_sync station=%s skipped: no static or timescale pool available",
                     self._station_id,
                 )
                 return

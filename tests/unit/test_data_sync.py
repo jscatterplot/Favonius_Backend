@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
@@ -414,6 +415,39 @@ class TestDataSyncSchemaResilience:
         pushed = service.supabase_client.sync_session_summaries.await_args.args[0]
         assert len(pushed) == 1
         assert pushed[0]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_sync_charging_sessions_serializes_decimals_for_supabase_json(self, service):
+        """asyncpg returns DECIMAL columns as Decimal; Supabase JSON must use floats."""
+        conn = AsyncMock()
+        conn.fetch.return_value = [
+            {
+                "session_id": "sess-decimal",
+                "station_id": "stn-1",
+                "vehicle_id": "veh-1",
+                "fleet_operator_id": "org-1",
+                "start_time": datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc),
+                "end_time": datetime(2026, 5, 7, 12, 30, tzinfo=timezone.utc),
+                "energy_delivered_kwh": Decimal("5.5"),
+                "energy_received_kwh": Decimal("0"),
+                "session_duration_minutes": Decimal("42.25"),
+                "cost_total": Decimal("9.99"),
+                "revenue_v2g": None,
+                "derived_status": "completed",
+            }
+        ]
+        conn.execute = AsyncMock()
+        service.timescale_pool = _make_pool_yielding(conn)
+
+        await service.sync_charging_sessions()
+
+        pushed = service.supabase_client.sync_session_summaries.await_args.args[0]
+        row = pushed[0]
+        assert isinstance(row["session_duration_minutes"], float)
+        assert row["session_duration_minutes"] == pytest.approx(42.25)
+        assert isinstance(row["energy_delivered_kwh"], float)
+        assert isinstance(row["cost_total"], float)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)

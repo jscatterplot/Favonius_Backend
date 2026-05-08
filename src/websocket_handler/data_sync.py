@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set
 
 import asyncpg
@@ -133,6 +134,15 @@ class DataSyncService:
         """Return a JSON-safe string for identifier values."""
         return str(value) if value is not None else None
 
+    @staticmethod
+    def _json_float(value: Any, default: float = 0.0) -> float:
+        """Coerce asyncpg numeric types (e.g. Decimal) for JSON serialization."""
+        if value is None:
+            return default
+        if isinstance(value, Decimal):
+            return float(value)
+        return float(value)
+
     def _handle_missing_relation(
         self, table_name: str, exc: BaseException, sync_label: str
     ) -> None:
@@ -222,21 +232,27 @@ class DataSyncService:
                                     session["end_time"].isoformat() if session["end_time"] else None
                                 ),
                                 "energy_delivered_kwh": (
-                                    float(session["energy_delivered_kwh"])
-                                    if session["energy_delivered_kwh"]
+                                    self._json_float(session["energy_delivered_kwh"])
+                                    if session["energy_delivered_kwh"] is not None
                                     else 0
                                 ),
                                 "energy_received_kwh": (
-                                    float(session["energy_received_kwh"])
-                                    if session["energy_received_kwh"]
+                                    self._json_float(session["energy_received_kwh"])
+                                    if session["energy_received_kwh"] is not None
                                     else 0
                                 ),
-                                "session_duration_minutes": session["session_duration_minutes"],
+                                "session_duration_minutes": self._json_float(
+                                    session["session_duration_minutes"]
+                                ),
                                 "cost_total": (
-                                    float(session["cost_total"]) if session["cost_total"] else 0
+                                    self._json_float(session["cost_total"])
+                                    if session["cost_total"] is not None
+                                    else 0
                                 ),
                                 "revenue_v2g": (
-                                    float(session["revenue_v2g"]) if session["revenue_v2g"] else 0
+                                    self._json_float(session["revenue_v2g"])
+                                    if session["revenue_v2g"] is not None
+                                    else 0
                                 ),
                                 "status": session["derived_status"],
                             }

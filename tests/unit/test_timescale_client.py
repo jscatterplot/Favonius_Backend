@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 
 from src.websocket_handler.config import TimescaleConfig
@@ -467,3 +468,44 @@ class TestTimescaleClient:
     ):
         """Removed for the same reason as ``validate_basic_auth`` above."""
         assert not hasattr(timescale_client, "station_requires_basic_auth")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_store_electricity_prices_fallback_to_prices_hypertable(
+        self, timescale_client, monkeypatch
+    ):
+        """Migration-only DB has ``prices`` but not ``electricity_prices``."""
+        monkeypatch.setenv(
+            "PRICE_FEEDER_DEFAULT_DEPOT_ID",
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        mock_conn = AsyncMock()
+        mock_conn.copy_records_to_table = AsyncMock(
+            side_effect=asyncpg.exceptions.UndefinedTableError(
+                'relation "electricity_prices" does not exist'
+            )
+        )
+        mock_conn.executemany = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        ts = datetime.now(timezone.utc)
+        await timescale_client.store_electricity_prices(
+            [
+                {
+                    "time": ts,
+                    "node_id": "10YLIT----------Y",
+                    "market_type": "ENTSOE_DAM",
+                    "lmp_price_mwh": 90.0,
+                    "energy_component_mwh": 90.0,
+                    "congestion_component_mwh": None,
+                    "loss_component_mwh": None,
+                    "ghg_adder_mwh": None,
+                    "price_confidence": None,
+                    "forecast_horizon_minutes": None,
+                }
+            ]
+        )
+        mock_conn.executemany.assert_awaited_once()
