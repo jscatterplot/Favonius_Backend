@@ -270,7 +270,10 @@ class TimescaleClient:
                             )
                             VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7, $8, $9, $10)
                             ON CONFLICT (time, station_id, connector_id) DO UPDATE
-                            SET transaction_id = EXCLUDED.transaction_id,
+                            SET transaction_id = COALESCE(
+                                    EXCLUDED.transaction_id,
+                                    telemetry.transaction_id
+                                ),
                                 vehicle_id = COALESCE(EXCLUDED.vehicle_id, telemetry.vehicle_id),
                                 charger_id = COALESCE(EXCLUDED.charger_id, telemetry.charger_id),
                                 soc = COALESCE(EXCLUDED.soc, telemetry.soc),
@@ -280,7 +283,7 @@ class TimescaleClient:
                             """,
                             data["time"],
                             station_id or "unknown",
-                            int(connector_id or 1),
+                            int(connector_id) if connector_id is not None else 1,
                             transaction_id,
                             str(vehicle_id) if vehicle_id else None,
                             str(charger_id) if charger_id else None,

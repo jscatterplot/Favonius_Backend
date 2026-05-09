@@ -10,8 +10,9 @@ ALTER TABLE telemetry
     ADD COLUMN IF NOT EXISTS transaction_id BIGINT;
 
 -- Backfill station/connector defaults for pre-migration rows.
+-- Use vehicle_id in station_id to preserve uniqueness from legacy (time, vehicle_id) PK.
 UPDATE telemetry
-SET station_id = COALESCE(station_id, 'legacy-unknown')
+SET station_id = COALESCE(station_id, 'legacy-vehicle-' || vehicle_id::text)
 WHERE station_id IS NULL;
 
 UPDATE telemetry
@@ -46,14 +47,15 @@ WITH sample_rollup AS (
         s.station_id,
         s.connector_id,
         s.transaction_id,
-        MAX(
-            CASE
-                WHEN s.measurand = 'Power.Active.Import' THEN
-                    CASE WHEN COALESCE(s.unit, '') = 'W' THEN s.value / 1000.0 ELSE s.value END
-                WHEN s.measurand = 'Power.Active.Export' THEN
-                    -1.0 * (CASE WHEN COALESCE(s.unit, '') = 'W' THEN s.value / 1000.0 ELSE s.value END)
-                ELSE NULL
-            END
+        GREATEST(
+            MAX(
+                CASE
+                    WHEN s.measurand = 'Power.Active.Import' THEN
+                        CASE WHEN COALESCE(s.unit, '') = 'W' THEN s.value / 1000.0 ELSE s.value END
+                    ELSE NULL
+                END
+            ),
+            0.0
         ) AS charging_kw,
         MAX(
             CASE
@@ -63,8 +65,12 @@ WITH sample_rollup AS (
         ) AS soc,
         MAX(
             CASE
-                WHEN s.measurand = 'Max.Current.Offered' THEN
-                    CASE WHEN COALESCE(s.unit, '') = 'A' THEN s.value ELSE NULL END
+                WHEN s.measurand = 'Power.Offered' THEN
+                    CASE
+                        WHEN COALESCE(s.unit, '') = 'W' THEN s.value / 1000.0
+                        WHEN COALESCE(s.unit, '') = 'kW' THEN s.value
+                        ELSE NULL
+                    END
                 ELSE NULL
             END
         ) AS max_charge_kw
