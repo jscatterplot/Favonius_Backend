@@ -82,8 +82,8 @@ WITH sample_rollup AS (
             CASE
                 WHEN s.measurand = 'Power.Offered' THEN
                     CASE
-                        WHEN COALESCE(s.unit, '') = 'W' THEN s.value / 1000.0
-                        WHEN COALESCE(s.unit, '') = 'kW' THEN s.value
+                        WHEN LOWER(COALESCE(s.unit, '')) = 'kw' THEN s.value
+                        WHEN LOWER(COALESCE(s.unit, '')) = 'w' THEN s.value / 1000.0
                         ELSE NULL
                     END
                 ELSE NULL
