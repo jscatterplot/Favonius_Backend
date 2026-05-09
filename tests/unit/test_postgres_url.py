@@ -6,6 +6,7 @@ import pytest
 
 from src.db.postgres_url import (
     build_postgres_dsn,
+    describe_database_target,
     is_postgres_url,
     merge_timescale_params_from_url,
     parse_postgres_connection_url,
@@ -140,3 +141,25 @@ def test_prepare_asyncpg_url_and_ssl_second_param() -> None:
     assert "sslmode" not in clean
     assert "application_name=a" in clean
     assert isinstance(ssl_arg, ssl.SSLContext)
+
+
+def test_describe_database_target_masks_user_password_db() -> None:
+    """Redact user/password/db; expose only port and a TLD-suffix host."""
+    desc = describe_database_target(
+        "postgresql://tsdbadmin:rotated_secret@abc123.tsdb.cloud.timescale.com:31413/tsdb?sslmode=require"
+    )
+    assert "tsdbadmin" not in desc
+    assert "rotated_secret" not in desc
+    assert "tsdb" not in desc.split("port=")[0]  # db name not before "port="
+    assert "abc123" not in desc
+    assert "port=31413" in desc
+    assert "*****.cloud.timescale.com" in desc or "*****.timescale.com" in desc
+
+
+def test_describe_database_target_short_host() -> None:
+    """Hosts with no dotted suffix still mask cleanly without crashing."""
+    desc = describe_database_target("postgresql://u:p@localhost:5432/db")
+    assert "u" not in desc.split("port=")[0].replace("user=", "")
+    assert "p" not in desc.split("port=")[0].replace("user=", "")
+    assert "*****" in desc
+    assert "port=5432" in desc

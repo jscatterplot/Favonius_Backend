@@ -19,7 +19,6 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, AsyncIterator, Iterator, Literal, Optional, Union
-from urllib.parse import urlparse
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -68,6 +67,7 @@ from ..db.exceptions import (
     IdempotencyKeyReusedError,
 )
 from ..db.pools import DatabasePools
+from ..db.postgres_url import describe_database_target
 from ..db.snapshot_store import persist_snapshot
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
 from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_admin_audit_row
@@ -150,21 +150,6 @@ async def _require_depot_access(
     validate_depot_id(depot_id)
     await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
     return depot_id
-
-
-def describe_database_target(database_url: str) -> str:
-    """Return safe, redacted connection target details for logs.
-
-    Security: only expose port; mask host/user/db to prevent
-    infrastructure reconnaissance via log scraping.
-    """
-    parsed = urlparse(database_url)
-    host = parsed.hostname or ""
-    port = parsed.port or "<default>"
-    # Show only the TLD suffix (e.g. "*****.timescale.com")
-    host_parts = host.rsplit(".", 2)
-    masked_host = f"*****.{'.'.join(host_parts[-2:])}" if len(host_parts) >= 2 else "*****"
-    return f"user=***** host={masked_host} port={port} db=*****"
 
 
 def resolve_database_url() -> tuple[str, str]:
