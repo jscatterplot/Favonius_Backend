@@ -140,6 +140,21 @@ class DataSyncService:
             return default
         return float(value)
 
+    @staticmethod
+    def _json_int(value: Any, default: int = 0) -> int:
+        """Coerce numeric values to a JSON-safe int.
+
+        ``EXTRACT(EPOCH ...) / 60`` returns a numeric/float, so a 13606-minute
+        session arrives here as ``13606.0``. PostgREST refuses to insert a
+        JSON number with a fractional component into an integer column
+        (``22P02 invalid input syntax for type integer``), even when the
+        fractional part is zero. Round-and-cast at this boundary keeps the
+        wire payload an integer literal.
+        """
+        if value is None:
+            return default
+        return int(round(float(value)))
+
     def _handle_missing_relation(
         self, table_name: str, exc: BaseException, sync_label: str
     ) -> None:
@@ -234,7 +249,7 @@ class DataSyncService:
                                 "energy_received_kwh": (
                                     self._json_float(session["energy_received_kwh"])
                                 ),
-                                "session_duration_minutes": self._json_float(
+                                "session_duration_minutes": self._json_int(
                                     session["session_duration_minutes"]
                                 ),
                                 "cost_total": (
