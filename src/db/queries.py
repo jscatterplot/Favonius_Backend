@@ -102,12 +102,15 @@ async def get_latest_vehicle_soc(
 
 async def insert_telemetry(
     db,
-    vehicle_id: UUID,
+    vehicle_id: Optional[UUID],
     charger_id: Optional[UUID],
     soc: Optional[float],
     charging_kw: Optional[float],
     max_charge_kw: Optional[float],
     timestamp: datetime,
+    station_id: str = "unknown",
+    connector_id: int = 1,
+    transaction_id: Optional[int] = None,
     is_plugged: Optional[bool] = None,
     location_lat: Optional[float] = None,
     location_lon: Optional[float] = None,
@@ -117,12 +120,15 @@ async def insert_telemetry(
 
     Args:
         db: Database connection or pool
-        vehicle_id: Vehicle UUID
+        vehicle_id: Optional vehicle UUID (enrichment)
         charger_id: Optional charger UUID that reported this telemetry
         soc: State of charge (0.0-1.0)
         charging_kw: Current charging power
         max_charge_kw: Max charge power from OCPP
         timestamp: Telemetry timestamp
+        station_id: OCPP station id
+        connector_id: Connector id for the station
+        transaction_id: Optional OCPP transaction id
         is_plugged: Whether vehicle is plugged in
         location_lat: Latitude
         location_lon: Longitude
@@ -130,13 +136,17 @@ async def insert_telemetry(
     """
     query = """
         INSERT INTO telemetry
-            (time, vehicle_id, charger_id, soc, charging_kw, max_charge_kw,
+            (time, station_id, connector_id, transaction_id,
+             vehicle_id, charger_id, soc, charging_kw, max_charge_kw,
              is_plugged, location_lat, location_lon, odometer_km)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     """
     await db.execute(
         query,
         timestamp,
+        station_id,
+        connector_id,
+        transaction_id,
         vehicle_id,
         charger_id,
         soc,
@@ -2428,6 +2438,27 @@ async def latest_telemetry_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, 
     """
     rows = await db.fetch(query, vehicle_ids)
     return {row["vehicle_id"]: dict(row) for row in rows}
+
+
+async def latest_telemetry_by_stations(db, station_ids: list[str]) -> dict[tuple[str, int], dict]:
+    """Latest telemetry row per (station_id, connector_id)."""
+    if not station_ids:
+        return {}
+    query = """
+        SELECT DISTINCT ON (station_id, connector_id)
+               station_id,
+               connector_id,
+               transaction_id,
+               time              AS last_seen_at,
+               soc               AS current_soc,
+               charging_kw       AS current_power_kw,
+               is_plugged
+        FROM telemetry
+        WHERE station_id = ANY($1)
+        ORDER BY station_id, connector_id, time DESC
+    """
+    rows = await db.fetch(query, station_ids)
+    return {(row["station_id"], int(row["connector_id"])): dict(row) for row in rows}
 
 
 async def open_session_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict]:

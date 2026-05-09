@@ -54,15 +54,15 @@ async def store_meter_values(
         charger_id: Optional charger UUID
         energy_kwh: Optional cumulative energy (Energy.Active.Import.Register)
     """
-    # Resolve vehicle_id via charger lookup in Supabase (static)
+    # Resolve vehicle_id via charger lookup in Supabase (static).
+    # Missing mapping should not block charger-keyed telemetry writes.
     if vehicle_id is None:
         vehicle_id = await get_vehicle_id_from_ocpp_id(pools.static, charge_point_id, connector_id)
         if vehicle_id is None:
-            logger.warning(
+            logger.debug(
                 f"Could not find vehicle_id for charge_point_id={charge_point_id}, "
-                f"connector_id={connector_id}. Skipping telemetry storage."
+                f"connector_id={connector_id}. Continuing with charger-keyed telemetry."
             )
-            return
 
     # Resolve charger_id from Supabase (chargers table is static)
     if charger_id is None:
@@ -77,9 +77,18 @@ async def store_meter_values(
             logger.debug(f"Could not resolve charger_id for {charge_point_id}: {e}")
 
     query = """
-    INSERT INTO telemetry (time, vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw)
-    VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7)
-    ON CONFLICT (time, vehicle_id) DO NOTHING
+    INSERT INTO telemetry (
+        time, station_id, connector_id, transaction_id,
+        vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
+    )
+    VALUES ($1, $2, $3, NULL, $4::uuid, $5::uuid, $6, $7, $8, $9)
+    ON CONFLICT (time, station_id, connector_id) DO UPDATE
+    SET vehicle_id = COALESCE(EXCLUDED.vehicle_id, telemetry.vehicle_id),
+        charger_id = COALESCE(EXCLUDED.charger_id, telemetry.charger_id),
+        soc = COALESCE(EXCLUDED.soc, telemetry.soc),
+        charging_kw = COALESCE(EXCLUDED.charging_kw, telemetry.charging_kw),
+        is_plugged = COALESCE(EXCLUDED.is_plugged, telemetry.is_plugged),
+        max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw)
     """
 
     is_plugged = power_kw > 0.1
@@ -90,7 +99,9 @@ async def store_meter_values(
             await conn.execute(
                 query,
                 timestamp,
-                str(vehicle_id),
+                charge_point_id,
+                connector_id,
+                str(vehicle_id) if vehicle_id else None,
                 str(charger_id) if charger_id else None,
                 soc,
                 power_kw,
@@ -106,7 +117,7 @@ async def store_meter_values(
 
         # CRITICAL: Update vehicles table if max_charge_kw provided (per PRD Section 8.4)
         # vehicles table is in Supabase (static pool)
-        if max_charge_kw and max_charge_kw > 0:
+        if vehicle_id and max_charge_kw and max_charge_kw > 0:
             await _update_vehicle_max_charge_kw(pools.static, vehicle_id, max_charge_kw, timestamp)
 
     except asyncpg.PostgresError as e:

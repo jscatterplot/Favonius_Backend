@@ -187,6 +187,63 @@ class TestTimescaleClient:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_insert_telemetry_batch_writes_without_vehicle_id(self, timescale_client):
+        """Charger-keyed telemetry writes must not require vehicle_id."""
+        mock_ts_conn = AsyncMock()
+        mock_ts_pool = MagicMock()
+        mock_ts_pool.acquire.return_value.__aenter__.return_value = mock_ts_conn
+        mock_ts_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_ts_pool
+
+        mock_static_conn = AsyncMock()
+        mock_static_pool = AsyncMock()
+        mock_static_pool.acquire.return_value.__aenter__.return_value = mock_static_conn
+        mock_static_pool.acquire.return_value.__aexit__.return_value = None
+        mock_static_pool.release = AsyncMock()
+
+        sb_client = MagicMock()
+        sb_client.db_pool = mock_static_pool
+        timescale_client.set_supabase_client(sb_client)
+
+        telemetry_data = [
+            {
+                "time": datetime.now(timezone.utc),
+                "station_id": "hrx-uab_hrx-vilnius-005",
+                "connector_id": 1,
+                "session_id": "6",
+                "power_kw": 10.769,
+                "soc_percent": None,
+                "max_charge_power_kw": None,
+            }
+        ]
+
+        with (
+            patch.object(
+                timescale_client, "_update_session_live_metrics", new_callable=AsyncMock
+            ) as update_live_mock,
+            patch.object(
+                timescale_client, "_resolve_vehicle_id_from_session", new_callable=AsyncMock
+            ) as resolve_vehicle_mock,
+            patch.object(
+                timescale_client, "_resolve_charger_id", new_callable=AsyncMock
+            ) as resolve_charger_mock,
+        ):
+            resolve_vehicle_mock.return_value = None
+            resolve_charger_mock.return_value = None
+
+            await timescale_client.insert_telemetry_batch(telemetry_data)
+
+        update_live_mock.assert_awaited()
+        resolve_vehicle_mock.assert_awaited()
+        telemetry_sql = mock_ts_conn.execute.await_args_list[-1].args[0]
+        assert "INSERT INTO telemetry" in telemetry_sql
+        assert "station_id, connector_id" in telemetry_sql
+        last_args = mock_ts_conn.execute.await_args_list[-1].args
+        assert last_args[2] == "hrx-uab_hrx-vilnius-005"
+        assert last_args[3] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_get_energy_usage_summary(self, timescale_client):
         """Test getting energy usage summary."""
         # Test without pool (should handle gracefully)
@@ -270,7 +327,7 @@ class TestTimescaleClient:
         """Open-session recovery must ignore imported NULL-end_time rows."""
         mock_conn = AsyncMock()
         mock_conn.fetch = AsyncMock(return_value=[])
-        mock_pool = AsyncMock()
+        mock_pool = MagicMock()
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
         mock_pool.acquire.return_value.__aexit__.return_value = None
         timescale_client.pg_pool = mock_pool
@@ -287,7 +344,7 @@ class TestTimescaleClient:
         """last_seen stamping must not touch imported rows."""
         mock_conn = AsyncMock()
         mock_conn.execute = AsyncMock()
-        mock_pool = AsyncMock()
+        mock_pool = MagicMock()
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
         mock_pool.acquire.return_value.__aexit__.return_value = None
         timescale_client.pg_pool = mock_pool
