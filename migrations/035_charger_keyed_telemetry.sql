@@ -47,16 +47,31 @@ WITH sample_rollup AS (
         s.station_id,
         s.connector_id,
         s.transaction_id,
-        GREATEST(
-            MAX(
+        CASE
+            WHEN MAX(
                 CASE
                     WHEN s.measurand = 'Power.Active.Import' THEN
-                        CASE WHEN COALESCE(s.unit, '') = 'W' THEN s.value / 1000.0 ELSE s.value END
+                        CASE
+                            WHEN LOWER(COALESCE(s.unit, '')) = 'kw' THEN s.value
+                            ELSE s.value / 1000.0
+                        END
                     ELSE NULL
                 END
-            ),
-            0.0
-        ) AS charging_kw,
+            ) IS NULL THEN NULL
+            ELSE GREATEST(
+                MAX(
+                    CASE
+                        WHEN s.measurand = 'Power.Active.Import' THEN
+                            CASE
+                                WHEN LOWER(COALESCE(s.unit, '')) = 'kw' THEN s.value
+                                ELSE s.value / 1000.0
+                            END
+                        ELSE NULL
+                    END
+                ),
+                0.0
+            )
+        END AS charging_kw,
         MAX(
             CASE
                 WHEN s.measurand = 'SoC' THEN s.value / 100.0
