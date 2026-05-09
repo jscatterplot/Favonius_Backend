@@ -1382,8 +1382,12 @@ async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
       * Vehicle id_tags: active vehicles whose ``site_id`` matches the
         charger's site.
       * In ``access_mode='restricted'`` sites the per-charger
-        ``charger_vehicle_access`` matrix filters which vehicles count;
-        absent rows fall back to ``sites.charger_vehicle_access_default``.
+        ``charger_vehicle_access`` matrix filters which vehicles count.
+        When no row exists for a (charger, vehicle) pair the
+        ``sites.charger_vehicle_access_default`` discriminator decides:
+        ``'all_to_all'`` grants access by default, ``'explicit_matrix'``
+        requires an explicit row. NULL is treated as ``'explicit_matrix'``
+        (deny) for safety.
       * RFID cards: active cards in the same site that are linked to an
         accessible vehicle (via ``rfid_card_vehicle_assignments``) **or** to
         an active driver (via ``rfid_card_driver_assignments``). Drivers are
@@ -1425,7 +1429,7 @@ async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
                   )
                   OR (
                       si.access_mode = 'restricted'
-                      AND si.access_default = TRUE
+                      AND si.access_default = 'all_to_all'
                       AND NOT EXISTS (
                           SELECT 1 FROM charger_vehicle_access cva
                           WHERE cva.charging_station_id = si.charging_station_id
