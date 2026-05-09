@@ -60,6 +60,37 @@ class TestDataSyncService:
         return DataSyncService(config, supabase_client, timescale_config)
 
     @pytest.mark.timeout(10)
+    def test_json_int_rounds_floats_for_integer_columns(self):
+        """``_json_int`` must drop the ``.0`` suffix that PostgREST refuses
+        on integer columns (``22P02 invalid input syntax for type integer``).
+
+        ``EXTRACT(EPOCH ...)/60`` returns a numeric, so a 13606-minute
+        session arrives at the helper as ``13606.0``. The destination
+        ``charging_sessions_summary.session_duration_minutes`` is INTEGER.
+        """
+        from decimal import Decimal
+
+        assert DataSyncService._json_int(13606.0) == 13606
+        assert isinstance(DataSyncService._json_int(13606.0), int)
+        # Sub-minute fractions must round to the nearest whole minute, not floor.
+        assert DataSyncService._json_int(45.6) == 46
+        assert DataSyncService._json_int(45.4) == 45
+        # asyncpg surfaces NUMERIC as Decimal — must coerce cleanly.
+        assert DataSyncService._json_int(Decimal("90.0")) == 90
+        # Default applies on None.
+        assert DataSyncService._json_int(None) == 0
+        assert DataSyncService._json_int(None, default=42) == 42
+
+    @pytest.mark.timeout(10)
+    def test_json_float_passes_through(self):
+        """``_json_float`` keeps coercing Decimals for the numeric columns."""
+        from decimal import Decimal
+
+        assert DataSyncService._json_float(Decimal("90.5")) == 90.5
+        assert DataSyncService._json_float(None) == 0.0
+        assert DataSyncService._json_float(None, default=1.5) == 1.5
+
+    @pytest.mark.timeout(10)
     def test_data_sync_service_initialization(self, config, supabase_client):
         """Test DataSyncService initialization."""
         service = DataSyncService(config, supabase_client)
@@ -444,8 +475,10 @@ class TestDataSyncSchemaResilience:
 
         pushed = service.supabase_client.sync_session_summaries.await_args.args[0]
         row = pushed[0]
-        assert isinstance(row["session_duration_minutes"], float)
-        assert row["session_duration_minutes"] == pytest.approx(42.25)
+        # session_duration_minutes is INTEGER in Supabase — must be a Python
+        # int (no fractional part on the wire) to satisfy PostgREST.
+        assert isinstance(row["session_duration_minutes"], int)
+        assert row["session_duration_minutes"] == 42  # rounded from 42.25
         assert isinstance(row["energy_delivered_kwh"], float)
         assert isinstance(row["cost_total"], float)
 
