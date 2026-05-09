@@ -2456,6 +2456,55 @@ class TimescaleClient:
                 station_id,
             )
 
+    async def mark_connectors_available_after_reconnect(self, station_id: str) -> int:
+        """Undo a stale ``mark_connectors_unavailable`` row when the WS reconnects.
+
+        ``mark_connectors_unavailable`` writes ``(Unavailable, 'ConnectionLost')``
+        on every WS drop. ``derive_charger_status`` then forces ``offline``
+        regardless of how recent the heartbeat is (see
+        ``src/api/fleet_list.py``). When the charger reconnects but does NOT
+        send a fresh StatusNotification — common for many ABB Terra firmwares
+        on quick reconnects — that stale row outlives the actual offline
+        window and the GET /depots/{id}/chargers pill stays stuck on
+        ``offline`` even while OCPP frames flow.
+
+        We append an ``(Available, NULL)`` row ONLY for connectors whose
+        latest row is exactly the close-hook's marker, identified by
+        ``error_code = 'ConnectionLost'``. That precisely undoes our own
+        marker without clobbering:
+          * a real ``Faulted`` from the charger,
+          * a charger-issued ``Unavailable`` carrying a different error code
+            (or NULL — handled by the equality on 'ConnectionLost'),
+          * any state newer than the close-hook row (the latest-row check
+            naturally excludes those).
+
+        Returns the number of connectors whose status was rewritten — useful
+        for observability so we can spot misbehaving firmwares whose stuck
+        states are routinely corrected on reconnect.
+        """
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH latest AS (
+                    SELECT DISTINCT ON (connector_id)
+                           station_id, connector_id, status, error_code
+                      FROM connector_status
+                     WHERE station_id = $1
+                     ORDER BY connector_id, timestamp DESC
+                )
+                INSERT INTO connector_status (
+                    station_id, connector_id, status, error_code, timestamp
+                )
+                SELECT station_id, connector_id, 'Available', NULL, NOW()
+                  FROM latest
+                 WHERE status = 'Unavailable'
+                   AND error_code = 'ConnectionLost'
+                RETURNING connector_id
+                """,
+                station_id,
+            )
+            return len(rows)
+
     async def enqueue_charging_command(
         self,
         *,

@@ -128,13 +128,18 @@ def derive_vehicle_state(
 def format_charger_session(session: Optional[dict]) -> Optional[dict]:
     """Render a runtime session row as the ``current_session`` sub-object.
 
-    Returns None when no open session exists.
+    Returns None when no open session exists. ``id_tag`` is the raw OCPP
+    idTag the charger sent on StartTransaction, surfaced so the frontend
+    can show "Unknown vehicle charging · RFID 0C923A35" when the
+    cards-only authorization path didn't resolve a ``vehicle_id`` (no row
+    in ``rfid_card_vehicle_assignments`` for this card).
     """
     if session is None:
         return None
     return {
         "session_id": str(session["session_id"]),
         "vehicle_id": session.get("vehicle_id"),
+        "id_tag": session.get("id_tag"),
         "started_at": _isoformat(session.get("started_at")),
         "current_power_kw": _float_or_none(session.get("current_power_kw")),
         "current_soc": _float_or_none(session.get("current_soc")),

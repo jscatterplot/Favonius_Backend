@@ -754,6 +754,32 @@ class OCPPWebSocketServer:
         CONNECTIONS_TOTAL.set(len(self.connections))
         CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
 
+        # Undo a stale ``Unavailable / ConnectionLost`` row from the previous
+        # disconnect. Some firmwares (notably ABB Terra AC) skip
+        # StatusNotification on quick reconnects, leaving the close-hook's
+        # marker as the latest connector_status row. Without this clear,
+        # GET /depots/{id}/chargers reports ``offline`` indefinitely even
+        # while OCPP frames flow. Best-effort; failure must not block
+        # accepting the WS.
+        if self.timescale_client is not None:
+            try:
+                cleared = await self.timescale_client.mark_connectors_available_after_reconnect(
+                    station_id
+                )
+                if cleared:
+                    self.logger.info(
+                        "Cleared stale Unavailable/ConnectionLost on %d connector(s) "
+                        "for station=%s on reconnect",
+                        cleared,
+                        station_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "mark_connectors_available_after_reconnect failed for station=%s: %s",
+                    station_id,
+                    exc,
+                )
+
         # Route to the correct OCPP library based on the negotiated subprotocol.
         # OCPP 1.6 chargers must use the v16 library; passing their messages
         # through EnhancedOCPPChargePoint (v201) causes _validate_payload to

@@ -2392,6 +2392,7 @@ async def open_sessions_by_stations(db, station_ids: list[str]) -> dict[str, dic
                station_id,
                session_id,
                vehicle_id::text  AS vehicle_id,
+               id_token          AS id_tag,
                start_time        AS started_at,
                current_power_kw,
                current_soc,
