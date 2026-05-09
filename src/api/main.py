@@ -1183,6 +1183,15 @@ class ChargerCurrentSession(BaseModel):
 
     session_id: str
     vehicle_id: Optional[str] = None
+    id_tag: Optional[str] = Field(
+        None,
+        description=(
+            "Raw OCPP idTag the charger sent at StartTransaction. Surfaced so "
+            "the frontend can render \"Unknown vehicle charging · RFID <tag>\" "
+            "when the cards-only auth path didn't resolve a ``vehicle_id`` "
+            "(no row in ``rfid_card_vehicle_assignments`` for this card)."
+        ),
+    )
     started_at: str = Field(..., description="Session start (ISO 8601)")
     current_power_kw: Optional[float] = None
     current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)

@@ -476,5 +476,40 @@ class TestFormatSubObjects:
     def test_format_charger_session_none(self):
         assert format_charger_session(None) is None
 
+    def test_format_charger_session_includes_id_tag(self):
+        """``id_tag`` must round-trip from the open-sessions row so the
+        frontend can render \"Unknown vehicle charging · RFID <tag>\" when
+        the auth path was a card without a vehicle assignment."""
+        session = {
+            "session_id": "ses-1",
+            "vehicle_id": None,  # cards-only flow, no rfid_card_vehicle_assignments row
+            "id_tag": "0C923A35",
+            "started_at": None,
+            "current_power_kw": None,
+            "current_soc": None,
+            "target_soc": None,
+            "estimated_end_at": None,
+        }
+        out = format_charger_session(session)
+        assert out is not None
+        assert out["id_tag"] == "0C923A35"
+        assert out["vehicle_id"] is None
+
+    def test_format_charger_session_id_tag_omitted(self):
+        """A session row without an ``id_tag`` key (legacy fixture) must
+        emit ``id_tag: None`` rather than raising KeyError."""
+        session = {
+            "session_id": "ses-2",
+            "vehicle_id": "veh-1",
+            "started_at": None,
+            "current_power_kw": None,
+            "current_soc": None,
+            "target_soc": None,
+            "estimated_end_at": None,
+        }
+        out = format_charger_session(session)
+        assert out is not None
+        assert out["id_tag"] is None
+
     def test_format_vehicle_next_departure_none(self):
         assert format_vehicle_next_departure(None) is None

@@ -499,3 +499,53 @@ class TestTimescaleClient:
         mock_conn.copy_records_to_table.assert_awaited_once()
         # First positional arg is the destination table name.
         assert mock_conn.copy_records_to_table.await_args.args[0] == "electricity_prices"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_mark_connectors_available_after_reconnect(self, timescale_client):
+        """Reconnect-clear inserts a fresh row and reports cleared connector count.
+
+        The query inserts ``(Available, NULL, NOW())`` for connectors whose
+        latest row is the close-hook's ``(Unavailable, ConnectionLost)``
+        marker. The selectivity is enforced in SQL — Python only counts the
+        RETURNING rows. We assert the call wiring + return value here; the
+        SQL precision (Faulted not clobbered, charger-issued Unavailable
+        with a different error_code preserved) lives in the integration
+        recovery suite where a real DB is available.
+        """
+        mock_conn = AsyncMock()
+        # Two connectors had stale ConnectionLost markers; the SQL returns
+        # one row per cleared connector via RETURNING connector_id.
+        mock_conn.fetch = AsyncMock(return_value=[{"connector_id": 1}, {"connector_id": 2}])
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        cleared = await timescale_client.mark_connectors_available_after_reconnect("hrx-ac-1")
+
+        assert cleared == 2
+        mock_conn.fetch.assert_awaited_once()
+        sql, station_id = mock_conn.fetch.await_args.args
+        assert station_id == "hrx-ac-1"
+        # SQL contract: must select Unavailable+ConnectionLost and insert Available.
+        assert "'Unavailable'" in sql
+        assert "'ConnectionLost'" in sql
+        assert "'Available'" in sql
+        assert "RETURNING connector_id" in sql
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_mark_connectors_available_after_reconnect_returns_zero_when_clean(
+        self, timescale_client
+    ):
+        """No stale rows → zero clears, no warning churn for healthy chargers."""
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        cleared = await timescale_client.mark_connectors_available_after_reconnect("hrx-ac-1")
+        assert cleared == 0
