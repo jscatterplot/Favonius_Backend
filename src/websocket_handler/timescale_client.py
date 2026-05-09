@@ -260,7 +260,7 @@ class TimescaleClient:
 
                         charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
                         soc = (soc_percent / 100.0) if soc_percent is not None else None
-                        is_plugged = power_kw is not None and power_kw > 0.1
+                        is_plugged = (power_kw > 0.1) if power_kw is not None else None
 
                         await conn.execute(
                             """

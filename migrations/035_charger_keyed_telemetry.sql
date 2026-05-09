@@ -46,7 +46,7 @@ WITH sample_rollup AS (
         s.time,
         s.station_id,
         s.connector_id,
-        s.transaction_id,
+        MAX(s.transaction_id) AS transaction_id,
         CASE
             WHEN MAX(
                 CASE
@@ -90,7 +90,7 @@ WITH sample_rollup AS (
             END
         ) AS max_charge_kw
     FROM telemetry_samples s
-    GROUP BY s.time, s.station_id, s.connector_id, s.transaction_id
+    GROUP BY s.time, s.station_id, s.connector_id
 )
 INSERT INTO telemetry (
     time,
