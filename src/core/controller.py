@@ -271,6 +271,12 @@ class DepotController:
                     continue
                 raise
 
+        # Rate-limit the scheduled loop regardless of outcome. Without this,
+        # last_run_time is never set on a readiness-blocked run, causing the
+        # hourly loop to retry every minute instead of every hour and
+        # producing thousands of redundant snapshots per day.
+        self.last_run_time = datetime.now(timezone.utc)
+
         # Persist the input snapshot once, BEFORE the solve retry loop, so
         # post-mortem replay survives crashes/timeouts and we don't write
         # multiple orphan rows for one logical run.
