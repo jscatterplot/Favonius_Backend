@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import csv
 import io
-import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -830,3 +829,519 @@ class TestEnergyReportCsvEndpoint:
         assert response.status_code == status.HTTP_403_FORBIDDEN
         detail = response.json()["detail"]
         assert detail["error_code"] == "CROSS_ORG_DENIED"
+
+
+# ── Report CRUD endpoint tests ──────────────────────────────────────────────
+
+
+def _make_report_row(
+    depot_id: str,
+    report_id: Optional[str] = None,
+    *,
+    kind: str = "monthly_consumption",
+    status: str = "draft",
+    group_by: str = "card",
+    period_start: Optional[datetime] = None,
+    period_end: Optional[datetime] = None,
+) -> dict:
+    """Return a dict that mimics an asyncpg Record for the reports table."""
+    from zoneinfo import ZoneInfo as _ZI
+
+    now_utc = datetime(2025, 5, 1, 0, 0, 0, tzinfo=_ZI("UTC"))
+    return {
+        "id": report_id or str(uuid4()),
+        "depot_id": depot_id,
+        "title": "Monthly consumption — April 2025 (by card)",
+        "kind": kind,
+        "status": status,
+        "period_start": period_start or datetime(2025, 4, 1, 7, 0, 0, tzinfo=_ZI("UTC")),
+        "period_end": period_end or datetime(2025, 4, 30, 6, 59, 59, 999999, tzinfo=_ZI("UTC")),
+        "created_at": now_utc,
+        "approved_at": None,
+        "approved_by": None,
+        "export_url": None,
+        "group_by": group_by,
+    }
+
+
+def _make_pool_for_create_report(
+    depot_id: str,
+    report_id: str,
+    session_records: Optional[list] = None,
+):
+    """
+    Construct a db_pools mock that handles the multi-step create_report flow:
+    - static pool: sites lookup + charging_stations lookup
+    - ts pool:
+        (1) fetch() for charging_sessions (session rows)
+        (2) fetchrow() for INSERT INTO reports RETURNING id, created_at
+        (3) fetchrow() for SELECT FROM reports WHERE id = ...
+    """
+    report_row = _make_report_row(depot_id, report_id=report_id)
+
+    static_conn = AsyncMock()
+
+    async def _static_fetchrow(query: str, *args, **kwargs):
+        if "FROM sites" in query:
+            return {"timezone": "America/Los_Angeles", "currency": "USD", "billing_metadata": {}}
+        return None
+
+    async def _static_fetch(query: str, *args, **kwargs):
+        if "FROM charging_stations" in query:
+            return []
+        return []
+
+    static_conn.fetchrow.side_effect = _static_fetchrow
+    static_conn.fetch.side_effect = _static_fetch
+
+    ts_conn = AsyncMock()
+    _insert_returning = {"id": report_id, "created_at": report_row["created_at"]}
+
+    async def _ts_fetch(query: str, *args, **kwargs):
+        # charging_sessions fetch
+        return session_records or []
+
+    async def _ts_fetchrow(query: str, *args, **kwargs):
+        if "INSERT INTO reports" in query:
+            return _insert_returning
+        if "SELECT" in query and "FROM reports" in query:
+            return report_row
+        return None
+
+    ts_conn.fetch.side_effect = _ts_fetch
+    ts_conn.fetchrow.side_effect = _ts_fetchrow
+
+    static_pool = MagicMock()
+    static_pool.acquire.return_value.__aenter__.return_value = static_conn
+    static_pool.acquire.return_value.__aexit__.return_value = None
+
+    ts_pool = MagicMock()
+    ts_pool.acquire.return_value.__aenter__.return_value = ts_conn
+    ts_pool.acquire.return_value.__aexit__.return_value = None
+
+    pools = MagicMock()
+    pools.static = static_pool
+    pools.ts = ts_pool
+    return pools
+
+
+def _make_pool_for_list_reports(depot_id: str, report_rows: list[dict]):
+    """Pool mock for list_reports and get_report endpoints."""
+    ts_conn = AsyncMock()
+
+    async def _ts_fetch(query: str, *args, **kwargs):
+        if "FROM reports" in query:
+            return report_rows
+        return []
+
+    async def _ts_fetchrow(query: str, *args, **kwargs):
+        if "FROM reports" in query and args:
+            report_id = str(args[0])
+            for r in report_rows:
+                if str(r["id"]) == report_id:
+                    return r
+        return None
+
+    ts_conn.fetch.side_effect = _ts_fetch
+    ts_conn.fetchrow.side_effect = _ts_fetchrow
+
+    ts_pool = MagicMock()
+    ts_pool.acquire.return_value.__aenter__.return_value = ts_conn
+    ts_pool.acquire.return_value.__aexit__.return_value = None
+
+    pools = MagicMock()
+    pools.static = MagicMock()
+    pools.ts = ts_pool
+    return pools
+
+
+class TestCreateReportEndpoint:
+    """Tests for POST /depots/{depot_id}/reports."""
+
+    def test_creates_monthly_consumption_report(self, client):
+        depot_id = str(uuid4())
+        report_id = str(uuid4())
+        pools = _make_pool_for_create_report(depot_id, report_id)
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/depots/{depot_id}/reports",
+                json={"kind": "monthly_consumption", "groupBy": "card"},
+            )
+
+        assert response.status_code == 201, response.json()
+        body = response.json()
+        assert body["id"] == report_id
+        assert body["kind"] == "monthly_consumption"
+        assert body["status"] == "draft"
+        assert body["group_by"] == "card"
+
+    def test_auto_derives_period_when_not_provided(self, client):
+        depot_id = str(uuid4())
+        report_id = str(uuid4())
+        pools = _make_pool_for_create_report(depot_id, report_id)
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/depots/{depot_id}/reports",
+                json={"kind": "monthly_consumption", "groupBy": "card"},
+            )
+
+        assert response.status_code == 201
+        # period_start and period_end must be present and non-null
+        body = response.json()
+        assert body["period_start"] is not None
+        assert body["period_end"] is not None
+
+    def test_missing_kind_returns_400(self, client):
+        # The API maps RequestValidationError → 400 (not 422) via its custom handler.
+        depot_id = str(uuid4())
+        pools = _make_pool_for_create_report(depot_id, str(uuid4()))
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/depots/{depot_id}/reports",
+                json={"groupBy": "card"},
+            )
+
+        assert response.status_code == 400
+
+    def test_monthly_consumption_without_group_by_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools = _make_pool_for_create_report(depot_id, str(uuid4()))
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/depots/{depot_id}/reports",
+                json={"kind": "monthly_consumption"},
+            )
+
+        assert response.status_code == 400
+        # detail is a plain string in HTTPException 400 responses
+        assert "groupBy" in response.json()["detail"]
+
+    def test_invalid_kind_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools = _make_pool_for_create_report(depot_id, str(uuid4()))
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/depots/{depot_id}/reports",
+                json={"kind": "not_a_valid_kind", "groupBy": "card"},
+            )
+
+        assert response.status_code == 400
+
+    def test_explicit_period_is_respected(self, client):
+        depot_id = str(uuid4())
+        report_id = str(uuid4())
+        pools = _make_pool_for_create_report(depot_id, report_id)
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/depots/{depot_id}/reports",
+                json={
+                    "kind": "monthly_consumption",
+                    "groupBy": "card",
+                    "periodStart": "2025-03-01",
+                    "periodEnd": "2025-03-31",
+                },
+            )
+
+        assert response.status_code == 201
+
+    def test_period_end_before_start_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools = _make_pool_for_create_report(depot_id, str(uuid4()))
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/depots/{depot_id}/reports",
+                json={
+                    "kind": "monthly_consumption",
+                    "groupBy": "card",
+                    "periodStart": "2025-03-31",
+                    "periodEnd": "2025-03-01",
+                },
+            )
+
+        assert response.status_code == 400
+
+
+class TestListReportsEndpoint:
+    """Tests for GET /depots/{depot_id}/reports."""
+
+    def test_returns_empty_list_when_no_reports(self, client):
+        depot_id = str(uuid4())
+        pools = _make_pool_for_list_reports(depot_id, [])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports")
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_returns_list_of_reports(self, client):
+        depot_id = str(uuid4())
+        rows = [
+            _make_report_row(depot_id, report_id=str(uuid4())),
+            _make_report_row(depot_id, report_id=str(uuid4()), kind="weekly_ops", group_by=None),
+        ]
+        pools = _make_pool_for_list_reports(depot_id, rows)
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body) == 2
+        assert body[0]["kind"] == "monthly_consumption"
+        assert body[1]["kind"] == "weekly_ops"
+
+    def test_report_has_expected_fields(self, client):
+        depot_id = str(uuid4())
+        report_id = str(uuid4())
+        rows = [_make_report_row(depot_id, report_id=report_id)]
+        pools = _make_pool_for_list_reports(depot_id, rows)
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports")
+
+        assert response.status_code == 200
+        report = response.json()[0]
+        for field in ("id", "depot_id", "title", "kind", "status", "period_start", "period_end", "created_at"):
+            assert field in report, f"Missing field: {field}"
+        assert report["id"] == report_id
+
+
+class TestGetReportEndpoint:
+    """Tests for GET /depots/{depot_id}/reports/{report_id}."""
+
+    def test_returns_report_by_id(self, client):
+        depot_id = str(uuid4())
+        report_id = str(uuid4())
+        rows = [_make_report_row(depot_id, report_id=report_id)]
+        pools = _make_pool_for_list_reports(depot_id, rows)
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports/{report_id}")
+
+        assert response.status_code == 200
+        assert response.json()["id"] == report_id
+
+    def test_returns_404_when_report_not_found(self, client):
+        depot_id = str(uuid4())
+        pools = _make_pool_for_list_reports(depot_id, [])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports/{uuid4()}")
+
+        assert response.status_code == 404
+
+
+class TestExportReportEndpoint:
+    """Tests for GET /depots/{depot_id}/reports/{report_id}/export."""
+
+    def _make_report_with_data(self, depot_id: str, report_id: str) -> dict:
+        import json as _json
+        row = _make_report_row(depot_id, report_id=report_id, status="approved")
+        agg_rows = [
+            {
+                "bucket": "2025-04",
+                "card_id": "card-abc",
+                "energy_kwh": 150.0,
+                "session_count": 3,
+                "avg_kw": 25.0,
+                "cost": {"amount": 30.0, "currency": "USD", "estimated": False},
+            }
+        ]
+        row["data"] = _json.dumps({"rows": agg_rows, "currency": "USD", "group_by": "card"})
+        return row
+
+    def test_csv_export_streams_data(self, client):
+        depot_id = str(uuid4())
+        report_id = str(uuid4())
+        row = self._make_report_with_data(depot_id, report_id)
+        pools = _make_pool_for_list_reports(depot_id, [row])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports/{report_id}/export")
+
+        assert response.status_code == 200
+        assert "text/csv" in response.headers["content-type"]
+        lines = response.text.strip().split("\n")
+        assert lines[0].startswith("bucket,card_id")
+        assert len(lines) == 2  # header + 1 data row
+
+    def test_export_returns_404_for_unknown_report(self, client):
+        depot_id = str(uuid4())
+        pools = _make_pool_for_list_reports(depot_id, [])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports/{uuid4()}/export")
+
+        assert response.status_code == 404
+
+    def test_export_returns_404_when_no_data_stored(self, client):
+        """A draft report with no data column yet should return 404."""
+        depot_id = str(uuid4())
+        report_id = str(uuid4())
+        row = _make_report_row(depot_id, report_id=report_id)
+        row["data"] = None  # no data stored
+        pools = _make_pool_for_list_reports(depot_id, [row])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/reports/{report_id}/export")
+
+        assert response.status_code == 404
+
+
+class TestAgentActionsEndpoint:
+    """Tests for GET /depots/{depot_id}/agent-actions."""
+
+    def _make_agent_action_row(self, depot_id: str) -> dict:
+        import json as _json
+        from zoneinfo import ZoneInfo as _ZI
+        return {
+            "id": str(uuid4()),
+            "depot_id": depot_id,
+            "agent_type": "reporting",
+            "action_class": "report_draft",
+            "mode": "proposed",
+            "status": "pending",
+            "summary": "Generate April 2025 consumption report by RFID card",
+            "entity_type": None,
+            "entity_id": None,
+            "created_at": datetime(2025, 5, 1, 0, 0, 0, tzinfo=_ZI("UTC")),
+            "resolved_at": None,
+            "payload": _json.dumps({"kind": "monthly_consumption", "groupBy": "card"}),
+        }
+
+    def _make_pool_for_agent_actions(self, depot_id: str, rows: list[dict]):
+        ts_conn = AsyncMock()
+
+        async def _ts_fetch(query: str, *args, **kwargs):
+            if "FROM agent_actions" in query:
+                return rows
+            return []
+
+        ts_conn.fetch.side_effect = _ts_fetch
+
+        ts_pool = MagicMock()
+        ts_pool.acquire.return_value.__aenter__.return_value = ts_conn
+        ts_pool.acquire.return_value.__aexit__.return_value = None
+
+        pools = MagicMock()
+        pools.static = MagicMock()
+        pools.ts = ts_pool
+        return pools
+
+    def test_returns_empty_list(self, client):
+        depot_id = str(uuid4())
+        pools = self._make_pool_for_agent_actions(depot_id, [])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/agent-actions")
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_returns_agent_actions(self, client):
+        depot_id = str(uuid4())
+        row = self._make_agent_action_row(depot_id)
+        pools = self._make_pool_for_agent_actions(depot_id, [row])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/agent-actions")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body) == 1
+        action = body[0]
+        assert action["action_class"] == "report_draft"
+        assert action["status"] == "pending"
+        assert action["agent_type"] == "reporting"
+
+    def test_action_has_expected_fields(self, client):
+        depot_id = str(uuid4())
+        row = self._make_agent_action_row(depot_id)
+        pools = self._make_pool_for_agent_actions(depot_id, [row])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(f"/depots/{depot_id}/agent-actions")
+
+        assert response.status_code == 200
+        action = response.json()[0]
+        for field in ("id", "depot_id", "agent_type", "action_class", "mode", "status", "summary", "created_at"):
+            assert field in action, f"Missing field: {field}"
+
+
+class TestAutonomySettingsEndpoint:
+    """Tests for GET /depots/{depot_id}/autonomy-settings."""
+
+    def test_returns_defaults(self, client):
+        depot_id = str(uuid4())
+
+        with patch("src.api.main.verify_depot_access", new_callable=AsyncMock):
+            response = client.get(f"/depots/{depot_id}/autonomy-settings")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["depot_id"] == depot_id
+        assert "enabled" in body
+        assert "mode" in body
+        assert "enabled_action_classes" in body
+
+    def test_mode_is_proposed_by_default(self, client):
+        depot_id = str(uuid4())
+
+        with patch("src.api.main.verify_depot_access", new_callable=AsyncMock):
+            response = client.get(f"/depots/{depot_id}/autonomy-settings")
+
+        assert response.status_code == 200
+        assert response.json()["mode"] == "proposed"
+
+    def test_enabled_action_classes_includes_report_draft(self, client):
+        depot_id = str(uuid4())
+
+        with patch("src.api.main.verify_depot_access", new_callable=AsyncMock):
+            response = client.get(f"/depots/{depot_id}/autonomy-settings")
+
+        assert response.status_code == 200
+        assert "report_draft" in response.json()["enabled_action_classes"]
