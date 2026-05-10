@@ -6541,6 +6541,7 @@ async def get_depot_active_sessions(
             ocpp_ids = list(ocpp_id_map.keys())
 
             rows: list[dict] = []
+            telemetry_by_station: dict[tuple[str, int], dict] = {}
             if ocpp_ids:
                 async def _fetch():
                     async with db_pools.ts.acquire() as ts_conn:
@@ -6552,31 +6553,45 @@ async def get_depot_active_sessions(
                     _fetch, label="active sessions", fallback_value=[]
                 )
 
-            items = [
-                {
-                    "session_id": r["session_id"],
-                    "ocpp_id": r["ocpp_id"],
-                    "connector_id": r["connector_id"],
-                    "vehicle_id": r.get("vehicle_id"),
-                    "started_at": _isoformat(r["started_at"]),
-                    "current_power_kw": (
-                        float(r["current_power_kw"])
-                        if r.get("current_power_kw") is not None
-                        else None
-                    ),
-                    "current_soc": (
-                        float(r["current_soc"])
-                        if r.get("current_soc") is not None
-                        else None
-                    ),
-                    "target_soc": (
-                        float(r["target_soc"]) if r.get("target_soc") is not None else None
-                    ),
-                    "estimated_end_at": _isoformat(r.get("estimated_end_at")),
-                    "last_sample_at": _isoformat(r.get("last_sample_at")),
-                }
-                for r in rows
-            ]
+                async def _fetch_telemetry():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.latest_telemetry_by_stations(ts_conn, ocpp_ids)
+
+                telemetry_by_station = await _safe_runtime_fetch(
+                    _fetch_telemetry,
+                    label="latest charger telemetry",
+                    fallback_value={},
+                )
+
+            items = []
+            for r in rows:
+                telemetry_row = telemetry_by_station.get((r["ocpp_id"], int(r["connector_id"])))
+                current_power = r.get("current_power_kw")
+                if current_power is None and telemetry_row:
+                    current_power = telemetry_row.get("current_power_kw")
+                current_soc = r.get("current_soc")
+                if current_soc is None and telemetry_row:
+                    current_soc = telemetry_row.get("current_soc")
+                sample_at = r.get("last_sample_at")
+                if sample_at is None and telemetry_row:
+                    sample_at = telemetry_row.get("last_seen_at")
+
+                items.append(
+                    {
+                        "session_id": r["session_id"],
+                        "ocpp_id": r["ocpp_id"],
+                        "connector_id": r["connector_id"],
+                        "vehicle_id": r.get("vehicle_id"),
+                        "started_at": _isoformat(r["started_at"]),
+                        "current_power_kw": float(current_power) if current_power is not None else None,
+                        "current_soc": float(current_soc) if current_soc is not None else None,
+                        "target_soc": (
+                            float(r["target_soc"]) if r.get("target_soc") is not None else None
+                        ),
+                        "estimated_end_at": _isoformat(r.get("estimated_end_at")),
+                        "last_sample_at": _isoformat(sample_at),
+                    }
+                )
 
             now = datetime.now(timezone.utc)
             payload = {"items": items, "fetched_at": now.isoformat()}

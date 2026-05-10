@@ -95,6 +95,11 @@ class TestGetDepotActiveSessions:
                 new_callable=AsyncMock,
                 return_value=active_rows,
             ),
+            patch(
+                "src.api.main.db_queries.latest_telemetry_by_stations",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
         ):
             response = client.get(
                 f"/depots/{depot_id}/sessions/active", headers=AUTH_HDR
@@ -144,6 +149,65 @@ class TestGetDepotActiveSessions:
 
         app.dependency_overrides.clear()
 
+    def test_falls_back_to_charger_telemetry_when_session_metrics_missing(self, client, mock_db_pool):
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        ocpp_id = "hrx-uab_hrx-vilnius-005"
+        active_rows = [
+            {
+                "session_id": str(uuid4()),
+                "ocpp_id": ocpp_id,
+                "connector_id": 1,
+                "vehicle_id": None,
+                "started_at": _now() - timedelta(minutes=7),
+                "current_power_kw": None,
+                "current_soc": None,
+                "target_soc": None,
+                "estimated_end_at": None,
+                "last_sample_at": None,
+            }
+        ]
+        telemetry_map = {
+            (ocpp_id, 1): {
+                "current_power_kw": 10.77,
+                "current_soc": 0.56,
+                "last_seen_at": _now() - timedelta(seconds=3),
+            }
+        }
+
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.verify_depot_access", new_callable=AsyncMock),
+            patch(
+                "src.api.main.db_queries.charger_id_by_ocpp_id",
+                new_callable=AsyncMock,
+                return_value={ocpp_id: str(uuid4())},
+            ),
+            patch(
+                "src.api.main.db_queries.list_active_sessions_for_depot",
+                new_callable=AsyncMock,
+                return_value=active_rows,
+            ),
+            patch(
+                "src.api.main.db_queries.latest_telemetry_by_stations",
+                new_callable=AsyncMock,
+                return_value=telemetry_map,
+            ),
+        ):
+            response = client.get(
+                f"/depots/{depot_id}/sessions/active", headers=AUTH_HDR
+            )
+
+        assert response.status_code == 200
+        item = response.json()["items"][0]
+        assert item["current_power_kw"] == pytest.approx(10.77)
+        assert item["current_soc"] == pytest.approx(0.56)
+        assert item["last_sample_at"] is not None
+        app.dependency_overrides.clear()
+
     def test_missing_charging_sessions_table_degrades(self, client, mock_db_pool):
         """If `charging_sessions` is missing, return empty items rather than 500."""
         depot_id = str(uuid4())
@@ -163,6 +227,11 @@ class TestGetDepotActiveSessions:
                 "src.api.main.db_queries.list_active_sessions_for_depot",
                 new_callable=AsyncMock,
                 side_effect=asyncpg.UndefinedTableError("charging_sessions missing"),
+            ),
+            patch(
+                "src.api.main.db_queries.latest_telemetry_by_stations",
+                new_callable=AsyncMock,
+                return_value={},
             ),
         ):
             response = client.get(
@@ -192,6 +261,11 @@ class TestGetDepotActiveSessions:
             patch(
                 "src.api.main.db_queries.list_active_sessions_for_depot", list_mock
             ),
+            patch(
+                "src.api.main.db_queries.latest_telemetry_by_stations",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as telemetry_mock,
         ):
             r1 = client.get(f"/depots/{depot_id}/sessions/active", headers=AUTH_HDR)
             r2 = client.get(f"/depots/{depot_id}/sessions/active", headers=AUTH_HDR)
@@ -201,6 +275,7 @@ class TestGetDepotActiveSessions:
         # Within the 2 s TTL the second call must hit the cache and skip both DBs.
         assert map_mock.call_count == 1
         assert list_mock.call_count == 1
+        assert telemetry_mock.call_count == 1
 
         app.dependency_overrides.clear()
 

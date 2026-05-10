@@ -251,37 +251,41 @@ class TimescaleClient:
                                 conn, station_id, transaction_id, power_kw, soc_percent, max_charge_kw
                             )
 
-                        # Vehicle-keyed optimizer view (telemetry table). Only
-                        # populated when the row can be attributed to a vehicle via
-                        # the open charging_sessions row. Rows without a vehicle
-                        # are intentionally skipped — telemetry has vehicle_id
-                        # NOT NULL and is read by the optimizer's StateAssembler.
+                        # Charger-keyed telemetry view (telemetry table). vehicle_id
+                        # is optional enrichment; writes must continue even when
+                        # idTag/session mapping is unavailable.
                         vehicle_id = data.get("vehicle_id")
                         if not vehicle_id:
                             vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
 
-                        if not vehicle_id:
-                            self.logger.debug(
-                                f"Skipping vehicle-keyed telemetry insert: no vehicle_id for "
-                                f"station_id={station_id}, connector_id={connector_id}, "
-                                f"session_id={session_id}"
-                            )
-                            continue
-
                         charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
                         soc = (soc_percent / 100.0) if soc_percent is not None else None
-                        is_plugged = power_kw is not None and power_kw > 0.1
+                        is_plugged = (power_kw > 0.1) if power_kw is not None else None
 
                         await conn.execute(
                             """
                             INSERT INTO telemetry (
-                                time, vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
+                                time, station_id, connector_id, transaction_id,
+                                vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
                             )
-                            VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7)
-                            ON CONFLICT (time, vehicle_id) DO NOTHING
+                            VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7, $8, $9, $10)
+                            ON CONFLICT (time, station_id, connector_id) DO UPDATE
+                            SET transaction_id = COALESCE(
+                                    EXCLUDED.transaction_id,
+                                    telemetry.transaction_id
+                                ),
+                                vehicle_id = COALESCE(EXCLUDED.vehicle_id, telemetry.vehicle_id),
+                                charger_id = COALESCE(EXCLUDED.charger_id, telemetry.charger_id),
+                                soc = COALESCE(EXCLUDED.soc, telemetry.soc),
+                                charging_kw = COALESCE(EXCLUDED.charging_kw, telemetry.charging_kw),
+                                is_plugged = COALESCE(EXCLUDED.is_plugged, telemetry.is_plugged),
+                                max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw)
                             """,
                             data["time"],
-                            str(vehicle_id),
+                            station_id or "unknown",
+                            int(connector_id) if connector_id is not None else 1,
+                            transaction_id,
+                            str(vehicle_id) if vehicle_id else None,
                             str(charger_id) if charger_id else None,
                             soc,
                             power_kw,
