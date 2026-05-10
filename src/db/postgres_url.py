@@ -97,6 +97,20 @@ def merge_timescale_params_from_url(
     )
 
 
+def describe_database_target(database_url: str) -> str:
+    """Return safe, redacted connection target details for logs.
+
+    Security: only expose port; mask host/user/db to prevent
+    infrastructure reconnaissance via log scraping.
+    """
+    parsed = urlparse(database_url)
+    host = parsed.hostname or ""
+    port = parsed.port or "<default>"
+    host_parts = host.rsplit(".", 2)
+    masked_host = f"*****.{'.'.join(host_parts[-2:])}" if len(host_parts) >= 2 else "*****"
+    return f"user=***** host={masked_host} port={port} db=*****"
+
+
 def build_postgres_dsn(
     *,
     host: str,

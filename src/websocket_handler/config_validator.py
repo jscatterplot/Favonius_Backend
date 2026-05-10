@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import asyncpg
 
-from src.db.postgres_url import ssl_context_for_postgres_sslmode
+from src.db.postgres_url import build_postgres_dsn, describe_database_target, ssl_context_for_postgres_sslmode
 import structlog
 from sqlalchemy import create_engine, text
 try:
@@ -169,13 +169,70 @@ class ConfigValidator:
             self._record_detail("timescale", "Connected and query checks passed")
             self.logger.info("TimescaleDB validation passed")
             return True
+        except asyncpg.exceptions.InvalidPasswordError:
+            target = self._timescale_target_descriptor()
+            source = self._timescale_credential_source()
+            detail = (
+                f"Auth failure for {source} ({target}) — TimescaleDB rejected the password. "
+                "Rotate the credential at the upstream provider (e.g. TigerCloud) and update the "
+                f"env var ({source}) to match."
+            )
+            self._record_detail("timescale", detail)
+            self.logger.error(detail)
+            return False
         except Exception as e:
-            detail = f"Connection failed: {e}"
+            target = self._timescale_target_descriptor()
+            source = self._timescale_credential_source()
+            detail = f"Connection failed for {source} ({target}): {e}"
             if "Connect call failed" in str(e):
                 detail += "; verify PGHOST/PGPORT are reachable from Railway"
             self._record_detail("timescale", detail)
             self.logger.error(f"TimescaleDB validation failed: {e}")
             return False
+
+    def _timescale_target_descriptor(self) -> str:
+        """Return a redacted host/port descriptor for log lines.
+
+        Reuses ``describe_database_target`` so the WS handler matches the API
+        service's redaction shape (``user=***** host=*****.suffix port=N``).
+        """
+        try:
+            dsn = build_postgres_dsn(
+                host=str(self.config.timescale.host or ""),
+                port=int(self.config.timescale.port or 0),
+                database=str(self.config.timescale.database or ""),
+                user=str(self.config.timescale.user or ""),
+                password=str(self.config.timescale.password or ""),
+                sslmode=str(self.config.timescale.sslmode or "require"),
+            )
+            return describe_database_target(dsn)
+        except Exception:
+            return "user=***** host=***** port=<unknown> db=*****"
+
+    def _timescale_credential_source(self) -> str:
+        """Identify which env var fed the Timescale credentials.
+
+        Operators looking at Railway need to know whether to rotate
+        ``TIMESCALE_SERVICE_URL`` or the discrete ``PGPASSWORD`` override.
+        """
+        secrets_manager = getattr(self.config, "secrets_manager", None)
+
+        pgpassword = None
+        timescale_service_url = None
+        if secrets_manager is not None:
+            try:
+                pgpassword = secrets_manager.get_secret("PGPASSWORD")
+                timescale_service_url = secrets_manager.get_secret("TIMESCALE_SERVICE_URL")
+            except Exception:
+                # Keep diagnostics resilient even if secret backends are unavailable.
+                pgpassword = None
+                timescale_service_url = None
+
+        if (pgpassword or os.getenv("PGPASSWORD") or "").strip():
+            return "PGPASSWORD"
+        if (timescale_service_url or os.getenv("TIMESCALE_SERVICE_URL") or "").strip():
+            return "TIMESCALE_SERVICE_URL"
+        return "TIMESCALE_SERVICE_URL or PGPASSWORD"
 
     async def _validate_supabase(self) -> bool:
         """Validate Supabase connection."""
