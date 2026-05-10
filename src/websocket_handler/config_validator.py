@@ -215,10 +215,10 @@ class ConfigValidator:
         Operators looking at Railway need to know whether to rotate
         ``TIMESCALE_SERVICE_URL`` or the discrete ``PGPASSWORD`` override.
         """
-        if (os.getenv("TIMESCALE_SERVICE_URL") or "").strip():
-            return "TIMESCALE_SERVICE_URL"
         if (os.getenv("PGPASSWORD") or "").strip():
             return "PGPASSWORD"
+        if (os.getenv("TIMESCALE_SERVICE_URL") or "").strip():
+            return "TIMESCALE_SERVICE_URL"
         return "TIMESCALE_SERVICE_URL or PGPASSWORD"
 
     async def _validate_supabase(self) -> bool:

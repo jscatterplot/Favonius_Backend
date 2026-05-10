@@ -96,6 +96,33 @@ async def test_invalid_password_error_names_pgpassword_when_service_url_unset(
 
 
 @pytest.mark.asyncio
+async def test_invalid_password_error_prefers_pgpassword_when_both_sources_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both are set, discrete ``PGPASSWORD`` is the effective override."""
+    monkeypatch.setenv(
+        "TIMESCALE_SERVICE_URL",
+        "postgresql://tsdbadmin:stale_pw@abc123.tsdb.cloud.timescale.com:31413/tsdb?sslmode=require",
+    )
+    monkeypatch.setenv("PGPASSWORD", "rotated_secret")
+
+    validator = ConfigValidator(_make_config())  # type: ignore[arg-type]
+
+    async def _fake_connect(**_kwargs):
+        raise asyncpg.exceptions.InvalidPasswordError(
+            'password authentication failed for user "tsdbadmin"'
+        )
+
+    with patch("src.websocket_handler.config_validator.asyncpg.connect", _fake_connect):
+        ok = await validator._validate_timescale()
+
+    assert ok is False
+    detail = validator.validation_details["timescale"]
+    assert "Auth failure for PGPASSWORD" in detail
+    assert "Auth failure for TIMESCALE_SERVICE_URL" not in detail
+
+
+@pytest.mark.asyncio
 async def test_generic_connection_failure_keeps_redaction_and_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
