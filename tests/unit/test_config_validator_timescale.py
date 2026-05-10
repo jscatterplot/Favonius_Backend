@@ -34,7 +34,7 @@ def _make_config(*, environment: str = "production") -> SimpleNamespace:
         password="rotated_secret",
         sslmode="require",
     )
-    return SimpleNamespace(timescale=timescale, environment=environment)
+    return SimpleNamespace(timescale=timescale, environment=environment, secrets_manager=None)
 
 
 @pytest.mark.asyncio
@@ -107,6 +107,41 @@ async def test_invalid_password_error_prefers_pgpassword_when_both_sources_set(
     monkeypatch.setenv("PGPASSWORD", "rotated_secret")
 
     validator = ConfigValidator(_make_config())  # type: ignore[arg-type]
+
+    async def _fake_connect(**_kwargs):
+        raise asyncpg.exceptions.InvalidPasswordError(
+            'password authentication failed for user "tsdbadmin"'
+        )
+
+    with patch("src.websocket_handler.config_validator.asyncpg.connect", _fake_connect):
+        ok = await validator._validate_timescale()
+
+    assert ok is False
+    detail = validator.validation_details["timescale"]
+    assert "Auth failure for PGPASSWORD" in detail
+    assert "Auth failure for TIMESCALE_SERVICE_URL" not in detail
+
+
+@pytest.mark.asyncio
+async def test_invalid_password_error_prefers_pgpassword_from_secrets_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kubernetes/file-secret PGPASSWORD should outrank service URL env var."""
+    monkeypatch.setenv(
+        "TIMESCALE_SERVICE_URL",
+        "postgresql://tsdbadmin:stale_pw@abc123.tsdb.cloud.timescale.com:31413/tsdb?sslmode=require",
+    )
+    monkeypatch.delenv("PGPASSWORD", raising=False)
+
+    class _SecretManager:
+        def get_secret(self, key: str):
+            if key == "PGPASSWORD":
+                return "mounted_secret"
+            return None
+
+    config = _make_config()  # type: ignore[arg-type]
+    config.secrets_manager = _SecretManager()
+    validator = ConfigValidator(config)  # type: ignore[arg-type]
 
     async def _fake_connect(**_kwargs):
         raise asyncpg.exceptions.InvalidPasswordError(

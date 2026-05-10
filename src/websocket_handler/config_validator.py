@@ -215,9 +215,22 @@ class ConfigValidator:
         Operators looking at Railway need to know whether to rotate
         ``TIMESCALE_SERVICE_URL`` or the discrete ``PGPASSWORD`` override.
         """
-        if (os.getenv("PGPASSWORD") or "").strip():
+        secrets_manager = getattr(self.config, "secrets_manager", None)
+
+        pgpassword = None
+        timescale_service_url = None
+        if secrets_manager is not None:
+            try:
+                pgpassword = secrets_manager.get_secret("PGPASSWORD")
+                timescale_service_url = secrets_manager.get_secret("TIMESCALE_SERVICE_URL")
+            except Exception:
+                # Keep diagnostics resilient even if secret backends are unavailable.
+                pgpassword = None
+                timescale_service_url = None
+
+        if (pgpassword or os.getenv("PGPASSWORD") or "").strip():
             return "PGPASSWORD"
-        if (os.getenv("TIMESCALE_SERVICE_URL") or "").strip():
+        if (timescale_service_url or os.getenv("TIMESCALE_SERVICE_URL") or "").strip():
             return "TIMESCALE_SERVICE_URL"
         return "TIMESCALE_SERVICE_URL or PGPASSWORD"
 
