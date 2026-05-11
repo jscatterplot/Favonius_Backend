@@ -830,3 +830,563 @@ class TestEnergyReportCsvEndpoint:
         assert response.status_code == status.HTTP_403_FORBIDDEN
         detail = response.json()["detail"]
         assert detail["error_code"] == "CROSS_ORG_DENIED"
+
+
+# ── Energy transactions endpoint tests ──────────────────────────────────────
+
+
+def _txn_record(
+    *,
+    session_id: str,
+    started_at: datetime,
+    ended_at: Optional[datetime],
+    energy_kwh: Optional[float],
+    cost_total: Optional[float],
+    vehicle_id: Optional[str] = None,
+    ocpp_id: str = "ocpp_a",
+    driver_id: Optional[str] = None,
+    card_id: Optional[str] = None,
+) -> dict:
+    """Build a fake asyncpg.Record-shaped dict for the transactions query."""
+    return {
+        "session_id": session_id,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "energy_delivered_kwh": energy_kwh,
+        "cost_total": cost_total,
+        "vehicle_id": vehicle_id,
+        "ocpp_id": ocpp_id,
+        "driver_id": driver_id,
+        "card_id": card_id,
+    }
+
+
+class TestEnergyTransactionsEndpoint:
+    """Tests for ``GET /reports/depots/{depot_id}/energy/transactions``."""
+
+    def _setup_pools(
+        self,
+        *,
+        ocpp_id: str = "ocpp_a",
+        charger_uuid: Optional[str] = None,
+        ts_records: Optional[list[dict]] = None,
+        timezone_name: str = "Europe/Vilnius",
+        currency: str = "EUR",
+        under_cap_rate: float = 0.20,
+    ):
+        charger_uuid = charger_uuid or str(uuid4())
+        captured: dict[str, Any] = {}
+
+        ts_records = ts_records or []
+
+        ts_conn = AsyncMock()
+
+        async def ts_fetch(query: str, *args, **kwargs):
+            captured["query"] = query
+            captured["args"] = args
+            return ts_records
+
+        ts_conn.fetch.side_effect = ts_fetch
+
+        static_conn = AsyncMock()
+
+        async def static_fetchrow(query: str, *args, **kwargs):
+            if "FROM sites" in query:
+                return _depot_row(
+                    timezone=timezone_name, currency=currency, under_cap_rate=under_cap_rate
+                )
+            return None
+
+        async def static_fetch(query: str, *args, **kwargs):
+            if "FROM charging_stations" in query:
+                return [{"charger_id": charger_uuid, "ocpp_id": ocpp_id}]
+            return []
+
+        static_conn.fetchrow.side_effect = static_fetchrow
+        static_conn.fetch.side_effect = static_fetch
+
+        static_pool = MagicMock()
+        static_pool.acquire.return_value.__aenter__.return_value = static_conn
+        static_pool.acquire.return_value.__aexit__.return_value = None
+
+        ts_pool = MagicMock()
+        ts_pool.acquire.return_value.__aenter__.return_value = ts_conn
+        ts_pool.acquire.return_value.__aexit__.return_value = None
+
+        pools = MagicMock()
+        pools.static = static_pool
+        pools.ts = ts_pool
+        return pools, charger_uuid, captured
+
+    def test_returns_one_row_per_session_in_camelcase(self, client):
+        depot_id = str(uuid4())
+        session_a = str(uuid4())
+        session_b = str(uuid4())
+        vehicle_uuid = str(uuid4())
+        driver_uuid = str(uuid4())
+        card_uuid = str(uuid4())
+        tz = "Europe/Vilnius"
+
+        # Newest first (ORDER BY started_at DESC, session_id DESC)
+        records = [
+            _txn_record(
+                session_id=session_a,
+                started_at=_utc(datetime(2026, 5, 4, 23, 14, 32), tz),
+                ended_at=_utc(datetime(2026, 5, 5, 6, 42, 11), tz),
+                energy_kwh=84.3,
+                cost_total=17.28,
+                vehicle_id=vehicle_uuid,
+                driver_id=None,
+                card_id=card_uuid,
+            ),
+            _txn_record(
+                session_id=session_b,
+                started_at=_utc(datetime(2026, 5, 3, 8, 0, 0), tz),
+                ended_at=_utc(datetime(2026, 5, 3, 9, 0, 0), tz),
+                energy_kwh=22.0,
+                cost_total=None,  # → estimated
+                vehicle_id=None,
+                driver_id=driver_uuid,
+                card_id=None,
+            ),
+        ]
+        pools, _, _ = self._setup_pools(ts_records=records, timezone_name=tz, currency="EUR")
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-01", "to": "2026-05-31"},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        # Top-level camelCase shape.
+        assert body["depotId"] == depot_id
+        assert body["currency"] == "EUR"
+        assert body["from"] == "2026-05-01"
+        assert body["to"] == "2026-05-31"
+        assert body["nextCursor"] is None
+        rows = body["rows"]
+        assert len(rows) == 2
+
+        # First row (cost present → estimated=false).
+        first = rows[0]
+        assert first["sessionId"] == session_a
+        assert first["startedAt"].endswith("Z")
+        assert first["endedAt"].endswith("Z")
+        assert first["vehicleId"] == vehicle_uuid
+        assert first["driverId"] is None
+        assert first["cardId"] == card_uuid  # never the literal "unassigned"
+        assert first["energyKwh"] == pytest.approx(84.3)
+        # duration = 7h27m59s → 448 minutes
+        assert first["durationMinutes"] == 448
+        # avg = 84.3 / (448/60) ≈ 11.29 → rounded to 2 decimals
+        assert first["avgKw"] == pytest.approx(round(84.3 / (448 / 60.0), 2))
+        assert first["cost"] == {"amount": 17.28, "currency": "EUR", "estimated": False}
+
+        # Second row (cost missing → estimated, amount = energy × under_cap_rate)
+        second = rows[1]
+        assert second["sessionId"] == session_b
+        assert second["cardId"] is None
+        assert second["cost"]["estimated"] is True
+        # 22 kWh × 0.20 = 4.40
+        assert second["cost"]["amount"] == pytest.approx(4.40)
+        assert second["cost"]["currency"] == "EUR"
+
+    def test_empty_range_returns_empty_rows(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-01", "to": "2026-05-31"},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        assert body["rows"] == []
+        assert body["nextCursor"] is None
+
+    def test_active_session_duration_against_now(self, client):
+        depot_id = str(uuid4())
+        tz = "Europe/Vilnius"
+        # Started 30 minutes ago, still active.
+        now = datetime.now(ZoneInfo("UTC"))
+        started = now.replace(microsecond=0) - timedelta_minutes(30)
+
+        records = [
+            _txn_record(
+                session_id=str(uuid4()),
+                started_at=started,
+                ended_at=None,
+                energy_kwh=0.0,
+                cost_total=None,
+            )
+        ]
+        pools, _, _ = self._setup_pools(ts_records=records, timezone_name=tz)
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-01", "to": "2026-05-31"},
+            )
+
+        body = response.json()
+        row = body["rows"][0]
+        assert row["endedAt"] is None
+        # Active session with no energy → 0 cost (estimated).
+        assert row["energyKwh"] == 0.0
+        assert row["cost"]["estimated"] is True
+        assert row["cost"]["amount"] == 0.0
+        # Duration: 30 ± 1 min (small wall-clock drift between request and check)
+        assert 29 <= row["durationMinutes"] <= 31
+        # avg = 0 / duration → 0
+        assert row["avgKw"] == 0.0
+
+    def test_manual_authorize_session_card_id_null_not_string(self, client):
+        depot_id = str(uuid4())
+        tz = "Europe/Vilnius"
+        records = [
+            _txn_record(
+                session_id=str(uuid4()),
+                started_at=_utc(datetime(2026, 5, 4, 12, 0), tz),
+                ended_at=_utc(datetime(2026, 5, 4, 13, 0), tz),
+                energy_kwh=10.0,
+                cost_total=2.0,
+                card_id=None,
+            )
+        ]
+        pools, _, _ = self._setup_pools(ts_records=records, timezone_name=tz)
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-01", "to": "2026-05-31"},
+            )
+
+        body = response.json()
+        assert body["rows"][0]["cardId"] is None
+        assert "unassigned" not in str(body)
+
+    def test_filter_by_card_id_passes_uuid_to_sql(self, client):
+        depot_id = str(uuid4())
+        card_uuid = str(uuid4())
+        tz = "Europe/Vilnius"
+
+        pools, _, captured = self._setup_pools(ts_records=[], timezone_name=tz)
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={
+                    "from": "2026-05-01",
+                    "to": "2026-05-31",
+                    "card_id": card_uuid,
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        # The card_id UUID must have been bound as a parameter.
+        assert card_uuid in captured["args"]
+        assert "cs.card_id =" in captured["query"]
+
+    def test_filter_by_charger_id_resolves_to_station_id(self, client):
+        depot_id = str(uuid4())
+        ocpp_id = "abb-001"
+        charger_uuid = str(uuid4())
+        tz = "Europe/Vilnius"
+
+        pools, _, captured = self._setup_pools(
+            ts_records=[], timezone_name=tz, ocpp_id=ocpp_id, charger_uuid=charger_uuid
+        )
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={
+                    "from": "2026-05-01",
+                    "to": "2026-05-31",
+                    "charger_id": charger_uuid,
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        # Backend should have rewritten charger_id (UUID) → station_id (OCPP).
+        assert ocpp_id in captured["args"]
+
+    def test_charger_id_in_other_depot_returns_empty_without_db_call(self, client):
+        depot_id = str(uuid4())
+        other_charger_uuid = str(uuid4())
+
+        pools, _, captured = self._setup_pools(ts_records=[])
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={
+                    "from": "2026-05-01",
+                    "to": "2026-05-31",
+                    "charger_id": other_charger_uuid,
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        assert body["rows"] == []
+        assert body["nextCursor"] is None
+        # The SQL fetch should be short-circuited.
+        assert "query" not in captured
+
+    def test_search_matches_card_id_uuid_prefix(self, client):
+        depot_id = str(uuid4())
+        card_uuid = "09d29997-1111-2222-3333-444444444444"
+        tz = "Europe/Vilnius"
+
+        records = [
+            _txn_record(
+                session_id=str(uuid4()),
+                started_at=_utc(datetime(2026, 5, 4, 12, 0), tz),
+                ended_at=_utc(datetime(2026, 5, 4, 13, 0), tz),
+                energy_kwh=10.0,
+                cost_total=2.0,
+                card_id=card_uuid,
+            )
+        ]
+        pools, _, captured = self._setup_pools(ts_records=records, timezone_name=tz)
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={
+                    "from": "2026-05-01",
+                    "to": "2026-05-31",
+                    "search": "09d29997",
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        # ILIKE pattern wrapping with % around the trimmed needle.
+        assert "%09d29997%" in captured["args"]
+        body = response.json()
+        assert len(body["rows"]) == 1
+        assert body["rows"][0]["cardId"] == card_uuid
+
+    def test_pagination_emits_next_cursor_when_more_rows_exist(self, client):
+        depot_id = str(uuid4())
+        tz = "Europe/Vilnius"
+
+        # 11 newest-first rows; limit=10 → first 10 returned + nextCursor pointing
+        # at the 10th row's (started_at, session_id).
+        records = []
+        for i in range(11):
+            records.append(
+                _txn_record(
+                    session_id=str(uuid4()),
+                    started_at=_utc(datetime(2026, 5, 10, 12, 0) - timedelta_minutes(i), tz),
+                    ended_at=_utc(datetime(2026, 5, 10, 13, 0) - timedelta_minutes(i), tz),
+                    energy_kwh=1.0,
+                    cost_total=0.10,
+                )
+            )
+
+        pools, _, _ = self._setup_pools(ts_records=records, timezone_name=tz)
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-01", "to": "2026-05-31", "limit": 10},
+            )
+
+        body = response.json()
+        assert len(body["rows"]) == 10
+        assert body["nextCursor"] is not None
+        # Cursor is base64-encoded JSON containing startedAt + sessionId of the
+        # last-returned row.
+        import base64
+        import json as _json
+
+        decoded = _json.loads(base64.urlsafe_b64decode(body["nextCursor"]).decode("utf-8"))
+        assert decoded["sessionId"] == body["rows"][-1]["sessionId"]
+        assert decoded["startedAt"] == body["rows"][-1]["startedAt"]
+
+    def test_pagination_returns_null_cursor_on_last_page(self, client):
+        depot_id = str(uuid4())
+        tz = "Europe/Vilnius"
+
+        records = [
+            _txn_record(
+                session_id=str(uuid4()),
+                started_at=_utc(datetime(2026, 5, 10, 12, 0), tz),
+                ended_at=_utc(datetime(2026, 5, 10, 13, 0), tz),
+                energy_kwh=1.0,
+                cost_total=0.10,
+            )
+        ]
+        pools, _, _ = self._setup_pools(ts_records=records, timezone_name=tz)
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-01", "to": "2026-05-31", "limit": 10},
+            )
+
+        body = response.json()
+        assert len(body["rows"]) == 1
+        assert body["nextCursor"] is None
+
+    def test_invalid_cursor_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={
+                    "from": "2026-05-01",
+                    "to": "2026-05-31",
+                    "cursor": "not-base64!!!",
+                },
+            )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_invalid_date_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "not-a-date", "to": "2026-05-31"},
+            )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_to_before_from_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-31", "to": "2026-05-01"},
+            )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_range_over_one_year_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2024-01-01", "to": "2026-01-01"},
+            )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_invalid_vehicle_id_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={
+                    "from": "2026-05-01",
+                    "to": "2026-05-31",
+                    "vehicle_id": "not-a-uuid",
+                },
+            )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_limit_out_of_range_returns_400(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={
+                    "from": "2026-05-01",
+                    "to": "2026-05-31",
+                    "limit": 100000,
+                },
+            )
+        # FastAPI's Query(le=...) returns 422 for validation failures.
+        assert response.status_code in (
+            status.HTTP_400_BAD_REQUEST,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+    def test_cross_org_denial(self, client):
+        depot_id = str(uuid4())
+        pools, _, _ = self._setup_pools(ts_records=[])
+
+        async def _denied(*args, **kwargs):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: you do not have permission for this depot",
+            )
+
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", side_effect=_denied
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-05-01", "to": "2026-05-31"},
+            )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "CROSS_ORG_DENIED"
+
+    def test_session_at_2330_local_does_not_bleed_into_next_month(self, client):
+        depot_id = str(uuid4())
+        tz = "Europe/Vilnius"
+        # 23:30 local on Apr 30 should still be inside [2026-04-01, 2026-04-30].
+        records = [
+            _txn_record(
+                session_id=str(uuid4()),
+                started_at=_utc(datetime(2026, 4, 30, 23, 30), tz),
+                ended_at=_utc(datetime(2026, 5, 1, 0, 30), tz),
+                energy_kwh=10.0,
+                cost_total=2.0,
+            )
+        ]
+        pools, _, captured = self._setup_pools(ts_records=records, timezone_name=tz)
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/transactions",
+                params={"from": "2026-04-01", "to": "2026-04-30"},
+            )
+        # Filter assertion: query must include the depot timezone in args.
+        assert tz in captured["args"]
+        body = response.json()
+        assert len(body["rows"]) == 1
+
+
+# Convenience helper local to this module.
+def timedelta_minutes(n: int):
+    """timedelta(minutes=n) shorthand used only by the transactions tests."""
+    from datetime import timedelta
+
+    return timedelta(minutes=n)
