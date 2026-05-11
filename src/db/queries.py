@@ -2670,3 +2670,128 @@ async def latest_telemetry_for_depot_vehicles(
     """
     rows = await db.fetch(query, vehicle_ids)
     return [dict(r) for r in rows]
+
+
+# Source markers for get_session_energy_kwh return values.
+ENERGY_SOURCE_SESSION_METER = "session_meter_delta"
+ENERGY_SOURCE_TELEMETRY_REGISTER = "telemetry_register_delta"
+
+
+async def get_session_energy_kwh(
+    db,
+    *,
+    session_id: Optional[UUID] = None,
+    transaction_id: Optional[int] = None,
+) -> Optional[dict]:
+    """Compute total energy delivered for a single charging session, in kWh.
+
+    Resolves the session via ``session_id`` (UUID PK) or ``transaction_id``
+    (OCPP 1.6 integer, globally unique via the ``ocpp_transaction_id``
+    sequence from migration 012). Exactly one must be supplied.
+
+    Uses two sources in priority order:
+
+    1. ``charging_sessions.energy_delivered_kwh`` (migration 032) — populated
+       from the OCPP StopTransaction meter delta when the session closes.
+       Billing-grade; only available once the session has ended (or for
+       imported rows). Returned with ``source = "session_meter_delta"``.
+    2. Meter-register delta from ``telemetry_samples`` —
+       ``MAX(value) - MIN(value)`` of ``Energy.Active.Import.Register``
+       samples bound to the session's ``transaction_id`` within the session
+       window. Used when (1) is missing (in-flight sessions). Returned with
+       ``source = "telemetry_register_delta"``.
+
+    Args:
+        db: asyncpg pool or connection.
+        session_id: ``charging_sessions.session_id`` (UUID).
+        transaction_id: ``charging_sessions.transaction_id`` (BIGINT).
+
+    Returns:
+        ``{"energy_kwh": float, "source": str}`` when a value is available,
+        otherwise ``None``. ``None`` covers the cases: session row not found,
+        no meter samples and no stored delta, or a negative computed delta
+        (almost always a meter rollover / bad ordering — surfaced as
+        unavailable rather than a misleading number).
+    """
+    if (session_id is None) == (transaction_id is None):
+        raise ValueError(
+            "get_session_energy_kwh requires exactly one of session_id or transaction_id"
+        )
+
+    if session_id is not None:
+        session_row = await db.fetchrow(
+            """
+            SELECT session_id,
+                   transaction_id,
+                   start_time,
+                   end_time,
+                   energy_delivered_kwh
+            FROM charging_sessions
+            WHERE session_id = $1
+            """,
+            session_id,
+        )
+    else:
+        session_row = await db.fetchrow(
+            """
+            SELECT session_id,
+                   transaction_id,
+                   start_time,
+                   end_time,
+                   energy_delivered_kwh
+            FROM charging_sessions
+            WHERE transaction_id = $1
+            """,
+            transaction_id,
+        )
+
+    if session_row is None:
+        return None
+
+    # Option A: prefer the stored meter delta when available.
+    stored = session_row["energy_delivered_kwh"]
+    if stored is not None:
+        return {
+            "energy_kwh": float(stored),
+            "source": ENERGY_SOURCE_SESSION_METER,
+        }
+
+    # Option B: integrate the cumulative register from telemetry_samples.
+    session_txid = session_row["transaction_id"]
+    if session_txid is None:
+        return None
+
+    delta_row = await db.fetchrow(
+        """
+        SELECT
+            MAX(CASE WHEN unit = 'kWh' THEN value ELSE value / 1000.0 END) AS max_kwh,
+            MIN(CASE WHEN unit = 'kWh' THEN value ELSE value / 1000.0 END) AS min_kwh
+        FROM telemetry_samples
+        WHERE transaction_id = $1
+          AND measurand = 'Energy.Active.Import.Register'
+          AND time >= $2
+          AND time <= COALESCE($3, NOW())
+        """,
+        session_txid,
+        session_row["start_time"],
+        session_row["end_time"],
+    )
+
+    if delta_row is None or delta_row["max_kwh"] is None or delta_row["min_kwh"] is None:
+        return None
+
+    delta_kwh = float(delta_row["max_kwh"]) - float(delta_row["min_kwh"])
+    if delta_kwh < 0:
+        logger.warning(
+            "Negative energy delta for session transaction_id=%s (max=%.3f kWh, "
+            "min=%.3f kWh); likely meter rollover, treating as unavailable",
+            session_txid,
+            float(delta_row["max_kwh"]),
+            float(delta_row["min_kwh"]),
+        )
+        return None
+
+    return {
+        "energy_kwh": delta_kwh,
+        "source": ENERGY_SOURCE_TELEMETRY_REGISTER,
+    }
