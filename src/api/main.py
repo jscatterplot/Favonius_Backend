@@ -5629,7 +5629,7 @@ def _encode_transaction_cursor(started_at: datetime, session_id: str) -> str:
     """Encode ``(started_at, session_id)`` into an opaque base64 cursor."""
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
-    started_at_utc = started_at.astimezone(timezone.utc).replace(microsecond=0)
+    started_at_utc = started_at.astimezone(timezone.utc)
     payload = json.dumps(
         {
             "startedAt": started_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -5647,9 +5647,15 @@ def _decode_transaction_cursor(value: str) -> tuple[datetime, str]:
         payload = json.loads(decoded)
         started_at_str = payload["startedAt"]
         session_id = payload["sessionId"]
-        started_at = datetime.strptime(started_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
+        try:
+            started_at = datetime.strptime(started_at_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            # Backward compatibility for pre-fix cursors encoded at second precision.
+            started_at = datetime.strptime(started_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
         UUID(session_id)
     except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
         raise HTTPException(
