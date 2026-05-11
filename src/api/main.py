@@ -5562,6 +5562,469 @@ async def get_energy_report_monthly_csv(
     return StreamingResponse(_generate(), media_type="text/csv", headers=headers)
 
 
+# ── Energy transactions endpoint ──────────────────────────────────────────────
+
+
+class EnergyTransactionCost(BaseModel):
+    """Per-session cost block."""
+
+    amount: float = Field(..., description="Cost amount in the depot currency")
+    currency: str = Field(..., description="ISO 4217 currency code")
+    estimated: bool = Field(
+        False,
+        description=(
+            "True when ``amount`` was derived from energy_kwh × tariff because "
+            "``charging_sessions.cost_total`` was NULL for this session."
+        ),
+    )
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+
+class EnergyTransactionRow(BaseModel):
+    """One row per charging_sessions transaction."""
+
+    session_id: str = Field(..., description="charging_sessions.session_id (UUID)")
+    started_at: str = Field(..., description="ISO 8601 UTC timestamp (Z suffix)")
+    ended_at: Optional[str] = Field(
+        None, description="ISO 8601 UTC timestamp; null while the session is active"
+    )
+    vehicle_id: Optional[str] = Field(None, description="Vehicle UUID; null if unresolved")
+    charger_id: Optional[str] = Field(None, description="Charger UUID; null if unresolved")
+    driver_id: Optional[str] = Field(None, description="Driver UUID; null if unresolved")
+    card_id: Optional[str] = Field(
+        None, description="RFID card UUID; null for manual-authorize sessions"
+    )
+    energy_kwh: float = Field(..., description="Delivered kWh for this session (0 is valid)")
+    avg_kw: float = Field(
+        ..., description="energy_kwh / (duration_minutes / 60); 0 when duration_minutes == 0"
+    )
+    duration_minutes: int = Field(..., ge=0, description="Backend-computed duration in minutes")
+    cost: EnergyTransactionCost = Field(..., description="Per-session cost")
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+
+class EnergyTransactionsResponse(BaseModel):
+    """Response from ``GET /reports/depots/{depot_id}/energy/transactions``."""
+
+    depot_id: str = Field(..., description="Echo of the path parameter")
+    currency: str = Field(..., description="Depot billing currency")
+    from_: str = Field(..., alias="from", description="Echo of the from query parameter")
+    to: str = Field(..., description="Echo of the to query parameter")
+    rows: list[EnergyTransactionRow]
+    next_cursor: Optional[str] = Field(
+        None, description="Opaque cursor for the next page; null when no more rows"
+    )
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+
+_ENERGY_TRANSACTIONS_DEFAULT_LIMIT = 500
+_ENERGY_TRANSACTIONS_MAX_LIMIT = 5000
+_ENERGY_TRANSACTIONS_MAX_RANGE_DAYS = 366  # inclusive 1-year window (leap-safe)
+
+
+def _encode_transaction_cursor(started_at: datetime, session_id: str) -> str:
+    """Encode ``(started_at, session_id)`` into an opaque base64 cursor."""
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    started_at_utc = started_at.astimezone(timezone.utc)
+    payload = json.dumps(
+        {
+            "startedAt": started_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "sessionId": session_id,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_transaction_cursor(value: str) -> tuple[datetime, str]:
+    """Decode an opaque cursor; raises HTTPException(400) on malformed input."""
+    try:
+        decoded = base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
+        payload = json.loads(decoded)
+        started_at_str = payload["startedAt"]
+        session_id = payload["sessionId"]
+        try:
+            started_at = datetime.strptime(started_at_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            # Backward compatibility for pre-fix cursors encoded at second precision.
+            started_at = datetime.strptime(started_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        UUID(session_id)
+    except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid cursor",
+        ) from exc
+    return started_at, session_id
+
+
+def _format_utc_z(value: Optional[datetime]) -> Optional[str]:
+    """Format a datetime as ``YYYY-MM-DDTHH:MM:SSZ`` (UTC, second precision)."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _round_half_up_int(value: float) -> int:
+    """Round half-up to nearest integer (PRD/contract spec for durationMinutes)."""
+    return int(math.floor(value + 0.5))
+
+
+def _escape_like(value: str) -> str:
+    """Escape ``%`` and ``_`` so a substring search is treated literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _fetch_transaction_records(
+    depot_id: str,
+    timezone_name: str,
+    ocpp_ids: list[str],
+    *,
+    from_date: date,
+    to_date: date,
+    vehicle_id: Optional[str],
+    target_station_id: Optional[str],
+    driver_id: Optional[str],
+    card_id: Optional[str],
+    search: Optional[str],
+    search_station_ids: Optional[list[str]],
+    cursor: Optional[tuple[datetime, str]],
+    limit_plus_one: int,
+) -> list[asyncpg.Record]:
+    """Fetch up to ``limit_plus_one`` charging_sessions rows for the transactions endpoint.
+
+    Matches both live OCPP rows (via ``station_id IN ocpp_ids``) and imported
+    backfill rows (via ``site_id = depot_id AND source = 'import'``). Optional
+    filters (vehicle/charger/driver/card/search/cursor) are pushed down so the
+    DB does the heavy lifting and the response slice is deterministic.
+    """
+    if not db_pools or db_pools.ts is None:
+        raise DatabaseError("Database not available")
+
+    args: list[Any] = []
+
+    def add(value: Any) -> str:
+        args.append(value)
+        return f"${len(args)}"
+
+    p_ocpp_ids = add(ocpp_ids)
+    p_from = add(from_date)
+    p_to = add(to_date)
+    p_tz = add(timezone_name)
+    p_depot = add(depot_id)
+
+    where_parts = [
+        f"(cs.station_id = ANY({p_ocpp_ids}::text[]) "
+        f"OR (cs.site_id = {p_depot}::uuid AND cs.source = 'import'))",
+        f"cs.start_time >= ({p_from}::date)::timestamp AT TIME ZONE {p_tz}",
+        f"cs.start_time < (({p_to}::date) + INTERVAL '1 day')::timestamp AT TIME ZONE {p_tz}",
+    ]
+
+    if vehicle_id is not None:
+        where_parts.append(f"cs.vehicle_id = {add(vehicle_id)}::uuid")
+    if target_station_id is not None:
+        where_parts.append(f"cs.station_id = {add(target_station_id)}")
+    if driver_id is not None:
+        where_parts.append(f"cs.driver_id = {add(driver_id)}::uuid")
+    if card_id is not None:
+        where_parts.append(f"cs.card_id = {add(card_id)}::uuid")
+
+    if search:
+        pattern = f"%{_escape_like(search)}%"
+        p_pattern = add(pattern)
+        p_search_stations = add(search_station_ids or [])
+        where_parts.append(
+            "("
+            f"cs.vehicle_id::text ILIKE {p_pattern} ESCAPE '\\' "
+            f"OR cs.driver_id::text ILIKE {p_pattern} ESCAPE '\\' "
+            f"OR cs.card_id::text ILIKE {p_pattern} ESCAPE '\\' "
+            f"OR cs.session_id::text ILIKE {p_pattern} ESCAPE '\\' "
+            f"OR cs.station_id = ANY({p_search_stations}::text[])"
+            ")"
+        )
+
+    if cursor is not None:
+        cursor_started_at, cursor_session_id = cursor
+        p_cursor_ts = add(cursor_started_at)
+        p_cursor_sid = add(cursor_session_id)
+        where_parts.append(
+            f"(cs.start_time, cs.session_id) < ({p_cursor_ts}::timestamptz, {p_cursor_sid}::uuid)"
+        )
+
+    p_limit = add(limit_plus_one)
+
+    query = f"""
+        SELECT
+            cs.session_id::text AS session_id,
+            cs.start_time AS started_at,
+            cs.end_time AS ended_at,
+            cs.energy_delivered_kwh,
+            cs.cost_total,
+            cs.vehicle_id::text AS vehicle_id,
+            cs.station_id AS ocpp_id,
+            cs.driver_id::text AS driver_id,
+            cs.card_id::text AS card_id
+        FROM charging_sessions cs
+        WHERE {' AND '.join(where_parts)}
+        ORDER BY cs.start_time DESC, cs.session_id DESC
+        LIMIT {p_limit}
+    """
+
+    async with db_pools.ts.acquire() as conn:
+        return await conn.fetch(query, *args)
+
+
+def _transaction_row_payload(
+    record: asyncpg.Record,
+    *,
+    charger_id_by_ocpp_id: dict[str, str],
+    currency: str,
+    under_cap_rate: Optional[float],
+    now_utc: datetime,
+) -> dict:
+    """Build the per-row dict (camelCase keys) for the transactions response."""
+    started_at: datetime = record["started_at"]
+    ended_at: Optional[datetime] = record["ended_at"]
+
+    energy_raw = record["energy_delivered_kwh"]
+    energy_kwh = float(energy_raw) if energy_raw is not None else 0.0
+
+    end_for_duration = ended_at if ended_at is not None else now_utc
+    started_at_utc = (
+        started_at if started_at.tzinfo is not None else started_at.replace(tzinfo=timezone.utc)
+    )
+    end_utc = (
+        end_for_duration
+        if end_for_duration.tzinfo is not None
+        else end_for_duration.replace(tzinfo=timezone.utc)
+    )
+    duration_seconds = max((end_utc - started_at_utc).total_seconds(), 0.0)
+    duration_minutes = _round_half_up_int(duration_seconds / 60.0)
+
+    if duration_minutes > 0:
+        avg_kw = round(energy_kwh / (duration_minutes / 60.0), 2)
+    else:
+        avg_kw = 0.0
+
+    cost_raw = record["cost_total"]
+    if cost_raw is not None:
+        cost_amount = round(float(cost_raw), 2)
+        estimated = False
+    else:
+        estimate = energy_kwh * under_cap_rate if under_cap_rate is not None else 0.0
+        cost_amount = round(estimate, 2)
+        estimated = True
+
+    return {
+        "sessionId": record["session_id"],
+        "startedAt": _format_utc_z(started_at),
+        "endedAt": _format_utc_z(ended_at),
+        "vehicleId": _optional_text(record["vehicle_id"]),
+        "chargerId": charger_id_by_ocpp_id.get(record["ocpp_id"]),
+        "driverId": _optional_text(record["driver_id"]),
+        "cardId": _optional_text(record["card_id"]),
+        "energyKwh": round(energy_kwh, 6),
+        "avgKw": avg_kw,
+        "durationMinutes": duration_minutes,
+        "cost": {
+            "amount": cost_amount,
+            "currency": currency,
+            "estimated": estimated,
+        },
+    }
+
+
+@app.get(
+    "/reports/depots/{depot_id}/energy/transactions",
+    response_model=EnergyTransactionsResponse,
+    response_model_by_alias=True,
+    tags=["Reports"],
+    summary="List individual charging-session transactions",
+    operation_id="getEnergyTransactions",
+    description=(
+        "Return one row per ``charging_sessions`` record whose ``start_time`` "
+        "falls inside the [from, to] window in the depot's local timezone. "
+        "Supports exact-match filters (vehicle/charger/driver/card), a free-text "
+        "substring search, and opaque cursor pagination ordered by "
+        "``(start_time DESC, session_id DESC)``. Sessions that started before "
+        "``from`` but are still active are excluded — they belong to the "
+        "prior period for billing."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Cross-organization access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_energy_transactions(
+    depot_id: str,
+    from_: str = Query(
+        ..., alias="from", description="Start date (YYYY-MM-DD, inclusive, depot TZ)"
+    ),
+    to: str = Query(..., description="End date (YYYY-MM-DD, inclusive, depot TZ)"),
+    vehicle_id: Optional[str] = Query(None, description="Exact match against vehicles.id"),
+    charger_id: Optional[str] = Query(None, description="Exact match against charging_stations.id"),
+    driver_id: Optional[str] = Query(None, description="Exact match against drivers.id"),
+    card_id: Optional[str] = Query(None, description="Exact match against rfid_cards.id"),
+    search: Optional[str] = Query(
+        None,
+        description=(
+            "Case-insensitive substring filter over vehicle_id, charger_id, "
+            "driver_id, card_id, and session_id (UUID texts)."
+        ),
+    ),
+    limit: int = Query(
+        _ENERGY_TRANSACTIONS_DEFAULT_LIMIT,
+        ge=1,
+        le=_ENERGY_TRANSACTIONS_MAX_LIMIT,
+        description=(
+            f"Max page size (default {_ENERGY_TRANSACTIONS_DEFAULT_LIMIT}, "
+            f"hard-cap {_ENERGY_TRANSACTIONS_MAX_LIMIT})."
+        ),
+    ),
+    cursor: Optional[str] = Query(
+        None, description="Opaque cursor from a prior response's nextCursor"
+    ),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """One row per ``charging_sessions`` record, in time-descending order."""
+    validate_depot_id(depot_id)
+    await _verify_depot_access_for_report(depot_id, user)
+
+    from_date = _parse_report_date(from_, "from")
+    to_date = _parse_report_date(to, "to")
+    if to_date < from_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'to' must be on or after 'from'",
+        )
+    if (to_date - from_date).days >= _ENERGY_TRANSACTIONS_MAX_RANGE_DAYS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Date range cannot exceed 1 year",
+        )
+
+    if vehicle_id is not None:
+        validate_uuid(vehicle_id, "vehicle_id")
+    if charger_id is not None:
+        validate_uuid(charger_id, "charger_id")
+    if driver_id is not None:
+        validate_uuid(driver_id, "driver_id")
+    if card_id is not None:
+        validate_uuid(card_id, "card_id")
+
+    cursor_pair: Optional[tuple[datetime, str]] = None
+    if cursor:
+        cursor_pair = _decode_transaction_cursor(cursor)
+
+    search_clean = search.strip() if search else None
+    if not search_clean:
+        search_clean = None
+
+    try:
+        (
+            timezone_name,
+            currency,
+            under_cap_rate,
+            ocpp_ids,
+            charger_id_by_ocpp_id,
+        ) = await _load_report_context(depot_id)
+
+        target_station_id: Optional[str] = None
+        if charger_id is not None:
+            for ocpp, uuid_str in charger_id_by_ocpp_id.items():
+                if uuid_str == charger_id:
+                    target_station_id = ocpp
+                    break
+            if target_station_id is None:
+                # Charger UUID not in this depot — short-circuit to an empty page.
+                return {
+                    "depotId": depot_id,
+                    "currency": currency,
+                    "from": from_,
+                    "to": to,
+                    "rows": [],
+                    "nextCursor": None,
+                }
+
+        search_station_ids: Optional[list[str]] = None
+        if search_clean is not None:
+            needle = search_clean.lower()
+            search_station_ids = [
+                ocpp
+                for ocpp, uuid_str in charger_id_by_ocpp_id.items()
+                if needle in uuid_str.lower()
+            ]
+
+        records = await _fetch_transaction_records(
+            depot_id,
+            timezone_name,
+            ocpp_ids,
+            from_date=from_date,
+            to_date=to_date,
+            vehicle_id=vehicle_id,
+            target_station_id=target_station_id,
+            driver_id=driver_id,
+            card_id=card_id,
+            search=search_clean,
+            search_station_ids=search_station_ids,
+            cursor=cursor_pair,
+            limit_plus_one=limit + 1,
+        )
+    except DepotNotFoundError:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error generating energy transactions: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError(f"Database error: {str(exc)}") from exc
+
+    has_more = len(records) > limit
+    page = records[:limit]
+
+    now_utc = datetime.now(timezone.utc)
+    rows = [
+        _transaction_row_payload(
+            rec,
+            charger_id_by_ocpp_id=charger_id_by_ocpp_id,
+            currency=currency,
+            under_cap_rate=under_cap_rate,
+            now_utc=now_utc,
+        )
+        for rec in page
+    ]
+
+    next_cursor: Optional[str] = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = _encode_transaction_cursor(last["started_at"], last["session_id"])
+
+    return {
+        "depotId": depot_id,
+        "currency": currency,
+        "from": from_,
+        "to": to,
+        "rows": rows,
+        "nextCursor": next_cursor,
+    }
+
+
 # ── Reports CRUD endpoints ────────────────────────────────────────────────────
 
 
