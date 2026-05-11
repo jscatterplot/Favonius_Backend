@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional, Protocol
 
@@ -100,9 +100,17 @@ class TimescalePriceSource:
             return None
 
         start_bucket = _hour_bucket(start)
-        end_bucket = _hour_bucket(end)
-        # Inclusive range of hour-aligned epoch seconds (3600 s apart).
-        buckets = list(range(start_bucket, end_bucket + 3600, 3600))
+        end_aware = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+        end_utc = end_aware.astimezone(timezone.utc)
+        # Treat ``end`` as exclusive for overlap so an end on ``:00`` does not
+        # pull in the next calendar hour. ``max`` covers sub-second windows
+        # starting immediately after an hour boundary (``end - 1µs`` can sit
+        # in the prior hour).
+        last_bucket = max(
+            start_bucket,
+            _hour_bucket(end_utc - timedelta(microseconds=1)),
+        )
+        buckets = list(range(start_bucket, last_bucket + 3600, 3600))
 
         prices: list[Decimal] = []
         for bucket in buckets:

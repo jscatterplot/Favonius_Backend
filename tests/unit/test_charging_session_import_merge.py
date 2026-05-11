@@ -260,6 +260,19 @@ class TestTimescalePriceSourceCache:
         assert conn.fetchrow.await_count == 3
 
     @pytest.mark.asyncio
+    async def test_end_on_hour_boundary_queries_one_bucket(self):
+        """``end`` at ``:00`` is exclusive; do not include the following hour."""
+        depot_id = str(uuid4())
+        pool, conn = self._make_pool({"price": Decimal("0.30")})
+        ps = TimescalePriceSource(pool)
+        await ps.average_price_per_kwh(
+            depot_id=depot_id,
+            start=_utc(2026, 5, 5, 12, 0),
+            end=_utc(2026, 5, 5, 13, 0),
+        )
+        assert conn.fetchrow.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_cache_returns_none_when_no_coverage(self):
         depot_id = str(uuid4())
         pool, conn = self._make_pool({"price": None})
