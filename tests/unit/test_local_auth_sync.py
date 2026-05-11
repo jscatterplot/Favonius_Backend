@@ -19,12 +19,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.adapters.ocpp.local_auth_sync import (
-    SyncResult,
     _BOOTSTRAP_CONFIG_KEYS,
+    SyncResult,
     _format_entries,
+    _probe_local_auth_support,
     sync_charger,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -64,15 +64,32 @@ def _make_cp(
     send_status: str = "Accepted",
     send_raises: Exception | None = None,
     vendor: str | None = None,
+    firmware_version: str | None = None,
+    get_configuration_response: Any | None = None,
+    get_configuration_raises: Exception | None = None,
 ) -> MagicMock:
-    """Build a fake FleetChargePoint with the methods sync_charger calls."""
+    """Build a fake FleetChargePoint with the methods sync_charger calls.
+
+    ``get_configuration_response`` controls the probe path: passing
+    ``{"configuration_key": [...]}`` simulates a wire reply; the default
+    (``None`` → empty reply) simulates a charger that returns neither
+    ``SupportedFeatureProfiles`` nor ``LocalAuthListMaxLength`` so the
+    probe is ambiguous and sync falls through to ``send_local_list``.
+    """
     cp = MagicMock()
     cp.vendor = vendor
+    cp.firmware_version = firmware_version
     cp.change_configuration = AsyncMock(return_value="Accepted")
     if send_raises is not None:
         cp.send_local_list = AsyncMock(side_effect=send_raises)
     else:
         cp.send_local_list = AsyncMock(return_value=send_status)
+    if get_configuration_raises is not None:
+        cp.get_configuration = AsyncMock(side_effect=get_configuration_raises)
+    elif get_configuration_response is not None:
+        cp.get_configuration = AsyncMock(return_value=get_configuration_response)
+    else:
+        cp.get_configuration = AsyncMock(return_value={"configuration_key": [], "unknown_key": []})
     return cp
 
 
@@ -111,9 +128,7 @@ class TestSyncChargerSkipPaths:
 
         result = await sync_charger(cp, db, "station-001")
 
-        assert result == SyncResult(
-            status="skipped", version=0, entries=0, reason="env_disabled"
-        )
+        assert result == SyncResult(status="skipped", version=0, entries=0, reason="env_disabled")
         # Must not touch the DB or the charger when disabled.
         db.fetchrow.assert_not_awaited()
         db.execute.assert_not_awaited()
@@ -146,9 +161,7 @@ class TestSyncChargerSkipPaths:
         cp.send_local_list.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_db_error_listing_tags_skipped_without_state_change(
-        self, monkeypatch
-    ) -> None:
+    async def test_db_error_listing_tags_skipped_without_state_change(self, monkeypatch) -> None:
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
         db = _make_db(
             station_row={"id": "uuid-1", "local_list_version": 5},
@@ -173,9 +186,7 @@ class TestSyncChargerSkipPaths:
 
 class TestSyncChargerFirstSync:
     @pytest.mark.asyncio
-    async def test_first_sync_pushes_bootstrap_config_then_full_list(
-        self, monkeypatch
-    ) -> None:
+    async def test_first_sync_pushes_bootstrap_config_then_full_list(self, monkeypatch) -> None:
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
         db = _make_db(
             station_row={"id": "uuid-1", "local_list_version": 0},
@@ -214,9 +225,7 @@ class TestSyncChargerFirstSync:
 
 class TestSyncChargerSubsequentSync:
     @pytest.mark.asyncio
-    async def test_subsequent_sync_skips_bootstrap_and_bumps_version(
-        self, monkeypatch
-    ) -> None:
+    async def test_subsequent_sync_skips_bootstrap_and_bumps_version(self, monkeypatch) -> None:
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
         db = _make_db(
             station_row={"id": "uuid-1", "local_list_version": 7},
@@ -258,9 +267,7 @@ class TestSyncChargerSubsequentSync:
 
 class TestSyncChargerFailureModes:
     @pytest.mark.asyncio
-    async def test_not_supported_records_status_without_bumping_version(
-        self, monkeypatch
-    ) -> None:
+    async def test_not_supported_records_status_without_bumping_version(self, monkeypatch) -> None:
         """ABB cap or vendor-disabled charger: status recorded, version held.
 
         FleetChargePoint.send_local_list returns 'NotSupported' when the
@@ -304,9 +311,7 @@ class TestSyncChargerFailureModes:
         assert result.version == 2
 
     @pytest.mark.asyncio
-    async def test_send_local_list_raises_is_caught_as_failed(
-        self, monkeypatch
-    ) -> None:
+    async def test_send_local_list_raises_is_caught_as_failed(self, monkeypatch) -> None:
         """Defensive path: production FleetChargePoint already catches its own
         exceptions, but a duck-typed test fake might not. The orchestration
         must never propagate an exception out of sync_charger."""
@@ -327,9 +332,7 @@ class TestSyncChargerFailureModes:
         assert update_call.args[1] == "Failed"
 
     @pytest.mark.asyncio
-    async def test_db_error_during_state_update_is_swallowed(
-        self, monkeypatch
-    ) -> None:
+    async def test_db_error_during_state_update_is_swallowed(self, monkeypatch) -> None:
         """If the post-push DB UPDATE fails, we still return the SendLocalList
         outcome — the charger has the list; we just can't record we sent it."""
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
@@ -354,9 +357,7 @@ class TestSyncChargerFailureModes:
 
 class TestBootstrapConfig:
     @pytest.mark.asyncio
-    async def test_change_configuration_failure_does_not_block_send(
-        self, monkeypatch
-    ) -> None:
+    async def test_change_configuration_failure_does_not_block_send(self, monkeypatch) -> None:
         """A charger that doesn't expose LocalAuthListEnabled must still get
         SendLocalList — a 'NotSupported' response on a config key cannot
         disable the offline-RFID feature for that charger."""
@@ -374,9 +375,7 @@ class TestBootstrapConfig:
         cp.send_local_list.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_change_configuration_exception_does_not_block_send(
-        self, monkeypatch
-    ) -> None:
+    async def test_change_configuration_exception_does_not_block_send(self, monkeypatch) -> None:
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
         db = _make_db(
             station_row={"id": "uuid-1", "local_list_version": 0},
@@ -389,6 +388,386 @@ class TestBootstrapConfig:
 
         assert result.status == "Accepted"
         cp.send_local_list.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _probe_local_auth_support
+# ---------------------------------------------------------------------------
+
+
+class TestProbeLocalAuthSupport:
+    @pytest.mark.asyncio
+    async def test_profiles_advertises_local_auth_list_management_returns_true(
+        self,
+    ) -> None:
+        cp = _make_cp(
+            get_configuration_response={
+                "configuration_key": [
+                    {
+                        "key": "SupportedFeatureProfiles",
+                        "value": "Core,FirmwareManagement,LocalAuthListManagement,SmartCharging",
+                    },
+                ],
+                "unknown_key": [],
+            }
+        )
+        result = await _probe_local_auth_support(cp, "station-001")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_profiles_missing_local_auth_list_returns_false(self) -> None:
+        """The HRX/ABB Terra AC V1.8.x case: profile is omitted."""
+        cp = _make_cp(
+            get_configuration_response={
+                "configuration_key": [
+                    {
+                        "key": "SupportedFeatureProfiles",
+                        "value": "Core,FirmwareManagement,SmartCharging",
+                    },
+                ],
+                "unknown_key": [],
+            }
+        )
+        result = await _probe_local_auth_support(cp, "station-002")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_profile_match_is_case_and_whitespace_insensitive(self) -> None:
+        cp = _make_cp(
+            get_configuration_response={
+                "configuration_key": [
+                    {
+                        "key": "supportedfeatureprofiles",  # lowercase key
+                        "value": " Core , LOCALAUTHLISTMANAGEMENT , SmartCharging ",
+                    },
+                ],
+                "unknown_key": [],
+            }
+        )
+        assert await _probe_local_auth_support(cp, "station-003") is True
+
+    @pytest.mark.asyncio
+    async def test_neither_key_returned_is_ambiguous(self) -> None:
+        cp = _make_cp(get_configuration_response={"configuration_key": [], "unknown_key": []})
+        assert await _probe_local_auth_support(cp, "station-004") is None
+
+    @pytest.mark.asyncio
+    async def test_get_configuration_exception_is_ambiguous(self) -> None:
+        cp = _make_cp(get_configuration_raises=RuntimeError("socket closed"))
+        assert await _probe_local_auth_support(cp, "station-005") is None
+
+    @pytest.mark.asyncio
+    async def test_max_length_positive_implies_supported(self) -> None:
+        """Some chargers omit SupportedFeatureProfiles but still expose the
+        cap. A positive cap is a strong corroborating signal."""
+        cp = _make_cp(
+            get_configuration_response={
+                "configuration_key": [
+                    {"key": "LocalAuthListMaxLength", "value": "16"},
+                ],
+                "unknown_key": [],
+            }
+        )
+        assert await _probe_local_auth_support(cp, "station-006") is True
+
+    @pytest.mark.asyncio
+    async def test_max_length_zero_implies_unsupported(self) -> None:
+        cp = _make_cp(
+            get_configuration_response={
+                "configuration_key": [
+                    {"key": "LocalAuthListMaxLength", "value": "0"},
+                ],
+                "unknown_key": [],
+            }
+        )
+        assert await _probe_local_auth_support(cp, "station-007") is False
+
+    @pytest.mark.asyncio
+    async def test_max_length_unparseable_is_ambiguous(self) -> None:
+        cp = _make_cp(
+            get_configuration_response={
+                "configuration_key": [
+                    {"key": "LocalAuthListMaxLength", "value": "n/a"},
+                ],
+                "unknown_key": [],
+            }
+        )
+        assert await _probe_local_auth_support(cp, "station-008") is None
+
+
+# ---------------------------------------------------------------------------
+# sync_charger — probe-cache short-circuit + re-probe on firmware change
+# ---------------------------------------------------------------------------
+
+
+class TestSyncChargerProbeCache:
+    @pytest.mark.asyncio
+    async def test_cached_unsupported_same_firmware_short_circuits(self, monkeypatch) -> None:
+        """The fix: ABB Terra AC V1.8.36 already known-unsupported on a previous
+        boot must NOT re-attempt the probe or SendLocalList on reconnect."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": False,
+                "local_list_probed_firmware": "TAC3Z9119006710273::V1.8.36",
+            },
+        )
+        cp = _make_cp(firmware_version="TAC3Z9119006710273::V1.8.36")
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result == SyncResult(
+            status="skipped",
+            version=0,
+            entries=0,
+            reason="unsupported_cached",
+        )
+        cp.get_configuration.assert_not_awaited()
+        cp.send_local_list.assert_not_awaited()
+        cp.change_configuration.assert_not_awaited()
+        db.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cached_unsupported_different_firmware_reprobes(self, monkeypatch) -> None:
+        """Firmware upgrade clears the cached negative — we must probe again
+        because the new firmware may have added support."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": False,
+                "local_list_probed_firmware": "V1.8.36",
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(
+            firmware_version="V2.0.0",  # different firmware
+            get_configuration_response={
+                "configuration_key": [
+                    {
+                        "key": "SupportedFeatureProfiles",
+                        "value": "Core,LocalAuthListManagement",
+                    },
+                ],
+                "unknown_key": [],
+            },
+            send_status="Accepted",
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        cp.get_configuration.assert_awaited_once()
+        cp.send_local_list.assert_awaited_once()
+        assert result.status == "Accepted"
+        assert result.version == 1
+
+    @pytest.mark.asyncio
+    async def test_probe_negative_records_outcome_and_skips_send(self, monkeypatch) -> None:
+        """First-time probe returns False → record FALSE + firmware + status,
+        return UnsupportedFeatureProfile, never call SendLocalList."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+        )
+        cp = _make_cp(
+            firmware_version="V1.8.36",
+            get_configuration_response={
+                "configuration_key": [
+                    {
+                        "key": "SupportedFeatureProfiles",
+                        "value": "Core,FirmwareManagement,SmartCharging",
+                    },
+                ],
+                "unknown_key": [],
+            },
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "UnsupportedFeatureProfile"
+        assert result.reason == "probe_negative"
+        assert result.version == 0
+        assert result.entries == 0
+        cp.send_local_list.assert_not_awaited()
+        cp.change_configuration.assert_not_awaited()
+
+        # DB UPDATE wrote the firmware-scoped negative.
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported = $1" in update_call.args[0]
+        assert "local_list_probed_firmware = $2" in update_call.args[0]
+        assert update_call.args[1] is False
+        assert update_call.args[2] == "V1.8.36"
+        assert update_call.args[3] == "UnsupportedFeatureProfile"
+
+    @pytest.mark.asyncio
+    async def test_probe_positive_records_outcome_and_proceeds(self, monkeypatch) -> None:
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(
+            firmware_version="V2.0.0",
+            get_configuration_response={
+                "configuration_key": [
+                    {
+                        "key": "SupportedFeatureProfiles",
+                        "value": "Core,LocalAuthListManagement",
+                    },
+                ],
+                "unknown_key": [],
+            },
+            send_status="Accepted",
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "Accepted"
+        cp.send_local_list.assert_awaited_once()
+        # First UPDATE recorded the positive probe (supported=True, firmware,
+        # no last_status); second UPDATE bumped version after Accepted push.
+        update_calls = db.execute.await_args_list
+        assert len(update_calls) == 2
+        probe_update = update_calls[0]
+        assert "local_list_supported = $1" in probe_update.args[0]
+        assert probe_update.args[1] is True
+        assert probe_update.args[2] == "V2.0.0"
+
+    @pytest.mark.asyncio
+    async def test_probe_ambiguous_falls_through_to_send(self, monkeypatch) -> None:
+        """Charger doesn't expose the keys — we still try SendLocalList; this
+        preserves the pre-probe behavior for non-standard firmware."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(
+            firmware_version="V1.0.0",
+            get_configuration_response={"configuration_key": [], "unknown_key": []},
+            send_status="Accepted",
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "Accepted"
+        cp.get_configuration.assert_awaited_once()
+        cp.send_local_list.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cached_supported_skips_probe_but_still_pushes(self, monkeypatch) -> None:
+        """A previously confirmed-supported charger doesn't need to re-probe
+        on every reconnect — we go straight to the push."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 3,
+                "local_list_supported": True,
+                "local_list_probed_firmware": "V1.0.0",
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(firmware_version="V1.0.0", send_status="Accepted")
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "Accepted"
+        assert result.version == 4
+        cp.get_configuration.assert_not_awaited()
+        cp.send_local_list.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# sync_charger — fallback caching when SendLocalList itself returns NotSupported
+# ---------------------------------------------------------------------------
+
+
+class TestSyncChargerNotSupportedFallbackCache:
+    @pytest.mark.asyncio
+    async def test_charger_not_supported_under_cap_caches_firmware_negative(
+        self, monkeypatch
+    ) -> None:
+        """If the probe was ambiguous and SendLocalList returned NotSupported
+        with entry count under the 16-cap, we know the charger itself said no
+        — cache the firmware-scoped negative so the next boot skips."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": f"VEH-{i}", "source": "vehicle"} for i in range(15)],
+        )
+        cp = _make_cp(
+            firmware_version="V1.8.36",
+            get_configuration_response={"configuration_key": [], "unknown_key": []},
+            send_status="NotSupported",
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "NotSupported"
+        # Last UPDATE recorded firmware-scoped negative (not just last_status).
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported = $1" in update_call.args[0]
+        assert update_call.args[1] is False
+        assert update_call.args[2] == "V1.8.36"
+        assert update_call.args[3] == "NotSupported"
+
+    @pytest.mark.asyncio
+    async def test_local_cap_refusal_over_cap_does_not_cache_firmware_negative(
+        self, monkeypatch
+    ) -> None:
+        """When the entry count exceeds the ABB 16-cap, FleetChargePoint
+        refuses LOCALLY and returns NotSupported. That's transient — adding
+        a tag from a different driver would not make it firmware-permanent.
+        We must record last_status only, NOT supported=False."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": f"VEH-{i}", "source": "vehicle"} for i in range(17)],
+        )
+        cp = _make_cp(
+            firmware_version="V1.8.36",
+            get_configuration_response={"configuration_key": [], "unknown_key": []},
+            send_status="NotSupported",
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "NotSupported"
+        # Last UPDATE is the "stamp last_status only" variant — does NOT
+        # touch local_list_supported.
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported" not in update_call.args[0]
+        assert "local_list_last_status" in update_call.args[0]
+        assert update_call.args[1] == "NotSupported"
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +814,7 @@ def _session_factory():
 
 class TestBootSchedulesLocalAuthSync:
     @pytest.mark.asyncio
-    async def test_on_boot_schedules_local_auth_sync_task(
-        self, _session_factory
-    ) -> None:
+    async def test_on_boot_schedules_local_auth_sync_task(self, _session_factory) -> None:
         session = _session_factory(pg_pool=MagicMock())
         # _resolve_tenant_context relies on _supabase_client — left None.
         # fetch_open_sessions is mocked to []; no transactions to reload.
@@ -483,13 +860,13 @@ class TestBootSchedulesLocalAuthSync:
         # Spy on sync_charger to ensure it is NOT called when pool is None.
         called = {"count": 0}
 
-        async def _fake_sync(*args: Any, **kwargs: Any) -> SyncResult:  # pragma: no cover - asserted via counter
+        async def _fake_sync(
+            *args: Any, **kwargs: Any
+        ) -> SyncResult:  # pragma: no cover - asserted via counter
             called["count"] += 1
             return SyncResult(status="Accepted", version=1, entries=0)
 
-        monkeypatch.setattr(
-            "src.websocket_handler.ocpp16_adapter.sync_local_auth_list", _fake_sync
-        )
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.sync_local_auth_list", _fake_sync)
         await session._delayed_local_auth_sync()
         assert called["count"] == 0
 
@@ -508,9 +885,7 @@ class TestBootSchedulesLocalAuthSync:
             used["pool"] = pool
             return SyncResult(status="skipped", version=0, entries=0)
 
-        monkeypatch.setattr(
-            "src.websocket_handler.ocpp16_adapter.sync_local_auth_list", _fake_sync
-        )
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.sync_local_auth_list", _fake_sync)
         await session._delayed_local_auth_sync()
         assert used["pool"] is static_pool
 
