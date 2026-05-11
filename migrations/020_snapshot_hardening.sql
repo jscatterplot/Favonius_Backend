@@ -54,10 +54,10 @@ ALTER TABLE optimization_input_snapshots
 
 -- 4. Foreign keys (only add when the referenced table exists in this DB).
 -- NOT VALID skips validation of pre-existing rows. Production has orphaned
--- depot_ids in optimization_input_snapshots when an organization is deleted
--- and the depot row cascades out before the dependent snapshots do; the FK
--- itself still prevents new orphans. Without NOT VALID, the validation pass
--- fails the migration and the runner crash-loops.
+-- depot_ids in optimization_input_snapshots because the depots/organizations
+-- shadow tables were never populated (Supabase owns canonical static data).
+-- These FKs are dropped immediately by 028_drop_static_shadow_fks.sql, so
+-- the relaxed validation only matters for the moments between 020 and 028.
 DO $$
 BEGIN
     IF EXISTS (

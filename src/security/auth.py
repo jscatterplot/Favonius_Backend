@@ -24,10 +24,12 @@ Environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Optional
 
+import asyncpg
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -50,6 +52,22 @@ JWT_ISSUER: Optional[str] = os.getenv("JWT_ISSUER")
 
 # JWKS client cache lifetime — default 1 hour; Supabase keys rotate rarely.
 _JWKS_CACHE_LIFESPAN_S = int(os.getenv("JWT_JWKS_CACHE_LIFESPAN_S", "3600"))
+
+# Email domains whose JWT subjects are auto-promoted to ``favonius_admin``.
+# Comparison is on the part after the final ``@``, lowercased, exact match —
+# so ``user@favoniusenergy.com`` matches but ``user@evil.favoniusenergy.com``
+# and ``user@favoniusenergy.com.attacker.com`` do not.
+_DEFAULT_FAVONIUS_ADMIN_DOMAINS: tuple[str, ...] = ("favoniusenergy.com",)
+
+
+def _load_favonius_admin_domains() -> tuple[str, ...]:
+    """Return the configured admin email domains (env override, lowercased)."""
+    raw = os.getenv("FAVONIUS_ADMIN_EMAIL_DOMAINS")
+    if not raw:
+        return _DEFAULT_FAVONIUS_ADMIN_DOMAINS
+    parsed = tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+    return parsed or _DEFAULT_FAVONIUS_ADMIN_DOMAINS
+
 
 security = HTTPBearer()
 
@@ -213,14 +231,19 @@ async def verify_token(
 
     The returned payload contains:
       - sub: user UUID (auth.uid() in Supabase)
-      - email: user email
+      - email: user email — also used by :func:`get_user_role` to auto-promote
+        a staff-domain address when the token shows a confirmed email identity
+        (non-empty ``email_confirmed_at`` if present, else issuer-signed
+        ``app_metadata`` / ``user_metadata`` rules in
+        :func:`_jwt_email_confirmation_present`).
       - role: "authenticated" (Supabase default)
       - aud: "authenticated"
       - exp: expiration timestamp
       - app_metadata: trusted Favonius tenancy claims (organization_id,
         favonius_role)
-      - user_metadata: user-editable fields (e.g. is_demo) — not used for
-        access control
+      - user_metadata: user-editable fields (e.g. is_demo). Only
+        ``email_verified: false`` is consulted for the staff-domain promotion
+        gate; it does not grant extra privileges.
 
     Raises HTTPException if the token is invalid or expired.
     """
@@ -338,9 +361,18 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
         )
 
     if pool is None:
+        # Static DB pool unavailable means the auth check cannot be evaluated.
+        # Surface this as 503 so the client (and on-call) can distinguish it
+        # from a real policy denial — silently returning 403 here previously
+        # made every depot endpoint look access-denied during startup blips.
+        logger.error(
+            "depot access check unavailable: static DB pool not initialized " "(depot=%s org=%s)",
+            depot_id,
+            org_id,
+        )
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: you do not have permission for this depot",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Depot access check is temporarily unavailable",
         )
 
     try:
@@ -351,15 +383,30 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
                 depot_id,
                 org_id,
             )
-        if has_access:
-            return
-    except Exception:
-        logger.warning(
-            "depot organization access check failed for depot=%s org=%s",
+    except (
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        asyncpg.InternalClientError,
+        OSError,
+        asyncio.TimeoutError,
+    ) as exc:
+        # Real DB / network failure. Don't disguise as a policy denial — that
+        # makes diagnosis impossible and falsely tells the user they lack
+        # access. Log with traceback and surface 503 so the caller can retry.
+        logger.error(
+            "depot access check failed due to DB error for depot=%s org=%s: %s",
             depot_id,
             org_id,
+            exc,
             exc_info=True,
         )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Depot access check is temporarily unavailable",
+        ) from exc
+
+    if has_access:
+        return
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
@@ -367,8 +414,96 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
     )
 
 
+def _app_metadata_indicates_confirmed_email_identity(meta: dict) -> bool:
+    """True when issuer-signed metadata ties the session to email (not phone-only).
+
+    ``app_metadata.provider`` / ``providers`` are set by Supabase Auth, not the
+    end user. Phone-only confirmation must not satisfy staff-domain promotion
+    when the email claim is otherwise unconstrained.
+    """
+    names: set[str] = set()
+    prov = meta.get("provider")
+    if isinstance(prov, str) and prov.strip():
+        names.add(prov.strip().lower())
+    provs = meta.get("providers")
+    if isinstance(provs, list):
+        for item in provs:
+            if isinstance(item, str) and item.strip():
+                names.add(item.strip().lower())
+    if not names:
+        return False
+    # ``confirmed_at`` can reflect phone-only confirmation; reject phone-only.
+    return not names <= {"phone"}
+
+
+def _jwt_email_confirmation_present(token: dict) -> bool:
+    """True if the JWT indicates a confirmed email identity for staff promotion.
+
+    ``user_metadata`` is user-editable and must not *grant* confirmation, but
+    Supabase mirrors ``email_verified: false`` there for unverified addresses;
+    when explicitly ``False``, promotion is denied — including when a Custom
+    Access Token Hook injects a non-empty ``email_confirmed_at``.
+
+    Standard Supabase access tokens omit ``email_confirmed_at`` (that field
+    lives on ``auth.users``); a hook may add it — when present and non-empty,
+    it is honored only after the unverified mirror check above.
+
+    Otherwise, rely on issuer-signed ``app_metadata`` (``provider`` /
+    ``providers``): any identity beyond phone-only is treated as email-backed
+    for this gate (OAuth and email magic-link sessions include non-phone
+    providers). ``confirmed_at`` alone is not used: it is set when either email
+    or phone is confirmed.
+    """
+    user_meta = token.get("user_metadata")
+    if isinstance(user_meta, dict) and user_meta.get("email_verified") is False:
+        return False
+
+    val = token.get("email_confirmed_at")
+    if isinstance(val, str) and val.strip():
+        return True
+
+    app_meta = token.get("app_metadata")
+    if not isinstance(app_meta, dict):
+        return False
+    return _app_metadata_indicates_confirmed_email_identity(app_meta)
+
+
+def _email_indicates_favonius_admin(token: dict) -> bool:
+    """Return True if the JWT email belongs to a Favonius staff domain.
+
+    Domain comparison is exact (no subdomain matching) and case-insensitive.
+    Staff-domain auto-promotion requires a confirmed email identity per
+    :func:`_jwt_email_confirmation_present` so unconfirmed signups cannot
+    elevate by spoofing ``user_metadata``.
+    """
+    email = token.get("email")
+    if not isinstance(email, str) or "@" not in email:
+        return False
+
+    if not _jwt_email_confirmation_present(token):
+        return False
+
+    domain = email.rsplit("@", 1)[-1].strip().lower()
+    return domain in _load_favonius_admin_domains()
+
+
 def get_user_role(token: dict) -> str:
-    """Extract Favonius role from ``app_metadata.favonius_role``, else Supabase ``role``."""
+    """Extract the Favonius role for the authenticated user.
+
+    Resolution order:
+      1. If the verified ``email`` claim belongs to a configured Favonius
+         staff domain (default ``favoniusenergy.com``), the role is
+         ``favonius_admin``. This grants platform-wide access to all depots
+         and tenants and overrides any explicit ``app_metadata.favonius_role``
+         so a stale Supabase metadata value cannot demote a Favonius
+         employee. Configure additional or alternate domains via the
+         ``FAVONIUS_ADMIN_EMAIL_DOMAINS`` env var (comma-separated).
+      2. Otherwise ``app_metadata.favonius_role`` if present.
+      3. Otherwise the Supabase top-level ``role`` claim
+         (defaults to ``authenticated``).
+    """
+    if _email_indicates_favonius_admin(token):
+        return "favonius_admin"
     meta = get_app_metadata(token)
     favonius_role = meta.get("favonius_role")
     if favonius_role:

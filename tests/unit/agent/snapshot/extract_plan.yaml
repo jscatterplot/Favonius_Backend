@@ -1,0 +1,133 @@
+# Snapshot fixtures for the depot agent's extract_plan step.
+#
+# Each entry maps a natural-language user message to the QueryPlan we
+# expect the LLM to extract. Run via the gated `snapshot` pytest marker
+# (e.g. `pytest -m snapshot`). The suite is NOT part of the default CI
+# run — it makes real LLM calls and is intended for nightly regression
+# checks (see PRD §B6) and side-by-side model comparisons.
+#
+# When adding cases:
+# - Cover happy path + ambiguity + refusal in roughly equal proportion.
+# - Don't lock in literal strings the resolver will canonicalize ("John"
+#   vs "John Smith"); the snapshot only fixes the *shape* of the plan.
+# - Refusal cases (out-of-scope intents, write actions, non-English)
+#   are encoded as `subjects: []` per the system prompt contract.
+
+cases:
+  # ── Happy path: relative time, single driver ────────────────────────
+  - message: "How much did John charge last month?"
+    expected:
+      intent: consumption_by_user
+      subjects:
+        - kind: driver
+          text: John
+      time_window:
+        kind: relative
+        relative: last_month
+      group_by: []
+
+  - message: "Show me Jane's consumption this week."
+    expected:
+      intent: consumption_by_user
+      subjects:
+        - kind: driver
+          text: Jane
+      time_window:
+        kind: relative
+        relative: this_week
+      group_by: []
+
+  - message: "How much energy did EMP-1234 use yesterday?"
+    expected:
+      intent: consumption_by_user
+      subjects:
+        - kind: driver
+          text: EMP-1234
+      time_window:
+        kind: relative
+        relative: yesterday
+      group_by: []
+
+  # ── Happy path: multiple drivers, grouping ─────────────────────────
+  - message: "Compare John and Jane's usage last month, grouped by driver."
+    expected:
+      intent: consumption_by_user
+      subjects:
+        - kind: driver
+          text: John
+        - kind: driver
+          text: Jane
+      time_window:
+        kind: relative
+        relative: last_month
+      group_by:
+        - driver
+
+  - message: "Daily breakdown of John's charging for this month."
+    expected:
+      intent: consumption_by_user
+      subjects:
+        - kind: driver
+          text: John
+      time_window:
+        kind: relative
+        relative: this_month
+      group_by:
+        - day
+
+  # ── Happy path: absolute date range ────────────────────────────────
+  - message: "John's consumption from 2026-04-01 to 2026-04-30"
+    expected:
+      intent: consumption_by_user
+      subjects:
+        - kind: driver
+          text: John
+      time_window:
+        kind: absolute
+        from_iso: "2026-04-01"
+        to_iso: "2026-04-30"
+      group_by: []
+
+  # ── Ambiguity: same first name, multiple matches ───────────────────
+  # The LLM extracts the name as written; the server-side resolver
+  # turns ambiguity into a disambiguation prompt.
+  - message: "Tell me about John's charging today."
+    expected:
+      intent: consumption_by_user
+      subjects:
+        - kind: driver
+          text: John
+      time_window:
+        kind: relative
+        relative: today
+      group_by: []
+
+  # ── Refusal: write intent ──────────────────────────────────────────
+  - message: "Schedule John for a charge tomorrow morning."
+    expected:
+      intent: consumption_by_user
+      subjects: []
+      time_window:
+        kind: relative
+        relative: this_month
+      group_by: []
+
+  # ── Refusal: out-of-scope read intent (not consumption_by_user) ────
+  - message: "What's the current SoC of bus 42?"
+    expected:
+      intent: consumption_by_user
+      subjects: []
+      time_window:
+        kind: relative
+        relative: this_month
+      group_by: []
+
+  # ── Refusal: tariff projection (future intent, not v0) ─────────────
+  - message: "What would John's last month bill have been on tariff B?"
+    expected:
+      intent: consumption_by_user
+      subjects: []
+      time_window:
+        kind: relative
+        relative: this_month
+      group_by: []

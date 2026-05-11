@@ -1,6 +1,7 @@
 """Unit tests for OCPP WebSocket server."""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from websocket_handler.config import Config
 from websocket_handler.server import OCPPWebSocketServer, _SuppressHandshakeEOFErrors
+from websocket_handler.supabase_client import SupabaseClient
 from websocket_handler.timescale_client import TimescaleClient
 
 
@@ -47,6 +49,16 @@ class TestOCPPWebSocketServer:
         client.health_check = AsyncMock(return_value={"status": "healthy"})
         client.connect = AsyncMock()
         client.disconnect = AsyncMock()
+        client.resolve_station_id = AsyncMock(side_effect=lambda station_id: station_id)
+        client.ensure_station_alias = AsyncMock(return_value=False)
+        return client
+
+    @pytest.fixture
+    def mock_supabase_client(self):
+        """Create mock Supabase client."""
+        client = Mock(spec=SupabaseClient)
+        client.resolve_station_id = AsyncMock(side_effect=lambda station_id: station_id)
+        client.ensure_station_alias = AsyncMock(return_value=False)
         return client
 
     @pytest.fixture
@@ -68,9 +80,19 @@ class TestOCPPWebSocketServer:
         return manager
 
     @pytest.fixture
-    def server(self, mock_config, mock_timescale_client, mock_connection_manager):
+    def server(
+        self,
+        mock_config,
+        mock_timescale_client,
+        mock_connection_manager,
+        mock_supabase_client,
+    ):
         """Create OCPP WebSocket server instance."""
-        server = OCPPWebSocketServer(mock_config, mock_timescale_client)
+        server = OCPPWebSocketServer(
+            mock_config,
+            mock_timescale_client,
+            supabase_client=mock_supabase_client,
+        )
         server.connection_manager = mock_connection_manager
         # Create a mock task for rate limit cleanup
         mock_task = Mock()
@@ -251,6 +273,224 @@ class TestOCPPWebSocketServer:
         websocket.close.assert_awaited_once_with(1008, "Authentication failed")
         assert "10.0.0.5" not in server._ip_connection_count
         assert server._connection_client_ips == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_basic_auth_alias_username_reaches_security_manager(self, server):
+        """ABB serial usernames are preserved for alias-aware auth validation."""
+        credentials = base64.b64encode(b"TACW1141622G1433:secret").decode("ascii")
+        websocket = self._make_websocket(
+            "10.0.0.5",
+            {"Authorization": f"Basic {credentials}"},
+        )
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-001")
+
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001",
+            {"username": "TACW1141622G1433", "password": "secret"},
+        )
+        websocket.close.assert_awaited_once_with(1008, "Authentication failed")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_path_alias_resolves_from_supabase(self, server):
+        """Vendor path identities resolve to canonical station ids before auth."""
+        server.supabase_client.resolve_station_id = AsyncMock(
+            return_value="hrx-uab_hrx-vilnius-001"
+        )
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001",
+            {},
+        )
+        websocket.close.assert_awaited_once_with(1008, "Authentication failed")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_path_alias_falls_back_to_timescale(
+        self, mock_config, mock_timescale_client, mock_connection_manager
+    ):
+        """When supabase_client is absent, alias resolution uses timescale_client."""
+        mock_timescale_client.resolve_station_id = AsyncMock(return_value="hrx-uab_hrx-vilnius-001")
+        server = OCPPWebSocketServer(mock_config, mock_timescale_client)
+        server.connection_manager = mock_connection_manager
+        mock_task = Mock()
+        mock_task.done.return_value = False
+        mock_task.cancelled.return_value = False
+        server._rate_limit_cleanup_task = mock_task
+
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+
+        mock_timescale_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001",
+            {},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_multi_segment_path_uses_last_segment(self, server):
+        """``/ocpp/{depot}/{charger}`` paths resolve to the charger serial.
+
+        Some integrations (HRX Vilnius pilot) embed depot routing in the
+        WebSocket URL. The server must extract the trailing charger serial
+        as the station id; the intermediate segment is used to auto-register
+        an alias so downstream alias resolution targets the canonical row.
+        """
+        server.supabase_client.resolve_station_id = AsyncMock(
+            side_effect=lambda station_id: station_id
+        )
+        server.supabase_client.ensure_station_alias = AsyncMock(return_value=False)
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-001/TACW1141622G1433")
+
+        # Alias lookup MUST target the charger serial, not the depot id.
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        # Auth MUST receive the charger serial too.
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "TACW1141622G1433",
+            {},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_multi_segment_path_auto_registers_alias(self, server):
+        """Multi-segment OCPP paths upsert ``serial → parent`` before resolution.
+
+        This is the HRX Vilnius onboarding flow: the charger reports the
+        trailing hardware serial as its CP id, but the parent segment is
+        the operator-provisioned canonical station id. The server must
+        ask the resolver to register the alias before resolving, so the
+        first connection from a new charger does not need a manual SQL
+        insert to translate username → canonical.
+        """
+        registered_aliases = []
+
+        async def _ensure_and_resolve(alias, canonical):
+            registered_aliases.append((alias, canonical))
+            return True
+
+        server.supabase_client.ensure_station_alias = AsyncMock(side_effect=_ensure_and_resolve)
+        # Resolver returns canonical AFTER ensure_station_alias has run, mirroring
+        # the production flow (the freshly-inserted row is now visible).
+        server.supabase_client.resolve_station_id = AsyncMock(
+            return_value="hrx-uab_hrx-vilnius-002"
+        )
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-002/TACW1141622G1438")
+
+        assert registered_aliases == [("TACW1141622G1438", "hrx-uab_hrx-vilnius-002")]
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1438")
+        # Once the alias is registered and resolved, auth runs on canonical.
+        server.security_manager.authenticate_station.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-002",
+            {},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_multi_segment_alias_failure_does_not_block(self, server):
+        """A DB error from ensure_station_alias must not abort the connection."""
+        server.supabase_client.ensure_station_alias = AsyncMock(
+            side_effect=RuntimeError("pool exhausted")
+        )
+        server.supabase_client.resolve_station_id = AsyncMock(
+            side_effect=lambda station_id: station_id
+        )
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-002/TACW1141622G1438")
+
+        # Resolution still ran with the unaliased serial — auth fails as a
+        # natural consequence, not because we crashed the request.
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1438")
+        server.security_manager.authenticate_station.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_ocpp_single_segment_path_unchanged(self, server):
+        """Plain ``/ocpp/{station}`` paths still extract the lone segment."""
+        server.supabase_client.resolve_station_id = AsyncMock(
+            side_effect=lambda station_id: station_id
+        )
+        server.supabase_client.ensure_station_alias = AsyncMock(return_value=False)
+        websocket = self._make_websocket("10.0.0.5")
+        server.security_manager = Mock()
+        server.security_manager.config.require_station_auth = True
+        server.security_manager.authenticate_station = AsyncMock(
+            return_value=(False, "bad credentials")
+        )
+
+        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        # Single-segment paths must NOT trigger auto-registration; nothing
+        # plausibly maps to a canonical id without a parent segment.
+        server.supabase_client.ensure_station_alias.assert_not_awaited()
+
+    def test_cgnat_peer_is_trusted_proxy(self, server):
+        """RFC 6598 100.64.0.0/10 peers are trusted when private-proxy headers are on.
+
+        Railway / Render / Fly.io route their edge proxy → container traffic
+        through CGNAT. Without trusting it, geo-blocking would resolve the
+        proxy's CGNAT IP rather than the real client.
+        """
+        server._trust_private_proxy_headers = True
+        assert server._is_trusted_proxy_ip("100.64.0.1") is True
+        assert server._is_trusted_proxy_ip("100.127.255.254") is True
+        # RFC 1918 / loopback / link-local still trusted
+        assert server._is_trusted_proxy_ip("10.0.0.1") is True
+        assert server._is_trusted_proxy_ip("127.0.0.1") is True
+        assert server._is_trusted_proxy_ip("169.254.0.1") is True
+        # IPv6 ULA still trusted (Railway sometimes uses fd00::/8)
+        assert server._is_trusted_proxy_ip("fd12:43ee:785e:1::1") is True
+        # Public IP NOT trusted
+        assert server._is_trusted_proxy_ip("85.254.97.158") is False
+
+    def test_cgnat_peer_not_trusted_when_disabled(self, server):
+        """Disabling OCPP_TRUST_PRIVATE_PROXY_HEADERS revokes implicit trust."""
+        server._trust_private_proxy_headers = False
+        assert server._is_trusted_proxy_ip("100.64.0.1") is False
+        assert server._is_trusted_proxy_ip("10.0.0.1") is False
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -635,6 +875,113 @@ class TestProcessRequest:
 
         assert result is None
         connection.respond.assert_not_called()
+
+
+class TestServerCleanupConnectionRace:
+    """Server-side guard against the late-cleanup race that fed the
+    hrx-vilnius reconnect cycle: connection A's _handle_connection task
+    finishing long after A was replaced by B must not pop the station
+    routing that now points at B."""
+
+    @pytest.fixture
+    def server(self):
+        from src.websocket_handler.config import Config
+        from src.websocket_handler.server import OCPPWebSocketServer
+
+        config = Mock(spec=Config)
+        config.websocket = Mock()
+        config.websocket.host = "localhost"
+        config.websocket.port = 9000
+        config.websocket.max_message_size = 65536
+        config.websocket.max_connections = 100
+        config.websocket.heartbeat_interval = 30
+        config.websocket.message_timeout = 60
+        config.websocket.rate_limit_per_minute = 100
+        config.tls = Mock()
+        config.tls.cert_path = None
+        config.tls.key_path = None
+        config.tls.ca_path = None
+        config.tls.verify_client = False
+        timescale = Mock()
+        timescale.mark_connectors_unavailable = AsyncMock()
+        timescale.mark_sessions_seen = AsyncMock()
+        s = OCPPWebSocketServer(config, timescale)
+        cm = Mock()
+        cm.unregister_connection = AsyncMock()
+        s.connection_manager = cm
+        return s
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_late_cleanup_preserves_successor_station_mapping(self, server):
+        """A's late _cleanup_connection must NOT pop station→B mapping."""
+        station = "hrx-uab_hrx-vilnius-001"
+        old_id = "old-conn"
+        new_id = "new-conn"
+
+        # Register A.
+        server.connections[old_id] = Mock()
+        server.charge_points[station] = Mock(name="A_charge_point")
+        server.station_connections[station] = old_id
+
+        # B takes over (this is what the synchronous "Station already
+        # connected" branch in _handle_connection would do via cleanup):
+        server.connections.pop(old_id, None)
+        b_cp = Mock(name="B_charge_point")
+        server.charge_points[station] = b_cp
+        server.connections[new_id] = Mock()
+        server.station_connections[station] = new_id
+
+        # Now A's recv loop finishes — its _handle_connection's finally
+        # runs _cleanup_connection(old_id, ws, station_id=station).
+        await server._cleanup_connection(old_id, Mock(), station_id=station)
+
+        # Successor's routing must survive intact.
+        assert server.station_connections[station] == new_id
+        assert server.charge_points[station] is b_cp
+        assert new_id in server.connections
+
+        # connection_manager must still be told about A's connection_id —
+        # it has its own guarded unregister.
+        server.connection_manager.unregister_connection.assert_awaited_once_with(station, old_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_cleanup_when_current_pops_station_mapping(self, server):
+        """The normal case: cleanup of the current connection clears state."""
+        station = "hrx-uab_hrx-vilnius-001"
+        conn_id = "current-conn"
+
+        server.connections[conn_id] = Mock()
+        server.charge_points[station] = Mock()
+        server.station_connections[station] = conn_id
+
+        await server._cleanup_connection(conn_id, Mock(), station_id=station)
+
+        assert station not in server.station_connections
+        assert station not in server.charge_points
+        # And mark_connectors_unavailable / mark_sessions_seen DID get called
+        # (the charger is genuinely gone in this branch).
+        server.timescale_client.mark_connectors_unavailable.assert_awaited_once_with(station)
+        server.timescale_client.mark_sessions_seen.assert_awaited_once_with(station)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_late_cleanup_does_not_mark_successor_connectors_unavailable(self, server):
+        """Late cleanup must NOT mark connectors Unavailable for the live successor."""
+        station = "hrx-uab_hrx-vilnius-001"
+        old_id = "old-conn"
+        new_id = "new-conn"
+
+        # Successor is the active connection.
+        server.connections[new_id] = Mock()
+        server.charge_points[station] = Mock()
+        server.station_connections[station] = new_id
+
+        await server._cleanup_connection(old_id, Mock(), station_id=station)
+
+        server.timescale_client.mark_connectors_unavailable.assert_not_called()
+        server.timescale_client.mark_sessions_seen.assert_not_called()
 
 
 if __name__ == "__main__":

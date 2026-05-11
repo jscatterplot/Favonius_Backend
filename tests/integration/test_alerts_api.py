@@ -70,26 +70,17 @@ async def db_pool():
 
 @pytest_asyncio.fixture
 async def org_depot(db_pool):
+    """Yield (org_id, depot_id) as plain UUIDs.
+
+    After migration 029 the static shadow tables are gone; these UUIDs serve as
+    unvalidated tenant-context references in notification_alerts.
+    """
     org_id = uuid4()
     depot_id = uuid4()
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO organizations (organization_id, name) VALUES ($1, $2)",
-            org_id, "API Test Org",
-        )
-        await conn.execute(
-            """
-            INSERT INTO depots (depot_id, name, latitude, longitude, max_grid_kw, organization_id)
-            VALUES ($1, $2, 37.0, -122.0, 500.0, $3)
-            """,
-            depot_id, "API Test Depot", org_id,
-        )
     yield org_id, depot_id
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM notification_alerts WHERE organization_id = $1", org_id)
         await conn.execute("DELETE FROM notification_recipients WHERE organization_id = $1", org_id)
-        await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
-        await conn.execute("DELETE FROM organizations WHERE organization_id = $1", org_id)
 
 
 @pytest_asyncio.fixture

@@ -13,6 +13,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import QueuePool
 
+from src.db.postgres_url import ssl_context_for_postgres_sslmode
+
 from .config import SupabaseConfig, TimescaleConfig
 from .monitoring import get_logger
 
@@ -112,22 +114,7 @@ class EnhancedConnectionPool:
                 min(self.min_connections * 2, self.max_connections)
 
             sslmode = getattr(self.config, "sslmode", "require")
-            ssl_context: Optional[ssl.SSLContext | bool] = None
-            if sslmode in ("disable", "false", "0"):
-                ssl_context = False
-            elif sslmode in ("verify-ca", "verify-full"):
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = sslmode == "verify-full"
-                ssl_context.verify_mode = ssl.CERT_REQUIRED
-            elif sslmode in ("require", "prefer"):
-                # PostgreSQL "require" = encrypt but do NOT verify server certificate.
-                # create_default_context() loads system CAs; we disable verification
-                # so self-signed certs (e.g. Timescale Cloud) are accepted.
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-            else:
-                ssl_context = True
+            ssl_context: ssl.SSLContext | bool = ssl_context_for_postgres_sslmode(str(sslmode))
 
             self.asyncpg_pool = await asyncpg.create_pool(
                 host=self.config.host,

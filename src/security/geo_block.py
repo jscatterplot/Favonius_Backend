@@ -56,10 +56,18 @@ _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 # As of MaxMind's 2024 policy change the legacy `?license_key=` query-param
 # endpoint is deprecated. Database downloads now require HTTP Basic Auth with
 # the account ID as the username and the license key as the password against
-# the new `/geoip/databases/{edition_id}/download` endpoint.
+# the new `/geoip/databases/{edition_id}/download` endpoint. The endpoint then
+# 302-redirects to a Cloudflare R2 presigned URL (X-Amz-Signature in the query
+# string), so we send the Authorization header as an *unredirected* header —
+# urllib propagates `req.headers` to the redirected request, but R2 rejects
+# requests that mix AWS-Sig-v4 query auth with an HTTP Basic header.
 _MAXMIND_DOWNLOAD_URL = (
     "https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz"
 )
+# Cloudflare's WAF in front of MaxMind blocks the default `Python-urllib/3.x`
+# User-Agent. The official `geoipupdate` client uses `geoipupdate/<version>`;
+# we mirror that shape so MaxMind sees a recognisable client identifier.
+_MAXMIND_USER_AGENT = "favonius-geoip-fetcher/1.0 (+https://favoniusenergy.com)"
 _DEFAULT_DOWNLOAD_RETRIES = 3
 _DEFAULT_DOWNLOAD_BACKOFF_S = 5.0
 _DEFAULT_DOWNLOAD_TIMEOUT_S = 30.0
@@ -123,10 +131,14 @@ def _download_geoip_db(
         try:
             with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
                 tmp_path = tmp.name
-            request = urllib.request.Request(
-                _MAXMIND_DOWNLOAD_URL,
-                headers={"Authorization": f"Basic {auth_token}"},
-            )
+            request = urllib.request.Request(_MAXMIND_DOWNLOAD_URL)
+            # User-Agent rides through redirects (Cloudflare WAF on R2 also
+            # checks it), so it goes in the regular headers dict.
+            request.add_header("User-Agent", _MAXMIND_USER_AGENT)
+            # Authorization is intentionally *unredirected* so urllib does not
+            # forward it to the R2 presigned URL, which authenticates via the
+            # X-Amz-Signature query parameter and 400s on a stray Basic header.
+            request.add_unredirected_header("Authorization", f"Basic {auth_token}")
             with urllib.request.urlopen(request, timeout=timeout_s) as resp:  # noqa: S310
                 status = getattr(resp, "status", 200)
                 if status != 200:
@@ -152,6 +164,17 @@ def _download_geoip_db(
                 total_attempts,
             )
             return True
+        except urllib.error.HTTPError as exc:
+            # Surface the HTTP status so operators can distinguish 401 (bad
+            # credentials) from 403 (Cloudflare WAF) from 400 (R2 redirect
+            # auth conflict) from 404 (typo in edition ID), etc.
+            last_error = f"HTTP {exc.code} {exc.reason or ''}".strip()
+            logger.warning(
+                "GeoIP download attempt %d/%d failed: %s",
+                attempt + 1,
+                total_attempts,
+                last_error,
+            )
         except Exception as exc:  # noqa: BLE001 — never let download crash startup
             last_error = str(exc) or type(exc).__name__
             logger.warning(
@@ -452,6 +475,68 @@ def get_geo_block_checker() -> GeoBlockChecker:
         config = GeoBlockConfig.from_env()
         _checker = GeoBlockChecker(config)
     return _checker
+
+
+def initialize_geo_blocking() -> GeoBlockChecker:
+    """Eagerly construct the GeoBlockChecker and report its readiness.
+
+    Call this once during service startup (Main API and WebSocket Handler)
+    so the GeoIP runtime download and database load happen before the first
+    request arrives. Without this, the singleton constructs on the first
+    geo-block check and any download failure produces a "fail-closed"
+    silent-block that's only visible per-request.
+
+    Logs a single CRITICAL line when geo-blocking is enabled but the
+    database is not loaded — that combination causes every non-allowlisted,
+    non-private request to fail-closed and block, which is the most
+    common cause of "chargers can't connect" from a fresh deploy.
+    """
+    checker = get_geo_block_checker()
+    cfg = checker.config
+
+    if not cfg.enabled:
+        logger.info("Geo-blocking disabled (GEO_BLOCK_ENABLED=false)")
+        return checker
+
+    db_present = os.path.exists(cfg.geoip_db_path)
+    db_size = os.path.getsize(cfg.geoip_db_path) if db_present else 0
+    creds_present = bool(
+        os.getenv("MAXMIND_LICENSE_KEY", "").strip()
+        and os.getenv("MAXMIND_ACCOUNT_ID", "").strip()
+    )
+    reader_loaded = checker._reader is not None  # noqa: SLF001 — startup probe
+
+    logger.info(
+        "Geo-blocking startup: enabled=%s, fail_closed=%s, blocked=%s, "
+        "allowlist_count=%d, db_path=%s, db_present=%s, db_size=%d, "
+        "geoip2_installed=%s, maxmind_creds_present=%s, reader_loaded=%s",
+        cfg.enabled,
+        cfg.fail_closed,
+        cfg.blocked_countries,
+        len(cfg.allowed_ips),
+        cfg.geoip_db_path,
+        db_present,
+        db_size,
+        GEOIP2_AVAILABLE,
+        creds_present,
+        reader_loaded,
+    )
+
+    if cfg.fail_closed and not reader_loaded:
+        logger.critical(
+            "Geo-blocking enabled and fail-closed, but GeoIP database is NOT "
+            "loaded. Every request from a non-allowlisted public IP will be "
+            "rejected with 'GeoIP unavailable, fail-closed'. Likely causes: "
+            "(1) MAXMIND_ACCOUNT_ID and/or MAXMIND_LICENSE_KEY not set on "
+            "this service (creds_present=%s); (2) MaxMind download failed "
+            "(check earlier 'GeoIP download attempt' warnings); (3) the "
+            "image was built without the GeoLite2 DB and runtime download "
+            "did not run yet. Set both MAXMIND_* env vars on the service, "
+            "or add the IP / depot uplink to GEO_BLOCK_ALLOWLIST as a "
+            "temporary unblock.",
+            creds_present,
+        )
+    return checker
 
 
 def check_ip_blocked(ip_str: str) -> GeoBlockResult:

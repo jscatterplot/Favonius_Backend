@@ -23,12 +23,14 @@ the SQL boundary so caller code keeps reading ``row["depot_id"]``.
 from __future__ import annotations
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
     DateTime,
     Double,
     ForeignKey,
+    Integer,
     Index,
     String,
     func,
@@ -243,11 +245,13 @@ class Telemetry(Base):
 
     __tablename__ = "telemetry"
 
-    # TimescaleDB hypertable - time is part of primary key.
-    # vehicle_id / charger_id reference UUIDs from Supabase static tables but
-    # the FK is logical (cross-DB) so we don't declare it here.
+    # TimescaleDB hypertable - charger-keyed primary identity.
+    # vehicle_id remains optional enrichment for vehicle-centric views.
     time = Column(DateTime(timezone=True), primary_key=True, nullable=False)
-    vehicle_id = Column(PGUUID(as_uuid=True), primary_key=True, nullable=False)
+    station_id = Column(String, primary_key=True, nullable=False, server_default="unknown")
+    connector_id = Column(Integer, primary_key=True, nullable=False, server_default="1")
+    transaction_id = Column(BigInteger, nullable=True)
+    vehicle_id = Column(PGUUID(as_uuid=True), nullable=True)
     charger_id = Column(PGUUID(as_uuid=True), nullable=True)
     soc = Column(Double, nullable=True)
     location_lat = Column(Double, nullable=True)
@@ -264,6 +268,7 @@ class Telemetry(Base):
         CheckConstraint("charging_kw >= 0", name="telemetry_charging_positive"),
         CheckConstraint("odometer_km >= 0", name="telemetry_odometer_positive"),
         CheckConstraint("max_charge_kw > 0", name="telemetry_max_charge_positive"),
+        Index("idx_telemetry_station", "station_id", "connector_id", "time"),
         Index("idx_telemetry_vehicle", "vehicle_id", "time"),
     )
 

@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from src.api.main import (
     _format_charger_onboarding_first_response,
     _format_charger_onboarding_replay_response,
+    _generate_ocpp_basic_password,
     app,
 )
 from src.security.tenant_mirror import ensure_tenant_mirrored
@@ -105,6 +106,13 @@ def _charger_dict() -> dict:
 
 
 class TestResponseFormatters:
+    def test_generated_password_fits_abb_terraconfig_limit(self):
+        password = _generate_ocpp_basic_password()
+
+        assert len(password) == 10
+        assert len(password.encode("utf-8")) == 10
+        assert password.isalnum()
+
     def test_first_response_includes_plaintext_password(self):
         response = _format_charger_onboarding_first_response(_charger_dict(), "PLAINTEXT-PW")
         assert response["credentials"]["password"] == "PLAINTEXT-PW"

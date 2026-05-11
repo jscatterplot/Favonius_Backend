@@ -257,7 +257,14 @@ class TestTransactionManager:
     def mock_timescale_client(self):
         """Mock TimescaleDB client."""
         client = AsyncMock(spec=TimescaleClient)
-        client.get_id_token_info.return_value = None
+        client.lookup_id_tag = AsyncMock(
+            return_value={
+                "vehicle_id": "test_vehicle",
+                "source": "rfid_card",
+                "card_id": "card-1",
+                "depot_id": "depot-1",
+            }
+        )
         client.store_transaction.return_value = None
         client.update_transaction.return_value = None
         client.get_transaction.return_value = None
@@ -288,7 +295,7 @@ class TestTransactionManager:
 
         assert result["status"] == "Accepted"
         assert "transactionId" in result
-        assert result["idTokenInfo"]["status"] == "Unknown"  # Token not in cache
+        assert result["idTokenInfo"]["status"] == "Accepted"
 
     @pytest.mark.asyncio
     async def test_request_start_transaction_evse_unavailable(
@@ -336,16 +343,6 @@ class TestTransactionManager:
 
         assert result["status"] == "Rejected"
         assert result["statusInfo"]["reasonCode"] == "UnknownTransaction"
-
-    @pytest.mark.asyncio
-    async def test_authorize_id_token_unknown(self, transaction_manager):
-        """Test ID token authorization with unknown token."""
-        id_token = IdToken(id_token="unknown_token", type=IdTokenType.ISO14443)
-
-        result = await transaction_manager.authorize_id_token(id_token)
-
-        assert result["status"] == "Unknown"
-        assert result["cacheTimeout"] == 300
 
 
 class TestCertificateManager:

@@ -84,7 +84,7 @@ For every specific issue (bug, smell, design concern, risk):
 - OCPP 1.6/2.0.1 protocol for charger communication
 - MILP-based optimization (Pyomo + Gurobi primary, HiGHS fallback)
 - VDV 463 transit operations integration (BMS/ITCS interface)
-- CAISO / ENTSO-E electricity price ingestion
+- ENTSO-E day-ahead electricity price ingestion (European depots)
 - Gaussian Process surrogate model for energy consumption prediction
 - TimescaleDB for time-series data storage
 - Prometheus/Grafana observability
@@ -132,7 +132,7 @@ Favonius_Backend/
 │   │   │   ├── depot_state.py   # Depot charging info for VDV responses
 │   │   │   ├── vehicle_resolver.py
 │   │   │   └── charging_point_resolver.py
-│   │   ├── caiso/               # CAISO price ingestion
+│   │   ├── caiso/               # CAISO price ingestion (deprecated — Europe-only feeder; module retained as dead code, see follow-up)
 │   │   ├── entsoe/              # ENTSO-E European price ingestion
 │   │   ├── weather/             # OpenMeteo weather adapter
 │   │   └── handoff/
@@ -159,7 +159,7 @@ Favonius_Backend/
 │   ├── ocpp_handler.py          # OCPP 2.0.1 EnhancedOCPPChargePoint
 │   ├── ocpp16_adapter.py        # OCPP 1.6 OCPP16Session (wraps FleetChargePoint, reload-on-boot + queue replay)
 │   ├── optimization_engine.py   # Heuristic scheduler (legacy)
-│   ├── price_feeder.py          # CAISO price ingestion (legacy)
+│   ├── price_feeder.py          # ENTSO-E day-ahead price ingestion
 │   ├── analytics_service.py     # Aggregated metrics for REST API
 │   ├── security_manager.py      # Auth, TLS, rate limiting
 │   └── ...                      # Many additional managers (cache, cert, DER, etc.)
@@ -237,6 +237,10 @@ src/api/main.py (FastAPI, middleware: rate-limiting, logging, CORS)
         │
         └── WebSocket: /ocpp/{charge_point_id} → OCPPServer → FleetChargePoint
 ```
+
+### Depot Chat Agent (Agent Search)
+
+`src/api/agent/` is a self-contained module that adds a plain-English query interface for depot operators. The module is mounted into the FastAPI app behind the `AGENT_SEARCH_ENABLED` feature flag (now default `true` since B6 golden-test gate passed). A user message goes through three server-side stages: (1) **LLM extraction** (`llm.py`) converts the message into a strict `QueryPlan` via Anthropic's tool-use API — the model never sees UUIDs or raw SQL; (2) **entity resolution** (`resolve.py`) maps the plan's subject names to real database UUIDs, scoped to the caller's `visible_depot_ids` from their JWT — this is the auth boundary; and (3) **deterministic compilation** (`intents/consumption_by_user.py`) turns the resolved plan into a parameterised SQL query that executes against TimescaleDB. Every turn is audited in `agent_runs` (full step trace) and `audit_log` (action `agent.query`). Prometheus metrics (`favonius_agent_turns_total`, `favonius_agent_turn_duration_seconds`, `favonius_agent_llm_tokens_total`, `favonius_agent_resolver_misses_total`) are incremented from `router.py`, `llm.py`, and `controller.py`. The golden test suite in `tests/golden/agent_consumption.yaml` (50 Q&A pairs) gates every deploy; AT-18 (`tests/e2e/test_agent_search.py`) is the end-to-end acceptance test. See `docs/plans/agent_search_architecture_v0.md` for the full design and `docs/API.md` for the endpoint reference.
 
 ### Optimization Control Loop
 
@@ -316,7 +320,7 @@ These come directly from the PRD and are non-negotiable:
 | Charger | `charging_stations` | `id` (`AS charger_id`) | `site_id` (`AS depot_id`), `station_id` (`AS ocpp_id`), `max_power_kw` (`AS rated_kw`), `efficiency`, `auth_required`, `connector_type`, `display_name`, `vendor`, `connector_count`, `connector_ids` |
 | Vehicle | `vehicles` | `id` (`AS vehicle_id`) | `organization_id` (Supabase native), `site_id` (`AS depot_id`, added by mig 006), `vin` (Supabase native, UNIQUE), `external_id` (mig 006), `vehicle_type` (mig 006), `id_tag` (mig 006), `battery_capacity_kwh` (`AS battery_kwh`), `max_charge_rate_kw` (`AS max_charge_kw`), `max_discharge_rate_kw`, `v2g_capable`, `license_plate`, `driver_id`, `status` |
 | Organization | `organizations` | `id` (`AS organization_id`) | `name`, `type`, `billing_address`, `primary_contact`, `subscription_tier`, `is_active` |
-| Org membership | `user_organizations` | `(user_id, organization_id)` | `role` (Supabase vocab: `owner|admin|operator|viewer`; backend writes Favonius vocab: `customer_admin|customer_operator|favonius_admin`) |
+| Org membership | `user_organizations` | `(user_id, organization_id)` | `role` (Supabase vocab: `owner|admin|operator|viewer`, enforced by CHECK constraint). The backend's tenant mirror translates Favonius vocab → Supabase vocab at the write boundary (`customer_admin → owner`, `customer_operator → operator`, `favonius_admin → admin`, unknown → `viewer`). Authorization never reads this column — see `_supabase_role_for` in `src/security/tenant_mirror.py`. |
 | Charger ↔ Vehicle access | `charger_vehicle_access` | `(charging_station_id, vehicle_id)` | `is_accessible`, `notes`. Note the FK column name is `charging_station_id`, not `charger_id`. |
 | Battery | `battery_storage` | `id` (`AS battery_id`) | `site_id` (`AS depot_id`), `capacity_kwh`, `max_power_kw`, `efficiency`, `soc_min`, `soc_max` |
 | Per-day route | `schedules` | `id` (`AS schedule_id`) | `vehicle_id`, `route_id`, `departure_time`, `return_time`, `actual_return_time`, `energy_kwh`, `required_soc`, `dest_site_id` (`AS dest_depot_id`). Distinct from Supabase's recurring `vehicle_schedules` table. |
@@ -331,14 +335,25 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 
 ### Time-series hypertables
 - `telemetry` — Vehicle SoC, charging_kw, is_plugged (from OCPP MeterValues)
-- `prices` — $/kWh by depot and time (CAISO DAM or utility TOU)
+- `prices` — $/kWh by depot and time (utility TOU; new architecture)
+- `electricity_prices` — Per-bidding-zone day-ahead prices written by the WS handler price feeder (migration 034). Schema-compatible with the historical CAISO LMP shape but populated from ENTSO-E in the current deployment.
 - `weather_forecasts` — Temperature, precipitation, solar radiation
 - `building_load` — Non-EV site power draw (**required** for grid calc)
 
 ### Tenant mirroring (JIT)
 - On each authenticated API request, `src/security/tenant_mirror.py` best-effort **UPSERT**s `organizations` and `user_organizations` from the verified JWT payload (`sub`, `app_metadata.organization_id`, `app_metadata.organization_name`, `app_metadata.favonius_role`). The org row uses `organizations.id` as the PK column. If `organization_name` is absent, a deterministic placeholder (`org-<org_uuid_prefix>`) is used for bootstrap rows. **Skips** `favonius_admin` and users without `organization_id`. Failures are logged and do not block the request (depot access still uses JWT vs `sites.organization_id`).
 - In-process TTL cache: `TENANT_MIRROR_TTL_S` (default `300`) seconds per `sub` to limit DB writes.
+- **Reverse-direction self-heal:** `repair_user_tenant_metadata` runs first in `ensure_tenant_mirrored`. Handles two cases:
+  - **Case A** — JWT lacks `app_metadata.organization_id`: when the user has exactly one `user_organizations` row whose role is `owner` or `operator`, the repair `PUT`s the full triple (`favonius_role`, `organization_id`, `organization_name`) to `{SUPABASE_URL}/auth/v1/admin/users/{user_id}` using `SUPABASE_SERVICE_KEY`.
+  - **Case B** — JWT has `organization_id` but lacks `favonius_role` (the Gustas/HRX pattern): looks up the role for that specific `(user, org)` pair in `user_organizations` and pushes just `favonius_role` (plus `organization_name` if also absent). `organization_id` is not overwritten.
+  In both cases the current request still proceeds with the unpatched token — the user's *next* token refresh sees the corrected claims. Skipped silently if `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` are unset, no repairable membership exists, or the membership role is `admin`/`viewer` (the `admin` exclusion prevents a corrupted DB row from escalating to `favonius_admin`). Successful repairs log `tenant_metadata_repair: backfilled app_metadata` at WARNING level so high counts surface a frontend-signup regression.
 - Workspace **invitations** are managed in Supabase only; there is no `invitations` table in this backend.
+
+### Favonius staff auto-promotion
+- `get_user_role` in `src/security/auth.py` resolves any verified JWT whose `email` ends with `@favoniusenergy.com` to `favonius_admin` regardless of `app_metadata.favonius_role`. This grants platform-wide access (all depots, all tenants, cross-org reads) and skips tenant mirroring as a side effect of the existing `favonius_admin` skip.
+- Domain comparison is exact (no subdomain matching) and case-insensitive. A token whose `user_metadata.email_verified` is explicitly `False` is **not** promoted — that defends against unverified-signup spoofing in projects that disabled email confirm.
+- Configure additional / alternate domains via `FAVONIUS_ADMIN_EMAIL_DOMAINS` (comma-separated). When set, it **replaces** the default — include `favoniusenergy.com` explicitly if you still want it.
+- Promotion overrides any explicit `app_metadata.favonius_role`, so a stale Supabase metadata value cannot demote a Favonius employee. To exclude a specific Favonius email (e.g. a contractor on a `@favoniusenergy.com` address), do not issue them an `@favoniusenergy.com` JWT email — there is no per-user opt-out hook.
 
 ### Operational tables
 - `schedules` — Vehicle route schedules (departure/return times)
@@ -396,6 +411,9 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `PATCH` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Patch a recipient |
 | `DELETE` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Hard-delete a recipient (cascades deliveries). |
 | `POST` | `/webhooks/resend` | Public, signature-verified Resend webhook for delivery status updates (alerts pipeline) |
+| `POST` | `/agent/turn` | Depot chat agent — synchronous turn; returns `AgentReply` (10 req/min; requires `AGENT_SEARCH_ENABLED=true`) |
+| `POST` | `/agent/turn/stream` | Depot chat agent — SSE streaming turn; emits `step` events then `answer` (10 req/min; same gate) |
+| `GET` | `/agent/runs/{run_id}` | Fetch stored agent run trace (ownership-gated; `favonius_admin` may access any run) |
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)
@@ -700,6 +718,7 @@ test(api): add coverage for handoff rate limiting
 | `SUPABASE_JWKS_URL` | Optional explicit JWKS URL override. |
 | `JWT_JWKS_CACHE_LIFESPAN_S` | Optional `PyJWKClient` cache TTL (default `3600`). |
 | `JWT_ISSUER` | Optional. If set, the JWT `iss` claim must match (e.g. `https://<ref>.supabase.co/auth/v1`). |
+| `FAVONIUS_ADMIN_EMAIL_DOMAINS` | Optional, comma-separated. Email domains whose verified JWT subjects are auto-promoted to `favonius_admin` (default `favoniusenergy.com`). Setting this **replaces** the default — include the original entry explicitly to keep it. |
 | `ENVIRONMENT` | `development` / `staging` / `production` |
 
 ### Tenant mirroring (optional)
@@ -734,12 +753,11 @@ test(api): add coverage for handoff rate limiting
 ### Price feeder
 | Variable | Default | Description |
 |---|---|---|
-| `PRICE_FEEDER_ENABLED` | `true` | Enable CAISO price ingestion |
-| `PRICE_FEEDER_NODES` | `TH_SP15_GEN-APND,...` | CAISO node list |
+| `PRICE_FEEDER_ENABLED` | `true` | Enable ENTSO-E day-ahead price ingestion |
 | `PRICE_FEEDER_FETCH_INTERVAL` | `900` | Fetch interval (seconds) |
 | `PRICE_FEEDER_LOOKAHEAD_HOURS` | `24` | Price horizon |
-| `PRICE_FEEDER_ENTSOE_ZONES` | — | ENTSO-E EIC zone codes (European depots) |
-| `EUROPEAN_ELECTRICITY_API` | — | ENTSO-E API security token |
+| `PRICE_FEEDER_ENTSOE_ZONES` | — | Comma-separated ENTSO-E EIC bidding-zone codes (e.g. `10YLT-1001A0008Q` for Lithuania, `10Y1001A1001A82H` for DE-LU) |
+| `EUROPEAN_ELECTRICITY_API` | — | ENTSO-E Transparency Platform API security token |
 
 ### Supabase (legacy websocket_handler)
 | Variable | Description |
@@ -765,8 +783,8 @@ test(api): add coverage for handoff rate limiting
 | `GEO_BLOCK_TRUST_PROXY_HEADERS` | `true` | When the TCP peer is private/loopback/link-local/CGNAT (RFC 6598 `100.64.0.0/10`), honour `Forwarded` / `X-Forwarded-For` / `X-Real-IP` and geo-check the real client IP. Required for Railway, Render, Fly.io, and similar PaaS providers whose edge proxy reaches the container over the CGNAT internal network. |
 | `GEO_BLOCK_TRUSTED_PROXY_RANGES` | — | Additional comma-separated CIDRs whose forwarded headers should be trusted (e.g. an on-prem load balancer with a public IP). Public-internet peers are NEVER implicitly trusted, so a spoofed `X-Forwarded-For` from the open internet is ignored. |
 | `GEOIP_DB_PATH` | `/app/data/GeoLite2-Country.mmdb` | MaxMind DB path |
-| `MAXMIND_ACCOUNT_ID` | — | MaxMind account ID. Required since MaxMind's 2024 policy change — paired with `MAXMIND_LICENSE_KEY` in HTTP Basic Auth (account ID = username, license key = password) against `https://download.maxmind.com/geoip/databases/GeoLite2-Country/download`. Set as **both** a build variable and a runtime variable, same as the license key. Without it the download is skipped and the app fails closed. |
-| `MAXMIND_LICENSE_KEY` | — | MaxMind license. Set as **both** a build variable (Dockerfile downloads at build, `Dockerfile:54`) **and** a runtime variable (app re-downloads at startup with retries via `_download_geoip_db` if the build-time download was skipped or hit a transient outage). Requires `MAXMIND_ACCOUNT_ID`; without either set anywhere, the app fails closed. |
+| `MAXMIND_ACCOUNT_ID` | — | MaxMind account ID. Required since MaxMind's 2024 policy change — paired with `MAXMIND_LICENSE_KEY` in HTTP Basic Auth (account ID = username, license key = password) against `https://download.maxmind.com/geoip/databases/GeoLite2-Country/download`. Set as a **runtime** (Service) variable only. Never a Docker build arg — that would leak the credential into image history and build logs. Without it the download is skipped and the app fails closed. |
+| `MAXMIND_LICENSE_KEY` | — | MaxMind license. Set as a **runtime** (Service) variable only. `src/security/geo_block.py::_download_geoip_db` downloads `GeoLite2-Country.mmdb` on startup with retries. Requires `MAXMIND_ACCOUNT_ID`; without either set, the app fails closed. |
 
 ### Alerts pipeline (notifications)
 See `docs/plans/alerts-pipeline.md` for the full design.
@@ -847,6 +865,7 @@ Before marking any feature complete, verify:
 | AT-06 | Inter-Depot Handoff — vehicle seamlessly handed off between depots |
 | AT-07 | Building Load Integration — grid power calc includes building load |
 | AT-17 | Alerts Pipeline End-to-End — Faulted → trigger → dispatcher email → Resend webhook → ack via API → recovery → resolve. See `tests/e2e/test_alerts_pipeline_e2e.py` and `docs/plans/alerts-pipeline.md`. |
+| AT-18 | Agent Search End-to-End — Authenticated user submits "How much did John charge last month?" via `POST /agent/turn/stream`; agent resolves driver, computes UTC bounds, executes aggregation, writes `agent_runs` + `audit_log` rows, returns natural-language reply; cross-org user gets `not_found`. See `tests/e2e/test_agent_search.py` and `docs/plans/agent_search_prd_v1.md`. |
 
 ---
 

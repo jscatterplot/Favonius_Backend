@@ -967,6 +967,88 @@ class TestRuntimeDownload:
         expected_token = base64.b64encode(b"123456:my-key").decode("ascii")
         assert captured["authorization"] == f"Basic {expected_token}"
 
+    def test_authorization_is_unredirected_so_r2_redirect_does_not_see_it(self, tmp_path):
+        """Authorization must NOT propagate through urllib's redirect handler.
+
+        MaxMind's `/geoip/databases/.../download` endpoint 302-redirects to a
+        Cloudflare R2 presigned URL whose own auth lives in the query string
+        (X-Amz-Signature, etc.). urllib propagates `req.headers` verbatim on
+        redirect, so a Basic-Auth header in `req.headers` would leak into the
+        R2 request and trigger a 400. The fix is `add_unredirected_header()`,
+        which keeps Authorization out of the redirected request.
+        """
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        archive = _build_mmdb_tarball(b"OK")
+        captured: dict = {}
+
+        def fake_urlopen(request, timeout):  # noqa: ARG001
+            # `headers` holds the redirected-through headers; `unredirected_hdrs`
+            # holds the per-request-only headers that urllib drops on 30x.
+            captured["redirected_headers"] = dict(request.headers)
+            captured["unredirected_headers"] = dict(request.unredirected_hdrs)
+            return _FakeUrlopenResponse(archive)
+
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            _download_geoip_db(db_path, license_key="my-key", account_id="123456")
+
+        # Authorization MUST be in the unredirected bucket, never in the
+        # redirected bucket — case-insensitive because urllib title-cases.
+        redirected_lower = {k.lower() for k in captured["redirected_headers"]}
+        unredirected_lower = {k.lower() for k in captured["unredirected_headers"]}
+        assert "authorization" not in redirected_lower
+        assert "authorization" in unredirected_lower
+
+    def test_sets_user_agent_to_avoid_cloudflare_waf(self, tmp_path):
+        """A non-default User-Agent is sent so Cloudflare's WAF in front of
+        MaxMind doesn't 403 us as `Python-urllib/3.x`."""
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+        archive = _build_mmdb_tarball(b"OK")
+        captured: dict = {}
+
+        def fake_urlopen(request, timeout):  # noqa: ARG001
+            captured["user_agent"] = request.get_header("User-agent")
+            return _FakeUrlopenResponse(archive)
+
+        with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+            _download_geoip_db(db_path, license_key="my-key", account_id="123456")
+
+        assert captured["user_agent"] is not None
+        assert "Python-urllib" not in captured["user_agent"]
+        # A recognisable identifier, not just the empty string.
+        assert "favonius" in captured["user_agent"].lower()
+
+    def test_logs_http_status_code_on_failure(self, tmp_path, caplog):
+        """An HTTPError surfaces the status code in the warning message,
+        so operators can tell 401 (bad creds) from 403 (WAF) from 404."""
+        import logging
+
+        db_path = str(tmp_path / "GeoLite2-Country.mmdb")
+
+        def fake_urlopen(request, timeout):  # noqa: ARG001
+            raise urllib.error.HTTPError(
+                "https://download.maxmind.com/geoip/databases/GeoLite2-Country/download",
+                401,
+                "Unauthorized",
+                {},
+                None,
+            )
+
+        with caplog.at_level(logging.WARNING, logger="src.security.geo_block"):
+            with patch("src.security.geo_block.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = _download_geoip_db(
+                    db_path,
+                    license_key="bad-key",
+                    account_id="acct",
+                    retries=0,
+                    backoff_s=0.0,
+                    sleep=lambda _: None,
+                )
+
+        assert result is False
+        # The exact status code is in the log so an operator can act on it.
+        assert any("401" in rec.message for rec in caplog.records)
+        assert any("Unauthorized" in rec.message for rec in caplog.records)
+
     def test_credentials_with_special_chars_basic_auth_encodes_correctly(self, tmp_path):
         """Account ID and license key with URL-significant chars survive Basic Auth.
 
@@ -1191,3 +1273,89 @@ class TestCheckerWiresRuntimeDownload:
         with patch("src.security.geo_block._download_geoip_db") as mock_dl:
             GeoBlockChecker(config)
             mock_dl.assert_not_called()
+
+
+class TestEagerInitialization:
+    """Cover ``initialize_geo_blocking()`` — the new startup hook.
+
+    Without this hook, the singleton is constructed lazily on the first
+    geo-block check and a missing DB or missing MaxMind credentials
+    produce a "GeoIP unavailable, fail-closed" log per request with no
+    earlier startup signal. The new hook surfaces the misconfig as a
+    single CRITICAL log line at boot.
+    """
+
+    def setup_method(self) -> None:
+        # Reset singleton so each test gets a fresh checker.
+        import src.security.geo_block as gb
+
+        gb._checker = None
+
+    def test_logs_critical_when_db_missing_and_creds_unset(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from src.security.geo_block import initialize_geo_blocking
+
+        monkeypatch.setenv("GEO_BLOCK_ENABLED", "true")
+        monkeypatch.setenv("GEO_BLOCK_FAIL_CLOSED", "true")
+        monkeypatch.setenv("GEOIP_DB_PATH", str(tmp_path / "missing.mmdb"))
+        monkeypatch.delenv("MAXMIND_ACCOUNT_ID", raising=False)
+        monkeypatch.delenv("MAXMIND_LICENSE_KEY", raising=False)
+
+        with caplog.at_level(logging.CRITICAL, logger="src.security.geo_block"):
+            checker = initialize_geo_blocking()
+
+        assert checker._reader is None
+        critical_messages = [
+            rec.message for rec in caplog.records if rec.levelname == "CRITICAL"
+        ]
+        assert any(
+            "Geo-blocking enabled and fail-closed" in msg
+            and "GeoIP database is NOT" in msg
+            for msg in critical_messages
+        ), f"Expected CRITICAL fail-closed warning, got: {critical_messages}"
+
+    def test_silent_when_disabled(self, monkeypatch, caplog):
+        import logging
+
+        from src.security.geo_block import initialize_geo_blocking
+
+        monkeypatch.setenv("GEO_BLOCK_ENABLED", "false")
+
+        with caplog.at_level(logging.CRITICAL, logger="src.security.geo_block"):
+            checker = initialize_geo_blocking()
+
+        assert checker.config.enabled is False
+        assert not any(rec.levelname == "CRITICAL" for rec in caplog.records)
+
+    def test_no_critical_when_db_loaded(self, tmp_path, monkeypatch, caplog):
+        """When the reader is loaded, the CRITICAL line MUST NOT fire."""
+        import logging
+
+        from src.security.geo_block import initialize_geo_blocking
+
+        monkeypatch.setenv("GEO_BLOCK_ENABLED", "true")
+        monkeypatch.setenv("GEO_BLOCK_FAIL_CLOSED", "true")
+        monkeypatch.setenv("GEOIP_DB_PATH", str(tmp_path / "stub.mmdb"))
+
+        # Patch geoip2.database.Reader so the checker constructor reports
+        # a loaded reader without needing a real .mmdb on disk.
+        (tmp_path / "stub.mmdb").write_bytes(b"")
+        with patch(
+            "src.security.geo_block.geoip2.database.Reader"
+        ) as mock_reader_cls:
+            mock_reader_cls.return_value = MagicMock()
+            with caplog.at_level(
+                logging.CRITICAL, logger="src.security.geo_block"
+            ):
+                checker = initialize_geo_blocking()
+
+        assert checker._reader is not None
+        assert not any(
+            rec.levelname == "CRITICAL"
+            and "fail-closed" in rec.message
+            and "NOT loaded" in rec.message
+            for rec in caplog.records
+        )

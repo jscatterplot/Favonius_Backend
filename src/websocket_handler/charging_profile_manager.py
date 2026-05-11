@@ -959,9 +959,7 @@ class ChargingCommandQueueConsumer:
         listen_task = asyncio.create_task(self._listen_loop(), name="queue_listen")
         listen_task.add_done_callback(self._handle_listen_task_done)
         self._tasks.append(listen_task)
-        self.logger.info(
-            "ChargingCommandQueueConsumer started (poll=%.1fs)", self.poll_interval
-        )
+        self.logger.info("ChargingCommandQueueConsumer started (poll=%.1fs)", self.poll_interval)
 
     def _handle_listen_task_done(self, task: asyncio.Task) -> None:
         """Log LISTEN task crashes so polling-only fallback is explicit."""
@@ -1096,18 +1094,14 @@ class ChargingCommandQueueConsumer:
                 conn = await pool.acquire()
                 self._listen_conn = conn
                 await conn.add_listener(self.NOTIFY_CHANNEL, self._on_notify)
-                self.logger.info(
-                    "Listening on PostgreSQL channel '%s'", self.NOTIFY_CHANNEL
-                )
+                self.logger.info("Listening on PostgreSQL channel '%s'", self.NOTIFY_CHANNEL)
                 # Hold the connection open until cancelled.
                 while self._running:
                     await asyncio.sleep(60)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.logger.warning(
-                    "LISTEN connection failed; will retry in 5s: %s", exc
-                )
+                self.logger.warning("LISTEN connection failed; will retry in 5s: %s", exc)
                 await asyncio.sleep(5)
             finally:
                 if self._listen_conn is not None:
@@ -1151,9 +1145,7 @@ class ChargingCommandQueueConsumer:
             # Re-publish all known statuses so a status that drops to 0
             # actually shows 0 instead of a stale value.
             for status in ("pending", "sent", "acked", "failed", "expired"):
-                CHARGING_COMMAND_QUEUE_DEPTH.labels(status=status).set(
-                    counts.get(status, 0)
-                )
+                CHARGING_COMMAND_QUEUE_DEPTH.labels(status=status).set(counts.get(status, 0))
 
             await asyncio.sleep(self.DEPTH_SAMPLE_INTERVAL_SECONDS)
 
@@ -1176,6 +1168,7 @@ class ChargingCommandQueueConsumer:
         """
         queue_id = int(row["queue_id"])
         cp_id = row["charge_point_id"]
+        command_type = row.get("command_type", "set_charging_profile")
         connector_id = int(row["connector_id"])
         payload = row["payload"]
         if isinstance(payload, str):
@@ -1185,6 +1178,33 @@ class ChargingCommandQueueConsumer:
         if cp is None:
             self._offline_charge_points[cp_id] = time.monotonic()
             return False
+
+        if command_type == "remote_reset":
+            return await self._handle_remote_reset(queue_id, cp_id, cp, payload)
+
+        if command_type == "remote_start_transaction":
+            return await self._handle_remote_start_transaction(
+                queue_id, cp_id, cp, connector_id, payload
+            )
+
+        if command_type != "set_charging_profile":
+            self.logger.warning(
+                "Unknown command_type=%s for queue_id=%s cp=%s — marking failed",
+                command_type,
+                queue_id,
+                cp_id,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, f"unknown command_type: {command_type}"
+                )
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
 
         # OCPP 1.6 (OCPP16Session) and OCPP 2.0.1 (EnhancedOCPPChargePoint)
         # both expose ``send_charging_profile(evse_id, payload)``. The
@@ -1217,9 +1237,9 @@ class ChargingCommandQueueConsumer:
             if accepts_allow_enqueue and self.cp_lookup(cp_id) is None:
                 self._offline_charge_points[cp_id] = time.monotonic()
                 if should_record_latency:
-                    PROFILE_PUSH_LATENCY.labels(
-                        station_id=cp_id, outcome="failed"
-                    ).observe(max(time.perf_counter() - start, 1e-6))
+                    PROFILE_PUSH_LATENCY.labels(station_id=cp_id, outcome="failed").observe(
+                        max(time.perf_counter() - start, 1e-6)
+                    )
                 return False
             try:
                 await self.timescale_client.mark_command_failed(queue_id, str(exc))
@@ -1230,9 +1250,9 @@ class ChargingCommandQueueConsumer:
                     mark_exc,
                 )
             if should_record_latency:
-                PROFILE_PUSH_LATENCY.labels(
-                    station_id=cp_id, outcome="failed"
-                ).observe(max(time.perf_counter() - start, 1e-6))
+                PROFILE_PUSH_LATENCY.labels(station_id=cp_id, outcome="failed").observe(
+                    max(time.perf_counter() - start, 1e-6)
+                )
             return True
 
         latency = max(time.perf_counter() - start, 1e-6)
@@ -1251,6 +1271,158 @@ class ChargingCommandQueueConsumer:
                 "Failed to update queue row queue_id=%s outcome=%s: %s",
                 queue_id,
                 outcome,
+                exc,
+            )
+        return True
+
+    async def _handle_remote_reset(
+        self,
+        queue_id: int,
+        cp_id: str,
+        cp: Any,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Push an OCPP RemoteReset to a connected charger.
+
+        Reset is irreversible at the device, so the row goes terminal
+        (``sent`` or ``failed``) on the first attempt regardless of the
+        charger's response. The boot-replay path skips ``remote_reset``
+        rows so a Rejected reset doesn't get retried on every reconnect.
+        """
+        send = getattr(cp, "send_reset", None)
+        if send is None:
+            self.logger.warning("cp_id=%s session has no send_reset; marking failed", cp_id)
+            try:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "session does not support send_reset"
+                )
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        reset_type = (payload or {}).get("type", "Soft")
+        try:
+            ok = await send(reset_type)
+        except Exception as exc:
+            self.logger.warning(
+                "send_reset raised for cp=%s queue_id=%s: %s",
+                cp_id,
+                queue_id,
+                exc,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(queue_id, str(exc))
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        try:
+            if ok:
+                await self.timescale_client.mark_command_sent(queue_id)
+            else:
+                await self.timescale_client.mark_command_failed(queue_id, "charger Rejected Reset")
+        except Exception as exc:
+            self.logger.error(
+                "Failed to update queue row queue_id=%s outcome=%s: %s",
+                queue_id,
+                "sent" if ok else "failed",
+                exc,
+            )
+        return True
+
+    async def _handle_remote_start_transaction(
+        self,
+        queue_id: int,
+        cp_id: str,
+        cp: Any,
+        connector_id: int,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Push an OCPP 1.6 RemoteStartTransaction with an operator-minted id_tag.
+
+        Enqueued by ``POST /admin/.../manual_authorize`` together with a row
+        in ``operator_authorization_overrides``. The synthetic id_tag in
+        ``payload`` is consumed exactly once by ``RFIDAuthorizationService``
+        when the charger sends Authorize/StartTransaction back to us.
+
+        Like ``_handle_remote_reset``, the row goes terminal on the first
+        attempt: a Rejected RemoteStart shouldn't be retried on every
+        BootNotification because the override may have already expired.
+        """
+        send = getattr(cp, "send_remote_start_transaction", None)
+        if send is None:
+            self.logger.warning(
+                "cp_id=%s session has no send_remote_start_transaction; marking failed",
+                cp_id,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "session does not support send_remote_start_transaction"
+                )
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        id_tag = (payload or {}).get("id_tag") or (payload or {}).get("idTag")
+        if not id_tag:
+            self.logger.warning(
+                "remote_start_transaction queue_id=%s cp=%s missing id_tag in payload — marking failed",
+                queue_id,
+                cp_id,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(queue_id, "payload missing id_tag")
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        try:
+            ok = await send(connector_id, id_tag)
+        except Exception as exc:
+            self.logger.warning(
+                "send_remote_start_transaction raised for cp=%s queue_id=%s: %s",
+                cp_id,
+                queue_id,
+                exc,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(queue_id, str(exc))
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            return True
+
+        try:
+            if ok:
+                await self.timescale_client.mark_command_sent(queue_id)
+            else:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "charger Rejected RemoteStartTransaction"
+                )
+        except Exception as exc:
+            self.logger.error(
+                "Failed to update queue row queue_id=%s outcome=%s: %s",
+                queue_id,
+                "sent" if ok else "failed",
                 exc,
             )
         return True

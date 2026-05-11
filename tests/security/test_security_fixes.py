@@ -423,32 +423,13 @@ class TestRateLimiterKeying:
 
 
 # ---------------------------------------------------------------------------
-# M7: Zip bomb protection
+# M7: Zip bomb protection — REMOVED.
+#
+# The TestZipBombProtection class previously asserted size limits on the
+# CAISO ZIP response parser. CAISO support was removed when the project
+# pivoted to ENTSO-E (XML, no zip), so the parser and these introspection
+# checks no longer apply.
 # ---------------------------------------------------------------------------
-
-
-class TestZipBombProtection:
-    """Test zip bomb mitigation on CAISO price feed (M7 fix)."""
-
-    def test_compressed_size_check(self):
-        """Should reject compressed content exceeding 10 MB."""
-        import inspect
-
-        from src.websocket_handler.price_feeder import PriceFeederService
-
-        source = inspect.getsource(PriceFeederService._parse_zip_response)
-        assert "_MAX_COMPRESSED_SIZE" in source
-        assert "10 * 1024 * 1024" in source
-
-    def test_decompressed_size_check(self):
-        """Should reject decompressed content exceeding 100 MB."""
-        import inspect
-
-        from src.websocket_handler.price_feeder import PriceFeederService
-
-        source = inspect.getsource(PriceFeederService._parse_zip_response)
-        assert "_MAX_DECOMPRESSED_SIZE" in source
-        assert "100 * 1024 * 1024" in source
 
 
 # ---------------------------------------------------------------------------

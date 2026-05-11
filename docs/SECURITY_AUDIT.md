@@ -271,7 +271,7 @@ These items require your direct action and cannot be automated in code:
    docker inspect --format='{{.RepoDigests}}' python:3.12-slim
    ```
    Then replace `FROM python:3.12-slim` with `FROM python:3.12-slim@sha256:<digest>` in all Dockerfiles.
-4. **Convert MAXMIND_LICENSE_KEY to BuildKit secret** — use `--mount=type=secret` instead of `ARG`
+4. ~~**Convert MAXMIND_LICENSE_KEY to BuildKit secret** — use `--mount=type=secret` instead of `ARG`~~ **Resolved:** the build-time MaxMind download was removed entirely; credentials are now runtime-only env vars consumed by `src/security/geo_block.py::_download_geoip_db`, so they never cross the Docker build boundary.
 5. **Set new environment variables:**
    - `JWT_ISSUER` — your Supabase project URL (e.g., `https://yourproject.supabase.co`)
    - `HANDOFF_SIGNING_KEY` — generate with `python -c "import secrets; print(secrets.token_hex(32))"`

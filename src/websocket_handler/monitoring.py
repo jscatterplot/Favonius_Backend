@@ -215,6 +215,13 @@ CHARGING_COMMAND_QUEUE_DEPTH = _get_or_create_metric(
     ["status"],
 )
 
+RFID_AUTH_ATTEMPTS_TOTAL = _get_or_create_metric(
+    Counter,
+    "rfid_authorization_attempts_total",
+    "RFID/idTag authorization attempts on legacy OCPP paths.",
+    ["source", "outcome"],
+)
+
 # Note: Other metrics are defined in server.py to avoid duplication
 
 # Redis metrics removed for simplification

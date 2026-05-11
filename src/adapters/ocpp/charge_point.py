@@ -221,6 +221,8 @@ class FleetChargePoint(CP16):
         on_diagnostics_status: Optional[Callable] = None,
         on_firmware_status: Optional[Callable] = None,
         on_data_transfer: Optional[Callable] = None,
+        on_security_event: Optional[Callable] = None,
+        on_message_received: Optional[Callable[[], Awaitable[None]]] = None,
         tx_id_provider: Optional[Callable[[], Awaitable[int]]] = None,
     ):
         """Initialize FleetChargePoint.
@@ -237,6 +239,10 @@ class FleetChargePoint(CP16):
             on_diagnostics_status: Callback for diagnostics status
             on_firmware_status: Callback for firmware status
             on_data_transfer: Callback for data transfer messages
+            on_message_received: Liveness hook fired on every received OCPP
+                frame. The websocket-handler stale-connection sweeper relies
+                on this to keep OCPP 1.6 sockets alive when the charger sends
+                only StatusNotification / MeterValues between Heartbeats.
             tx_id_provider: Async callable returning the next transactionId
                 (back this with a DB sequence in production so IDs survive
                 restarts). Falls back to an in-memory monotonic counter.
@@ -251,6 +257,8 @@ class FleetChargePoint(CP16):
         self._cb_diagnostics = on_diagnostics_status
         self._cb_firmware = on_firmware_status
         self._cb_data_transfer = on_data_transfer
+        self._cb_security_event = on_security_event
+        self._cb_message_received = on_message_received
         self._tx_id_provider = tx_id_provider
 
         # Backward-compatible attribute names (used by OCPPServer)
@@ -291,6 +299,12 @@ class FleetChargePoint(CP16):
         except Exception:
             pass
 
+        if self._cb_message_received is not None:
+            try:
+                await self._cb_message_received()
+            except Exception:
+                logger.exception("on_message_received callback failed for %s", self.id)
+
         if structlog is not None:
             try:
                 structlog.get_logger(__name__).bind(
@@ -330,13 +344,18 @@ class FleetChargePoint(CP16):
         status = RegistrationStatus.accepted
         if self._cb_boot:
             try:
+                # python-ocpp forwards every BootNotification field in kwargs
+                # (snake-cased), including ``firmware_version``. We pass that
+                # explicitly as a positional arg below, so drop it from kwargs
+                # to avoid TypeError: multiple values for argument.
+                cb_kwargs = {k: v for k, v in kwargs.items() if k != "firmware_version"}
                 result = await self._cb_boot(
                     self.id,
                     charge_point_vendor,
                     charge_point_model,
                     self.serial_number,
                     self.firmware_version,
-                    **kwargs,
+                    **cb_kwargs,
                 )
                 if result is not None:
                     status = result
@@ -722,6 +741,37 @@ class FleetChargePoint(CP16):
                 logger.error(f"Error in firmware callback: {e}")
         return call_result.FirmwareStatusNotification()
 
+    @on("SecurityEventNotification")
+    async def on_security_event_notification(
+        self,
+        type: str,
+        timestamp: str,
+        tech_info: Optional[str] = None,
+        **kwargs,
+    ):
+        """Acknowledge OCPP 1.6 Security Whitepaper events from the charger.
+
+        ABB Terra AC and other modern OCPP 1.6 chargers send these on each
+        WebSocket reconnect (``StartupOfTheDevice``) and after time sync
+        (``SettingSystemTime``). Without a registered handler the python-ocpp
+        library raises NotImplementedError, returning CALLERROR to the
+        charger which then logs/disconnects.
+        """
+        logger.info(
+            "SecurityEventNotification from %s: type=%s timestamp=%s tech_info=%s",
+            self.id,
+            type,
+            timestamp,
+            tech_info,
+        )
+        _record_ocpp_metric("inbound", "SecurityEventNotification", type)
+        if self._cb_security_event:
+            try:
+                await self._cb_security_event(self.id, type, timestamp, tech_info)
+            except Exception as e:
+                logger.error(f"Error in security_event callback: {e}")
+        return call_result.SecurityEventNotification()
+
     # ===================================================================
     # Outgoing commands (CSMS → Charge Point)
     # ===================================================================
@@ -1034,10 +1084,10 @@ class FleetChargePoint(CP16):
         unknown-vendor-before-boot) chargers, the call is refused with
         ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
-        if (
-            _requires_abb_safe_measurands(self.vendor)
-            and key in {"MeterValuesSampledData", "MeterValuesAlignedData"}
-        ):
+        if _requires_abb_safe_measurands(self.vendor) and key in {
+            "MeterValuesSampledData",
+            "MeterValuesAlignedData",
+        }:
             requested = {m.strip() for m in value.split(",") if m.strip()}
             unsupported = requested - _ABB_SAFE_MEASURANDS
             if unsupported:

@@ -102,12 +102,15 @@ async def get_latest_vehicle_soc(
 
 async def insert_telemetry(
     db,
-    vehicle_id: UUID,
+    vehicle_id: Optional[UUID],
     charger_id: Optional[UUID],
     soc: Optional[float],
     charging_kw: Optional[float],
     max_charge_kw: Optional[float],
     timestamp: datetime,
+    station_id: str = "unknown",
+    connector_id: int = 1,
+    transaction_id: Optional[int] = None,
     is_plugged: Optional[bool] = None,
     location_lat: Optional[float] = None,
     location_lon: Optional[float] = None,
@@ -117,12 +120,15 @@ async def insert_telemetry(
 
     Args:
         db: Database connection or pool
-        vehicle_id: Vehicle UUID
+        vehicle_id: Optional vehicle UUID (enrichment)
         charger_id: Optional charger UUID that reported this telemetry
         soc: State of charge (0.0-1.0)
         charging_kw: Current charging power
         max_charge_kw: Max charge power from OCPP
         timestamp: Telemetry timestamp
+        station_id: OCPP station id
+        connector_id: Connector id for the station
+        transaction_id: Optional OCPP transaction id
         is_plugged: Whether vehicle is plugged in
         location_lat: Latitude
         location_lon: Longitude
@@ -130,13 +136,17 @@ async def insert_telemetry(
     """
     query = """
         INSERT INTO telemetry
-            (time, vehicle_id, charger_id, soc, charging_kw, max_charge_kw,
+            (time, station_id, connector_id, transaction_id,
+             vehicle_id, charger_id, soc, charging_kw, max_charge_kw,
              is_plugged, location_lat, location_lon, odometer_km)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     """
     await db.execute(
         query,
         timestamp,
+        station_id,
+        connector_id,
+        transaction_id,
         vehicle_id,
         charger_id,
         soc,
@@ -839,12 +849,17 @@ async def create_vehicle_identity(
     vehicle_status: str,
 ) -> Optional[dict]:
     """Create a vehicle under an organization-owned depot."""
+    # organization_id is sourced from the parent site row so the new vehicle
+    # row is visible to Supabase RLS policies that gate on organization_id
+    # (e.g. "Admins can manage vehicles"). Without it the row is invisible
+    # to RLS-bound roles and to org-scoped reads via PostgREST.
     query = """
         INSERT INTO vehicles (
-            site_id, external_id, vehicle_type, battery_capacity_kwh, max_charge_rate_kw,
+            site_id, organization_id, external_id, vehicle_type,
+            battery_capacity_kwh, max_charge_rate_kw,
             display_name, id_tag, vin, license_plate, status
         )
-        SELECT d.id, $3, $4, $5, $6, $7, $8, $9, $10, $11
+        SELECT d.id, d.organization_id, $3, $4, $5, $6, $7, $8, $9, $10, $11
         FROM sites d
         WHERE d.id = $1::uuid
           AND d.organization_id = $2::uuid
@@ -1364,6 +1379,92 @@ async def resolve_id_tag_identity(
     return dict(card_rows[0]) if card_rows else None
 
 
+async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
+    """Return the approved idTag list for a charger's local authorization list.
+
+    Backs OCPP 1.6 SendLocalList: the charger holds this list locally so it
+    can authorize approved tags when the WebSocket to the backend is down.
+
+    Scoping rules mirror the central ``resolve_id_tag_identity`` path so the
+    set a charger accepts offline is a strict subset of what it would accept
+    online — there is never a tag that works offline but not online.
+
+      * Vehicle id_tags: active vehicles whose ``site_id`` matches the
+        charger's site.
+      * In ``access_mode='restricted'`` sites the per-charger
+        ``charger_vehicle_access`` matrix filters which vehicles count.
+        When no row exists for a (charger, vehicle) pair the
+        ``sites.charger_vehicle_access_default`` discriminator decides:
+        ``'all_to_all'`` grants access by default, ``'explicit_matrix'``
+        requires an explicit row. NULL is treated as ``'explicit_matrix'``
+        (deny) for safety.
+      * RFID cards: every active card in the same site, regardless of
+        whether it is linked to a vehicle or driver. This matches the
+        central ``resolve_id_tag_identity`` path — the card row alone is
+        sufficient to authorize online, so it must also authorize offline.
+        Excluding orphan cards (an earlier iteration of this query did so)
+        breaks the invariant and produced empty pushes against deployments
+        that operate cards-only fleets, e.g. HRX Vilnius.
+
+    Returns each id_tag at most once, with a ``source`` discriminator
+    (``vehicle`` | ``rfid_card``) for metrics and debug logging.
+
+    Returns an empty list if the station is unknown — the caller should
+    treat that as "skip the push", not "clear the charger's list".
+    """
+    query = """
+        WITH station_info AS (
+            SELECT ch.id::uuid                       AS charging_station_id,
+                   ch.site_id::uuid                  AS site_id,
+                   s.access_mode                     AS access_mode,
+                   s.charger_vehicle_access_default  AS access_default
+            FROM charging_stations ch
+            JOIN sites s ON s.id = ch.site_id
+            WHERE ch.station_id = $1
+        ),
+        accessible_vehicles AS (
+            SELECT v.id AS vehicle_id, v.id_tag
+            FROM vehicles v, station_info si
+            WHERE v.site_id = si.site_id
+              AND v.status = 'active'
+              AND v.id_tag IS NOT NULL
+              AND (
+                  si.access_mode = 'open'
+                  OR EXISTS (
+                      SELECT 1 FROM charger_vehicle_access cva
+                      WHERE cva.charging_station_id = si.charging_station_id
+                        AND cva.vehicle_id = v.id
+                        AND cva.is_accessible = TRUE
+                  )
+                  OR (
+                      si.access_mode = 'restricted'
+                      AND si.access_default = 'all_to_all'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM charger_vehicle_access cva
+                          WHERE cva.charging_station_id = si.charging_station_id
+                            AND cva.vehicle_id = v.id
+                      )
+                  )
+              )
+        )
+        ,
+        all_tags AS (
+            SELECT id_tag, 'vehicle'::text AS source, 1 AS source_priority
+            FROM accessible_vehicles
+            UNION ALL
+            SELECT c.id_tag, 'rfid_card'::text AS source, 2 AS source_priority
+            FROM rfid_cards c, station_info si
+            WHERE c.site_id = si.site_id
+              AND c.status = 'active'
+        )
+        SELECT DISTINCT ON (id_tag) id_tag, source
+        FROM all_tags
+        ORDER BY id_tag, source_priority
+    """
+    rows = await db.fetch(query, station_id)
+    return [dict(row) for row in rows]
+
+
 async def get_depot_by_id(db, depot_id: str) -> Optional[dict]:
     """Get depot metadata by depot_id.
 
@@ -1592,7 +1693,7 @@ async def create_charger_with_credentials(
             vendor,
             model,
             serial_number,
-            firmware,
+            firmware_version,
             connector_count,
             connector_ids,
             network_notes,
@@ -1608,7 +1709,7 @@ async def create_charger_with_credentials(
                   vendor,
                   model,
                   serial_number,
-                  firmware,
+                  firmware_version AS firmware,
                   max_power_kw AS rated_kw,
                   efficiency,
                   connector_type,
@@ -2075,9 +2176,7 @@ async def list_all_organizations(db) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def get_charger_credentials_status(
-    db, *, depot_id: str, charger_id: str
-) -> Optional[dict]:
+async def get_charger_credentials_status(db, *, depot_id: str, charger_id: str) -> Optional[dict]:
     """Return credential status (configured / created_at / last_rotated_at).
 
     Joins ``chargers`` to ``station_credentials`` by ocpp_id. Returns None if the
@@ -2134,3 +2233,440 @@ async def rotate_charger_credentials(
         "last_rotated_at": updated["last_rotated_at"],
         "created_at": updated["created_at"],
     }
+
+
+# ============ Fleet List Helpers (GET /depots/{id}/chargers, /vehicles) ============
+
+
+async def list_chargers_for_depot(db, *, depot_id: str) -> list[dict]:
+    """Return static charger rows for a depot.
+
+    Does NOT join runtime tables (those live on the Timescale pool). Caller
+    is responsible for stitching telemetry/connector_status/sessions in.
+    """
+    query = """
+        SELECT id::text                            AS id,
+               site_id::text                       AS depot_id,
+               station_id                          AS ocpp_id,
+               display_name,
+               vendor,
+               model,
+               serial_number,
+               firmware_version                    AS firmware,
+               max_power_kw                        AS rated_kw,
+               efficiency,
+               connector_type,
+               connector_count,
+               connector_ids,
+               network_notes,
+               auth_required,
+               created_at
+        FROM charging_stations
+        WHERE site_id = $1::uuid
+        ORDER BY station_id
+    """
+    rows = await db.fetch(query, depot_id)
+    result: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        # connector_ids comes back as either a JSON string or a Python list
+        # depending on asyncpg's jsonb codec config; normalize to list[int].
+        raw_connector_ids = item.get("connector_ids")
+        if isinstance(raw_connector_ids, str):
+            try:
+                parsed = json.loads(raw_connector_ids)
+                item["connector_ids"] = parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                item["connector_ids"] = []
+        elif raw_connector_ids is None:
+            item["connector_ids"] = []
+        result.append(item)
+    return result
+
+
+async def list_vehicles_for_depot(db, *, depot_id: str) -> list[dict]:
+    """Return static vehicle rows for a depot."""
+    query = """
+        SELECT id::text                            AS id,
+               site_id::text                       AS depot_id,
+               external_id,
+               display_name,
+               vehicle_type,
+               vin,
+               license_plate,
+               id_tag,
+               battery_capacity_kwh,
+               max_charge_rate_kw,
+               max_discharge_rate_kw,
+               COALESCE(v2g_capable, FALSE)        AS v2g_capable,
+               status,
+               created_at
+        FROM vehicles
+        WHERE site_id = $1::uuid
+        ORDER BY external_id NULLS LAST, id
+    """
+    rows = await db.fetch(query, depot_id)
+    return [dict(r) for r in rows]
+
+
+async def latest_connector_status_by_stations(db, station_ids: list[str]) -> dict[str, dict]:
+    """Latest connector_status row per station_id (across all connectors).
+
+    Returns a mapping ``ocpp_id -> {ocpp_status, last_interaction_at,
+    last_heartbeat_at}`` where:
+      * ``ocpp_status`` is the StatusNotification value of the most recently
+        updated connector on the station (most "interesting" wins for the
+        4-state pill: Faulted > Charging > else).
+      * ``last_interaction_at`` is the MAX timestamp across all connectors.
+        Canonical field used by the API and frontend going forward. Source:
+        ``connector_status.timestamp`` — only advances on connector state
+        changes (StatusNotification), so for idle chargers it can lag the
+        actual frame cadence. The frontend supersedes this initial value
+        with live data from the SSE stream
+        (``GET /depots/{depot_id}/liveness/stream``) — see
+        ``api.liveness_hub`` and ``websocket_handler.liveness_notifier``.
+      * ``last_heartbeat_at`` is the same value, retained for one
+        transitional release while the frontend migrates to
+        ``last_interaction_at``. Drop after the rollout completes.
+    """
+    if not station_ids:
+        return {}
+    query = """
+        WITH latest_per_connector AS (
+            SELECT DISTINCT ON (station_id, connector_id)
+                station_id, connector_id, status, timestamp
+            FROM connector_status
+            WHERE station_id = ANY($1)
+            ORDER BY station_id, connector_id, timestamp DESC
+        )
+        SELECT station_id,
+               array_agg(status ORDER BY
+                   CASE status
+                       WHEN 'Faulted' THEN 0
+                       WHEN 'Charging' THEN 1
+                       WHEN 'SuspendedEV' THEN 2
+                       WHEN 'SuspendedEVSE' THEN 3
+                       WHEN 'Preparing' THEN 4
+                       WHEN 'Finishing' THEN 5
+                       WHEN 'Reserved' THEN 6
+                       WHEN 'Available' THEN 7
+                       WHEN 'Unavailable' THEN 8
+                       ELSE 9
+                   END
+               ) AS statuses_by_priority,
+               MAX(timestamp) AS last_interaction_at
+        FROM latest_per_connector
+        GROUP BY station_id
+    """
+    rows = await db.fetch(query, station_ids)
+    out: dict[str, dict] = {}
+    for row in rows:
+        statuses = row["statuses_by_priority"] or []
+        ts = row["last_interaction_at"]
+        out[row["station_id"]] = {
+            "ocpp_status": statuses[0] if statuses else None,
+            "last_interaction_at": ts,
+            # Transitional alias — drop after frontend completes the
+            # `lastHeartbeatAt` → `lastInteractionAt` migration.
+            "last_heartbeat_at": ts,
+        }
+    return out
+
+
+async def open_sessions_by_stations(db, station_ids: list[str]) -> dict[str, dict]:
+    """Latest open ``charging_sessions`` row per station_id.
+
+    Open live session = ``end_time IS NULL AND source='live'``.
+    Returns mapping ``ocpp_id -> session dict``.
+    Multiple open sessions on the same station should not happen but we pick
+    the most recent ``start_time`` defensively.
+    """
+    if not station_ids:
+        return {}
+    query = """
+        SELECT DISTINCT ON (station_id)
+               station_id,
+               session_id,
+               vehicle_id::text  AS vehicle_id,
+               id_token          AS id_tag,
+               start_time        AS started_at,
+               current_power_kw,
+               current_soc,
+               target_soc,
+               estimated_end_time AS estimated_end_at
+        FROM charging_sessions
+        WHERE station_id = ANY($1)
+          AND end_time IS NULL
+          AND source = 'live'
+        ORDER BY station_id, start_time DESC
+    """
+    rows = await db.fetch(query, station_ids)
+    return {row["station_id"]: dict(row) for row in rows}
+
+
+async def latest_telemetry_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict]:
+    """Latest telemetry row per vehicle_id.
+
+    Returns mapping ``vehicle_id -> {soc, charging_kw, charger_id, is_plugged, time}``.
+    """
+    if not vehicle_ids:
+        return {}
+    query = """
+        SELECT DISTINCT ON (vehicle_id)
+               vehicle_id::text  AS vehicle_id,
+               time              AS last_seen_at,
+               soc               AS current_soc,
+               charging_kw       AS current_power_kw,
+               charger_id::text  AS charger_id,
+               is_plugged
+        FROM telemetry
+        WHERE vehicle_id = ANY($1::uuid[])
+        ORDER BY vehicle_id, time DESC
+    """
+    rows = await db.fetch(query, vehicle_ids)
+    return {row["vehicle_id"]: dict(row) for row in rows}
+
+
+async def latest_telemetry_by_stations(db, station_ids: list[str]) -> dict[tuple[str, int], dict]:
+    """Latest telemetry row per (station_id, connector_id)."""
+    if not station_ids:
+        return {}
+    query = """
+        SELECT DISTINCT ON (station_id, connector_id)
+               station_id,
+               connector_id,
+               transaction_id,
+               time              AS last_seen_at,
+               soc               AS current_soc,
+               charging_kw       AS current_power_kw,
+               is_plugged
+        FROM telemetry
+        WHERE station_id = ANY($1)
+        ORDER BY station_id, connector_id, time DESC
+    """
+    rows = await db.fetch(query, station_ids)
+    return {(row["station_id"], int(row["connector_id"])): dict(row) for row in rows}
+
+
+async def open_session_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict]:
+    """Latest open charging session per vehicle_id.
+
+    Returns ``vehicle_id -> session dict`` with session_id and station_id so
+    the caller can resolve the connected charger UUID from its OCPP id.
+    """
+    if not vehicle_ids:
+        return {}
+    query = """
+        SELECT DISTINCT ON (vehicle_id)
+               vehicle_id::text AS vehicle_id,
+               session_id,
+               station_id       AS ocpp_id,
+               start_time       AS started_at,
+               current_power_kw
+        FROM charging_sessions
+        WHERE vehicle_id = ANY($1::uuid[])
+          AND end_time IS NULL
+          AND source = 'live'
+        ORDER BY vehicle_id, start_time DESC
+    """
+    rows = await db.fetch(query, vehicle_ids)
+    return {row["vehicle_id"]: dict(row) for row in rows}
+
+
+async def next_departures_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict]:
+    """Next future ``schedules`` row per vehicle_id.
+
+    "Next" = ``departure_time > now()`` ordered ASC, first row.
+    """
+    if not vehicle_ids:
+        return {}
+    query = """
+        SELECT DISTINCT ON (vehicle_id)
+               vehicle_id::text AS vehicle_id,
+               id::text          AS schedule_id,
+               route_id,
+               departure_time,
+               return_time,
+               required_soc,
+               energy_kwh
+        FROM schedules
+        WHERE vehicle_id = ANY($1::uuid[]) AND departure_time > NOW()
+        ORDER BY vehicle_id, departure_time ASC
+    """
+    rows = await db.fetch(query, vehicle_ids)
+    return {row["vehicle_id"]: dict(row) for row in rows}
+
+
+async def active_schedule_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict]:
+    """Currently-active ``schedules`` row per vehicle_id (for in_route check).
+
+    Active = ``departure_time <= now() < COALESCE(actual_return_time, return_time)``.
+    """
+    if not vehicle_ids:
+        return {}
+    query = """
+        SELECT DISTINCT ON (vehicle_id)
+               vehicle_id::text AS vehicle_id,
+               id::text          AS schedule_id,
+               departure_time,
+               return_time,
+               actual_return_time
+        FROM schedules
+        WHERE vehicle_id = ANY($1::uuid[])
+          AND departure_time <= NOW()
+          AND NOW() < COALESCE(actual_return_time, return_time)
+        ORDER BY vehicle_id, departure_time DESC
+    """
+    rows = await db.fetch(query, vehicle_ids)
+    return {row["vehicle_id"]: dict(row) for row in rows}
+
+
+async def charger_id_by_ocpp_id(db, *, depot_id: str) -> dict[str, str]:
+    """Return mapping ``ocpp_id -> charging_stations.id`` (UUID, as text) for a depot.
+
+    Used to resolve ``charging_sessions.station_id`` (the OCPP id) to the
+    canonical charger UUID that frontends use as their stable handle.
+    """
+    query = """
+        SELECT station_id AS ocpp_id, id::text AS charger_id
+        FROM charging_stations
+        WHERE site_id = $1::uuid
+    """
+    rows = await db.fetch(query, depot_id)
+    return {row["ocpp_id"]: row["charger_id"] for row in rows}
+
+
+async def list_active_sessions_for_depot(
+    db, *, station_ids: list[str]
+) -> list[dict]:
+    """Open live charging sessions across a set of OCPP station ids.
+
+    Backs ``GET /depots/{id}/sessions/active``. Reads from TimescaleDB only;
+    the caller resolves ``station_ids`` from the static charger list on
+    Supabase. Sorted by ``start_time`` so the UI shows newest first.
+    """
+    if not station_ids:
+        return []
+    query = """
+        SELECT session_id::text         AS session_id,
+               station_id               AS ocpp_id,
+               connector_id,
+               vehicle_id::text         AS vehicle_id,
+               start_time               AS started_at,
+               current_power_kw,
+               current_soc,
+               target_soc,
+               estimated_end_time       AS estimated_end_at,
+               updated_at               AS last_sample_at
+        FROM charging_sessions
+        WHERE station_id = ANY($1)
+          AND end_time IS NULL
+          AND source = 'live'
+        ORDER BY start_time DESC
+    """
+    rows = await db.fetch(query, station_ids)
+    return [dict(r) for r in rows]
+
+
+async def list_completed_sessions_for_depot(
+    db,
+    *,
+    depot_id: str,
+    station_ids: list[str],
+    from_ts: Optional[datetime],
+    to_ts: Optional[datetime],
+    limit: int,
+    cursor: Optional[tuple[datetime, str]],
+) -> list[dict]:
+    """Paginated completed sessions for a depot.
+
+    Backs ``GET /depots/{id}/sessions``. Returns rows where ``end_time IS NOT
+    NULL``. A row is in scope if its ``station_id`` is one of the depot's OCPP
+    ids OR its ``site_id`` matches the depot UUID — the OR catches imported
+    rows (``source='import'``) that have ``site_id`` but no live OCPP station.
+
+    Cursor pagination is keyset-based on ``(end_time DESC, session_id DESC)``
+    to avoid duplicate or skipped rows when new sessions close mid-page. The
+    caller passes the last seen ``(end_time, session_id)`` and we return the
+    next ``limit`` rows strictly older than that.
+    """
+    clauses: list[str] = ["end_time IS NOT NULL"]
+    params: list[Any] = []
+
+    # Depot scope: live rows by station_id, imported rows by site_id.
+    if station_ids:
+        params.append(station_ids)
+        params.append(depot_id)
+        clauses.append(f"(station_id = ANY(${len(params) - 1}) OR site_id = ${len(params)}::uuid)")
+    else:
+        params.append(depot_id)
+        clauses.append(f"site_id = ${len(params)}::uuid")
+
+    if from_ts is not None:
+        params.append(from_ts)
+        clauses.append(f"end_time >= ${len(params)}")
+    if to_ts is not None:
+        params.append(to_ts)
+        clauses.append(f"end_time < ${len(params)}")
+
+    if cursor is not None:
+        cursor_ts, cursor_session_id = cursor
+        params.append(cursor_ts)
+        params.append(cursor_session_id)
+        # Keyset: strictly older than the cursor by (end_time, session_id).
+        clauses.append(
+            f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)"
+        )
+
+    params.append(limit)
+    where_sql = " AND ".join(clauses)
+    query = f"""
+        SELECT session_id::text          AS session_id,
+               station_id                AS ocpp_id,
+               connector_id,
+               vehicle_id::text          AS vehicle_id,
+               driver_id::text           AS driver_id,
+               start_time                AS started_at,
+               end_time                  AS ended_at,
+               energy_delivered_kwh,
+               energy_received_kwh,
+               cost_total,
+               start_soc_percent,
+               end_soc_percent,
+               source
+        FROM charging_sessions
+        WHERE {where_sql}
+        ORDER BY end_time DESC, session_id DESC
+        LIMIT ${len(params)}
+    """
+    rows = await db.fetch(query, *params)
+    return [dict(r) for r in rows]
+
+
+async def latest_telemetry_for_depot_vehicles(
+    db, *, vehicle_ids: list[str]
+) -> list[dict]:
+    """Lightweight per-vehicle real-time state for a depot.
+
+    Distinct from :func:`latest_telemetry_by_vehicles` (which keys by
+    vehicle_id and is consumed by the rich /vehicles endpoint): this returns
+    a flat list shaped for the dedicated ``/vehicles/state`` realtime poll,
+    and includes the ``charger_id`` so the UI can show which charger a
+    vehicle is plugged into without a second join.
+    """
+    if not vehicle_ids:
+        return []
+    query = """
+        SELECT DISTINCT ON (vehicle_id)
+               vehicle_id::text  AS vehicle_id,
+               charger_id::text  AS charger_id,
+               time              AS last_seen_at,
+               soc               AS soc,
+               charging_kw       AS power_kw,
+               is_plugged
+        FROM telemetry
+        WHERE vehicle_id = ANY($1::uuid[])
+        ORDER BY vehicle_id, time DESC
+    """
+    rows = await db.fetch(query, vehicle_ids)
+    return [dict(r) for r in rows]

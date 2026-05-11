@@ -1,8 +1,10 @@
-"""Integration tests for the migration 022 connector_status trigger.
+"""Integration tests for the connector_status trigger (migration 029+).
 
-Exercises fn_alerts_on_connector_status against a real Postgres so the SQL,
-generated columns, partial unique index, ON CONFLICT inference, and pg_notify
-are all validated end to end. Skipped when TEST_DATABASE_URL is unreachable.
+After migration 029, fn_alerts_on_connector_status resolves tenant context
+directly from connector_status.organization_id / depot_id — no shadow-table
+JOIN. Tests insert connector_status rows with those columns set, verifying
+the SQL, generated columns, partial unique index, ON CONFLICT inference, and
+pg_notify all work end-to-end. Skipped when TEST_DATABASE_URL is unreachable.
 """
 
 from __future__ import annotations
@@ -35,45 +37,16 @@ async def db_pool():
 
 
 @pytest_asyncio.fixture
-async def fixture_org_depot_charger(db_pool):
-    """Create org, depot, and charger; yield (org_id, depot_id, charger_ocpp_id).
+async def org_depot_ids(db_pool):
+    """Yield (org_id, depot_id, ocpp_id) as plain UUIDs; no shadow-table rows needed.
 
-    Uses freshly generated UUIDs so concurrent test runs don't collide. Cleanup
-    deletes everything created (notification_alerts cascade-resolved by FK
-    chains, but we also clean by dedup_key).
+    The trigger resolves tenant context directly from connector_status columns
+    (migration 029), so we only need to clean up notification_alerts and
+    connector_status rows on teardown.
     """
     org_id = uuid4()
     depot_id = uuid4()
     ocpp_id = f"test_cp_{uuid4().hex[:8]}"
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO organizations (organization_id, name) VALUES ($1, $2)",
-            org_id,
-            "Test Org for Alerts",
-        )
-        await conn.execute(
-            """
-            INSERT INTO depots (
-                depot_id, name, latitude, longitude, max_grid_kw, organization_id
-            ) VALUES ($1, $2, $3, $4, $5, $6)
-            """,
-            depot_id,
-            "Test Depot for Alerts",
-            37.0,
-            -122.0,
-            500.0,
-            org_id,
-        )
-        await conn.execute(
-            """
-            INSERT INTO chargers (depot_id, ocpp_id, rated_kw)
-            VALUES ($1, $2, $3)
-            """,
-            depot_id,
-            ocpp_id,
-            50.0,
-        )
 
     yield org_id, depot_id, ocpp_id
 
@@ -84,11 +57,6 @@ async def fixture_org_depot_charger(db_pool):
         await conn.execute(
             "DELETE FROM connector_status WHERE station_id = $1", ocpp_id
         )
-        await conn.execute("DELETE FROM chargers WHERE ocpp_id = $1", ocpp_id)
-        await conn.execute("DELETE FROM depots WHERE depot_id = $1", depot_id)
-        await conn.execute(
-            "DELETE FROM organizations WHERE organization_id = $1", org_id
-        )
 
 
 async def _insert_status(
@@ -96,17 +64,24 @@ async def _insert_status(
     station_id: str,
     connector_id: int,
     status: str,
+    *,
+    organization_id: UUID | None = None,
+    depot_id: UUID | None = None,
     error_code: str | None = None,
 ) -> None:
+    """Insert a connector_status row, optionally setting tenant context columns."""
     await conn.execute(
         """
-        INSERT INTO connector_status (station_id, connector_id, status, error_code)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO connector_status
+            (station_id, connector_id, status, error_code, organization_id, depot_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
         """,
         station_id,
         connector_id,
         status,
         error_code,
+        organization_id,
+        depot_id,
     )
 
 
@@ -122,10 +97,14 @@ class TestConnectorStatusTrigger:
     """fn_alerts_on_connector_status behavior."""
 
     @pytest.mark.asyncio
-    async def test_faulted_creates_critical_alert(self, db_pool, fixture_org_depot_charger):
-        org_id, depot_id, ocpp_id = fixture_org_depot_charger
+    async def test_faulted_creates_critical_alert(self, db_pool, org_depot_ids):
+        org_id, depot_id, ocpp_id = org_depot_ids
         async with db_pool.acquire() as conn:
-            await _insert_status(conn, ocpp_id, 1, "Faulted", "PowerMeterFailure")
+            await _insert_status(
+                conn, ocpp_id, 1, "Faulted",
+                organization_id=org_id, depot_id=depot_id,
+                error_code="PowerMeterFailure",
+            )
 
             alert = await _fetch_alert(conn, f"charger_fault:{ocpp_id}:1")
             assert alert is not None
@@ -143,10 +122,13 @@ class TestConnectorStatusTrigger:
             assert detail["error_code"] == "PowerMeterFailure"
 
     @pytest.mark.asyncio
-    async def test_unavailable_creates_warning_alert(self, db_pool, fixture_org_depot_charger):
-        org_id, _, ocpp_id = fixture_org_depot_charger
+    async def test_unavailable_creates_warning_alert(self, db_pool, org_depot_ids):
+        org_id, _, ocpp_id = org_depot_ids
         async with db_pool.acquire() as conn:
-            await _insert_status(conn, ocpp_id, 2, "Unavailable")
+            await _insert_status(
+                conn, ocpp_id, 2, "Unavailable",
+                organization_id=org_id,
+            )
 
             alert = await _fetch_alert(conn, f"charger_fault:{ocpp_id}:2")
             assert alert is not None
@@ -155,17 +137,23 @@ class TestConnectorStatusTrigger:
 
     @pytest.mark.asyncio
     async def test_repeat_fault_dedupes_and_bumps_last_occurrence(
-        self, db_pool, fixture_org_depot_charger
+        self, db_pool, org_depot_ids
     ):
-        _, _, ocpp_id = fixture_org_depot_charger
+        org_id, _, ocpp_id = org_depot_ids
         async with db_pool.acquire() as conn:
-            await _insert_status(conn, ocpp_id, 1, "Faulted", "OverCurrentFailure")
+            await _insert_status(
+                conn, ocpp_id, 1, "Faulted",
+                organization_id=org_id, error_code="OverCurrentFailure",
+            )
             first = await _fetch_alert(conn, f"charger_fault:{ocpp_id}:1")
             assert first is not None
 
             await asyncio.sleep(0.05)
 
-            await _insert_status(conn, ocpp_id, 1, "Faulted", "OtherError")
+            await _insert_status(
+                conn, ocpp_id, 1, "Faulted",
+                organization_id=org_id, error_code="OtherError",
+            )
             after = await _fetch_alert(conn, f"charger_fault:{ocpp_id}:1")
 
             row_count = await conn.fetchval(
@@ -179,12 +167,16 @@ class TestConnectorStatusTrigger:
             assert json.loads(after["detail"])["error_code"] == "OtherError"
 
     @pytest.mark.asyncio
-    async def test_recovery_resolves_active_alert(self, db_pool, fixture_org_depot_charger):
-        _, _, ocpp_id = fixture_org_depot_charger
+    async def test_recovery_resolves_active_alert(self, db_pool, org_depot_ids):
+        org_id, _, ocpp_id = org_depot_ids
         async with db_pool.acquire() as conn:
-            await _insert_status(conn, ocpp_id, 1, "Faulted", "PowerMeterFailure")
+            await _insert_status(
+                conn, ocpp_id, 1, "Faulted",
+                organization_id=org_id, error_code="PowerMeterFailure",
+            )
             assert (await _fetch_alert(conn, f"charger_fault:{ocpp_id}:1"))["status"] == "active"
 
+            # Recovery row does not need org context — trigger uses dedup_key to resolve.
             await _insert_status(conn, ocpp_id, 1, "Available")
 
             resolved = await _fetch_alert(conn, f"charger_fault:{ocpp_id}:1")
@@ -193,13 +185,16 @@ class TestConnectorStatusTrigger:
 
     @pytest.mark.asyncio
     async def test_resolved_alert_can_reopen_with_new_row(
-        self, db_pool, fixture_org_depot_charger
+        self, db_pool, org_depot_ids
     ):
-        _, _, ocpp_id = fixture_org_depot_charger
+        org_id, _, ocpp_id = org_depot_ids
         async with db_pool.acquire() as conn:
-            await _insert_status(conn, ocpp_id, 1, "Faulted")
+            await _insert_status(conn, ocpp_id, 1, "Faulted", organization_id=org_id)
             await _insert_status(conn, ocpp_id, 1, "Available")
-            await _insert_status(conn, ocpp_id, 1, "Faulted", "Re-occurred")
+            await _insert_status(
+                conn, ocpp_id, 1, "Faulted",
+                organization_id=org_id, error_code="Re-occurred",
+            )
 
             rows = await conn.fetch(
                 "SELECT id, status FROM notification_alerts WHERE dedup_key = $1 ORDER BY created_at",
@@ -211,20 +206,20 @@ class TestConnectorStatusTrigger:
             assert rows[0]["id"] != rows[1]["id"]
 
     @pytest.mark.asyncio
-    async def test_unknown_station_silently_skipped(self, db_pool):
-        """Faulted row for an unknown station_id must not raise — trigger bails cleanly."""
-        unknown_station = f"unknown_{uuid4().hex[:8]}"
+    async def test_null_org_silently_skipped(self, db_pool):
+        """Faulted row without organization_id must not raise or create an alert."""
+        station = f"noorg_{uuid4().hex[:8]}"
         async with db_pool.acquire() as conn:
-            await _insert_status(conn, unknown_station, 1, "Faulted", "Test")
-            alert = await _fetch_alert(conn, f"charger_fault:{unknown_station}:1")
+            await _insert_status(conn, station, 1, "Faulted", error_code="Test")
+            alert = await _fetch_alert(conn, f"charger_fault:{station}:1")
             assert alert is None
             await conn.execute(
-                "DELETE FROM connector_status WHERE station_id = $1", unknown_station
+                "DELETE FROM connector_status WHERE station_id = $1", station
             )
 
     @pytest.mark.asyncio
-    async def test_pg_notify_fires_on_new_alert(self, db_pool, fixture_org_depot_charger):
-        _, depot_id, ocpp_id = fixture_org_depot_charger
+    async def test_pg_notify_fires_on_new_alert(self, db_pool, org_depot_ids):
+        org_id, depot_id, ocpp_id = org_depot_ids
         payloads: list[str] = []
         received = asyncio.Event()
 
@@ -237,7 +232,11 @@ class TestConnectorStatusTrigger:
             await listener.add_listener("notification_alerts_new", on_notify)
 
             async with db_pool.acquire() as writer:
-                await _insert_status(writer, ocpp_id, 1, "Faulted", "PowerMeterFailure")
+                await _insert_status(
+                    writer, ocpp_id, 1, "Faulted",
+                    organization_id=org_id, depot_id=depot_id,
+                    error_code="PowerMeterFailure",
+                )
 
             try:
                 await asyncio.wait_for(received.wait(), timeout=2.0)
@@ -257,10 +256,10 @@ class TestConnectorStatusTrigger:
 
     @pytest.mark.asyncio
     async def test_recovery_for_nonexistent_alert_is_noop(
-        self, db_pool, fixture_org_depot_charger
+        self, db_pool, org_depot_ids
     ):
         """An Available row when no active alert exists must not error or insert."""
-        _, _, ocpp_id = fixture_org_depot_charger
+        _, _, ocpp_id = org_depot_ids
         async with db_pool.acquire() as conn:
             await _insert_status(conn, ocpp_id, 1, "Available")
             count = await conn.fetchval(

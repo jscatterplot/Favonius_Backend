@@ -4,6 +4,8 @@ Reference: PRD_v2.md#7-api-specifications
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -16,8 +18,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Annotated, Any, Iterator, Literal, Optional, Union
-from urllib.parse import urlparse
+from typing import Annotated, Any, AsyncIterator, Iterator, Literal, Optional, Union
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,7 @@ import asyncpg
 import bcrypt
 import httpx
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     Header,
@@ -65,6 +67,7 @@ from ..db.exceptions import (
     IdempotencyKeyReusedError,
 )
 from ..db.pools import DatabasePools
+from ..db.postgres_url import describe_database_target
 from ..db.snapshot_store import persist_snapshot
 from ..monitoring.metrics import CONTROLLER_MANAGER_UP
 from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_admin_audit_row
@@ -93,6 +96,7 @@ from ..security.validators import (
     validate_uuid,
     validate_vehicle_id,
 )
+from . import fleet_list as _fleet_list
 from .error_codes import ERROR_MESSAGES, ErrorCode, http_status_for, safe_message_for
 from .reports import (
     REPORT_GROUP_BY_VALUES,
@@ -110,12 +114,21 @@ db_pools: Optional[DatabasePools] = None
 # Controller manager and OCPP server
 controller_manager: Optional[ControllerManager] = None
 ocpp_server: Optional[object] = None  # OCPPServer type
+liveness_hub: Optional[Any] = None  # api.liveness_hub.LivenessHub
 
 # Depot config cache (to reduce database queries)
 _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (config, timestamp)
 _config_cache_ttl: float = 300.0  # 5 minutes
 _depot_config_locks: dict[str, asyncio.Lock] = {}  # single-flight locks per depot
 _background_tasks: set[asyncio.Task] = set()
+
+# Fleet list response cache (chargers + vehicles). 2 s TTL is enough to dedupe
+# multi-tab thundering herd (frontend polls at 10 s) without making the data
+# stale. Cache keys are (depot_id, "chargers"|"vehicles"); values are (payload
+# dict, timestamp). Pair of asyncio.Locks per key to single-flight refreshes.
+_fleet_list_cache: dict[tuple[str, str], tuple[dict, float]] = {}
+_fleet_list_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_fleet_list_cache_ttl: float = 2.0  # seconds
 
 
 def _create_background_task(coro) -> None:
@@ -137,21 +150,6 @@ async def _require_depot_access(
     validate_depot_id(depot_id)
     await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
     return depot_id
-
-
-def describe_database_target(database_url: str) -> str:
-    """Return safe, redacted connection target details for logs.
-
-    Security: only expose port; mask host/user/db to prevent
-    infrastructure reconnaissance via log scraping.
-    """
-    parsed = urlparse(database_url)
-    host = parsed.hostname or ""
-    port = parsed.port or "<default>"
-    # Show only the TLD suffix (e.g. "*****.timescale.com")
-    host_parts = host.rsplit(".", 2)
-    masked_host = f"*****.{'.'.join(host_parts[-2:])}" if len(host_parts) >= 2 else "*****"
-    return f"user=***** host={masked_host} port={port} db=*****"
 
 
 def resolve_database_url() -> tuple[str, str]:
@@ -251,10 +249,29 @@ async def lifespan(app: FastAPI):
 
     # ── Database pools ────────────────────────────────────────────────────────
     # Supabase (static/reference data): DATABASE_URL required.
-    # TimescaleDB (time-series/operational): TIMESCALE_SERVICE_URL required;
-    #   falls back to DATABASE_URL for single-DB local dev (docker-compose).
+    # TimescaleDB (TigerCloud / favonius-timeseries): TIMESCALE_SERVICE_URL required
+    # in production and staging so we never accidentally point the ts pool at
+    # Supabase. Local single-DB dev may omit TIMESCALE_SERVICE_URL and fall back
+    # to DATABASE_URL (docker-compose).
     static_url = os.getenv("DATABASE_URL")
-    ts_url = os.getenv("TIMESCALE_SERVICE_URL") or os.getenv("DATABASE_URL")
+    _env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    _ts_explicit = os.getenv("TIMESCALE_SERVICE_URL")
+    if _env in ("production", "staging"):
+        if not (_ts_explicit and _ts_explicit.strip()):
+            raise RuntimeError(
+                "TIMESCALE_SERVICE_URL must be set when ENVIRONMENT is production or staging. "
+                "DATABASE_URL is reserved for Supabase (static schema); TimescaleDB must be "
+                "TigerCloud (e.g. favonius-timeseries)."
+            )
+        ts_url = _ts_explicit.strip()
+        ts_url_source = "TIMESCALE_SERVICE_URL"
+    else:
+        ts_url = (_ts_explicit.strip() if _ts_explicit and _ts_explicit.strip() else None) or (
+            static_url
+        )
+        ts_url_source = (
+            "TIMESCALE_SERVICE_URL" if _ts_explicit and _ts_explicit.strip() else "DATABASE_URL"
+        )
 
     if not static_url:
         raise RuntimeError(
@@ -263,16 +280,24 @@ async def lifespan(app: FastAPI):
         )
     if not ts_url:
         raise RuntimeError(
-            "TIMESCALE_SERVICE_URL is not set. "
-            "Set it to the TimescaleDB connection string (time-series data)."
+            "No TimescaleDB URL available. Set TIMESCALE_SERVICE_URL (preferred), or in "
+            "local development set DATABASE_URL to a single Postgres that hosts both roles."
         )
 
     static_pool = await _create_pool(static_url, "DATABASE_URL")
-    ts_pool = await _create_pool(
-        ts_url,
-        "TIMESCALE_SERVICE_URL" if os.getenv("TIMESCALE_SERVICE_URL") else "DATABASE_URL",
-    )
+    ts_pool = await _create_pool(ts_url, ts_url_source)
     db_pools = DatabasePools(static=static_pool, ts=ts_pool)
+
+    # ── Geo-blocking (Article 73-3) — eager init so the GeoIP runtime
+    # download and reader-load happen before requests arrive. The lazy
+    # singleton in geo_block.py would otherwise construct on first request
+    # and silently fail-closed if MaxMind credentials are missing.
+    try:
+        from ..security.geo_block import initialize_geo_blocking
+
+        await asyncio.to_thread(initialize_geo_blocking)
+    except Exception as exc:  # pragma: no cover — defensive: never block startup
+        logger.warning("Geo-blocking eager init failed: %s", exc)
 
     # ── Audit logger (Article 73-3 / NIS2 compliance) ────────────────────────
     audit_logger = AuditLogger(db_pool=ts_pool, service="main_api")
@@ -288,6 +313,7 @@ async def lifespan(app: FastAPI):
 
     # ── OCPP server ───────────────────────────────────────────────────────────
     ocpp_enabled = os.getenv("OCPP_SERVER_ENABLED", "false").lower() == "true"
+    ocpp_emergency_only = os.getenv("OCPP_EMERGENCY_FALLBACK_ONLY", "true").lower() == "true"
     ocpp_use_same_port = os.getenv("OCPP_USE_SAME_PORT", "false").lower() == "true"
     if ocpp_enabled:
         try:
@@ -301,6 +327,11 @@ async def lifespan(app: FastAPI):
                 port=ocpp_port,
                 pools=db_pools,
             )
+            if ocpp_emergency_only:
+                logger.warning(
+                    "Main API OCPP adapter is running in EMERGENCY_FALLBACK_ONLY mode. "
+                    "Primary production path remains src/websocket_handler."
+                )
 
             if ocpp_use_same_port:
                 logger.info("OCPP served on same port as REST (path /ocpp/{charge_point_id})")
@@ -355,10 +386,35 @@ async def lifespan(app: FastAPI):
             _environment,
         )
 
+    # ── Liveness fan-out hub ──────────────────────────────────────────────────
+    # Subscribes to the ``charger_liveness`` Postgres channel and fans
+    # notifications out to per-organisation SSE subscribers. Producer is the
+    # WS handler (src/websocket_handler/liveness_notifier.py).
+    global liveness_hub
+    from .liveness_hub import LivenessHub  # noqa: PLC0415
+
+    liveness_hub = LivenessHub(ts_pool)
+    await liveness_hub.start()
+
+    # ── Monthly report-draft scheduler ───────────────────────────────────────
+    # Emits one agent_action(action_class='report_draft') per depot on day 1
+    # of each calendar month in the depot's local timezone.
+    from .monthly_scheduler import run_monthly_scheduler  # noqa: PLC0415
+
+    _create_background_task(run_monthly_scheduler(ts_pool))
+    logger.info("Monthly report-draft scheduler started")
+
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
     logger.info("Shutting down application...")
+
+    if liveness_hub is not None:
+        try:
+            await liveness_hub.stop()
+            logger.info("Liveness hub stopped")
+        except Exception as e:
+            logger.error(f"Error stopping liveness hub: {e}", exc_info=True)
 
     if controller_manager:
         try:
@@ -536,6 +592,16 @@ def _verify_handoff_payload(
 # ============ Rate Limiting Middleware ============
 
 
+# Admin write paths used by the bulk-import flows on the fleet identity panel.
+# Match POST/PATCH/PUT requests against /admin/depots/{depot_id}/{vehicles|
+# drivers|rfid-cards}[/...]. Reusable for future bulk-import endpoints — add
+# the new resource segment to the alternation when chargers or schedules ship
+# their own xlsx import.
+_ADMIN_BULK_WRITE_PATH_RE = re.compile(
+    r"^/admin/depots/[^/]+/(?:vehicles|drivers|rfid-cards|charging-sessions/import)(?:/|$)"
+)
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Middleware to enforce rate limits per PRD Section 10.4."""
 
@@ -599,6 +665,26 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # Handoff rate limiting handled in endpoint handlers
             # (requires reading request body which is not available in middleware)
             pass
+
+        # Admin bulk-import writes: dedicated bucket so a sequential xlsx
+        # import (one POST per row) does not trip the 100/min general limit.
+        # Replaces — does not stack on top of — the general bucket.
+        elif request.method in {"POST", "PATCH", "PUT"} and _ADMIN_BULK_WRITE_PATH_RE.match(path):
+            result = limiter.check_admin_write_limit(client_id)
+            if not result:
+                resp = JSONResponse(
+                    status_code=429,
+                    content=ErrorResponse(
+                        detail=(
+                            f"Rate limit exceeded: Maximum {result.limit} "
+                            "identity-write requests per minute"
+                        ),
+                        error_code="RATE_LIMIT_EXCEEDED",
+                        timestamp=datetime.utcnow().isoformat(),
+                    ).model_dump(),
+                )
+                self._add_rate_limit_headers(resp, result)
+                return resp
 
         # General API endpoints: 100 requests/minute
         else:
@@ -796,6 +882,21 @@ app.add_middleware(
 # Add geo-blocking middleware (outermost — executes first, before all other middleware)
 # Required by Lithuanian Electric Energy Law Article 73-3
 app.add_middleware(GeoBlockMiddleware)
+
+
+# ── Depot chat agent (feature-flagged) ────────────────────────────────────
+# Mounted behind ``AGENT_SEARCH_ENABLED`` (default false; flipped to default-on
+# in sprint B6 after the golden tests pass — see
+# docs/plans/agent_search_architecture_v0.md §11). The router inherits the
+# JWT and geo-block pipeline above. The LLM-powered turn endpoints add their
+# own 10 req/min/user agent bucket; read-only run-trace fetches use JWT only.
+from .agent.feature_flag import is_agent_search_enabled
+
+if is_agent_search_enabled():
+    from .agent.router import router as agent_router  # noqa: PLC0415
+
+    app.include_router(agent_router)
+    logger.info("Depot chat agent enabled at /agent/*")
 
 
 class OptimizationRequest(BaseModel):
@@ -1057,6 +1158,251 @@ class AcknowledgeAlertResponse(BaseModel):
     id: str
     status: str
     acknowledged_at: str
+
+
+# ============ Fleet List Models (GET /depots/{id}/chargers, /vehicles) ============
+
+
+class ChargerCurrentSession(BaseModel):
+    """Active charging session running on this charger right now."""
+
+    session_id: str
+    vehicle_id: Optional[str] = None
+    id_tag: Optional[str] = Field(
+        None,
+        description=(
+            "Raw OCPP idTag the charger sent at StartTransaction. Surfaced so "
+            "the frontend can render \"Unknown vehicle charging · RFID <tag>\" "
+            "when the cards-only auth path didn't resolve a ``vehicle_id`` "
+            "(no row in ``rfid_card_vehicle_assignments`` for this card)."
+        ),
+    )
+    started_at: str = Field(..., description="Session start (ISO 8601)")
+    current_power_kw: Optional[float] = None
+    current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    target_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    estimated_end_at: Optional[str] = None
+
+
+class ChargerListItem(BaseModel):
+    """One charger row for ``GET /depots/{id}/chargers``."""
+
+    id: str = Field(..., description="charging_stations.id (UUID)")
+    depot_id: str
+    ocpp_id: str = Field(..., description="OCPP charge_point_id (charging_stations.station_id)")
+    display_name: Optional[str] = None
+    vendor: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    firmware: Optional[str] = None
+    rated_kw: Optional[float] = None
+    efficiency: Optional[float] = None
+    connector_type: Optional[str] = None
+    connector_count: int = Field(..., ge=1)
+    connector_ids: list[int] = Field(default_factory=list)
+    auth_required: bool
+    status: Literal["charging", "idle", "offline", "fault"] = Field(
+        ..., description="Four-state pill: charging | idle | offline | fault"
+    )
+    ocpp_connector_status: Optional[str] = Field(
+        None,
+        description=(
+            "Raw OCPP StatusNotification value (Available, Preparing, Charging, "
+            "SuspendedEV, SuspendedEVSE, Faulted, Unavailable, Reserved, Finishing) "
+            "for tooltips and /admin/support drilldown."
+        ),
+    )
+    network_notes: Optional[str] = None
+    created_at: str
+    last_interaction_at: Optional[str] = Field(
+        None,
+        description=(
+            "Timestamp of the charger's most recent activity from this API's "
+            "perspective. Initial-load value is "
+            "``MAX(connector_status.timestamp)`` across this station's "
+            "connectors — a lower bound (the charger was at least alive then). "
+            "Live updates flow via the SSE stream at "
+            "``GET /depots/{depot_id}/liveness/stream`` which the WS handler "
+            "feeds on every received OCPP frame, rate-limited to ~10s per "
+            "station. Null if the charger has never connected."
+        ),
+    )
+    last_heartbeat_at: Optional[str] = Field(
+        None,
+        description=(
+            "**Deprecated.** Same value as ``last_interaction_at`` for one "
+            "transitional release while the frontend migrates. Drop after "
+            "the rollout completes."
+        ),
+        deprecated=True,
+    )
+    current_session: Optional[ChargerCurrentSession] = None
+
+
+class ChargerListResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/chargers``."""
+
+    items: list[ChargerListItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+class VehicleNextDeparture(BaseModel):
+    """Next scheduled departure for this vehicle."""
+
+    schedule_id: str
+    route_id: Optional[str] = None
+    departure_time: str = Field(..., description="ISO 8601")
+    return_time: str = Field(..., description="ISO 8601")
+    required_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    energy_kwh: Optional[float] = None
+
+
+class VehicleCurrentState(BaseModel):
+    """Live operational state for a vehicle.
+
+    State derivation priority (top wins):
+      1. ``offline`` — ``last_seen_at`` is NULL or older than 30 minutes.
+      2. ``charging`` — an open ``charging_sessions`` row exists for this vehicle.
+      3. ``in_route`` — within an active schedule window
+         (``departure_time <= now() < COALESCE(actual_return_time, return_time)``).
+      4. ``ready`` — ``current_soc >= COALESCE(next_departure.required_soc, 0.95)``.
+      5. ``at_risk`` — ``current_soc < COALESCE(next_departure.required_soc, 0.95)``.
+    """
+
+    state: Literal["ready", "charging", "at_risk", "in_route", "offline"]
+    current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    current_power_kw: Optional[float] = None
+    connected_charger_id: Optional[str] = Field(
+        None, description="charging_stations.id (UUID), not the OCPP id"
+    )
+    connected_session_id: Optional[str] = None
+    last_seen_at: Optional[str] = Field(None, description="Latest telemetry timestamp (ISO 8601)")
+
+
+class VehicleListItem(BaseModel):
+    """One vehicle row for ``GET /depots/{id}/vehicles``."""
+
+    id: str = Field(..., description="vehicles.id (UUID)")
+    depot_id: str
+    external_id: str = Field(
+        ...,
+        min_length=1,
+        description="Customer's fleet number (vehicles.external_id, required + unique per depot)",
+    )
+    display_name: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    vin: Optional[str] = None
+    license_plate: Optional[str] = None
+    id_tag: Optional[str] = None
+    battery_capacity_kwh: Optional[float] = None
+    max_charge_rate_kw: Optional[float] = None
+    max_discharge_rate_kw: Optional[float] = None
+    v2g_capable: bool = False
+    make: Optional[str] = None
+    model: Optional[str] = None
+    year: Optional[int] = None
+    status: Optional[str] = None
+    created_at: str
+    current_state: VehicleCurrentState
+    next_departure: Optional[VehicleNextDeparture] = None
+
+
+class VehicleListResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/vehicles``."""
+
+    items: list[VehicleListItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+# ===== Live Sessions / Realtime State (replaces Supabase mirror tables) =====
+#
+# These three endpoints replace direct frontend reads of the Supabase tables
+# `charging_sessions_active`, `charging_sessions_summary`, and
+# `vehicle_realtime_state`. The canonical store is TimescaleDB
+# (`charging_sessions`, `telemetry`); Supabase keeps only static reference
+# data (sites, charging_stations, vehicles, organizations).
+
+
+class ActiveSessionItem(BaseModel):
+    """One open live charging session, returned by ``GET /depots/{id}/sessions/active``."""
+
+    session_id: str
+    ocpp_id: str = Field(..., description="OCPP station id (charging_stations.station_id)")
+    connector_id: int
+    vehicle_id: Optional[str] = None
+    started_at: str = Field(..., description="ISO 8601")
+    current_power_kw: Optional[float] = None
+    current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    target_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    estimated_end_at: Optional[str] = None
+    last_sample_at: Optional[str] = Field(
+        None,
+        description=(
+            "Server-side updated_at on the charging_sessions row; bumped on every "
+            "MeterValues. Use to detect stalled sessions."
+        ),
+    )
+
+
+class ActiveSessionsResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/sessions/active``."""
+
+    items: list[ActiveSessionItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+class CompletedSessionItem(BaseModel):
+    """One completed charging session, returned by ``GET /depots/{id}/sessions``."""
+
+    session_id: str
+    ocpp_id: Optional[str] = Field(
+        None, description="OCPP station id; null for imported rows with no live charger."
+    )
+    connector_id: Optional[int] = None
+    vehicle_id: Optional[str] = None
+    driver_id: Optional[str] = None
+    started_at: str = Field(..., description="ISO 8601")
+    ended_at: str = Field(..., description="ISO 8601")
+    energy_delivered_kwh: Optional[float] = None
+    energy_received_kwh: Optional[float] = None
+    cost_total: Optional[float] = None
+    start_soc_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    end_soc_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    source: Literal["live", "import"] = "live"
+
+
+class CompletedSessionsResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/sessions``."""
+
+    items: list[CompletedSessionItem] = Field(default_factory=list)
+    next_cursor: Optional[str] = Field(
+        None,
+        description=(
+            "Opaque cursor for the next page. Pass back as the ``cursor`` query "
+            "parameter; null when no more rows are available."
+        ),
+    )
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
+
+
+class VehicleRealtimeStateItem(BaseModel):
+    """Latest telemetry per vehicle, for ``GET /depots/{id}/vehicles/state``."""
+
+    vehicle_id: str
+    charger_id: Optional[str] = Field(
+        None, description="charging_stations.id (UUID) of the connected charger, if any."
+    )
+    soc: Optional[float] = Field(None, ge=0.0, le=1.0)
+    power_kw: Optional[float] = None
+    is_plugged: Optional[bool] = None
+    last_seen_at: str = Field(..., description="Latest telemetry timestamp (ISO 8601)")
+
+
+class VehicleRealtimeStateResponse(BaseModel):
+    """Response envelope for ``GET /depots/{id}/vehicles/state``."""
+
+    items: list[VehicleRealtimeStateItem] = Field(default_factory=list)
+    fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
 
 
 class ScheduleResponse(BaseModel):
@@ -1756,6 +2102,53 @@ class FleetIdentityResponse(BaseModel):
     rfid_cards: list[RfidCardResponse] = Field(default_factory=list)
 
 
+class HistoricalSessionImport(_CamelOrSnakeModel):
+    """One row of a historical charging-sessions XLSX upload.
+
+    Mirrors the bulk-RFID flow: the frontend parses the spreadsheet and POSTs
+    one row per call. Timestamps are accepted as naive strings interpreted in
+    the depot's local timezone (``sites.timezone``); the server converts to
+    UTC before persisting.
+
+    Identity resolution priority:
+      1. ``rfid_label`` matched against ``rfid_cards.label`` (case-insensitive)
+      2. ``id_tag`` matched against ``vehicles.id_tag``, then ``rfid_cards.id_tag``
+      3. Unmatched — session is stored with all identity fields null
+    """
+
+    import_batch_id: UUID
+    start_time_local: str = Field(..., min_length=1, max_length=64)
+    end_time_local: Optional[str] = Field(default=None, max_length=64)
+    energy_delivered_kwh: float = Field(..., ge=0)
+    revenue: float = Field(default=0.0, ge=0)
+    rfid_label: Optional[str] = Field(default=None, max_length=255)
+    id_tag: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    # Open-text rather than a Literal[...] enum because the upstream export
+    # emits at least Charging / Finished / ConnectedStoppedByEv today and
+    # additional codes (e.g. Faulted, Available) appear in the wild. We
+    # preserve the raw string verbatim in charging_sessions.import_status so
+    # any future state round-trips without a backend deploy. Length is capped
+    # to keep the column predictable.
+    status: str = Field(..., min_length=1, max_length=64)
+    transaction_type: str = Field(default="RFID", max_length=64)
+    user_full_name: Optional[str] = Field(default=None, max_length=255)
+    station_owner_full_name: Optional[str] = Field(default=None, max_length=255)
+
+class HistoricalSessionImportMatched(BaseModel):
+    """Identity resolution outcome for an imported session row."""
+
+    vehicle_id: Optional[str] = None
+    card_id: Optional[str] = None
+    driver_id: Optional[str] = None
+
+
+class HistoricalSessionImportResponse(BaseModel):
+    """201 response for POST /admin/depots/{id}/charging-sessions/import."""
+
+    session_id: str
+    matched: HistoricalSessionImportMatched
+
+
 # ============ Command Dispatcher Models ============
 
 
@@ -2114,14 +2507,14 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
         try:
             config, _ = await StateAssembler.load_depot_config(db_pools, depot_id)
 
+            # Empty fleets and chargerless depots are valid for freshly-onboarded
+            # depots; GET /state should still succeed with empty payloads. The
+            # /optimize endpoint enforces the not-empty precondition at its own
+            # layer (see line ~4160), so empty configs here are not an error.
             if not config.vehicle_capacities:
-                raise HTTPException(
-                    status_code=400, detail=f"Depot {depot_id} has no vehicles configured"
-                )
+                logger.info(f"Depot {depot_id} has no vehicles configured yet")
             if config.n_chargers == 0:
-                logger.warning(
-                    f"Depot {depot_id} has no chargers configured, optimization may fail"
-                )
+                logger.info(f"Depot {depot_id} has no chargers configured yet")
 
             _depot_config_cache[depot_id] = (config, time.time())
             logger.info(
@@ -2253,9 +2646,15 @@ def _canonical_request_hash(payload: BaseModel) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_OCPP_BASIC_PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_OCPP_BASIC_PASSWORD_LENGTH = 10
+
+
 def _generate_ocpp_basic_password() -> str:
-    """Generate a high-entropy URL-safe one-time Basic Auth password."""
-    return secrets.token_urlsafe(32)
+    """Generate an ABB-compatible high-entropy one-time Basic Auth password."""
+    return "".join(
+        secrets.choice(_OCPP_BASIC_PASSWORD_ALPHABET) for _ in range(_OCPP_BASIC_PASSWORD_LENGTH)
+    )
 
 
 async def _hash_ocpp_basic_password(password: str) -> str:
@@ -2372,17 +2771,38 @@ def _require_customer_admin_with_org(user: dict) -> str:
 
 
 def _handle_identity_unique_violation(exc: asyncpg.UniqueViolationError) -> HTTPException:
-    """Map identity uniqueness conflicts to frontend-stable 409 responses."""
+    """Map identity uniqueness conflicts to frontend-stable 409 responses.
+
+    The FE bulk-import flow keys off ``error_code`` to group per-row failures,
+    so each kind of conflict gets its own stable code (``DUPLICATE_ID_TAG`` for
+    a clashing RFID/vehicle id_tag, ``DUPLICATE_VIN`` for a clashing VIN, and
+    ``DUPLICATE_EXTERNAL_ID`` for a clashing external identifier).
+    """
     constraint = getattr(exc, "constraint_name", "") or ""
     if "id_tag" in constraint:
+        error_code = ErrorCode.DUPLICATE_ID_TAG.value
         detail = "idTag is already registered"
+    elif "vehicles_vin" in constraint:
+        # vehicles_vin_key is a global UNIQUE on vin, so this conflict can
+        # surface across organizations and not just within the depot.
+        error_code = ErrorCode.DUPLICATE_VIN.value
+        detail = "VIN is already registered"
     elif "vehicles_external_id" in constraint:
+        error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered"
+    elif "charging_sessions_import_dedup" in constraint:
+        error_code = ErrorCode.DUPLICATE_SESSION.value
+        detail = "Charging session has already been imported"
     elif "external" in constraint:
+        error_code = ErrorCode.DUPLICATE_EXTERNAL_ID.value
         detail = "External identifier is already registered for this depot"
     else:
+        error_code = ErrorCode.CONFLICT.value
         detail = "Identity record already exists"
-    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"error_code": error_code, "detail": detail},
+    )
 
 
 async def _audit_identity_write(user: dict, depot_id: str, action: str, resource_id: str) -> None:
@@ -2638,7 +3058,10 @@ async def _build_depot_readiness_checklist(
 
 @app.websocket("/ocpp/{charge_point_id}")
 async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
-    """OCPP 1.6 WebSocket endpoint (same port as REST when OCPP_USE_SAME_PORT=true).
+    """Emergency-fallback OCPP 1.6 endpoint on the API service.
+
+    This endpoint is not the primary production runtime. The legacy
+    ``src/websocket_handler`` service is the canonical OCPP path.
 
     Security (C1): the upgrade is gated by OCPP-J Security Profile 1 Basic Auth.
     The Authorization header is verified against ``station_credentials`` BEFORE
@@ -2719,14 +3142,19 @@ async def list_my_depots(user: dict = Depends(ensure_tenant_mirrored)):
                 depots = await db_queries.get_all_depots(conn)
             return {"depots": depots, "needs_setup": False, "viewer": viewer}
 
-        if role not in ("customer_admin", "customer_operator"):
-            return {"depots": [], "needs_setup": False, "viewer": viewer}
-
         if not org_id:
             return {"depots": [], "needs_setup": False, "viewer": viewer}
 
         async with db_pools.static.acquire() as conn:
             depots = await db_queries.get_depots_for_organization(conn, org_id)
+
+        if role not in ("customer_admin", "customer_operator"):
+            # Role not yet provisioned in app_metadata (e.g. new customer whose
+            # favonius_role hasn't been set in Supabase yet). Withhold depot
+            # details but return the correct needs_setup signal so the wizard
+            # remains visible rather than silently hiding behind a false False.
+            return {"depots": [], "needs_setup": len(depots) == 0, "viewer": viewer}
+
         return {
             "depots": depots,
             "needs_setup": len(depots) == 0,
@@ -2787,6 +3215,102 @@ async def get_depot_metadata(
             extra={"depot_id": depot_id},
         )
         raise DatabaseError(f"Database error: {str(e)}")
+
+
+@app.get(
+    "/depots/{depot_id}/liveness/stream",
+    tags=["depots"],
+    summary="SSE stream of charger liveness signals",
+    description="""
+    Long-lived Server-Sent Events stream that pushes one event per
+    received OCPP frame from any charger in the caller's organisation,
+    rate-limited at the source to one per ~10s per charger.
+
+    Event payload:
+    ```
+    data: {"station_id": "<ocpp_id>", "last_interaction_at": "<iso8601>"}
+    ```
+
+    Plus a ``:keepalive`` SSE comment every 25s so intermediate proxies
+    (Railway, nginx, etc.) don't reap the connection on idle days.
+
+    **Authentication:** same JWT + depot-access tier as
+    ``GET /depots/{depot_id}/state``. Subscribers are scoped to their
+    organisation — events for other tenants never reach this stream.
+    """,
+)
+async def depot_liveness_stream(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Subscribe to depot-scoped liveness events for the caller.
+
+    The hub is process-wide and fans out by organisation; this endpoint
+    applies a depot-level station filter before emitting SSE frames so
+    callers only receive chargers that belong to ``depot_id``.
+    """
+    if liveness_hub is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "LIVENESS_HUB_UNAVAILABLE",
+                "message": "Liveness stream not initialised",
+            },
+        )
+    organization_id = (user.get("app_metadata") or {}).get("organization_id")
+    # favonius_admin without an org claim: surface the requirement clearly
+    # rather than returning a stream that can never receive events.
+    if not organization_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "ORG_SCOPE_REQUIRED",
+                "message": "Liveness stream requires organization_id in the token",
+            },
+        )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.static.acquire() as conn:
+        station_rows = await conn.fetch(
+            "SELECT station_id FROM charging_stations WHERE site_id = $1::uuid",
+            depot_id,
+        )
+    depot_station_ids = {row["station_id"] for row in station_rows if row["station_id"]}
+
+    queue = liveness_hub.subscribe(str(organization_id))
+
+    async def _iterator() -> AsyncIterator[bytes]:
+        # Keepalive cadence in seconds; long enough that we don't waste
+        # bandwidth, short enough to outpace common proxy idle reapers.
+        keepalive_s = 25.0
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=keepalive_s)
+                except asyncio.TimeoutError:
+                    # Idle — emit a comment line so the proxy keeps the
+                    # connection open. Browser EventSource ignores comments.
+                    yield b": keepalive\n\n"
+                    continue
+                if event is None:
+                    # Hub-stopped sentinel.
+                    return
+                if event.get("station_id") not in depot_station_ids:
+                    continue
+                yield (f"data: {json.dumps(event, default=str)}\n\n").encode("utf-8")
+        finally:
+            liveness_hub.unsubscribe(str(organization_id), queue)
+
+    return StreamingResponse(
+        _iterator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get(
@@ -2860,6 +3384,7 @@ async def create_vehicle_identity(
             )
         await _audit_identity_write(user, depot_id, "vehicle.create", vehicle["vehicle_id"])
         _depot_config_cache.pop(depot_id, None)
+        _fleet_list_cache.pop((depot_id, "vehicles"), None)
         return vehicle
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
@@ -2907,6 +3432,7 @@ async def update_vehicle_identity(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
         await _audit_identity_write(user, depot_id, "vehicle.update", vehicle_id)
         _depot_config_cache.pop(depot_id, None)
+        _fleet_list_cache.pop((depot_id, "vehicles"), None)
         return vehicle
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
@@ -2946,6 +3472,7 @@ async def set_vehicle_primary_id_tag(
         if vehicle is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
         await _audit_identity_write(user, depot_id, "vehicle.primary_id_tag", vehicle_id)
+        _fleet_list_cache.pop((depot_id, "vehicles"), None)
         return vehicle
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
@@ -3123,6 +3650,363 @@ async def update_rfid_card(
         raise _handle_identity_unique_violation(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+# ============ Historical charging-sessions XLSX import ============
+
+# Strict format the frontend RFID-bulk parser already emits ("YYYY-MM-DD HH:mm").
+# Accept seconds optionally so an export with finer granularity still works.
+_IMPORT_TS_FORMATS: tuple[str, ...] = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S")
+
+
+def _parse_import_local_timestamp(value: str, tz: ZoneInfo, *, field: str) -> datetime:
+    """Parse a depot-local timestamp string and return its UTC datetime."""
+    text = (value or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.MISSING_REQUIRED_FIELD.value,
+                "detail": f"{field} is required",
+                "field": field,
+            },
+        )
+    for fmt in _IMPORT_TS_FORMATS:
+        try:
+            naive = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                "detail": "Expected 'YYYY-MM-DD HH:mm' in the depot's local timezone",
+                "field": field,
+            },
+        )
+    return naive.replace(tzinfo=tz).astimezone(timezone.utc)
+
+
+def _compute_import_row_hash(
+    *,
+    depot_id: str,
+    start_time_utc: datetime,
+    id_tag: str,
+    energy_delivered_kwh: float,
+    revenue: float,
+) -> str:
+    """SHA-256 of the canonical row tuple, used for idempotent re-uploads."""
+    canonical = "|".join(
+        [
+            depot_id,
+            start_time_utc.isoformat(),
+            id_tag,
+            f"{float(energy_delivered_kwh):.6f}",
+            f"{float(revenue):.6f}",
+        ]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_PLATFORM_IMPORT_ID_TOKEN = "platform-start"
+
+
+def _is_platform_initiated_import_row(request: HistoricalSessionImport) -> bool:
+    """Return True when import row has no RFID/card identifier data."""
+    return not (request.rfid_label or request.id_tag)
+
+
+def _platform_import_hash_token(
+    request: HistoricalSessionImport,
+    *,
+    end_time_utc: Optional[datetime],
+) -> str:
+    """Build a richer dedup token for platform-initiated import rows.
+
+    Platform-start imports intentionally store a constant id_token
+    (``platform-start``) in ``charging_sessions.id_token`` so reports can
+    classify their origin. Using only that constant in ``import_row_hash``
+    can falsely dedup distinct sessions that share minute-level start time,
+    energy, and revenue. This helper keeps persisted ``id_token`` stable
+    while adding additional request fields to the hash input.
+    """
+    payload = {
+        "id_token": _PLATFORM_IMPORT_ID_TOKEN,
+        "end_time_utc": end_time_utc.isoformat() if end_time_utc else "",
+        "transaction_type": request.transaction_type or "",
+        "status": request.status or "",
+        "user_full_name": request.user_full_name or "",
+        "station_owner_full_name": request.station_owner_full_name or "",
+    }
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"{_PLATFORM_IMPORT_ID_TOKEN}:{hashlib.sha256(canonical_payload.encode('utf-8')).hexdigest()}"
+
+
+async def _resolve_import_id_tag(
+    conn: asyncpg.Connection,
+    *,
+    depot_id: str,
+    id_tag: Optional[str],
+    rfid_label: Optional[str] = None,
+) -> dict[str, Optional[str]]:
+    """Resolve RFID identity against vehicles + rfid_cards scoped to this depot.
+
+    Resolution order:
+      1. ``rfid_label`` matched against ``rfid_cards.label`` (case-insensitive)
+      2. ``id_tag`` matched against ``vehicles.id_tag``
+      3. ``id_tag`` matched against ``rfid_cards.id_tag``
+      4. Returns all-None — the row is imported unmatched so the FE can surface
+         an "unmatched" badge.
+    """
+    _CARD_ASSIGNMENT_SUBQUERIES = """
+        (
+            SELECT cva.vehicle_id::text
+            FROM rfid_card_vehicle_assignments cva
+            JOIN vehicles v ON v.id = cva.vehicle_id
+            WHERE cva.card_id = c.id
+              AND v.site_id = c.site_id
+              AND COALESCE(v.status, 'active') = 'active'
+            ORDER BY v.external_id
+            LIMIT 1
+        ) AS vehicle_id,
+        (
+            SELECT cda.driver_id::text
+            FROM rfid_card_driver_assignments cda
+            JOIN drivers dr ON dr.id = cda.driver_id
+            WHERE cda.card_id = c.id
+              AND dr.site_id = c.site_id
+              AND dr.status = 'active'
+            ORDER BY dr.display_name
+            LIMIT 1
+        ) AS driver_id
+    """
+
+    if rfid_label:
+        label_row = await conn.fetchrow(
+            f"""
+            SELECT c.id::text AS card_id, {_CARD_ASSIGNMENT_SUBQUERIES}
+            FROM rfid_cards c
+            WHERE LOWER(c.label) = LOWER($1)
+              AND c.site_id = $2::uuid
+              AND c.status = 'active'
+            LIMIT 1
+            """,
+            rfid_label,
+            depot_id,
+        )
+        if label_row:
+            return {
+                "vehicle_id": label_row["vehicle_id"],
+                "card_id": label_row["card_id"],
+                "driver_id": label_row["driver_id"],
+            }
+
+    if id_tag:
+        vehicle_row = await conn.fetchrow(
+            """
+            SELECT id::text AS vehicle_id
+            FROM vehicles
+            WHERE id_tag = $1
+              AND site_id = $2::uuid
+              AND COALESCE(status, 'active') = 'active'
+            LIMIT 1
+            """,
+            id_tag,
+            depot_id,
+        )
+        if vehicle_row:
+            return {
+                "vehicle_id": vehicle_row["vehicle_id"],
+                "card_id": None,
+                "driver_id": None,
+            }
+
+        card_row = await conn.fetchrow(
+            f"""
+            SELECT c.id::text AS card_id, {_CARD_ASSIGNMENT_SUBQUERIES}
+            FROM rfid_cards c
+            WHERE c.id_tag = $1
+              AND c.site_id = $2::uuid
+              AND c.status = 'active'
+            LIMIT 1
+            """,
+            id_tag,
+            depot_id,
+        )
+        if card_row:
+            return {
+                "vehicle_id": card_row["vehicle_id"],
+                "card_id": card_row["card_id"],
+                "driver_id": card_row["driver_id"],
+            }
+
+    return {"vehicle_id": None, "card_id": None, "driver_id": None}
+
+
+@app.post(
+    "/admin/depots/{depot_id}/charging-sessions/import",
+    response_model=HistoricalSessionImportResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Import a historical charging-session row from an XLSX upload",
+)
+async def import_historical_charging_session(
+    depot_id: str,
+    request: HistoricalSessionImport,
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> HistoricalSessionImportResponse:
+    """Insert one historical charging session for the Reports / Energy accounting backfill.
+
+    Mirrors the bulk-RFID dialog pattern: the frontend parses the XLSX and POSTs
+    one row per call. Imported rows are scoped by ``site_id`` and use a
+    deterministic placeholder ``station_id`` so they do not require a
+    matching ``charging_stations`` row.
+    """
+    org_id = _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools or db_pools.ts is None:
+        raise DatabaseError("Database not available")
+
+    # Look up the depot timezone (and confirm it belongs to caller's org).
+    async with db_pools.static.acquire() as static_conn:
+        depot_row = await static_conn.fetchrow(
+            """
+            SELECT timezone
+            FROM sites
+            WHERE id = $1::uuid AND organization_id = $2::uuid
+            """,
+            depot_id,
+            org_id,
+        )
+        if depot_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error_code": ErrorCode.DEPOT_NOT_FOUND.value,
+                    "detail": "Depot not found",
+                },
+            )
+        timezone_name = depot_row["timezone"] or "America/Los_Angeles"
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+
+        is_platform_initiated = _is_platform_initiated_import_row(request)
+        if is_platform_initiated:
+            identity = {"vehicle_id": None, "card_id": None, "driver_id": None}
+        else:
+            identity = await _resolve_import_id_tag(
+                static_conn,
+                depot_id=depot_id,
+                id_tag=request.id_tag,
+                rfid_label=request.rfid_label,
+            )
+
+    start_time_utc = _parse_import_local_timestamp(
+        request.start_time_local, tz, field="start_time_local"
+    )
+    # Persist end_time for any caller-supplied value, not just status="Finished".
+    # The source export emits multiple terminal/non-terminal statuses (Finished,
+    # ConnectedStoppedByEv, Charging, ...) and we let them all round-trip the
+    # `end_time` cell when present. Status semantics live on `import_status`
+    # (free text); the only timestamp invariant we still enforce is monotonic
+    # ordering relative to start.
+    end_time_utc: Optional[datetime] = None
+    if request.end_time_local:
+        end_time_utc = _parse_import_local_timestamp(
+            request.end_time_local, tz, field="end_time_local"
+        )
+        if end_time_utc < start_time_utc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                    "detail": "end_time_local must be on or after start_time_local",
+                },
+            )
+
+    if not math.isfinite(request.energy_delivered_kwh):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.INVALID_ENERGY.value,
+                "detail": "energy_delivered_kwh must be a finite, non-negative number",
+            },
+        )
+
+    # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
+    # When both identifiers are absent, classify as platform-initiated import.
+    id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
+    hash_id_token = (
+        _platform_import_hash_token(request, end_time_utc=end_time_utc)
+        if is_platform_initiated
+        else id_token
+    )
+    row_hash = _compute_import_row_hash(
+        depot_id=depot_id,
+        start_time_utc=start_time_utc,
+        id_tag=hash_id_token,
+        energy_delivered_kwh=request.energy_delivered_kwh,
+        revenue=request.revenue,
+    )
+    placeholder_station_id = f"imported:{depot_id}"
+
+    try:
+        async with db_pools.ts.acquire() as ts_conn:
+            session_id = await ts_conn.fetchval(
+                """
+                INSERT INTO charging_sessions (
+                    station_id, evse_id, connector_id,
+                    vehicle_id, id_token, driver_id, card_id,
+                    start_time, end_time,
+                    energy_delivered_kwh, cost_total,
+                    site_id, source,
+                    import_batch_id, import_row_hash,
+                    import_user_full_name, import_station_owner, import_status
+                )
+                VALUES (
+                    $1, 0, 0,
+                    $2, $3, $4::uuid, $5::uuid,
+                    $6, $7,
+                    $8, $9,
+                    $10::uuid, 'import',
+                    $11::uuid, $12,
+                    $13, $14, $15
+                )
+                RETURNING session_id::text
+                """,
+                placeholder_station_id,
+                identity["vehicle_id"],
+                id_token,
+                identity["driver_id"],
+                identity["card_id"],
+                start_time_utc,
+                end_time_utc,
+                request.energy_delivered_kwh,
+                request.revenue,
+                depot_id,
+                str(request.import_batch_id),
+                row_hash,
+                request.user_full_name,
+                request.station_owner_full_name,
+                request.status,
+            )
+    except asyncpg.UniqueViolationError as exc:
+        raise _handle_identity_unique_violation(exc) from exc
+
+    await _audit_identity_write(user, depot_id, "charging_session.import", str(session_id))
+    return HistoricalSessionImportResponse(
+        session_id=str(session_id),
+        matched=HistoricalSessionImportMatched(
+            vehicle_id=identity["vehicle_id"],
+            card_id=identity["card_id"],
+            driver_id=identity["driver_id"],
+        ),
+    )
 
 
 @app.post(
@@ -4249,6 +5133,47 @@ class EnergyReportResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# ── Report & AgentAction models ───────────────────────────────────────────────
+
+
+class Report(BaseModel):
+    """A persisted report row."""
+
+    id: str
+    depot_id: str
+    title: str
+    kind: str = Field(..., description="weekly_ops | monthly_savings | monthly_consumption | incident | compliance")
+    status: str = Field(..., description="draft | pending | approved")
+    period_start: datetime
+    period_end: datetime
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    export_url: Optional[str] = None
+    group_by: Optional[str] = Field(None, description="card | vehicle — only set for monthly_consumption")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AgentAction(BaseModel):
+    """A proposed / shadow / executed agent-generated action."""
+
+    id: str
+    depot_id: str
+    agent_type: str
+    action_class: str
+    mode: str = Field(..., description="shadow | proposed | auto_notify | auto_silent")
+    status: str = Field(..., description="pending | executed | rejected | rolled_back | failed | shadow")
+    summary: str
+    entity_type: Optional[str] = Field(None, description="charger | vehicle | site | session")
+    entity_id: Optional[str] = None
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+    payload: Optional[dict] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 def _parse_report_date(value: str, field_name: str) -> date:
     """Parse an ISO 8601 calendar date for the from/to query parameters."""
     try:
@@ -4363,13 +5288,15 @@ async def _fetch_session_rows(
     charger_id_by_ocpp_id: dict[str, str],
     from_date: date,
     to_date: date,
+    ts_conn: Optional[asyncpg.Connection] = None,
 ) -> list[SessionRow]:
     """Fetch charging_sessions rows in [from, to] (inclusive) in depot TZ."""
     if not db_pools or db_pools.ts is None:
         raise DatabaseError("Database not available")
-    if not ocpp_ids:
-        return []
 
+    # Match live OCPP rows by their station_id and imported (XLSX backfill) rows
+    # by site_id directly. Imported rows carry a synthetic station_id that has
+    # no charging_stations row, so they must be selected via cs.site_id.
     query = """
         SELECT
             cs.start_time,
@@ -4381,14 +5308,20 @@ async def _fetch_session_rows(
             cs.driver_id::text AS driver_id,
             cs.card_id::text AS card_id
         FROM charging_sessions cs
-        WHERE cs.station_id = ANY($1::text[])
+        WHERE (
+                cs.station_id = ANY($1::text[])
+                OR (cs.site_id = $5::uuid AND cs.source = 'import')
+              )
           AND cs.start_time >= ($2::date)::timestamp AT TIME ZONE $4
           AND cs.start_time < (($3::date) + INTERVAL '1 day')::timestamp AT TIME ZONE $4
         ORDER BY cs.start_time
         """
 
-    async with db_pools.ts.acquire() as conn:
-        records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name)
+    if ts_conn is None:
+        async with db_pools.ts.acquire() as conn:
+            records = await conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name, depot_id)
+    else:
+        records = await ts_conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name, depot_id)
 
     rows: list[SessionRow] = []
     for r in records:
@@ -4409,11 +5342,21 @@ async def _fetch_session_rows(
     return rows
 
 
+def _session_matches_search(row: SessionRow, search_lower: str) -> bool:
+    """Return True if any ID field of the session contains ``search_lower``."""
+    return any(
+        f is not None and search_lower in f.lower()
+        for f in (row.vehicle_id, row.charger_id, row.driver_id, row.card_id)
+    )
+
+
 async def _build_energy_report(
     depot_id: str,
     from_str: str,
     to_str: str,
     group_by: Optional[str],
+    *,
+    search: Optional[str] = None,
 ) -> tuple[dict, list[dict], str]:
     """Run the full report pipeline and return (metadata, rows, currency)."""
     from_date = _parse_report_date(from_str, "from")
@@ -4430,6 +5373,9 @@ async def _build_energy_report(
     sessions = await _fetch_session_rows(
         depot_id, timezone_name, ocpp_ids, charger_id_by_ocpp_id, from_date, to_date
     )
+    if search:
+        search_lower = search.lower()
+        sessions = [s for s in sessions if _session_matches_search(s, search_lower)]
     rows = aggregate_energy_rows(
         sessions,
         timezone=timezone_name,
@@ -4477,6 +5423,13 @@ async def get_energy_report_monthly(
         None,
         description="Optional grouping dimension: vehicle | charger | driver | card",
     ),
+    search: Optional[str] = Query(
+        None,
+        description=(
+            "Case-insensitive substring filter applied to vehicle_id, charger_id, "
+            "driver_id, and card_id before aggregation."
+        ),
+    ),
     user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Monthly energy + cost rollup for a depot."""
@@ -4485,7 +5438,7 @@ async def get_energy_report_monthly(
     grouping = _validate_report_group_by(group_by)
 
     try:
-        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping, search=search)
     except DepotNotFoundError:
         raise
     except asyncpg.PostgresError as exc:
@@ -4576,6 +5529,7 @@ async def get_energy_report_monthly_csv(
     from_: str = Query(..., alias="from"),
     to: str = Query(...),
     group_by: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Stream the monthly energy report as CSV."""
@@ -4584,7 +5538,7 @@ async def get_energy_report_monthly_csv(
     grouping = _validate_report_group_by(group_by)
 
     try:
-        _, rows, _ = await _build_energy_report(depot_id, from_, to, grouping)
+        _, rows, _ = await _build_energy_report(depot_id, from_, to, grouping, search=search)
     except DepotNotFoundError:
         raise
     except asyncpg.PostgresError as exc:
@@ -4606,6 +5560,343 @@ async def get_energy_report_monthly_csv(
         yield from stream_rows_as_csv(rows_for_stream, group_by=grouping)
 
     return StreamingResponse(_generate(), media_type="text/csv", headers=headers)
+
+
+# ── Reports CRUD endpoints ────────────────────────────────────────────────────
+
+
+def _row_to_report(row: asyncpg.Record) -> Report:
+    """Convert an asyncpg Record from the reports table to a Report model."""
+    return Report(
+        id=str(row["id"]),
+        depot_id=str(row["depot_id"]),
+        title=row["title"],
+        kind=row["kind"],
+        status=row["status"],
+        period_start=row["period_start"],
+        period_end=row["period_end"],
+        created_at=row["created_at"],
+        approved_at=row["approved_at"],
+        approved_by=row["approved_by"],
+        export_url=row["export_url"],
+        group_by=row["group_by"],
+    )
+
+
+@app.get(
+    "/depots/{depot_id}/reports",
+    response_model=list[Report],
+    tags=["depots"],
+    summary="List reports for a depot",
+    description="Returns all reports for the depot, ordered by created_at descending.",
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_reports(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> list[Report]:
+    """GET /depots/{depot_id}/reports — list reports ordered by created_at desc."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, depot_id, title, kind, status, period_start, period_end,
+                   created_at, approved_at, approved_by, export_url, group_by
+            FROM reports
+            WHERE depot_id = $1::uuid
+            ORDER BY created_at DESC
+            """,
+            depot_id,
+        )
+
+    return [_row_to_report(r) for r in rows]
+
+
+class CreateReportRequest(BaseModel):
+    """Body for POST /depots/{depot_id}/reports."""
+
+    kind: str = Field(..., description="weekly_ops | monthly_savings | monthly_consumption | incident | compliance")
+    title: Optional[str] = Field(None)
+    group_by: Optional[str] = Field(None, alias="groupBy")
+    period_start: Optional[str] = Field(None, alias="periodStart")
+    period_end: Optional[str] = Field(None, alias="periodEnd")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@app.post(
+    "/depots/{depot_id}/reports",
+    response_model=Report,
+    status_code=201,
+    tags=["depots"],
+    summary="Create a draft report",
+    description=(
+        "Create a draft Report row. For kind='monthly_consumption' the aggregation "
+        "runs inline against charging_sessions data and is stored as JSONB for later export."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def create_report(
+    body: CreateReportRequest,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> Report:
+    """POST /depots/{depot_id}/reports — create a draft report."""
+    params = {
+        "kind": body.kind,
+        "title": body.title,
+        "groupBy": body.group_by,
+        "periodStart": body.period_start,
+        "periodEnd": body.period_end,
+    }
+    result = await _handle_reports_generate(params, depot_id, dry_run=False, user=user)
+
+    # Re-fetch the created row to return a full Report object.
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, depot_id, title, kind, status, period_start, period_end,
+                   created_at, approved_at, approved_by, export_url, group_by
+            FROM reports
+            WHERE id = $1::uuid
+            """,
+            result["reportId"],
+        )
+    if not row:
+        raise HTTPException(status_code=500, detail="Report created but not retrievable")
+    return _row_to_report(row)
+
+
+@app.get(
+    "/depots/{depot_id}/reports/{report_id}",
+    response_model=Report,
+    tags=["depots"],
+    summary="Get a single report",
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Report not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_report(
+    report_id: str,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> Report:
+    """GET /depots/{depot_id}/reports/{report_id}."""
+    validate_uuid(report_id, "report_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, depot_id, title, kind, status, period_start, period_end,
+                   created_at, approved_at, approved_by, export_url, group_by
+            FROM reports
+            WHERE id = $1::uuid AND depot_id = $2::uuid
+            """,
+            report_id,
+            depot_id,
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+
+    return _row_to_report(row)
+
+
+@app.get(
+    "/depots/{depot_id}/reports/{report_id}/export",
+    tags=["depots"],
+    summary="Export an approved report as CSV",
+    description=(
+        "Streams the report as CSV. Only available for approved reports with stored data. "
+        "Returns 404 for draft/pending reports or kinds without stored data."
+    ),
+    responses={
+        200: {"content": {"text/csv": {}}, "description": "CSV export"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Report not found or not yet approved"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def export_report(
+    report_id: str,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> StreamingResponse:
+    """GET /depots/{depot_id}/reports/{report_id}/export — stream report as CSV."""
+    validate_uuid(report_id, "report_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT kind, status, group_by, data FROM reports WHERE id = $1::uuid AND depot_id = $2::uuid",
+            report_id,
+            depot_id,
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+    if row["status"] != "approved":
+        raise HTTPException(
+            status_code=404,
+            detail="Report is not yet approved; export is only available for approved reports",
+        )
+    if row["data"] is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No export data available for {row['kind']} reports",
+        )
+
+    stored = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
+    agg_rows: list[dict] = stored.get("rows", [])
+    group_by: Optional[str] = row["group_by"]
+
+    filename = f"report_{report_id}.csv"
+    headers_resp = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    rows_for_stream = agg_rows
+
+    def _generate() -> Iterator[str]:
+        yield from stream_rows_as_csv(rows_for_stream, group_by=group_by)
+
+    return StreamingResponse(_generate(), media_type="text/csv", headers=headers_resp)
+
+
+# ── Agent Actions endpoint ─────────────────────────────────────────────────────
+
+
+def _row_to_agent_action(row: asyncpg.Record) -> AgentAction:
+    """Convert an asyncpg Record from agent_actions to an AgentAction model."""
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            payload = None
+    return AgentAction(
+        id=str(row["id"]),
+        depot_id=str(row["depot_id"]),
+        agent_type=row["agent_type"],
+        action_class=row["action_class"],
+        mode=row["mode"],
+        status=row["status"],
+        summary=row["summary"],
+        entity_type=row["entity_type"],
+        entity_id=row["entity_id"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+        payload=payload,
+    )
+
+
+@app.get(
+    "/depots/{depot_id}/agent-actions",
+    response_model=list[AgentAction],
+    tags=["depots"],
+    summary="List agent actions for a depot",
+    description=(
+        "Returns agent-proposed actions for the depot ordered by created_at descending. "
+        "Polled every 10 seconds by the frontend to surface new proposals."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_agent_actions(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> list[AgentAction]:
+    """GET /depots/{depot_id}/agent-actions — list actions ordered by created_at desc."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, depot_id, agent_type, action_class, mode, status, summary,
+                   entity_type, entity_id, created_at, resolved_at, payload
+            FROM agent_actions
+            WHERE depot_id = $1::uuid
+            ORDER BY created_at DESC
+            """,
+            depot_id,
+        )
+
+    return [_row_to_agent_action(r) for r in rows]
+
+
+# ── Autonomy-settings endpoint ─────────────────────────────────────────────────
+# Returns per-depot agent autonomy configuration.  The frontend uses this to
+# render the agents page and gate which action classes are surfaced.
+
+
+class AutonomySettings(BaseModel):
+    """Per-depot autonomous agent configuration."""
+
+    depot_id: str
+    enabled: bool = True
+    mode: str = Field(
+        "proposed",
+        description="Default action mode: shadow | proposed | auto_notify | auto_silent",
+    )
+    enabled_action_classes: list[str] = Field(
+        default_factory=lambda: ["report_draft"],
+        description="Action classes the agent is allowed to propose.",
+    )
+    auto_approve_threshold: Optional[float] = Field(
+        None,
+        description="Confidence threshold above which actions are auto-approved (null = never).",
+    )
+
+
+@app.get(
+    "/depots/{depot_id}/autonomy-settings",
+    response_model=AutonomySettings,
+    tags=["depots"],
+    summary="Get depot agent autonomy settings",
+    description=(
+        "Returns the autonomous agent configuration for the depot. "
+        "Settings are currently depot-level defaults; per-class overrides are not yet stored."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_autonomy_settings(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> AutonomySettings:
+    """GET /depots/{depot_id}/autonomy-settings."""
+    return AutonomySettings(
+        depot_id=depot_id,
+        enabled=True,
+        mode="proposed",
+        enabled_action_classes=["report_draft"],
+        auto_approve_threshold=None,
+    )
 
 
 @app.get(
@@ -4896,6 +6187,618 @@ async def get_depot_alerts(
             status_code=500,
             detail={"error_code": ErrorCode.INTERNAL_ERROR.value, "detail": "Failed to get alerts"},
         ) from e
+
+
+# ============ Fleet List Endpoints (chargers + vehicles) ============
+
+
+def _fleet_list_cache_get(depot_id: str, kind: str) -> Optional[dict]:
+    """Return a cached fleet list payload if it's fresh, else None."""
+    key = (depot_id, kind)
+    entry = _fleet_list_cache.get(key)
+    if entry is None:
+        return None
+    payload, cached_at = entry
+    if time.time() - cached_at >= _fleet_list_cache_ttl:
+        _fleet_list_cache.pop(key, None)
+        return None
+    return payload
+
+
+def _fleet_list_cache_set(depot_id: str, kind: str, payload: dict) -> None:
+    """Store a fleet list payload in the per-depot cache."""
+    _fleet_list_cache[(depot_id, kind)] = (payload, time.time())
+
+
+def _fleet_list_lock(depot_id: str, kind: str) -> asyncio.Lock:
+    """Return the single-flight lock for ``(depot_id, kind)``, creating it lazily."""
+    key = (depot_id, kind)
+    lock = _fleet_list_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _fleet_list_locks[key] = lock
+    return lock
+
+
+def _fleet_list_response(payload: dict) -> JSONResponse:
+    """Wrap a fleet list payload in a JSONResponse with Cache-Control."""
+    return JSONResponse(
+        content=payload,
+        headers={"Cache-Control": "max-age=5, stale-while-revalidate=10"},
+    )
+
+
+_RUNTIME_ENRICHMENT_DEGRADE_ERRORS = (
+    asyncpg.PostgresError,
+    asyncio.TimeoutError,
+)
+
+
+async def _safe_runtime_fetch(coro_factory, *, label: str, fallback_value=None):
+    """Run optional runtime enrichment without failing the static fleet list."""
+    if fallback_value is None:
+        fallback_value = {}
+    try:
+        return await coro_factory()
+    except _RUNTIME_ENRICHMENT_DEGRADE_ERRORS as exc:
+        logger.warning(
+            "Optional runtime enrichment failed for %s; using fallback: %s",
+            label,
+            exc,
+            exc_info=True,
+        )
+        return fallback_value
+
+
+@app.get(
+    "/depots/{depot_id}/chargers",
+    response_model=ChargerListResponse,
+    tags=["depots"],
+    summary="List chargers for a depot with live status",
+    description=(
+        "Static charger reference data from `charging_stations` joined with the "
+        "latest `connector_status` and any open `charging_sessions` rows. The "
+        "`status` field is a 4-state pill (`charging | idle | offline | fault`) "
+        "computed server-side; `ocpp_connector_status` exposes the raw OCPP "
+        "literal for tooltips and admin drilldown."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_chargers(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """List chargers for a depot with live status and any active session."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "chargers")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "chargers"):
+        cached = _fleet_list_cache_get(depot_id, "chargers")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                static_rows = await db_queries.list_chargers_for_depot(
+                    static_conn, depot_id=depot_id
+                )
+
+            ocpp_ids = [row["ocpp_id"] for row in static_rows]
+
+            connector_statuses: dict[str, dict] = {}
+            open_sessions: dict[str, dict] = {}
+            if ocpp_ids:
+
+                async def _fetch_connector_statuses():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.latest_connector_status_by_stations(
+                            ts_conn, ocpp_ids
+                        )
+
+                async def _fetch_open_sessions():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.open_sessions_by_stations(ts_conn, ocpp_ids)
+
+                connector_statuses = await _safe_runtime_fetch(
+                    _fetch_connector_statuses, label="charger connector status"
+                )
+                open_sessions = await _safe_runtime_fetch(
+                    _fetch_open_sessions, label="charger open sessions"
+                )
+
+            now = datetime.now(timezone.utc)
+            # Consult the LivenessHub in-memory cache for the freshest
+            # ``last_interaction_at`` per station — the cache is fed by
+            # every OCPP frame via pg_notify, including Heartbeats which
+            # the connector_status MAX query would miss.
+            def _live_lookup(ocpp_id: str):
+                if liveness_hub is None:
+                    return None
+                return liveness_hub.get_last_interaction(ocpp_id)
+
+            items = [
+                _fleet_list.format_charger_item(
+                    static_row,
+                    connector_status=connector_statuses.get(static_row["ocpp_id"]),
+                    open_session=open_sessions.get(static_row["ocpp_id"]),
+                    now=now,
+                    last_interaction_override=_live_lookup(static_row["ocpp_id"]),
+                )
+                for static_row in static_rows
+            ]
+
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            # NOTE: do not cache liveness-augmented payloads aggressively —
+            # the override only changes when an OCPP frame arrives, and
+            # the existing 2 s TTL is short enough that staleness is bounded.
+            _fleet_list_cache_set(depot_id, "chargers", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing chargers for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
+
+
+@app.get(
+    "/depots/{depot_id}/vehicles",
+    response_model=VehicleListResponse,
+    tags=["depots"],
+    summary="List vehicles for a depot with live state",
+    description=(
+        "Static vehicle reference data from `vehicles` joined with the latest "
+        "`telemetry`, any open `charging_sessions`, the next future `schedules` "
+        "row, and (if applicable) the currently active schedule window. The "
+        "`current_state.state` field is a 5-state pill "
+        "(`ready | charging | at_risk | in_route | offline`) computed server-side."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_vehicles(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """List vehicles for a depot with live state and next departure."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "vehicles")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "vehicles"):
+        cached = _fleet_list_cache_get(depot_id, "vehicles")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                static_rows = await db_queries.list_vehicles_for_depot(
+                    static_conn, depot_id=depot_id
+                )
+                charger_id_map = await db_queries.charger_id_by_ocpp_id(
+                    static_conn, depot_id=depot_id
+                )
+
+            vehicle_ids = [row["id"] for row in static_rows]
+
+            telemetry: dict[str, dict] = {}
+            sessions: dict[str, dict] = {}
+            next_departures: dict[str, dict] = {}
+            active_schedules: dict[str, dict] = {}
+            if vehicle_ids:
+                async with db_pools.ts.acquire() as ts_conn:
+                    telemetry = await _safe_runtime_fetch(
+                        lambda: db_queries.latest_telemetry_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle telemetry",
+                    )
+                    sessions = await _safe_runtime_fetch(
+                        lambda: db_queries.open_session_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle open sessions",
+                    )
+                    next_departures = await _safe_runtime_fetch(
+                        lambda: db_queries.next_departures_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle next departures",
+                    )
+                    active_schedules = await _safe_runtime_fetch(
+                        lambda: db_queries.active_schedule_by_vehicles(ts_conn, vehicle_ids),
+                        label="vehicle active schedules",
+                    )
+
+            now = datetime.now(timezone.utc)
+            items = [
+                _fleet_list.format_vehicle_item(
+                    static_row,
+                    telemetry=telemetry.get(static_row["id"]),
+                    open_session=sessions.get(static_row["id"]),
+                    next_departure=next_departures.get(static_row["id"]),
+                    active_schedule=active_schedules.get(static_row["id"]),
+                    charger_id_by_ocpp_id=charger_id_map,
+                    now=now,
+                )
+                for static_row in static_rows
+            ]
+
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            _fleet_list_cache_set(depot_id, "vehicles", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing vehicles for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
+
+
+# ===== Live Sessions / Realtime State Endpoints =====
+
+
+def _isoformat(value: Any) -> Optional[str]:
+    """Render a datetime as ISO 8601, or return None if value is falsy."""
+    return value.isoformat() if value else None
+
+
+def _encode_session_cursor(end_time: datetime, session_id: str) -> str:
+    """Opaque base64 cursor over ``(end_time_iso, session_id)``."""
+    raw = f"{end_time.isoformat()}|{session_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_session_cursor(cursor: str) -> tuple[datetime, str]:
+    """Inverse of :func:`_encode_session_cursor`. Raises HTTPException(400) on bad input."""
+    try:
+        decoded = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        ts_str, session_id = decoded.split("|", 1)
+        ts = datetime.fromisoformat(ts_str)
+        UUID(session_id)  # validate
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail="Invalid cursor") from exc
+    return ts, session_id
+
+
+@app.get(
+    "/depots/{depot_id}/sessions/active",
+    response_model=ActiveSessionsResponse,
+    tags=["depots"],
+    summary="List currently-open charging sessions for a depot",
+    description=(
+        "Replaces frontend reads of the Supabase `charging_sessions_active` "
+        "mirror table. Returns one row per open `charging_sessions` row "
+        "(`end_time IS NULL AND source='live'`) for any OCPP station belonging "
+        "to this depot. Live `current_power_kw` and `current_soc` are kept "
+        "fresh on the row by every MeterValues; poll this endpoint at the "
+        "same cadence the UI refreshes (5–15 s)."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_active_sessions(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """List currently-open charging sessions for a depot."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "sessions_active")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "sessions_active"):
+        cached = _fleet_list_cache_get(depot_id, "sessions_active")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                ocpp_id_map = await db_queries.charger_id_by_ocpp_id(
+                    static_conn, depot_id=depot_id
+                )
+            ocpp_ids = list(ocpp_id_map.keys())
+
+            rows: list[dict] = []
+            telemetry_by_station: dict[tuple[str, int], dict] = {}
+            if ocpp_ids:
+                async def _fetch():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.list_active_sessions_for_depot(
+                            ts_conn, station_ids=ocpp_ids
+                        )
+
+                rows = await _safe_runtime_fetch(
+                    _fetch, label="active sessions", fallback_value=[]
+                )
+
+                async def _fetch_telemetry():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.latest_telemetry_by_stations(ts_conn, ocpp_ids)
+
+                telemetry_by_station = await _safe_runtime_fetch(
+                    _fetch_telemetry,
+                    label="latest charger telemetry",
+                    fallback_value={},
+                )
+
+            items = []
+            for r in rows:
+                telemetry_row = telemetry_by_station.get((r["ocpp_id"], int(r["connector_id"])))
+                current_power = r.get("current_power_kw")
+                if current_power is None and telemetry_row:
+                    current_power = telemetry_row.get("current_power_kw")
+                current_soc = r.get("current_soc")
+                if current_soc is None and telemetry_row:
+                    current_soc = telemetry_row.get("current_soc")
+                sample_at = r.get("last_sample_at")
+                if sample_at is None and telemetry_row:
+                    sample_at = telemetry_row.get("last_seen_at")
+
+                items.append(
+                    {
+                        "session_id": r["session_id"],
+                        "ocpp_id": r["ocpp_id"],
+                        "connector_id": r["connector_id"],
+                        "vehicle_id": r.get("vehicle_id"),
+                        "started_at": _isoformat(r["started_at"]),
+                        "current_power_kw": float(current_power) if current_power is not None else None,
+                        "current_soc": float(current_soc) if current_soc is not None else None,
+                        "target_soc": (
+                            float(r["target_soc"]) if r.get("target_soc") is not None else None
+                        ),
+                        "estimated_end_at": _isoformat(r.get("estimated_end_at")),
+                        "last_sample_at": _isoformat(sample_at),
+                    }
+                )
+
+            now = datetime.now(timezone.utc)
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            _fleet_list_cache_set(depot_id, "sessions_active", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing active sessions for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
+
+
+@app.get(
+    "/depots/{depot_id}/sessions",
+    response_model=CompletedSessionsResponse,
+    tags=["depots"],
+    summary="Paginated completed charging sessions for a depot",
+    description=(
+        "Replaces frontend reads of the Supabase `charging_sessions_summary` "
+        "mirror table. Keyset pagination over `(end_time DESC, session_id "
+        "DESC)` so concurrent inserts don't shift pages. Includes both `live` "
+        "(OCPP-derived) and `import` (XLSX-backfilled) rows."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_sessions(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+    from_ts: Optional[datetime] = Query(
+        None, alias="from", description="Filter end_time >= this ISO 8601 timestamp"
+    ),
+    to_ts: Optional[datetime] = Query(
+        None, alias="to", description="Filter end_time < this ISO 8601 timestamp"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    cursor: Optional[str] = Query(
+        None, description="Opaque cursor returned in `next_cursor` from the prior page"
+    ),
+) -> CompletedSessionsResponse:
+    """Paginated completed charging sessions for a depot."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    if from_ts is not None and to_ts is not None and from_ts >= to_ts:
+        raise HTTPException(status_code=400, detail="`from` must be earlier than `to`")
+
+    cursor_tuple = _decode_session_cursor(cursor) if cursor else None
+
+    try:
+        async with db_pools.static.acquire() as static_conn:
+            ocpp_id_map = await db_queries.charger_id_by_ocpp_id(
+                static_conn, depot_id=depot_id
+            )
+        ocpp_ids = list(ocpp_id_map.keys())
+
+        async with db_pools.ts.acquire() as ts_conn:
+            rows = await db_queries.list_completed_sessions_for_depot(
+                ts_conn,
+                depot_id=depot_id,
+                station_ids=ocpp_ids,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                cursor=cursor_tuple,
+            )
+
+        items = [
+            CompletedSessionItem(
+                session_id=r["session_id"],
+                ocpp_id=r.get("ocpp_id"),
+                connector_id=r.get("connector_id"),
+                vehicle_id=r.get("vehicle_id"),
+                driver_id=r.get("driver_id"),
+                started_at=_isoformat(r["started_at"]),
+                ended_at=_isoformat(r["ended_at"]),
+                energy_delivered_kwh=(
+                    float(r["energy_delivered_kwh"])
+                    if r.get("energy_delivered_kwh") is not None
+                    else None
+                ),
+                energy_received_kwh=(
+                    float(r["energy_received_kwh"])
+                    if r.get("energy_received_kwh") is not None
+                    else None
+                ),
+                cost_total=(
+                    float(r["cost_total"]) if r.get("cost_total") is not None else None
+                ),
+                start_soc_percent=(
+                    float(r["start_soc_percent"])
+                    if r.get("start_soc_percent") is not None
+                    else None
+                ),
+                end_soc_percent=(
+                    float(r["end_soc_percent"])
+                    if r.get("end_soc_percent") is not None
+                    else None
+                ),
+                source=r.get("source") or "live",
+            )
+            for r in rows
+        ]
+
+        next_cursor = (
+            _encode_session_cursor(rows[-1]["ended_at"], rows[-1]["session_id"])
+            if len(rows) == limit
+            else None
+        )
+        return CompletedSessionsResponse(
+            items=items,
+            next_cursor=next_cursor,
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    except HTTPException:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error listing sessions for depot %s: %s",
+            depot_id,
+            exc,
+            exc_info=True,
+        )
+        raise DatabaseError() from exc
+
+
+@app.get(
+    "/depots/{depot_id}/vehicles/state",
+    response_model=VehicleRealtimeStateResponse,
+    tags=["depots"],
+    summary="Latest telemetry per vehicle in a depot",
+    description=(
+        "Replaces frontend reads of the Supabase `vehicle_realtime_state` "
+        "mirror table. Returns one row per vehicle in the depot that has at "
+        "least one telemetry sample. Lightweight by design — for the richer "
+        "vehicle list with schedule/state derivation, use "
+        "`GET /depots/{id}/vehicles`."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_vehicles_state(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> JSONResponse:
+    """Latest telemetry per vehicle for a depot."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    cached = _fleet_list_cache_get(depot_id, "vehicles_state")
+    if cached is not None:
+        return _fleet_list_response(cached)
+
+    async with _fleet_list_lock(depot_id, "vehicles_state"):
+        cached = _fleet_list_cache_get(depot_id, "vehicles_state")
+        if cached is not None:
+            return _fleet_list_response(cached)
+
+        try:
+            async with db_pools.static.acquire() as static_conn:
+                static_rows = await db_queries.list_vehicles_for_depot(
+                    static_conn, depot_id=depot_id
+                )
+            vehicle_ids = [row["id"] for row in static_rows]
+
+            rows: list[dict] = []
+            if vehicle_ids:
+                async def _fetch():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.latest_telemetry_for_depot_vehicles(
+                            ts_conn, vehicle_ids=vehicle_ids
+                        )
+
+                rows = await _safe_runtime_fetch(
+                    _fetch, label="vehicle realtime state", fallback_value=[]
+                )
+
+            items = [
+                {
+                    "vehicle_id": r["vehicle_id"],
+                    "charger_id": r.get("charger_id"),
+                    "soc": float(r["soc"]) if r.get("soc") is not None else None,
+                    "power_kw": (
+                        float(r["power_kw"]) if r.get("power_kw") is not None else None
+                    ),
+                    "is_plugged": r.get("is_plugged"),
+                    "last_seen_at": _isoformat(r["last_seen_at"]),
+                }
+                for r in rows
+            ]
+
+            now = datetime.now(timezone.utc)
+            payload = {"items": items, "fetched_at": now.isoformat()}
+            _fleet_list_cache_set(depot_id, "vehicles_state", payload)
+            return _fleet_list_response(payload)
+
+        except HTTPException:
+            raise
+        except asyncpg.PostgresError as exc:
+            logger.error(
+                "Database error listing vehicle state for depot %s: %s",
+                depot_id,
+                exc,
+                exc_info=True,
+            )
+            raise DatabaseError() from exc
 
 
 @app.post(
@@ -6186,6 +8089,341 @@ async def rotate_charger_credentials_endpoint(
     }
 
 
+@app.post(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize",
+    tags=["admin"],
+    summary="Authorize a charging session at a charger without an RFID scan",
+)
+async def manual_authorize_charger_endpoint(
+    depot_id: str,
+    charger_id: str,
+    body: dict = Body(...),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Mint a one-shot operator authorization override + dispatch RemoteStartTransaction.
+
+    Use case: an operator wants to start a charging session when the RFID
+    reader is broken or the driver has no card. Flow:
+
+      1. Validate caller is customer_admin (or favonius_admin) with tenant
+         access to the depot.
+      2. Reject if a recent unconsumed override already exists for this
+         connector (60 s cooldown — the de-facto idempotency).
+      3. Mint synthetic id_tag ``OP-<uuid>`` + insert a row into
+         ``operator_authorization_overrides`` (migration 031).
+      4. Enqueue a ``remote_start_transaction`` row in
+         ``charging_command_queue``; the WS handler's
+         ``ChargingCommandQueueConsumer`` drains it within ~2 s.
+      5. When the charger sends Authorize/StartTransaction with the
+         synthetic tag, ``RFIDAuthorizationService.authorize`` atomically
+         consumes the override and returns Accepted.
+      6. ``charger.manual_authorize`` audit_log row written.
+
+    Body:
+      - ``connector_id`` (int, required): 1-based connector to authorize.
+      - ``expires_in_seconds`` (int, optional, default 60, max 300): how
+        long the synthetic tag stays valid.
+      - ``reason`` (string, optional, max 200 chars): operator note for
+        the audit trail.
+
+    Idempotency: an ``Idempotency-Key`` header is accepted and recorded in
+    the audit metadata but the natural dedupe is the per-connector
+    cooldown — a second POST within 60 s returns 409 RECENT_OVERRIDE_EXISTS
+    regardless of whether the same key is sent.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin"):
+        raise _forbidden("FORBIDDEN_ROLE", "favonius_admin or customer_admin role required")
+
+    connector_id = body.get("connector_id")
+    if not isinstance(connector_id, int) or connector_id < 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "VALIDATION_ERROR",
+                "message": "connector_id must be a positive integer",
+            },
+        )
+
+    expires_in_seconds = body.get("expires_in_seconds", 60)
+    if not isinstance(expires_in_seconds, int) or not (1 <= expires_in_seconds <= 300):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "VALIDATION_ERROR",
+                "message": "expires_in_seconds must be an integer between 1 and 300",
+            },
+        )
+
+    reason = body.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str) or len(reason) > 200:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_code": "VALIDATION_ERROR",
+                    "message": "reason must be a string of at most 200 characters",
+                },
+            )
+
+    depot_row, _ = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name=("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
+    )
+    organization_id = depot_row.get("organization_id")
+    if not organization_id:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": "DEPOT_MISSING_ORG",
+                "message": "Depot has no organization assigned",
+            },
+        )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    # Resolve charger UUID → OCPP id for the queue dispatch.
+    async with db_pools.static.acquire() as conn:
+        charger_row = await conn.fetchrow(
+            """
+            SELECT station_id AS ocpp_id
+              FROM charging_stations
+             WHERE id = $1::uuid
+               AND site_id = $2::uuid
+            """,
+            charger_id,
+            depot_id,
+        )
+    if charger_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "CHARGER_NOT_FOUND",
+                "message": f"Charger {charger_id} not found in depot {depot_id}",
+            },
+        )
+    ocpp_id = charger_row["ocpp_id"]
+
+    synthetic_tag = f"OP-{uuid.uuid4().hex[:17]}"
+    audit_metadata = {
+        "endpoint": ("POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"),
+        "ocpp_id": ocpp_id,
+        "expires_in_seconds": expires_in_seconds,
+        "idempotency_key": idempotency_key,
+    }
+
+    # Atomic insert of override + queue row in the same TS transaction so a
+    # crash mid-call can't leave a queue row pointing at a missing override.
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            # Serialize manual authorization attempts per connector so the
+            # cooldown check and inserts are effectively atomic.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1), $2)",
+                ocpp_id,
+                connector_id,
+            )
+            now = datetime.now(timezone.utc)
+            expires_at = now + timedelta(seconds=expires_in_seconds)
+            recent = await conn.fetchrow(
+                """
+                SELECT id, expires_at, created_at
+                  FROM operator_authorization_overrides
+                 WHERE station_id = $1
+                   AND connector_id = $2
+                   AND created_at >= NOW() - INTERVAL '60 seconds'
+                ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                ocpp_id,
+                connector_id,
+            )
+            if recent is not None:
+                retry_after = max(
+                    int((recent["created_at"] + timedelta(seconds=60) - now).total_seconds()),
+                    1,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": "RECENT_OVERRIDE_EXISTS",
+                        "message": "A recent override exists for this connector",
+                        "retry_after_seconds": retry_after,
+                        "active_override_id": str(recent["id"]),
+                        "expires_at": recent["expires_at"].isoformat(),
+                    },
+                )
+            override_row = await conn.fetchrow(
+                """
+                INSERT INTO operator_authorization_overrides (
+                    station_id, id_tag, connector_id,
+                    organization_id, depot_id, expires_at, created_by,
+                    reason, audit_metadata
+                ) VALUES (
+                    $1, $2, $3, $4::uuid, $5::uuid, $6, $7::uuid, $8, $9::jsonb
+                )
+                RETURNING id, expires_at
+                """,
+                ocpp_id,
+                synthetic_tag,
+                connector_id,
+                str(organization_id),
+                depot_id,
+                expires_at,
+                user["sub"],
+                reason,
+                json.dumps(audit_metadata),
+            )
+            queue_id = int(
+                await conn.fetchval(
+                    """
+                    INSERT INTO charging_command_queue (
+                        charge_point_id, connector_id, command_type,
+                        payload, expires_at
+                    ) VALUES (
+                        $1, $2, 'remote_start_transaction',
+                        $3::jsonb,
+                        $4
+                    )
+                    RETURNING queue_id
+                    """,
+                    ocpp_id,
+                    connector_id,
+                    json.dumps({"id_tag": synthetic_tag}),
+                    expires_at,
+                )
+            )
+
+    try:
+        await _record_admin_action(
+            user=user,
+            action="charger.manual_authorize",
+            depot_id=depot_id,
+            organization_id_override=str(organization_id),
+            target_type="charger",
+            target_id=str(charger_id),
+            metadata={
+                "endpoint": (
+                    "POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize"
+                ),
+                "ocpp_id": ocpp_id,
+                "connector_id": connector_id,
+                "override_id": str(override_row["id"]),
+                "queue_id": queue_id,
+                "expires_at": override_row["expires_at"].isoformat(),
+                "reason": reason,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "manual authorize audit write failed for depot=%s charger=%s override=%s",
+            depot_id,
+            charger_id,
+            override_row["id"],
+            exc_info=True,
+        )
+
+    return {
+        "status": "Accepted",
+        "override_id": str(override_row["id"]),
+        "expires_at": override_row["expires_at"].isoformat(),
+        "queue_id": queue_id,
+        "transaction_started": False,
+    }
+
+
+@app.get(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/last_manual_override",
+    tags=["admin"],
+    summary="Most recent manual authorization for a charger (for the admin panel)",
+)
+async def get_last_manual_override_endpoint(
+    depot_id: str,
+    charger_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return the most recent manual authorize event for this charger.
+
+    Used by the charger detail page's "Last manual override" panel so the
+    operator can see who overrode authorization most recently. Returns
+    404 when no override has ever been issued for this charger.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin", "customer_operator"):
+        raise _forbidden(
+            "FORBIDDEN_ROLE",
+            "favonius_admin, customer_admin, or customer_operator role required",
+        )
+
+    await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name=("GET /admin/depots/{depot_id}/chargers/{charger_id}/last_manual_override"),
+    )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        charger_row = await conn.fetchrow(
+            """
+            SELECT station_id AS ocpp_id
+              FROM charging_stations
+             WHERE id = $1::uuid
+               AND site_id = $2::uuid
+            """,
+            charger_id,
+            depot_id,
+        )
+    if charger_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "CHARGER_NOT_FOUND",
+                "message": f"Charger {charger_id} not found in depot {depot_id}",
+            },
+        )
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, connector_id, created_at, created_by, reason,
+                   expires_at, consumed_at
+              FROM operator_authorization_overrides
+             WHERE station_id = $1
+            ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            charger_row["ocpp_id"],
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "NO_MANUAL_OVERRIDE",
+                "message": "No manual authorization has been issued for this charger",
+            },
+        )
+    return {
+        "id": str(row["id"]),
+        "connector_id": row["connector_id"],
+        "created_at": row["created_at"].isoformat(),
+        "created_by": str(row["created_by"]),
+        "reason": row["reason"],
+        "expires_at": row["expires_at"].isoformat(),
+        "consumed_at": row["consumed_at"].isoformat() if row["consumed_at"] else None,
+    }
+
+
 # ── Command Dispatcher ────────────────────────────────────────────────────────
 
 
@@ -6193,44 +8431,109 @@ async def _handle_charger_restart(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Restart a charger via OCPP RemoteReset.
 
-    Params: charger_id (UUID)
-    Rollback: not applicable (physical reset is irreversible; logged as ROLLBACK_IMPOSSIBLE).
+    Params:
+        charger_id: UUID of the target charger (charging_stations.id).
+        reset_type: 'Soft' (default) or 'Hard'.
+
+    Production runs with ``OCPP_SERVER_ENABLED=false`` on the API service —
+    live charger sockets live in the legacy WS handler. Dispatch is therefore
+    queue-mediated: we INSERT a ``remote_reset`` row into
+    ``charging_command_queue`` and the WS handler's ``ChargingCommandQueueConsumer``
+    drains it (typically within 2 s, sooner via pg_notify).
+
+    Reset is irreversible at the device, so the row is treated terminal on
+    first attempt by the consumer and the boot-replay path skips it. We use
+    a short 5-minute expiry so a stale request doesn't lurk in the queue.
     """
     charger_id = params.get("charger_id")
     if not charger_id:
         raise HTTPException(status_code=400, detail="params.charger_id is required")
     validate_uuid(charger_id, "charger_id")
 
-    if dry_run:
-        return {"charger_id": charger_id, "action": "RemoteReset", "simulated": True}
-
-    if ocpp_server is None:
-        raise HTTPException(status_code=503, detail="OCPP server not available")
-
-    try:
-        result = await ocpp_server.remote_reset(charger_id)
-        return {"charger_id": charger_id, "ocpp_result": result}
-    except Exception as e:
-        logger.warning(
-            "Charger restart ROLLBACK_IMPOSSIBLE — reset already sent",
-            extra={"charger_id": charger_id, "depot_id": depot_id, "error": str(e)},
-        )
+    reset_type = str(params.get("reset_type", "Soft"))
+    if reset_type not in {"Soft", "Hard"}:
         raise HTTPException(
-            status_code=500,
-            detail={
-                "error_code": ErrorCode.INTERNAL_ERROR.value,
-                "detail": "Charger restart failed",
-            },
-        ) from e
+            status_code=422,
+            detail="reset_type must be 'Soft' or 'Hard'",
+        )
+
+    if dry_run:
+        return {
+            "charger_id": charger_id,
+            "action": "RemoteReset",
+            "reset_type": reset_type,
+            "simulated": True,
+        }
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT station_id AS ocpp_id
+              FROM charging_stations
+             WHERE id = $1::uuid
+               AND site_id = $2::uuid
+            """,
+            charger_id,
+            depot_id,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Charger {charger_id} not found in depot {depot_id}",
+        )
+    ocpp_id = row["ocpp_id"]
+
+    async with db_pools.ts.acquire() as conn:
+        queue_id = int(
+            await conn.fetchval(
+                """
+                INSERT INTO charging_command_queue (
+                    charge_point_id, connector_id, command_type,
+                    payload, expires_at
+                ) VALUES (
+                    $1, 0, 'remote_reset',
+                    $2::jsonb,
+                    NOW() + INTERVAL '5 minutes'
+                )
+                RETURNING queue_id
+                """,
+                ocpp_id,
+                json.dumps({"type": reset_type}),
+            )
+        )
+
+    logger.info(
+        "Charger restart enqueued",
+        extra={
+            "charger_id": charger_id,
+            "ocpp_id": ocpp_id,
+            "depot_id": depot_id,
+            "reset_type": reset_type,
+            "queue_id": queue_id,
+        },
+    )
+    return {
+        "charger_id": charger_id,
+        "ocpp_id": ocpp_id,
+        "action": "RemoteReset",
+        "reset_type": reset_type,
+        "queue_id": queue_id,
+        "status": "enqueued",
+    }
 
 
 async def _handle_schedule_adjust(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Adjust a vehicle's charging schedule target.
 
@@ -6308,6 +8611,7 @@ async def _handle_depot_config_update(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Update mutable depot configuration (e.g. max_grid_kw).
 
@@ -6366,6 +8670,7 @@ async def _handle_optimization_run(
     params: dict,
     depot_id: str,
     dry_run: bool,
+    user: Optional[dict] = None,
 ) -> dict:
     """Trigger an immediate MILP optimization run.
 
@@ -6394,6 +8699,437 @@ async def _handle_optimization_run(
     return {"depot_id": depot_id, "horizon_hours": horizon_hours, "triggered": True}
 
 
+_VALID_REPORT_KINDS = frozenset(
+    {"weekly_ops", "monthly_savings", "monthly_consumption", "incident", "compliance"}
+)
+_VALID_REPORT_GROUP_BY = frozenset({"card", "vehicle"})
+
+
+async def _handle_reports_generate(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+    ts_conn: Optional[asyncpg.Connection] = None,
+) -> dict:
+    """Create a draft Report row.
+
+    For kind='monthly_consumption' the aggregation runs inline and is stored
+    as JSONB in reports.data so the export endpoint can stream without
+    re-querying.
+    """
+    kind = params.get("kind") or params.get("Kind")
+    if not kind:
+        raise HTTPException(status_code=400, detail="params.kind is required")
+    if kind not in _VALID_REPORT_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind '{kind}'. Valid: {sorted(_VALID_REPORT_KINDS)}",
+        )
+
+    title = params.get("title") or f"Report — {kind}"
+    group_by = params.get("groupBy") or params.get("group_by")
+
+    if kind == "monthly_consumption" and not group_by:
+        raise HTTPException(
+            status_code=400,
+            detail="params.groupBy is required for kind='monthly_consumption'",
+        )
+    if group_by and group_by not in _VALID_REPORT_GROUP_BY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown groupBy '{group_by}'. Valid: {sorted(_VALID_REPORT_GROUP_BY)}",
+        )
+
+    # Load depot timezone to resolve defaults and for UTC conversion.
+    timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
+        await _load_report_context(depot_id)
+    )
+    tz = ZoneInfo(timezone_name)
+
+    period_start_str = params.get("periodStart") or params.get("period_start")
+    period_end_str = params.get("periodEnd") or params.get("period_end")
+
+    if bool(period_start_str) != bool(period_end_str):
+        raise HTTPException(
+            status_code=400,
+            detail="periodStart and periodEnd must both be provided together",
+        )
+    if not period_start_str and not period_end_str:
+        from .monthly_scheduler import _prev_month_bounds  # noqa: PLC0415
+
+        period_start_str, period_end_str, _ = _prev_month_bounds(datetime.now(tz))
+
+    try:
+        period_start_date = date.fromisoformat(period_start_str)
+        period_end_date = date.fromisoformat(period_end_str)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid period date: {exc}",
+        ) from exc
+
+    if period_end_date < period_start_date:
+        raise HTTPException(status_code=400, detail="periodEnd must be on or after periodStart")
+
+    # Convert local calendar dates → UTC datetimes for storage.
+    # period_start = midnight at start of first day in depot TZ.
+    # period_end   = exclusive upper bound: midnight of day after last day in depot TZ.
+    period_start_utc = datetime(
+        period_start_date.year, period_start_date.month, period_start_date.day,
+        0, 0, 0, tzinfo=tz,
+    ).astimezone(timezone.utc)
+    _next_day = period_end_date + timedelta(days=1)
+    period_end_utc = datetime(
+        _next_day.year, _next_day.month, _next_day.day, 0, 0, 0, tzinfo=tz,
+    ).astimezone(timezone.utc)
+
+    if dry_run:
+        return {
+            "kind": kind,
+            "periodStart": period_start_str,
+            "periodEnd": period_end_str,
+            "title": title,
+            "groupBy": group_by,
+        }
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    # For monthly_consumption: run aggregation and persist result.
+    stored_data: Optional[str] = None
+    if kind == "monthly_consumption":
+        sessions = await _fetch_session_rows(
+            depot_id,
+            timezone_name,
+            ocpp_ids,
+            charger_id_by_ocpp_id,
+            period_start_date,
+            period_end_date,
+            ts_conn=ts_conn,
+        )
+        agg_rows = aggregate_energy_rows(
+            sessions,
+            timezone=timezone_name,
+            group_by=group_by,
+            under_cap_rate=under_cap_rate,
+            currency=currency,
+            from_date=period_start_date,
+            to_date=period_end_date,
+        )
+        stored_data = json.dumps(
+            {"rows": agg_rows, "currency": currency, "group_by": group_by}
+        )
+
+    async def _insert_report(conn: asyncpg.Connection) -> asyncpg.Record:
+        return await conn.fetchrow(
+            """
+            INSERT INTO reports
+                (depot_id, title, kind, status, period_start, period_end, group_by, data)
+            VALUES
+                ($1::uuid, $2, $3, 'draft', $4, $5, $6, $7::jsonb)
+            RETURNING id::text, created_at
+            """,
+            depot_id,
+            title,
+            kind,
+            period_start_utc,
+            period_end_utc,
+            group_by,
+            stored_data,
+        )
+
+    if ts_conn is None:
+        async with db_pools.ts.acquire() as conn:
+            row = await _insert_report(conn)
+    else:
+        row = await _insert_report(ts_conn)
+
+    return {
+        "reportId": str(row["id"]),
+        "status": "draft",
+        "createdAt": row["created_at"].isoformat(),
+        "title": title,
+        "kind": kind,
+        "groupBy": group_by,
+        "periodStart": period_start_str,
+        "periodEnd": period_end_str,
+    }
+
+
+async def _handle_reports_approve(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Approve a draft report: set status='approved', stamp approved_at/by, set export_url."""
+    report_id = params.get("reportId") or params.get("report_id")
+    if not report_id:
+        raise HTTPException(status_code=400, detail="params.reportId is required")
+    validate_uuid(report_id, "reportId")
+
+    if dry_run:
+        return {"reportId": report_id, "status": "approved"}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    approved_by = (user or {}).get("email") or (user or {}).get("sub")
+
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            report_row = await conn.fetchrow(
+                """
+                SELECT kind, data
+                FROM reports
+                WHERE id = $1::uuid
+                  AND depot_id = $2::uuid
+                  AND status IN ('draft', 'pending')
+                FOR UPDATE
+                """,
+                report_id,
+                depot_id,
+            )
+            if not report_row:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Report {report_id} not found or not in approvable status",
+                )
+
+            export_url: Optional[str] = None
+            if report_row["kind"] == "monthly_consumption" and report_row["data"] is not None:
+                export_url = f"/depots/{depot_id}/reports/{report_id}/export"
+
+            updated = await conn.fetchrow(
+                """
+                UPDATE reports
+                SET status      = 'approved',
+                    approved_at = NOW(),
+                    approved_by = $3,
+                    export_url  = $4
+                WHERE id = $1::uuid
+                  AND depot_id = $2::uuid
+                  AND status IN ('draft', 'pending')
+                RETURNING id::text, approved_at
+                """,
+                report_id,
+                depot_id,
+                approved_by,
+                export_url,
+            )
+
+    return {
+        "reportId": report_id,
+        "status": "approved",
+        "exportUrl": export_url,
+        "approvedAt": updated["approved_at"].isoformat(),
+    }
+
+
+async def _handle_agent_action_approve(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Approve a pending agent action.
+
+    When the action is a report_draft, this triggers the same effect as
+    reports.generate using the payload embedded in the action, then sets
+    the action status to 'executed'.
+    """
+    action_id = params.get("actionId") or params.get("action_id")
+    if not action_id:
+        raise HTTPException(status_code=400, detail="params.actionId is required")
+    validate_uuid(action_id, "actionId")
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    def _report_params_from_payload(payload: dict) -> dict:
+        return {
+            "kind": payload.get("kind"),
+            "title": payload.get("title"),
+            "groupBy": payload.get("groupBy"),
+            "periodStart": payload.get("periodStart"),
+            "periodEnd": payload.get("periodEnd"),
+        }
+
+    report_result: Optional[dict] = None
+    if dry_run:
+        async with db_pools.ts.acquire() as conn:
+            action_row = await conn.fetchrow(
+                """
+                SELECT action_class, status, payload
+                FROM agent_actions
+                WHERE id = $1::uuid AND depot_id = $2::uuid
+                """,
+                action_id,
+                depot_id,
+            )
+        if not action_row:
+            raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+        current_status = action_row["status"]
+        if current_status not in ("pending", "shadow"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Action is already '{current_status}' and cannot be approved",
+            )
+
+        if action_row["action_class"] == "report_draft":
+            payload = action_row["payload"] or {}
+            report_result = await _handle_reports_generate(
+                _report_params_from_payload(payload),
+                depot_id,
+                dry_run=True,
+                user=user,
+            )
+
+        result: dict = {"actionId": action_id, "actionStatus": "executed"}
+        if report_result:
+            result["report"] = report_result
+        return result
+
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            action_row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM agent_actions
+                WHERE id = $1::uuid AND depot_id = $2::uuid
+                FOR UPDATE
+                """,
+                action_id,
+                depot_id,
+            )
+            if not action_row:
+                raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+            current_status = action_row["status"]
+            if current_status not in ("pending", "shadow"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Action is already '{current_status}' and cannot be approved",
+                )
+
+            action_class = action_row["action_class"]
+
+            if action_class == "report_draft":
+                payload = action_row["payload"] or {}
+                report_result = await _handle_reports_generate(
+                    _report_params_from_payload(payload),
+                    depot_id,
+                    dry_run=False,
+                    user=user,
+                    ts_conn=conn,
+                )
+
+            updated = await conn.fetchrow(
+                """
+                UPDATE agent_actions
+                SET status = 'executed', resolved_at = NOW()
+                WHERE id = $1::uuid
+                  AND depot_id = $2::uuid
+                  AND status IN ('pending', 'shadow')
+                RETURNING id::text
+                """,
+                action_row["id"],
+                depot_id,
+            )
+            if not updated:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Action could not be approved because its status changed",
+                )
+
+    result: dict = {"actionId": action_id, "actionStatus": "executed"}
+    if report_result:
+        result["report"] = report_result
+    return result
+
+
+async def _handle_agent_action_reject(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Reject a pending agent action."""
+    action_id = params.get("actionId") or params.get("action_id")
+    if not action_id:
+        raise HTTPException(status_code=400, detail="params.actionId is required")
+    validate_uuid(action_id, "actionId")
+
+    if dry_run:
+        return {"actionId": action_id, "actionStatus": "rejected"}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await conn.fetchrow(
+            """
+            UPDATE agent_actions
+            SET status = 'rejected', resolved_at = NOW()
+            WHERE id = $1::uuid
+              AND depot_id = $2::uuid
+              AND status IN ('pending', 'shadow')
+            RETURNING id::text
+            """,
+            action_id,
+            depot_id,
+        )
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Action {action_id} not found or not in a rejectable state",
+        )
+    return {"actionId": action_id, "actionStatus": "rejected"}
+
+
+async def _handle_agent_action_rollback(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Roll back an executed agent action."""
+    action_id = params.get("actionId") or params.get("action_id")
+    if not action_id:
+        raise HTTPException(status_code=400, detail="params.actionId is required")
+    validate_uuid(action_id, "actionId")
+
+    if dry_run:
+        return {"actionId": action_id, "actionStatus": "rolled_back"}
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await conn.fetchrow(
+            """
+            UPDATE agent_actions
+            SET status = 'rolled_back', resolved_at = NOW()
+            WHERE id = $1::uuid
+              AND depot_id = $2::uuid
+              AND status = 'executed'
+            RETURNING id::text
+            """,
+            action_id,
+            depot_id,
+        )
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Action {action_id} not found or not in 'executed' state",
+        )
+    return {"actionId": action_id, "actionStatus": "rolled_back"}
+
+
 class _CommandSpec:
     """Registry entry for a dispatchable command."""
 
@@ -6419,6 +9155,26 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
         required_permission=Permission.OPTIMIZE_TRIGGER,
         handler=_handle_optimization_run,
     ),
+    "reports.generate": _CommandSpec(
+        required_permission=Permission.DEPOT_VIEW,
+        handler=_handle_reports_generate,
+    ),
+    "reports.approve": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_reports_approve,
+    ),
+    "agents.action.approve": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_agent_action_approve,
+    ),
+    "agents.action.reject": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_agent_action_reject,
+    ),
+    "agents.action.rollback": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_agent_action_rollback,
+    ),
 }
 
 
@@ -6438,6 +9194,11 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
     | `fleet.vehicle.schedule_adjust` | `depot:manage` (operator+) | `vehicle_id`, `target_soc`, `by_time` |
     | `depot.config.update` | `admin:config` (admin) | `max_grid_kw` |
     | `optimization.run` | `optimize:trigger` (operator+) | `horizon_hours` |
+    | `reports.generate` | `depot:view` (viewer+) | `kind`, `title`, `groupBy`, `periodStart`, `periodEnd` |
+    | `reports.approve` | `depot:manage` (operator+) | `reportId` |
+    | `agents.action.approve` | `depot:manage` (operator+) | `actionId` |
+    | `agents.action.reject` | `depot:manage` (operator+) | `actionId` |
+    | `agents.action.rollback` | `depot:manage` (operator+) | `actionId` |
 
     Set `dry_run: true` to validate and simulate the command without side effects.
     Every execution (real or dry-run) is written to the security audit log.
@@ -6483,7 +9244,7 @@ async def execute_command(
             detail=f"Insufficient permissions. Required: {spec.required_permission.value}",
         )
 
-    result = await spec.handler(body.params, body.depot_id, dry_run=body.dry_run)
+    result = await spec.handler(body.params, body.depot_id, dry_run=body.dry_run, user=user)
 
     audit = get_audit_logger()
     if audit is not None:

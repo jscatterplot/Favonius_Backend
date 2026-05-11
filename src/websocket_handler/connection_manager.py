@@ -179,7 +179,20 @@ class ConnectionManager:
     async def unregister_connection(
         self, station_id: str, connection_id: Optional[str] = None
     ) -> None:
-        """Unregister a WebSocket connection."""
+        """Unregister a WebSocket connection.
+
+        ``connection_id`` is treated as a guard: when supplied, the
+        ``station_connections`` mapping (and its derived ``last_heartbeats``)
+        is only popped if it currently points to this exact connection.
+
+        Without this guard, a "stale" cleanup — the original
+        ``_handle_connection`` task for connection A finishing late, after A
+        was already replaced by B via the ``station already connected``
+        path — would unconditionally remove the station→B mapping, leaving
+        B orphaned. Symptom: charger keeps reconnecting because every
+        existing session has its routing erased ~30 s after the next
+        connection arrives.
+        """
         try:
             # Find connection ID if not provided
             if not connection_id:
@@ -189,11 +202,19 @@ class ConnectionManager:
                 self.logger.warning(f"No connection found for station {station_id}")
                 return
 
-            # Remove from local storage
+            # Always remove the per-connection records — those are keyed by
+            # connection_id and never confused across two connections.
             self.connections.pop(connection_id, None)
-            self.station_connections.pop(station_id, None)
-            self.last_heartbeats.pop(station_id, None)
             stats = self.connection_stats.pop(connection_id, None)
+
+            # The station-level mapping must only be cleared if it still
+            # points to *this* connection. A late-finishing handler for a
+            # replaced connection must not erase the routing for the
+            # successor that took over.
+            current_connection_id = self.station_connections.get(station_id)
+            if current_connection_id == connection_id:
+                self.station_connections.pop(station_id, None)
+                self.last_heartbeats.pop(station_id, None)
 
             # PRD §10.5: observability metric for charger connectivity
             try:
@@ -348,27 +369,46 @@ class ConnectionManager:
         return len(self.connections)
 
     async def _monitor_connections(self) -> None:
-        """Monitor connection health in background."""
+        """Monitor connection health in background.
+
+        OCPP-frame inactivity alone is not a reliable liveness signal: some
+        chargers (e.g. ABB Terra AC firmware 1.8.x) only send StatusNotification
+        on state change and skip BootNotification on reconnect, going minutes
+        between OCPP frames while the WebSocket layer is healthy. We rely on
+        the websockets library's ping_interval/ping_timeout for true liveness
+        and only kill at the OCPP layer when either (a) the WS is closed or
+        (b) the session has been completely silent for ``absolute_silence_seconds``.
+        """
         while self._running:
             try:
                 now = time.time()
-                stale_threshold = now - (self.config.websocket.heartbeat_interval * 3)
-                stale_stations = []
+                quiet_threshold = now - (self.config.websocket.heartbeat_interval * 3)
+                absolute_silence_cutoff = now - self.config.websocket.absolute_silence_seconds
+                stations_to_kill: list[tuple[str, str]] = []
 
-                # Use copy to avoid dict modification during iteration
                 async with self._lock:
                     for station_id, last_heartbeat in self.last_heartbeats.copy().items():
-                        if last_heartbeat < stale_threshold:
-                            stale_stations.append(station_id)
+                        if last_heartbeat >= quiet_threshold:
+                            continue
 
-                # Cleanup stale connections
-                for station_id in stale_stations:
-                    self.logger.warning(f"Connection for station {station_id} appears stale")
+                        connection_id = self.station_connections.get(station_id)
+                        websocket = self.connections.get(connection_id) if connection_id else None
+                        if websocket is None or self._is_websocket_closed(websocket):
+                            stations_to_kill.append((station_id, "websocket_closed"))
+                            continue
+
+                        if last_heartbeat < absolute_silence_cutoff:
+                            stations_to_kill.append((station_id, "absolute_silence"))
+
+                for station_id, reason in stations_to_kill:
+                    self.logger.warning(
+                        "Connection for station %s appears stale (reason=%s)",
+                        station_id,
+                        reason,
+                    )
                     await self._mark_connection_for_cleanup(station_id)
 
-                # Redis connection status update removed for simplification
-
-                await asyncio.sleep(30)  # Monitor every 30 seconds
+                await asyncio.sleep(30)
 
             except Exception as e:
                 self.logger.error(f"Error in connection monitoring: {e}")

@@ -101,8 +101,14 @@ class SecurityConfig:
 class SecurityManager:
     """Manages OCPP Security Profile 3 features."""
 
-    def __init__(self, timescale_client: TimescaleClient, config: SecurityConfig):
+    def __init__(
+        self,
+        timescale_client: TimescaleClient,
+        config: SecurityConfig,
+        static_auth_client: Optional[Any] = None,
+    ):
         self.timescale_client = timescale_client
+        self.static_auth_client = static_auth_client or timescale_client
         self.config = config
         self.logger = get_logger(__name__)
 
@@ -151,22 +157,40 @@ class SecurityManager:
                         {"reason": "missing_basic_auth"},
                     )
                     return False, "Basic Auth credentials required"
-                if username != station_id:
+                if not await self._is_basic_auth_username_allowed(station_id, username):
                     await self._record_failed_attempt(station_id)
                     await self._log_security_event(
                         station_id,
                         SecurityEventType.FAILED_TO_AUTHENTICATE_AT_CENTRAL_SYSTEM,
-                        f"Basic Auth username must match station id for station {station_id}",
+                        (
+                            "Basic Auth username must match station id or an active alias "
+                            f"for station {station_id}"
+                        ),
                         {"reason": "basic_auth_username_mismatch"},
                     )
-                    return False, "Basic Auth username must match station id"
+                    return False, "Basic Auth username must match station id or active alias"
 
             # Production chargers provisioned through onboarding must use Basic Auth.
+            async def _authenticate_required_basic_auth(
+                station: str,
+                method_auth_data: Dict[str, Any],
+                cert: Optional[x509.Certificate],
+            ) -> bool:
+                return await self._authenticate_basic_auth(
+                    station,
+                    method_auth_data,
+                    cert,
+                    username_prevalidated=True,
+                )
+
             auth_methods = (
-                [(AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth)]
+                [(AuthenticationMethod.BASIC_AUTH, _authenticate_required_basic_auth)]
                 if basic_auth_required
                 else [
-                    (AuthenticationMethod.CLIENT_CERTIFICATE, self._authenticate_client_certificate),
+                    (
+                        AuthenticationMethod.CLIENT_CERTIFICATE,
+                        self._authenticate_client_certificate,
+                    ),
                     (AuthenticationMethod.BEARER_TOKEN, self._authenticate_bearer_token),
                     (AuthenticationMethod.API_KEY, self._authenticate_api_key),
                     (AuthenticationMethod.BASIC_AUTH, self._authenticate_basic_auth),
@@ -471,7 +495,12 @@ class SecurityManager:
         return await self._validate_api_key(station_id, api_key)
 
     async def _authenticate_basic_auth(
-        self, station_id: str, auth_data: Dict[str, Any], client_cert: Optional[x509.Certificate]
+        self,
+        station_id: str,
+        auth_data: Dict[str, Any],
+        client_cert: Optional[x509.Certificate],
+        *,
+        username_prevalidated: bool = False,
     ) -> bool:
         """Authenticate using basic authentication."""
         username = auth_data.get("username")
@@ -480,12 +509,33 @@ class SecurityManager:
         if not username or not password:
             return False
 
+        if not username_prevalidated and not await self._is_basic_auth_username_allowed(
+            station_id, username
+        ):
+            return False
+
         # Validate credentials against database
         return await self._validate_basic_auth(station_id, username, password)
 
+    async def _is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
+        """Return True when username is canonical or an explicitly configured alias."""
+        checker = getattr(self.static_auth_client, "is_basic_auth_username_allowed", None)
+        if checker is None:
+            return username == station_id
+        try:
+            return bool(await checker(station_id, username))
+        except Exception as exc:
+            self.logger.warning(
+                "Could not check Basic Auth username alias for station %s username %s: %s",
+                station_id,
+                username,
+                exc,
+            )
+            return username == station_id
+
     async def _station_requires_basic_auth(self, station_id: str) -> bool:
         """Return True when a provisioned production charger requires Basic Auth."""
-        checker = getattr(self.timescale_client, "station_requires_basic_auth", None)
+        checker = getattr(self.static_auth_client, "station_requires_basic_auth", None)
         if checker is None:
             self.logger.warning(
                 "Basic Auth requirement checker unavailable; allowing standard auth fallback for "
@@ -537,6 +587,30 @@ class SecurityManager:
         """Clear failed authentication attempts."""
         self.failed_auth_attempts.pop(station_id, None)
 
+    async def _lookup_charger_context(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve org/depot/charger context for ``station_id`` via Supabase.
+
+        Migration 029 dropped the TimescaleDB shadow ``chargers`` and
+        ``depots`` tables — the canonical static data lives in Supabase
+        (``charging_stations``/``sites``). Both alert emit and resolve
+        paths share this helper. Returns ``None`` when the station isn't
+        onboarded or the static-auth client doesn't expose
+        ``lookup_charger_context`` (e.g. pure-TimescaleDB tests where the
+        SecurityManager fell back to ``timescale_client``).
+        """
+        client = self.static_auth_client
+        if client is None or not hasattr(client, "lookup_charger_context"):
+            return None
+        try:
+            return await client.lookup_charger_context(station_id)
+        except Exception:
+            self.logger.warning(
+                "lookup_charger_context failed for station %s",
+                station_id,
+                exc_info=True,
+            )
+            return None
+
     async def _emit_charger_auth_failure_alert(self, station_id: str, reason: str) -> None:
         """Best-effort: insert/bump a charger_auth_failure notification_alert.
 
@@ -548,59 +622,47 @@ class SecurityManager:
         if pool is None:
             return
         try:
-            # Resolve org / depot from the station's ocpp_id. Unknown station
-            # (test setup, charger not yet onboarded) → silently skip; we
-            # can't write a tenant-scoped alert without an organization.
             from uuid import UUID  # noqa: PLC0415
 
             from src.notifications.alerts import upsert_alert  # noqa: PLC0415
             from src.notifications.severity import Severity  # noqa: PLC0415
 
+            ctx = await self._lookup_charger_context(station_id)
+            if ctx is None or ctx.get("organization_id") is None:
+                # Unknown station (test setup, charger not yet onboarded, or
+                # the lookup just failed) → silently skip; we can't write a
+                # tenant-scoped alert without an organization.
+                return
+
+            charger_name = ctx.get("charger_name") or station_id
+            detail = {
+                "description": (
+                    f"Charger {charger_name} failed to authenticate "
+                    f"({reason}). Repeated failures lock the station out for "
+                    f"{self.config.lockout_duration_minutes} minutes."
+                ),
+                "suggestedAction": (
+                    "Verify the charger's Basic Auth credentials match the "
+                    "values stored on this station. Rotate the credential "
+                    "from the admin panel if it may have been compromised."
+                ),
+                "context": {
+                    "kind": "charger",
+                    "id": str(ctx.get("charger_id")) if ctx.get("charger_id") else None,
+                    "label": charger_name,
+                },
+                "station_id": station_id,
+                "reason": reason,
+            }
+
             async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT d.organization_id,
-                           d.id AS depot_id,
-                           d.name AS depot_name,
-                           c.id AS charger_id,
-                           COALESCE(c.display_name, c.station_id) AS charger_name
-                      FROM charging_stations c
-                      JOIN sites             d ON d.id = c.site_id
-                     WHERE c.station_id = $1
-                     LIMIT 1
-                    """,
-                    station_id,
-                )
-                if row is None:
-                    return
-
-                detail = {
-                    "description": (
-                        f"Charger {row['charger_name']} failed to authenticate "
-                        f"({reason}). Repeated failures lock the station out for "
-                        f"{self.config.lockout_duration_minutes} minutes."
-                    ),
-                    "suggestedAction": (
-                        "Verify the charger's Basic Auth credentials match the "
-                        "values stored on this station. Rotate the credential "
-                        "from the admin panel if it may have been compromised."
-                    ),
-                    "context": {
-                        "kind": "charger",
-                        "id": str(row["charger_id"]),
-                        "label": row["charger_name"],
-                    },
-                    "station_id": station_id,
-                    "reason": reason,
-                }
-
                 await upsert_alert(
                     conn,
-                    organization_id=UUID(str(row["organization_id"])),
-                    depot_id=UUID(str(row["depot_id"])),
+                    organization_id=UUID(str(ctx["organization_id"])),
+                    depot_id=UUID(str(ctx["depot_id"])) if ctx.get("depot_id") else None,
                     alert_type="charger_auth_failure",
                     severity=Severity.CRITICAL,
-                    title=f"Charger {row['charger_name']} authentication failed",
+                    title=f"Charger {charger_name} authentication failed",
                     detail=detail,
                     dedup_key=f"charger_auth_failure:{station_id}",
                 )
@@ -625,22 +687,14 @@ class SecurityManager:
 
             from src.notifications.alerts import resolve_alert  # noqa: PLC0415
 
+            ctx = await self._lookup_charger_context(station_id)
+            if ctx is None or ctx.get("organization_id") is None:
+                return
+
             async with pool.acquire() as conn:
-                org_id = await conn.fetchval(
-                    """
-                    SELECT d.organization_id
-                      FROM charging_stations c
-                      JOIN sites             d ON d.id = c.site_id
-                     WHERE c.station_id = $1
-                     LIMIT 1
-                    """,
-                    station_id,
-                )
-                if org_id is None:
-                    return
                 await resolve_alert(
                     conn,
-                    organization_id=UUID(str(org_id)),
+                    organization_id=UUID(str(ctx["organization_id"])),
                     dedup_key=f"charger_auth_failure:{station_id}",
                 )
         except Exception:
@@ -749,4 +803,4 @@ class SecurityManager:
 
     async def _validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
         """Validate basic authentication credentials."""
-        return await self.timescale_client.validate_basic_auth(station_id, username, password)
+        return await self.static_auth_client.validate_basic_auth(station_id, username, password)

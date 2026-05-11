@@ -7,7 +7,6 @@ import http
 import ipaddress
 import logging
 import os
-import secrets
 import ssl
 import uuid
 from collections import defaultdict
@@ -34,6 +33,13 @@ from .priority_charging_manager import PriorityChargingManager
 from .security_manager import SecurityConfig, SecurityManager
 from .supabase_client import SupabaseClient
 from .timescale_client import TimescaleClient
+
+# RFC 6598 carrier-grade NAT (CGNAT) shared address space. Not classified as
+# is_private by Python's ipaddress module, but Railway / Render / Fly.io route
+# their edge proxy → container traffic through this range, so we must treat it
+# as a trusted-proxy network when honouring forwarded headers. Mirrors the
+# constant in src/security/geo_block.py.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 # Geo-blocking (Article 73-3 compliance)
 try:
@@ -118,6 +124,17 @@ class OCPPWebSocketServer:
         self.timescale_client = timescale_client
         self.supabase_client = supabase_client
         self.optimization_engine = optimization_engine
+
+        # Liveness pub/sub (rate-limited pg_notify on every OCPP frame).
+        # Configured via env vars; instance is shared across all
+        # OCPP16Sessions so the rate-limit dict is process-wide.
+        from .liveness_notifier import LivenessNotifier  # noqa: PLC0415
+
+        self.liveness_notifier = LivenessNotifier(
+            timescale_client,
+            interval_s=float(os.getenv("LIVENESS_NOTIFY_INTERVAL_S", "10")),
+            enabled=os.getenv("LIVENESS_NOTIFY_ENABLED", "true").lower() == "true",
+        )
 
         # Core components
         self.connection_manager: Optional[ConnectionManager] = None
@@ -211,6 +228,7 @@ class OCPPWebSocketServer:
             # reporting spurious failures during the startup grace period.
             try:
                 from .health_checks import notify_websocket_ready
+
                 notify_websocket_ready()
             except Exception:
                 pass
@@ -297,10 +315,12 @@ class OCPPWebSocketServer:
             require_station_auth=require_auth,
             require_mtls=False,  # Railway terminates TLS at edge
         )
-        self.security_manager = SecurityManager(self.timescale_client, security_config)
-        self.logger.info(
-            "Security manager initialized (require_auth=%s)", require_auth
+        self.security_manager = SecurityManager(
+            self.timescale_client,
+            security_config,
+            static_auth_client=self.supabase_client,
         )
+        self.logger.info("Security manager initialized (require_auth=%s)", require_auth)
 
         _environment = os.getenv("ENVIRONMENT", "development")
         if _environment == "production" and not require_auth:
@@ -358,16 +378,28 @@ class OCPPWebSocketServer:
         return "unknown"
 
     def _is_trusted_proxy_ip(self, ip_str: str) -> bool:
-        """Return True when forwarded headers from this peer may be trusted."""
+        """Return True when forwarded headers from this peer may be trusted.
+
+        Implicitly trusts private (RFC 1918 / RFC 4193 ULA), loopback,
+        link-local, and CGNAT (RFC 6598 ``100.64.0.0/10``) peers when
+        ``OCPP_TRUST_PRIVATE_PROXY_HEADERS=true`` (default). Railway / Render
+        / Fly.io and similar PaaS providers reach the container over the
+        CGNAT shared address space; without trusting it we'd geo-block on
+        the proxy IP itself rather than the real client. Public-internet
+        IPs are never implicitly trusted — operators must opt in via
+        ``OCPP_TRUSTED_PROXY_RANGES``. Mirrors the FastAPI middleware's
+        ``_is_implicitly_trusted_proxy`` in ``src/security/geo_block.py``.
+        """
         try:
             ip_addr = ipaddress.ip_address(ip_str)
         except ValueError:
             return False
 
-        if self._trust_private_proxy_headers and (
-            ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local
-        ):
-            return True
+        if self._trust_private_proxy_headers:
+            if ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local:
+                return True
+            if isinstance(ip_addr, ipaddress.IPv4Address) and ip_addr in _CGNAT_NETWORK:
+                return True
 
         return any(ip_addr in network for network in self._trusted_proxy_networks)
 
@@ -393,9 +425,7 @@ class OCPPWebSocketServer:
     def _release_client_ip(self, client_ip: str) -> None:
         """Decrement per-IP connection accounting for a rejected or closed connection."""
         if client_ip in self._ip_connection_count:
-            self._ip_connection_count[client_ip] = max(
-                0, self._ip_connection_count[client_ip] - 1
-            )
+            self._ip_connection_count[client_ip] = max(0, self._ip_connection_count[client_ip] - 1)
             if self._ip_connection_count[client_ip] == 0:
                 del self._ip_connection_count[client_ip]
 
@@ -423,9 +453,7 @@ class OCPPWebSocketServer:
                     geo_result.country_code,
                     geo_result.reason,
                 )
-                ERRORS_TOTAL.labels(
-                    error_type="geo_blocked", station_id="unknown"
-                ).inc()
+                ERRORS_TOTAL.labels(error_type="geo_blocked", station_id="unknown").inc()
                 await websocket.close(1008, "Access denied")
                 return
 
@@ -559,14 +587,94 @@ class OCPPWebSocketServer:
             self._connection_client_ips.pop(connection_id, None)
             return
 
-        # Extract station ID from path
+        # Extract station ID from path.
+        #
+        # Most chargers send the OCPP-spec single-segment path
+        # ``/ocpp/{charge_point_id}``, but some integrations (e.g. the HRX
+        # Vilnius pilot's ABB Terra AC wallboxes) embed the depot routing
+        # in the path: ``/ocpp/{canonical_station_id}/{charger_serial}``.
+        # The OCPP 1.6 spec treats charge_point_id as opaque, so we accept
+        # any number of segments after ``/ocpp/`` and use the LAST segment
+        # as the station id (the actual charger identity). The penultimate
+        # segment, when it matches a registered charging_stations row, is
+        # used to auto-register an alias so the canonical id is resolved
+        # downstream — see ``ensure_station_alias`` below.
         if protocol == "ocpp" and len(path_parts) > 1:
-            station_id = path_parts[1]
+            station_id = path_parts[-1]
+            if len(path_parts) > 2:
+                self.logger.info(
+                    "OCPP multi-segment path %s parsed as station_id=%s "
+                    "(intermediate routing segments: %s)",
+                    path,
+                    station_id,
+                    path_parts[1:-1],
+                )
         elif path.strip("/"):
             station_id = path.strip("/")
         else:
             # Use full UUID to avoid collisions
             station_id = f"station_{connection_id}"
+
+        resolver = self.supabase_client or self.timescale_client
+
+        # Auto-register a station alias for multi-segment OCPP paths.
+        #
+        # When the path is ``/ocpp/{parent}/{serial}`` and ``{parent}`` is a
+        # known charging_stations.station_id, upsert ``serial → parent`` so
+        # the alias table maps the trailing serial (which the charger sends
+        # as its CP id and Basic Auth username target) to the canonical id
+        # the operator provisioned. The DB query enforces that the canonical
+        # already exists; existing alias rows are never overwritten.
+        #
+        # Security: this widens the alias table but not authorization.
+        # Basic Auth still gates every connection — a malicious charger that
+        # crafts ``/ocpp/{real_canonical}/{junk_serial}`` only burns one
+        # alias row before being rejected on password mismatch (DoS bounded
+        # by the geo-block + per-IP connection cap above).
+        if (
+            protocol == "ocpp"
+            and len(path_parts) > 2
+            and resolver
+            and hasattr(resolver, "ensure_station_alias")
+        ):
+            parent_segment = path_parts[-2]
+            try:
+                registered = await resolver.ensure_station_alias(
+                    station_id,
+                    parent_segment,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Auto-alias upsert failed for %s → %s: %s",
+                    station_id,
+                    parent_segment,
+                    exc,
+                )
+            else:
+                if registered:
+                    self.logger.info(
+                        "Auto-registered OCPP station alias %s → %s " "(source=auto-multipath)",
+                        station_id,
+                        parent_segment,
+                    )
+
+        if resolver and hasattr(resolver, "resolve_station_id"):
+            try:
+                canonical_station_id = await resolver.resolve_station_id(station_id)
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not resolve OCPP station alias for %s: %s",
+                    station_id,
+                    exc,
+                )
+            else:
+                if canonical_station_id != station_id:
+                    self.logger.info(
+                        "Resolved OCPP station alias %s to canonical station %s",
+                        station_id,
+                        canonical_station_id,
+                    )
+                    station_id = canonical_station_id
 
         # Authenticate station (Article 73-3 / NIS2 compliance)
         # Uses the SecurityManager's fallback chain: cert → JWT → API key → basic auth
@@ -592,15 +700,6 @@ class OCPPWebSocketServer:
                                 # OCPP 1.6 basic auth payload uses username:password.
                                 auth_data["username"] = username
                                 auth_data["password"] = password
-                                if not secrets.compare_digest(username, station_id):
-                                    self.logger.warning(
-                                        "Basic auth username mismatch from %s: station=%s username=%s",
-                                        client_ip,
-                                        station_id,
-                                        username,
-                                    )
-                                    auth_data.pop("username", None)
-                                    auth_data.pop("password", None)
                             else:
                                 self.logger.warning(
                                     "Malformed basic auth payload from %s for station %s",
@@ -629,11 +728,11 @@ class OCPPWebSocketServer:
             if not auth_ok:
                 self.logger.warning(
                     "Authentication failed for station %s from %s: %s",
-                    station_id, client_ip, auth_error,
+                    station_id,
+                    client_ip,
+                    auth_error,
                 )
-                ERRORS_TOTAL.labels(
-                    error_type="auth_failed", station_id=station_id
-                ).inc()
+                ERRORS_TOTAL.labels(error_type="auth_failed", station_id=station_id).inc()
                 await websocket.close(1008, "Authentication failed")
                 self._release_client_ip(client_ip)
                 self._connection_client_ips.pop(connection_id, None)
@@ -655,6 +754,32 @@ class OCPPWebSocketServer:
         CONNECTIONS_TOTAL.set(len(self.connections))
         CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
 
+        # Undo a stale ``Unavailable / ConnectionLost`` row from the previous
+        # disconnect. Some firmwares (notably ABB Terra AC) skip
+        # StatusNotification on quick reconnects, leaving the close-hook's
+        # marker as the latest connector_status row. Without this clear,
+        # GET /depots/{id}/chargers reports ``offline`` indefinitely even
+        # while OCPP frames flow. Best-effort; failure must not block
+        # accepting the WS.
+        if self.timescale_client is not None:
+            try:
+                cleared = await self.timescale_client.mark_connectors_available_after_reconnect(
+                    station_id
+                )
+                if cleared:
+                    self.logger.info(
+                        "Cleared stale Unavailable/ConnectionLost on %d connector(s) "
+                        "for station=%s on reconnect",
+                        cleared,
+                        station_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "mark_connectors_available_after_reconnect failed for station=%s: %s",
+                    station_id,
+                    exc,
+                )
+
         # Route to the correct OCPP library based on the negotiated subprotocol.
         # OCPP 1.6 chargers must use the v16 library; passing their messages
         # through EnhancedOCPPChargePoint (v201) causes _validate_payload to
@@ -665,6 +790,9 @@ class OCPPWebSocketServer:
                 websocket=websocket,
                 timescale_client=self.timescale_client,
                 message_handler=self.message_handler,
+                connection_manager=self.connection_manager,
+                supabase_client=self.supabase_client,
+                liveness_notifier=self.liveness_notifier,
             )
         else:
             charge_point = EnhancedOCPPChargePoint(
@@ -678,6 +806,8 @@ class OCPPWebSocketServer:
                 priority_charging_manager=self.priority_charging_manager,
                 external_control_manager=self.external_control_manager,
                 certificate_manager=self.certificate_manager,
+                rfid_authorization=self.message_handler.rfid_authorization,
+                static_auth_client=self.supabase_client,
             )
         self.charge_points[station_id] = charge_point
 
@@ -708,10 +838,22 @@ class OCPPWebSocketServer:
     async def _cleanup_connection(
         self, connection_id: str, websocket: WebSocketServerProtocol, station_id: str = None
     ) -> None:
-        """Cleanup connection resources."""
+        """Cleanup connection resources.
+
+        Guards against the "late stale cleanup" race: when connection A is
+        replaced by B via the ``Station already connected`` branch in
+        ``_handle_connection``, A's recv loop only ends when its WebSocket
+        actually closes — possibly long after B has taken over. This second,
+        deferred ``_cleanup_connection(A, …, station_id)`` must NOT pop the
+        station-level mappings, because they now point to B. Without the
+        guard, B is silently orphaned and the charger ends up reconnecting
+        on a loop. The connection-level pops (``connections``,
+        ``_connection_client_ips``) are always safe — they're keyed by
+        connection_id.
+        """
         client_ip = self._connection_client_ips.pop(connection_id, None)
 
-        # Remove from connections
+        # Remove from connections (always safe — connection-id keyed)
         self.connections.pop(connection_id, None)
         CONNECTIONS_TOTAL.set(len(self.connections))
 
@@ -723,16 +865,32 @@ class OCPPWebSocketServer:
                     break
 
         if station_id:
-            self.station_connections.pop(station_id, None)
-            self.charge_points.pop(station_id, None)
-            CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
+            # Only erase the station-level routing if it still points at
+            # *this* connection. A late-finishing handler for a replaced
+            # connection must not nuke the successor's mapping.
+            current = self.station_connections.get(station_id)
+            is_current = current == connection_id
+
+            if is_current:
+                self.station_connections.pop(station_id, None)
+                self.charge_points.pop(station_id, None)
+                CONNECTED_CHARGERS_COUNT.set(len(self.station_connections))
+
+            # Always tell the connection_manager which connection_id we're
+            # cleaning up so its own guarded unregister can do the right
+            # thing per-connection, even when the station mapping has
+            # already moved on.
             if self.connection_manager:
-                await self.connection_manager.unregister_connection(station_id)
+                await self.connection_manager.unregister_connection(station_id, connection_id)
+
             # Persist that the charger is gone so reads (alerts, state) and
             # the boot-replay path can distinguish a stale-but-open session
-            # from a live one. Both calls are best-effort; the connection is
+            # from a live one. Only do this when this cleanup actually
+            # represents the active session ending — otherwise we'd mark
+            # connectors Unavailable while the successor is happily
+            # connected. Both calls are best-effort; the connection is
             # already torn down.
-            if self.timescale_client is not None:
+            if is_current and self.timescale_client is not None:
                 try:
                     await self.timescale_client.mark_connectors_unavailable(station_id)
                 except Exception as exc:

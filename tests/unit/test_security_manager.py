@@ -28,6 +28,7 @@ class TestSecurityManager:
         """Mock TimescaleDB client."""
         mock_client = Mock(spec=TimescaleClient)
         mock_client.station_requires_basic_auth.return_value = False
+        mock_client.is_basic_auth_username_allowed.return_value = False
         return mock_client
 
     @pytest.fixture
@@ -55,12 +56,27 @@ class TestSecurityManager:
         manager = SecurityManager(mock_timescale_client, security_config)
 
         assert manager.timescale_client == mock_timescale_client
+        assert manager.static_auth_client == mock_timescale_client
         assert manager.config == security_config
         assert manager.token_cache == {}
         assert manager.failed_auth_attempts == {}
         assert manager.security_events == []
         assert manager.jwt_secret is not None
         assert manager.cert_validation_cache == {}
+
+    @pytest.mark.timeout(10)
+    def test_security_manager_uses_static_auth_client(self, mock_timescale_client, security_config):
+        """Static OCPP auth reads can be sourced from Supabase."""
+        static_auth_client = Mock()
+
+        manager = SecurityManager(
+            mock_timescale_client,
+            security_config,
+            static_auth_client=static_auth_client,
+        )
+
+        assert manager.timescale_client == mock_timescale_client
+        assert manager.static_auth_client == static_auth_client
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -144,16 +160,20 @@ class TestSecurityManager:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
-    async def test_legacy_basic_auth_allows_username_distinct_from_station_id(
-        self, security_manager
-    ):
-        """Legacy Basic Auth stations may use any active username for that station."""
+    async def test_non_provisioned_basic_auth_allows_alias_username(self, security_manager):
+        """Non-provisioned stations still require canonical id or alias as Basic Auth username."""
         station_id = "legacy-station-001"
         auth_data = {"username": "operator-user", "password": "valid_password"}
 
         with (
             patch.object(security_manager, "_is_station_locked_out", return_value=False),
             patch.object(security_manager, "_station_requires_basic_auth", return_value=False),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as username_allowed,
             patch.object(
                 security_manager,
                 "_validate_basic_auth",
@@ -167,22 +187,27 @@ class TestSecurityManager:
 
         assert success is True
         assert error is None
-        validate_basic_auth.assert_awaited_once_with(
-            station_id, "operator-user", "valid_password"
-        )
+        username_allowed.assert_awaited_once_with(station_id, "operator-user")
+        validate_basic_auth.assert_awaited_once_with(station_id, "operator-user", "valid_password")
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_production_basic_auth_requires_username_to_match_station_id(
         self, security_manager
     ):
-        """Onboarded production chargers must use the generated station id username."""
+        """Onboarded production chargers must use the station id or a configured alias."""
         station_id = "acme-berlin-001"
         auth_data = {"username": "operator-user", "password": "valid_password"}
 
         with (
             patch.object(security_manager, "_is_station_locked_out", return_value=False),
             patch.object(security_manager, "_station_requires_basic_auth", return_value=True),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as username_allowed,
             patch.object(
                 security_manager,
                 "_validate_basic_auth",
@@ -199,11 +224,84 @@ class TestSecurityManager:
             success, error = await security_manager.authenticate_station(station_id, auth_data)
 
         assert success is False
-        assert error == "Basic Auth username must match station id"
+        assert error == "Basic Auth username must match station id or active alias"
+        username_allowed.assert_awaited_once_with(station_id, "operator-user")
         validate_basic_auth.assert_not_awaited()
         failed.assert_awaited_once_with(station_id)
         log_event.assert_awaited_once()
         assert log_event.await_args.args[3]["reason"] == "basic_auth_username_mismatch"
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_production_basic_auth_accepts_configured_username_alias(self, security_manager):
+        """Onboarded production chargers may use an active vendor username alias."""
+        station_id = "hrx-uab_hrx-vilnius-001"
+        auth_data = {"username": "TACW1141622G1433", "password": "valid_password"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=True),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as username_allowed,
+            patch.object(
+                security_manager,
+                "_validate_basic_auth",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as validate_basic_auth,
+            patch.object(security_manager, "_clear_failed_attempts", return_value=None),
+            patch.object(security_manager, "_log_security_event", return_value=None),
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is True
+        assert error is None
+        assert username_allowed.await_count == 1
+        assert all(
+            c == ((station_id, "TACW1141622G1433"), {}) for c in username_allowed.await_args_list
+        )
+        validate_basic_auth.assert_awaited_once_with(
+            station_id, "TACW1141622G1433", "valid_password"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_non_required_basic_auth_rejects_unknown_username(self, security_manager):
+        """Fallback basic-auth path must reject credentials with an unrecognised username."""
+        station_id = "non-provisioned-001"
+        auth_data = {"username": "random-hardware-serial", "password": "stolen-password"}
+
+        with (
+            patch.object(security_manager, "_is_station_locked_out", return_value=False),
+            patch.object(security_manager, "_station_requires_basic_auth", return_value=False),
+            patch.object(
+                security_manager,
+                "_is_basic_auth_username_allowed",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as username_allowed,
+            patch.object(
+                security_manager,
+                "_validate_basic_auth",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as validate_basic_auth,
+            patch.object(security_manager, "_authenticate_client_certificate", return_value=False),
+            patch.object(security_manager, "_authenticate_bearer_token", return_value=False),
+            patch.object(security_manager, "_authenticate_api_key", return_value=False),
+            patch.object(security_manager, "_record_failed_attempt", return_value=None),
+            patch.object(security_manager, "_log_security_event", return_value=None),
+            patch.object(security_manager, "_emit_charger_auth_failure_alert", return_value=None),
+        ):
+            success, error = await security_manager.authenticate_station(station_id, auth_data)
+
+        assert success is False
+        username_allowed.assert_awaited_once_with(station_id, "random-hardware-serial")
+        validate_basic_auth.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
@@ -524,3 +622,140 @@ class TestSecurityEnums:
         assert AuthenticationMethod.CLIENT_CERTIFICATE.value == "ClientCertificate"
         assert AuthenticationMethod.API_KEY.value == "ApiKey"
         assert AuthenticationMethod.OAUTH2.value == "OAuth2"
+
+
+class TestChargerAuthFailureAlertSql:
+    """Tenant-context resolution for charger_auth_failure alerts must go
+    through Supabase (``charging_stations``/``sites``). Migration 029 dropped
+    the local TimescaleDB shadow tables (``chargers``/``depots``); querying
+    them raises UndefinedTableError on every auth event (see incident
+    2026-05-06: charger reconnect cycle log spam)."""
+
+    @pytest.fixture
+    def static_auth_client(self):
+        """SupabaseClient stand-in exposing lookup_charger_context."""
+        client = Mock()
+        client.lookup_charger_context = AsyncMock(
+            return_value={
+                "charger_id": "11111111-1111-1111-1111-111111111111",
+                "depot_id": "22222222-2222-2222-2222-222222222222",
+                "ocpp_id": "hrx-uab_hrx-vilnius-001",
+                "charger_name": "HRX Vilnius #1",
+                "organization_id": "33333333-3333-3333-3333-333333333333",
+                "depot_name": "HRX Vilnius",
+            }
+        )
+        return client
+
+    @pytest.fixture
+    def security_manager(self, static_auth_client):
+        from src.websocket_handler.security_manager import SecurityConfig, SecurityManager
+
+        tc = Mock()
+        # The notifications pool is still the TimescaleDB one; static lookups
+        # now route through Supabase.
+        return SecurityManager(tc, SecurityConfig(), static_auth_client=static_auth_client)
+
+    def _make_pool(self):
+        """asyncpg-style pool that records calls but otherwise no-ops."""
+        conn = Mock()
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.fetchrow = AsyncMock(return_value=None)
+        conn.fetchval = AsyncMock(return_value=None)
+
+        class _Acquire:
+            async def __aenter__(self_inner):
+                return conn
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        pool = Mock()
+        pool.acquire = lambda: _Acquire()
+        return pool, conn
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_emit_resolves_context_via_supabase_not_dropped_tables(
+        self, security_manager, static_auth_client
+    ):
+        """Emit path must call lookup_charger_context, not query chargers/depots."""
+        pool, _conn = self._make_pool()
+        security_manager.timescale_client.pg_pool = pool
+
+        with patch("src.notifications.alerts.upsert_alert", new=AsyncMock(return_value=None)):
+            await security_manager._emit_charger_auth_failure_alert(
+                "hrx-uab_hrx-vilnius-001", "wrong_password"
+            )
+
+        static_auth_client.lookup_charger_context.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_resolve_resolves_context_via_supabase_not_dropped_tables(
+        self, security_manager, static_auth_client
+    ):
+        """Resolve path must call lookup_charger_context — never query chargers/depots."""
+        pool, _conn = self._make_pool()
+        security_manager.timescale_client.pg_pool = pool
+
+        with patch("src.notifications.alerts.resolve_alert", new=AsyncMock(return_value=None)):
+            await security_manager._resolve_charger_auth_failure_alert("hrx-uab_hrx-vilnius-001")
+
+        static_auth_client.lookup_charger_context.assert_awaited_once_with(
+            "hrx-uab_hrx-vilnius-001"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_emit_skips_when_station_not_onboarded(
+        self, security_manager, static_auth_client
+    ):
+        """Unknown station → no alert emitted (no organization to scope to)."""
+        static_auth_client.lookup_charger_context = AsyncMock(return_value=None)
+        pool, conn = self._make_pool()
+        security_manager.timescale_client.pg_pool = pool
+
+        with patch("src.notifications.alerts.upsert_alert", new=AsyncMock()) as upsert:
+            await security_manager._emit_charger_auth_failure_alert(
+                "unknown-station", "wrong_password"
+            )
+            upsert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_resolve_swallows_lookup_failures(self, security_manager, static_auth_client):
+        """Supabase lookup failure → log warning, do not raise into the auth path."""
+        static_auth_client.lookup_charger_context = AsyncMock(
+            side_effect=RuntimeError("supabase down")
+        )
+        pool, _conn = self._make_pool()
+        security_manager.timescale_client.pg_pool = pool
+
+        # Must not raise.
+        await security_manager._resolve_charger_auth_failure_alert("station-x")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_resolve_is_noop_without_pool(self, security_manager):
+        security_manager.timescale_client.pg_pool = None
+        # Must not raise even without a configured pool.
+        await security_manager._resolve_charger_auth_failure_alert("station-x")
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_lookup_context_returns_none_when_client_lacks_method(self):
+        """Backward-compat: pre-Supabase deploys (or test setups) where
+        static_auth_client falls back to TimescaleClient must skip the
+        lookup cleanly without raising."""
+        from src.websocket_handler.security_manager import SecurityConfig, SecurityManager
+
+        # static_auth_client without lookup_charger_context — simulates the
+        # legacy fallback in __init__: ``static_auth_client = static_auth_client or timescale_client``
+        legacy_client = Mock(spec=["pg_pool"])
+        sm = SecurityManager(Mock(), SecurityConfig(), static_auth_client=legacy_client)
+
+        result = await sm._lookup_charger_context("station-x")
+        assert result is None

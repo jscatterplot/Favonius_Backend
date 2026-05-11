@@ -100,6 +100,8 @@ class TestGetVehicleSocs:
         assert "bus_1" in socs
         assert socs["bus_1"] == 0.65
         mock_conn.fetch.assert_called()
+        static_query = mock_conn.fetch.call_args_list[0].args[0]
+        assert "SELECT id::text AS vehicle_id FROM vehicles WHERE site_id = $1" in static_query
 
     @pytest.mark.asyncio
     async def test_get_vehicle_socs_multiple(self, assembler, mock_db_pool):
@@ -279,6 +281,9 @@ class TestGetSchedules:
         assert len(schedules) == 1
         assert schedules[0]["vehicle_id"] == "bus_1"
         assert schedules[0]["estimated_energy_kwh"] == 150.0
+        schedule_query = mock_conn.fetch.call_args.args[0]
+        assert "JOIN vehicles v ON s.vehicle_id = v.id" in schedule_query
+        assert "WHERE v.site_id = $1" in schedule_query
 
     @pytest.mark.asyncio
     async def test_get_schedules_multiple(self, assembler, mock_db_pool):
@@ -386,6 +391,35 @@ class TestComputeAvailability:
 
         # Unknown vehicle should be ignored
         assert "unknown_bus" not in availability
+
+
+class TestRecentTelemetry:
+    """Test snapshot recent telemetry helpers."""
+
+    @pytest.mark.asyncio
+    async def test_recent_telemetry_uses_static_site_id(self, assembler, mock_db_pool):
+        """Recent telemetry resolves vehicles using Supabase static schema names."""
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        now = datetime.utcnow()
+        mock_conn.fetch.side_effect = [
+            [{"vehicle_id": "bus_1"}],
+            [
+                {
+                    "time": now,
+                    "vehicle_id": "bus_1",
+                    "soc": 0.7,
+                    "charging_kw": 42.0,
+                    "is_plugged": True,
+                }
+            ],
+        ]
+
+        rows = await assembler._get_recent_telemetry(now)
+
+        assert rows[0]["vehicle_id"] == "bus_1"
+        static_query = mock_conn.fetch.call_args_list[0].args[0]
+        assert "SELECT id::text AS vehicle_id FROM vehicles WHERE site_id = $1" in static_query
 
 
 class TestComputeDepartureTimes:
@@ -1349,6 +1383,42 @@ class TestLoadDepotConfigAccessMode:
         # Last fetch must be the access matrix query.
         last_sql = mock_conn.fetch.call_args_list[-1].args[0]
         assert "FROM charger_vehicle_access" in last_sql
+
+    @pytest.mark.asyncio
+    async def test_zero_vehicles_returns_empty_config(
+        self, mock_db_pools, mock_db_pool
+    ):
+        """A depot with no vehicles must load successfully with empty maps.
+
+        Onboarding depots can be created before any vehicle is added; the
+        dashboard endpoints (/state, /optimization/readiness) must still
+        respond 200 so the FE can render an empty-state CTA. Hard-failing
+        here previously cascaded into a 500 via _get_depot_config's brittle
+        substring matching.
+        """
+        depot_id = str(uuid4())
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        mock_conn.fetchrow.side_effect = [
+            self._depot_row(access_default="explicit_matrix"),
+            None,  # battery_storage row
+        ]
+        mock_conn.fetch.side_effect = [
+            [],  # vehicles — empty
+            [],  # chargers grouped — empty (defaults applied)
+            [],  # access matrix — empty
+        ]
+
+        config, vehicle_to_ocpp = await StateAssembler.load_depot_config(
+            mock_db_pools, depot_id
+        )
+
+        assert config.vehicle_capacities == {}
+        assert config.vehicle_max_charge_kw == {}
+        assert vehicle_to_ocpp == {}
+        # Site-level config still loaded correctly.
+        assert config.max_site_power == 800.0
 
 
 class TestCumulativeKwhPeriod:

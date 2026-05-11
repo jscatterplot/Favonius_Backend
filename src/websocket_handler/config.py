@@ -5,7 +5,14 @@ from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, validator
 
+from src.db.postgres_url import (
+    build_postgres_dsn,
+    is_postgres_url,
+    merge_timescale_params_from_url,
+)
+
 from .secrets_manager import SecretsConfig, SecretsManager
+
 
 def _parse_int_env(primary_name: str, fallback_name: Optional[str] = None, default: int = 0) -> int:
     """Parse integer env vars safely, tolerating unresolved templates like '$PORT'."""
@@ -40,6 +47,7 @@ def _parse_int_value(raw_value: Optional[str], default: int) -> int:
     except ValueError:
         return default
 
+
 # Redis and Kafka configuration removed for simplification
 
 
@@ -63,6 +71,14 @@ class WebSocketConfig(BaseModel):
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
     ping_interval: int = Field(default=45, description="Server ping interval in seconds")
     ping_timeout: int = Field(default=30, description="Server ping timeout in seconds")
+    absolute_silence_seconds: int = Field(
+        default=1800,
+        description=(
+            "Kill an OCPP session if no frame has been received for this long, "
+            "even when the WebSocket is still alive at ping/pong layer. Safety "
+            "net for chargers that handshake but never participate."
+        ),
+    )
     message_timeout: int = Field(default=60, description="Message timeout in seconds")
     max_message_size: int = Field(
         default=1048576, description="Maximum message size in bytes (PRD: 1 MB)"
@@ -120,19 +136,15 @@ class MonitoringConfig(BaseModel):
 
 
 class PriceFeederConfig(BaseModel):
-    """Price feeder configuration."""
+    """Price feeder configuration (ENTSO-E day-ahead prices for European depots)."""
 
     enabled: bool = Field(default=True, description="Enable price feeder")
-    base_url: str = Field(
-        default="https://oasis.caiso.com/oasisapi/SingleZip", description="CAISO OASIS API base URL"
-    )
-    nodes: List[str] = Field(
-        default_factory=lambda: ["TH_SP15_GEN-APND", "TH_NP15_GEN-APND"],
-        description="CAISO pricing nodes to monitor",
-    )
     entsoe_zones: List[str] = Field(
         default_factory=list,
-        description="ENTSO-E bidding zone EIC codes for European depots (e.g., '10Y1001A1001A82H' for DE-LU)",
+        description=(
+            "ENTSO-E bidding zone EIC codes for European depots "
+            "(e.g., '10Y1001A1001A82H' for DE-LU, '10YLT-1001A0008Q' for LT)"
+        ),
     )
     fetch_interval_seconds: int = Field(
         default=900, description="Price refresh interval in seconds"
@@ -227,6 +239,98 @@ class VDV463Config(BaseModel):
     )
 
 
+def _timescale_config_from_env(secrets_manager: SecretsManager) -> TimescaleConfig:
+    """Build ``TimescaleConfig`` from env, parsing ``TIMESCALE_SERVICE_URL`` when needed."""
+    _ts_secret_raw = secrets_manager.get_secret("TIMESCALE_SERVICE_URL") or os.getenv(
+        "TIMESCALE_SERVICE_URL"
+    )
+    _ts_s = (_ts_secret_raw or "").strip()
+    _env_ws = os.getenv("ENVIRONMENT", "development").strip().lower()
+    _prodlike_ws = _env_ws in ("production", "staging")
+
+    if _prodlike_ws and not _ts_s:
+        raise ValueError(
+            "TIMESCALE_SERVICE_URL must be set when ENVIRONMENT is production or staging "
+            "for the WebSocket handler (TigerCloud favonius-timeseries). "
+            "DATABASE_URL is reserved for Supabase static data."
+        )
+
+    _db_url_ws = (os.getenv("DATABASE_URL") or "").strip()
+    _merge_url_candidate = _ts_s if _ts_s else ("" if _prodlike_ws else _db_url_ws)
+    _merge_postgres_url = _merge_url_candidate if is_postgres_url(_merge_url_candidate) else None
+
+    _pgport_raw = secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT")
+    _pgport_explicit = bool(_pgport_raw and str(_pgport_raw).strip())
+
+    _host = secrets_manager.get_secret("PGHOST") or os.getenv("PGHOST")
+    _port = _parse_int_value(_pgport_raw, 5432)
+    _database = secrets_manager.get_secret("PGDATABASE") or os.getenv("PGDATABASE", "tsdb")
+    _user = secrets_manager.get_secret("PGUSER") or os.getenv("PGUSER")
+    _password = secrets_manager.get_secret("PGPASSWORD") or os.getenv("PGPASSWORD")
+    _sslmode = secrets_manager.get_secret("PGSSLMODE") or os.getenv("PGSSLMODE", "require")
+
+    h_m, port_m, d_m, u_m, pw_m, sm_m = merge_timescale_params_from_url(
+        service_url=_merge_postgres_url,
+        host=_host,
+        port=_port,
+        database=_database,
+        user=_user,
+        password=_password,
+        sslmode=_sslmode or "require",
+        pgport_explicit=_pgport_explicit,
+    )
+
+    if not h_m or not u_m or not pw_m:
+        raise ValueError(
+            "TimescaleDB connection is incomplete: set TIMESCALE_SERVICE_URL to a full "
+            "postgres:// or postgresql:// URI, or set PGHOST, PGUSER, and PGPASSWORD "
+            "(and optional PGPORT, PGDATABASE, PGSSLMODE)."
+        )
+
+    _service_url_field = _ts_s if _ts_s else (_merge_postgres_url or "")
+    if not _service_url_field:
+        _service_url_field = build_postgres_dsn(
+            host=h_m,
+            port=port_m,
+            database=d_m,
+            user=u_m,
+            password=pw_m,
+            sslmode=sm_m,
+        )
+
+    return TimescaleConfig(
+        service_url=_service_url_field,
+        host=h_m,
+        port=port_m,
+        database=d_m,
+        user=u_m,
+        password=pw_m,
+        sslmode=sm_m,
+        max_connections=int(
+            secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS")
+            or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")
+        ),
+        pool_size=int(
+            secrets_manager.get_secret("TIMESCALE_POOL_SIZE")
+            or os.getenv("TIMESCALE_POOL_SIZE", "20")
+        ),
+        statement_timeout=int(
+            secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT")
+            or os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")
+        ),
+        idle_timeout=int(
+            secrets_manager.get_secret("TIMESCALE_IDLE_TIMEOUT")
+            or os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")
+        ),
+        chunk_time_interval=secrets_manager.get_secret("TIMESCALE_CHUNK_INTERVAL")
+        or os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
+        compression_after=secrets_manager.get_secret("TIMESCALE_COMPRESSION_AFTER")
+        or os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
+        retention_period=secrets_manager.get_secret("TIMESCALE_RETENTION_PERIOD")
+        or os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
+    )
+
+
 class Config(BaseModel):
     """Main application configuration."""
 
@@ -293,54 +397,38 @@ class Config(BaseModel):
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),
                 ping_interval=int(os.getenv("WEBSOCKET_PING_INTERVAL", "45")),
                 ping_timeout=int(os.getenv("WEBSOCKET_PING_TIMEOUT", "30")),
+                absolute_silence_seconds=int(os.getenv("OCPP_ABSOLUTE_SILENCE_SECONDS", "1800")),
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "1048576")),
                 rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "100")),
             ),
-            timescale=TimescaleConfig(
-                service_url=secrets_manager.get_secret("TIMESCALE_SERVICE_URL")
-                or os.getenv("TIMESCALE_SERVICE_URL"),
-                host=secrets_manager.get_secret("PGHOST") or os.getenv("PGHOST"),
-                port=_parse_int_value(secrets_manager.get_secret("PGPORT") or os.getenv("PGPORT"), 5432),
-                database=secrets_manager.get_secret("PGDATABASE") or os.getenv("PGDATABASE", "tsdb"),
-                user=secrets_manager.get_secret("PGUSER") or os.getenv("PGUSER"),
-                password=secrets_manager.get_secret("PGPASSWORD") or os.getenv("PGPASSWORD"),
-                sslmode=secrets_manager.get_secret("PGSSLMODE")
-                or os.getenv("PGSSLMODE", "require"),
-                max_connections=int(
-                    secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS")
-                    or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")
-                ),
-                pool_size=int(
-                    secrets_manager.get_secret("TIMESCALE_POOL_SIZE")
-                    or os.getenv("TIMESCALE_POOL_SIZE", "20")
-                ),
-                statement_timeout=int(
-                    secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT")
-                    or os.getenv("TIMESCALE_STATEMENT_TIMEOUT", "30")
-                ),
-                idle_timeout=int(
-                    secrets_manager.get_secret("TIMESCALE_IDLE_TIMEOUT")
-                    or os.getenv("TIMESCALE_IDLE_TIMEOUT", "600")
-                ),
-                chunk_time_interval=secrets_manager.get_secret("TIMESCALE_CHUNK_INTERVAL")
-                or os.getenv("TIMESCALE_CHUNK_INTERVAL", "1 day"),
-                compression_after=secrets_manager.get_secret("TIMESCALE_COMPRESSION_AFTER")
-                or os.getenv("TIMESCALE_COMPRESSION_AFTER", "7 days"),
-                retention_period=secrets_manager.get_secret("TIMESCALE_RETENTION_PERIOD")
-                or os.getenv("TIMESCALE_RETENTION_PERIOD", "2 years"),
-            ),
+            timescale=_timescale_config_from_env(secrets_manager),
             supabase=SupabaseConfig(
                 url=secrets_manager.get_secret("SUPABASE_URL") or os.getenv("SUPABASE_URL"),
-                anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY"),
-                service_key=secrets_manager.get_secret("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_KEY"),
-                db_host=secrets_manager.get_secret("SUPABASE_DB_HOST") or os.getenv("SUPABASE_DB_HOST"),
-                db_port=_parse_int_value(secrets_manager.get_secret("SUPABASE_DB_PORT") or os.getenv("SUPABASE_DB_PORT"), 6543),
-                db_name=secrets_manager.get_secret("SUPABASE_DB_NAME") or os.getenv("SUPABASE_DB_NAME", "postgres"),
-                db_user=secrets_manager.get_secret("SUPABASE_DB_USER") or os.getenv("SUPABASE_DB_USER"),
-                db_password=secrets_manager.get_secret("SUPABASE_DB_PASSWORD") or os.getenv("SUPABASE_DB_PASSWORD"),
-                max_connections=int(secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS") or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")),
-                connection_timeout=int(secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT") or os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")),
+                anon_key=secrets_manager.get_secret("SUPABASE_ANON_KEY")
+                or os.getenv("SUPABASE_ANON_KEY"),
+                service_key=secrets_manager.get_secret("SUPABASE_SERVICE_KEY")
+                or os.getenv("SUPABASE_SERVICE_KEY"),
+                db_host=secrets_manager.get_secret("SUPABASE_DB_HOST")
+                or os.getenv("SUPABASE_DB_HOST"),
+                db_port=_parse_int_value(
+                    secrets_manager.get_secret("SUPABASE_DB_PORT") or os.getenv("SUPABASE_DB_PORT"),
+                    6543,
+                ),
+                db_name=secrets_manager.get_secret("SUPABASE_DB_NAME")
+                or os.getenv("SUPABASE_DB_NAME", "postgres"),
+                db_user=secrets_manager.get_secret("SUPABASE_DB_USER")
+                or os.getenv("SUPABASE_DB_USER"),
+                db_password=secrets_manager.get_secret("SUPABASE_DB_PASSWORD")
+                or os.getenv("SUPABASE_DB_PASSWORD"),
+                max_connections=int(
+                    secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS")
+                    or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")
+                ),
+                connection_timeout=int(
+                    secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT")
+                    or os.getenv("SUPABASE_CONNECTION_TIMEOUT", "30")
+                ),
                 enable_realtime=os.getenv("SUPABASE_ENABLE_REALTIME", "true").lower() == "true",
             ),
             monitoring=MonitoringConfig(
@@ -352,16 +440,6 @@ class Config(BaseModel):
             ),
             price_feeder=PriceFeederConfig(
                 enabled=os.getenv("PRICE_FEEDER_ENABLED", "true").lower() == "true",
-                base_url=os.getenv(
-                    "PRICE_FEEDER_BASE_URL", "https://oasis.caiso.com/oasisapi/SingleZip"
-                ),
-                nodes=[
-                    node.strip()
-                    for node in os.getenv(
-                        "PRICE_FEEDER_NODES", "TH_SP15_GEN-APND,TH_NP15_GEN-APND"
-                    ).split(",")
-                    if node.strip()
-                ],
                 entsoe_zones=[
                     z.strip()
                     for z in os.getenv("PRICE_FEEDER_ENTSOE_ZONES", "").split(",")
@@ -390,9 +468,7 @@ class Config(BaseModel):
                 enabled=os.getenv("EMAIL_DELIVERY_ENABLED", "true").lower() == "true",
                 resend_api_key=secrets_manager.get_secret("RESEND_API_KEY")
                 or os.getenv("RESEND_API_KEY", ""),
-                resend_from_address=os.getenv(
-                    "RESEND_FROM_ADDRESS", "alerts@favonius.energy"
-                ),
+                resend_from_address=os.getenv("RESEND_FROM_ADDRESS", "alerts@favonius.energy"),
                 poll_interval_s=float(os.getenv("ALERT_DISPATCHER_POLL_INTERVAL_S", "30")),
                 resend_interval_s=int(os.getenv("ALERT_NOTIFY_RESEND_INTERVAL_S", "3600")),
                 batch_size=int(os.getenv("ALERT_DISPATCHER_BATCH_SIZE", "50")),

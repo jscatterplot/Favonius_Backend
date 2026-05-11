@@ -22,7 +22,7 @@ import logging
 import math
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -37,8 +37,20 @@ class RateLimitConfig:
     # General API endpoints
     api_requests_per_minute: int = 100
 
+    # Admin write endpoints used by the bulk-import flows on the fleet
+    # identity panel (POST/PATCH /admin/depots/{id}/{vehicles|drivers|rfid-cards}).
+    # Sized for sequential xlsx imports — a 200-row file completes in ~10s at
+    # the FE's serial cadence and a 5,000-row file in ~5 minutes — without
+    # weakening the general 100/min limit on read-heavy admin paths. Reusable
+    # for future bulk-import endpoints (drivers, chargers); extend the path
+    # match in RateLimitMiddleware accordingly.
+    admin_write_requests_per_minute: int = 1200
+
     # POST /optimize endpoint (more expensive)
     optimize_requests_per_minute: int = 10
+
+    # /agent/* LLM endpoints (same cadence as optimize; separate bucket)
+    agent_requests_per_minute: int = 10
 
     # Inter-depot handoff: 50 messages/hour per depot pair
     handoff_messages_per_hour: int = 50
@@ -102,7 +114,9 @@ class RateLimiter:
 
         # In-memory sliding window buckets (timestamp lists)
         self._api_buckets: dict[str, list[float]] = defaultdict(list)
+        self._admin_write_buckets: dict[str, list[float]] = defaultdict(list)
         self._optimize_buckets: dict[str, list[float]] = defaultdict(list)
+        self._agent_buckets: dict[str, list[float]] = defaultdict(list)
         self._handoff_buckets: dict[tuple, list[float]] = defaultdict(list)
         self._last_trigger_optimization: dict[UUID, float] = {}
 
@@ -139,7 +153,9 @@ class RateLimiter:
     def reset_in_memory_buckets_for_tests(self) -> None:
         """Clear sliding-window state (unit tests only; avoids cross-test 429s)."""
         self._api_buckets.clear()
+        self._admin_write_buckets.clear()
         self._optimize_buckets.clear()
+        self._agent_buckets.clear()
         self._handoff_buckets.clear()
         self._last_trigger_optimization.clear()
 
@@ -186,6 +202,26 @@ class RateLimiter:
         bucket.append(time.time())
         return self._make_result(True, bucket, limit, 60)
 
+    def check_admin_write_limit(self, client_id: str) -> RateLimitResult:
+        """Check if client is within the admin-write rate limit.
+
+        Used by the bulk-import flows that issue sequential POST/PATCH calls
+        against the fleet identity endpoints (vehicles, drivers, RFID cards).
+        This bucket is separate from the general API limit so a 200-row xlsx
+        import does not trip the 100/min ceiling shared with read-heavy admin
+        traffic.
+        """
+        limit = self.config.admin_write_requests_per_minute
+        bucket = self._clean_bucket(self._admin_write_buckets[client_id], 60)
+        self._admin_write_buckets[client_id] = bucket
+
+        if len(bucket) >= limit:
+            logger.warning("Admin write rate limit exceeded for client %s", client_id)
+            return self._make_result(False, bucket, limit, 60)
+
+        bucket.append(time.time())
+        return self._make_result(True, bucket, limit, 60)
+
     def check_optimize_limit(self, client_id: str) -> RateLimitResult:
         """Check if client is within optimization rate limit.
 
@@ -197,6 +233,24 @@ class RateLimiter:
 
         if len(bucket) >= limit:
             logger.warning("Optimize rate limit exceeded for client %s", client_id)
+            return self._make_result(False, bucket, limit, 60)
+
+        bucket.append(time.time())
+        return self._make_result(True, bucket, limit, 60)
+
+    def check_agent_limit(self, client_id: str) -> RateLimitResult:
+        """Check if client is within depot-chat agent rate limit.
+
+        Same window/limit shape as :meth:`check_optimize_limit` but uses a
+        dedicated bucket so /agent/* traffic does not compete with POST
+        /optimize.
+        """
+        limit = self.config.agent_requests_per_minute
+        bucket = self._clean_bucket(self._agent_buckets[client_id], 60)
+        self._agent_buckets[client_id] = bucket
+
+        if len(bucket) >= limit:
+            logger.warning("Agent rate limit exceeded for client %s", client_id)
             return self._make_result(False, bucket, limit, 60)
 
         bucket.append(time.time())
@@ -227,9 +281,7 @@ class RateLimiter:
         """Record that a trigger-induced optimization occurred."""
         self._last_trigger_optimization[depot_id] = time.time()
 
-    def check_handoff_limit(
-        self, origin_depot_id: str, dest_depot_id: str
-    ) -> RateLimitResult:
+    def check_handoff_limit(self, origin_depot_id: str, dest_depot_id: str) -> RateLimitResult:
         """Check if handoff rate limit is within bounds.
 
         Per PRD Section 10.4: 50 messages/hour per depot pair.
@@ -294,6 +346,15 @@ class RateLimiter:
                 )
                 rows.append(("api", client_id, window_start, len(clean)))
 
+        # Aggregate admin-write buckets (same 60s window shape as api)
+        for client_id, timestamps in list(self._admin_write_buckets.items()):
+            clean = [t for t in timestamps if t > now - 60]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
+                )
+                rows.append(("admin_write", client_id, window_start, len(clean)))
+
         # Aggregate optimize buckets
         for client_id, timestamps in list(self._optimize_buckets.items()):
             clean = [t for t in timestamps if t > now - 60]
@@ -302,6 +363,15 @@ class RateLimiter:
                     math.floor(clean[0] / 60) * 60, tz=timezone.utc
                 )
                 rows.append(("optimize", client_id, window_start, len(clean)))
+
+        # Aggregate agent buckets
+        for client_id, timestamps in list(self._agent_buckets.items()):
+            clean = [t for t in timestamps if t > now - 60]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
+                )
+                rows.append(("agent", client_id, window_start, len(clean)))
 
         # Aggregate handoff buckets
         for depot_pair, timestamps in list(self._handoff_buckets.items()):
@@ -346,13 +416,11 @@ class RateLimiter:
         now = time.time()
         try:
             async with self._pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
+                rows = await conn.fetch("""
                     SELECT bucket_type, bucket_key, window_start, request_count
                     FROM rate_limit_state
                     WHERE last_updated > NOW() - INTERVAL '2 minutes'
-                    """
-                )
+                    """)
         except Exception as e:
             logger.error("Failed to read rate limit state: %s", e)
             return
@@ -368,28 +436,36 @@ class RateLimiter:
                     self._api_buckets[bucket_key] = self._generate_synthetic_timestamps(
                         remote_count, 60, now
                     )
+            elif bucket_type == "admin_write":
+                local = self._clean_bucket(self._admin_write_buckets.get(bucket_key, []), 60)
+                if remote_count > len(local):
+                    self._admin_write_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                        remote_count, 60, now
+                    )
             elif bucket_type == "optimize":
                 local = self._clean_bucket(self._optimize_buckets.get(bucket_key, []), 60)
                 if remote_count > len(local):
-                    self._optimize_buckets[bucket_key] = (
-                        self._generate_synthetic_timestamps(remote_count, 60, now)
+                    self._optimize_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                        remote_count, 60, now
+                    )
+            elif bucket_type == "agent":
+                local = self._clean_bucket(self._agent_buckets.get(bucket_key, []), 60)
+                if remote_count > len(local):
+                    self._agent_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                        remote_count, 60, now
                     )
             elif bucket_type == "handoff":
                 parts = bucket_key.split(":", 1)
                 if len(parts) == 2:
                     depot_pair = tuple(parts)
-                    local = self._clean_bucket(
-                        self._handoff_buckets.get(depot_pair, []), 3600
-                    )
+                    local = self._clean_bucket(self._handoff_buckets.get(depot_pair, []), 3600)
                     if remote_count > len(local):
-                        self._handoff_buckets[depot_pair] = (
-                            self._generate_synthetic_timestamps(remote_count, 3600, now)
+                        self._handoff_buckets[depot_pair] = self._generate_synthetic_timestamps(
+                            remote_count, 3600, now
                         )
 
     @staticmethod
-    def _generate_synthetic_timestamps(
-        count: int, window_seconds: int, now: float
-    ) -> list[float]:
+    def _generate_synthetic_timestamps(count: int, window_seconds: int, now: float) -> list[float]:
         """Generate evenly-spaced synthetic timestamps within a window.
 
         Used to populate in-memory buckets from DB aggregate counts.
@@ -409,13 +485,11 @@ class RateLimiter:
         now = time.time()
         try:
             async with self._pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
+                rows = await conn.fetch("""
                     SELECT bucket_type, bucket_key, request_count
                     FROM rate_limit_state
                     WHERE last_updated > NOW() - INTERVAL '2 minutes'
-                    """
-                )
+                    """)
         except Exception as e:
             logger.warning("Failed to hydrate rate limiter from DB: %s", e)
             return
@@ -427,21 +501,29 @@ class RateLimiter:
             count = row["request_count"]
 
             if bucket_type == "api":
-                self._api_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                self._api_buckets[bucket_key] = self._generate_synthetic_timestamps(count, 60, now)
+                hydrated += 1
+            elif bucket_type == "admin_write":
+                self._admin_write_buckets[bucket_key] = self._generate_synthetic_timestamps(
                     count, 60, now
                 )
                 hydrated += 1
             elif bucket_type == "optimize":
-                self._optimize_buckets[bucket_key] = (
-                    self._generate_synthetic_timestamps(count, 60, now)
+                self._optimize_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                    count, 60, now
+                )
+                hydrated += 1
+            elif bucket_type == "agent":
+                self._agent_buckets[bucket_key] = self._generate_synthetic_timestamps(
+                    count, 60, now
                 )
                 hydrated += 1
             elif bucket_type == "handoff":
                 parts = bucket_key.split(":", 1)
                 if len(parts) == 2:
                     depot_pair = tuple(parts)
-                    self._handoff_buckets[depot_pair] = (
-                        self._generate_synthetic_timestamps(count, 3600, now)
+                    self._handoff_buckets[depot_pair] = self._generate_synthetic_timestamps(
+                        count, 3600, now
                     )
                     hydrated += 1
 
@@ -455,12 +537,10 @@ class RateLimiter:
 
         try:
             async with self._pool.acquire() as conn:
-                deleted = await conn.execute(
-                    """
+                deleted = await conn.execute("""
                     DELETE FROM rate_limit_state
                     WHERE last_updated < NOW() - INTERVAL '5 minutes'
-                    """
-                )
+                    """)
                 if deleted and deleted != "DELETE 0":
                     logger.debug("Cleaned up expired rate limit rows: %s", deleted)
         except Exception as e:

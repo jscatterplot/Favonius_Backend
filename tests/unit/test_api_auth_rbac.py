@@ -491,7 +491,7 @@ class TestMyDepots:
         assert data["needs_setup"] is True
         assert data["viewer"] == {"role": "customer_operator", "organization_id": org_id}
 
-    def test_unknown_role_returns_empty_without_setup_signal(self, client, mock_db_pool):
+    def test_unknown_role_without_org_id_returns_no_setup_signal(self, client, mock_db_pool):
         pool, conn = mock_db_pool
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
             _valid_user(role="authenticated", omit_organization_id=True)
@@ -504,6 +504,27 @@ class TestMyDepots:
         assert data["depots"] == []
         assert data["needs_setup"] is False
         assert data["viewer"] == {"role": "authenticated", "organization_id": None}
+
+    def test_unprovisioned_role_with_org_id_signals_setup(self, client, mock_db_pool):
+        """User with org_id but no favonius_role in app_metadata still sees needs_setup=True.
+
+        Regression: gustas.diksa@hrx.lt had an organization but app_metadata.favonius_role
+        was unset, so role resolved to 'authenticated'. The early role-check returned
+        needs_setup=False, hiding the depot wizard entirely.
+        """
+        pool, conn = mock_db_pool
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="authenticated", organization_id=org_id)
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        with patch("src.api.main.db_pools", pool):
+            response = client.get("/me/depots", headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_200_OK
+        data = response.json()
+        assert data["depots"] == []
+        assert data["needs_setup"] is True
+        assert data["viewer"] == {"role": "authenticated", "organization_id": org_id}
 
 
 class TestTenantMirrorOnAuthenticatedRequest:
@@ -2007,6 +2028,98 @@ class TestCrossOrganizationDepotAccessDenied:
             )
 
         assert response.status_code == http_status.HTTP_200_OK
+
+
+# ── H5b: verify_depot_access distinguishes DB failure from policy denial ───
+#
+# Previously verify_depot_access wrapped the depot-org SQL in a bare
+# ``except Exception`` and fell through to a generic 403, so a real DB
+# outage looked identical to "you don't have access" in both the response
+# and the logs. The fix narrows the catch to known DB / network errors
+# and surfaces them as 503 (with a clear log) so on-call can distinguish.
+
+
+class TestVerifyDepotAccessDbFailureModes:
+    @pytest.mark.asyncio
+    async def test_pool_none_raises_503_not_403(self):
+        """pool=None means the auth check cannot run; must not be silent 403."""
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=None)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_asyncpg_error_raises_503_not_403(self, mock_db_pool):
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_asyncpg_interface_error_raises_503(self, mock_db_pool):
+        """InterfaceError is a sibling of PostgresError; pool-closing raises this."""
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=asyncpg.InterfaceError("pool is closing"))
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_asyncpg_internal_client_error_raises_503(self, mock_db_pool):
+        """InternalClientError is also a sibling of PostgresError; must not become 500."""
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=asyncpg.InternalClientError("internal client error"))
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_oserror_from_pool_raises_503(self, mock_db_pool):
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=OSError("socket gone"))
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_timeout_during_lookup_raises_503(self, mock_db_pool):
+        import asyncio as _asyncio
+
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=_asyncio.TimeoutError())
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_unknown_exception_propagates_not_swallowed_as_403(self, mock_db_pool):
+        """Truly unexpected exceptions must propagate, not become silent 403s.
+
+        The global handler will turn this into a 500; the previous bare
+        ``except Exception`` would have hidden a programmer error as a
+        misleading access-denied response.
+        """
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(side_effect=RuntimeError("programmer error"))
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(RuntimeError, match="programmer error"):
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+
+    @pytest.mark.asyncio
+    async def test_policy_denial_still_returns_403(self, mock_db_pool):
+        """Sanity check: the happy-path 403 (no row matches org) is unchanged."""
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(return_value=False)
+        user = _valid_user(role="customer_admin")
+        with pytest.raises(HTTPException) as exc:
+            await verify_depot_access(DEPOT_ID, user, pool=pool)
+        assert exc.value.status_code == http_status.HTTP_403_FORBIDDEN
 
 
 # ── H6: depot setup idempotency semantics ──────────────────────────────────

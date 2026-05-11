@@ -63,6 +63,13 @@ logging.basicConfig(
 logger = logging.getLogger("pilot")
 
 
+def _action(name_pascal: str, name_snake: str):
+    action = getattr(Action, name_pascal, None)
+    if action is not None:
+        return action
+    return getattr(Action, name_snake)
+
+
 def _now_iso() -> str:
     """OCPP 1.6 timestamp: UTC, milliseconds, trailing Z."""
     now = datetime.now(timezone.utc)
@@ -82,7 +89,7 @@ class PilotChargePoint(CP):
         self.failures: list[str] = []
 
     # ---- Inbound from CSMS ----
-    @on(Action.SetChargingProfile)
+    @on(_action("SetChargingProfile", "set_charging_profile"))
     async def _on_set_charging_profile(self, connector_id, cs_charging_profiles, **kwargs):
         try:
             schedule = cs_charging_profiles.get("chargingSchedule") or cs_charging_profiles.get(
@@ -107,33 +114,33 @@ class PilotChargePoint(CP):
             self.failures.append(f"SetChargingProfile parse failed: {e}")
         return call_result.SetChargingProfile(status=ChargingProfileStatus.accepted)
 
-    @on(Action.RemoteStartTransaction)
+    @on(_action("RemoteStartTransaction", "remote_start_transaction"))
     async def _on_remote_start(self, id_tag, **kwargs):
         logger.info("[%s] <- RemoteStartTransaction id_tag=%s", self.id, id_tag)
         self.received_remote_start.set()
         return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.accepted)
 
-    @on(Action.RemoteStopTransaction)
+    @on(_action("RemoteStopTransaction", "remote_stop_transaction"))
     async def _on_remote_stop(self, transaction_id, **kwargs):
         logger.info("[%s] <- RemoteStopTransaction tx=%s", self.id, transaction_id)
         return call_result.RemoteStopTransaction(status=RemoteStartStopStatus.accepted)
 
-    @on(Action.TriggerMessage)
+    @on(_action("TriggerMessage", "trigger_message"))
     async def _on_trigger(self, requested_message, **kwargs):
         logger.info("[%s] <- TriggerMessage %s", self.id, requested_message)
         return call_result.TriggerMessage(status="Accepted")
 
-    @on(Action.Reset)
+    @on(_action("Reset", "reset"))
     async def _on_reset(self, type, **kwargs):
         logger.info("[%s] <- Reset type=%s", self.id, type)
         return call_result.Reset(status=ResetStatus.accepted)
 
-    @on(Action.ChangeConfiguration)
+    @on(_action("ChangeConfiguration", "change_configuration"))
     async def _on_change_config(self, key, value, **kwargs):
         logger.info("[%s] <- ChangeConfiguration %s=%s", self.id, key, value)
         return call_result.ChangeConfiguration(status="Accepted")
 
-    @on(Action.GetConfiguration)
+    @on(_action("GetConfiguration", "get_configuration"))
     async def _on_get_config(self, key=None, **kwargs):
         logger.info("[%s] <- GetConfiguration keys=%s", self.id, key)
         return call_result.GetConfiguration(configuration_key=[], unknown_key=key or [])

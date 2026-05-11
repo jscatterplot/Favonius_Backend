@@ -20,14 +20,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import re
-import ssl
 import sys
 from pathlib import Path
 
 # Repo root: script lives in scripts/
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
+
+_SRC = REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from db.postgres_url import prepare_asyncpg_url_and_ssl
 
 
 def _read_migrations_dir(target: str) -> list[Path]:
@@ -81,46 +85,14 @@ async def run_migrations(target: str = "ts") -> int:
         print("No migration files found under migrations/", file=sys.stderr)
         return 1
 
-    # Build SSL configuration when sslmode is present in the URL.
-    # asyncpg needs an explicit ssl.SSLContext or bool for cloud-hosted databases.
-    ssl_config: ssl.SSLContext | bool | None = None
+    database_url, ssl_config = prepare_asyncpg_url_and_ssl(database_url)
 
-    # Extract sslmode from the query string without full URL round-trip.
-    # Using urlparse/urlunparse can mangle passwords containing special
-    # characters (%, +, @, etc.), causing authentication failures.
-    sslmode_match = re.search(r"[?&]sslmode=([^&#]*)", database_url)
-    sslmode: str | None = sslmode_match.group(1) if sslmode_match else None
-
-    if sslmode:
-        mode = sslmode.lower()
-        if mode == "disable":
-            # Explicitly requested no SSL.
-            ssl_config = False
-        else:
-            # For all non-disable modes we establish an SSL context.
-            # libpq-style negotiation modes like "allow" and "prefer" cannot be
-            # expressed directly in asyncpg, so we treat them as "require" from
-            # the client's perspective.
-            ctx = ssl.create_default_context()
-            if mode in {"require", "allow", "prefer"}:
-                # Timescale Cloud / most managed DBs use valid certs, but if the
-                # provider uses self-signed certs, fall back to unverified context.
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            # For verify-ca / verify-full we keep default verification behaviour.
-            ssl_config = ctx
-
-        # Strip sslmode param from the URL so asyncpg doesn't choke on it.
-        # Operate directly on the string to avoid password mangling.
-        # Case 1: sslmode is the first (or only) query param — ?sslmode=val(&...)
-        database_url = re.sub(r"\?sslmode=[^&#]*&?", "?", database_url)
-        # Case 2: sslmode appears after another param — &sslmode=val
-        database_url = re.sub(r"&sslmode=[^&#]*", "", database_url)
-        # Clean up trailing '?' if no query params remain.
-        database_url = database_url.rstrip("?")
+    connect_kw: dict = {}
+    if ssl_config is not None:
+        connect_kw["ssl"] = ssl_config
 
     try:
-        conn = await asyncpg.connect(database_url, ssl=ssl_config)
+        conn = await asyncpg.connect(database_url, **connect_kw)
     except Exception as e:
         print(f"Failed to connect to database ({url_source}): {e}", file=sys.stderr)
         return 1

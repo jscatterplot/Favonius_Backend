@@ -1,11 +1,13 @@
 """Supabase client for static/reference data access."""
 
 import asyncio
+import hmac
 import random
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+
 try:
     from supabase import Client, create_client
 except ImportError:  # pragma: no cover - keep test imports working without optional deps
@@ -15,6 +17,7 @@ except ImportError:  # pragma: no cover - keep test imports working without opti
         raise RuntimeError(
             "supabase package is unavailable. Install optional dependencies to enable Supabase access."
         )
+
 
 from .config import SupabaseConfig
 from .monitoring import get_logger
@@ -135,6 +138,174 @@ class SupabaseClient:
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(query, *args)
             return [dict(row) for row in rows]
+
+    async def resolve_station_id(self, station_id: str) -> str:
+        """Return the canonical station id for a path-supplied station or alias."""
+        query = """
+            SELECT canonical_station_id
+            FROM ocpp_station_aliases
+            WHERE alias_station_id = $1
+              AND active = TRUE
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id)
+        return str(row["canonical_station_id"]) if row else station_id
+
+    async def ensure_station_alias(
+        self,
+        alias_station_id: str,
+        canonical_station_id: str,
+        *,
+        source: str = "auto-multipath",
+        notes: str = "Auto-registered from OCPP multi-segment path",
+    ) -> bool:
+        """Best-effort upsert of an OCPP station alias.
+
+        Mirror of ``TimescaleClient.ensure_station_alias`` for the Supabase-
+        backed pool. Inserts ``(alias → canonical)`` only when the canonical
+        id matches a real ``charging_stations.station_id`` row and no row
+        already exists for the alias. Returns ``True`` iff a row was created.
+        """
+        if alias_station_id == canonical_station_id:
+            return False
+        if not self.db_pool:
+            return False
+        async with self.db_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO ocpp_station_aliases
+                    (alias_station_id, canonical_station_id, source, notes)
+                SELECT $1::VARCHAR, $2::VARCHAR, $3::VARCHAR, $4::TEXT
+                WHERE EXISTS (
+                    SELECT 1 FROM charging_stations WHERE station_id = $2::VARCHAR
+                )
+                ON CONFLICT (alias_station_id) DO NOTHING
+                """,
+                alias_station_id,
+                canonical_station_id,
+                source,
+                notes,
+            )
+        return isinstance(result, str) and result.endswith(" 1")
+
+    async def lookup_tenant_context(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Return ``{"organization_id", "depot_id"}`` for a charger or None.
+
+        Used by the OCPP handlers to label time-series rows (e.g.
+        ``connector_status`` after migration 029) with tenant context so the
+        alerts trigger can route notifications without joining the dropped
+        TimescaleDB shadow tables. Returns None when the station is not
+        registered or has no site assigned — callers persist a NULL-context
+        row in that case and the trigger silently bails.
+        """
+        query = """
+            SELECT cs.site_id AS depot_id, s.organization_id
+            FROM charging_stations cs
+            LEFT JOIN sites s ON s.id = cs.site_id
+            WHERE cs.station_id = $1
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id)
+        if not row:
+            return None
+        return {
+            "organization_id": row.get("organization_id"),
+            "depot_id": row.get("depot_id"),
+        }
+
+    async def lookup_charger_context(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """Return the richer tenant + display context for a charger or None.
+
+        Superset of ``lookup_tenant_context`` — also returns the charger UUID,
+        a human-friendly charger label, and the site's display name. Used by
+        ``security_manager`` to emit/resolve ``charger_auth_failure`` alerts
+        with proper context fields. Replaces the legacy ``chargers JOIN
+        depots`` query that was killed by migration 029.
+        """
+        query = """
+            SELECT
+                cs.id            AS charger_id,
+                cs.site_id       AS depot_id,
+                cs.station_id    AS ocpp_id,
+                COALESCE(cs.display_name, cs.station_id) AS charger_name,
+                s.organization_id,
+                s.name           AS depot_name
+            FROM charging_stations cs
+            LEFT JOIN sites s ON s.id = cs.site_id
+            WHERE cs.station_id = $1
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id)
+        if not row:
+            return None
+        return {
+            "charger_id": row.get("charger_id"),
+            "depot_id": row.get("depot_id"),
+            "ocpp_id": row.get("ocpp_id"),
+            "charger_name": row.get("charger_name"),
+            "organization_id": row.get("organization_id"),
+            "depot_name": row.get("depot_name"),
+        }
+
+    async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
+        """Return True when username is the canonical station id or an active alias."""
+        if hmac.compare_digest(username, station_id):
+            return True
+        query = """
+            SELECT 1
+            FROM ocpp_station_aliases
+            WHERE alias_station_id = $1
+              AND canonical_station_id = $2
+              AND active = TRUE
+            LIMIT 1
+        """
+        return await self.fetch_one(query, username, station_id) is not None
+
+    async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
+        """Validate station Basic Auth credentials from Supabase static config."""
+        query = """
+            SELECT id, password_hash
+            FROM station_credentials
+            WHERE station_id = $1
+              AND username IN ($1, $2)
+              AND active = TRUE
+            ORDER BY CASE WHEN username = $2 THEN 0 ELSE 1 END
+            LIMIT 1
+        """
+        row = await self.fetch_one(query, station_id, username)
+        if not row:
+            return False
+
+        import bcrypt
+
+        password_ok = bcrypt.checkpw(
+            password.encode("utf-8"),
+            row["password_hash"].encode("utf-8"),
+        )
+        if password_ok and self.db_pool:
+            try:
+                async with self.db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE station_credentials SET last_used = NOW() WHERE id = $1",
+                        row["id"],
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to update station_credentials.last_used for id %s: %s",
+                    row["id"],
+                    exc,
+                )
+        return password_ok
+
+    async def station_requires_basic_auth(self, station_id: str) -> bool:
+        """Return True when a provisioned charger requires Basic Auth."""
+        query = """
+            SELECT COALESCE(auth_required, FALSE) AS auth_required
+            FROM charging_stations
+            WHERE station_id = $1
+        """
+        row = await self.fetch_one(query, station_id)
+        return bool(row["auth_required"]) if row else False
 
     # Static data access methods
 

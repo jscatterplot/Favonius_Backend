@@ -9,7 +9,7 @@ import json
 import os
 import random
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -40,6 +40,36 @@ class TimescaleClient:
 
         # Connection state
         self.connected = False
+
+        # Static-table source. RFID/vehicle/charging_stations rows live in
+        # Supabase; ``lookup_id_tag`` routes there when wired by main.py.
+        # Left None during construction so unit tests that build the client
+        # in isolation continue to use ``pg_pool``.
+        self._supabase_client: Any = None
+
+    def set_supabase_client(self, supabase_client: Any) -> None:
+        """Attach a SupabaseClient for static-identity lookups.
+
+        ``lookup_id_tag`` queries ``vehicles`` / ``rfid_cards`` /
+        ``charging_stations`` — those tables live in Supabase. Without
+        this wiring the lookup hits TimescaleDB, where migration 029
+        dropped the static shadows, producing schema errors that the
+        OCPP 1.6 charger interprets as a hard authorization rejection.
+        """
+        self._supabase_client = supabase_client
+
+    def _static_pool(self) -> Any:
+        """Return the connection pool that owns the static identity tables.
+
+        Prefer the wired Supabase pool; fall back to ``pg_pool`` so legacy
+        deployments and existing unit tests (which mock ``pg_pool`` only)
+        continue to work without modification.
+        """
+        if self._supabase_client is not None:
+            pool = getattr(self._supabase_client, "db_pool", None)
+            if pool is not None:
+                return pool
+        return self.pg_pool
 
     async def connect(self) -> None:
         """Establish connections to TimescaleDB with retry logic."""
@@ -169,83 +199,103 @@ class TimescaleClient:
 
         try:
             async with self.pg_pool.acquire() as conn:
+                static_pool = self._static_pool()
+                static_conn = conn if static_pool is self.pg_pool else await static_pool.acquire()
                 inserted = 0
-                for data in telemetry_data:
-                    raw_sample = data.get("raw_sample")
-                    if raw_sample:
-                        await conn.execute(
-                            """
-                            INSERT INTO telemetry_samples (
-                                time,
+                try:
+                    for data in telemetry_data:
+                        station_id = data.get("station_id")
+                        connector_id = data.get("connector_id", 1)
+                        session_id = data.get("session_id")
+                        power_kw = data.get("power_kw")
+                        soc_percent = data.get("soc_percent")
+                        max_charge_kw = data.get("max_charge_power_kw")
+                        transaction_id = self._coerce_transaction_id(session_id)
+
+                        raw_sample = data.get("raw_sample")
+                        if raw_sample:
+                            await conn.execute(
+                                """
+                                INSERT INTO telemetry_samples (
+                                    time,
+                                    station_id,
+                                    connector_id,
+                                    transaction_id,
+                                    measurand,
+                                    phase,
+                                    location,
+                                    unit,
+                                    context,
+                                    format,
+                                    value
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                """,
+                                raw_sample.get("timestamp", data["time"]),
                                 station_id,
                                 connector_id,
                                 transaction_id,
-                                measurand,
-                                phase,
-                                location,
-                                unit,
-                                context,
-                                format,
-                                value
-                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                raw_sample.get("measurand"),
+                                raw_sample.get("phase"),
+                                raw_sample.get("location"),
+                                raw_sample.get("unit"),
+                                raw_sample.get("context"),
+                                raw_sample.get("format"),
+                                raw_sample.get("value"),
+                            )
+
+                        # Live session metrics: keep the open charging_sessions row
+                        # fresh so per-charger power/SoC is observable in real time
+                        # without requiring vehicle attribution.
+                        if station_id and transaction_id is not None:
+                            await self._update_session_live_metrics(
+                                conn, station_id, transaction_id, power_kw, soc_percent, max_charge_kw
+                            )
+
+                        # Charger-keyed telemetry view (telemetry table). vehicle_id
+                        # is optional enrichment; writes must continue even when
+                        # idTag/session mapping is unavailable.
+                        vehicle_id = data.get("vehicle_id")
+                        if not vehicle_id:
+                            vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
+
+                        charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
+                        soc = (soc_percent / 100.0) if soc_percent is not None else None
+                        is_plugged = (power_kw > 0.1) if power_kw is not None else None
+
+                        await conn.execute(
+                            """
+                            INSERT INTO telemetry (
+                                time, station_id, connector_id, transaction_id,
+                                vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
+                            )
+                            VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7, $8, $9, $10)
+                            ON CONFLICT (time, station_id, connector_id) DO UPDATE
+                            SET transaction_id = COALESCE(
+                                    EXCLUDED.transaction_id,
+                                    telemetry.transaction_id
+                                ),
+                                vehicle_id = COALESCE(EXCLUDED.vehicle_id, telemetry.vehicle_id),
+                                charger_id = COALESCE(EXCLUDED.charger_id, telemetry.charger_id),
+                                soc = COALESCE(EXCLUDED.soc, telemetry.soc),
+                                charging_kw = COALESCE(EXCLUDED.charging_kw, telemetry.charging_kw),
+                                is_plugged = COALESCE(EXCLUDED.is_plugged, telemetry.is_plugged),
+                                max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw)
                             """,
-                            raw_sample.get("timestamp", data["time"]),
-                            data.get("station_id"),
-                            data.get("connector_id", 1),
-                            int(data["session_id"]) if data.get("session_id") else None,
-                            raw_sample.get("measurand"),
-                            raw_sample.get("phase"),
-                            raw_sample.get("location"),
-                            raw_sample.get("unit"),
-                            raw_sample.get("context"),
-                            raw_sample.get("format"),
-                            raw_sample.get("value"),
+                            data["time"],
+                            station_id or "unknown",
+                            int(connector_id) if connector_id is not None else 1,
+                            transaction_id,
+                            str(vehicle_id) if vehicle_id else None,
+                            str(charger_id) if charger_id else None,
+                            soc,
+                            power_kw,
+                            is_plugged,
+                            max_charge_kw,
                         )
-
-                    vehicle_id = data.get("vehicle_id")
-                    session_id = data.get("session_id")
-                    station_id = data.get("station_id")
-                    connector_id = data.get("connector_id", 1)
-
-                    if not vehicle_id:
-                        vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
-                    if not vehicle_id:
-                        vehicle_id = await self._resolve_vehicle_id_from_id_token(
-                            conn, station_id, connector_id
-                        )
-
-                    if not vehicle_id:
-                        self.logger.debug(
-                            f"Skipping telemetry: no vehicle_id for station_id={station_id}, "
-                            f"connector_id={connector_id}, session_id={session_id}"
-                        )
-                        continue
-
-                    charger_id = await self._resolve_charger_id(conn, station_id)
-
-                    soc_percent = data.get("soc_percent")
-                    soc = (soc_percent / 100.0) if soc_percent is not None else None
-                    charging_kw = data.get("power_kw")
-                    is_plugged = charging_kw is not None and charging_kw > 0.1
-                    max_charge_kw = data.get("max_charge_power_kw")
-
-                    await conn.execute(
-                        """
-                        INSERT INTO telemetry (
-                            time, vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
-                        )
-                        VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7)
-                        ON CONFLICT (time, vehicle_id) DO NOTHING
-                        """,
-                        data["time"],
-                        str(vehicle_id),
-                        str(charger_id) if charger_id else None,
-                        soc,
-                        charging_kw,
-                        is_plugged,
-                        max_charge_kw,
-                    )
-                    inserted += 1
+                        inserted += 1
+                finally:
+                    if static_conn is not conn:
+                        await static_pool.release(static_conn)
 
                 if inserted:
                     self.logger.debug(f"Inserted {inserted} telemetry records into telemetry")
@@ -277,60 +327,136 @@ class TimescaleClient:
     async def _resolve_vehicle_id_from_session(
         self, conn: asyncpg.Connection, session_id: Optional[str]
     ) -> Optional[str]:
+        """Resolve an attached vehicle for a charging session.
+
+        Upstream callers pass either the ``charging_sessions.session_id``
+        UUID PK or the OCPP 1.6 integer ``transaction_id`` (legacy adapter,
+        ``ocpp16_adapter.py``). Detect numeric vs UUID and dispatch to the
+        right column rather than letting an int hit the UUID-typed
+        ``session_id`` and fail with "invalid UUID '1'".
+        """
         if not session_id:
             return None
-        row = await conn.fetchrow(
-            "SELECT vehicle_id FROM charging_sessions WHERE session_id = $1 LIMIT 1", session_id
-        )
+        key = str(session_id)
+        try:
+            uuid.UUID(key)
+        except (ValueError, TypeError):
+            try:
+                tx_id = int(key)
+            except (TypeError, ValueError):
+                return None
+            row = await conn.fetchrow(
+                """
+                SELECT vehicle_id
+                  FROM charging_sessions
+                 WHERE transaction_id = $1
+                 ORDER BY start_time DESC
+                 LIMIT 1
+                """,
+                tx_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT vehicle_id FROM charging_sessions WHERE session_id = $1::uuid LIMIT 1",
+                key,
+            )
         return row["vehicle_id"] if row and row["vehicle_id"] else None
 
-    async def _resolve_vehicle_id_from_id_token(
-        self, conn: asyncpg.Connection, station_id: Optional[str], connector_id: int
-    ) -> Optional[str]:
-        if not station_id:
+    @staticmethod
+    def _coerce_transaction_id(value: Any) -> Optional[int]:
+        """Coerce a session_id-like value into an OCPP 1.6 integer transaction id.
+
+        Returns None for UUID session ids and other non-integer inputs so the
+        caller can safely pass it to columns typed BIGINT.
+        """
+        if value is None:
             return None
-        row = await conn.fetchrow(
-            """
-            SELECT id_token
-            FROM transaction_events_v2g
-            WHERE station_id = $1 AND connector_id = $2
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            station_id,
-            connector_id,
-        )
-        if not row or not row["id_token"]:
+        s = str(value).strip()
+        if not s:
             return None
-        id_token = row["id_token"]
-        if isinstance(id_token, str):
-            try:
-                id_token = json.loads(id_token)
-            except json.JSONDecodeError:
-                id_token = {}
-        token_value = id_token.get("idToken") or id_token.get("id_token")
-        if not token_value:
+        try:
+            return int(s)
+        except (TypeError, ValueError):
             return None
-        vehicle_row = await conn.fetchrow(
-            "SELECT id AS vehicle_id FROM vehicles WHERE id_tag = $1 LIMIT 1",
-            token_value,
-        )
-        return vehicle_row["vehicle_id"] if vehicle_row else None
+
+    async def _update_session_live_metrics(
+        self,
+        conn: asyncpg.Connection,
+        station_id: str,
+        transaction_id: int,
+        power_kw: Optional[float],
+        soc_percent: Optional[float],
+        max_charge_kw: Optional[float],
+    ) -> None:
+        """Refresh charging_sessions live fields for the open session.
+
+        Writes per-MeterValues snapshots of charging power and SoC onto the
+        open charging_sessions row so per-charger charging rate is observable
+        without joining telemetry. ``max_charge_power_kw`` is bumped only when
+        the new value is higher so the column captures the session peak.
+        """
+        soc = (soc_percent / 100.0) if soc_percent is not None else None
+        try:
+            await conn.execute(
+                """
+                UPDATE charging_sessions
+                   SET current_power_kw     = COALESCE($3, current_power_kw),
+                       current_soc          = COALESCE($4, current_soc),
+                       max_charge_power_kw  = GREATEST(max_charge_power_kw, $5),
+                       updated_at           = NOW()
+                 WHERE station_id     = $1
+                   AND transaction_id = $2
+                   AND end_time IS NULL
+                   AND source = 'live'
+                """,
+                station_id,
+                transaction_id,
+                power_kw,
+                soc,
+                max_charge_kw,
+            )
+        except Exception as exc:
+            self.logger.debug(
+                "Live session metric update skipped: station=%s tx=%s err=%s",
+                station_id,
+                transaction_id,
+                exc,
+            )
 
     async def _resolve_charger_id(
-        self, conn: asyncpg.Connection, station_id: Optional[str]
+        self, station_id: Optional[str], conn: Optional[asyncpg.Connection] = None
     ) -> Optional[str]:
+        """Resolve ``charging_stations.id`` for a given OCPP station_id.
+
+        ``charging_stations`` lives in Supabase (migration 029 dropped the
+        TimescaleDB shadow), so the lookup must go through ``_static_pool``;
+        a direct ``pg_pool`` query trips ``UndefinedTableError`` and would
+        bubble up through ``insert_telemetry_batch``, taking the whole
+        telemetry batch with it. ``_static_pool`` falls back to ``pg_pool``
+        for tests and legacy deployments without a Supabase wiring.
+
+        Returns ``None`` when the station is unknown — telemetry rows are
+        still inserted with a NULL ``charger_id``.
+        """
         if not station_id:
             return None
-        row = await conn.fetchrow(
-            "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
-            station_id,
-        )
+        if conn is None:
+            async with self._static_pool().acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                    station_id,
+                )
+        else:
+            row = await conn.fetchrow(
+                "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                station_id,
+            )
         return row["charger_id"] if row else None
 
-    # Electricity Prices
+    # Electricity Prices — ``electricity_prices`` hypertable (migration 034)
+
     async def store_electricity_prices(self, price_points: List[Dict[str, Any]]) -> None:
-        """Store electricity price points."""
+        """Store electricity price points into the ``electricity_prices`` hypertable."""
         if not price_points:
             return
 
@@ -365,6 +491,10 @@ class TimescaleClient:
                         "price_confidence",
                         "forecast_horizon_minutes",
                     ],
+                )
+                self.logger.debug(
+                    "Stored %s electricity price records (electricity_prices)",
+                    len(price_points),
                 )
 
         except Exception as e:
@@ -581,7 +711,12 @@ class TimescaleClient:
             raise
 
     async def insert_connector_status(self, status_data: Dict[str, Any]) -> None:
-        """Insert connector status."""
+        """Insert connector status.
+
+        Populates the optional ``organization_id`` and ``depot_id`` columns
+        (migration 029) when present in ``status_data``; the trigger uses these
+        to create ``notification_alerts`` rows without relying on shadow tables.
+        """
         # Local import keeps this module importable in environments without
         # prometheus_client installed (e.g. some CI shards).
         from .monitoring import DB_WRITE_LATENCY
@@ -592,14 +727,17 @@ class TimescaleClient:
                 await conn.execute(
                     """
                     INSERT INTO connector_status (
-                        station_id, connector_id, status, error_code, timestamp
-                    ) VALUES ($1, $2, $3, $4, $5)
+                        station_id, connector_id, status, error_code,
+                        timestamp, organization_id, depot_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
                     status_data["station_id"],
                     status_data["connector_id"],
                     status_data["status"],
                     status_data["error_code"],
                     status_data["timestamp"],
+                    status_data.get("organization_id"),
+                    status_data.get("depot_id"),
                 )
         except Exception as e:
             self.logger.error(f"Failed to insert connector status: {e}")
@@ -804,56 +942,6 @@ class TimescaleClient:
 
         except Exception as e:
             self.logger.error(f"Failed to update schedule execution: {e}")
-            raise
-
-    # Electricity Prices Operations
-    async def store_electricity_prices(  # noqa: F811
-        self, price_data: List[Dict[str, Any]]
-    ) -> None:
-        """Store electricity price data."""
-        if not price_data:
-            return
-
-        try:
-            async with self.pg_pool.acquire() as conn:
-                values = []
-                for data in price_data:
-                    values.append(
-                        (
-                            data["time"],
-                            data["node_id"],
-                            data["market_type"],
-                            data.get("lmp_price_mwh"),
-                            data.get("energy_component_mwh"),
-                            data.get("congestion_component_mwh"),
-                            data.get("loss_component_mwh"),
-                            data.get("ghg_adder_mwh"),
-                            data.get("price_confidence"),
-                            data.get("forecast_horizon_minutes"),
-                        )
-                    )
-
-                await conn.copy_records_to_table(
-                    "electricity_prices",
-                    records=values,
-                    columns=[
-                        "time",
-                        "node_id",
-                        "market_type",
-                        "lmp_price_mwh",
-                        "energy_component_mwh",
-                        "congestion_component_mwh",
-                        "loss_component_mwh",
-                        "ghg_adder_mwh",
-                        "price_confidence",
-                        "forecast_horizon_minutes",
-                    ],
-                )
-
-                self.logger.debug(f"Stored {len(price_data)} electricity price records")
-
-        except Exception as e:
-            self.logger.error(f"Failed to store electricity prices: {e}")
             raise
 
     async def get_electricity_prices(
@@ -1778,6 +1866,118 @@ class TimescaleClient:
             rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
 
+    async def record_invalid_rfid_attempt(self, station_id: str, id_tag: str) -> None:
+        """Persist an invalid RFID authorization attempt for abuse controls.
+
+        Note: ``id_tag`` is a fleet card identifier and may be linkable to a
+        driver. Treat ``security_events`` rows of this type as PII for the
+        purposes of retention and access control — consider scoping any
+        retention policy to keep this event_type for the minimum window the
+        abuse-controls hot path actually needs (currently 60 s) plus whatever
+        compliance window applies (typically 30–90 days).
+        """
+        await self.store_security_event(
+            {
+                "station_id": station_id,
+                "event_type": "rfid_authorization_invalid",
+                "timestamp": datetime.now(timezone.utc),
+                "tech_info": "RFID/idTag authorization denied",
+                "additional_info": {"id_tag": id_tag},
+            }
+        )
+
+    async def count_recent_invalid_rfid_attempts(
+        self,
+        station_id: str,
+        id_tag: str,
+        window_seconds: int = 60,
+    ) -> int:
+        """Count invalid RFID attempts for a station/tag in a recent window.
+
+        Backed by ``idx_security_events_rfid_invalid`` (migration 028) — a
+        partial functional index on ``(station_id, additional_info ->> 'id_tag',
+        timestamp)`` scoped to ``event_type = 'rfid_authorization_invalid'``.
+        Update or drop both together if the query shape changes.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        async with self.pg_pool.acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                  FROM security_events
+                 WHERE station_id = $1
+                   AND event_type = 'rfid_authorization_invalid'
+                   AND timestamp >= $2
+                   AND (additional_info ->> 'id_tag') = $3
+                """,
+                station_id,
+                cutoff,
+                id_tag,
+            )
+            return int(value or 0)
+
+    async def clear_invalid_rfid_attempts(self, station_id: str, id_tag: str) -> None:
+        """Record successful recovery after previous invalid attempts.
+
+        The invalid-attempt rows are append-only audit data. This marker keeps
+        the trail intact while giving operators a visible recovery signal.
+        """
+        if await self.count_recent_invalid_rfid_attempts(station_id, id_tag, 300) == 0:
+            return
+        await self.store_security_event(
+            {
+                "station_id": station_id,
+                "event_type": "rfid_authorization_recovered",
+                "timestamp": datetime.now(timezone.utc),
+                "tech_info": "RFID/idTag authorized after previous invalid attempts",
+                "additional_info": {"id_tag": id_tag},
+            }
+        )
+
+    async def consume_operator_override(
+        self, station_id: str, id_tag: str
+    ) -> Optional[Dict[str, Any]]:
+        """Claim or reuse a recent unexpired override for StartTransaction flow.
+
+        Used by ``RFIDAuthorizationService.authorize`` after ``lookup_id_tag``
+        misses but before the invalid-attempt audit row is written.
+
+        Why this is not strictly single-use:
+        many OCPP 1.6 chargers send both ``Authorize`` and ``StartTransaction``
+        for the same RemoteStart idTag. The first call should consume the row,
+        and the immediately following second call should still pass. We allow
+        reuse only for already-consumed rows from the last 120 seconds.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                WITH claimed AS (
+                    UPDATE operator_authorization_overrides
+                       SET consumed_at = NOW()
+                     WHERE station_id = $1
+                       AND id_tag = $2
+                       AND consumed_at IS NULL
+                       AND expires_at > NOW()
+                    RETURNING id, station_id, connector_id, organization_id, depot_id,
+                              created_by, reason, expires_at, consumed_at
+                )
+                SELECT * FROM claimed
+                UNION ALL
+                SELECT id, station_id, connector_id, organization_id, depot_id,
+                       created_by, reason, expires_at, consumed_at
+                  FROM operator_authorization_overrides
+                 WHERE station_id = $1
+                   AND id_tag = $2
+                   AND consumed_at IS NOT NULL
+                   AND consumed_at > NOW() - INTERVAL '120 seconds'
+                   AND NOT EXISTS (SELECT 1 FROM claimed)
+                 LIMIT 1
+                """,
+                station_id,
+                id_tag,
+            )
+            return dict(row) if row else None
+
     async def validate_api_key(self, station_id: str, api_key: str) -> bool:
         """Validate API key."""
         api_key_hash = self._hash_secret(api_key)
@@ -1813,36 +2013,84 @@ class TimescaleClient:
             ).hexdigest()
         return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
-    async def validate_basic_auth(self, station_id: str, username: str, password: str) -> bool:
-        """Validate basic authentication credentials."""
+    async def resolve_station_id(self, station_id: str) -> str:
+        """Return the canonical station id for a path-supplied station or alias."""
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
+            canonical = await conn.fetchval(
                 """
-                SELECT password_hash FROM station_credentials
-                WHERE station_id = $1 AND username = $2 AND active = true
-            """,
+                SELECT canonical_station_id
+                FROM ocpp_station_aliases
+                WHERE alias_station_id = $1
+                  AND active = TRUE
+                LIMIT 1
+                """,
                 station_id,
-                username,
             )
+        return str(canonical) if canonical else station_id
 
-            if not row:
-                return False
+    async def ensure_station_alias(
+        self,
+        alias_station_id: str,
+        canonical_station_id: str,
+        *,
+        source: str = "auto-multipath",
+        notes: str = "Auto-registered from OCPP multi-segment path",
+    ) -> bool:
+        """Best-effort upsert of an OCPP station alias.
 
-            # Verify password hash
-            import bcrypt
+        Inserts ``(alias_station_id → canonical_station_id)`` only when the
+        canonical id matches an existing ``charging_stations.station_id`` row
+        and no row already exists for the alias. Idempotent — existing aliases
+        are never overwritten, even if they point at a different canonical.
+        Returns ``True`` iff a new row was actually created.
 
-            return bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8"))
+        The alias only enables resolution; Basic Auth still gates every
+        connection, so an attacker who supplies a real canonical in the path
+        but an unknown serial gets a wasted alias row and a 1008 close — no
+        authorization boundary is crossed.
+        """
+        if alias_station_id == canonical_station_id:
+            return False
+        # The EXISTS subquery references ``charging_stations`` which lives
+        # in Supabase; using ``pg_pool`` directly raises ``UndefinedTableError``
+        # against the real Timescale DB. ``_static_pool`` routes to Supabase
+        # when wired and falls back to ``pg_pool`` for tests. ``ocpp_station_aliases``
+        # exists in both DBs (migration 024 + supabase/008), so the INSERT
+        # half of the statement is correct against either pool.
+        async with self._static_pool().acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO ocpp_station_aliases
+                    (alias_station_id, canonical_station_id, source, notes)
+                SELECT $1::VARCHAR, $2::VARCHAR, $3::VARCHAR, $4::TEXT
+                WHERE EXISTS (
+                    SELECT 1 FROM charging_stations WHERE station_id = $2::VARCHAR
+                )
+                ON CONFLICT (alias_station_id) DO NOTHING
+                """,
+                alias_station_id,
+                canonical_station_id,
+                source,
+                notes,
+            )
+        return isinstance(result, str) and result.endswith(" 1")
 
-    async def station_requires_basic_auth(self, station_id: str) -> bool:
-        """Return True when a provisioned production charger requires Basic Auth."""
+    async def is_basic_auth_username_allowed(self, station_id: str, username: str) -> bool:
+        """Return True when username is the canonical station id or an active alias."""
+        if hmac.compare_digest(username, station_id):
+            return True
         async with self.pg_pool.acquire() as conn:
             return bool(
                 await conn.fetchval(
                     """
-                    SELECT COALESCE(auth_required, FALSE)
-                    FROM charging_stations
-                    WHERE station_id = $1
+                    SELECT 1
+                    FROM ocpp_station_aliases
+                    WHERE alias_station_id = $1
+                      AND canonical_station_id = $2
+                      AND active = TRUE
+                    LIMIT 1
                     """,
+                    username,
                     station_id,
                 )
             )
@@ -1870,90 +2118,193 @@ class TimescaleClient:
     ) -> Optional[Dict[str, Any]]:
         """Resolve an OCPP idTag to known vehicle/card/driver identity.
 
-        Vehicle primary idTags are authoritative. Active RFID cards are accepted
-        after vehicle lookup; lost/stolen/inactive cards do not match.
-        """
-        async with self.pg_pool.acquire() as conn:
-            station_filter = ""
-            params: list[Any] = [id_tag]
-            if station_id is not None:
-                station_filter = (
-                    "AND EXISTS (SELECT 1 FROM charging_stations c "
-                    "WHERE c.station_id = $2 AND c.site_id = v.site_id)"
-                )
-                params.append(station_id)
-            rows = await conn.fetch(
-                f"""
-                SELECT v.id::text AS vehicle_id,
-                       v.site_id::text AS depot_id,
-                       NULL::text AS driver_id,
-                       NULL::text AS card_id,
-                       'vehicle'::text AS source
-                FROM vehicles v
-                WHERE v.id_tag = $1
-                  AND COALESCE(v.status, 'active') = 'active'
-                  {station_filter}
-                LIMIT 2
-                """,
-                *params,
-            )
-            if len(rows) > 1:
-                logger.error(
-                    "Rejecting id_tag lookup for %r: multiple vehicles share the same id_tag.",
-                    id_tag,
-                )
-                return None
-            if rows:
-                return dict(rows[0])
+        Vehicle primary idTags are authoritative when ``vehicles.id_tag``
+        matches. Otherwise an active row in ``rfid_cards`` is sufficient on
+        its own — vehicle and driver assignments are best-effort enrichment
+        and a card without either is still a valid authorization.
 
+        Resilient to missing reference tables: deployments that have not
+        provisioned ``vehicles``, ``drivers`` or the assignment join tables
+        (e.g. cards-only fleets) still authorize active cards. Each
+        ``UndefinedTableError`` is logged once per process so schema drift
+        is visible without spamming the log on every Authorize.
+
+        Static identity tables live in Supabase; ``_static_pool`` returns
+        the Supabase pool when wired in, falling back to ``pg_pool``
+        for legacy deployments and unit tests.
+        """
+        async with self._static_pool().acquire() as conn:
+            # Vehicle-primary tag (e.g. printed on the vehicle itself).
+            # Optional — if the deployment does not provision ``vehicles``,
+            # fall through to the cards lookup rather than failing closed
+            # on the whole authorize flow.
+            try:
+                station_filter = ""
+                params: list[Any] = [id_tag]
+                if station_id is not None:
+                    station_filter = (
+                        "AND EXISTS (SELECT 1 FROM charging_stations c "
+                        "WHERE c.station_id = $2 AND c.site_id = v.site_id)"
+                    )
+                    params.append(station_id)
+                rows = await conn.fetch(
+                    f"""
+                    SELECT v.id::text AS vehicle_id,
+                           v.site_id::text AS depot_id,
+                           NULL::text AS driver_id,
+                           NULL::text AS card_id,
+                           'vehicle'::text AS source
+                    FROM vehicles v
+                    WHERE v.id_tag = $1
+                      AND COALESCE(v.status, 'active') = 'active'
+                      {station_filter}
+                    LIMIT 2
+                    """,
+                    *params,
+                )
+                if len(rows) > 1:
+                    self.logger.error(
+                        "Rejecting id_tag lookup for %r: multiple vehicles share the same id_tag.",
+                        id_tag,
+                    )
+                    return None
+                if rows:
+                    return dict(rows[0])
+            except asyncpg.exceptions.UndefinedTableError as exc:
+                self._log_missing_reference_table_once("vehicles", exc)
+
+            # RFID card lookup. The card row alone is sufficient to
+            # authorize. Vehicle/driver attribution is enriched separately
+            # so a deployment without those reference tables still works.
             card_filter = ""
-            params = [id_tag]
+            card_params: list[Any] = [id_tag]
             if station_id is not None:
                 card_filter = (
                     "AND EXISTS (SELECT 1 FROM charging_stations ch "
                     "WHERE ch.station_id = $2 AND ch.site_id = c.site_id)"
                 )
-                params.append(station_id)
-            rows = await conn.fetch(
-                f"""
-                SELECT c.id::text AS card_id,
-                       c.site_id::text AS depot_id,
-                       (
-                           SELECT cva.vehicle_id::text
-                           FROM rfid_card_vehicle_assignments cva
-                           JOIN vehicles v ON v.id = cva.vehicle_id
-                           WHERE cva.card_id = c.id
-                             AND v.site_id = c.site_id
-                             AND COALESCE(v.status, 'active') = 'active'
-                           ORDER BY v.external_id
-                           LIMIT 1
-                       ) AS vehicle_id,
-                       (
-                           SELECT cda.driver_id::text
-                           FROM rfid_card_driver_assignments cda
-                           JOIN drivers dr ON dr.id = cda.driver_id
-                           WHERE cda.card_id = c.id
-                             AND dr.site_id = c.site_id
-                             AND dr.status = 'active'
-                           ORDER BY dr.display_name
-                           LIMIT 1
-                       ) AS driver_id,
-                       'rfid_card'::text AS source
-                FROM rfid_cards c
-                WHERE c.id_tag = $1
-                  AND c.status = 'active'
-                  {card_filter}
-                LIMIT 2
-                """,
-                *params,
-            )
-            if len(rows) > 1:
-                logger.error(
+                card_params.append(station_id)
+            try:
+                card_rows = await conn.fetch(
+                    f"""
+                    SELECT c.id::text AS card_id,
+                           c.site_id::text AS depot_id
+                    FROM rfid_cards c
+                    WHERE c.id_tag = $1
+                      AND c.status = 'active'
+                      {card_filter}
+                    LIMIT 2
+                    """,
+                    *card_params,
+                )
+            except asyncpg.exceptions.UndefinedTableError as exc:
+                self._log_missing_reference_table_once("rfid_cards", exc)
+                return None
+
+            if len(card_rows) > 1:
+                self.logger.error(
                     "Rejecting id_tag lookup for %r: multiple active RFID cards share it.",
                     id_tag,
                 )
                 return None
-            return dict(rows[0]) if rows else None
+            if not card_rows:
+                return None
+
+            card_row = dict(card_rows[0])
+            card_id = card_row["card_id"]
+            depot_id = card_row["depot_id"]
+
+            return {
+                "card_id": card_id,
+                "depot_id": depot_id,
+                "vehicle_id": await self._lookup_card_vehicle_assignment(conn, card_id, depot_id),
+                "driver_id": await self._lookup_card_driver_assignment(conn, card_id, depot_id),
+                "source": "rfid_card",
+            }
+
+    async def _lookup_card_vehicle_assignment(
+        self,
+        conn: "asyncpg.Connection",
+        card_id: str,
+        depot_id: str,
+    ) -> Optional[str]:
+        """Return the active vehicle attached to ``card_id``, or None.
+
+        Tolerates missing ``rfid_card_vehicle_assignments`` / ``vehicles``
+        so cards without an attached vehicle still authorize.
+        """
+        try:
+            return await conn.fetchval(
+                """
+                SELECT cva.vehicle_id::text
+                FROM rfid_card_vehicle_assignments cva
+                JOIN vehicles v ON v.id = cva.vehicle_id
+                WHERE cva.card_id = $1::uuid
+                  AND v.site_id = $2::uuid
+                  AND COALESCE(v.status, 'active') = 'active'
+                ORDER BY v.external_id
+                LIMIT 1
+                """,
+                card_id,
+                depot_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError as exc:
+            self._log_missing_reference_table_once("rfid_card_vehicle_assignments", exc)
+            return None
+
+    async def _lookup_card_driver_assignment(
+        self,
+        conn: "asyncpg.Connection",
+        card_id: str,
+        depot_id: str,
+    ) -> Optional[str]:
+        """Return the active driver attached to ``card_id``, or None.
+
+        Tolerates missing ``rfid_card_driver_assignments`` / ``drivers`` so
+        cards without an attached driver still authorize.
+        """
+        try:
+            return await conn.fetchval(
+                """
+                SELECT cda.driver_id::text
+                FROM rfid_card_driver_assignments cda
+                JOIN drivers dr ON dr.id = cda.driver_id
+                WHERE cda.card_id = $1::uuid
+                  AND dr.site_id = $2::uuid
+                  AND dr.status = 'active'
+                ORDER BY dr.display_name
+                LIMIT 1
+                """,
+                card_id,
+                depot_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError as exc:
+            self._log_missing_reference_table_once("rfid_card_driver_assignments", exc)
+            return None
+
+    def _log_missing_reference_table_once(
+        self, table_label: str, exc: BaseException
+    ) -> None:
+        """Log a missing-relation error at WARNING, once per process.
+
+        Schema drift (e.g. a deployment running without ``vehicles``)
+        should be visible to operators but not flood the log on every
+        Authorize attempt.
+        """
+        cache = TimescaleClient._missing_reference_table_logs
+        if table_label in cache:
+            return
+        cache.add(table_label)
+        self.logger.warning(
+            "rfid_lookup_missing_reference_table table=%s error=%s "
+            "(continuing without enrichment from this table)",
+            table_label,
+            exc,
+        )
+
+    # Process-wide cache so each missing reference table is logged once,
+    # not once per ``TimescaleClient`` instance and not once per Authorize.
+    _missing_reference_table_logs: set[str] = set()
 
     # ===== OCPP 1.6 RECOVERY HELPERS (migration 013) =====
 
@@ -1971,6 +2322,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -1998,23 +2350,54 @@ class TimescaleClient:
         ``ocpp_transaction_id`` sequence.
         """
         async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO charging_sessions (
-                    station_id, transaction_id, evse_id, connector_id,
-                    id_token, start_time, vehicle_id, driver_id, card_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
-                """,
-                station_id,
-                transaction_id,
-                evse_id,
-                connector_id,
-                id_token,
-                start_time,
-                vehicle_id,
-                driver_id,
-                card_id,
-            )
+            async with conn.transaction():
+                # Lock key built in Python to avoid asyncpg's prepared-statement
+                # type inference treating $2 as text (via the `||` chain) and
+                # rejecting the integer transaction_id with "expected str, got
+                # int". Single text bind is unambiguous and equivalent in
+                # lock semantics.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"{station_id}:{transaction_id}",
+                )
+                existing_open = await conn.fetchval(
+                    """
+                    SELECT session_id::text
+                    FROM charging_sessions
+                    WHERE station_id = $1
+                      AND transaction_id = $2
+                      AND end_time IS NULL
+                      AND source = 'live'
+                    LIMIT 1
+                    """,
+                    station_id,
+                    transaction_id,
+                )
+                if existing_open:
+                    self.logger.info(
+                        "Skipping duplicate open session insert for station=%s tx_id=%s session_id=%s",
+                        station_id,
+                        transaction_id,
+                        existing_open,
+                    )
+                    return
+                await conn.execute(
+                    """
+                    INSERT INTO charging_sessions (
+                        station_id, transaction_id, evse_id, connector_id,
+                        id_token, start_time, vehicle_id, driver_id, card_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
+                    """,
+                    station_id,
+                    transaction_id,
+                    evse_id,
+                    connector_id,
+                    id_token,
+                    start_time,
+                    vehicle_id,
+                    driver_id,
+                    card_id,
+                )
 
     async def close_open_session(
         self, station_id: str, transaction_id: int, end_time: datetime
@@ -2028,6 +2411,7 @@ class TimescaleClient:
                  WHERE station_id = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
                 transaction_id,
@@ -2047,6 +2431,7 @@ class TimescaleClient:
                    SET last_seen_at = NOW()
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                 """,
                 station_id,
             )
@@ -2074,6 +2459,55 @@ class TimescaleClient:
                 """,
                 station_id,
             )
+
+    async def mark_connectors_available_after_reconnect(self, station_id: str) -> int:
+        """Undo a stale ``mark_connectors_unavailable`` row when the WS reconnects.
+
+        ``mark_connectors_unavailable`` writes ``(Unavailable, 'ConnectionLost')``
+        on every WS drop. ``derive_charger_status`` then forces ``offline``
+        regardless of how recent the heartbeat is (see
+        ``src/api/fleet_list.py``). When the charger reconnects but does NOT
+        send a fresh StatusNotification — common for many ABB Terra firmwares
+        on quick reconnects — that stale row outlives the actual offline
+        window and the GET /depots/{id}/chargers pill stays stuck on
+        ``offline`` even while OCPP frames flow.
+
+        We append an ``(Available, NULL)`` row ONLY for connectors whose
+        latest row is exactly the close-hook's marker, identified by
+        ``error_code = 'ConnectionLost'``. That precisely undoes our own
+        marker without clobbering:
+          * a real ``Faulted`` from the charger,
+          * a charger-issued ``Unavailable`` carrying a different error code
+            (or NULL — handled by the equality on 'ConnectionLost'),
+          * any state newer than the close-hook row (the latest-row check
+            naturally excludes those).
+
+        Returns the number of connectors whose status was rewritten — useful
+        for observability so we can spot misbehaving firmwares whose stuck
+        states are routinely corrected on reconnect.
+        """
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH latest AS (
+                    SELECT DISTINCT ON (connector_id)
+                           station_id, connector_id, status, error_code
+                      FROM connector_status
+                     WHERE station_id = $1
+                     ORDER BY connector_id, timestamp DESC
+                )
+                INSERT INTO connector_status (
+                    station_id, connector_id, status, error_code, timestamp
+                )
+                SELECT station_id, connector_id, 'Available', NULL, NOW()
+                  FROM latest
+                 WHERE status = 'Unavailable'
+                   AND error_code = 'ConnectionLost'
+                RETURNING connector_id
+                """,
+                station_id,
+            )
+            return len(rows)
 
     async def enqueue_charging_command(
         self,
@@ -2110,9 +2544,7 @@ class TimescaleClient:
             )
             return int(queue_id)
 
-    async def fetch_pending_commands(
-        self, charge_point_id: str
-    ) -> List[Dict[str, Any]]:
+    async def fetch_pending_commands(self, charge_point_id: str) -> List[Dict[str, Any]]:
         """Return non-expired pending commands for a cp_id, oldest first."""
         async with self.pg_pool.acquire() as conn:
             rows = await conn.fetch(
@@ -2225,14 +2657,12 @@ class TimescaleClient:
     async def expire_overdue_commands(self) -> int:
         """Move expired ``pending`` rows to ``expired``. Returns rowcount."""
         async with self.pg_pool.acquire() as conn:
-            result = await conn.execute(
-                """
+            result = await conn.execute("""
                 UPDATE charging_command_queue
                    SET status = 'expired'
                  WHERE status = 'pending'
                    AND expires_at <= NOW()
-                """
-            )
+                """)
             # asyncpg returns "UPDATE n"
             try:
                 return int(result.split()[-1])
@@ -2246,18 +2676,14 @@ class TimescaleClient:
         Returns a dict like ``{'pending': 3, 'sent': 17, 'failed': 0, ...}``.
         """
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT status, COUNT(*)::bigint AS n
                   FROM charging_command_queue
                  GROUP BY status
-                """
-            )
+                """)
         return {r["status"]: int(r["n"]) for r in rows}
 
-    async def fetch_admin_state(
-        self, charge_point_id: str
-    ) -> Dict[str, Any]:
+    async def fetch_admin_state(self, charge_point_id: str) -> Dict[str, Any]:
         """Aggregate state for ``/admin/ocpp/{cp_id}/state``.
 
         Reads:
@@ -2285,6 +2711,7 @@ class TimescaleClient:
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  ORDER BY start_time ASC
                 """,
@@ -2321,15 +2748,14 @@ class TimescaleClient:
     async def count_active_transactions_by_station(self) -> Dict[str, int]:
         """Return open-transaction counts grouped by station (for metrics)."""
         async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT station_id, COUNT(*)::bigint AS n
                   FROM charging_sessions
                  WHERE end_time IS NULL
+                   AND source = 'live'
                    AND transaction_id IS NOT NULL
                  GROUP BY station_id
-                """
-            )
+                """)
         return {r["station_id"]: int(r["n"]) for r in rows}
 
     # ===== PLUG & CHARGE METHODS =====
