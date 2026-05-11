@@ -2670,3 +2670,146 @@ async def latest_telemetry_for_depot_vehicles(
     """
     rows = await db.fetch(query, vehicle_ids)
     return [dict(r) for r in rows]
+
+
+# Source markers for get_session_energy_kwh return values.
+ENERGY_SOURCE_SESSION_METER = "session_meter_delta"
+ENERGY_SOURCE_TELEMETRY_REGISTER = "telemetry_register_delta"
+
+
+async def get_session_energy_kwh(
+    db,
+    *,
+    session_id: Optional[UUID] = None,
+    transaction_id: Optional[int] = None,
+) -> Optional[dict]:
+    """Compute total energy delivered for a single charging session, in kWh.
+
+    Resolves the session via ``session_id`` (UUID PK) or ``transaction_id``
+    (OCPP 1.6 integer, globally unique via the ``ocpp_transaction_id``
+    sequence from migration 012). Exactly one must be supplied.
+
+    Uses two sources in priority order:
+
+    1. ``charging_sessions.energy_delivered_kwh`` (migration 032) — populated
+       from the OCPP StopTransaction meter delta when the session closes.
+       Billing-grade; only available once the session has ended (or for
+       imported rows). Returned with ``source = "session_meter_delta"``.
+    2. Meter-register delta from ``telemetry_samples`` — difference between
+       the first and last ``Energy.Active.Import.Register`` samples in the
+       session window (transaction-scoped), normalized to kWh. If the register
+       decreases at any point (rollover/reset), this fallback is treated as
+       unavailable to avoid returning misleading billing values. Returned with
+       ``source = "telemetry_register_delta"``.
+
+    Args:
+        db: asyncpg pool or connection.
+        session_id: ``charging_sessions.session_id`` (UUID).
+        transaction_id: ``charging_sessions.transaction_id`` (BIGINT).
+
+    Returns:
+        ``{"energy_kwh": float, "source": str}`` when a value is available,
+        otherwise ``None``. ``None`` covers the cases: session row not found,
+        no meter samples and no stored delta, or register rollover/reset in
+        telemetry samples (surfaced as unavailable rather than a misleading
+        number).
+    """
+    if (session_id is None) == (transaction_id is None):
+        raise ValueError(
+            "get_session_energy_kwh requires exactly one of session_id or transaction_id"
+        )
+
+    if session_id is not None:
+        session_row = await db.fetchrow(
+            """
+            SELECT session_id,
+                   transaction_id,
+                   start_time,
+                   end_time,
+                   energy_delivered_kwh
+            FROM charging_sessions
+            WHERE session_id = $1
+            """,
+            session_id,
+        )
+    else:
+        session_row = await db.fetchrow(
+            """
+            SELECT session_id,
+                   transaction_id,
+                   start_time,
+                   end_time,
+                   energy_delivered_kwh
+            FROM charging_sessions
+            WHERE transaction_id = $1
+            """,
+            transaction_id,
+        )
+
+    if session_row is None:
+        return None
+
+    # Option A: prefer the stored meter delta when available.
+    stored = session_row["energy_delivered_kwh"]
+    if stored is not None:
+        return {
+            "energy_kwh": float(stored),
+            "source": ENERGY_SOURCE_SESSION_METER,
+        }
+
+    # Option B: integrate the cumulative register from telemetry_samples.
+    session_txid = session_row["transaction_id"]
+    if session_txid is None:
+        return None
+
+    delta_row = await db.fetchrow(
+        """
+        WITH normalized_samples AS (
+            SELECT
+                time,
+                CASE
+                    WHEN LOWER(COALESCE(unit, 'Wh')) = 'kwh' THEN value
+                    ELSE value / 1000.0
+                END AS value_kwh
+            FROM telemetry_samples
+            WHERE transaction_id = $1
+              AND measurand = 'Energy.Active.Import.Register'
+              AND time >= $2
+              AND time <= COALESCE($3, NOW())
+        ),
+        ordered_samples AS (
+            SELECT
+                value_kwh,
+                LAG(value_kwh) OVER (ORDER BY time ASC, value_kwh ASC) AS prev_kwh
+            FROM normalized_samples
+        )
+        SELECT
+            (SELECT value_kwh FROM normalized_samples ORDER BY time ASC, value_kwh ASC LIMIT 1) AS start_kwh,
+            (SELECT value_kwh FROM normalized_samples ORDER BY time DESC, value_kwh DESC LIMIT 1) AS end_kwh,
+            COALESCE(BOOL_OR(prev_kwh IS NOT NULL AND value_kwh < prev_kwh), FALSE) AS has_rollover
+        FROM ordered_samples
+        """,
+        session_txid,
+        session_row["start_time"],
+        session_row["end_time"],
+    )
+
+    if delta_row is None or delta_row["start_kwh"] is None or delta_row["end_kwh"] is None:
+        return None
+
+    delta_kwh = float(delta_row["end_kwh"]) - float(delta_row["start_kwh"])
+    if delta_row["has_rollover"] or delta_kwh < 0:
+        logger.warning(
+            "Invalid telemetry register progression for session transaction_id=%s "
+            "(start=%.3f kWh, end=%.3f kWh, has_rollover=%s); treating as unavailable",
+            session_txid,
+            float(delta_row["start_kwh"]),
+            float(delta_row["end_kwh"]),
+            bool(delta_row["has_rollover"]),
+        )
+        return None
+
+    return {
+        "energy_kwh": delta_kwh,
+        "source": ENERGY_SOURCE_TELEMETRY_REGISTER,
+    }
