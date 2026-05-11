@@ -62,7 +62,7 @@ async def test_falls_back_to_telemetry_register_delta_for_open_session():
     db.fetchrow = AsyncMock(
         side_effect=[
             _session_row(energy_delivered_kwh=None, end_time=None),
-            {"max_kwh": 1234.567, "min_kwh": 1200.000},
+            {"start_kwh": 1200.000, "end_kwh": 1234.567, "has_rollover": False},
         ]
     )
 
@@ -76,7 +76,7 @@ async def test_falls_back_to_telemetry_register_delta_for_open_session():
     assert "telemetry_samples" in fallback_query
     assert "Energy.Active.Import.Register" in fallback_query
     # Wh/kWh unit normalisation must be in the SQL, not in Python.
-    assert "kWh" in fallback_query
+    assert "LOWER(COALESCE(unit, 'Wh')) = 'kwh'" in fallback_query
 
 
 @pytest.mark.asyncio
@@ -115,7 +115,7 @@ async def test_returns_none_when_no_stored_and_no_telemetry():
     db.fetchrow = AsyncMock(
         side_effect=[
             _session_row(energy_delivered_kwh=None, end_time=None),
-            {"max_kwh": None, "min_kwh": None},
+            {"start_kwh": None, "end_kwh": None, "has_rollover": False},
         ]
     )
 
@@ -141,14 +141,13 @@ async def test_returns_none_when_session_lacks_transaction_id():
 
 
 @pytest.mark.asyncio
-async def test_negative_delta_returns_none(caplog):
-    # Meter rollover / bad ordering: max < min. Surface as unavailable
-    # rather than a misleading number.
+async def test_rollover_flag_returns_none(caplog):
+    # Meter rollover / reset is surfaced as unavailable.
     db = AsyncMock()
     db.fetchrow = AsyncMock(
         side_effect=[
             _session_row(energy_delivered_kwh=None, end_time=None),
-            {"max_kwh": 100.0, "min_kwh": 150.0},
+            {"start_kwh": 100.0, "end_kwh": 110.0, "has_rollover": True},
         ]
     )
 
@@ -156,18 +155,18 @@ async def test_negative_delta_returns_none(caplog):
         result = await get_session_energy_kwh(db, transaction_id=1001)
 
     assert result is None
-    assert any("Negative energy delta" in r.message for r in caplog.records)
+    assert any("Invalid telemetry register progression" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_zero_delta_is_returned_not_none():
     # A session with a single register reading (or no power drawn) has
-    # max == min == 0 delta. That's a legitimate 0.0 kWh, not missing data.
+    # start == end == 0 delta. That's a legitimate 0.0 kWh, not missing data.
     db = AsyncMock()
     db.fetchrow = AsyncMock(
         side_effect=[
             _session_row(energy_delivered_kwh=None, end_time=None),
-            {"max_kwh": 1234.5, "min_kwh": 1234.5},
+            {"start_kwh": 1234.5, "end_kwh": 1234.5, "has_rollover": False},
         ]
     )
 
@@ -198,7 +197,7 @@ async def test_fallback_query_passes_session_window_bounds():
 
     db = AsyncMock()
     db.fetchrow = AsyncMock(
-        side_effect=[session, {"max_kwh": 5.0, "min_kwh": 2.0}]
+        side_effect=[session, {"start_kwh": 2.0, "end_kwh": 5.0, "has_rollover": False}]
     )
 
     await get_session_energy_kwh(db, transaction_id=1001)
@@ -210,3 +209,20 @@ async def test_fallback_query_passes_session_window_bounds():
     assert fallback_call.args[3] == end
     # COALESCE($3, NOW()) — open sessions pass end_time=None and let SQL pick NOW().
     assert "COALESCE($3, NOW())" in fallback_call.args[0]
+
+
+@pytest.mark.asyncio
+async def test_lowercase_kwh_is_not_divided_by_thousand():
+    db = AsyncMock()
+    db.fetchrow = AsyncMock(
+        side_effect=[
+            _session_row(energy_delivered_kwh=None, end_time=None),
+            {"start_kwh": 10.0, "end_kwh": 60.0, "has_rollover": False},
+        ]
+    )
+
+    result = await get_session_energy_kwh(db, transaction_id=1001)
+
+    assert result == {"energy_kwh": 50.0, "source": ENERGY_SOURCE_TELEMETRY_REGISTER}
+    fallback_query = db.fetchrow.await_args_list[1].args[0]
+    assert "LOWER(COALESCE(unit, 'Wh')) = 'kwh'" in fallback_query

@@ -2695,10 +2695,11 @@ async def get_session_energy_kwh(
        from the OCPP StopTransaction meter delta when the session closes.
        Billing-grade; only available once the session has ended (or for
        imported rows). Returned with ``source = "session_meter_delta"``.
-    2. Meter-register delta from ``telemetry_samples`` —
-       ``MAX(value) - MIN(value)`` of ``Energy.Active.Import.Register``
-       samples bound to the session's ``transaction_id`` within the session
-       window. Used when (1) is missing (in-flight sessions). Returned with
+    2. Meter-register delta from ``telemetry_samples`` — difference between
+       the first and last ``Energy.Active.Import.Register`` samples in the
+       session window (transaction-scoped), normalized to kWh. If the register
+       decreases at any point (rollover/reset), this fallback is treated as
+       unavailable to avoid returning misleading billing values. Returned with
        ``source = "telemetry_register_delta"``.
 
     Args:
@@ -2709,9 +2710,9 @@ async def get_session_energy_kwh(
     Returns:
         ``{"energy_kwh": float, "source": str}`` when a value is available,
         otherwise ``None``. ``None`` covers the cases: session row not found,
-        no meter samples and no stored delta, or a negative computed delta
-        (almost always a meter rollover / bad ordering — surfaced as
-        unavailable rather than a misleading number).
+        no meter samples and no stored delta, or register rollover/reset in
+        telemetry samples (surfaced as unavailable rather than a misleading
+        number).
     """
     if (session_id is None) == (transaction_id is None):
         raise ValueError(
@@ -2763,31 +2764,48 @@ async def get_session_energy_kwh(
 
     delta_row = await db.fetchrow(
         """
+        WITH normalized_samples AS (
+            SELECT
+                time,
+                CASE
+                    WHEN LOWER(COALESCE(unit, 'Wh')) = 'kwh' THEN value
+                    ELSE value / 1000.0
+                END AS value_kwh
+            FROM telemetry_samples
+            WHERE transaction_id = $1
+              AND measurand = 'Energy.Active.Import.Register'
+              AND time >= $2
+              AND time <= COALESCE($3, NOW())
+        ),
+        ordered_samples AS (
+            SELECT
+                value_kwh,
+                LAG(value_kwh) OVER (ORDER BY time ASC, value_kwh ASC) AS prev_kwh
+            FROM normalized_samples
+        )
         SELECT
-            MAX(CASE WHEN unit = 'kWh' THEN value ELSE value / 1000.0 END) AS max_kwh,
-            MIN(CASE WHEN unit = 'kWh' THEN value ELSE value / 1000.0 END) AS min_kwh
-        FROM telemetry_samples
-        WHERE transaction_id = $1
-          AND measurand = 'Energy.Active.Import.Register'
-          AND time >= $2
-          AND time <= COALESCE($3, NOW())
+            (SELECT value_kwh FROM normalized_samples ORDER BY time ASC, value_kwh ASC LIMIT 1) AS start_kwh,
+            (SELECT value_kwh FROM normalized_samples ORDER BY time DESC, value_kwh DESC LIMIT 1) AS end_kwh,
+            COALESCE(BOOL_OR(prev_kwh IS NOT NULL AND value_kwh < prev_kwh), FALSE) AS has_rollover
+        FROM ordered_samples
         """,
         session_txid,
         session_row["start_time"],
         session_row["end_time"],
     )
 
-    if delta_row is None or delta_row["max_kwh"] is None or delta_row["min_kwh"] is None:
+    if delta_row is None or delta_row["start_kwh"] is None or delta_row["end_kwh"] is None:
         return None
 
-    delta_kwh = float(delta_row["max_kwh"]) - float(delta_row["min_kwh"])
-    if delta_kwh < 0:
+    delta_kwh = float(delta_row["end_kwh"]) - float(delta_row["start_kwh"])
+    if delta_row["has_rollover"] or delta_kwh < 0:
         logger.warning(
-            "Negative energy delta for session transaction_id=%s (max=%.3f kWh, "
-            "min=%.3f kWh); likely meter rollover, treating as unavailable",
+            "Invalid telemetry register progression for session transaction_id=%s "
+            "(start=%.3f kWh, end=%.3f kWh, has_rollover=%s); treating as unavailable",
             session_txid,
-            float(delta_row["max_kwh"]),
-            float(delta_row["min_kwh"]),
+            float(delta_row["start_kwh"]),
+            float(delta_row["end_kwh"]),
+            bool(delta_row["has_rollover"]),
         )
         return None
 
