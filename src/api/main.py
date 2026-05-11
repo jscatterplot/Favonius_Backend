@@ -16,7 +16,9 @@ import re
 import secrets
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, AsyncIterator, Iterator, Literal, Optional, Union
 from uuid import UUID
@@ -97,6 +99,11 @@ from ..security.validators import (
     validate_vehicle_id,
 )
 from . import fleet_list as _fleet_list
+from .charging_import import (
+    PriceSource,
+    StaticPriceSource,
+    TimescalePriceSource,
+)
 from .error_codes import ERROR_MESSAGES, ErrorCode, http_status_for, safe_message_for
 from .reports import (
     REPORT_GROUP_BY_VALUES,
@@ -121,6 +128,13 @@ _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (c
 _config_cache_ttl: float = 300.0  # 5 minutes
 _depot_config_locks: dict[str, asyncio.Lock] = {}  # single-flight locks per depot
 _background_tasks: set[asyncio.Task] = set()
+
+# Site-metadata cache: small per-depot lookup used by hot endpoints that need
+# timezone / org_id without paying for the full StateAssembler.load_depot_config
+# round-trip. Same 300 s TTL as the depot-config cache so a multi-row XLSX
+# import does a single sites lookup for the whole batch.
+_site_metadata_cache: dict[str, tuple["_SiteMetadata", float]] = {}
+_site_metadata_locks: dict[str, asyncio.Lock] = {}
 
 # Fleet list response cache (chargers + vehicles). 2 s TTL is enough to dedupe
 # multi-tab thundering herd (frontend polls at 10 s) without making the data
@@ -2143,10 +2157,17 @@ class HistoricalSessionImportMatched(BaseModel):
 
 
 class HistoricalSessionImportResponse(BaseModel):
-    """201 response for POST /admin/depots/{id}/charging-sessions/import."""
+    """201 response for POST /admin/depots/{id}/charging-sessions/import.
+
+    ``was_new`` distinguishes a fresh insert from a merge into an existing
+    session (the import path uses UPSERT-with-fill-nulls, so re-uploading the
+    same logical row merges null columns rather than erroring with 409). The
+    bulk-import dialog keys off this flag to surface "merged" vs "new" counts.
+    """
 
     session_id: str
     matched: HistoricalSessionImportMatched
+    was_new: bool = True
 
 
 # ============ Command Dispatcher Models ============
@@ -2554,6 +2575,149 @@ async def _get_depot_config(depot_id: str) -> DepotConfig:
                     "detail": "Failed to load depot configuration",
                 },
             ) from e
+
+
+@dataclass(frozen=True)
+class _SiteMetadata:
+    """Cached subset of ``sites`` used by the import endpoint per-row.
+
+    Read-only because cache consumers may share the instance across concurrent
+    requests; nothing on it is request-specific. Lookup is by depot UUID and
+    callers must independently verify ``organization_id`` matches the caller's
+    JWT org claim before trusting the row.
+    """
+
+    depot_id: str
+    organization_id: str
+    timezone_name: str
+    tariff_config: Optional[dict]
+
+
+async def _get_site_metadata(depot_id: str) -> Optional[_SiteMetadata]:
+    """Return cached ``sites`` metadata for the given depot.
+
+    Returns ``None`` when the depot does not exist. Callers must still compare
+    ``organization_id`` against the JWT claim before serving data — the cache
+    is shared across orgs.
+    """
+    if not db_pools or db_pools.static is None:
+        return None
+
+    now = time.time()
+    cached = _site_metadata_cache.get(depot_id)
+    if cached is not None and now - cached[1] < _config_cache_ttl:
+        return cached[0]
+
+    lock = _site_metadata_locks.setdefault(depot_id, asyncio.Lock())
+    async with lock:
+        cached = _site_metadata_cache.get(depot_id)
+        if cached is not None and time.time() - cached[1] < _config_cache_ttl:
+            return cached[0]
+
+        async with db_pools.static.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    id::text                AS depot_id,
+                    organization_id::text   AS organization_id,
+                    timezone,
+                    tariff_config
+                FROM sites
+                WHERE id = $1::uuid
+                """,
+                depot_id,
+            )
+        if row is None:
+            return None
+
+        tariff_raw = row["tariff_config"]
+        tariff_config: Optional[dict] = None
+        if isinstance(tariff_raw, str):
+            try:
+                tariff_config = json.loads(tariff_raw)
+            except json.JSONDecodeError:
+                tariff_config = None
+        elif isinstance(tariff_raw, dict):
+            tariff_config = tariff_raw
+
+        meta = _SiteMetadata(
+            depot_id=row["depot_id"],
+            organization_id=row["organization_id"],
+            timezone_name=row["timezone"] or "UTC",
+            tariff_config=tariff_config,
+        )
+        _site_metadata_cache[depot_id] = (meta, time.time())
+        return meta
+
+
+def get_price_source() -> PriceSource:
+    """FastAPI dependency: return the active ``PriceSource`` implementation.
+
+    Production wires this to ``TimescalePriceSource`` reading the ``prices``
+    hypertable. Unit tests override the dependency to inject a deterministic
+    ``StaticPriceSource``. When ``db_pools`` is unavailable (e.g. early
+    startup) we fall back to ``StaticPriceSource(None)`` so the import path
+    still serves with revenue-as-cost behavior.
+    """
+    if db_pools is None or db_pools.ts is None:
+        return StaticPriceSource(None)
+    return TimescalePriceSource(db_pools.ts)
+
+
+async def _resolve_session_cost(
+    *,
+    price_source: PriceSource,
+    depot_id: str,
+    start_time_utc: datetime,
+    end_time_utc: Optional[datetime],
+    energy_kwh: float,
+    fallback_revenue: float,
+) -> Decimal:
+    """Compute ``cost_total`` from depot prices when coverage exists.
+
+    Falls back to the request-supplied ``revenue`` whenever:
+      * the session has no end time (open / in-progress import),
+      * energy is zero (no cost to derive), or
+      * the depot has no price coverage for the session window.
+
+    Resolves *before* opening the UPSERT transaction so the price lookup never
+    extends row-lock duration.
+    """
+    fallback = _to_decimal(fallback_revenue, default=Decimal(0))
+
+    if end_time_utc is None or energy_kwh <= 0:
+        return fallback
+
+    try:
+        avg_price = await price_source.average_price_per_kwh(
+            depot_id=depot_id,
+            start=start_time_utc,
+            end=end_time_utc,
+        )
+    except Exception:  # noqa: BLE001 — never let price lookup fail the import
+        logger.exception(
+            "price-source lookup failed; falling back to revenue (depot=%s)",
+            depot_id,
+        )
+        return fallback
+
+    if avg_price is None:
+        return fallback
+
+    derived = (Decimal(str(energy_kwh)) * avg_price).quantize(Decimal("0.000001"))
+    return derived
+
+
+def _to_decimal(value, *, default: Decimal) -> Decimal:
+    """Convert a float/str/Decimal to Decimal, returning ``default`` on bad input."""
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return default
 
 
 def _format_depot_setup_validation_errors(exc: ValidationError) -> dict:
@@ -3694,17 +3858,19 @@ def _compute_import_row_hash(
     depot_id: str,
     start_time_utc: datetime,
     id_tag: str,
-    energy_delivered_kwh: float,
-    revenue: float,
 ) -> str:
-    """SHA-256 of the canonical row tuple, used for idempotent re-uploads."""
+    """SHA-256 of the canonical row identity, used for idempotent re-uploads.
+
+    The canonical tuple is ``(depot_id, start_time_utc, id_tag)`` — deliberately
+    free of energy and cost so subsequent re-uploads with corrected energy or
+    revenue values merge into the same row via the UPSERT path rather than
+    creating duplicates. Migration 036 is the matching backfill.
+    """
     canonical = "|".join(
         [
             depot_id,
             start_time_utc.isoformat(),
             id_tag,
-            f"{float(energy_delivered_kwh):.6f}",
-            f"{float(revenue):.6f}",
         ]
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -3728,20 +3894,27 @@ def _platform_import_hash_token(
     Platform-start imports intentionally store a constant id_token
     (``platform-start``) in ``charging_sessions.id_token`` so reports can
     classify their origin. Using only that constant in ``import_row_hash``
-    can falsely dedup distinct sessions that share minute-level start time,
-    energy, and revenue. This helper keeps persisted ``id_token`` stable
-    while adding additional request fields to the hash input.
+    would falsely dedup distinct sessions that share minute-level start time.
+    This helper keeps persisted ``id_token`` stable while baking additional
+    persisted columns into the hash input.
+
+    Canonical form is length-prefixed (``<bytes>:<value>`` for each field) so
+    free-text content containing ``|`` cannot collide across distinct rows, and
+    so migration 036 can reconstruct the exact same token in pure SQL from the
+    ``charging_sessions`` columns alone. ``transaction_type`` is not persisted
+    and is therefore excluded from the canonical form.
     """
-    payload = {
-        "id_token": _PLATFORM_IMPORT_ID_TOKEN,
-        "end_time_utc": end_time_utc.isoformat() if end_time_utc else "",
-        "transaction_type": request.transaction_type or "",
-        "status": request.status or "",
-        "user_full_name": request.user_full_name or "",
-        "station_owner_full_name": request.station_owner_full_name or "",
-    }
-    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return f"{_PLATFORM_IMPORT_ID_TOKEN}:{hashlib.sha256(canonical_payload.encode('utf-8')).hexdigest()}"
+    fields = [
+        end_time_utc.isoformat() if end_time_utc else "",
+        request.status or "",
+        request.user_full_name or "",
+        request.station_owner_full_name or "",
+    ]
+    canonical = "".join(
+        f"{len(field.encode('utf-8'))}:{field}" for field in fields
+    )
+    inner = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{_PLATFORM_IMPORT_ID_TOKEN}:{inner}"
 
 
 async def _resolve_import_id_tag(
@@ -3856,13 +4029,20 @@ async def import_historical_charging_session(
     depot_id: str,
     request: HistoricalSessionImport,
     user: dict = Depends(ensure_tenant_mirrored),
+    price_source: PriceSource = Depends(get_price_source),
 ) -> HistoricalSessionImportResponse:
-    """Insert one historical charging session for the Reports / Energy accounting backfill.
+    """Upsert one historical charging session for the Reports / Energy accounting backfill.
 
     Mirrors the bulk-RFID dialog pattern: the frontend parses the XLSX and POSTs
     one row per call. Imported rows are scoped by ``site_id`` and use a
     deterministic placeholder ``station_id`` so they do not require a
     matching ``charging_stations`` row.
+
+    Re-uploads of the same logical session (same depot + start_time + id_token)
+    merge into the existing row via UPSERT-with-fill-nulls: only columns that
+    are currently NULL get overwritten. Energy and cost are also refreshed when
+    the incoming value is non-zero, so a corrected XLSX re-upload updates the
+    metering numbers without inventing a duplicate row.
     """
     org_id = _require_customer_admin_with_org(user)
     validate_depot_id(depot_id)
@@ -3870,35 +4050,25 @@ async def import_historical_charging_session(
     if not db_pools or db_pools.ts is None:
         raise DatabaseError("Database not available")
 
-    # Look up the depot timezone (and confirm it belongs to caller's org).
-    async with db_pools.static.acquire() as static_conn:
-        depot_row = await static_conn.fetchrow(
-            """
-            SELECT timezone
-            FROM sites
-            WHERE id = $1::uuid AND organization_id = $2::uuid
-            """,
-            depot_id,
-            org_id,
+    site_meta = await _get_site_metadata(depot_id)
+    if site_meta is None or site_meta.organization_id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": ErrorCode.DEPOT_NOT_FOUND.value,
+                "detail": "Depot not found",
+            },
         )
-        if depot_row is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error_code": ErrorCode.DEPOT_NOT_FOUND.value,
-                    "detail": "Depot not found",
-                },
-            )
-        timezone_name = depot_row["timezone"] or "America/Los_Angeles"
-        try:
-            tz = ZoneInfo(timezone_name)
-        except Exception:
-            tz = ZoneInfo("UTC")
+    try:
+        tz = ZoneInfo(site_meta.timezone_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
 
-        is_platform_initiated = _is_platform_initiated_import_row(request)
-        if is_platform_initiated:
-            identity = {"vehicle_id": None, "card_id": None, "driver_id": None}
-        else:
+    is_platform_initiated = _is_platform_initiated_import_row(request)
+    if is_platform_initiated:
+        identity = {"vehicle_id": None, "card_id": None, "driver_id": None}
+    else:
+        async with db_pools.static.acquire() as static_conn:
             identity = await _resolve_import_id_tag(
                 static_conn,
                 depot_id=depot_id,
@@ -3950,14 +4120,24 @@ async def import_historical_charging_session(
         depot_id=depot_id,
         start_time_utc=start_time_utc,
         id_tag=hash_id_token,
-        energy_delivered_kwh=request.energy_delivered_kwh,
-        revenue=request.revenue,
     )
     placeholder_station_id = f"imported:{depot_id}"
 
+    # Resolve cost from depot prices BEFORE opening the upsert transaction so
+    # the (potentially slow) price lookup never holds a row lock. Falls back
+    # transparently to request.revenue when no price coverage exists.
+    cost_total = await _resolve_session_cost(
+        price_source=price_source,
+        depot_id=depot_id,
+        start_time_utc=start_time_utc,
+        end_time_utc=end_time_utc,
+        energy_kwh=request.energy_delivered_kwh,
+        fallback_revenue=request.revenue,
+    )
+
     try:
         async with db_pools.ts.acquire() as ts_conn:
-            session_id = await ts_conn.fetchval(
+            row = await ts_conn.fetchrow(
                 """
                 INSERT INTO charging_sessions (
                     station_id, evse_id, connector_id,
@@ -3977,7 +4157,30 @@ async def import_historical_charging_session(
                     $11::uuid, $12,
                     $13, $14, $15
                 )
-                RETURNING session_id::text
+                ON CONFLICT (site_id, import_row_hash) WHERE source = 'import'
+                DO UPDATE SET
+                    -- Fill nulls only: never clobber a value the existing row
+                    -- already has. Re-uploads with corrected end_time / identity
+                    -- backfill the gaps without overwriting prior corrections.
+                    vehicle_id            = COALESCE(charging_sessions.vehicle_id, EXCLUDED.vehicle_id),
+                    driver_id             = COALESCE(charging_sessions.driver_id, EXCLUDED.driver_id),
+                    card_id               = COALESCE(charging_sessions.card_id, EXCLUDED.card_id),
+                    end_time              = COALESCE(charging_sessions.end_time, EXCLUDED.end_time),
+                    import_user_full_name = COALESCE(charging_sessions.import_user_full_name, EXCLUDED.import_user_full_name),
+                    import_station_owner  = COALESCE(charging_sessions.import_station_owner, EXCLUDED.import_station_owner),
+                    import_status         = COALESCE(charging_sessions.import_status, EXCLUDED.import_status),
+                    -- Refresh numeric metering when the new payload reports a
+                    -- value: corrections to energy or cost are the common
+                    -- reason customers re-upload an XLSX.
+                    energy_delivered_kwh  = CASE
+                        WHEN EXCLUDED.energy_delivered_kwh > 0 THEN EXCLUDED.energy_delivered_kwh
+                        ELSE charging_sessions.energy_delivered_kwh
+                    END,
+                    cost_total            = CASE
+                        WHEN EXCLUDED.cost_total IS NOT NULL AND EXCLUDED.cost_total > 0 THEN EXCLUDED.cost_total
+                        ELSE charging_sessions.cost_total
+                    END
+                RETURNING session_id::text AS session_id, (xmax = 0) AS was_new
                 """,
                 placeholder_station_id,
                 identity["vehicle_id"],
@@ -3987,7 +4190,7 @@ async def import_historical_charging_session(
                 start_time_utc,
                 end_time_utc,
                 request.energy_delivered_kwh,
-                request.revenue,
+                cost_total,
                 depot_id,
                 str(request.import_batch_id),
                 row_hash,
@@ -3998,6 +4201,8 @@ async def import_historical_charging_session(
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
 
+    session_id = row["session_id"]
+    was_new = bool(row["was_new"])
     await _audit_identity_write(user, depot_id, "charging_session.import", str(session_id))
     return HistoricalSessionImportResponse(
         session_id=str(session_id),
@@ -4006,6 +4211,7 @@ async def import_historical_charging_session(
             card_id=identity["card_id"],
             driver_id=identity["driver_id"],
         ),
+        was_new=was_new,
     )
 
 
