@@ -46,3 +46,36 @@ async def test_list_authorized_id_tags_compares_access_default_as_string() -> No
         "Found legacy boolean comparison; PG raises a type error against "
         "the actual schema."
     )
+
+
+@pytest.mark.asyncio
+async def test_list_authorized_id_tags_includes_orphan_cards() -> None:
+    """Active RFID cards must be pushed regardless of vehicle/driver
+    assignment, matching the central ``resolve_id_tag_identity`` path.
+
+    Earlier iterations of this query gated cards on ``rfid_card_vehicle_assignments``
+    / ``rfid_card_driver_assignments`` EXISTS clauses, which silently
+    excluded operator deployments that use cards without populating those
+    linkage tables (HRX Vilnius: 15 active orphan cards, zero vehicles).
+    That broke the invariant 'anything that authorizes online also
+    authorizes offline' and produced empty SendLocalList pushes.
+    """
+    db = MagicMock()
+    db.fetch = AsyncMock(return_value=[])
+
+    await list_authorized_id_tags(db, "station-001")
+
+    sql = " ".join(db.fetch.await_args.args[0].split())
+
+    # The card branch must NOT require an assignment EXISTS.
+    assert "rfid_card_vehicle_assignments" not in sql, (
+        "Card inclusion must not depend on vehicle assignment — orphan "
+        "cards still authorize online and so must authorize offline."
+    )
+    assert "rfid_card_driver_assignments" not in sql, (
+        "Card inclusion must not depend on driver assignment — orphan "
+        "cards still authorize online and so must authorize offline."
+    )
+    # And the card branch itself must be present.
+    assert "FROM rfid_cards c" in sql
+    assert "c.status = 'active'" in sql

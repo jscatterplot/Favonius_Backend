@@ -1398,17 +1398,16 @@ async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
         ``'all_to_all'`` grants access by default, ``'explicit_matrix'``
         requires an explicit row. NULL is treated as ``'explicit_matrix'``
         (deny) for safety.
-      * RFID cards: active cards in the same site that are linked to an
-        accessible vehicle (via ``rfid_card_vehicle_assignments``) **or** to
-        an active driver (via ``rfid_card_driver_assignments``). Drivers are
-        not constrained by the per-charger access matrix — that matrix
-        models physical reach for vehicles, not human authorization.
-      * Orphan cards (no active assignment) are excluded.
+      * RFID cards: every active card in the same site, regardless of
+        whether it is linked to a vehicle or driver. This matches the
+        central ``resolve_id_tag_identity`` path — the card row alone is
+        sufficient to authorize online, so it must also authorize offline.
+        Excluding orphan cards (an earlier iteration of this query did so)
+        breaks the invariant and produced empty pushes against deployments
+        that operate cards-only fleets, e.g. HRX Vilnius.
 
     Returns each id_tag at most once, with a ``source`` discriminator
-    (``vehicle`` | ``rfid_card_vehicle`` | ``rfid_card_driver``) for metrics
-    and debug logging. Caller is responsible for shaping into the OCPP 1.6
-    ``AuthorizationData`` wire format.
+    (``vehicle`` | ``rfid_card``) for metrics and debug logging.
 
     Returns an empty list if the station is unknown — the caller should
     treat that as "skip the push", not "clear the charger's list".
@@ -1453,27 +1452,10 @@ async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
             SELECT id_tag, 'vehicle'::text AS source, 1 AS source_priority
             FROM accessible_vehicles
             UNION ALL
-            SELECT c.id_tag, 'rfid_card_vehicle'::text AS source, 2 AS source_priority
+            SELECT c.id_tag, 'rfid_card'::text AS source, 2 AS source_priority
             FROM rfid_cards c, station_info si
             WHERE c.site_id = si.site_id
               AND c.status = 'active'
-              AND EXISTS (
-                  SELECT 1 FROM rfid_card_vehicle_assignments cva
-                  JOIN accessible_vehicles av ON av.vehicle_id = cva.vehicle_id
-                  WHERE cva.card_id = c.id
-              )
-            UNION ALL
-            SELECT c.id_tag, 'rfid_card_driver'::text AS source, 3 AS source_priority
-            FROM rfid_cards c, station_info si
-            WHERE c.site_id = si.site_id
-              AND c.status = 'active'
-              AND EXISTS (
-                  SELECT 1 FROM rfid_card_driver_assignments cda
-                  JOIN drivers dr ON dr.id = cda.driver_id
-                  WHERE cda.card_id = c.id
-                    AND dr.site_id = c.site_id
-                    AND dr.status = 'active'
-              )
         )
         SELECT DISTINCT ON (id_tag) id_tag, source
         FROM all_tags
