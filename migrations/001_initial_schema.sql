@@ -218,59 +218,79 @@ CREATE INDEX IF NOT EXISTS idx_trigger_depot ON trigger_log (depot_id, trigger_t
 
 -- ============ SEED DATA FOR DEVELOPMENT ============
 
--- Insert development depot
-INSERT INTO depots (depot_id, name, latitude, longitude, timezone, utility_id, max_grid_kw, demand_charge_rate_kw)
-VALUES
-    ('550e8400-e29b-41d4-a716-446655440001', 'Development Depot A', 37.7749, -122.4194, 'America/Los_Angeles', 'PG&E', 1000.0, 20.0),
-    ('550e8400-e29b-41d4-a716-446655440002', 'Development Depot B', 37.3382, -121.8863, 'America/Los_Angeles', 'PG&E', 800.0, 20.0)
-ON CONFLICT (depot_id) DO NOTHING;
+-- Skip dev seeds once the schema has been tenant-hardened by migration 015
+-- (depots.organization_id NOT NULL). Re-running these INSERTs after the seed
+-- depot row has been deleted (e.g. cascade from an organization delete) would
+-- attempt to insert a row without organization_id, violating NOT NULL and
+-- crash-looping the runner. The seeds are still useful on a fresh dev DB,
+-- where 015 hasn't applied yet and the column doesn't exist.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'depots'
+          AND column_name = 'organization_id'
+          AND is_nullable = 'NO'
+    ) THEN
+        RAISE NOTICE 'Skipping 001 dev seeds: depots.organization_id is NOT NULL (production schema)';
+        RETURN;
+    END IF;
 
--- Insert development vehicles (20 vehicles for Depot A)
-INSERT INTO vehicles (vehicle_id, depot_id, external_id, vehicle_type, battery_kwh, max_charge_kw)
-SELECT
-    gen_random_uuid(),
-    '550e8400-e29b-41d4-a716-446655440001'::uuid,
-    'bus_' || LPAD(i::text, 2, '0'),
-    CASE
-        WHEN i <= 10 THEN 'bus_large'
-        WHEN i <= 15 THEN 'bus_small'
-        ELSE 'van'
-    END,
-    CASE
-        WHEN i <= 10 THEN 324.0  -- bus_large
-        WHEN i <= 15 THEN 180.0  -- bus_small
-        ELSE 100.0              -- van
-    END,
-    CASE
-        WHEN i <= 10 THEN 150.0  -- bus_large
-        WHEN i <= 15 THEN 100.0  -- bus_small
-        ELSE 50.0               -- van
-    END
-FROM generate_series(1, 20) AS i
-ON CONFLICT (external_id) DO NOTHING;
+    -- Insert development depot
+    INSERT INTO depots (depot_id, name, latitude, longitude, timezone, utility_id, max_grid_kw, demand_charge_rate_kw)
+    VALUES
+        ('550e8400-e29b-41d4-a716-446655440001', 'Development Depot A', 37.7749, -122.4194, 'America/Los_Angeles', 'PG&E', 1000.0, 20.0),
+        ('550e8400-e29b-41d4-a716-446655440002', 'Development Depot B', 37.3382, -121.8863, 'America/Los_Angeles', 'PG&E', 800.0, 20.0)
+    ON CONFLICT (depot_id) DO NOTHING;
 
--- Insert development chargers (10 chargers for Depot A)
-INSERT INTO chargers (charger_id, depot_id, ocpp_id, rated_kw, efficiency, connector_type, status)
-SELECT
-    gen_random_uuid(),
-    '550e8400-e29b-41d4-a716-446655440001'::uuid,
-    'charger_' || LPAD(i::text, 2, '0'),
-    CASE
-        WHEN i <= 3 THEN 50.0   -- 3 chargers @ 50kW
-        WHEN i <= 8 THEN 80.0   -- 5 chargers @ 80kW
-        ELSE 150.0              -- 2 chargers @ 150kW
-    END,
-    0.95,
-    'CCS',
-    'Available'
-FROM generate_series(1, 10) AS i
-ON CONFLICT (ocpp_id) DO NOTHING;
+    -- Insert development vehicles (20 vehicles for Depot A)
+    INSERT INTO vehicles (vehicle_id, depot_id, external_id, vehicle_type, battery_kwh, max_charge_kw)
+    SELECT
+        gen_random_uuid(),
+        '550e8400-e29b-41d4-a716-446655440001'::uuid,
+        'bus_' || LPAD(i::text, 2, '0'),
+        CASE
+            WHEN i <= 10 THEN 'bus_large'
+            WHEN i <= 15 THEN 'bus_small'
+            ELSE 'van'
+        END,
+        CASE
+            WHEN i <= 10 THEN 324.0  -- bus_large
+            WHEN i <= 15 THEN 180.0  -- bus_small
+            ELSE 100.0              -- van
+        END,
+        CASE
+            WHEN i <= 10 THEN 150.0  -- bus_large
+            WHEN i <= 15 THEN 100.0  -- bus_small
+            ELSE 50.0               -- van
+        END
+    FROM generate_series(1, 20) AS i
+    ON CONFLICT (external_id) DO NOTHING;
 
--- Insert development battery storage (1 for Depot A)
-INSERT INTO battery_storage (battery_id, depot_id, capacity_kwh, max_power_kw, efficiency, soc_min, soc_max)
-VALUES
-    (gen_random_uuid(), '550e8400-e29b-41d4-a716-446655440001', 500.0, 100.0, 0.92, 0.2, 0.8)
-ON CONFLICT DO NOTHING;
+    -- Insert development chargers (10 chargers for Depot A)
+    INSERT INTO chargers (charger_id, depot_id, ocpp_id, rated_kw, efficiency, connector_type, status)
+    SELECT
+        gen_random_uuid(),
+        '550e8400-e29b-41d4-a716-446655440001'::uuid,
+        'charger_' || LPAD(i::text, 2, '0'),
+        CASE
+            WHEN i <= 3 THEN 50.0   -- 3 chargers @ 50kW
+            WHEN i <= 8 THEN 80.0   -- 5 chargers @ 80kW
+            ELSE 150.0              -- 2 chargers @ 150kW
+        END,
+        0.95,
+        'CCS',
+        'Available'
+    FROM generate_series(1, 10) AS i
+    ON CONFLICT (ocpp_id) DO NOTHING;
+
+    -- Insert development battery storage (1 for Depot A)
+    INSERT INTO battery_storage (battery_id, depot_id, capacity_kwh, max_power_kw, efficiency, soc_min, soc_max)
+    VALUES
+        (gen_random_uuid(), '550e8400-e29b-41d4-a716-446655440001', 500.0, 100.0, 0.92, 0.2, 0.8)
+    ON CONFLICT DO NOTHING;
+END $$;
 
 -- ============ PERMISSIONS ============
 

@@ -772,4 +772,69 @@ class TestStateUpdates:
         assert controller.last_run_time is not None
         assert before <= controller.last_run_time <= after
 
+    @pytest.mark.asyncio
+    async def test_readiness_blocked_rate_limits_hourly_loop(
+        self,
+        mock_db_pool,
+        depot_config,
+        controller_config,
+        sample_depot_state,
+    ):
+        """A readiness-blocked run must still stamp last_run_time so the
+        hourly control loop doesn't retry every minute.
+
+        Regression guard for two related bugs:
+          1. last_run_time stayed None on the blocked path → loop fired the
+             expensive snapshot capture every 60 seconds, producing thousands
+             of redundant optimization_input_snapshots and alert upserts.
+          2. last_run_time was set tz-aware while the loop comparison uses
+             datetime.utcnow() (naive) → silent TypeError that killed the
+             loop. last_run_time must stay naive to match the loop.
+        """
+        from src.core.controller import _ReadinessBlockedError, _stub_snapshot
+        from src.core.models import ReadinessReport
+
+        pool, _ = mock_db_pool
+        depot_id = str(uuid4())
+
+        controller = DepotController(
+            pools=pool,
+            depot_id=depot_id,
+            config=depot_config,
+            controller_config=controller_config,
+        )
+
+        controller.assembler.get_current_state = AsyncMock(return_value=sample_depot_state)
+
+        blocking_readiness = ReadinessReport(
+            status="not_ready",
+            missing_inputs=["schedules"],
+        )
+
+        async def _blocking_snapshot(state, horizon_hours):
+            now = datetime.utcnow()
+            return _stub_snapshot(
+                controller.depot_id, now, now + timedelta(hours=horizon_hours), blocking_readiness
+            )
+
+        # Override the autouse non-blocking snapshot patch at instance scope.
+        controller._capture_snapshot = _blocking_snapshot
+        controller._emit_readiness_alerts = AsyncMock()
+
+        before = datetime.utcnow()
+
+        with pytest.raises(_ReadinessBlockedError):
+            await controller.run_optimization("hourly")
+
+        after = datetime.utcnow()
+
+        assert controller.last_run_time is not None
+        assert before <= controller.last_run_time <= after
+        assert controller.last_run_time.tzinfo is None, (
+            "last_run_time must be naive UTC to match the control loop's "
+            "datetime.utcnow() comparison; mixing tz-aware here TypeErrors."
+        )
+        # And the actual subtraction the loop performs must not blow up.
+        _ = datetime.utcnow() - controller.last_run_time
+
 

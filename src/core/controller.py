@@ -271,6 +271,13 @@ class DepotController:
                     continue
                 raise
 
+        # Rate-limit the hourly loop even when readiness blocks below; without
+        # this, last_run_time stays None forever and the loop re-runs every
+        # minute. Must stay naive to match the loop comparison further down
+        # in this file (now - self.last_run_time); tz-aware here would
+        # TypeError on subtraction and silently kill the loop.
+        self.last_run_time = datetime.utcnow()
+
         # Persist the input snapshot once, BEFORE the solve retry loop, so
         # post-mortem replay survives crashes/timeouts and we don't write
         # multiple orphan rows for one logical run.

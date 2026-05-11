@@ -8,6 +8,12 @@
 -- This is appropriate for simulation; production should reflect actual
 -- physical bay layout.
 
+-- Guarded with to_regclass so the migration is a no-op once the static
+-- shadow tables are dropped (these tables now live in Supabase; the
+-- TimescaleDB shadows are removed by migration 029 on main). Without the
+-- guard, re-running migrations against a post-029 DB crashes with
+-- `relation "charger_vehicle_access" does not exist`, which puts the
+-- migration runner into a restart loop.
 DO $$
 BEGIN
     IF to_regclass('public.charger_vehicle_access') IS NULL THEN
