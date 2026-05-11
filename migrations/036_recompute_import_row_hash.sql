@@ -36,7 +36,9 @@ DROP INDEX IF EXISTS charging_sessions_import_dedup_idx;
 -- value as stored. For platform-initiated rows we reconstruct the length-
 -- prefixed inner hash from persisted columns (end_time / import_status /
 -- import_user_full_name / import_station_owner) — identical bytes to the
--- Python helper.
+-- Python helper. Platform-initiated rows are those with the placeholder
+-- id_token and no resolved vehicle/card/driver (matches runtime: both
+-- rfid_label and id_tag absent on import).
 CREATE TEMPORARY TABLE _new_import_hashes ON COMMIT DROP AS
 WITH platform_inner AS (
     SELECT
@@ -60,6 +62,9 @@ WITH platform_inner AS (
     FROM charging_sessions cs
     WHERE cs.source = 'import'
       AND cs.id_token = 'platform-start'
+      AND cs.vehicle_id IS NULL
+      AND cs.card_id IS NULL
+      AND cs.driver_id IS NULL
 )
 SELECT
     cs.session_id,
@@ -69,7 +74,10 @@ SELECT
             cs.site_id::text || '|' ||
             to_char(cs.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS+00:00') || '|' ||
             CASE
-                WHEN cs.id_token = 'platform-start' THEN
+                WHEN cs.id_token = 'platform-start'
+                     AND cs.vehicle_id IS NULL
+                     AND cs.card_id IS NULL
+                     AND cs.driver_id IS NULL THEN
                     'platform-start:' || pi.inner_hash
                 ELSE cs.id_token
             END,

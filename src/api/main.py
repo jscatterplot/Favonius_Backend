@@ -2643,7 +2643,7 @@ async def _get_site_metadata(depot_id: str) -> Optional[_SiteMetadata]:
         meta = _SiteMetadata(
             depot_id=row["depot_id"],
             organization_id=row["organization_id"],
-            timezone_name=row["timezone"] or "UTC",
+            timezone_name=row["timezone"] or "America/Los_Angeles",
             tariff_config=tariff_config,
         )
         _site_metadata_cache[depot_id] = (meta, time.time())
