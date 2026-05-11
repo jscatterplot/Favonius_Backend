@@ -2587,10 +2587,8 @@ class _SiteMetadata:
     JWT org claim before trusting the row.
     """
 
-    depot_id: str
     organization_id: str
     timezone_name: str
-    tariff_config: Optional[dict]
 
 
 async def _get_site_metadata(depot_id: str) -> Optional[_SiteMetadata]:
@@ -2618,10 +2616,8 @@ async def _get_site_metadata(depot_id: str) -> Optional[_SiteMetadata]:
             row = await conn.fetchrow(
                 """
                 SELECT
-                    id::text                AS depot_id,
                     organization_id::text   AS organization_id,
-                    timezone,
-                    tariff_config
+                    timezone
                 FROM sites
                 WHERE id = $1::uuid
                 """,
@@ -2630,21 +2626,9 @@ async def _get_site_metadata(depot_id: str) -> Optional[_SiteMetadata]:
         if row is None:
             return None
 
-        tariff_raw = row["tariff_config"]
-        tariff_config: Optional[dict] = None
-        if isinstance(tariff_raw, str):
-            try:
-                tariff_config = json.loads(tariff_raw)
-            except json.JSONDecodeError:
-                tariff_config = None
-        elif isinstance(tariff_raw, dict):
-            tariff_config = tariff_raw
-
         meta = _SiteMetadata(
-            depot_id=row["depot_id"],
             organization_id=row["organization_id"],
             timezone_name=row["timezone"] or "America/Los_Angeles",
-            tariff_config=tariff_config,
         )
         _site_metadata_cache[depot_id] = (meta, time.time())
         return meta
@@ -2678,7 +2662,7 @@ async def _resolve_session_cost(
     Falls back to the request-supplied ``revenue`` whenever:
       * the session has no end time (open / in-progress import),
       * energy is zero (no cost to derive), or
-      * the depot has no price coverage for the session window.
+      * the depot has incomplete or missing hourly price data for the session window.
 
     Resolves *before* opening the UPSERT transaction so the price lookup never
     extends row-lock duration.

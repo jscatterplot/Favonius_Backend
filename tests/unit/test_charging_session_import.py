@@ -71,10 +71,8 @@ def _depot_row(
 ) -> dict:
     """Build a sites row matching the columns _get_site_metadata reads."""
     return {
-        "depot_id": str(uuid4()),
         "organization_id": organization_id or str(uuid4()),
         "timezone": timezone_name,
-        "tariff_config": None,
     }
 
 

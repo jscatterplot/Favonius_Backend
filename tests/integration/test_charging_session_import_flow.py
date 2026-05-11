@@ -189,15 +189,13 @@ def _build_shared_pool(
     static_conn = AsyncMock()
 
     async def static_fetchrow(query: str, *args, **kwargs):
-        if "FROM sites" in query and "tariff_config" in query:
+        if "FROM sites" in query and "organization_id::text" in query:
             # Import endpoint _get_site_metadata lookup (no org filter — the
             # org check is in-process against the returned row).
             if str(args[0]) == depot_id:
                 return {
-                    "depot_id": depot_id,
                     "organization_id": org_id,
                     "timezone": timezone_name,
-                    "tariff_config": None,
                 }
             return None
         if "FROM sites" in query:

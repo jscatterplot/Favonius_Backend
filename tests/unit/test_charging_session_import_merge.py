@@ -260,6 +260,30 @@ class TestTimescalePriceSourceCache:
         assert conn.fetchrow.await_count == 3
 
     @pytest.mark.asyncio
+    async def test_partial_hour_coverage_returns_none(self):
+        """A missing price in any spanned hour must not average the remainder."""
+        depot_id = str(uuid4())
+        pool = MagicMock()
+        conn = AsyncMock()
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                {"price": Decimal("0.50")},
+                {"price": None},
+                {"price": Decimal("0.10")},
+            ]
+        )
+        ps = TimescalePriceSource(pool)
+        result = await ps.average_price_per_kwh(
+            depot_id=depot_id,
+            start=_utc(2026, 5, 5, 12, 0),
+            end=_utc(2026, 5, 5, 15, 0),
+        )
+        assert result is None
+        assert conn.fetchrow.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_end_on_hour_boundary_queries_one_bucket(self):
         """``end`` at ``:00`` is exclusive; do not include the following hour."""
         depot_id = str(uuid4())
@@ -375,10 +399,8 @@ class TestUpsertSqlContract:
         pool.static = pool
 
         sites_row = {
-            "depot_id": depot_id,
             "organization_id": org_id,
             "timezone": "UTC",
-            "tariff_config": None,
         }
         conn.fetchrow = AsyncMock(
             side_effect=[

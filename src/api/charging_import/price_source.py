@@ -32,7 +32,7 @@ class PriceSource(Protocol):
         start: datetime,
         end: datetime,
     ) -> Optional[Decimal]:
-        """Return the time-weighted average price, or ``None`` if no coverage."""
+        """Return the simple mean of hourly prices, or ``None`` if any hour lacks data."""
         ...
 
 
@@ -115,11 +115,10 @@ class TimescalePriceSource:
         prices: list[Decimal] = []
         for bucket in buckets:
             price = await self._lookup_bucket(depot_id, bucket)
-            if price is not None:
-                prices.append(price)
+            if price is None:
+                return None
+            prices.append(price)
 
-        if not prices:
-            return None
         total = sum(prices, start=Decimal(0))
         return total / Decimal(len(prices))
 
