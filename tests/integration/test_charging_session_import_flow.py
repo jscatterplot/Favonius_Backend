@@ -189,10 +189,16 @@ def _build_shared_pool(
     static_conn = AsyncMock()
 
     async def static_fetchrow(query: str, *args, **kwargs):
-        if "FROM sites" in query and "organization_id" in query:
-            # Import endpoint depot/org check.
-            if str(args[0]) == depot_id and str(args[1]) == org_id:
-                return {"timezone": timezone_name}
+        if "FROM sites" in query and "tariff_config" in query:
+            # Import endpoint _get_site_metadata lookup (no org filter — the
+            # org check is in-process against the returned row).
+            if str(args[0]) == depot_id:
+                return {
+                    "depot_id": depot_id,
+                    "organization_id": org_id,
+                    "timezone": timezone_name,
+                    "tariff_config": None,
+                }
             return None
         if "FROM sites" in query:
             # Reports endpoint depot row.
@@ -221,10 +227,10 @@ def _build_shared_pool(
     static_pool.acquire.return_value.__aenter__.return_value = static_conn
     static_pool.acquire.return_value.__aexit__.return_value = None
 
-    # ── Timeseries connection: INSERT (import) and SELECT (reports) ──
+    # ── Timeseries connection: UPSERT (import) and SELECT (reports) ──
     ts_conn = AsyncMock()
 
-    async def ts_fetchval(query: str, *args, **kwargs):
+    async def ts_fetchrow(query: str, *args, **kwargs):
         if "INSERT INTO charging_sessions" in query:
             (
                 station_id,
@@ -235,7 +241,7 @@ def _build_shared_pool(
                 start_time,
                 end_time,
                 energy,
-                revenue,
+                cost_total,
                 site_id,
                 _batch,
                 _hash,
@@ -247,17 +253,18 @@ def _build_shared_pool(
                 "Import endpoint must use the deterministic placeholder station_id"
             )
             assert site_id == depot_id, "Import row must scope by site_id=depot_id"
-            return store.insert_imported(
+            session_id = store.insert_imported(
                 station_id=station_id,
                 site_id=site_id,
                 start_time=start_time,
                 end_time=end_time,
                 energy_kwh=float(energy),
-                cost_total=float(revenue),
+                cost_total=float(cost_total),
                 vehicle_id=vehicle_id,
                 driver_id=driver_id,
                 card_id=card_id,
             )
+            return {"session_id": session_id, "was_new": True}
         return None
 
     async def ts_fetch(query: str, *args, **kwargs):
@@ -276,7 +283,7 @@ def _build_shared_pool(
             )
         return []
 
-    ts_conn.fetchval.side_effect = ts_fetchval
+    ts_conn.fetchrow.side_effect = ts_fetchrow
     ts_conn.fetch.side_effect = ts_fetch
 
     ts_pool = MagicMock()
