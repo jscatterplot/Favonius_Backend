@@ -5632,7 +5632,7 @@ def _encode_transaction_cursor(started_at: datetime, session_id: str) -> str:
     started_at_utc = started_at.astimezone(timezone.utc)
     payload = json.dumps(
         {
-            "startedAt": started_at_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "startedAt": started_at_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sessionId": session_id,
         },
         separators=(",", ":"),
