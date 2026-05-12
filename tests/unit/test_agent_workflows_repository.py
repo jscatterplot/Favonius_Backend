@@ -457,13 +457,10 @@ async def seeded_decision(real_pool):
             ts,
         )
 
+    # No teardown delete: decisions.workflow_id references workflows(id) without
+    # ON DELETE CASCADE and decisions are append-only, so deleting the parent
+    # workflow would fail with FK violations in integration runs.
     yield decision_id, ts, workflow_id
-
-    # Teardown: drop the parent workflow row (FK ON DELETE CASCADE would
-    # cascade tiers but `decisions` rows are append-only, so we leave
-    # them — they expire via the 90d retention policy).
-    async with real_pool.acquire() as conn:
-        await conn.execute("DELETE FROM workflows WHERE id = $1", workflow_id)
 
 
 @pytest.mark.database
