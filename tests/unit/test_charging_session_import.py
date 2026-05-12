@@ -8,6 +8,7 @@ envelope (Reports → Energy accounting subsection).
 
 from __future__ import annotations
 
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -15,12 +16,14 @@ import asyncpg
 import pytest
 from fastapi import HTTPException, status as http_status
 
+from src.api.charging_import import StaticPriceSource, invalidate_price_cache
 from src.api.main import (
     _compute_import_row_hash,
     _platform_import_hash_token,
     _parse_import_local_timestamp,
     HistoricalSessionImport,
     app,
+    get_price_source,
 )
 from src.security.tenant_mirror import ensure_tenant_mirrored
 
@@ -61,8 +64,16 @@ def _row_payload(**overrides) -> dict:
     return payload
 
 
-def _depot_row(timezone_name: str = "Europe/Vilnius") -> dict:
-    return {"timezone": timezone_name}
+def _depot_row(
+    timezone_name: str = "Europe/Vilnius",
+    *,
+    organization_id: str | None = None,
+) -> dict:
+    """Build a sites row matching the columns _get_site_metadata reads."""
+    return {
+        "organization_id": organization_id or str(uuid4()),
+        "timezone": timezone_name,
+    }
 
 
 def _vehicle_match_row(vehicle_id: str) -> dict:
@@ -78,10 +89,32 @@ def _card_match_row(
     return {"card_id": card_id, "vehicle_id": vehicle_id, "driver_id": driver_id}
 
 
+def _upsert_row(session_id: str, *, was_new: bool = True) -> dict:
+    """RETURNING row from the UPSERT — session_id + xmax-derived was_new."""
+    return {"session_id": session_id, "was_new": was_new}
+
+
 @pytest.fixture(autouse=True)
-def clear_dependency_overrides():
+def reset_import_endpoint_state():
+    """Reset module-level caches and force a no-op PriceSource for every test.
+
+    The endpoint caches `sites` metadata and prices at module scope so a single
+    import-batch only queries each (depot, hour) once. Tests need a clean slate
+    between cases. StaticPriceSource(None) makes cost_total fall back to the
+    request's `revenue` field — matches the legacy behavior these tests pin.
+    """
+    from src.api import main as api_main
+
+    api_main._site_metadata_cache.clear()
+    api_main._site_metadata_locks.clear()
+    invalidate_price_cache()
+
+    app.dependency_overrides[get_price_source] = lambda: StaticPriceSource(None)
     yield
     app.dependency_overrides.clear()
+    api_main._site_metadata_cache.clear()
+    api_main._site_metadata_locks.clear()
+    invalidate_price_cache()
 
 
 # --------------------------------------------------------------------------- #
@@ -140,58 +173,71 @@ class TestPureHelpers:
             depot_id=depot_id,
             start_time_utc=ts,
             id_tag="ED8503",
-            energy_delivered_kwh=24.044,
-            revenue=0,
         )
         b = _compute_import_row_hash(
             depot_id=depot_id,
             start_time_utc=ts,
             id_tag="ED8503",
-            energy_delivered_kwh=24.044,
-            revenue=0,
         )
         assert a == b
         assert len(a) == 64
 
-    def test_compute_import_row_hash_changes_on_any_input(self):
+    def test_compute_import_row_hash_changes_on_canonical_inputs(self):
+        """Hash must differ when ANY of (depot_id, start_time, id_tag) differs."""
+        from datetime import datetime, timezone
+
+        depot_id = str(uuid4())
+        other_depot = str(uuid4())
+        ts = datetime(2026, 5, 5, 9, 56, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 5, 9, 57, tzinfo=timezone.utc)
+        base = _compute_import_row_hash(
+            depot_id=depot_id,
+            start_time_utc=ts,
+            id_tag="ED8503",
+        )
+        # different depot
+        assert base != _compute_import_row_hash(
+            depot_id=other_depot, start_time_utc=ts, id_tag="ED8503"
+        )
+        # different start_time
+        assert base != _compute_import_row_hash(
+            depot_id=depot_id, start_time_utc=later, id_tag="ED8503"
+        )
+        # different id_tag
+        assert base != _compute_import_row_hash(
+            depot_id=depot_id, start_time_utc=ts, id_tag="OTHER"
+        )
+
+    def test_compute_import_row_hash_is_stable_when_energy_or_revenue_change(self):
+        """Energy / revenue are NOT in the canonical form — corrected re-uploads
+        merge into the same row via the runtime UPSERT-with-fill-nulls path.
+
+        Pins migration 036's promise: a customer who re-uploads an XLSX with a
+        corrected metering value should not create a duplicate row.
+        """
         from datetime import datetime, timezone
 
         depot_id = str(uuid4())
         ts = datetime(2026, 5, 5, 9, 56, tzinfo=timezone.utc)
         base = _compute_import_row_hash(
-            depot_id=depot_id,
-            start_time_utc=ts,
-            id_tag="ED8503",
-            energy_delivered_kwh=24.044,
-            revenue=0,
+            depot_id=depot_id, start_time_utc=ts, id_tag="ED8503"
         )
-        # different id_tag
-        assert base != _compute_import_row_hash(
-            depot_id=depot_id,
-            start_time_utc=ts,
-            id_tag="OTHER",
-            energy_delivered_kwh=24.044,
-            revenue=0,
-        )
-        # different energy
-        assert base != _compute_import_row_hash(
-            depot_id=depot_id,
-            start_time_utc=ts,
-            id_tag="ED8503",
-            energy_delivered_kwh=24.045,
-            revenue=0,
-        )
-        # different revenue
-        assert base != _compute_import_row_hash(
-            depot_id=depot_id,
-            start_time_utc=ts,
-            id_tag="ED8503",
-            energy_delivered_kwh=24.044,
-            revenue=1.5,
+        # The function signature deliberately does not accept energy / revenue;
+        # tests that previously varied those values must merge into the same
+        # row at the UPSERT layer, not produce different hashes.
+        assert base == _compute_import_row_hash(
+            depot_id=depot_id, start_time_utc=ts, id_tag="ED8503"
         )
 
-    def test_platform_import_hash_token_changes_with_row_content(self):
-        """Platform-start dedup token should distinguish materially different rows."""
+    def test_platform_import_hash_token_changes_with_persisted_content(self):
+        """Platform-start dedup token distinguishes rows by persisted fields.
+
+        Only fields present in charging_sessions are part of the canonical
+        form (end_time, import_status, import_user_full_name,
+        import_station_owner) — transaction_type is excluded because it isn't
+        persisted and migration 036 must be able to reconstruct the same token
+        from DB columns alone.
+        """
         from datetime import datetime, timezone
         from uuid import uuid4
 
@@ -208,13 +254,37 @@ class TestPureHelpers:
             "user_full_name": "HRX Transport",
             "station_owner_full_name": "Gustas Diksa",
         }
-        request_a = HistoricalSessionImport(**common)
-        request_b = HistoricalSessionImport(**{**common, "transaction_type": "IOS"})
-
+        request_base = HistoricalSessionImport(**common)
         end_time = datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)
-        token_a = _platform_import_hash_token(request_a, end_time_utc=end_time)
-        token_b = _platform_import_hash_token(request_b, end_time_utc=end_time)
-        assert token_a != token_b
+        token_base = _platform_import_hash_token(request_base, end_time_utc=end_time)
+
+        # status / user_name / station_owner / end_time each shift the token.
+        for override in (
+            {"status": "Charging"},
+            {"user_full_name": "Other Transport"},
+            {"station_owner_full_name": "Other Owner"},
+        ):
+            request_other = HistoricalSessionImport(**{**common, **override})
+            assert (
+                _platform_import_hash_token(request_other, end_time_utc=end_time)
+                != token_base
+            ), f"override {override} must change the token"
+
+        # end_time shifts the token too.
+        other_end = datetime(2026, 5, 10, 23, 0, tzinfo=timezone.utc)
+        assert (
+            _platform_import_hash_token(request_base, end_time_utc=other_end)
+            != token_base
+        )
+
+        # transaction_type is NOT in the canonical form (migration 036).
+        request_other_txn = HistoricalSessionImport(
+            **{**common, "transaction_type": "IOS"}
+        )
+        assert (
+            _platform_import_hash_token(request_other_txn, end_time_utc=end_time)
+            == token_base
+        )
 
     def test_platform_import_hash_token_handles_pipe_characters_without_colliding(self):
         """Free-text fields containing pipes should not collapse into same dedup token."""
@@ -263,16 +333,68 @@ def _set_fetchrow_sequence(conn, *rows):
     conn.fetchrow = AsyncMock(side_effect=list(rows))
 
 
+def _upsert_bind(conn) -> tuple:
+    """Bind values passed to the UPSERT (the final fetchrow call)."""
+    return conn.fetchrow.await_args_list[-1].args[1:]
+
+
+def _upsert_sql(conn) -> str:
+    """SQL string passed to the UPSERT (the final fetchrow call)."""
+    return conn.fetchrow.await_args_list[-1].args[0]
+
+
+def _upsert_was_called(conn) -> bool:
+    """True iff fetchrow was ever invoked with the UPSERT SQL."""
+    return any(
+        call.args and "INSERT INTO charging_sessions" in str(call.args[0])
+        for call in conn.fetchrow.await_args_list
+    )
+
+
 class TestHistoricalChargingSessionImport:
     """End-to-end behavior of POST /admin/depots/{id}/charging-sessions/import."""
 
-    def _setup(self, mock_db_pool, *, depot_row, vehicle_row, card_row):
+    def _setup(
+        self,
+        mock_db_pool,
+        *,
+        depot_row,
+        vehicle_row=None,
+        card_row=None,
+        identity_fetchrows: list | None = None,
+        upsert_row=None,
+        session_id: str | None = None,
+        org_id: str | None = None,
+    ):
+        """Configure the conn fetchrow sequence for the endpoint's full path.
+
+        Ordered fetchrow calls inside the endpoint:
+          1) sites lookup (cached in _site_metadata_cache after first hit)
+          2+) static identity: zero or more ``fetchrow`` results (vehicle by
+              id_tag, then card by id_tag — platform-initiated rows skip this
+              block entirely; vehicle-hit short-circuit uses one row only)
+          N) UPSERT into charging_sessions returning (session_id, was_new)
+
+        When ``identity_fetchrows`` is ``None`` (default), the static phase is
+        ``[vehicle_row, card_row]``. Pass ``[]`` for platform-initiated imports,
+        or ``[vehicle_hit_row]`` when the vehicle lookup hits and the card
+        query is never executed.
+
+        ``org_id`` patches the depot_row so its ``organization_id`` matches the
+        caller's JWT org claim; tests that omit it use whatever random org_id
+        ``_depot_row`` generated and exercise the 404 path.
+        """
         pool, conn = mock_db_pool
-        # Ordered fetchrow calls inside the endpoint:
-        #   1) sites lookup (timezone + org check)
-        #   2) vehicles lookup by id_tag
-        #   3) rfid_cards lookup by id_tag
-        _set_fetchrow_sequence(conn, depot_row, vehicle_row, card_row)
+        if depot_row is not None and org_id is not None:
+            depot_row = {**depot_row, "organization_id": org_id}
+        if upsert_row is None:
+            sid = session_id or str(uuid4())
+            upsert_row = _upsert_row(sid)
+        if identity_fetchrows is not None:
+            id_rows = list(identity_fetchrows)
+        else:
+            id_rows = [vehicle_row, card_row]
+        _set_fetchrow_sequence(conn, depot_row, *id_rows, upsert_row)
         return pool, conn
 
     def test_finished_row_inserts_with_utc_conversion_and_card_match(
@@ -292,8 +414,9 @@ class TestHistoricalChargingSessionImport:
             card_row=_card_match_row(
                 card_id=card_id, vehicle_id=vehicle_id, driver_id=None
             ),
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -315,7 +438,7 @@ class TestHistoricalChargingSessionImport:
         # source via SQL literal ('import'), depot_id as site_id. fetchval is
         # called as fetchval(query, *bind_values), so args[0] is the SQL
         # string; bind values start at args[1].
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         from datetime import datetime, timezone
 
         assert bind[0] == f"imported:{depot_id}"  # $1 placeholder station_id
@@ -358,8 +481,9 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("UTC"),
             vehicle_row=None,
             card_row=None,
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -371,7 +495,7 @@ class TestHistoricalChargingSessionImport:
             )
 
         assert response.status_code == http_status.HTTP_201_CREATED
-        sql = conn.fetchval.await_args.args[0]
+        sql = _upsert_sql(conn)
         # Both columns must appear in the column list, not just in a comment.
         # Extract the column list to be robust to whitespace.
         col_list_start = sql.index("INSERT INTO charging_sessions (") + len(
@@ -403,8 +527,9 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -418,7 +543,7 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_201_CREATED
         from datetime import datetime, timezone
 
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         # end_time_local 2026-05-11 01:17 Vilnius (UTC+3 DST) -> 22:17 UTC on 2026-05-10
         assert bind[6] == datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)  # $7
         assert bind[14] == "Charging"  # $15 raw import_status preserved
@@ -437,8 +562,9 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -452,7 +578,7 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_201_CREATED
         from datetime import datetime, timezone
 
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[6] == datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)  # $7
         assert bind[14] == "ConnectedStoppedByEv"  # $15 raw import_status preserved
 
@@ -470,8 +596,9 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         payload = _row_payload(status="Charging")
         payload["end_time_local"] = None  # FE may suppress for ongoing sessions
@@ -486,7 +613,7 @@ class TestHistoricalChargingSessionImport:
             )
 
         assert response.status_code == http_status.HTTP_201_CREATED
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[6] is None  # $7 end_time NULL when omitted
         assert bind[14] == "Charging"
 
@@ -500,10 +627,10 @@ class TestHistoricalChargingSessionImport:
         pool, conn = self._setup(
             mock_db_pool,
             depot_row=_depot_row("UTC"),
-            vehicle_row=_vehicle_match_row(vehicle_id),
-            card_row=None,  # would 500 if reached — confirms we short-circuit
+            identity_fetchrows=[_vehicle_match_row(vehicle_id)],
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -519,9 +646,8 @@ class TestHistoricalChargingSessionImport:
         assert body["matched"]["vehicle_id"] == vehicle_id
         assert body["matched"]["card_id"] is None
         assert body["matched"]["driver_id"] is None
-        # Only two fetchrow calls used: sites + vehicles. The third was queued
-        # via side_effect but never awaited.
-        assert conn.fetchrow.await_count == 2
+        # sites + vehicle hit + UPSERT — card lookup is short-circuited.
+        assert conn.fetchrow.await_count == 3
 
     def test_unmatched_id_tag_inserts_with_null_identity_but_keeps_id_token(
         self, client, mock_db_pool
@@ -537,8 +663,9 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -555,13 +682,66 @@ class TestHistoricalChargingSessionImport:
         assert body["matched"]["card_id"] is None
         assert body["matched"]["driver_id"] is None
 
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[2] == "Opel Mokka"  # $3 id_token preserved
         assert bind[1] is None  # $2 vehicle_id NULL
         assert bind[4] is None  # $5 card_id NULL
 
-    def test_duplicate_row_returns_409_duplicate_session(self, client, mock_db_pool):
-        """Re-uploading the same file row hits the partial unique index."""
+    def test_re_uploading_same_row_merges_and_returns_was_new_false(
+        self, client, mock_db_pool
+    ):
+        """Re-uploading the same logical row merges via UPSERT-with-fill-nulls.
+
+        Previously this surfaced as a 409 DUPLICATE_SESSION. Since migration 036
+        and the runtime UPSERT switch, the API returns 201 with the existing
+        session_id and `was_new = false`; the bulk-import dialog reads
+        `was_new` to surface "N merged" vs "N new" counts to operators.
+        """
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        existing_session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+            upsert_row=_upsert_row(existing_session_id, was_new=False),
+            org_id=org_id,
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(),
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        body = response.json()
+        assert body["session_id"] == existing_session_id
+        assert body["was_new"] is False
+
+        # The UPSERT SQL must include the ON CONFLICT clause; this pins the
+        # fill-nulls behavior at the SQL boundary so a future refactor can't
+        # silently drop it.
+        sql = _upsert_sql(conn)
+        assert "ON CONFLICT" in sql
+        assert "DO UPDATE SET" in sql
+        assert "COALESCE(charging_sessions" in sql
+
+    def test_unique_violation_outside_dedup_index_still_maps_to_409(
+        self, client, mock_db_pool
+    ):
+        """A non-dedup unique-violation (e.g. id_tag clash) still surfaces as 409.
+
+        The endpoint's UPSERT only swallows conflicts on the dedup index. Any
+        other UniqueViolationError from a sibling write must still propagate
+        through ``_handle_identity_unique_violation``.
+        """
         depot_id = str(uuid4())
         org_id = str(uuid4())
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
@@ -571,10 +751,21 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            org_id=org_id,
         )
-        err = asyncpg.UniqueViolationError("duplicate")
-        err.constraint_name = "charging_sessions_import_dedup_idx"
-        conn.fetchval = AsyncMock(side_effect=err)
+        # Replace the upsert_row in the side_effect with an exception so the
+        # UPSERT call itself raises. Constraint name is NOT the dedup index, so
+        # the mapper picks the generic CONFLICT code rather than DUPLICATE_SESSION.
+        err = asyncpg.UniqueViolationError("conflict")
+        err.constraint_name = "vehicles_id_tag_unique"
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _depot_row("Europe/Vilnius", organization_id=org_id),
+                None,  # vehicle miss
+                None,  # rfid miss
+                err,  # UPSERT raises
+            ]
+        )
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -587,8 +778,7 @@ class TestHistoricalChargingSessionImport:
 
         assert response.status_code == http_status.HTTP_409_CONFLICT
         body = response.json()
-        # The bulk-import dialog keys off this stable code to count duplicates.
-        assert body["error_code"] == "DUPLICATE_SESSION"
+        assert body["error_code"] == "DUPLICATE_ID_TAG"
 
     def test_invalid_timestamp_returns_400(self, client, mock_db_pool):
         depot_id = str(uuid4())
@@ -600,8 +790,8 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock()
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -615,8 +805,8 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
         body = response.json()
         assert body["error_code"] == "INVALID_TIMESTAMP"
-        # No INSERT issued when validation fails.
-        conn.fetchval.assert_not_awaited()
+        # No UPSERT issued when validation fails.
+        assert not _upsert_was_called(conn)
 
     def test_arbitrary_status_string_round_trips_to_import_status(
         self, client, mock_db_pool
@@ -638,8 +828,9 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -651,7 +842,7 @@ class TestHistoricalChargingSessionImport:
             )
 
         assert response.status_code == http_status.HTTP_201_CREATED
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[14] == "Faulted"  # $15 raw status persisted verbatim
 
     def test_blank_status_rejected_by_pydantic(self, client, mock_db_pool):
@@ -701,8 +892,8 @@ class TestHistoricalChargingSessionImport:
             depot_row=_depot_row("Europe/Vilnius"),
             vehicle_row=None,
             card_row=None,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock()
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -719,7 +910,7 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
         body = response.json()
         assert body["error_code"] == "INVALID_TIMESTAMP"
-        conn.fetchval.assert_not_awaited()
+        assert not _upsert_was_called(conn)
 
     def test_non_customer_admin_returns_403(self, client, mock_db_pool):
         depot_id = str(uuid4())
@@ -779,13 +970,13 @@ class TestHistoricalChargingSessionImport:
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
 
         pool, conn = mock_db_pool
-        # fetchrow sequence: 1) sites  2) rfid_cards.label hit (stops here)
+        # fetchrow sequence: 1) sites  2) rfid_cards.label hit  3) UPSERT
         _set_fetchrow_sequence(
             conn,
-            _depot_row("Europe/Vilnius"),
+            _depot_row("Europe/Vilnius", organization_id=org_id),
             _card_match_row(card_id=card_id, vehicle_id=vehicle_id, driver_id=None),
+            _upsert_row(session_id),
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -802,9 +993,11 @@ class TestHistoricalChargingSessionImport:
         assert body["matched"]["vehicle_id"] == vehicle_id
         assert body["matched"]["driver_id"] is None
         # Label matched on the 2nd fetchrow — no vehicle/card id_tag queries ran
-        assert conn.fetchrow.await_count == 2
+        # sites + identity-hit + UPSERT = 3 fetchrow calls; the second identity
+        # query (card or vehicle, depending on path) is short-circuited.
+        assert conn.fetchrow.await_count == 3
         # id_token stores rfid_label (preferred over id_tag)
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[2] == "Opel Mokka"  # $3 id_token
 
     def test_rfid_label_miss_falls_back_to_id_tag_path(self, client, mock_db_pool):
@@ -816,14 +1009,14 @@ class TestHistoricalChargingSessionImport:
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
 
         pool, conn = mock_db_pool
-        # fetchrow sequence: 1) sites  2) label miss  3) vehicle hit
+        # fetchrow sequence: 1) sites  2) label miss  3) vehicle hit  4) UPSERT
         _set_fetchrow_sequence(
             conn,
-            _depot_row("UTC"),
+            _depot_row("UTC", organization_id=org_id),
             None,  # rfid_cards.label -> no match
             _vehicle_match_row(vehicle_id),  # vehicles.id_tag -> hit
+            _upsert_row(session_id),
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -839,7 +1032,7 @@ class TestHistoricalChargingSessionImport:
         assert body["matched"]["vehicle_id"] == vehicle_id
         assert body["matched"]["card_id"] is None
         # id_token stores rfid_label (it was provided)
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[2] == "Unknown Label"  # $3 id_token
 
     def test_rfid_label_only_no_match_stores_unmatched(self, client, mock_db_pool):
@@ -850,9 +1043,13 @@ class TestHistoricalChargingSessionImport:
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
 
         pool, conn = mock_db_pool
-        # fetchrow sequence: 1) sites  2) label miss  (no id_tag → stops)
-        _set_fetchrow_sequence(conn, _depot_row("UTC"), None)
-        conn.fetchval = AsyncMock(return_value=session_id)
+        # fetchrow sequence: 1) sites  2) label miss  3) UPSERT
+        _set_fetchrow_sequence(
+            conn,
+            _depot_row("UTC", organization_id=org_id),
+            None,
+            _upsert_row(session_id),
+        )
 
         with patch("src.api.main.db_pools", pool), patch(
             "src.api.main.verify_depot_access", new_callable=AsyncMock
@@ -871,7 +1068,7 @@ class TestHistoricalChargingSessionImport:
         assert body["matched"]["vehicle_id"] is None
         assert body["matched"]["card_id"] is None
         assert body["matched"]["driver_id"] is None
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[2] == "Opel Mokka"  # $3 id_token = rfid_label
 
     def test_neither_rfid_label_nor_id_tag_imports_as_platform_started(
@@ -886,10 +1083,10 @@ class TestHistoricalChargingSessionImport:
         pool, conn = self._setup(
             mock_db_pool,
             depot_row=_depot_row("UTC"),
-            vehicle_row=None,
-            card_row=None,
+            identity_fetchrows=[],
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
 
         payload = _row_payload(id_tag=None, transaction_type="IOS")
 
@@ -909,8 +1106,30 @@ class TestHistoricalChargingSessionImport:
         assert body["matched"]["card_id"] is None
         assert body["matched"]["driver_id"] is None
 
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[2] == "platform-start"  # $3 id_token marker for platform starts
+
+    def test_upsert_fetchrow_returns_none_returns_503(self, client, mock_db_pool):
+        """UPSERT returning no row is treated as a database-layer failure."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, conn = mock_db_pool
+        _set_fetchrow_sequence(
+            conn,
+            _depot_row("UTC", organization_id=org_id),
+            None,
+        )
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(id_tag=None, transaction_type="IOS"),
+            )
+        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.json()["error_code"] == "DATABASE_ERROR"
 
     def test_literal_platform_start_identifier_is_not_treated_as_platform_initiated(
         self, client, mock_db_pool
@@ -927,10 +1146,10 @@ class TestHistoricalChargingSessionImport:
         pool, conn = self._setup(
             mock_db_pool,
             depot_row=_depot_row("UTC"),
-            vehicle_row=_vehicle_match_row(vehicle_id),
-            card_row=None,
+            identity_fetchrows=[_vehicle_match_row(vehicle_id)],
+            session_id=session_id,
+            org_id=org_id,
         )
-        conn.fetchval = AsyncMock(return_value=session_id)
         payload = _row_payload(id_tag="platform-start")
 
         with patch("src.api.main.db_pools", pool), patch(
@@ -945,13 +1164,14 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_201_CREATED
         body = response.json()
         assert body["matched"]["vehicle_id"] == vehicle_id
-        bind = conn.fetchval.await_args.args[1:]
+        bind = _upsert_bind(conn)
         assert bind[2] == "platform-start"
+        # Literal "platform-start" id_tag is treated as a regular id, NOT as a
+        # platform-initiated row, so the hash uses the raw token (no platform
+        # envelope) and is invariant under energy/revenue corrections.
         expected_hash = _compute_import_row_hash(
             depot_id=depot_id,
             start_time_utc=datetime(2026, 5, 5, 12, 56, tzinfo=timezone.utc),
             id_tag="platform-start",
-            energy_delivered_kwh=24.044,
-            revenue=0,
         )
         assert bind[11] == expected_hash
