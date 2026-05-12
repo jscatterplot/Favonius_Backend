@@ -296,9 +296,9 @@ def _decision_from_row(row: Any) -> Decision:
 
 
 def _tool_call_to_dict(tc: ToolCall) -> dict[str, Any]:
-    # ``model_dump(mode="json")`` would coerce nested datetimes/UUIDs in
-    # ``arguments``/``result`` to JSON-safe primitives; ``mode="python"``
-    # keeps the plain-dict shape we want before ``json.dumps``.
+    # ``mode="json"`` coerces nested UUIDs/datetimes in ``arguments``/``result``
+    # to JSON-safe primitives for ``json.dumps`` (e.g. in ``insert_decision``).
+    # ``mode="python"`` would keep native types and can raise ``TypeError`` on dump.
     return tc.model_dump(mode="json")
 
 
