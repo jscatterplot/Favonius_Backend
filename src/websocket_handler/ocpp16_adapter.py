@@ -1080,20 +1080,20 @@ class OCPP16Session:
             energy_kwh = close_result.get("energy_delivered_kwh")
             if energy_kwh is None:
                 if meter_stop is None:
-                    reason = "missing_meter_stop"
+                    anomaly_reason = "missing_meter_stop"
                 elif meter_start_db is None:
-                    reason = "missing_meter_start"
+                    anomaly_reason = "missing_meter_start"
                 elif meter_stop < int(meter_start_db):
-                    reason = "meter_stop_lt_meter_start"
+                    anomaly_reason = "meter_stop_lt_meter_start"
                 else:
-                    reason = "unknown"
+                    anomaly_reason = "unknown"
                 logger.warning(
                     "Anomalous meter delta on station=%s tx_id=%s: %s "
                     "(meter_start_wh=%s, meter_stop_wh=%s). Leaving "
                     "energy_delivered_kwh NULL.",
                     cp_id,
                     transaction_id,
-                    reason,
+                    anomaly_reason,
                     meter_start_db,
                     meter_stop,
                 )
