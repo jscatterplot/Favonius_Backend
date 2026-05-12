@@ -470,7 +470,7 @@ class TestAppendOnlyTrigger:
 
     async def test_update_raises(self, real_pool, seeded_decision):
         decision_id, ts, _ = seeded_decision
-        with pytest.raises(asyncpg.exceptions.RaiseError) as excinfo:
+        with pytest.raises(asyncpg.CheckViolationError) as excinfo:
             async with real_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE decisions SET rule_applied = 'tampered' WHERE id = $1",
@@ -480,7 +480,7 @@ class TestAppendOnlyTrigger:
 
     async def test_delete_raises(self, real_pool, seeded_decision):
         decision_id, _, _ = seeded_decision
-        with pytest.raises(asyncpg.exceptions.RaiseError) as excinfo:
+        with pytest.raises(asyncpg.CheckViolationError) as excinfo:
             async with real_pool.acquire() as conn:
                 await conn.execute("DELETE FROM decisions WHERE id = $1", decision_id)
         assert "append-only" in str(excinfo.value)
