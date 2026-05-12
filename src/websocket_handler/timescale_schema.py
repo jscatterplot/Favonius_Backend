@@ -130,9 +130,12 @@ class TimescaleSchema:
             CREATE TABLE IF NOT EXISTS charging_sessions (
                 session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 station_id VARCHAR(255) NOT NULL,
+                transaction_id BIGINT,
                 evse_id INTEGER NOT NULL,
                 connector_id INTEGER NOT NULL,
                 vehicle_id VARCHAR(255),
+                driver_id UUID,
+                card_id UUID,
                 id_token VARCHAR(255),
                 start_time TIMESTAMPTZ NOT NULL,
                 end_time TIMESTAMPTZ,

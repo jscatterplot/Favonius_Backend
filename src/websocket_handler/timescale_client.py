@@ -2318,7 +2318,13 @@ class TimescaleClient:
         async with self.pg_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT transaction_id, connector_id, evse_id, id_token, start_time
+                SELECT
+                    transaction_id,
+                    connector_id,
+                    evse_id,
+                    id_token,
+                    start_time,
+                    meter_start_wh
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
@@ -2342,6 +2348,7 @@ class TimescaleClient:
         vehicle_id: Optional[str] = None,
         driver_id: Optional[str] = None,
         card_id: Optional[str] = None,
+        meter_start_wh: Optional[int] = None,
     ) -> None:
         """Insert an open ``charging_sessions`` row at StartTransaction.
 
@@ -2385,8 +2392,8 @@ class TimescaleClient:
                     """
                     INSERT INTO charging_sessions (
                         station_id, transaction_id, evse_id, connector_id,
-                        id_token, start_time, vehicle_id, driver_id, card_id
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
+                        id_token, start_time, vehicle_id, driver_id, card_id, meter_start_wh
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid, $10)
                     """,
                     station_id,
                     transaction_id,
@@ -2397,6 +2404,7 @@ class TimescaleClient:
                     vehicle_id,
                     driver_id,
                     card_id,
+                    meter_start_wh,
                 )
 
     async def close_open_session(
@@ -2405,6 +2413,7 @@ class TimescaleClient:
         transaction_id: int,
         end_time: datetime,
         energy_delivered_kwh: Optional[float] = None,
+        meter_stop_wh: Optional[int] = None,
     ) -> None:
         """Mark a ``charging_sessions`` row closed at StopTransaction."""
         async with self.pg_pool.acquire() as conn:
@@ -2412,7 +2421,17 @@ class TimescaleClient:
                 """
                 UPDATE charging_sessions
                    SET end_time = $3,
-                       energy_delivered_kwh = COALESCE($4, energy_delivered_kwh),
+                       meter_stop_wh = COALESCE($5, meter_stop_wh),
+                       energy_delivered_kwh = COALESCE(
+                           $4,
+                           CASE
+                               WHEN meter_start_wh IS NOT NULL
+                                AND $5 IS NOT NULL
+                                AND $5 >= meter_start_wh
+                               THEN ($5 - meter_start_wh)::numeric / 1000.0
+                               ELSE energy_delivered_kwh
+                           END
+                       ),
                        updated_at = NOW()
                  WHERE station_id = $1
                    AND transaction_id = $2
@@ -2423,6 +2442,7 @@ class TimescaleClient:
                 transaction_id,
                 end_time,
                 energy_delivered_kwh,
+                meter_stop_wh,
             )
 
     async def mark_sessions_seen(self, station_id: str) -> None:

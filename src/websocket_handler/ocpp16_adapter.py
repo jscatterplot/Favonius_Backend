@@ -482,6 +482,9 @@ class OCPP16Session:
                     vehicle_id=pending.get("vehicle_id"),
                     driver_id=pending.get("driver_id"),
                     card_id=pending.get("card_id"),
+                    meter_start_wh=(
+                        int(meter_start) if isinstance(meter_start, (int, float)) else None
+                    ),
                 )
             except Exception as exc:
                 logger.warning(
@@ -637,8 +640,12 @@ class OCPP16Session:
             tx_id = row["transaction_id"]
             if connector_id is None or tx_id is None:
                 continue
-            self._cp.transactions[connector_id] = int(tx_id)
-            self._cp.current_transaction_id = int(tx_id)
+            tx_id_int = int(tx_id)
+            self._cp.transactions[connector_id] = tx_id_int
+            self._cp.current_transaction_id = tx_id_int
+            meter_start_wh = row.get("meter_start_wh")
+            if isinstance(meter_start_wh, (int, float)):
+                self._meter_start_by_tx_id[tx_id_int] = int(meter_start_wh)
         if open_rows:
             logger.info(
                 "Reloaded %d open session(s) for station=%s on boot",
@@ -1071,6 +1078,7 @@ class OCPP16Session:
                 tx_id,
                 end_time,
                 energy_delivered_kwh=energy_delivered_kwh,
+                meter_stop_wh=int(meter_stop) if meter_stop is not None else None,
             )
         except Exception as exc:
             logger.warning(
