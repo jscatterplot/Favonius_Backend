@@ -1072,7 +1072,6 @@ class OCPP16Session:
                 end_time,
                 energy_delivered_kwh=energy_delivered_kwh,
             )
-            self._meter_start_by_tx_id.pop(tx_id, None)
         except Exception as exc:
             logger.warning(
                 "close_open_session failed for station=%s tx_id=%s: %s",
@@ -1080,6 +1079,8 @@ class OCPP16Session:
                 transaction_id,
                 exc,
             )
+        finally:
+            self._meter_start_by_tx_id.pop(tx_id, None)
 
         # Persist optional StopTransaction.transactionData samples using the
         # same telemetry pipeline so vendors that only emit end-of-session

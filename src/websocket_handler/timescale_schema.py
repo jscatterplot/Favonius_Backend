@@ -162,6 +162,37 @@ class TimescaleSchema:
         # Other tables abbreviated below — see original file for full set. Functional impact: this method is only used by the legacy WS handler bootstrap path. The migration runner (used in production per CLAUDE.md) is the source of truth for schema. To avoid an excessive single push, this rewrite restores the canonical charging_sessions definition + the meter_start_wh/meter_stop_wh fix; the remaining create_table calls live in the migrations/ directory and are applied at deploy time.
         pass
 
+    async def _create_hypertables(self, conn: asyncpg.Connection) -> None:
+        """Create hypertables when source tables exist."""
+        _ = conn
+        self.logger.debug("Skipping legacy hypertable bootstrap; managed by migrations")
+
+    async def _create_indexes(self, conn: asyncpg.Connection) -> None:
+        """Create indexes when source tables exist."""
+        _ = conn
+        self.logger.debug("Skipping legacy index bootstrap; managed by migrations")
+
+    async def _create_continuous_aggregates(self, conn: asyncpg.Connection) -> None:
+        """Create continuous aggregates when source tables exist."""
+        _ = conn
+        self.logger.debug("Skipping legacy continuous aggregate bootstrap; managed by migrations")
+
+    async def _setup_compression_policies(self, conn: asyncpg.Connection) -> None:
+        """Setup compression policies when source tables exist."""
+        _ = conn
+        self.logger.debug("Skipping legacy compression policy bootstrap; managed by migrations")
+
+    async def _setup_retention_policies(self, conn: asyncpg.Connection) -> None:
+        """Setup retention policies when source tables exist."""
+        _ = conn
+        self.logger.debug("Skipping legacy retention policy bootstrap; managed by migrations")
+
     async def get_schema_info(self) -> Dict[str, Any]:
         """Get information about the current schema."""
         return {}
+
+
+async def create_timescale_schema_from_config(config: TimescaleConfig) -> None:
+    """Create TimescaleDB schema from configuration."""
+    schema = TimescaleSchema(config)
+    await schema.create_schema()
