@@ -1,0 +1,224 @@
+"""Workflow eval harness — parametrised gate.
+
+Discovers every ``*.yaml`` file in ``tests/golden/workflows/`` (except
+the schema file and the example placeholders under ``_examples/``) and
+runs it through :func:`src.api.agent_workflows.eval.runner.run_scenario`
+against the real test database.
+
+Sprint 5 lands the first 10 readiness scenarios next to this file. Until
+then the gated directory is empty — but the harness itself (this
+module, the runner, the schema) is in place, and the unit tests in
+``tests/unit/agent_workflows/`` already exercise every code path.
+
+Gate behaviour
+--------------
+* ``severity: blocking`` → ``assert result.passed`` (gate fails).
+* ``severity: warning`` → emits a ``pytest.warns``-style warning on
+  failure but does not fail the gate.
+* ``severity: info``    → result is logged via ``caplog`` and never
+  fails.
+
+The example scenarios are exercised via a dedicated test below that
+opts in by name — they are NOT part of the gated dir, so the CI gate
+only fires on scenarios authors deliberately landed under the gated
+path.
+"""
+
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+from typing import Any, Iterator
+
+import pytest
+
+from src.api.agent_workflows.eval import (
+    EvalResult,
+    ScenarioLoadError,
+    load_scenario,
+    run_scenario,
+)
+
+from tests.golden.workflows.conftest import EXAMPLES_DIR, WORKFLOW_GOLDEN_DIR
+
+
+# ── Scenario discovery ────────────────────────────────────────────────────
+
+
+def _gated_scenario_paths() -> list[Path]:
+    """Every *.yaml directly under tests/golden/workflows/ except the schema."""
+    return sorted(
+        p
+        for p in WORKFLOW_GOLDEN_DIR.glob("*.yaml")
+        if p.name != "_schema.yaml"
+    )
+
+
+def _example_scenario_paths() -> list[Path]:
+    """Every *.yaml under tests/golden/workflows/_examples/."""
+    if not EXAMPLES_DIR.is_dir():
+        return []
+    return sorted(EXAMPLES_DIR.glob("*.yaml"))
+
+
+def _scenario_id(path: Path) -> str:
+    return path.stem
+
+
+# ── Harness invariants ────────────────────────────────────────────────────
+
+
+def test_schema_file_exists() -> None:
+    """The schema reference must always be present — it's what scenarios
+    are validated against."""
+    schema = WORKFLOW_GOLDEN_DIR / "_schema.yaml"
+    assert schema.is_file(), "_schema.yaml missing from tests/golden/workflows/"
+
+
+def test_examples_have_unique_ids() -> None:
+    """Every example scenario id must be unique across the examples dir.
+
+    Once the real scenarios land in the gated dir this invariant grows
+    to cover both directories — but for now the example dir is the only
+    place YAMLs live, so we keep the assertion scoped there.
+    """
+    paths = _example_scenario_paths()
+    if not paths:
+        pytest.skip("no example scenarios present")
+
+    ids: list[str] = []
+    for path in paths:
+        scenario = load_scenario(path.read_text(encoding="utf-8"))
+        ids.append(scenario["id"])
+
+    assert len(ids) == len(set(ids)), f"Duplicate example scenario ids: {ids!r}"
+
+
+def test_examples_validate_against_schema() -> None:
+    """Every example scenario must pass the runner's structural validation.
+
+    This is the cheap, no-DB check: failing here means the example file
+    is malformed (missing key, bad enum, etc.) — independent of whether
+    the workflow under test actually produces matching output.
+    """
+    paths = _example_scenario_paths()
+    if not paths:
+        pytest.skip("no example scenarios present")
+
+    failures: list[str] = []
+    for path in paths:
+        try:
+            load_scenario(path.read_text(encoding="utf-8"))
+        except ScenarioLoadError as exc:
+            failures.append(f"{path.name}: {exc}")
+
+    assert not failures, "Schema-invalid example scenarios:\n  " + "\n  ".join(failures)
+
+
+# ── The gate itself ───────────────────────────────────────────────────────
+
+
+_GATED_PATHS = _gated_scenario_paths()
+
+
+@pytest.mark.workflow_golden
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario_path",
+    _GATED_PATHS,
+    ids=[_scenario_id(p) for p in _GATED_PATHS] if _GATED_PATHS else None,
+)
+async def test_workflow_golden_gated(scenario_path: Path, workflow_test_db_pool: Any) -> None:
+    """Run every gated scenario through the harness.
+
+    A failure here blocks the PR. Sprint 5 lands the actual scenarios
+    that this body asserts against — until then, when the gated dir is
+    empty, pytest collects zero parametrise IDs for this test and skips
+    cleanly (see ``test_workflow_golden_gate_skips_when_empty`` below).
+    """
+    if not _GATED_PATHS:
+        pytest.skip("no gated workflow scenarios yet — sprint 5 lands them")
+
+    scenario = load_scenario(scenario_path.read_text(encoding="utf-8"))
+    result = await run_scenario(scenario, pool=workflow_test_db_pool)
+
+    _enforce_severity(result, scenario_path)
+
+
+def test_workflow_golden_gate_skips_when_empty() -> None:
+    """Documents the current state: the gated dir is empty so the gate
+    is a no-op. Once sprint 5 lands real scenarios this test stops
+    being meaningful and the gated parametrise above takes over.
+    """
+    if _GATED_PATHS:
+        pytest.skip("gated scenarios present — handled by the parametrised gate")
+    assert not _GATED_PATHS  # explicit no-op so the suite still reports a passing assertion
+
+
+# ── Example exercising path (proves the harness works) ────────────────────
+
+
+_EXAMPLE_PATHS = _example_scenario_paths()
+
+
+@pytest.mark.workflow_golden
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario_path",
+    _EXAMPLE_PATHS,
+    ids=[_scenario_id(p) for p in _EXAMPLE_PATHS] if _EXAMPLE_PATHS else None,
+)
+async def test_workflow_golden_examples(
+    scenario_path: Path, workflow_test_db_pool: Any
+) -> None:
+    """Run the example scenarios.
+
+    Examples are NOT part of the gated dir — they ship as proof the
+    harness works end-to-end and as a template for sprint 5. They use
+    the ``eval_demo_readiness`` workflow that the conftest in
+    ``tests/unit/agent_workflows/`` also registers; see that conftest
+    for the handler definition.
+    """
+    if not _EXAMPLE_PATHS:
+        pytest.skip("no example scenarios present")
+
+    # Ensure the demo workflow is registered. The unit-test conftest
+    # registers it process-wide; importing it here is enough.
+    from tests.unit.agent_workflows import (  # noqa: F401 — import for side-effect
+        _demo_readiness,
+    )
+
+    scenario = load_scenario(scenario_path.read_text(encoding="utf-8"))
+    result = await run_scenario(scenario, pool=workflow_test_db_pool)
+
+    _enforce_severity(result, scenario_path)
+
+
+# ── Severity-aware assertion helper ───────────────────────────────────────
+
+
+def _enforce_severity(result: EvalResult, scenario_path: Path) -> None:
+    """Translate ``severity`` into a pass/fail signal for pytest.
+
+    Blocking failures `assert`; warnings emit ``warnings.warn``; info-
+    level failures print and pass. All three branches surface the unified
+    diff so a fix is one paste away.
+    """
+    if result.passed:
+        return
+
+    diff_text = result.diff()
+    msg = (
+        f"[{result.scenario_id}] workflow={result.workflow} severity={result.severity}\n"
+        + "\n".join(f"  - {f}" for f in result.failures)
+        + "\n\n--- expected vs actual ---\n"
+        + diff_text
+    )
+
+    if result.severity == "blocking":
+        pytest.fail(msg, pytrace=False)
+    elif result.severity == "warning":
+        warnings.warn(msg, stacklevel=2)
+    else:  # info
+        # Nothing to assert; bubble the diff up via the test report.
+        print(msg)

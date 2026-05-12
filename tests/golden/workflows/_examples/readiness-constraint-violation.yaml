@@ -1,0 +1,103 @@
+# Example scenario — vehicle below required SoC for its scheduled departure.
+#
+# Proves the harness catches hard-constraint violations: BUS-201 is at
+# 71% SoC but the route requires 85% by 06:30. The workflow must surface
+# the gap as an exception with a reassign_to_route proposal — matching
+# PRD §6.1's third sketched scenario ("one driver assigned to a vehicle
+# that won't be ready → expect vehicle reassignment").
+#
+# This is a constraint-violation test: by PRD §10.3 the departure SoC
+# is a hard constraint the agent must never propose violating, so the
+# harness must always catch this case. Severity is `blocking`.
+
+id: readiness-constraint-violation
+workflow: eval_demo_readiness
+description: >
+  BUS-201 is 14 points below its 85% required_soc with two hours to
+  departure. The workflow must surface the gap and propose a route
+  reassignment (or some other action_type_allow_list-permitted fix).
+severity: blocking
+
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+graph_snapshot:
+  depot:
+    depot_id: "33333333-3333-4333-8333-333333333333"
+    name: "Klaipeda depot"
+    latitude: 55.7033
+    longitude: 21.1443
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+      external_id: "BUS-201"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000002"
+      external_id: "BUS-202"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "eeeeee01-0000-4000-8000-000000000001"
+      ocpp_id: "CP-201"
+      rated_kw: 80.0
+      status: "Available"
+    - charger_id: "eeeeee01-0000-4000-8000-000000000002"
+      ocpp_id: "CP-202"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+      route_id: "R-201"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 260.0
+      required_soc: 0.85
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000002"
+      route_id: "R-202"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+
+  telemetry:
+    # BUS-201 — only at 71% SoC, well below the route's 85% requirement.
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+      charger_id: "eeeeee01-0000-4000-8000-000000000001"
+      time: "-5m"
+      soc: 0.71
+      is_plugged: true
+      charging_kw: 60.0
+    # BUS-202 — healthy and ready.
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000002"
+      charger_id: "eeeeee01-0000-4000-8000-000000000002"
+      time: "-5m"
+      soc: 0.95
+      is_plugged: true
+      charging_kw: 40.0
+
+  prices: []
+  building_load: []
+  drivers: []
+
+expected:
+  status: exceptions_present
+  coverage:
+    vehicles_checked: 2
+    chargers_checked: 2
+    routes_checked: 2
+  exception_count_min: 1
+  exception_count_max: 1
+  must_include_exceptions:
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+      issue_contains: "SoC"
+  must_not_include:
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000002"
+  action_type_allow_list:
+    - reassign_to_route
+    - swap_charger

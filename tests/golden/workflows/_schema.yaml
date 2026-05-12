@@ -1,0 +1,267 @@
+# Workflow eval scenario — schema reference
+#
+# Sibling to tests/golden/agent_consumption.yaml (which gates the chat
+# agent). This file is the JSON-schema-style description for every
+# scenario YAML under tests/golden/workflows/. Per PRD principle 6 the
+# harness ships before the workflow; the real 10 readiness scenarios
+# land in sprint 5 against this same schema.
+#
+# Conventions:
+#   - Anything time-relative is anchored to `scenario_now`. Use ISO
+#     strings, signed seconds (`+3600`), or duration suffixes (`+2h`,
+#     `-15m`, `+45s`). The runner refuses to load a snapshot that
+#     contains a bare `now()`-style field.
+#   - All UUIDs are explicit and stable across runs. No `gen_random_uuid`
+#     inside the snapshot.
+#   - Numbers are floats unless schema says otherwise.
+#
+# The runner validates every scenario against this schema before loading
+# it into the savepoint. Adding a new field here requires updating
+# src/api/agent_workflows/eval/runner.py and the runner unit tests.
+
+$schema: "https://json-schema.org/draft-07/schema#"
+title: "Workflow eval scenario"
+type: object
+required:
+  - id
+  - workflow
+  - description
+  - scenario_now
+  - graph_snapshot
+  - expected
+  - severity
+additionalProperties: false
+
+properties:
+  id:
+    type: string
+    description: |
+      Unique slug across all scenario files. Convention: `<workflow>-<slug>`,
+      e.g. `readiness-all-clear`, `readiness-charger-fault`.
+    pattern: "^[a-z][a-z0-9_-]*$"
+
+  workflow:
+    type: string
+    description: |
+      Name the workflow was registered under via `register_workflow(...)`.
+      Must match one of `workflow_registry().names()` at test time, else
+      the runner raises `WorkflowNotRegisteredError`.
+
+  description:
+    type: string
+    description: One-line human-readable summary of what the scenario tests.
+
+  scenario_now:
+    type: string
+    description: |
+      Logical "now" for the run, as an ISO-8601 timestamp. Workflows
+      receive this as `ctx.now`; all snapshot times are resolved
+      relative to it. Determinism: never wall-clock.
+    format: date-time
+
+  graph_snapshot:
+    type: object
+    additionalProperties: false
+    required: [depot]
+    properties:
+      depot:
+        type: object
+        required: [depot_id]
+        additionalProperties: false
+        properties:
+          depot_id:        { type: string, format: uuid }
+          name:            { type: string }
+          latitude:        { type: number }
+          longitude:       { type: number }
+          max_grid_kw:     { type: number, minimum: 0 }
+          timezone:        { type: string }
+
+      vehicles:
+        type: array
+        description: |
+          Each vehicle record matches the `vehicles` table columns the
+          harness understands (vehicle_id, depot_id, external_id,
+          vehicle_type, battery_kwh, max_charge_kw, id_tag).
+        items:
+          type: object
+          required: [vehicle_id]
+          additionalProperties: false
+          properties:
+            vehicle_id:     { type: string, format: uuid }
+            external_id:    { type: string }
+            vehicle_type:   { type: string }
+            battery_kwh:    { type: number, minimum: 0 }
+            max_charge_kw:  { type: number, minimum: 0 }
+            id_tag:         { type: [string, "null"] }
+
+      chargers:
+        type: array
+        description: |
+          Charger records. `status` is the live OCPP status that the
+          readiness workflow reads (e.g. "Available", "Faulted",
+          "Unavailable").
+        items:
+          type: object
+          required: [charger_id]
+          additionalProperties: false
+          properties:
+            charger_id:      { type: string, format: uuid }
+            ocpp_id:         { type: string }
+            rated_kw:        { type: number, minimum: 0 }
+            efficiency:      { type: number, exclusiveMinimum: 0, maximum: 1 }
+            connector_type:  { type: string }
+            status:          { type: string, enum: ["Available", "Occupied", "Faulted", "Unavailable"] }
+
+      schedules:
+        type: array
+        description: |
+          Route assignments for the day. `departure_time` and
+          `return_time` accept the same time-shorthand as the rest of
+          the snapshot (ISO, signed seconds, or duration suffix).
+        items:
+          type: object
+          required: [vehicle_id, departure_time, return_time]
+          additionalProperties: false
+          properties:
+            schedule_id:     { type: string, format: uuid }
+            vehicle_id:      { type: string, format: uuid }
+            route_id:        { type: string }
+            departure_time:  { oneOf: [{ type: string }, { type: number }] }
+            return_time:     { oneOf: [{ type: string }, { type: number }] }
+            energy_kwh:      { type: number, minimum: 0 }
+            required_soc:    { type: number, minimum: 0, maximum: 1 }
+
+      drivers:
+        type: array
+        description: |
+          Driver roster. Sprint 4 will join `driver_id` onto schedules;
+          for now drivers exist as a static-table fixture so workflows
+          can already exercise the "no driver assigned" branch.
+        items:
+          type: object
+          required: [driver_id]
+          additionalProperties: false
+          properties:
+            driver_id:           { type: string, format: uuid }
+            external_driver_id:  { type: string }
+            display_name:        { type: string }
+            status:              { type: string, enum: ["active", "inactive"] }
+
+      telemetry:
+        type: array
+        description: Latest-SoC samples per vehicle.
+        items:
+          type: object
+          required: [vehicle_id, soc]
+          additionalProperties: false
+          properties:
+            time:           { oneOf: [{ type: string }, { type: number }] }
+            vehicle_id:     { type: string, format: uuid }
+            charger_id:     { type: [string, "null"], format: uuid }
+            soc:            { type: number, minimum: 0, maximum: 1 }
+            is_plugged:     { type: boolean }
+            charging_kw:    { type: number, minimum: 0 }
+
+      prices:
+        type: array
+        description: Price points for the depot.
+        items:
+          type: object
+          required: [time, energy_kwh]
+          additionalProperties: false
+          properties:
+            time:        { oneOf: [{ type: string }, { type: number }] }
+            energy_kwh:  { type: number }
+            source:      { type: string }
+
+      building_load:
+        type: array
+        description: Building-load samples.
+        items:
+          type: object
+          required: [time, power_kw]
+          additionalProperties: false
+          properties:
+            time:     { oneOf: [{ type: string }, { type: number }] }
+            power_kw: { type: number, minimum: 0 }
+            source:   { type: string }
+
+  expected:
+    type: object
+    description: |
+      Assertions against `Decision.output`. The runner builds a unified
+      diff of expected vs actual on failure (see EvalResult.diff()).
+    additionalProperties: false
+    required: [status]
+    properties:
+      status:
+        type: string
+        enum: [all_clear, exceptions_present]
+        description: |
+          Top-level state of the workflow's today-view output. PRD §6.1
+          allows either; `all_clear` requires `exception_count_max: 0`.
+
+      coverage:
+        type: object
+        description: Coverage counts the workflow MUST report.
+        additionalProperties: false
+        properties:
+          vehicles_checked: { type: integer, minimum: 0 }
+          chargers_checked: { type: integer, minimum: 0 }
+          routes_checked:   { type: integer, minimum: 0 }
+
+      exception_count_min:
+        type: integer
+        minimum: 0
+        description: |
+          Inclusive lower bound on the number of exceptions in
+          `Decision.output.exceptions`.
+
+      exception_count_max:
+        type: integer
+        minimum: 0
+        description: Inclusive upper bound on exception count.
+
+      must_include_exceptions:
+        type: array
+        description: |
+          Exception assertions that must be present. Match is on
+          `vehicle_id` exact + `issue_contains` substring (case-insensitive).
+        items:
+          type: object
+          required: [vehicle_id]
+          additionalProperties: false
+          properties:
+            vehicle_id:      { type: string, format: uuid }
+            issue_contains:  { type: string }
+
+      must_not_include:
+        type: array
+        description: |
+          Vehicle IDs that MUST NOT appear in the exception list.
+        items:
+          type: object
+          required: [vehicle_id]
+          additionalProperties: false
+          properties:
+            vehicle_id: { type: string, format: uuid }
+
+      action_type_allow_list:
+        type: array
+        description: |
+          Optional. If present, every exception with a `proposed_action`
+          must have a `type` field in this list (anti-flapping guard so
+          the workflow doesn't invent new action verbs unnoticed).
+        items:
+          type: string
+
+  severity:
+    type: string
+    enum: [blocking, warning, info]
+    description: |
+      How CI treats a failure for this scenario.
+        blocking — failing this scenario fails the workflow-golden gate.
+        warning  — reported but does not fail the gate.
+        info     — purely informational.
+      The runner records this in `EvalResult.severity`; the pytest
+      plugin uses it to decide between `assert` and `pytest.warns`.

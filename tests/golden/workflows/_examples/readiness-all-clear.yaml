@@ -1,0 +1,90 @@
+# Example scenario — all vehicles healthy, all chargers available.
+#
+# Proves the harness reports `all_clear` with correct coverage counts
+# when nothing is wrong. Mirrors the first scenario sketched in PRD §6.1
+# ("All vehicles healthy, all chargers healthy → expect all_clear").
+#
+# This file lives under _examples/ so it does NOT block the workflow-
+# golden gate. The real readiness scenarios land directly under
+# tests/golden/workflows/ in sprint 5.
+
+id: readiness-all-clear
+workflow: eval_demo_readiness
+description: >
+  Two vehicles, both plugged into available chargers at 95% SoC,
+  scheduled to depart in two hours. No exceptions expected.
+severity: blocking
+
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+graph_snapshot:
+  depot:
+    depot_id: "11111111-1111-4111-8111-111111111111"
+    name: "Vilnius depot"
+    latitude: 54.6872
+    longitude: 25.2797
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000001"
+      external_id: "BUS-101"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000002"
+      external_id: "BUS-102"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "cccccc01-0000-4000-8000-000000000001"
+      ocpp_id: "CP-001"
+      rated_kw: 80.0
+      status: "Available"
+    - charger_id: "cccccc01-0000-4000-8000-000000000002"
+      ocpp_id: "CP-002"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000001"
+      route_id: "R-101"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000002"
+      route_id: "R-102"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+
+  telemetry:
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000001"
+      time: "-5m"
+      soc: 0.95
+      is_plugged: true
+      charging_kw: 60.0
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000002"
+      time: "-5m"
+      soc: 0.96
+      is_plugged: true
+      charging_kw: 60.0
+
+  prices: []
+  building_load: []
+  drivers: []
+
+expected:
+  status: all_clear
+  coverage:
+    vehicles_checked: 2
+    chargers_checked: 2
+    routes_checked: 2
+  exception_count_max: 0
+  must_not_include:
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000001"
+    - vehicle_id: "aaaaaaa1-0000-4000-8000-000000000002"

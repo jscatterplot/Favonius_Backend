@@ -1,0 +1,98 @@
+# Example scenario — one vehicle plugged into a faulted charger.
+#
+# Proves the harness propagates exceptions through Decision.output and
+# that must_include_exceptions matches on both vehicle_id and issue
+# substring. Mirrors the second scenario sketched in PRD §6.1 ("One
+# vehicle plugged into a faulted charger → expect exception with charger
+# swap proposal").
+
+id: readiness-charger-fault
+workflow: eval_demo_readiness
+description: >
+  Two vehicles plugged in for the morning pull-out. CP-001 is faulted,
+  so BUS-101 should surface a swap_charger proposal. BUS-102 is on a
+  healthy charger and should not appear in the exception list.
+severity: blocking
+
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+graph_snapshot:
+  depot:
+    depot_id: "22222222-2222-4222-8222-222222222222"
+    name: "Kaunas depot"
+    latitude: 54.8985
+    longitude: 23.9036
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+      external_id: "BUS-101"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+      external_id: "BUS-102"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "dddddd01-0000-4000-8000-000000000001"
+      ocpp_id: "CP-001"
+      rated_kw: 80.0
+      status: "Faulted"
+    - charger_id: "dddddd01-0000-4000-8000-000000000002"
+      ocpp_id: "CP-002"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+      route_id: "R-101"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+      route_id: "R-102"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+
+  # BUS-101 plugged into the faulted CP-001; BUS-102 plugged into CP-002.
+  telemetry:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+      charger_id: "dddddd01-0000-4000-8000-000000000001"
+      time: "-5m"
+      soc: 0.92
+      is_plugged: true
+      charging_kw: 0.0
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+      charger_id: "dddddd01-0000-4000-8000-000000000002"
+      time: "-5m"
+      soc: 0.96
+      is_plugged: true
+      charging_kw: 60.0
+
+  prices: []
+  building_load: []
+  drivers: []
+
+expected:
+  status: exceptions_present
+  coverage:
+    vehicles_checked: 2
+    chargers_checked: 2
+    routes_checked: 2
+  exception_count_min: 1
+  exception_count_max: 1
+  must_include_exceptions:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+      issue_contains: "faulted charger"
+  must_not_include:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+  action_type_allow_list:
+    - swap_charger
+    - reassign_to_route

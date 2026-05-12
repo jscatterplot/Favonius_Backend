@@ -183,6 +183,7 @@ markers = [
     "edge_case: Edge case tests",
     "security: Security tests",
     "snapshot: Snapshot tests against the live LLM (gated; nightly only)",
+    "workflow_golden: Parametrised workflow eval scenarios (real DB required)",
 ]
 
 # Coverage configuration

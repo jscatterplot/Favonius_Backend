@@ -99,7 +99,11 @@ For every specific issue (bug, smell, design concern, risk):
 Favonius_Backend/
 ├── src/                         # Primary application code (new architecture)
 │   ├── api/
-│   │   └── main.py              # FastAPI app, all REST endpoints, OCPP WebSocket mount
+│   │   ├── main.py              # FastAPI app, all REST endpoints, OCPP WebSocket mount
+│   │   ├── agent/               # Depot chat agent (Agent Search) — see "Depot Chat Agent" section
+│   │   └── agent_workflows/     # Depot agent runtime + eval harness
+│   │       ├── runtime.py       # WorkflowContext, Decision, WorkflowAgent.run_turn, registry
+│   │       └── eval/runner.py   # Scenario loader, savepoint executor, expected-block assertion
 │   ├── core/
 │   │   ├── controller.py        # DepotController — main control loop
 │   │   ├── controller_config.py # ControllerConfig dataclass
@@ -241,6 +245,10 @@ src/api/main.py (FastAPI, middleware: rate-limiting, logging, CORS)
 ### Depot Chat Agent (Agent Search)
 
 `src/api/agent/` is a self-contained module that adds a plain-English query interface for depot operators. The module is mounted into the FastAPI app behind the `AGENT_SEARCH_ENABLED` feature flag (now default `true` since B6 golden-test gate passed). A user message goes through three server-side stages: (1) **LLM extraction** (`llm.py`) converts the message into a strict `QueryPlan` via Anthropic's tool-use API — the model never sees UUIDs or raw SQL; (2) **entity resolution** (`resolve.py`) maps the plan's subject names to real database UUIDs, scoped to the caller's `visible_depot_ids` from their JWT — this is the auth boundary; and (3) **deterministic compilation** (`intents/consumption_by_user.py`) turns the resolved plan into a parameterised SQL query that executes against TimescaleDB. Every turn is audited in `agent_runs` (full step trace) and `audit_log` (action `agent.query`). Prometheus metrics (`favonius_agent_turns_total`, `favonius_agent_turn_duration_seconds`, `favonius_agent_llm_tokens_total`, `favonius_agent_resolver_misses_total`) are incremented from `router.py`, `llm.py`, and `controller.py`. The golden test suite in `tests/golden/agent_consumption.yaml` (50 Q&A pairs) gates every deploy; AT-18 (`tests/e2e/test_agent_search.py`) is the end-to-end acceptance test. The endpoint reference lives in `docs/API.md`; the original design plan has been retired now that the implementation has shipped — the code in `src/api/agent/` is the source of truth, and this feature is positioned as a precursor to the broader Depot Agent product (`docs/PRD_Depot_Agent.md`).
+
+### Depot Agent — Workflow Runtime & Eval Harness
+
+`src/api/agent_workflows/` is the substrate the depot agent (PRD §4) builds on. The runtime (`runtime.py`) defines a tiny contract — `WorkflowContext` (depot scope + auth + `now`), `Decision` (audit-grade output), and `WorkflowAgent.run_turn(name, ctx)` dispatching through a process-wide `workflow_registry()`. Workflows self-register via `register_workflow(name, handler, description=...)` at import time. Per PRD principle 6 ("the evaluation harness ships before the workflow"), the eval harness shipped in sprint 3 before any real workflow code. The harness lives in `src/api/agent_workflows/eval/runner.py`; scenarios live as YAML under `tests/golden/workflows/` against the JSON-schema-style reference in `_schema.yaml`. The runner loads each scenario's `graph_snapshot` into a transaction on the real test database (asyncpg pool), runs the workflow against a thin `_TxPool` adapter so the workflow sees only the snapshot rows, then **always** rolls back — no mocked schemas (we want to catch schema drift). Determinism: every snapshot is anchored to a `scenario_now` ISO timestamp; workflows must read `ctx.now` instead of `datetime.now()`. The pytest plugin in `tests/golden/workflows/conftest.py` registers the `workflow_golden` marker; `test_workflow_golden.py` parametrises across every `*.yaml` directly under that dir (excluding `_schema.yaml`). Three placeholder scenarios under `_examples/` (`readiness-all-clear`, `readiness-charger-fault`, `readiness-constraint-violation`) prove the harness end-to-end against the `eval_demo_readiness` workflow registered in `tests/unit/agent_workflows/__init__.py`. CI gate: `.github/workflows/workflow-golden.yml` spins up TimescaleDB, applies migrations, runs the harness, and enforces a 90% runner coverage floor (currently 100%). Sprint 5 lands the first 10 readiness scenarios under the gated path.
 
 ### Optimization Control Loop
 
