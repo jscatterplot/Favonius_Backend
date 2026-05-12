@@ -81,7 +81,9 @@ class TimescaleSchema:
             ADD COLUMN IF NOT EXISTS import_row_hash CHAR(64),
             ADD COLUMN IF NOT EXISTS import_user_full_name TEXT,
             ADD COLUMN IF NOT EXISTS import_station_owner TEXT,
-            ADD COLUMN IF NOT EXISTS import_status TEXT
+            ADD COLUMN IF NOT EXISTS import_status TEXT,
+            ADD COLUMN IF NOT EXISTS meter_start_wh BIGINT,
+            ADD COLUMN IF NOT EXISTS meter_stop_wh BIGINT
             """
         )
         await conn.execute(
@@ -121,6 +123,8 @@ class TimescaleSchema:
                 id_token VARCHAR(255),
                 start_time TIMESTAMPTZ NOT NULL,
                 end_time TIMESTAMPTZ,
+                meter_start_wh BIGINT,
+                meter_stop_wh BIGINT,
                 start_soc_percent DECIMAL(5,2),
                 end_soc_percent DECIMAL(5,2),
                 energy_delivered_kwh DECIMAL(10,3),
