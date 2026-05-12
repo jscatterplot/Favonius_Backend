@@ -996,6 +996,7 @@ class OCPP16Session:
             "connector_id": connector_id,
             "evse_id": connector_id,
             "id_tag": id_tag,
+            "meter_start": meter_start,
             "start_time": start_time,
         }
         self._pending_start.update(
