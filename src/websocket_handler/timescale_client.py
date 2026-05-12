@@ -2412,7 +2412,6 @@ class TimescaleClient:
         station_id: str,
         transaction_id: int,
         end_time: datetime,
-        energy_delivered_kwh: Optional[float] = None,
         meter_stop_wh: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a ``charging_sessions`` row closed and return persisted meter values."""
@@ -2421,17 +2420,14 @@ class TimescaleClient:
                 """
                 UPDATE charging_sessions
                    SET end_time = $3,
-                       meter_stop_wh = COALESCE($5, meter_stop_wh),
-                       energy_delivered_kwh = COALESCE(
-                           $4,
-                           CASE
-                               WHEN meter_start_wh IS NOT NULL
-                                AND $5 IS NOT NULL
-                                AND $5 >= meter_start_wh
-                               THEN ($5 - meter_start_wh)::numeric / 1000.0
-                               ELSE energy_delivered_kwh
-                           END
-                       ),
+                       meter_stop_wh = COALESCE($4, meter_stop_wh),
+                       energy_delivered_kwh = CASE
+                           WHEN meter_start_wh IS NOT NULL
+                            AND $4 IS NOT NULL
+                            AND $4 >= meter_start_wh
+                           THEN ($4 - meter_start_wh)::numeric / 1000.0
+                           ELSE energy_delivered_kwh
+                       END,
                        updated_at = NOW()
                  WHERE station_id = $1
                    AND transaction_id = $2
@@ -2442,7 +2438,6 @@ class TimescaleClient:
                 station_id,
                 transaction_id,
                 end_time,
-                energy_delivered_kwh,
                 meter_stop_wh,
             )
         return dict(row) if row is not None else None
