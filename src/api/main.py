@@ -2685,7 +2685,7 @@ async def _resolve_session_cost(
         )
         return fallback
 
-    if avg_price is None:
+    if avg_price is None or not avg_price.is_finite():
         return fallback
 
     derived = (Decimal(str(energy_kwh)) * avg_price).quantize(Decimal("0.000001"))
@@ -4161,7 +4161,7 @@ async def import_historical_charging_session(
                         ELSE charging_sessions.energy_delivered_kwh
                     END,
                     cost_total            = CASE
-                        WHEN EXCLUDED.cost_total IS NOT NULL AND EXCLUDED.cost_total > 0 THEN EXCLUDED.cost_total
+                        WHEN EXCLUDED.cost_total IS NOT NULL THEN EXCLUDED.cost_total
                         ELSE charging_sessions.cost_total
                     END
                 RETURNING session_id::text AS session_id, (xmax = 0) AS was_new

@@ -32,7 +32,7 @@ class PriceSource(Protocol):
         start: datetime,
         end: datetime,
     ) -> Optional[Decimal]:
-        """Return the simple mean of hourly prices, or ``None`` if any hour lacks data."""
+        """Return the time-weighted mean price, or ``None`` if any overlapped hour lacks data."""
         ...
 
 
@@ -112,15 +112,26 @@ class TimescalePriceSource:
         )
         buckets = list(range(start_bucket, last_bucket + 3600, 3600))
 
-        prices: list[Decimal] = []
+        total_weighted_price = Decimal(0)
+        total_seconds = Decimal(0)
         for bucket in buckets:
             price = await self._lookup_bucket(depot_id, bucket)
             if price is None:
                 return None
-            prices.append(price)
+            bucket_start = datetime.fromtimestamp(bucket, tz=timezone.utc)
+            bucket_end = datetime.fromtimestamp(bucket + 3600, tz=timezone.utc)
+            overlap_start = max(start.astimezone(timezone.utc), bucket_start)
+            overlap_end = min(end_utc, bucket_end)
+            overlap_seconds = (overlap_end - overlap_start).total_seconds()
+            if overlap_seconds <= 0:
+                continue
+            weight = Decimal(str(overlap_seconds))
+            total_weighted_price += price * weight
+            total_seconds += weight
 
-        total = sum(prices, start=Decimal(0))
-        return total / Decimal(len(prices))
+        if total_seconds <= 0:
+            return None
+        return total_weighted_price / total_seconds
 
     async def _lookup_bucket(self, depot_id: str, bucket: int) -> Optional[Decimal]:
         cache_key = (depot_id, bucket)

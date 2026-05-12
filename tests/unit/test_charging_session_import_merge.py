@@ -115,6 +115,19 @@ class TestResolveSessionCost:
         assert len(ps.calls) == 1
 
     @pytest.mark.asyncio
+    async def test_non_finite_price_falls_back_to_revenue(self):
+        ps = _RecordingPriceSource(Decimal("NaN"))
+        cost = await _resolve_session_cost(
+            price_source=ps,
+            depot_id=str(uuid4()),
+            start_time_utc=_utc(2026, 5, 5, 12, 0),
+            end_time_utc=_utc(2026, 5, 5, 13, 0),
+            energy_kwh=24.044,
+            fallback_revenue=4.56,
+        )
+        assert cost == Decimal("4.56")
+
+    @pytest.mark.asyncio
     async def test_price_source_raises_falls_back_to_revenue(self):
         """A price-source error must NEVER fail the import."""
 
@@ -461,7 +474,7 @@ class TestUpsertSqlContract:
         "column",
         ["energy_delivered_kwh", "cost_total"],
     )
-    def test_metering_columns_refresh_on_positive_value(self, upsert_sql, column: str):
+    def test_metering_columns_refresh_rules(self, upsert_sql, column: str):
         # Metering columns refresh when the new value is positive so corrections
         # propagate, but preserve the existing non-zero value otherwise.
         assert f"EXCLUDED.{column}" in upsert_sql
@@ -469,6 +482,27 @@ class TestUpsertSqlContract:
         # The CASE branch must use ">", not just COALESCE.
         assert "WHEN EXCLUDED.energy_delivered_kwh > 0" in upsert_sql
         assert "EXCLUDED.cost_total IS NOT NULL" in upsert_sql
+        assert "EXCLUDED.cost_total > 0" not in upsert_sql
+
+    @pytest.mark.asyncio
+    async def test_average_price_is_time_weighted_for_partial_edge_hours(self):
+        depot_id = str(uuid4())
+        pool = MagicMock()
+        conn = AsyncMock()
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        # 12:00 bucket = 1.00, 13:00 bucket = 0.10
+        conn.fetchrow = AsyncMock(
+            side_effect=[{"price": Decimal("1.00")}, {"price": Decimal("0.10")}]
+        )
+        ps = TimescalePriceSource(pool)
+        result = await ps.average_price_per_kwh(
+            depot_id=depot_id,
+            start=_utc(2026, 5, 5, 12, 59),
+            end=_utc(2026, 5, 5, 13, 1),
+        )
+        # 1 minute at 1.00 + 1 minute at 0.10 => 0.55 weighted average.
+        assert result == Decimal("0.55")
 
     def test_returns_session_id_and_was_new_flag(self, upsert_sql):
         assert "RETURNING" in upsert_sql
