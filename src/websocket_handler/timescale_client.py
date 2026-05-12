@@ -2448,7 +2448,7 @@ class TimescaleClient:
                             AND meter_start_wh IS NOT NULL
                             AND $4 >= meter_start_wh
                            THEN ($4 - meter_start_wh) / 1000.0
-                           ELSE energy_delivered_kwh
+                           ELSE NULL
                        END,
                        updated_at = NOW()
                  WHERE station_id = $1
