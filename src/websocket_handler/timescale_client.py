@@ -2342,12 +2342,15 @@ class TimescaleClient:
         vehicle_id: Optional[str] = None,
         driver_id: Optional[str] = None,
         card_id: Optional[str] = None,
+        meter_start_wh: Optional[int] = None,
     ) -> None:
         """Insert an open ``charging_sessions`` row at StartTransaction.
 
         ``end_time`` is left NULL so ``fetch_open_sessions`` can find it on
         boot. ``transaction_id`` is the OCPP 1.6 integer id from the
-        ``ocpp_transaction_id`` sequence.
+        ``ocpp_transaction_id`` sequence. ``meter_start_wh`` is persisted so
+        the StopTransaction handler can recompute ``energy_delivered_kwh``
+        even if the WS handler restarts between Start and Stop.
         """
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
@@ -2385,8 +2388,9 @@ class TimescaleClient:
                     """
                     INSERT INTO charging_sessions (
                         station_id, transaction_id, evse_id, connector_id,
-                        id_token, start_time, vehicle_id, driver_id, card_id
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
+                        id_token, start_time, vehicle_id, driver_id, card_id,
+                        meter_start_wh
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid, $10)
                     """,
                     station_id,
                     transaction_id,
@@ -2397,6 +2401,7 @@ class TimescaleClient:
                     vehicle_id,
                     driver_id,
                     card_id,
+                    meter_start_wh,
                 )
 
     async def close_open_session(
@@ -2404,26 +2409,52 @@ class TimescaleClient:
         station_id: str,
         transaction_id: int,
         end_time: datetime,
-        energy_delivered_kwh: Optional[float] = None,
-    ) -> None:
-        """Mark a ``charging_sessions`` row closed at StopTransaction."""
+        *,
+        meter_stop_wh: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Mark a ``charging_sessions`` row closed at StopTransaction.
+
+        Computes ``energy_delivered_kwh`` in SQL from the stored
+        ``meter_start_wh`` and the provided ``meter_stop_wh`` so the delta
+        survives a WS handler restart between StartTransaction and
+        StopTransaction. ``COALESCE`` preserves any pre-existing non-null
+        ``energy_delivered_kwh`` (e.g. an imported row) and only writes a
+        computed delta when both registers are present and non-negative.
+
+        Returns the row's meter registers and energy delta after the update
+        so the caller can detect meter rollover (start > stop) and log an
+        operator-facing warning. Returns ``None`` if no matching open row
+        was found.
+        """
         async with self.pg_pool.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 UPDATE charging_sessions
                    SET end_time = $3,
-                       energy_delivered_kwh = COALESCE($4, energy_delivered_kwh),
+                       meter_stop_wh = COALESCE($4, meter_stop_wh),
+                       energy_delivered_kwh = COALESCE(
+                           energy_delivered_kwh,
+                           CASE
+                               WHEN meter_start_wh IS NOT NULL
+                                    AND COALESCE($4, meter_stop_wh) IS NOT NULL
+                                    AND (COALESCE($4, meter_stop_wh) - meter_start_wh) >= 0
+                               THEN (COALESCE($4, meter_stop_wh) - meter_start_wh) / 1000.0
+                               ELSE NULL
+                           END
+                       ),
                        updated_at = NOW()
                  WHERE station_id = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
                    AND source = 'live'
+             RETURNING meter_start_wh, meter_stop_wh, energy_delivered_kwh
                 """,
                 station_id,
                 transaction_id,
                 end_time,
-                energy_delivered_kwh,
+                meter_stop_wh,
             )
+            return dict(row) if row is not None else None
 
     async def mark_sessions_seen(self, station_id: str) -> None:
         """Stamp ``last_seen_at = NOW()`` on every open session at the station.

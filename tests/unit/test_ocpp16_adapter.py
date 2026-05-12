@@ -1026,7 +1026,7 @@ class TestOCPP16SessionRecovery:
 
     @pytest.mark.asyncio
     async def test_on_transaction_stop_closes_session_row(self, session, mock_timescale) -> None:
-        mock_timescale.close_open_session = AsyncMock()
+        mock_timescale.close_open_session = AsyncMock(return_value=None)
 
         await session._on_transaction_stop(
             cp_id="test_station_001",
@@ -1045,6 +1045,137 @@ class TestOCPP16SessionRecovery:
         assert args[2].year == 2026
 
     @pytest.mark.asyncio
+    async def test_on_transaction_stop_passes_meter_stop_wh(
+        self, session, mock_timescale
+    ) -> None:
+        """Happy path: meter_stop is forwarded to close_open_session so the
+        SQL UPDATE can compute energy_delivered_kwh from the stored
+        meter_start_wh."""
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={
+                "meter_start_wh": 1_000,
+                "meter_stop_wh": 16_000,
+                "energy_delivered_kwh": 15.0,
+            }
+        )
+
+        await session._on_transaction_stop(
+            cp_id="test_station_001",
+            transaction_id=4242,
+            id_tag="TAG_X",
+            meter_stop=16_000,
+            timestamp="2026-04-26T13:00:00Z",
+            reason="Local",
+        )
+
+        mock_timescale.close_open_session.assert_awaited_once()
+        kwargs = mock_timescale.close_open_session.call_args.kwargs
+        assert kwargs["meter_stop_wh"] == 16_000
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_works_after_handler_restart(
+        self, session, mock_timescale
+    ) -> None:
+        """Cross-restart: _on_transaction_stop must close the row and forward
+        meter_stop_wh even when the matching StartTransaction was handled by
+        a previous process (no in-memory state about the session).
+
+        This is the scenario the in-memory _meter_start_by_tx_id stash could
+        not handle: handler restarts between Start and Stop. The DB now
+        carries meter_start_wh, so close_open_session computes the delta in
+        SQL and we just need to pass meter_stop through."""
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={
+                # meter_start_wh was persisted by the previous process
+                "meter_start_wh": 5_000,
+                "meter_stop_wh": 25_500,
+                "energy_delivered_kwh": 20.5,
+            }
+        )
+
+        # Simulate a fresh process: no stash, no pending_start.
+        assert not hasattr(session, "_meter_start_by_tx_id")
+        assert session._pending_start is None
+
+        await session._on_transaction_stop(
+            cp_id="test_station_001",
+            transaction_id=4242,
+            id_tag="TAG_X",
+            meter_stop=25_500,
+            timestamp="2026-04-26T13:00:00Z",
+            reason="Local",
+        )
+
+        mock_timescale.close_open_session.assert_awaited_once()
+        kwargs = mock_timescale.close_open_session.call_args.kwargs
+        assert kwargs["meter_stop_wh"] == 25_500
+        args = mock_timescale.close_open_session.call_args.args
+        # The row was still closed: cp_id, tx_id, end_time positional args.
+        assert args[0] == "test_station_001"
+        assert args[1] == 4242
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_logs_meter_rollover(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """When close_open_session reports meter_stop_wh < meter_start_wh
+        (replacement, firmware reset, or wrap), _on_transaction_stop must
+        log a WARNING so operators can investigate. energy_delivered_kwh
+        is left NULL by the SQL CASE on negative deltas."""
+        import logging
+
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={
+                "meter_start_wh": 50_000,
+                "meter_stop_wh": 10_000,
+                "energy_delivered_kwh": None,
+            }
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_stop(
+                cp_id="test_station_001",
+                transaction_id=4242,
+                id_tag="TAG_X",
+                meter_stop=10_000,
+                timestamp="2026-04-26T13:00:00Z",
+                reason="Local",
+            )
+
+        rollover_logs = [r for r in caplog.records if "rollover" in r.getMessage().lower()]
+        assert rollover_logs, "expected a meter-rollover WARNING"
+        msg = rollover_logs[0].getMessage()
+        assert "50000" in msg or "50_000" in msg or "meter_start_wh=50000" in msg
+        assert "10000" in msg or "meter_stop_wh=10000" in msg
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_still_closes_with_unparseable_meter_stop(
+        self, session, mock_timescale
+    ) -> None:
+        """Regression guard: a malformed meter_stop value (e.g. a non-numeric
+        type from a spec-violating vendor) must NOT prevent the row from
+        being closed. Before the refactor, the int(meter_stop) cast lived
+        inside the same try block as close_open_session, so a ValueError
+        skipped the close entirely and stranded the row with end_time IS
+        NULL — exactly the recovery scenario migration 013 is meant to
+        avoid."""
+        mock_timescale.close_open_session = AsyncMock(return_value=None)
+
+        await session._on_transaction_stop(
+            cp_id="test_station_001",
+            transaction_id=4242,
+            id_tag="TAG_X",
+            meter_stop="not-a-number",  # type: ignore[arg-type]
+            timestamp="2026-04-26T13:00:00Z",
+            reason="Local",
+        )
+
+        # Row was still closed; meter_stop_wh was simply not forwarded.
+        mock_timescale.close_open_session.assert_awaited_once()
+        kwargs = mock_timescale.close_open_session.call_args.kwargs
+        assert kwargs["meter_stop_wh"] is None
+
+    @pytest.mark.asyncio
     async def test_next_transaction_id_persists_when_pending_set(
         self, session, mock_timescale
     ) -> None:
@@ -1054,6 +1185,7 @@ class TestOCPP16SessionRecovery:
             "connector_id": 1,
             "evse_id": 1,
             "id_tag": "TAG_Y",
+            "meter_start": 1_000,
             "start_time": datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc),
             "vehicle_id": "660e8400-e29b-41d4-a716-446655440001",
             "driver_id": "770e8400-e29b-41d4-a716-446655440001",
@@ -1070,6 +1202,9 @@ class TestOCPP16SessionRecovery:
         assert kwargs["vehicle_id"] == "660e8400-e29b-41d4-a716-446655440001"
         assert kwargs["driver_id"] == "770e8400-e29b-41d4-a716-446655440001"
         assert kwargs["card_id"] == "880e8400-e29b-41d4-a716-446655440001"
+        # meter_start_wh must be forwarded so the StopTransaction handler
+        # can compute the energy delta even if this process restarts.
+        assert kwargs["meter_start_wh"] == 1_000
         # Stash must be cleared so a stray call cannot double-insert.
         assert session._pending_start is None
 
