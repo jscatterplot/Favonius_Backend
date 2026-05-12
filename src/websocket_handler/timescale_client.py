@@ -2414,10 +2414,10 @@ class TimescaleClient:
         end_time: datetime,
         energy_delivered_kwh: Optional[float] = None,
         meter_stop_wh: Optional[int] = None,
-    ) -> None:
-        """Mark a ``charging_sessions`` row closed at StopTransaction."""
+    ) -> Optional[Dict[str, Any]]:
+        """Mark a ``charging_sessions`` row closed and return persisted meter values."""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 UPDATE charging_sessions
                    SET end_time = $3,
@@ -2437,6 +2437,7 @@ class TimescaleClient:
                    AND transaction_id = $2
                    AND end_time IS NULL
                    AND source = 'live'
+                RETURNING meter_start_wh, meter_stop_wh
                 """,
                 station_id,
                 transaction_id,
@@ -2444,6 +2445,7 @@ class TimescaleClient:
                 energy_delivered_kwh,
                 meter_stop_wh,
             )
+        return dict(row) if row is not None else None
 
     async def mark_sessions_seen(self, station_id: str) -> None:
         """Stamp ``last_seen_at = NOW()`` on every open session at the station.
