@@ -36,7 +36,12 @@
 CREATE OR REPLACE VIEW public.routes AS
 SELECT
     s.route_id                              AS id,
-    MAX(s.energy_kwh)                       AS energy_estimate_kwh,
+    (array_agg(
+        s.energy_kwh
+        ORDER BY
+            s.departure_time DESC NULLS LAST,
+            s.created_at DESC NULLS LAST
+    ))[1]                                   AS energy_estimate_kwh,
     MIN(s.departure_time)                   AS start_time,
     MAX(s.return_time)                      AS end_time,
     NULL::text                              AS contract_id,
