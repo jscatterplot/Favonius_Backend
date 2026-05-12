@@ -272,5 +272,6 @@ Use it to triage individual chargers without spelunking through the DB.
 
 ## Additional Resources
 
-- [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md) - Product Requirements Document
-- [favonius_development_plan_v3.md](../favonius_development_plan_v3.md) - Development Plan
+- [PRD_Depot_Agent.md](PRD_Depot_Agent.md) — Product direction
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Service topology
+- [RAILWAY_ENV_VARIABLES.md](RAILWAY_ENV_VARIABLES.md) — Env-var reference

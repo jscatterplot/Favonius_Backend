@@ -393,9 +393,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 ## References
 
-- Development Plan Step 6.1: Simulation Harness
-- Development Plan Step 6.2: Integration Tests
-- PRD Section 11.1: MVP Acceptance Tests — [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md)
-- PRD Section 11.3: Integration Test Requirements
-- PRD Section 8.5: Performance Targets
+- [PRD_Depot_Agent.md](PRD_Depot_Agent.md) — Product direction
+- [TESTING.md](TESTING.md) — Test categories, markers, coverage targets
+- [CONTROL_LOOP.md](CONTROL_LOOP.md) — Substrate the simulator exercises
 
