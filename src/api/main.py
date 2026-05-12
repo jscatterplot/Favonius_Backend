@@ -4157,7 +4157,8 @@ async def import_historical_charging_session(
                     -- value: corrections to energy or cost are the common
                     -- reason customers re-upload an XLSX.
                     energy_delivered_kwh  = CASE
-                        WHEN EXCLUDED.energy_delivered_kwh IS NOT NULL THEN EXCLUDED.energy_delivered_kwh
+                        WHEN charging_sessions.energy_delivered_kwh IS NULL THEN EXCLUDED.energy_delivered_kwh
+                        WHEN EXCLUDED.energy_delivered_kwh > 0 THEN EXCLUDED.energy_delivered_kwh
                         ELSE charging_sessions.energy_delivered_kwh
                     END,
                     cost_total            = CASE

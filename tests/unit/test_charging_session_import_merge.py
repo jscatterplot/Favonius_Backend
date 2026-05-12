@@ -482,7 +482,7 @@ class TestUpsertSqlContract:
         # The CASE branch must use ">", not just COALESCE.
         assert "WHEN EXCLUDED.energy_delivered_kwh > 0" in upsert_sql
         assert "EXCLUDED.cost_total IS NOT NULL" in upsert_sql
-        assert "EXCLUDED.cost_total > 0" not in upsert_sql
+        assert "EXCLUDED.cost_total > 0" in upsert_sql
 
     @pytest.mark.asyncio
     async def test_average_price_is_time_weighted_for_partial_edge_hours(self):
