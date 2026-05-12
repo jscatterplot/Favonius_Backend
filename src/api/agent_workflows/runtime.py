@@ -103,19 +103,20 @@ class _ClientFacade(Protocol):
 
 
 def _canonical_tool_calls_hash(tool_calls: Sequence[ToolCall]) -> str:
-    """Return a stable sha256 over the tool-call inputs and outputs.
+    """Return a stable sha256 over each tool call's name and input only.
 
-    Excludes ``duration_ms`` because wall-clock varies across runs. The
-    canonical form is a JSON dump with sorted keys and ``default=str``
-    so UUIDs and datetimes serialise deterministically. Mirrors the
-    inputs-hash contract in PRD §5.3 / §10.4.
+    Excludes ``duration_ms``, ``output``, and ``is_error`` so the digest
+    matches :attr:`~src.api.agent_workflows.schemas.Decision.inputs_hash`
+    semantics and stays reproducible for identical LLM tool requests even
+    when live tool results differ between runs.
+
+    The canonical form is a JSON dump with sorted keys and ``default=str``
+    so UUIDs and datetimes serialise deterministically.
     """
     serialisable = [
         {
             "name": tc.name,
             "input": tc.input,
-            "output": tc.output,
-            "is_error": tc.is_error,
         }
         for tc in tool_calls
     ]
