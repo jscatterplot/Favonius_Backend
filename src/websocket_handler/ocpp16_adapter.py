@@ -124,9 +124,6 @@ class OCPP16Session:
         # row alongside the generated tx_id. Safe because FleetChargePoint
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
-        # In-memory meter_start stash keyed by transaction_id so we can
-        # persist a billing-grade session delta on StopTransaction.
-        self._meter_start_by_tx_id: Dict[int, int] = {}
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
         self._boot_trigger_task: Optional[asyncio.Task[None]] = None
@@ -468,9 +465,10 @@ class OCPP16Session:
         self._pending_start = None
         tx_id = await self._timescale.next_transaction_id()
         if pending is not None:
-            meter_start = pending.get("meter_start")
-            if isinstance(meter_start, (int, float)):
-                self._meter_start_by_tx_id[tx_id] = int(meter_start)
+            meter_start_raw = pending.get("meter_start")
+            meter_start_wh: Optional[int] = None
+            if isinstance(meter_start_raw, (int, float)):
+                meter_start_wh = int(meter_start_raw)
             try:
                 await self._timescale.insert_open_session(
                     station_id=self._station_id,
@@ -482,9 +480,7 @@ class OCPP16Session:
                     vehicle_id=pending.get("vehicle_id"),
                     driver_id=pending.get("driver_id"),
                     card_id=pending.get("card_id"),
-                    meter_start_wh=(
-                        int(meter_start) if isinstance(meter_start, (int, float)) else None
-                    ),
+                    meter_start_wh=meter_start_wh,
                 )
             except Exception as exc:
                 logger.warning(
@@ -640,12 +636,8 @@ class OCPP16Session:
             tx_id = row["transaction_id"]
             if connector_id is None or tx_id is None:
                 continue
-            tx_id_int = int(tx_id)
-            self._cp.transactions[connector_id] = tx_id_int
-            self._cp.current_transaction_id = tx_id_int
-            meter_start_wh = row.get("meter_start_wh")
-            if isinstance(meter_start_wh, (int, float)):
-                self._meter_start_by_tx_id[tx_id_int] = int(meter_start_wh)
+            self._cp.transactions[connector_id] = int(tx_id)
+            self._cp.current_transaction_id = int(tx_id)
         if open_rows:
             logger.info(
                 "Reloaded %d open session(s) for station=%s on boot",
@@ -1065,20 +1057,21 @@ class OCPP16Session:
             end_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             end_time = datetime.now(timezone.utc)
-        tx_id = int(transaction_id)
+
+        # Cast inputs outside the try so a malformed value can't strand the
+        # row in an "open" state — the close UPDATE must still run.
+        tx_id_int = int(transaction_id)
+        meter_stop_wh: Optional[int] = None
+        if isinstance(meter_stop, (int, float)):
+            meter_stop_wh = int(meter_stop)
+
+        close_result: Optional[Dict[str, Any]] = None
         try:
-            meter_start = self._meter_start_by_tx_id.get(tx_id)
-            energy_delivered_kwh: Optional[float] = None
-            if meter_start is not None and meter_stop is not None:
-                delta_wh = int(meter_stop) - int(meter_start)
-                if delta_wh >= 0:
-                    energy_delivered_kwh = delta_wh / 1000.0
-            await self._timescale.close_open_session(
+            close_result = await self._timescale.close_open_session(
                 cp_id,
-                tx_id,
+                tx_id_int,
                 end_time,
-                energy_delivered_kwh=energy_delivered_kwh,
-                meter_stop_wh=int(meter_stop) if meter_stop is not None else None,
+                meter_stop_wh=meter_stop_wh,
             )
         except Exception as exc:
             logger.warning(
@@ -1087,8 +1080,30 @@ class OCPP16Session:
                 transaction_id,
                 exc,
             )
-        finally:
-            self._meter_start_by_tx_id.pop(tx_id, None)
+
+        # Meter rollover detection: if the row carried a stored meter_start_wh
+        # and the new meter_stop_wh is lower (replacement, firmware reset, or
+        # wrap), energy_delivered_kwh will be NULL because the CASE in
+        # close_open_session bails on a negative delta. Surface that to ops
+        # so the anomaly is investigable from logs.
+        if isinstance(close_result, dict):
+            stored_start = close_result.get("meter_start_wh")
+            stored_stop = close_result.get("meter_stop_wh")
+            if (
+                isinstance(stored_start, (int, float))
+                and isinstance(stored_stop, (int, float))
+                and int(stored_stop) < int(stored_start)
+            ):
+                logger.warning(
+                    "Meter rollover detected for station=%s tx_id=%s: "
+                    "meter_start_wh=%s meter_stop_wh=%s delta_wh=%s; "
+                    "energy_delivered_kwh left NULL",
+                    cp_id,
+                    transaction_id,
+                    stored_start,
+                    stored_stop,
+                    int(stored_stop) - int(stored_start),
+                )
 
         # Persist optional StopTransaction.transactionData samples using the
         # same telemetry pipeline so vendors that only emit end-of-session
