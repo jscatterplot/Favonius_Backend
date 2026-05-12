@@ -1,0 +1,97 @@
+# Depot-agent readiness scenario 02 — single undercharge exception.
+#
+# Used by:
+#   tests/integration/agent_workflows/test_today_endpoint.py
+#   tests/e2e/test_depot_agent_today_view.py
+#
+# Shape mirrors PRD §6.1 inputs: a flat fixture per tool. The integration
+# test loads it through tests/golden/depot_agent/loader.py and injects a
+# StaticToolBundle so the workflow runs without any DB IO.
+
+id: "02_undercharge"
+description: |
+  Two buses, one charger each. BUS-A is plugged into CH-1 charging at
+  22 kW with 80 minutes until departure and battery_kwh=200 — projects
+  to ~95% SoC, short of the 99% required. BUS-B is healthy. Expected
+  output: exactly one exception flagging BUS-A, with a proposed
+  swap_charger to CH-FAST.
+
+depot_id: "33333333-3333-4333-8333-333333333333"
+organization_id: "44444444-4444-4444-8444-444444444444"
+timezone: "Europe/Vilnius"
+
+# Window — local time, naive datetime literals.
+window_start_local: "2026-05-13T05:00:00"
+window_end_local:   "2026-05-13T09:00:00"
+
+# Hours from now at which each departure happens (the loader converts
+# to absolute UTC at fixture load time so the projection is stable).
+departures:
+  - vehicle_id: "11111111-1111-4111-8111-111111111111"
+    route_id:   "R-101"
+    minutes_from_now: 80
+    required_soc: 0.99
+    charger_id: "55555555-5555-4555-8555-555555555555"
+  - vehicle_id: "22222222-2222-4222-8222-222222222222"
+    route_id:   "R-102"
+    minutes_from_now: 120
+    required_soc: 0.85
+    charger_id: "66666666-6666-4666-8666-666666666666"
+
+vehicle_states:
+  "11111111-1111-4111-8111-111111111111":
+    soc: 0.80
+    plugged_in: true
+    charger_id: "55555555-5555-4555-8555-555555555555"
+    battery_kwh: 200.0
+    max_charge_kw: 60.0
+  "22222222-2222-4222-8222-222222222222":
+    soc: 0.95
+    plugged_in: true
+    charger_id: "66666666-6666-4666-8666-666666666666"
+    battery_kwh: 200.0
+    max_charge_kw: 60.0
+
+charger_states:
+  "55555555-5555-4555-8555-555555555555":
+    status: "Charging"
+    fault_code: null
+    current_power_kw: 22.0
+    rated_kw: 22.0
+  "66666666-6666-4666-8666-666666666666":
+    status: "Charging"
+    fault_code: null
+    current_power_kw: 22.0
+    rated_kw: 22.0
+
+charging_plans:
+  "11111111-1111-4111-8111-111111111111":
+    planned_power_kw: 22.0
+  "22222222-2222-4222-8222-222222222222":
+    planned_power_kw: 22.0
+
+driver_assignments:
+  "R-101":
+    driver_id: "drv-101"
+    valid: true
+  "R-102":
+    driver_id: "drv-102"
+    valid: true
+
+alternate_chargers:
+  - charger_id: "77777777-7777-4777-8777-777777777777"
+    rated_kw: 150.0
+    station_id: "CH-FAST"
+
+# What the workflow MUST produce. The integration test asserts coverage
+# and exceptions against this block.
+expected:
+  status: "exceptions_present"
+  coverage:
+    vehicles_checked: 2
+    chargers_checked: 2
+    routes_checked: 2
+  exception_count: 1
+  exception_vehicle_id: "11111111-1111-4111-8111-111111111111"
+  exception_action_type: "swap_charger"
+  exception_candidate_charger_id: "77777777-7777-4777-8777-777777777777"

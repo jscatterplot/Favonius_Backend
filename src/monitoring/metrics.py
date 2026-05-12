@@ -110,6 +110,45 @@ AGENT_RESOLVER_MISSES = Counter(
     ["kind"],  # kind: not_found | ambiguous
 )
 
+# Depot-agent workflow metrics (PRD §6.1, §11.2 — sprint 6 today view).
+# Counters are per (endpoint, status) so dashboards can distinguish a
+# 4xx/5xx spike on one route from a slow happy path.
+AGENT_WORKFLOW_REQUESTS = Counter(
+    "favonius_agent_workflow_requests_total",
+    "REST hits against /agent-workflows/* by endpoint and HTTP status code",
+    ["endpoint", "status_code"],  # endpoint: today | today_stream | get_decision | list_decisions
+)
+
+AGENT_WORKFLOW_RUNS = Counter(
+    "favonius_agent_workflow_runs_total",
+    "Workflow executions by workflow_name, trigger, and final status",
+    ["workflow_name", "triggered_by", "status"],
+)
+
+AGENT_WORKFLOW_RUN_DURATION = Histogram(
+    "favonius_agent_workflow_run_duration_seconds",
+    "Workflow run end-to-end duration (tool calls + reasoning)",
+    ["workflow_name"],
+    buckets=[0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20],
+)
+
+# Scheduler-specific latency: time from the planned trigger time
+# (lead_time_min before earliest departure) to the moment the workflow
+# completed. A consistently large value here means the scheduler is
+# starting jobs late — typically because the event loop is saturated.
+AGENT_WORKFLOW_SCHEDULER_LATENCY = Histogram(
+    "favonius_agent_workflow_scheduler_to_completion_seconds",
+    "Scheduler-trigger-to-completion latency for scheduled readiness runs",
+    ["workflow_name"],
+    buckets=[1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600],
+)
+
+AGENT_WORKFLOW_EXCEPTIONS_OUT = Counter(
+    "favonius_agent_workflow_exceptions_emitted_total",
+    "Exceptions emitted by readiness runs, broken down by exception type",
+    ["workflow_name", "exception_type"],
+)
+
 # Control loop metrics
 # Per PRD Section 10.2: System availability ≥ 99.5%
 CONTROL_LOOP_UPTIME = Gauge(

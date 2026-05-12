@@ -122,6 +122,7 @@ db_pools: Optional[DatabasePools] = None
 controller_manager: Optional[ControllerManager] = None
 ocpp_server: Optional[object] = None  # OCPPServer type
 liveness_hub: Optional[Any] = None  # api.liveness_hub.LivenessHub
+workflow_scheduler: Optional[Any] = None  # core.workflow_scheduler.WorkflowScheduler
 
 # Depot config cache (to reduce database queries)
 _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (config, timestamp)
@@ -418,6 +419,28 @@ async def lifespan(app: FastAPI):
     _create_background_task(run_monthly_scheduler(ts_pool))
     logger.info("Monthly report-draft scheduler started")
 
+    # ── Depot-agent workflow scheduler ───────────────────────────────────────
+    # Gated on the DEPOT_AGENT_ENABLED feature flag so production stays off
+    # until the scenario suite + shadow run pass. Per-depot daily readiness
+    # check triggered lead_time_min before earliest scheduled departure.
+    global workflow_scheduler
+    try:
+        from .agent_workflows.feature_flag import is_depot_agent_enabled  # noqa: PLC0415
+
+        if is_depot_agent_enabled():
+            from ..core.workflow_scheduler import WorkflowScheduler  # noqa: PLC0415
+
+            workflow_scheduler = WorkflowScheduler(pools=db_pools)
+            await workflow_scheduler.start()
+            logger.info("Depot-agent WorkflowScheduler started")
+        else:
+            logger.info(
+                "Depot-agent WorkflowScheduler not started (DEPOT_AGENT_ENABLED=false)"
+            )
+    except Exception:
+        logger.exception("Failed to start WorkflowScheduler")
+        workflow_scheduler = None
+
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
@@ -429,6 +452,13 @@ async def lifespan(app: FastAPI):
             logger.info("Liveness hub stopped")
         except Exception as e:
             logger.error(f"Error stopping liveness hub: {e}", exc_info=True)
+
+    if workflow_scheduler:
+        try:
+            await workflow_scheduler.stop()
+            logger.info("WorkflowScheduler stopped")
+        except Exception as e:
+            logger.error(f"Error stopping WorkflowScheduler: {e}", exc_info=True)
 
     if controller_manager:
         try:
@@ -911,6 +941,22 @@ if is_agent_search_enabled():
 
     app.include_router(agent_router)
     logger.info("Depot chat agent enabled at /agent/*")
+
+
+# ── Depot-agent workflows (feature-flagged) ───────────────────────────────
+# Mounted behind ``DEPOT_AGENT_ENABLED`` (default off). When off, the four
+# /agent-workflows/* paths return 404 — matches the sprint-6 acceptance
+# criterion. Production stays off until the scenarios + a one-week shadow
+# run against pilot data pass.
+from .agent_workflows.feature_flag import is_depot_agent_enabled  # noqa: PLC0415, E402
+
+if is_depot_agent_enabled():
+    from .agent_workflows.router import router as agent_workflows_router  # noqa: PLC0415
+
+    app.include_router(agent_workflows_router)
+    logger.info("Depot-agent workflows enabled at /agent-workflows/*")
+else:
+    logger.info("Depot-agent workflows disabled (DEPOT_AGENT_ENABLED=false)")
 
 
 class OptimizationRequest(BaseModel):

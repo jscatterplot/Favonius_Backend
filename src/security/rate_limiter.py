@@ -52,6 +52,11 @@ class RateLimitConfig:
     # /agent/* LLM endpoints (same cadence as optimize; separate bucket)
     agent_requests_per_minute: int = 10
 
+    # /agent-workflows/* POST endpoints (same cadence as optimize; separate
+    # bucket so a busy depot manager triggering today-view refreshes does
+    # not compete with chat-agent traffic).
+    agent_workflow_requests_per_minute: int = 10
+
     # Inter-depot handoff: 50 messages/hour per depot pair
     handoff_messages_per_hour: int = 50
 
@@ -117,6 +122,7 @@ class RateLimiter:
         self._admin_write_buckets: dict[str, list[float]] = defaultdict(list)
         self._optimize_buckets: dict[str, list[float]] = defaultdict(list)
         self._agent_buckets: dict[str, list[float]] = defaultdict(list)
+        self._agent_workflow_buckets: dict[str, list[float]] = defaultdict(list)
         self._handoff_buckets: dict[tuple, list[float]] = defaultdict(list)
         self._last_trigger_optimization: dict[UUID, float] = {}
 
@@ -156,6 +162,7 @@ class RateLimiter:
         self._admin_write_buckets.clear()
         self._optimize_buckets.clear()
         self._agent_buckets.clear()
+        self._agent_workflow_buckets.clear()
         self._handoff_buckets.clear()
         self._last_trigger_optimization.clear()
 
@@ -251,6 +258,24 @@ class RateLimiter:
 
         if len(bucket) >= limit:
             logger.warning("Agent rate limit exceeded for client %s", client_id)
+            return self._make_result(False, bucket, limit, 60)
+
+        bucket.append(time.time())
+        return self._make_result(True, bucket, limit, 60)
+
+    def check_agent_workflow_limit(self, client_id: str) -> RateLimitResult:
+        """Check if client is within /agent-workflows/* rate limit.
+
+        Same window/limit as :meth:`check_optimize_limit` (10 req/min);
+        separate bucket so agent-workflows traffic does not deplete
+        either the LLM agent bucket or the optimize bucket.
+        """
+        limit = self.config.agent_workflow_requests_per_minute
+        bucket = self._clean_bucket(self._agent_workflow_buckets[client_id], 60)
+        self._agent_workflow_buckets[client_id] = bucket
+
+        if len(bucket) >= limit:
+            logger.warning("Agent-workflow rate limit exceeded for client %s", client_id)
             return self._make_result(False, bucket, limit, 60)
 
         bucket.append(time.time())

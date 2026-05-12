@@ -535,6 +535,168 @@ the collapsible reasoning panel in the UI.
 
 ---
 
+## Depot-agent Workflows (sprint 6, today view)
+
+Mounted under `/agent-workflows` behind the `DEPOT_AGENT_ENABLED` feature flag.
+When the flag is off every endpoint below returns `404`. Production stays off
+until the eval scenarios + a one-week shadow run pass; flipped to `true` in
+staging only after this PR merges.
+
+Phase 1 ships exactly one workflow: `daily_readiness_check` (PRD §6.1). All
+four endpoints require a valid Supabase JWT (`Authorization: Bearer <token>`).
+`POST` endpoints share a dedicated 10 req/min/user rate-limit bucket;
+exceeding it returns `429` with `X-RateLimit-*` headers. `GET` endpoints
+rely on the global 100 req/min API limit.
+
+### POST /agent-workflows/today/{depot_id}
+
+Trigger a fresh readiness run for a depot and return the §6.1 "today view"
+payload synchronously.
+
+**Idempotency:** repeat calls inside a 60-second window return the cached
+Decision row (`cached: true`) instead of re-running the workflow.
+
+**Access control:** `verify_depot_access` runs first — cross-organization
+callers get `403`. `favonius_admin` bypasses the tenant check.
+
+**Response (200):**
+```json
+{
+    "decision_id": "uuid",
+    "depot_id": "uuid",
+    "window": "2026-05-13T05:00 → 09:00",
+    "coverage": {"vehicles_checked": 18, "chargers_checked": 22, "routes_checked": 16},
+    "status": "exceptions_present",
+    "exceptions": [
+        {
+            "vehicle_id": "uuid",
+            "issue": "Projected SoC 71% < required 85% at 06:30 departure",
+            "evidence": {"…": "…"},
+            "proposed_action": {
+                "type": "swap_charger",
+                "candidate_charger_id": "uuid",
+                "justification": "…"
+            },
+            "permission_required": "draft_and_wait"
+        }
+    ],
+    "triggered_by": "manual",
+    "cached": false,
+    "created_at": "2026-05-13T04:00:00Z"
+}
+```
+
+**Error codes:**
+- 401 — invalid JWT
+- 403 — depot belongs to another organization
+- 404 — depot not found, or `DEPOT_AGENT_ENABLED=false`
+- 429 — workflow rate limit exceeded
+
+---
+
+### POST /agent-workflows/today/{depot_id}/stream
+
+SSE variant. Emits one `step` event per tool call as the workflow runs,
+then a final `result` event carrying the same payload `POST /today/{depot_id}`
+returns. On errors emits a single `error` event with a generic detail and
+closes the stream.
+
+**Wire format:**
+```
+event: step
+data: {"name": "get_scheduled_departures", "result_summary": {"count": 16}, "duration_ms": 12}
+
+event: step
+data: {"name": "get_vehicle_state", "result_summary": {"count": 18}, "duration_ms": 8}
+
+event: result
+data: {"decision_id": "…", "status": "exceptions_present", …}
+```
+
+Shape and error semantics mirror `POST /agent/turn/stream`.
+
+---
+
+### GET /agent-workflows/decisions/{decision_id}
+
+Fetch the full `workflow_decisions` row — including `tool_calls`, `output`,
+`inputs_hash`, and `permission_tier`. Powers the "why" view (PRD §7.2).
+
+**Access control:** the row's `organization_id` must match the caller's,
+**or** the caller must be `favonius_admin`. Mismatched tenants get `404`
+(not `403`) so decision IDs cannot be enumerated.
+
+**Response (200):**
+```json
+{
+    "decision_id": "uuid",
+    "workflow_name": "daily_readiness_check",
+    "workflow_version": "v1",
+    "depot_id": "uuid",
+    "organization_id": "uuid",
+    "triggered_by": "scheduler",
+    "triggered_by_user_id": null,
+    "inputs_hash": "sha256-hex",
+    "tool_calls": [
+        {"name": "get_scheduled_departures", "args": {…}, "result_summary": {…}, "duration_ms": 12}
+    ],
+    "output": { "…": "the §6.1 payload as JSON …" },
+    "permission_tier": "inform",
+    "status": "success",
+    "duration_ms": 412,
+    "created_at": "2026-05-13T04:00:00Z"
+}
+```
+
+**Error codes:**
+- 401 — invalid JWT
+- 404 — decision not found, or owned by another organization
+
+---
+
+### GET /agent-workflows/workflows/{name}/decisions
+
+Paginated audit-log list of Decisions for a workflow (PRD §7.3). Scoped by
+the caller's `visible_depot_ids` so other tenants' decisions are invisible.
+
+**Query parameters:**
+| Param | Type | Notes |
+|---|---|---|
+| `depot_id` | UUID (optional) | Restrict to one depot; must be in the caller's visible set |
+| `since` | RFC-3339 datetime (optional) | Exclusive lower bound on `created_at` |
+| `before` | RFC-3339 datetime (optional) | Exclusive upper bound on `created_at` — cursor for older pages |
+| `limit` | int (default 50, max 200) | Page size |
+
+**Response (200):**
+```json
+{
+    "items": [
+        {
+            "decision_id": "uuid",
+            "depot_id": "uuid",
+            "triggered_by": "scheduler",
+            "status": "success",
+            "workflow_version": "v1",
+            "has_exceptions": true,
+            "exception_count": 1,
+            "duration_ms": 412,
+            "created_at": "2026-05-13T04:00:00Z"
+        }
+    ],
+    "next_before": "2026-05-13T04:00:00Z"
+}
+```
+
+`next_before` is `null` on the final page. Pass it as the next call's
+`before` parameter to fetch older rows.
+
+**Error codes:**
+- 401 — invalid JWT
+- 404 — `depot_id` is outside the caller's visible set, or
+  `DEPOT_AGENT_ENABLED=false`
+
+---
+
 ## Implementation Notes
 
 - All endpoints use FastAPI framework

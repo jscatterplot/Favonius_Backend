@@ -242,6 +242,10 @@ src/api/main.py (FastAPI, middleware: rate-limiting, logging, CORS)
 
 `src/api/agent/` is a self-contained module that adds a plain-English query interface for depot operators. The module is mounted into the FastAPI app behind the `AGENT_SEARCH_ENABLED` feature flag (now default `true` since B6 golden-test gate passed). A user message goes through three server-side stages: (1) **LLM extraction** (`llm.py`) converts the message into a strict `QueryPlan` via Anthropic's tool-use API — the model never sees UUIDs or raw SQL; (2) **entity resolution** (`resolve.py`) maps the plan's subject names to real database UUIDs, scoped to the caller's `visible_depot_ids` from their JWT — this is the auth boundary; and (3) **deterministic compilation** (`intents/consumption_by_user.py`) turns the resolved plan into a parameterised SQL query that executes against TimescaleDB. Every turn is audited in `agent_runs` (full step trace) and `audit_log` (action `agent.query`). Prometheus metrics (`favonius_agent_turns_total`, `favonius_agent_turn_duration_seconds`, `favonius_agent_llm_tokens_total`, `favonius_agent_resolver_misses_total`) are incremented from `router.py`, `llm.py`, and `controller.py`. The golden test suite in `tests/golden/agent_consumption.yaml` (50 Q&A pairs) gates every deploy; AT-18 (`tests/e2e/test_agent_search.py`) is the end-to-end acceptance test. The endpoint reference lives in `docs/API.md`; the original design plan has been retired now that the implementation has shipped — the code in `src/api/agent/` is the source of truth, and this feature is positioned as a precursor to the broader Depot Agent product (`docs/PRD_Depot_Agent.md`).
 
+### Depot-agent workflows (Today View)
+
+`src/api/agent_workflows/` is the HTTP surface for the depot-agent **workflow** system described in PRD §6. Phase 1 (sprint 6) ships one workflow — `daily_readiness_check` (PRD §6.1) — gated by the `DEPOT_AGENT_ENABLED` feature flag (default off; flipped to `true` in staging only after this PR). The workflow lives in `src/core/workflows/readiness.py` as a pure function: it takes already-assembled inputs (departures, vehicle telemetry, charger status, charging plans, driver assignments) and produces the §6.1 "today view" payload — coverage counts plus a list of `exceptions` with `proposed_action`. The orchestrator at `src/core/workflows/orchestrator.py` wraps it with the read-only "tools" defined in `src/core/workflows/tools.py` (`get_scheduled_departures`, `get_vehicle_state`, `get_charger_state`, `get_charging_plan`, `get_driver_assignment`, `find_alternate_chargers`) — each invocation is recorded as a `ToolCall` so the "why" view can replay the exact data the workflow saw. Every run is persisted to `workflow_decisions` (migration 037) with `inputs_hash`, `tool_calls`, `output`, and `triggered_by ∈ {manual, scheduler, event}`. The `WorkflowScheduler` (`src/core/workflow_scheduler.py`) polls per depot once per minute and fires the readiness check `DEPOT_AGENT_SCHEDULER_LEAD_TIME_MIN` (default 60) before the earliest scheduled departure inside `DEPOT_AGENT_SCHEDULER_LOOKAHEAD_H` (default 24h); a fresh row inside `DEPOT_AGENT_SCHEDULER_DEDUPE_S` (default 1800s) suppresses re-runs. The router enforces a 60-second idempotency window on `POST /today/{depot_id}` by consulting `workflow_decisions.created_at` for the same `workflow_name`+`depot_id`. Prometheus metrics: `favonius_agent_workflow_requests_total{endpoint,status_code}`, `favonius_agent_workflow_runs_total{workflow_name,triggered_by,status}`, `favonius_agent_workflow_run_duration_seconds`, `favonius_agent_workflow_scheduler_to_completion_seconds`, `favonius_agent_workflow_exceptions_emitted_total`. The scenario fixture used by integration + e2e tests is `tests/golden/depot_agent/scenarios/02_undercharge.yaml`; full happy-path stream coverage is at `tests/e2e/test_depot_agent_today_view.py`.
+
 ### Optimization Control Loop
 
 ```
@@ -414,6 +418,10 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `POST` | `/agent/turn` | Depot chat agent — synchronous turn; returns `AgentReply` (10 req/min; requires `AGENT_SEARCH_ENABLED=true`) |
 | `POST` | `/agent/turn/stream` | Depot chat agent — SSE streaming turn; emits `step` events then `answer` (10 req/min; same gate) |
 | `GET` | `/agent/runs/{run_id}` | Fetch stored agent run trace (ownership-gated; `favonius_admin` may access any run) |
+| `POST` | `/agent-workflows/today/{depot_id}` | Depot-agent daily readiness check — returns §6.1 today-view payload (10 req/min; idempotent within 60s; requires `DEPOT_AGENT_ENABLED=true`) |
+| `POST` | `/agent-workflows/today/{depot_id}/stream` | SSE variant — emits `step` events during tool calls and a final `result` event (10 req/min; same gate) |
+| `GET` | `/agent-workflows/decisions/{decision_id}` | Fetch one workflow decision row (`tool_calls`, `output`, `inputs_hash`) — backs the "why" view. Ownership-gated; `favonius_admin` may read any |
+| `GET` | `/agent-workflows/workflows/{name}/decisions` | Paginated audit-log list for a workflow; scoped by `visible_depot_ids`. Cursor backward via `next_before` |
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)
@@ -423,6 +431,7 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 
 ### Rate limits (per PRD Section 10.4)
 - `POST /optimize`: 10 req/min
+- `POST /agent-workflows/*`: 10 req/min/user (separate bucket)
 - `/depots/*/handoff`: 50 msg/hr per depot pair
 - All other endpoints: 100 req/min
 
