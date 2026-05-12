@@ -124,11 +124,13 @@ BEGIN
                 import_station_owner  = COALESCE(surv.import_station_owner, other.import_station_owner),
                 import_status         = COALESCE(surv.import_status, other.import_status),
                 energy_delivered_kwh  = CASE
-                    WHEN other.energy_delivered_kwh IS NOT NULL THEN other.energy_delivered_kwh
+                    WHEN surv.energy_delivered_kwh IS NULL THEN other.energy_delivered_kwh
+                    WHEN other.energy_delivered_kwh > 0 THEN other.energy_delivered_kwh
                     ELSE surv.energy_delivered_kwh
                 END,
                 cost_total            = CASE
-                    WHEN other.cost_total IS NOT NULL THEN other.cost_total
+                    WHEN surv.cost_total IS NULL THEN other.cost_total
+                    WHEN other.cost_total IS NOT NULL AND other.cost_total > 0 THEN other.cost_total
                     ELSE surv.cost_total
                 END
             FROM charging_sessions other
