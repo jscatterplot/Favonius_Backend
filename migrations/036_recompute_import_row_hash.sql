@@ -16,7 +16,7 @@
 --   2. Computes the new hash for every row where source='import' (both raw-id
 --      and platform-initiated variants).
 --   3. Finds collision groups under the new hash. Within each group, the
---      earliest row by (start_time, session_id) is the survivor; the others
+--      earliest row by (start_time, created_at, session_id) is the survivor; the others
 --      are folded into it using the same fill-nulls rules the runtime UPSERT
 --      uses, then deleted. Counts are RAISE NOTICE'd so deploy logs surface
 --      any merges.
@@ -101,7 +101,7 @@ BEGIN
         SELECT
             cs.site_id,
             nh.new_hash,
-            array_agg(cs.session_id ORDER BY cs.start_time, cs.session_id) AS members
+            array_agg(cs.session_id ORDER BY cs.start_time, cs.created_at, cs.session_id) AS members
         FROM charging_sessions cs
         JOIN _new_import_hashes nh ON nh.session_id = cs.session_id
         WHERE cs.source = 'import'
@@ -124,7 +124,7 @@ BEGIN
                 import_station_owner  = COALESCE(surv.import_station_owner, other.import_station_owner),
                 import_status         = COALESCE(surv.import_status, other.import_status),
                 energy_delivered_kwh  = CASE
-                    WHEN COALESCE(other.energy_delivered_kwh, 0) > 0 THEN other.energy_delivered_kwh
+                    WHEN other.energy_delivered_kwh IS NOT NULL THEN other.energy_delivered_kwh
                     ELSE surv.energy_delivered_kwh
                 END,
                 cost_total            = CASE
