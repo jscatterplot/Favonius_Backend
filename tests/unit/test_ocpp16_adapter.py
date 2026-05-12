@@ -1026,7 +1026,7 @@ class TestOCPP16SessionRecovery:
 
     @pytest.mark.asyncio
     async def test_on_transaction_stop_closes_session_row(self, session, mock_timescale) -> None:
-        mock_timescale.close_open_session = AsyncMock()
+        mock_timescale.close_open_session = AsyncMock(return_value=None)
 
         await session._on_transaction_stop(
             cp_id="test_station_001",
@@ -1043,6 +1043,170 @@ class TestOCPP16SessionRecovery:
         assert args[1] == 4242
         # args[2] is the parsed end_time
         assert args[2].year == 2026
+        # meter_stop_wh is plumbed through as the kwarg (migration 036).
+        kwargs = mock_timescale.close_open_session.call_args.kwargs
+        assert kwargs["meter_stop_wh"] == 12345
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_stashes_meter_start_wh(
+        self, session, mock_timescale
+    ) -> None:
+        """meter_start arrives in OCPP StartTransaction and must be stashed.
+
+        Without this, _next_transaction_id has no meter_start_wh to send
+        to insert_open_session and the DB row goes in with NULL — the
+        whole bug we are fixing (migration 036).
+        """
+        await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=17500,
+            timestamp="2026-04-26T12:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert session._pending_start is not None
+        assert session._pending_start["meter_start_wh"] == 17500
+
+    @pytest.mark.asyncio
+    async def test_next_transaction_id_persists_meter_start_wh(
+        self, session, mock_timescale
+    ) -> None:
+        """insert_open_session must receive the stashed meter_start_wh."""
+        mock_timescale.next_transaction_id = AsyncMock(return_value=1000)
+        mock_timescale.insert_open_session = AsyncMock()
+        session._pending_start = {
+            "connector_id": 1,
+            "evse_id": 1,
+            "id_tag": "TAG_Z",
+            "start_time": datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc),
+            "meter_start_wh": 22000,
+            "vehicle_id": None,
+            "driver_id": None,
+            "card_id": None,
+        }
+
+        await session._next_transaction_id()
+
+        kwargs = mock_timescale.insert_open_session.call_args.kwargs
+        assert kwargs["meter_start_wh"] == 22000
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_warns_on_anomalous_delta(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """meter_stop < meter_start_wh (rollover/replacement) -> WARN, no kWh.
+
+        The close UPDATE keeps energy_delivered_kwh NULL via the CASE
+        gate; the adapter must surface that for operators rather than
+        silently swallow it.
+        """
+        import logging
+
+        # Simulates the DB-side CASE gate leaving energy_delivered_kwh NULL.
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={"meter_start_wh": 9000, "energy_delivered_kwh": None}
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_stop(
+                cp_id="test_station_001",
+                transaction_id=4243,
+                id_tag="TAG_X",
+                meter_stop=1000,  # < 9000
+                timestamp="2026-04-26T13:00:00Z",
+                reason="Local",
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "meter_stop_lt_meter_start" in m for m in warnings
+        ), f"Expected anomaly WARN with reason=meter_stop_lt_meter_start; got: {warnings}"
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_warns_on_missing_meter_start(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """Legacy row inserted before mig 036 has meter_start_wh NULL.
+
+        Close cannot compute a delta; operator gets a WARN with the
+        reason tag so they can reconcile manually.
+        """
+        import logging
+
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={"meter_start_wh": None, "energy_delivered_kwh": None}
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_stop(
+                cp_id="test_station_001",
+                transaction_id=4244,
+                id_tag="TAG_X",
+                meter_stop=5000,
+                timestamp="2026-04-26T13:00:00Z",
+                reason="Local",
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "missing_meter_start" in m for m in warnings
+        ), f"Expected missing_meter_start WARN; got: {warnings}"
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_no_warn_on_happy_path(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """Successful delta write must not produce noisy WARN logs."""
+        import logging
+
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={"meter_start_wh": 1000, "energy_delivered_kwh": 4.0}
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_stop(
+                cp_id="test_station_001",
+                transaction_id=4245,
+                id_tag="TAG_X",
+                meter_stop=5000,
+                timestamp="2026-04-26T13:00:00Z",
+                reason="Local",
+            )
+
+        anomaly_warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelname == "WARNING" and "Anomalous meter delta" in r.getMessage()
+        ]
+        assert anomaly_warnings == []
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_silent_when_no_row_matched(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """Idempotent retry (close returns None) is silent — not an anomaly."""
+        import logging
+
+        mock_timescale.close_open_session = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_stop(
+                cp_id="test_station_001",
+                transaction_id=4246,
+                id_tag="TAG_X",
+                meter_stop=5000,
+                timestamp="2026-04-26T13:00:00Z",
+                reason="Local",
+            )
+
+        anomaly_warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelname == "WARNING" and "Anomalous meter delta" in r.getMessage()
+        ]
+        assert anomaly_warnings == []
 
     @pytest.mark.asyncio
     async def test_next_transaction_id_persists_when_pending_set(

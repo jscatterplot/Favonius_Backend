@@ -340,6 +340,29 @@ class TestTimescaleClient:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_fetch_open_sessions_includes_meter_start_wh(self, timescale_client):
+        """Boot-time reload must select meter_start_wh (migration 036).
+
+        Without this column in the projection, a StopTransaction that
+        arrives after a handler restart cannot reconstruct the energy
+        delta — the in-memory copy of meter_start_wh was lost when the
+        handler died, and the close path's RETURNING only sees what is
+        already in the row.
+        """
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        await timescale_client.fetch_open_sessions("CP-1")
+
+        query = mock_conn.fetch.await_args.args[0]
+        assert "meter_start_wh" in query
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_mark_sessions_seen_filters_to_live_source(self, timescale_client):
         """last_seen stamping must not touch imported rows."""
         mock_conn = AsyncMock()

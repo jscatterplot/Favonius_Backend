@@ -2313,12 +2313,15 @@ class TimescaleClient:
 
         Used by ``OCPP16Session._on_boot`` to repopulate
         ``FleetChargePoint.transactions`` after a handler restart so
-        StopTransaction does not orphan the row.
+        StopTransaction does not orphan the row. ``meter_start_wh`` is
+        included so the close path can still compute a billing-grade
+        energy delta across a handler restart (migration 036).
         """
         async with self.pg_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT transaction_id, connector_id, evse_id, id_token, start_time
+                SELECT transaction_id, connector_id, evse_id, id_token,
+                       start_time, meter_start_wh
                   FROM charging_sessions
                  WHERE station_id = $1
                    AND end_time IS NULL
@@ -2342,12 +2345,17 @@ class TimescaleClient:
         vehicle_id: Optional[str] = None,
         driver_id: Optional[str] = None,
         card_id: Optional[str] = None,
+        meter_start_wh: Optional[int] = None,
     ) -> None:
         """Insert an open ``charging_sessions`` row at StartTransaction.
 
         ``end_time`` is left NULL so ``fetch_open_sessions`` can find it on
         boot. ``transaction_id`` is the OCPP 1.6 integer id from the
-        ``ocpp_transaction_id`` sequence.
+        ``ocpp_transaction_id`` sequence. ``meter_start_wh`` is the raw
+        Wh reading from OCPP StartTransaction.meterStart; the close path
+        subtracts it from meter_stop_wh to compute energy_delivered_kwh
+        (migration 036). Optional only to keep older simulator paths
+        working — production OCPP traffic always carries it.
         """
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
@@ -2385,8 +2393,11 @@ class TimescaleClient:
                     """
                     INSERT INTO charging_sessions (
                         station_id, transaction_id, evse_id, connector_id,
-                        id_token, start_time, vehicle_id, driver_id, card_id
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid)
+                        id_token, start_time, vehicle_id, driver_id, card_id,
+                        meter_start_wh
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8::uuid, $9::uuid, $10
+                    )
                     """,
                     station_id,
                     transaction_id,
@@ -2397,26 +2408,63 @@ class TimescaleClient:
                     vehicle_id,
                     driver_id,
                     card_id,
+                    meter_start_wh,
                 )
 
     async def close_open_session(
-        self, station_id: str, transaction_id: int, end_time: datetime
-    ) -> None:
-        """Mark a ``charging_sessions`` row closed at StopTransaction."""
+        self,
+        station_id: str,
+        transaction_id: int,
+        end_time: datetime,
+        meter_stop_wh: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Mark a ``charging_sessions`` row closed at StopTransaction.
+
+        Writes ``end_time`` and ``meter_stop_wh`` and computes
+        ``energy_delivered_kwh = (meter_stop_wh - meter_start_wh) / 1000.0``
+        atomically (migration 036). The kWh write is gated by a CASE so
+        anomalous deltas (missing meter_start_wh, meter_stop < meter_start
+        from a meter rollover or replacement) leave the column NULL — the
+        caller logs a WARN so operators can reconcile from the raw Wh
+        values rather than trust a bogus billing number.
+
+        Returns:
+            ``None`` if no live, still-open row matched (idempotent retry,
+            already-closed session, or imported source). Otherwise a dict
+            of the RETURNING values: ``meter_start_wh`` (as stored before
+            this update) and ``energy_delivered_kwh`` (NULL on anomaly,
+            else the freshly written delta). Callers compare the two
+            against the provided ``meter_stop_wh`` to decide whether to
+            emit a WARN.
+        """
         async with self.pg_pool.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 UPDATE charging_sessions
-                   SET end_time = $3, updated_at = NOW()
+                   SET end_time = $3,
+                       meter_stop_wh = $4,
+                       energy_delivered_kwh = CASE
+                           WHEN $4 IS NOT NULL
+                            AND meter_start_wh IS NOT NULL
+                            AND $4 >= meter_start_wh
+                           THEN ($4 - meter_start_wh) / 1000.0
+                           ELSE NULL
+                       END,
+                       updated_at = NOW()
                  WHERE station_id = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
                    AND source = 'live'
+             RETURNING meter_start_wh, energy_delivered_kwh
                 """,
                 station_id,
                 transaction_id,
                 end_time,
+                meter_stop_wh,
             )
+            if row is None:
+                return None
+            return dict(row)
 
     async def mark_sessions_seen(self, station_id: str) -> None:
         """Stamp ``last_seen_at = NOW()`` on every open session at the station.

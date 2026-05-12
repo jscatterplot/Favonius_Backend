@@ -476,6 +476,7 @@ class OCPP16Session:
                     vehicle_id=pending.get("vehicle_id"),
                     driver_id=pending.get("driver_id"),
                     card_id=pending.get("card_id"),
+                    meter_start_wh=pending.get("meter_start_wh"),
                 )
             except Exception as exc:
                 logger.warning(
@@ -985,12 +986,15 @@ class OCPP16Session:
             start_time = datetime.now(timezone.utc)
         # Stash for ``_next_transaction_id`` (FleetChargePoint will call it
         # next, only because we returned ``accepted``). evse_id == connector_id
-        # in OCPP 1.6.
+        # in OCPP 1.6. meter_start_wh is persisted in the DB so a restart
+        # between Start and Stop still yields a billing-grade kWh delta on
+        # close (migration 036).
         self._pending_start = {
             "connector_id": connector_id,
             "evse_id": connector_id,
             "id_tag": id_tag,
             "start_time": start_time,
+            "meter_start_wh": meter_start,
         }
         self._pending_start.update(
             {
@@ -1052,14 +1056,47 @@ class OCPP16Session:
         except (ValueError, AttributeError):
             end_time = datetime.now(timezone.utc)
         try:
-            await self._timescale.close_open_session(cp_id, int(transaction_id), end_time)
+            close_result = await self._timescale.close_open_session(
+                cp_id,
+                int(transaction_id),
+                end_time,
+                meter_stop_wh=meter_stop,
+            )
         except Exception as exc:
+            close_result = None
             logger.warning(
                 "close_open_session failed for station=%s tx_id=%s: %s",
                 cp_id,
                 transaction_id,
                 exc,
             )
+        # Surface meter-delta anomalies so operators can reconcile the row
+        # from the raw Wh values rather than from a NULL billing kWh. The
+        # close already matched a row; we just couldn't compute the delta.
+        # `close_result is None` covers the idempotent retry / no-match
+        # case, which is silent on purpose.
+        if close_result is not None:
+            meter_start_db = close_result.get("meter_start_wh")
+            energy_kwh = close_result.get("energy_delivered_kwh")
+            if energy_kwh is None:
+                if meter_stop is None:
+                    anomaly_reason = "missing_meter_stop"
+                elif meter_start_db is None:
+                    anomaly_reason = "missing_meter_start"
+                elif meter_stop < int(meter_start_db):
+                    anomaly_reason = "meter_stop_lt_meter_start"
+                else:
+                    anomaly_reason = "unknown"
+                logger.warning(
+                    "Anomalous meter delta on station=%s tx_id=%s: %s "
+                    "(meter_start_wh=%s, meter_stop_wh=%s). Leaving "
+                    "energy_delivered_kwh NULL.",
+                    cp_id,
+                    transaction_id,
+                    anomaly_reason,
+                    meter_start_db,
+                    meter_stop,
+                )
 
         # Persist optional StopTransaction.transactionData samples using the
         # same telemetry pipeline so vendors that only emit end-of-session
