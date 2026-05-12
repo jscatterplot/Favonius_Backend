@@ -79,7 +79,7 @@ SELECT
                      AND cs.card_id IS NULL
                      AND cs.driver_id IS NULL THEN
                     'platform-start:' || pi.inner_hash
-                ELSE cs.id_token
+                ELSE COALESCE(cs.id_token, '')
             END,
             'sha256'
         ),

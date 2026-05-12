@@ -4161,7 +4161,8 @@ async def import_historical_charging_session(
                         ELSE charging_sessions.energy_delivered_kwh
                     END,
                     cost_total            = CASE
-                        WHEN EXCLUDED.cost_total IS NOT NULL THEN EXCLUDED.cost_total
+                        WHEN charging_sessions.cost_total IS NULL THEN EXCLUDED.cost_total
+                        WHEN EXCLUDED.cost_total IS NOT NULL AND EXCLUDED.cost_total > 0 THEN EXCLUDED.cost_total
                         ELSE charging_sessions.cost_total
                     END
                 RETURNING session_id::text AS session_id, (xmax = 0) AS was_new
