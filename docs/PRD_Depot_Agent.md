@@ -702,3 +702,10 @@ This PRD describes the product layer. The underlying systems are documented sepa
 ### 15.3 Document history
 
 - v0.1 — Initial draft from founder + agent design conversation. Supersedes the previous `PRD_v2_7_Building_Integration.md` for product-level direction; substrate technical specs continue to live in the documents listed in §15.2.
+- v0.1.1 — Sprint 2 (`depot-agent/sprint-2-runtime`) lands the depot-agent workflow runtime in `src/api/agent_workflows/`:
+  - `WorkflowAgent.run_turn` (`src/api/agent_workflows/runtime.py`) drives one Anthropic Messages-API tool-use loop per turn, enforces `workflow.allowed_tools` strictly before each dispatch, and persists exactly one `Decision` row with `disposition='pending'` via `DecisionRepo` — the agent itself never writes `auto_executed` (PRD §9.1, §10.4).
+  - `ToolRegistry` (`src/api/agent_workflows/tools.py`) is the single source of truth for tool names, schemas, and async callables; the runtime never looks up a callable elsewhere.
+  - `HardConstraintGuard` (`src/api/agent_workflows/constraints.py`) enforces the substrate hard constraints (PRD §10.3) at two points: pre-dispatch on tool inputs, and post-emit on the LLM's `proposed_actions`. Violations are recorded in the audit row, never executed.
+  - The system prompt is prompt-cached (`cache_control: ephemeral`) so repeat turns of the same workflow hit Anthropic's prefix cache, mirroring the pattern in `src/api/agent/llm.py`.
+  - New Prometheus metrics: `favonius_workflow_turns_total{workflow,depot,status}`, `favonius_workflow_turn_duration_seconds`, `favonius_workflow_llm_tokens_total` — naming parallels the existing `favonius_agent_*` family.
+  - No HTTP endpoint yet (Sprint 3 wires the route). Coverage on the new module is ≥ 93% via `tests/unit/test_agent_workflows_runtime.py`.
