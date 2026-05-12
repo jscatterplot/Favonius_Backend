@@ -2400,14 +2400,20 @@ class TimescaleClient:
                 )
 
     async def close_open_session(
-        self, station_id: str, transaction_id: int, end_time: datetime
+        self,
+        station_id: str,
+        transaction_id: int,
+        end_time: datetime,
+        energy_delivered_kwh: Optional[float] = None,
     ) -> None:
         """Mark a ``charging_sessions`` row closed at StopTransaction."""
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE charging_sessions
-                   SET end_time = $3, updated_at = NOW()
+                   SET end_time = $3,
+                       energy_delivered_kwh = COALESCE($4, energy_delivered_kwh),
+                       updated_at = NOW()
                  WHERE station_id = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
@@ -2416,6 +2422,7 @@ class TimescaleClient:
                 station_id,
                 transaction_id,
                 end_time,
+                energy_delivered_kwh,
             )
 
     async def mark_sessions_seen(self, station_id: str) -> None:
