@@ -124,6 +124,9 @@ class OCPP16Session:
         # row alongside the generated tx_id. Safe because FleetChargePoint
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
+        # In-memory meter_start stash keyed by transaction_id so we can
+        # persist a billing-grade session delta on StopTransaction.
+        self._meter_start_by_tx_id: Dict[int, int] = {}
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
         self._boot_trigger_task: Optional[asyncio.Task[None]] = None
@@ -465,6 +468,9 @@ class OCPP16Session:
         self._pending_start = None
         tx_id = await self._timescale.next_transaction_id()
         if pending is not None:
+            meter_start = pending.get("meter_start")
+            if isinstance(meter_start, (int, float)):
+                self._meter_start_by_tx_id[tx_id] = int(meter_start)
             try:
                 await self._timescale.insert_open_session(
                     station_id=self._station_id,
@@ -1052,7 +1058,18 @@ class OCPP16Session:
         except (ValueError, AttributeError):
             end_time = datetime.now(timezone.utc)
         try:
-            await self._timescale.close_open_session(cp_id, int(transaction_id), end_time)
+            meter_start = self._meter_start_by_tx_id.pop(int(transaction_id), None)
+            energy_delivered_kwh: Optional[float] = None
+            if meter_start is not None and meter_stop is not None:
+                delta_wh = int(meter_stop) - int(meter_start)
+                if delta_wh >= 0:
+                    energy_delivered_kwh = delta_wh / 1000.0
+            await self._timescale.close_open_session(
+                cp_id,
+                int(transaction_id),
+                end_time,
+                energy_delivered_kwh=energy_delivered_kwh,
+            )
         except Exception as exc:
             logger.warning(
                 "close_open_session failed for station=%s tx_id=%s: %s",
