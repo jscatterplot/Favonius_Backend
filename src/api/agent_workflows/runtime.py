@@ -305,9 +305,9 @@ class WorkflowAgent:
                     if name == EMIT_DECISION_TOOL_NAME:
                         decision_output, rule_applied = self._capture_terminator(block_input, guard)
                         emit_called = True
-                        # Don't append a tool_result for emit_decision: it
-                        # is the terminator, the loop exits below.
-                        continue
+                        # Terminator: do not append a tool_result; do not
+                        # process further tool_use blocks in this response.
+                        break
 
                     if name not in workflow.allowed_tools:
                         # Strict allow-list enforcement. The model only
