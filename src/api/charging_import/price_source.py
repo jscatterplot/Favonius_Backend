@@ -99,7 +99,9 @@ class TimescalePriceSource:
         if end <= start:
             return None
 
-        start_bucket = _hour_bucket(start)
+        start_aware = start if start.tzinfo is not None else start.replace(tzinfo=timezone.utc)
+        start_utc = start_aware.astimezone(timezone.utc)
+        start_bucket = _hour_bucket(start_utc)
         end_aware = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
         end_utc = end_aware.astimezone(timezone.utc)
         # Treat ``end`` as exclusive for overlap so an end on ``:00`` does not
@@ -120,7 +122,7 @@ class TimescalePriceSource:
                 return None
             bucket_start = datetime.fromtimestamp(bucket, tz=timezone.utc)
             bucket_end = datetime.fromtimestamp(bucket + 3600, tz=timezone.utc)
-            overlap_start = max(start.astimezone(timezone.utc), bucket_start)
+            overlap_start = max(start_utc, bucket_start)
             overlap_end = min(end_utc, bucket_end)
             overlap_seconds = (overlap_end - overlap_start).total_seconds()
             if overlap_seconds <= 0:
