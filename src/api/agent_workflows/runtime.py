@@ -390,14 +390,16 @@ class WorkflowAgent:
                 # the audit captures everything we observed.
                 status = "max_iterations"
 
-            if not emit_called and status == "success":
+            if not emit_called and status in ("success", "max_iterations"):
                 # The model exited via stop_reason=end_turn after a
-                # regular tool call without ever calling the terminator.
-                # Populate audit defaults and flag the outcome.
+                # regular tool call without ever calling the terminator,
+                # or the iteration budget was exhausted. Populate audit
+                # defaults; only the former is reclassified as no_terminator.
                 decision_output.setdefault("summary", "")
                 decision_output.setdefault("proposed_actions", [])
                 decision_output.setdefault("filtered_violations", [])
-                status = "no_terminator"
+                if status == "success":
+                    status = "no_terminator"
 
             inputs_hash = _canonical_tool_calls_hash(tool_calls)
             decision = Decision(
