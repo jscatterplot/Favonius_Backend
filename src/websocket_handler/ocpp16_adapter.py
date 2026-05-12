@@ -1058,15 +1058,13 @@ class OCPP16Session:
         except (ValueError, AttributeError):
             end_time = datetime.now(timezone.utc)
 
-        # Cast inputs outside the try so a malformed value can't strand the
-        # row in an "open" state — the close UPDATE must still run.
-        tx_id_int = int(transaction_id)
         meter_stop_wh: Optional[int] = None
         if isinstance(meter_stop, (int, float)):
             meter_stop_wh = int(meter_stop)
 
         close_result: Optional[Dict[str, Any]] = None
         try:
+            tx_id_int = int(transaction_id)
             close_result = await self._timescale.close_open_session(
                 cp_id,
                 tx_id_int,
