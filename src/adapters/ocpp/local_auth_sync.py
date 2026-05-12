@@ -319,6 +319,8 @@ async def sync_charger(
         )
         return SyncResult(status="skipped", version=0, entries=0, reason="env_disabled")
 
+    station_row: Any = None
+    legacy_schema = False
     try:
         station_row = await db.fetchrow(
             """
@@ -332,12 +334,47 @@ async def sync_charger(
             station_id,
         )
     except Exception as exc:
-        logger.error(
-            "local_auth_sync station=%s db_error fetching station row: %s",
-            station_id,
-            exc,
-        )
-        return SyncResult(status="skipped", version=0, entries=0, reason="db_error")
+        # Migration 012 (``migrations/supabase/012_local_list_support_probe.sql``)
+        # adds the probe-cache columns. On a Supabase DB where ops hasn't
+        # applied it yet, the SELECT errors with sqlstate 42703 and we MUST
+        # fall back to the legacy push path — without that, ABB Terra AC
+        # 1.8.x sees no post-boot OCPP traffic from the server (no
+        # ChangeConfiguration, no SendLocalList) and reconnect-loops every
+        # ~60 s waiting for the boot-completion exchange.
+        if getattr(exc, "sqlstate", None) == "42703":
+            logger.warning(
+                "local_auth_sync station=%s schema missing probe columns "
+                "(apply migrations/supabase/012_local_list_support_probe.sql) — "
+                "falling back to legacy push without firmware-scoped probe cache",
+                station_id,
+            )
+            legacy_schema = True
+            try:
+                station_row = await db.fetchrow(
+                    """
+                    SELECT id, local_list_version
+                    FROM charging_stations
+                    WHERE station_id = $1
+                    """,
+                    station_id,
+                )
+            except Exception as legacy_exc:
+                logger.error(
+                    "local_auth_sync station=%s db_error fetching station row "
+                    "(legacy shape): %s",
+                    station_id,
+                    legacy_exc,
+                )
+                return SyncResult(
+                    status="skipped", version=0, entries=0, reason="db_error"
+                )
+        else:
+            logger.error(
+                "local_auth_sync station=%s db_error fetching station row: %s",
+                station_id,
+                exc,
+            )
+            return SyncResult(status="skipped", version=0, entries=0, reason="db_error")
 
     if station_row is None:
         logger.warning(
@@ -355,12 +392,22 @@ async def sync_charger(
     # the whole exchange. The cache is per firmware string so a firmware
     # upgrade automatically re-probes.
     current_fw = getattr(cp, "firmware_version", None)
-    # ``.get()`` (vs ``[...]``) keeps the test fakes — which pass minimal
-    # ``{"id": ..., "local_list_version": ...}`` dicts — working without
-    # forcing every fixture to enumerate the new probe-state columns.
-    # asyncpg ``Record`` also supports ``.get()``.
-    supported_cached = station_row.get("local_list_supported")
-    probed_fw = station_row.get("local_list_probed_firmware")
+    if legacy_schema:
+        # Probe columns don't exist on this DB — bypass cache + probe and go
+        # straight to the legacy bootstrap + SendLocalList path. This matches
+        # the pre-PR-#167 behaviour: ABB returns NotSupported on
+        # SendLocalList, we record it via ``local_list_last_status`` (which
+        # exists via migration 011) and the charger gets the post-boot
+        # exchange it expects.
+        supported_cached = None
+        probed_fw = None
+    else:
+        # ``.get()`` (vs ``[...]``) keeps the test fakes — which pass minimal
+        # ``{"id": ..., "local_list_version": ...}`` dicts — working without
+        # forcing every fixture to enumerate the new probe-state columns.
+        # asyncpg ``Record`` also supports ``.get()``.
+        supported_cached = station_row.get("local_list_supported")
+        probed_fw = station_row.get("local_list_probed_firmware")
     if supported_cached is False and probed_fw == current_fw:
         logger.info(
             "local_auth_sync station=%s skipped: known_unsupported firmware=%s",
@@ -378,7 +425,11 @@ async def sync_charger(
     # probed, ask the charger directly before attempting the push. A negative
     # answer is recorded and short-circuits all future reconnects on this
     # firmware. A positive or ambiguous answer falls through to the push.
-    needs_probe = supported_cached is None or probed_fw != current_fw
+    # Skipped under legacy schema: the probe outcome has nowhere to be cached
+    # so an extra GetConfiguration round-trip on every reconnect is wasted.
+    needs_probe = not legacy_schema and (
+        supported_cached is None or probed_fw != current_fw
+    )
     if needs_probe:
         probe_result = await _probe_local_auth_support(cp, station_id)
         if probe_result is False:
@@ -446,9 +497,12 @@ async def sync_charger(
     # wasn't our own 16-entry cap refusal inside send_local_list), record
     # the firmware-scoped negative so the next reconnect short-circuits.
     # The entry-count guard distinguishes a charger "NotSupported" from our
-    # local refusal — only the former is firmware-permanent.
+    # local refusal — only the former is firmware-permanent. Skipped under
+    # legacy schema: the cache columns don't exist so we fall through to the
+    # plain ``local_list_last_status`` UPDATE.
     if (
         status == "NotSupported"
+        and not legacy_schema
         and len(entries) <= _LOCAL_LIST_MAX_ENTRIES
         and current_fw is not None
     ):

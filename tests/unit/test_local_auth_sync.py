@@ -771,6 +771,146 @@ class TestSyncChargerNotSupportedFallbackCache:
 
 
 # ---------------------------------------------------------------------------
+# sync_charger — legacy schema fallback when migration 012 hasn't applied
+# ---------------------------------------------------------------------------
+
+
+class _UndefinedColumnError(Exception):
+    """Stand-in for asyncpg.exceptions.UndefinedColumnError.
+
+    asyncpg surfaces Postgres SQLSTATE on the exception instance; the
+    production code keys off ``sqlstate == "42703"`` rather than the class
+    name so this test fixture stays driver-agnostic.
+    """
+
+    sqlstate = "42703"
+
+
+class TestSyncChargerLegacySchemaFallback:
+    """Regression: chargers entering connect-loop when migration 012 hasn't
+    been applied to Supabase.
+
+    PR #167 widened the ``charging_stations`` SELECT to include
+    ``local_list_supported`` / ``local_list_probed_firmware``. On a DB that
+    hasn't run ``migrations/supabase/012_local_list_support_probe.sql``,
+    asyncpg raises ``UndefinedColumnError`` (sqlstate 42703) and the old
+    code path silently aborted — leaving ABB Terra AC 1.8.x with zero
+    post-boot OCPP traffic from the server, which the firmware treats as a
+    half-open session and reconnects ~60 s later. These tests pin the
+    fallback: legacy SELECT shape, skip probe + cache UPDATEs, still
+    deliver the bootstrap config + SendLocalList exchange that ABB needs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_falls_back_and_sends_local_list_when_probe_columns_missing(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = MagicMock()
+        # First fetchrow (new shape) raises UndefinedColumnError; retry with
+        # legacy shape returns a minimal row.
+        db.fetchrow = AsyncMock(
+            side_effect=[
+                _UndefinedColumnError(
+                    'column "local_list_supported" does not exist'
+                ),
+                {"id": "uuid-1", "local_list_version": 0},
+            ]
+        )
+        db.fetch = AsyncMock(return_value=[{"id_tag": "VEH-1", "source": "vehicle"}])
+        db.execute = AsyncMock()
+
+        cp = _make_cp(firmware_version="TAC3Z9119006710273::V1.8.36")
+
+        result = await sync_charger(cp, db, "station-001")
+
+        # Retry happened with the legacy SELECT shape.
+        assert db.fetchrow.await_count == 2
+        legacy_select = db.fetchrow.await_args_list[1].args[0]
+        assert "local_list_supported" not in legacy_select
+        assert "local_list_probed_firmware" not in legacy_select
+        assert "local_list_version" in legacy_select
+
+        # Probe is suppressed under legacy schema — the round-trip would have
+        # nowhere to cache its outcome.
+        cp.get_configuration.assert_not_awaited()
+
+        # First sync still pushes bootstrap config + the full list, matching
+        # pre-PR-#167 behaviour that kept ABB chargers from looping.
+        assert cp.change_configuration.await_count == len(_BOOTSTRAP_CONFIG_KEYS)
+        cp.send_local_list.assert_awaited_once()
+
+        # Result reflects the actual SendLocalList response.
+        assert result.status == "Accepted"
+        assert result.version == 1
+
+        # The success UPDATE only touches columns that exist via migration 011.
+        update_sql = db.execute.await_args_list[-1].args[0]
+        assert "local_list_version = $1" in update_sql
+        assert "local_list_supported" not in update_sql
+        assert "local_list_probed_firmware" not in update_sql
+
+    @pytest.mark.asyncio
+    async def test_legacy_fallback_skips_probe_outcome_update_on_not_supported(
+        self, monkeypatch
+    ) -> None:
+        """ABB on legacy DB returns NotSupported from SendLocalList. We must
+        NOT try to UPDATE the missing ``local_list_supported`` column —
+        we'd just raise inside the existing db_error handler. Instead the
+        ``local_list_last_status`` UPDATE (migration 011) runs."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = MagicMock()
+        db.fetchrow = AsyncMock(
+            side_effect=[
+                _UndefinedColumnError(
+                    'column "local_list_supported" does not exist'
+                ),
+                {"id": "uuid-1", "local_list_version": 0},
+            ]
+        )
+        db.fetch = AsyncMock(return_value=[{"id_tag": "VEH-1", "source": "vehicle"}])
+        db.execute = AsyncMock()
+
+        cp = _make_cp(
+            firmware_version="TAC3Z9119006710273::V1.8.36",
+            send_status="NotSupported",
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "NotSupported"
+        update_sql = db.execute.await_args_list[-1].args[0]
+        assert "local_list_supported" not in update_sql
+        assert "local_list_last_status" in update_sql
+        assert db.execute.await_args_list[-1].args[1] == "NotSupported"
+
+    @pytest.mark.asyncio
+    async def test_non_42703_db_error_still_aborts(self, monkeypatch) -> None:
+        """Any error that is NOT a missing-column failure (connection reset,
+        permission denied, etc.) must short-circuit like before — we only
+        widen the tolerance for sqlstate 42703."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+
+        class _ConnectionFailure(Exception):
+            sqlstate = "08006"  # connection_failure
+
+        db = MagicMock()
+        db.fetchrow = AsyncMock(side_effect=_ConnectionFailure("server gone"))
+        db.fetch = AsyncMock(return_value=[])
+        db.execute = AsyncMock()
+
+        cp = _make_cp(firmware_version="V1.8.36")
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "skipped"
+        assert result.reason == "db_error"
+        # No retry — the original guard still aborts immediately.
+        assert db.fetchrow.await_count == 1
+        cp.send_local_list.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # OCPP16Session BootNotification wiring
 # ---------------------------------------------------------------------------
 
