@@ -4187,6 +4187,19 @@ async def import_historical_charging_session(
     except asyncpg.UniqueViolationError as exc:
         raise _handle_identity_unique_violation(exc) from exc
 
+    if row is None:
+        logger.error(
+            "charging session import UPSERT returned no row (depot_id=%s)",
+            depot_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error_code": ErrorCode.DATABASE_ERROR.value,
+                "detail": "Charging session import did not persist",
+            },
+        )
+
     session_id = row["session_id"]
     was_new = bool(row["was_new"])
     await _audit_identity_write(user, depot_id, "charging_session.import", str(session_id))

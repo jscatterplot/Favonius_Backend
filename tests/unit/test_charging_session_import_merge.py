@@ -385,32 +385,27 @@ class TestUpsertSqlContract:
     migration 036."""
 
     @pytest.fixture
-    def upsert_sql(self):
+    def upsert_sql(self, client, mock_db_pool):
         from src.api.main import app, get_price_source
         from src.api.charging_import import StaticPriceSource
         from src.security.tenant_mirror import ensure_tenant_mirrored
-        from fastapi.testclient import TestClient
-        from unittest.mock import AsyncMock, patch
         from uuid import uuid4
 
         org_id = str(uuid4())
         depot_id = str(uuid4())
 
         # Bypass auth + db dependencies; stub fetchrow to feed the endpoint
-        # everything it needs to reach the UPSERT.
+        # everything it needs to reach the UPSERT. Reuse the shared ``client``
+        # fixture (lifespan already ran) and patch ``db_pools`` only for this
+        # request — a nested ``TestClient`` would re-run startup and require a
+        # real ``DATABASE_URL`` in CI.
         app.dependency_overrides[ensure_tenant_mirrored] = lambda: {
             "sub": str(uuid4()),
             "app_metadata": {"favonius_role": "customer_admin", "organization_id": org_id},
         }
         app.dependency_overrides[get_price_source] = lambda: StaticPriceSource(None)
 
-        pool = MagicMock()
-        conn = AsyncMock()
-        pool.acquire.return_value.__aenter__.return_value = conn
-        pool.acquire.return_value.__aexit__.return_value = None
-        pool.ts = pool
-        pool.static = pool
-
+        pool, conn = mock_db_pool
         sites_row = {
             "organization_id": org_id,
             "timezone": "UTC",
@@ -425,9 +420,9 @@ class TestUpsertSqlContract:
         )
 
         try:
-            with TestClient(app) as client, patch(
-                "src.api.main.db_pools", pool
-            ), patch("src.api.main.verify_depot_access", new_callable=AsyncMock):
+            with patch("src.api.main.db_pools", pool), patch(
+                "src.api.main.verify_depot_access", new_callable=AsyncMock
+            ):
                 client.post(
                     f"/admin/depots/{depot_id}/charging-sessions/import",
                     headers={"Authorization": "Bearer t"},
@@ -444,7 +439,8 @@ class TestUpsertSqlContract:
                 )
                 sql = conn.fetchrow.await_args_list[-1].args[0]
         finally:
-            app.dependency_overrides.clear()
+            app.dependency_overrides.pop(ensure_tenant_mirrored, None)
+            app.dependency_overrides.pop(get_price_source, None)
         return sql
 
     def test_conflict_target_is_partial_dedup_index(self, upsert_sql):
@@ -470,17 +466,14 @@ class TestUpsertSqlContract:
             in upsert_sql
         ), f"missing COALESCE for {column}"
 
-    @pytest.mark.parametrize(
-        "column",
-        ["energy_delivered_kwh", "cost_total"],
-    )
-    def test_metering_columns_refresh_rules(self, upsert_sql, column: str):
-        # Metering columns refresh when the new value is positive so corrections
-        # propagate, but preserve the existing non-zero value otherwise.
-        assert f"EXCLUDED.{column}" in upsert_sql
-        assert f"charging_sessions.{column}" in upsert_sql
-        # The CASE branch must use ">", not just COALESCE.
+    def test_energy_metering_column_refresh_rules(self, upsert_sql):
+        assert "energy_delivered_kwh" in upsert_sql
+        assert "charging_sessions.energy_delivered_kwh IS NULL" in upsert_sql
         assert "WHEN EXCLUDED.energy_delivered_kwh > 0" in upsert_sql
+
+    def test_cost_metering_column_refresh_rules(self, upsert_sql):
+        assert "cost_total" in upsert_sql
+        assert "charging_sessions.cost_total IS NULL" in upsert_sql
         assert "EXCLUDED.cost_total IS NOT NULL" in upsert_sql
         assert "EXCLUDED.cost_total > 0" in upsert_sql
 

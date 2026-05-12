@@ -48,7 +48,27 @@ def _hour_bucket(dt: datetime) -> int:
 # multi-row XLSX upload only queries each (depot, hour) once per TTL window.
 _HOUR_PRICE_CACHE: dict[tuple[str, int], tuple[Optional[Decimal], float]] = {}
 _HOUR_PRICE_CACHE_TTL_S: float = 300.0
+# Hard cap after TTL eviction so pathological depot lists cannot grow locks
+# without bound (each distinct (depot_id, hour) bucket gets its own Lock).
+_HOUR_PRICE_CACHE_MAX_ENTRIES: int = 4096
 _HOUR_PRICE_LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
+
+
+def _prune_hour_price_cache(now: Optional[float] = None) -> None:
+    """Drop TTL-expired entries, then oldest rows until under ``_MAX``."""
+    t = time.time() if now is None else now
+    ttl = _HOUR_PRICE_CACHE_TTL_S
+    stale = [k for k, (_v, ts) in _HOUR_PRICE_CACHE.items() if (t - ts) >= ttl]
+    for k in stale:
+        _HOUR_PRICE_CACHE.pop(k, None)
+        _HOUR_PRICE_LOCKS.pop(k, None)
+    if len(_HOUR_PRICE_CACHE) <= _HOUR_PRICE_CACHE_MAX_ENTRIES:
+        return
+    overflow = len(_HOUR_PRICE_CACHE) - _HOUR_PRICE_CACHE_MAX_ENTRIES
+    oldest = sorted(_HOUR_PRICE_CACHE.keys(), key=lambda k: _HOUR_PRICE_CACHE[k][1])
+    for k in oldest[:overflow]:
+        _HOUR_PRICE_CACHE.pop(k, None)
+        _HOUR_PRICE_LOCKS.pop(k, None)
 
 
 def invalidate_price_cache() -> None:
@@ -138,6 +158,7 @@ class TimescalePriceSource:
     async def _lookup_bucket(self, depot_id: str, bucket: int) -> Optional[Decimal]:
         cache_key = (depot_id, bucket)
         now = time.time()
+        _prune_hour_price_cache(now)
 
         cached = _HOUR_PRICE_CACHE.get(cache_key)
         if cached is not None and now - cached[1] < _HOUR_PRICE_CACHE_TTL_S:
@@ -151,7 +172,9 @@ class TimescalePriceSource:
                 return cached[0]
 
             price = await self._fetch_bucket(depot_id, bucket)
-            _HOUR_PRICE_CACHE[cache_key] = (price, time.time())
+            insert_ts = time.time()
+            _HOUR_PRICE_CACHE[cache_key] = (price, insert_ts)
+            _prune_hour_price_cache(insert_ts)
             return price
 
     async def _fetch_bucket(self, depot_id: str, bucket: int) -> Optional[Decimal]:

@@ -359,8 +359,9 @@ class TestHistoricalChargingSessionImport:
         mock_db_pool,
         *,
         depot_row,
-        vehicle_row,
-        card_row,
+        vehicle_row=None,
+        card_row=None,
+        identity_fetchrows: list | None = None,
         upsert_row=None,
         session_id: str | None = None,
         org_id: str | None = None,
@@ -369,9 +370,15 @@ class TestHistoricalChargingSessionImport:
 
         Ordered fetchrow calls inside the endpoint:
           1) sites lookup (cached in _site_metadata_cache after first hit)
-          2) vehicles lookup by id_tag (skipped for platform-initiated rows)
-          3) rfid_cards lookup by id_tag (skipped on early hit)
-          4) UPSERT into charging_sessions returning (session_id, was_new)
+          2+) static identity: zero or more ``fetchrow`` results (vehicle by
+              id_tag, then card by id_tag — platform-initiated rows skip this
+              block entirely; vehicle-hit short-circuit uses one row only)
+          N) UPSERT into charging_sessions returning (session_id, was_new)
+
+        When ``identity_fetchrows`` is ``None`` (default), the static phase is
+        ``[vehicle_row, card_row]``. Pass ``[]`` for platform-initiated imports,
+        or ``[vehicle_hit_row]`` when the vehicle lookup hits and the card
+        query is never executed.
 
         ``org_id`` patches the depot_row so its ``organization_id`` matches the
         caller's JWT org claim; tests that omit it use whatever random org_id
@@ -383,7 +390,11 @@ class TestHistoricalChargingSessionImport:
         if upsert_row is None:
             sid = session_id or str(uuid4())
             upsert_row = _upsert_row(sid)
-        _set_fetchrow_sequence(conn, depot_row, vehicle_row, card_row, upsert_row)
+        if identity_fetchrows is not None:
+            id_rows = list(identity_fetchrows)
+        else:
+            id_rows = [vehicle_row, card_row]
+        _set_fetchrow_sequence(conn, depot_row, *id_rows, upsert_row)
         return pool, conn
 
     def test_finished_row_inserts_with_utc_conversion_and_card_match(
@@ -616,8 +627,7 @@ class TestHistoricalChargingSessionImport:
         pool, conn = self._setup(
             mock_db_pool,
             depot_row=_depot_row("UTC"),
-            vehicle_row=_vehicle_match_row(vehicle_id),
-            card_row=None,  # would 500 if reached — confirms we short-circuit
+            identity_fetchrows=[_vehicle_match_row(vehicle_id)],
             session_id=session_id,
             org_id=org_id,
         )
@@ -636,10 +646,7 @@ class TestHistoricalChargingSessionImport:
         assert body["matched"]["vehicle_id"] == vehicle_id
         assert body["matched"]["card_id"] is None
         assert body["matched"]["driver_id"] is None
-        # Only two fetchrow calls used: sites + vehicles. The third was queued
-        # via side_effect but never awaited.
-        # sites + identity-hit + UPSERT = 3 fetchrow calls; the second identity
-        # query (card or vehicle, depending on path) is short-circuited.
+        # sites + vehicle hit + UPSERT — card lookup is short-circuited.
         assert conn.fetchrow.await_count == 3
 
     def test_unmatched_id_tag_inserts_with_null_identity_but_keeps_id_token(
@@ -1076,8 +1083,7 @@ class TestHistoricalChargingSessionImport:
         pool, conn = self._setup(
             mock_db_pool,
             depot_row=_depot_row("UTC"),
-            vehicle_row=None,
-            card_row=None,
+            identity_fetchrows=[],
             session_id=session_id,
             org_id=org_id,
         )
@@ -1103,6 +1109,28 @@ class TestHistoricalChargingSessionImport:
         bind = _upsert_bind(conn)
         assert bind[2] == "platform-start"  # $3 id_token marker for platform starts
 
+    def test_upsert_fetchrow_returns_none_returns_503(self, client, mock_db_pool):
+        """UPSERT returning no row is treated as a database-layer failure."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, conn = mock_db_pool
+        _set_fetchrow_sequence(
+            conn,
+            _depot_row("UTC", organization_id=org_id),
+            None,
+        )
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(id_tag=None, transaction_type="IOS"),
+            )
+        assert response.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.json()["error_code"] == "DATABASE_ERROR"
+
     def test_literal_platform_start_identifier_is_not_treated_as_platform_initiated(
         self, client, mock_db_pool
     ):
@@ -1118,8 +1146,7 @@ class TestHistoricalChargingSessionImport:
         pool, conn = self._setup(
             mock_db_pool,
             depot_row=_depot_row("UTC"),
-            vehicle_row=_vehicle_match_row(vehicle_id),
-            card_row=None,
+            identity_fetchrows=[_vehicle_match_row(vehicle_id)],
             session_id=session_id,
             org_id=org_id,
         )
