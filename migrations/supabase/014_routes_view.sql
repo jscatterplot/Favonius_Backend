@@ -49,8 +49,18 @@ SELECT
     -- the readiness tool scope by depot / vehicle / driver without a
     -- second join against schedules.
     v.site_id                               AS site_id,
-    MAX(s.vehicle_id)                       AS vehicle_id,
-    MAX(s.driver_id)                        AS driver_id,
+    (array_agg(
+        s.vehicle_id
+        ORDER BY
+            s.departure_time DESC NULLS LAST,
+            s.created_at DESC NULLS LAST
+    ))[1]                                   AS vehicle_id,
+    (array_agg(
+        s.driver_id
+        ORDER BY
+            s.departure_time DESC NULLS LAST,
+            s.created_at DESC NULLS LAST
+    ))[1]                                   AS driver_id,
     MAX(s.required_soc)                     AS required_soc
 FROM public.schedules s
 JOIN public.vehicles  v ON v.id = s.vehicle_id
