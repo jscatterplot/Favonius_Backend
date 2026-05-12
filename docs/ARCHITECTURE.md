@@ -1,7 +1,6 @@
 # System Architecture
 
-## Reference
-This document is extracted from the Product Requirements Document. For the authoritative specification, see [PRD_v2_7_Building_Integration.md#5-system-architecture](PRD_v2_7_Building_Integration.md#5-system-architecture).
+This document is the in-repo reference for the platform's service topology, data flow, and database layout. It is the operational source of truth for substrate architecture; product-level direction lives in [PRD_Depot_Agent.md](PRD_Depot_Agent.md).
 
 ## Service Architecture Overview
 
@@ -297,7 +296,7 @@ modules are the primary deprecation candidates:
 
 ### 7. ALERTS PIPELINE (continuous - WebSocket Handler)
 
-See `docs/plans/alerts-pipeline.md` for the full design and locked decisions.
+The implementation lives in `src/websocket_handler/` (AlertDispatcher), `src/api/main.py` (alert endpoints, Resend webhook), and migration 022; the live code and migration are the source of truth.
 
 ```
 connector_status INSERT (Faulted/Unavailable)
@@ -365,5 +364,5 @@ The codebase is organized as follows:
 - `src/api/` - FastAPI REST endpoints
 - `src/db/` - Database models & migrations
 
-For detailed specifications, see [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md).
+For product direction, see [PRD_Depot_Agent.md](PRD_Depot_Agent.md). Day-to-day operational reference lives in `CLAUDE.md` and the in-repo migration files.
 

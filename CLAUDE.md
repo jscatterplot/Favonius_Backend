@@ -89,7 +89,7 @@ For every specific issue (bug, smell, design concern, risk):
 - TimescaleDB for time-series data storage
 - Prometheus/Grafana observability
 
-**Authoritative spec:** `docs/PRD_v2_7_Building_Integration.md` — always consult it for acceptance criteria, data models, and feature requirements.
+**Authoritative product spec:** `docs/PRD_Depot_Agent.md` — product direction (depot agent: workflows, today view, trust graduation). The substrate (optimiser, OCPP, MILP constraints, schema, regulatory docs) is documented in the in-repo operational docs listed in §15.2 of that PRD; this CLAUDE.md remains the operational reference for working in the codebase.
 
 ---
 
@@ -240,7 +240,7 @@ src/api/main.py (FastAPI, middleware: rate-limiting, logging, CORS)
 
 ### Depot Chat Agent (Agent Search)
 
-`src/api/agent/` is a self-contained module that adds a plain-English query interface for depot operators. The module is mounted into the FastAPI app behind the `AGENT_SEARCH_ENABLED` feature flag (now default `true` since B6 golden-test gate passed). A user message goes through three server-side stages: (1) **LLM extraction** (`llm.py`) converts the message into a strict `QueryPlan` via Anthropic's tool-use API — the model never sees UUIDs or raw SQL; (2) **entity resolution** (`resolve.py`) maps the plan's subject names to real database UUIDs, scoped to the caller's `visible_depot_ids` from their JWT — this is the auth boundary; and (3) **deterministic compilation** (`intents/consumption_by_user.py`) turns the resolved plan into a parameterised SQL query that executes against TimescaleDB. Every turn is audited in `agent_runs` (full step trace) and `audit_log` (action `agent.query`). Prometheus metrics (`favonius_agent_turns_total`, `favonius_agent_turn_duration_seconds`, `favonius_agent_llm_tokens_total`, `favonius_agent_resolver_misses_total`) are incremented from `router.py`, `llm.py`, and `controller.py`. The golden test suite in `tests/golden/agent_consumption.yaml` (50 Q&A pairs) gates every deploy; AT-18 (`tests/e2e/test_agent_search.py`) is the end-to-end acceptance test. See `docs/plans/agent_search_architecture_v0.md` for the full design and `docs/API.md` for the endpoint reference.
+`src/api/agent/` is a self-contained module that adds a plain-English query interface for depot operators. The module is mounted into the FastAPI app behind the `AGENT_SEARCH_ENABLED` feature flag (now default `true` since B6 golden-test gate passed). A user message goes through three server-side stages: (1) **LLM extraction** (`llm.py`) converts the message into a strict `QueryPlan` via Anthropic's tool-use API — the model never sees UUIDs or raw SQL; (2) **entity resolution** (`resolve.py`) maps the plan's subject names to real database UUIDs, scoped to the caller's `visible_depot_ids` from their JWT — this is the auth boundary; and (3) **deterministic compilation** (`intents/consumption_by_user.py`) turns the resolved plan into a parameterised SQL query that executes against TimescaleDB. Every turn is audited in `agent_runs` (full step trace) and `audit_log` (action `agent.query`). Prometheus metrics (`favonius_agent_turns_total`, `favonius_agent_turn_duration_seconds`, `favonius_agent_llm_tokens_total`, `favonius_agent_resolver_misses_total`) are incremented from `router.py`, `llm.py`, and `controller.py`. The golden test suite in `tests/golden/agent_consumption.yaml` (50 Q&A pairs) gates every deploy; AT-18 (`tests/e2e/test_agent_search.py`) is the end-to-end acceptance test. The endpoint reference lives in `docs/API.md`; the original design plan has been retired now that the implementation has shipped — the code in `src/api/agent/` is the source of truth, and this feature is positioned as a precursor to the broader Depot Agent product (`docs/PRD_Depot_Agent.md`).
 
 ### Optimization Control Loop
 
@@ -787,7 +787,7 @@ test(api): add coverage for handoff rate limiting
 | `MAXMIND_LICENSE_KEY` | — | MaxMind license. Set as a **runtime** (Service) variable only. `src/security/geo_block.py::_download_geoip_db` downloads `GeoLite2-Country.mmdb` on startup with retries. Requires `MAXMIND_ACCOUNT_ID`; without either set, the app fails closed. |
 
 ### Alerts pipeline (notifications)
-See `docs/plans/alerts-pipeline.md` for the full design.
+The pipeline has shipped; the implementation in `src/api/main.py` (alert endpoints, Resend webhook), `src/websocket_handler/` (AlertDispatcher), and migration 022 is the source of truth. The PR-era design plan has been retired.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -864,8 +864,8 @@ Before marking any feature complete, verify:
 | AT-05 | Return Time Deviation — triggered on >15 min late return |
 | AT-06 | Inter-Depot Handoff — vehicle seamlessly handed off between depots |
 | AT-07 | Building Load Integration — grid power calc includes building load |
-| AT-17 | Alerts Pipeline End-to-End — Faulted → trigger → dispatcher email → Resend webhook → ack via API → recovery → resolve. See `tests/e2e/test_alerts_pipeline_e2e.py` and `docs/plans/alerts-pipeline.md`. |
-| AT-18 | Agent Search End-to-End — Authenticated user submits "How much did John charge last month?" via `POST /agent/turn/stream`; agent resolves driver, computes UTC bounds, executes aggregation, writes `agent_runs` + `audit_log` rows, returns natural-language reply; cross-org user gets `not_found`. See `tests/e2e/test_agent_search.py` and `docs/plans/agent_search_prd_v1.md`. |
+| AT-17 | Alerts Pipeline End-to-End — Faulted → trigger → dispatcher email → Resend webhook → ack via API → recovery → resolve. See `tests/e2e/test_alerts_pipeline_e2e.py`. |
+| AT-18 | Agent Search End-to-End — Authenticated user submits "How much did John charge last month?" via `POST /agent/turn/stream`; agent resolves driver, computes UTC bounds, executes aggregation, writes `agent_runs` + `audit_log` rows, returns natural-language reply; cross-org user gets `not_found`. See `tests/e2e/test_agent_search.py`. |
 
 ---
 
@@ -896,14 +896,26 @@ make docker-verify
 
 | File | Contents |
 |---|---|
-| `docs/PRD_v2_7_Building_Integration.md` | **Authoritative spec** |
+| `docs/PRD_Depot_Agent.md` | **Authoritative product spec** (depot agent direction) |
 | `docs/ARCHITECTURE.md` | System architecture |
 | `docs/API.md` | API reference |
 | `docs/TESTING.md` | Testing guide |
 | `docs/DEPLOYMENT.md` | Deployment guide |
+| `docs/RAILWAY_ENV_VARIABLES.md` | Railway env-var reference |
 | `docs/SIMULATION.md` | Simulation guide |
 | `docs/CONTROL_LOOP.md` | Control loop details |
 | `docs/DATA_ANALYST_GUIDE.md` | Data access guide |
+| `docs/INTERACTION_DIAGRAM.md` | Component interaction diagram |
+| `docs/PILOT_RUNBOOK.md` | OCPP pilot ops runbook |
+| `docs/EVEREST_TESTING.md` | EVerest smoke test |
+| `docs/AUTH_HOOK_SETUP.md` | Supabase JWT auth hook setup |
+| `docs/COMPLIANCE_GAP_ANALYSIS.md` | Lithuanian Art. 73-3 / NIS2 / IEC 62443 gap analysis |
+| `docs/SECURITY_NETWORK_ARCHITECTURE.md` | IEC 62443 security zones |
+| `docs/SECURITY_DECLARATION_ESO.md` | ESO security declaration template |
+| `docs/VULNERABILITY_DISCLOSURE_POLICY.md` | NIS2 Art. 21(2)(e) policy |
+| `docs/WIRELESS_PROHIBITION_POLICY.md` | Art. 73-3 wireless-module policy |
+| `docs/plans/ocpp_local_auth_list_roadmap.md` | OCPP local auth list staged roadmap |
+| `docs/frontend/manual_charger_authorize.md` | Manual charger authorize (frontend) |
 | `.cursor/rules/optimization.mdc` | MILP patterns |
 | `.cursor/rules/ocpp.mdc` | OCPP patterns |
 | `.cursor/rules/timescale.mdc` | TimescaleDB patterns |

@@ -4,7 +4,7 @@
 
 The control loop is the core orchestration system for depot charging optimization. It automatically runs optimizations, monitors for re-optimization triggers, and dispatches charging commands to chargers via OCPP.
 
-**Reference:** PRD Section 5.2 — [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md)
+**Product direction:** [PRD_Depot_Agent.md](PRD_Depot_Agent.md). The control loop is part of the substrate the depot agent builds on.
 
 ## Architecture
 
@@ -299,10 +299,9 @@ Controllers are automatically:
 
 ## References
 
-- Development Plan Step 5.2: Control Loop Implementation
-- [PRD_v2_7_Building_Integration.md](PRD_v2_7_Building_Integration.md) Section 5.2: Component Responsibilities
-- PRD Section 5.3: Data Flow
-- PRD Section 9.1: OCPP Integration
+- [PRD_Depot_Agent.md](PRD_Depot_Agent.md): product direction (the agent uses the control loop as substrate)
+- [ARCHITECTURE.md](ARCHITECTURE.md): system topology and data flow
+- [API.md](API.md): REST + OCPP endpoint reference
 - Code: `src/core/controller.py`
 - Code: `src/core/controller_manager.py`
 - Code: `src/core/controller_config.py`
