@@ -1058,8 +1058,9 @@ class OCPP16Session:
             end_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             end_time = datetime.now(timezone.utc)
+        tx_id = int(transaction_id)
         try:
-            meter_start = self._meter_start_by_tx_id.pop(int(transaction_id), None)
+            meter_start = self._meter_start_by_tx_id.get(tx_id)
             energy_delivered_kwh: Optional[float] = None
             if meter_start is not None and meter_stop is not None:
                 delta_wh = int(meter_stop) - int(meter_start)
@@ -1067,10 +1068,11 @@ class OCPP16Session:
                     energy_delivered_kwh = delta_wh / 1000.0
             await self._timescale.close_open_session(
                 cp_id,
-                int(transaction_id),
+                tx_id,
                 end_time,
                 energy_delivered_kwh=energy_delivered_kwh,
             )
+            self._meter_start_by_tx_id.pop(tx_id, None)
         except Exception as exc:
             logger.warning(
                 "close_open_session failed for station=%s tx_id=%s: %s",
