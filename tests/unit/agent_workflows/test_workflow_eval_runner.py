@@ -1207,7 +1207,7 @@ async def test_default_tools_get_charger_state_with_row() -> None:
     scenario["expected"] = {"tool_calls": {"all_ok": True}}
     # Stage a fake row keyed on the SQL the tool issues.
     pool = _FakePool()
-    pool.conn.fetchrow_responses["FROM chargers"] = [
+    pool.conn.fetchrow_responses["FROM telemetry"] = [
         {"ocpp_id": "CP-001", "status": "Available", "rated_kw": 80.0}
     ]
     result = await run_scenario(scenario, pool=pool)
