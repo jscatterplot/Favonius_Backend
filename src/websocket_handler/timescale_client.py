@@ -339,6 +339,30 @@ class TimescaleClient:
             value = row.get("connector_id")
             return int(value) if value is not None else None
 
+    async def is_transaction_open(self, station_id: str, transaction_id: int) -> bool:
+        """Return True iff a live charging_sessions row exists with end_time IS NULL.
+
+        Used by ``_on_transaction_start`` in the OCPP 1.6 adapter to
+        self-heal stale in-memory state after orphan recovery closes a DB
+        row. The DB is the source of truth; the in-memory transactions
+        dict is a cache that can drift when the recovery loop closes a
+        row without notifying the WS layer.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchval(
+                """
+                SELECT 1 FROM charging_sessions
+                 WHERE station_id = $1
+                   AND transaction_id = $2
+                   AND end_time IS NULL
+                   AND source = 'live'
+                 LIMIT 1
+                """,
+                station_id,
+                transaction_id,
+            )
+            return row is not None
+
     async def _resolve_vehicle_id_from_session(
         self, conn: asyncpg.Connection, session_id: Optional[str]
     ) -> Optional[str]:
@@ -2725,12 +2749,21 @@ class TimescaleClient:
         a reconnect while charging continues; leaving the old disconnect
         timestamp in place would let orphan recovery close an active
         session after ``stale_after_seconds`` elapses.
+
+        ``updated_at`` is bumped to NOW() so the orphan-recovery case-2
+        predicate (``COALESCE(last_meter_seen_at, updated_at, start_time)
+        < NOW() - threshold``) sees the row as freshly touched and skips
+        it. Without this, a sweep that runs between the boot reload and
+        the first post-reconnect MeterValues can close a session that
+        the WS handler has just rehydrated into memory — leaving the
+        in-memory tx_id pointing at a closed DB row.
         """
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE charging_sessions
-                   SET last_seen_at = NULL
+                   SET last_seen_at = NULL,
+                       updated_at   = NOW()
                  WHERE station_id = $1
                    AND end_time IS NULL
                    AND source = 'live'

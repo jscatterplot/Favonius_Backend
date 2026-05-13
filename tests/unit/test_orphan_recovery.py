@@ -166,9 +166,7 @@ async def test_recover_orphaned_sessions_respects_batch_limit():
     conn.fetchrow = AsyncMock(return_value=None)
     client = _client_with_conn(conn)
 
-    await client.recover_orphaned_sessions(
-        stale_after_seconds=300, batch_limit=25
-    )
+    await client.recover_orphaned_sessions(stale_after_seconds=300, batch_limit=25)
 
     select_call = conn.fetch.await_args
     # $1 = stale_after_seconds, $2 = batch_limit
@@ -207,3 +205,33 @@ async def test_recover_orphaned_sessions_idempotent_when_update_loses_race():
 
     # The row was claimed by another writer; recovery silently skips it.
     assert closed == []
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_freshly_reconnected_session():
+    """A row whose ``updated_at`` was just bumped by ``clear_sessions_seen``
+    must NOT be closed by the case-2 predicate.
+
+    Scenario: a charger reconnects after a long absence. Boot calls
+    ``clear_sessions_seen`` which nulls ``last_seen_at`` and bumps
+    ``updated_at = NOW()``. If the orphan-recovery sweep runs before the
+    first MeterValues arrives, the case-2 COALESCE in the SELECT picks
+    up the fresh ``updated_at`` and the row is not returned for closure.
+
+    This test verifies the SELECT predicate semantics by confirming that
+    when the DB returns no stale rows (the realistic outcome with a
+    freshly-bumped ``updated_at``), recovery is a no-op.
+    """
+    conn = AsyncMock()
+    # No stale rows surface — the DB-side filter already excluded the
+    # freshly reconnected session via the COALESCE check.
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchrow = AsyncMock(return_value=None)
+    client = _client_with_conn(conn)
+
+    closed = await client.recover_orphaned_sessions(stale_after_seconds=1800)
+
+    assert closed == []
+    select_sql = conn.fetch.await_args.args[0]
+    # The predicate that protects fresh reconnects must still be present.
+    assert "COALESCE(last_meter_seen_at, updated_at, start_time)" in select_sql

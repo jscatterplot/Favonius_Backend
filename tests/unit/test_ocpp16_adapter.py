@@ -85,6 +85,10 @@ def mock_timescale() -> MagicMock:
     tc.next_transaction_id = AsyncMock(return_value=4242)
     tc.next_charging_profile_id = AsyncMock(return_value=123456)
     tc.store_security_event = AsyncMock()
+    # Default to "DB confirms open" so the existing ConcurrentTx-rejection
+    # test path keeps its semantics. Tests that exercise the self-heal
+    # branch override this per-test to return False.
+    tc.is_transaction_open = AsyncMock(return_value=True)
     return tc
 
 
@@ -564,10 +568,15 @@ class TestOCPP16SessionCallbacks:
     async def test_on_transaction_start_rejects_active_connector_with_concurrent_tx(
         self, session, mock_timescale, mock_message_handler
     ) -> None:
-        """OCPP 1.6 ConcurrentTx: EVSE already in transaction (not card Blocked)."""
+        """OCPP 1.6 ConcurrentTx: EVSE already in transaction (not card Blocked).
+
+        DB confirms the in-memory cache: tx is genuinely open. Authorize
+        is skipped and the rejection is returned without touching the
+        message handler.
+        """
         from ocpp.v16.enums import AuthorizationStatus
 
-        session._cp.transactions[1] = MagicMock()
+        session._cp.transactions[1] = 999
         result = await session._on_transaction_start(
             cp_id="test_station_001",
             connector_id=1,
@@ -576,7 +585,162 @@ class TestOCPP16SessionCallbacks:
             timestamp="2026-01-01T00:00:00Z",
         )
         assert result == AuthorizationStatus.concurrent_tx
+        mock_timescale.is_transaction_open.assert_awaited_once_with("test_station_001", 999)
         mock_timescale.lookup_id_tag.assert_not_awaited()
+        mock_message_handler._push_to_main_api.assert_not_awaited()
+        # The cache entry survives a confirmed ConcurrentTx so a subsequent
+        # retry against the same still-open tx is also rejected.
+        assert session._cp.transactions[1] == 999
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_self_heals_when_db_says_closed(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        """In-memory cache holds a tx_id whose DB row is already closed.
+
+        Self-heal: drop the cache entry, fall through to Authorize +
+        Accept. This is the production failure mode where orphan recovery
+        closed the row but the WS layer never saw it.
+        """
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        mock_timescale.is_transaction_open = AsyncMock(return_value=False)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert result == AuthorizationStatus.accepted
+        assert 1 not in session._cp.transactions
+        mock_timescale.is_transaction_open.assert_awaited_once_with("test_station_001", 999)
+        mock_timescale.lookup_id_tag.assert_any_await("TAG-001", station_id="test_station_001")
+        assert session._pending_start is not None
+        assert session._pending_start["connector_id"] == 1
+        assert session._pending_start["meter_start_wh"] == 0
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_self_heal_clears_current_transaction_id(
+        self, session, mock_timescale
+    ) -> None:
+        """Self-heal also clears the ``current_transaction_id`` backward-compat field."""
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        session._cp.current_transaction_id = 999
+        mock_timescale.is_transaction_open = AsyncMock(return_value=False)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.accepted
+        assert session._cp.current_transaction_id is None
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_self_heal_preserves_other_current_transaction_id(
+        self, session, mock_timescale
+    ) -> None:
+        """Self-healing tx 999 must not clear current_transaction_id when it points elsewhere."""
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        # Connector 2 still has an active session that we should leave alone.
+        session._cp.current_transaction_id = 1234
+        mock_timescale.is_transaction_open = AsyncMock(return_value=False)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.accepted
+        assert session._cp.current_transaction_id == 1234
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_db_error_keeps_concurrent_tx_default(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        """A DB blip on ``is_transaction_open`` must fail closed (reject), not open."""
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        mock_timescale.is_transaction_open = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.concurrent_tx
+        mock_timescale.lookup_id_tag.assert_not_awaited()
+        mock_message_handler._push_to_main_api.assert_not_awaited()
+        # Cache entry preserved so subsequent retries continue to fail
+        # closed until the DB recovers.
+        assert session._cp.transactions[1] == 999
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_post_authorize_race_check_blocks_sibling(
+        self, session, mock_message_handler
+    ) -> None:
+        """Sibling StartTransaction beats us between Authorize and _pending_start stash.
+
+        Simulates a charger retry storm: the in-memory cache is empty when
+        we enter, but a concurrent task populates ``_cp.transactions[1]``
+        while we ``await self._authz.authorize(...)``. The post-Authorize
+        re-check must catch this and return ConcurrentTx without stashing
+        ``_pending_start`` (which would otherwise produce a second open
+        ``charging_sessions`` row on the same connector).
+        """
+        from ocpp.v16.enums import AuthorizationStatus
+
+        from src.websocket_handler.rfid_authorization import (
+            RFIDAuthDecision,
+            RFIDAuthStatus,
+        )
+
+        async def _authorize_then_seed_dict(cp_id, id_tag, source):
+            # A sibling racer stashed its tx in the dict while we awaited.
+            session._cp.transactions[1] = 5555
+            return RFIDAuthDecision(
+                status=RFIDAuthStatus.ACCEPTED,
+                source="test",
+                reason="race-test",
+                vehicle_id="vehicle-1",
+                driver_id=None,
+                card_id=None,
+            )
+
+        session._authz = MagicMock()
+        session._authz.authorize = AsyncMock(side_effect=_authorize_then_seed_dict)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.concurrent_tx
+        # _pending_start must NOT be populated — that would let the
+        # framework call _next_transaction_id and create a duplicate row.
+        assert session._pending_start is None
         mock_message_handler._push_to_main_api.assert_not_awaited()
 
     @pytest.mark.asyncio
