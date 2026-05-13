@@ -77,6 +77,14 @@ CREATE TABLE IF NOT EXISTS decisions (
     PRIMARY KEY (id, timestamp)
 );
 
+
+-- Sidecar identity table to guarantee global uniqueness of decisions.id
+-- safely under concurrency (hypertable unique constraints must include
+-- the partition key, so we cannot enforce UNIQUE(id) directly on decisions).
+CREATE TABLE IF NOT EXISTS decision_identity_keys (
+    id UUID PRIMARY KEY
+);
+
 SELECT create_hypertable(
     'decisions',
     'timestamp',
@@ -125,20 +133,24 @@ $$;
 
 
 -- Enforce logical decision identity uniqueness on `id` even though the
--- hypertable primary key must include `timestamp`.
+-- hypertable primary key must include `timestamp`. We reserve IDs in a
+-- sidecar table with a real PRIMARY KEY so concurrency is safely handled
+-- by PostgreSQL's unique index machinery.
 CREATE OR REPLACE FUNCTION decisions_enforce_unique_id()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM decisions WHERE id = NEW.id LIMIT 1) THEN
+    INSERT INTO decision_identity_keys (id)
+    VALUES (NEW.id);
+
+    RETURN NEW;
+EXCEPTION
+    WHEN unique_violation THEN
         RAISE EXCEPTION
             'duplicate decisions.id: % already exists',
             NEW.id
         USING ERRCODE = 'unique_violation';
-    END IF;
-
-    RETURN NEW;
 END;
 $$;
 
@@ -152,4 +164,11 @@ DROP TRIGGER IF EXISTS trg_decisions_append_only ON decisions;
 CREATE TRIGGER trg_decisions_append_only
     BEFORE UPDATE OR DELETE ON decisions
     FOR EACH ROW
+    EXECUTE FUNCTION decisions_append_only_guard();
+
+
+DROP TRIGGER IF EXISTS trg_decisions_append_only_truncate ON decisions;
+CREATE TRIGGER trg_decisions_append_only_truncate
+    BEFORE TRUNCATE ON decisions
+    FOR EACH STATEMENT
     EXECUTE FUNCTION decisions_append_only_guard();
