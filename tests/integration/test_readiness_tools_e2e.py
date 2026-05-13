@@ -304,6 +304,7 @@ async def test_readiness_tools_end_to_end(seeded):
         static_pool=static_pool,
         ts_pool=ts_pool,
         auth=_auth_for([DEPOT_A]),
+        depot_id=DEPOT_A,
         now=now,
     )
 
@@ -375,6 +376,7 @@ async def test_cross_org_isolation_e2e(seeded):
         static_pool=static_pool,
         ts_pool=ts_pool,
         auth=_auth_for([other_depot]),
+        depot_id=other_depot,
         now=now,
     )
 
