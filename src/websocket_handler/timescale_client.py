@@ -2670,6 +2670,15 @@ class TimescaleClient:
                        AND transaction_id = $2
                        AND end_time IS NULL
                        AND source = 'live'
+                       AND (
+                           (last_seen_at IS NOT NULL
+                            AND last_seen_at < NOW() - make_interval(secs => $6))
+                           OR
+                           (last_seen_at IS NULL
+                            AND start_time < NOW() - make_interval(secs => $6)
+                            AND COALESCE(last_meter_seen_at, updated_at, start_time)
+                                < NOW() - make_interval(secs => $6))
+                       )
                  RETURNING session_id, station_id, transaction_id,
                            meter_start_wh, meter_stop_wh, energy_delivered_kwh
                     """,
@@ -2678,6 +2687,7 @@ class TimescaleClient:
                     close_time,
                     last_meter_wh,
                     energy_kwh,
+                    stale_after_seconds,
                 )
                 if updated is not None:
                     closed.append(dict(updated))
