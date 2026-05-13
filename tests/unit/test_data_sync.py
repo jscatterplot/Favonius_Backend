@@ -155,6 +155,79 @@ class TestDataSyncService:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_start_reuses_injected_timescale_client_pool(self, config, supabase_client):
+        """When a TimescaleClient is injected, start() must share its pool.
+
+        Connection-pressure regression guard: opening a second 1-10 pool
+        against the same Postgres was exhausting Supabase slots during
+        restart loops. The shared-pool path must NOT call
+        ``asyncpg.create_pool``.
+        """
+        live_pool = AsyncMock()
+        live_client = MagicMock()
+        live_client.pg_pool = live_pool
+
+        service = DataSyncService(config, supabase_client, timescale_client=live_client)
+
+        with patch("asyncpg.create_pool", new_callable=AsyncMock) as mock_create_pool:
+            await service.start()
+
+        try:
+            assert service.timescale_pool is live_pool
+            mock_create_pool.assert_not_called()
+            assert service._owns_timescale_pool is False
+        finally:
+            await service.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_stop_does_not_close_shared_pool(self, config, supabase_client):
+        """A pool owned by the injected ``TimescaleClient`` is not closed by stop().
+
+        The TimescaleClient is the only owner; closing it from here would
+        rip the rug out from every other component using that same pool.
+        """
+        live_pool = AsyncMock()
+        live_client = MagicMock()
+        live_client.pg_pool = live_pool
+
+        service = DataSyncService(config, supabase_client, timescale_client=live_client)
+        await service.start()
+        await service.stop()
+
+        live_pool.close.assert_not_called()
+        assert service.sync_running is False
+        assert service.timescale_pool is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_start_raises_when_injected_client_has_no_pool(self, config, supabase_client):
+        """A half-initialised client (``pg_pool is None``) must fail loudly.
+
+        Silently fanning out queries to ``None.acquire()`` would surface
+        as confusing AttributeErrors on every sync tick.
+        """
+        live_client = MagicMock()
+        live_client.pg_pool = None
+
+        service = DataSyncService(config, supabase_client, timescale_client=live_client)
+
+        with pytest.raises(RuntimeError, match="pg_pool"):
+            await service.start()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_start_raises_when_neither_config_nor_client_provided(
+        self, config, supabase_client
+    ):
+        """A service with no way to reach TimescaleDB must reject ``start()``."""
+        service = DataSyncService(config, supabase_client)
+
+        with pytest.raises(RuntimeError, match="timescale_client or "):
+            await service.start()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_stop_no_pool(self, data_sync_service):
         """Test stopping when no pool exists."""
         data_sync_service.sync_running = True

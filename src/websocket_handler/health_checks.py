@@ -4,10 +4,12 @@ import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
+import asyncpg
+
+from src.db.postgres_url import ssl_context_for_postgres_sslmode
 
 from .config import Config
 from .resilience_manager import HealthCheck
-
 
 # Module-level timestamp set when the WebSocket server binds its port.
 # The WebSocket health check skips failures during the grace period so
@@ -90,26 +92,44 @@ def _make_timescale_check(config: Config, client: Optional[Any]) -> Any:
     """Return an async health-check function for TimescaleDB.
 
     Uses the live *client* pool when available; falls back to a one-shot
-    connection (same as before) when the client is not yet initialised.
+    ``asyncpg.connect`` when the client is not yet initialised. The older
+    fallback instantiated a full ``TimescaleClient`` whose ``connect()``
+    spins up the 20-100 connection ``EnhancedConnectionPool`` just to run
+    a ``SELECT 1``. On a Postgres instance that is already near its
+    ``max_connections`` ceiling, that disposable pool can be the
+    difference between a healthy boot and a connection-slot-exhaustion
+    crash loop. A single transient connection is enough to answer
+    "can we reach the DB?" and releases its slot the moment we close it.
     """
     if client is not None:
+
         async def _check_with_live_client() -> bool:
             return await client.health_check()
+
         return _check_with_live_client
 
-    # Fallback: create a disposable connection (used during early startup)
-    from .timescale_client import TimescaleClient
-
     async def _check_fallback() -> bool:
+        conn: Optional[asyncpg.Connection] = None
         try:
-            tc = TimescaleClient(config.timescale)
-            await tc.connect()
-            try:
-                return await tc.health_check()
-            finally:
-                await tc.disconnect()
+            conn = await asyncpg.connect(
+                host=config.timescale.host,
+                port=config.timescale.port,
+                database=config.timescale.database,
+                user=config.timescale.user,
+                password=config.timescale.password,
+                ssl=ssl_context_for_postgres_sslmode(str(config.timescale.sslmode)),
+                timeout=5.0,
+            )
+            result = await conn.fetchval("SELECT 1")
+            return result == 1
         except Exception:
             return False
+        finally:
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
 
     return _check_fallback
 
@@ -120,8 +140,10 @@ def _make_supabase_check(config: Config, client: Optional[Any]) -> Any:
     Uses the live *client* pool when available.
     """
     if client is not None:
+
         async def _check_with_live_client() -> bool:
             return await client.health_check()
+
         return _check_with_live_client
 
     from .supabase_client import SupabaseClient
@@ -146,6 +168,7 @@ def _make_websocket_check(config: Config) -> Any:
     Returns True during the startup grace period so the resilience manager
     does not log spurious failures before the server has bound its port.
     """
+
     async def _check() -> bool:
         # Honour startup grace period
         if _ws_bind_time is None:
