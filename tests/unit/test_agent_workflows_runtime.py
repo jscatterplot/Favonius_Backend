@@ -1121,7 +1121,7 @@ class TestRuntimeDefensive:
         assert decision.disposition == Disposition.PENDING
 
     @pytest.mark.asyncio
-    async def test_permission_tier_kwarg_appears_in_system_prompt_and_user_message(
+    async def test_permission_tier_kwarg_appears_in_user_message_not_cached_system(
         self,
         workflow: Workflow,
         depot_id: UUID,
@@ -1131,7 +1131,8 @@ class TestRuntimeDefensive:
     ) -> None:
         # Sprint 1 stores per-(workflow, depot) tier in workflow_tiers,
         # not on the workflow row. The runtime takes the resolved tier
-        # as a kwarg and bakes it into the prompts.
+        # as a kwarg and passes it in the per-turn user message only so
+        # the cached system block stays identical across depots.
         responses = [
             _response(
                 [
@@ -1155,7 +1156,7 @@ class TestRuntimeDefensive:
         )
 
         call_kwargs = client._create_mock.call_args.kwargs
-        assert "act_and_notify" in call_kwargs["system"][0]["text"]
+        assert "act_and_notify" not in call_kwargs["system"][0]["text"]
         assert "act_and_notify" in call_kwargs["messages"][0]["content"]
 
     @pytest.mark.asyncio

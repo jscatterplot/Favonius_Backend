@@ -227,10 +227,10 @@ class WorkflowAgent:
         ``permission_tier`` is sourced by the caller via Sprint 1's
         :func:`~src.api.agent_workflows.repository.get_tier` (per
         ``(workflow_id, depot_id)``) and passed in here. The runtime
-        never queries the database; it just bakes the tier into the
-        system prompt and records nothing tier-derived on the
-        :class:`Decision` itself (per-depot tier lives in
-        ``workflow_tiers``, not on each row).
+        never queries the database; it includes the tier in the
+        per-turn user message (not the cached system block) and records
+        nothing tier-derived on the :class:`Decision` itself (per-depot
+        tier lives in ``workflow_tiers``, not on each row).
 
         Returns:
             The :class:`Decision` row written to the repo (or
@@ -247,14 +247,6 @@ class WorkflowAgent:
                 bug, surfaced eagerly.
             WorkflowRuntimeError: Any other runtime invariant breach.
         """
-        # ``Decision.organization_id`` is NOT NULL in the Sprint 1 schema
-        # (migration 037). Reject turns whose auth context has no org —
-        # there is no safe scope we can attribute the audit row to.
-        if auth_context.organization_id is None:
-            raise WorkflowRuntimeError(
-                "auth_context.organization_id is required to write a Decision row"
-            )
-
         guard = HardConstraintGuard(self._constraints)
         tool_calls: list[ToolCall] = []
         decision_output: dict[str, Any] = {}
@@ -265,6 +257,14 @@ class WorkflowAgent:
         start_perf = time.perf_counter()
 
         try:
+            # ``Decision.organization_id`` is NOT NULL in the Sprint 1 schema
+            # (migration 037). Reject turns whose auth context has no org —
+            # there is no safe scope we can attribute the audit row to.
+            if auth_context.organization_id is None:
+                raise WorkflowRuntimeError(
+                    "auth_context.organization_id is required to write a Decision row"
+                )
+
             # Build the tools array (allow-listed + terminator) up-front
             # so an unknown name in ``allowed_tools`` fails fast.
             if EMIT_DECISION_TOOL_NAME in workflow.allowed_tools:
@@ -275,7 +275,7 @@ class WorkflowAgent:
             tools = tool_registry.anthropic_schemas(workflow.allowed_tools)
             tools.append(_emit_decision_schema())
 
-            system_blocks = self._build_system_prompt(workflow, permission_tier)
+            system_blocks = self._build_system_prompt(workflow)
             messages: list[dict[str, Any]] = [
                 {
                     "role": "user",
@@ -468,17 +468,13 @@ class WorkflowAgent:
 
     # ── Prompt building ────────────────────────────────────────────────
 
-    def _build_system_prompt(
-        self,
-        workflow: Workflow,
-        permission_tier: PermissionTier,
-    ) -> list[dict[str, Any]]:
+    def _build_system_prompt(self, workflow: Workflow) -> list[dict[str, Any]]:
         """Return the Anthropic ``system`` block(s) with prompt caching.
 
         The block is keyed on the workflow's static identity (name,
-        version, prompt body, constraint values) plus the tier. The
-        depot-specific and per-turn parts go in the user message so
-        they don't bust the prefix cache.
+        version, prompt body, constraint values). Depot-specific values
+        (including ``permission_tier``) go in the user message so they
+        do not bust the prefix cache across depots.
         """
         constraints = self._constraints
         max_grid_line = (
@@ -486,14 +482,8 @@ class WorkflowAgent:
             if constraints.max_grid_kw is not None
             else "- Site grid power must not exceed the depot's max_grid_kw at any timestep."
         )
-        tier_line = (
-            f"Active permission tier: {permission_tier.value}. "
-            "Read this strictly — propose only what this tier permits."
-        )
         body = f"""\
 You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workflow.version}).
-
-{tier_line}
 
 ## Workflow brief
 {workflow.description}
