@@ -8429,7 +8429,7 @@ async def _record_admin_action(
         target_id=target_id,
         metadata=metadata or {},
     )
-    await write_admin_audit_row(db_pools.static, row, strict=strict)
+    await write_admin_audit_row(db_pools.ts, row, strict=strict)
 
 
 @app.get(

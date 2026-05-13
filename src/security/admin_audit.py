@@ -76,7 +76,9 @@ async def write_admin_audit_row(pool: Any, row: AdminAuditRow, *, strict: bool =
     """Insert a single audit_log row.
 
     Args:
-        pool: asyncpg pool (typically static Supabase pool).
+        pool: asyncpg pool. ``audit_log`` lives in TimescaleDB (mig 021), so
+            production callers pass ``db_pools.ts``. The legacy parameter
+            name is preserved for backward compatibility with existing tests.
         row: AdminAuditRow to insert.
         strict: When True, propagate insert failures as
             ``AdminAuditWriteError`` so the caller can fail the request
