@@ -156,6 +156,7 @@ async def test_recover_orphaned_sessions_filters_to_live_source():
     assert "last_seen_at IS NOT NULL" in select_sql
     assert "last_seen_at < NOW() - make_interval(secs => $1)" in select_sql
     assert "last_seen_at IS NULL" not in select_sql
+    assert "COALESCE(last_meter_seen_at, updated_at, start_time)" in select_sql
 
 
 @pytest.mark.asyncio
