@@ -76,7 +76,7 @@ async def workflow_test_db_pool():
             max_size=4,
             command_timeout=15,
         )
-    except (OSError, Exception) as exc:  # asyncpg.PostgresError subclasses Exception
+    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
         pytest.skip(f"workflow-golden tests: test database unavailable: {exc}")
 
     try:

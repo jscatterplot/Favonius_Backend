@@ -29,9 +29,12 @@ from __future__ import annotations
 import difflib
 import json
 import re
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
+
+import jsonschema
 from uuid import UUID, uuid4
 
 from src.api.agent.auth_context import AuthContext
@@ -147,6 +150,29 @@ def _validate_scenario(scenario: dict) -> None:
                 f"scenario {scenario['id']!r}: llm_trace[{i}] missing 'content'"
             )
 
+
+
+
+def _scenario_schema() -> dict[str, Any]:
+    schema_path = Path(__file__).resolve().parents[4] / "tests/golden/workflows/_schema.yaml"
+    if not schema_path.exists():
+        raise ScenarioLoadError(f"scenario schema not found at {schema_path}")
+
+    import yaml
+
+    schema = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+    if not isinstance(schema, dict):
+        raise ScenarioLoadError("scenario schema must be a mapping")
+    return schema
+
+
+def _validate_against_schema(scenario: dict) -> None:
+    try:
+        jsonschema.validate(instance=scenario, schema=_scenario_schema())
+    except jsonschema.ValidationError as exc:
+        path = ".".join(str(p) for p in exc.absolute_path)
+        where = f" at {path}" if path else ""
+        raise ScenarioLoadError(f"scenario schema validation failed{where}: {exc.message}") from exc
 
 # ── Time resolution ───────────────────────────────────────────────────────
 
@@ -452,6 +478,7 @@ class _MessagesFake:
     def __init__(self, responses: list[_Response]) -> None:
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
+        self._last_response: Optional[_Response] = None
 
     async def create(self, **kwargs: Any) -> _Response:
         # Record what the runtime asked for so tests can assert that
@@ -462,7 +489,33 @@ class _MessagesFake:
                 "FakeAnthropicClient exhausted: scenario llm_trace too short "
                 f"(call #{len(self.calls)} unmet)"
             )
-        return self._responses.pop(0)
+
+        messages = kwargs.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise AssertionError(
+                "FakeAnthropicClient requires non-empty 'messages' on every create() call"
+            )
+
+        if self._last_response is not None:
+            prev_had_tool_use = any(block.type == "tool_use" for block in self._last_response.content)
+            if prev_had_tool_use:
+                has_tool_result = any(
+                    isinstance(msg, dict)
+                    and isinstance(msg.get("content"), list)
+                    and any(
+                        isinstance(block, dict) and block.get("type") == "tool_result"
+                        for block in msg["content"]
+                    )
+                    for msg in messages
+                )
+                if not has_tool_result:
+                    raise AssertionError(
+                        "FakeAnthropicClient expected tool_result context after tool_use response"
+                    )
+
+        response = self._responses.pop(0)
+        self._last_response = response
+        return response
 
 
 class FakeAnthropicClient:
@@ -839,6 +892,7 @@ def load_scenario(text: str) -> dict:
     scenario = yaml.safe_load(text)
     if not isinstance(scenario, dict):
         raise ScenarioLoadError("scenario YAML must be a mapping at the top level")
+    _validate_against_schema(scenario)
     _validate_scenario(scenario)
     return scenario
 
