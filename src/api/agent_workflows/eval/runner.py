@@ -353,6 +353,8 @@ async def _insert_chargers(conn: Any, chargers: Iterable[dict], depot_id: UUID) 
 
 
 async def _insert_drivers(conn: Any, drivers: Iterable[dict], depot_id: UUID) -> None:
+    if not await _table_exists(conn, "drivers"):
+        return
     for d in drivers:
         await conn.execute(
             """

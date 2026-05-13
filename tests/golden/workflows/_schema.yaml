@@ -76,7 +76,7 @@ properties:
     format: date-time
 
   user_input:
-    type: [string, "null"]
+    type: [object, "null"]
     description: |
       Optional operator message passed through to ``WorkflowAgent.run_turn`` as ``user_input``.
 
