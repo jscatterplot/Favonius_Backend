@@ -383,6 +383,19 @@ async def test_start_transaction_self_heals_after_orphan_recovery(
     await asyncio.sleep(0.05)  # let the delayed replay task complete
     assert session._cp.transactions[1] == stale_tx_id
 
+    # Boot calls clear_sessions_seen, which sets updated_at = NOW(); rewind so
+    # case-2 orphan recovery still sees this row as stale (no MeterValues).
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE charging_sessions
+               SET updated_at = start_time
+             WHERE station_id = $1 AND transaction_id = $2
+            """,
+            station_id,
+            stale_tx_id,
+        )
+
     # 3. Orphan recovery closes the row (no MeterValues, > stale_after).
     closed = await timescale_client.recover_orphaned_sessions(stale_after_seconds=1, batch_limit=10)
     assert any(row["transaction_id"] == stale_tx_id for row in closed)
