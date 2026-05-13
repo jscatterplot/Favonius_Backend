@@ -2589,8 +2589,13 @@ class TimescaleClient:
             WebSocket close hook stamps this column, so 'old' means the
             charger socket has been closed for at least that long), or
           * ``last_seen_at IS NULL`` AND ``start_time`` is older than
-            ``stale_after_seconds`` (defensive: covers handler restarts
-            that never had a chance to stamp last_seen_at).
+            ``stale_after_seconds`` AND the row has no recent handler
+            activity (``COALESCE(last_meter_seen_at, updated_at,
+            start_time)`` older than the same threshold). Covers handler
+            restarts that never stamped ``last_seen_at``, and excludes
+            live sessions (MeterValues refresh ``updated_at`` /
+            ``last_meter_seen_at``) including after ``clear_sessions_seen``
+            nulls ``last_seen_at`` on reconnect.
 
         For each orphaned row the synthesized ``meter_stop_wh`` is the
         running ``last_meter_wh`` from migration 038 — populated by the
@@ -2633,7 +2638,9 @@ class TimescaleClient:
                         AND last_seen_at < NOW() - make_interval(secs => $1))
                        OR
                        (last_seen_at IS NULL
-                        AND start_time < NOW() - make_interval(secs => $1))
+                        AND start_time < NOW() - make_interval(secs => $1)
+                        AND COALESCE(last_meter_seen_at, updated_at, start_time)
+                            < NOW() - make_interval(secs => $1))
                    )
                  ORDER BY COALESCE(last_seen_at, start_time) ASC
                  LIMIT $2

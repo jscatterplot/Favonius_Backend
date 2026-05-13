@@ -194,6 +194,7 @@ async def test_recover_orphaned_sessions_filters_to_live_source():
     assert "source = 'live'" in select_sql
     assert "transaction_id IS NOT NULL" in select_sql
     assert "end_time IS NULL" in select_sql
+    assert "COALESCE(last_meter_seen_at, updated_at, start_time)" in select_sql
 
 
 @pytest.mark.asyncio
