@@ -1,25 +1,31 @@
 """Workflow agent runtime — one turn of one workflow.
 
-This is the Sprint 2 deliverable. The runtime composes:
+Sprint 2 of the Depot Agent. The runtime composes:
 
 - The Anthropic Messages API with tool-use, called in a bounded loop.
-- The workflow's allow-list of tools, enforced strictly before each
-  dispatch (the model never sees a tool outside the allow-list plus the
-  runtime's reserved ``emit_decision`` terminator).
+- The workflow's allow-list of tools (from
+  :class:`~src.api.agent_workflows.models.Workflow`), enforced strictly
+  before each dispatch. The model never sees a tool outside the
+  allow-list plus the runtime's reserved ``emit_decision`` terminator.
 - The hard-constraint guard, which rejects violating tool inputs at
   dispatch time and filters violating entries out of the LLM's final
-  ``proposed_actions`` array.
-- The :class:`~src.api.agent_workflows.schemas.Decision` audit record,
-  written once at the end with ``disposition='pending'`` (the agent
-  itself never writes ``auto_executed``; humans, or a later promotion
-  pathway, do).
+  ``proposed_actions`` array (PRD §10.3).
+- The :class:`~src.api.agent_workflows.models.Decision` audit record,
+  written once at the end with ``disposition=Disposition.PENDING``. The
+  agent itself never writes ``auto_executed`` (PRD §9.2); humans, or a
+  later promotion pathway, advance the disposition.
 
-Prompt caching follows the same pattern as
-``src/api/agent/llm.py``: the system block carries
-``cache_control={"type": "ephemeral"}`` so repeated turns of the same
-workflow hit Anthropic's prefix cache.
+Prompt caching follows the same pattern as ``src/api/agent/llm.py``:
+the system block carries ``cache_control={"type": "ephemeral"}`` so
+repeated turns of the same workflow hit Anthropic's prefix cache.
 
-The runtime is HTTP-less — wiring into FastAPI lands in a later sprint.
+Sprint 1 owns the schemas (``models.py``), the schema migration
+(037), and the canonical writer (``repository.insert_decision``). The
+runtime depends on those types directly and writes through a thin
+:class:`~src.api.agent_workflows.repo.DecisionRepo` Protocol so tests
+can stub the database.
+
+The runtime is HTTP-less — wiring into FastAPI lands in Sprint 3.
 """
 
 from __future__ import annotations
@@ -38,13 +44,14 @@ from src.api.agent_workflows.constraints import (
     DepotConstraints,
     HardConstraintGuard,
 )
-from src.api.agent_workflows.repo import DecisionRepo
-from src.api.agent_workflows.schemas import (
+from src.api.agent_workflows.models import (
     Decision,
+    Disposition,
     PermissionTier,
     ToolCall,
     Workflow,
 )
+from src.api.agent_workflows.repo import DecisionRepo
 from src.api.agent_workflows.tools import (
     ToolNotRegisteredError,
     ToolRegistry,
@@ -66,6 +73,12 @@ logger = logging.getLogger(__name__)
 EMIT_DECISION_TOOL_NAME: str = "emit_decision"
 
 
+# Sprint-1's launch default for a workflow without an explicit
+# per-depot tier (PRD §9.2 — "All V1 workflows ship at inform or
+# draft_and_wait. No workflow ships at autonomous in V1.").
+DEFAULT_PERMISSION_TIER: PermissionTier = PermissionTier.DRAFT_AND_WAIT
+
+
 class WorkflowRuntimeError(RuntimeError):
     """Base class for runtime failures the caller may want to distinguish."""
 
@@ -77,8 +90,8 @@ class ToolNotAllowedError(WorkflowRuntimeError):
     the upstream service hands the runtime a workflow whose
     ``allowed_tools`` does not match the tools array the LLM was given —
     or if the LLM hallucinates a tool name. Either way, the turn aborts
-    and the Decision is written with ``status='tool_not_allowed'`` on the
-    metrics side; the exception propagates to the caller.
+    and the metric carries ``status='tool_not_allowed'``; the exception
+    propagates to the caller.
     """
 
 
@@ -103,19 +116,19 @@ class _ClientFacade(Protocol):
 
 
 def _canonical_tool_calls_hash(tool_calls: Sequence[ToolCall]) -> str:
-    """Return a stable sha256 over the tool-call inputs and outputs.
+    """Return a stable sha256 over the tool-call arguments and results.
 
-    Excludes ``duration_ms`` because wall-clock varies across runs. The
-    canonical form is a JSON dump with sorted keys and ``default=str``
-    so UUIDs and datetimes serialise deterministically. Mirrors the
-    inputs-hash contract in PRD §5.3 / §10.4.
+    The canonical form is a JSON dump with sorted keys and
+    ``default=str`` so UUIDs and datetimes serialise deterministically.
+    Mirrors the inputs-hash contract in PRD §5.3 / §10.4.
     """
     serialisable = [
         {
             "name": tc.name,
-            "input": tc.input,
-            "output": tc.output,
-            "is_error": tc.is_error,
+            "arguments": tc.arguments,
+            "result": tc.result,
+            "ok": tc.ok,
+            "error": tc.error,
         }
         for tc in tool_calls
     ]
@@ -127,17 +140,6 @@ def _canonical_tool_calls_hash(tool_calls: Sequence[ToolCall]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
-
-
-def _coerce_output_to_dict(value: Any) -> dict[str, Any]:
-    """Coerce a tool return value to a JSON-able dict for the audit row.
-
-    Dicts pass through. Anything else gets wrapped in ``{"value": ...}``
-    so the audit shape is uniform.
-    """
-    if isinstance(value, dict):
-        return value
-    return {"value": value}
 
 
 def _emit_decision_schema() -> dict[str, Any]:
@@ -215,14 +217,24 @@ class WorkflowAgent:
         auth_context: AuthContext,
         tool_registry: ToolRegistry,
         user_input: dict[str, Any] | None = None,
+        *,
+        permission_tier: PermissionTier = DEFAULT_PERMISSION_TIER,
     ) -> Decision:
         """Run one turn of ``workflow`` against the agent's Anthropic client.
 
+        ``permission_tier`` is sourced by the caller via Sprint 1's
+        :func:`~src.api.agent_workflows.repository.get_tier` (per
+        ``(workflow_id, depot_id)``) and passed in here. The runtime
+        never queries the database; it just bakes the tier into the
+        system prompt and records nothing tier-derived on the
+        :class:`Decision` itself (per-depot tier lives in
+        ``workflow_tiers``, not on each row).
+
         Returns:
-            The :class:`Decision` row written to the repo (or constructed
-            in memory if no repo is configured). ``disposition`` is
-            always ``"pending"`` — the agent never writes
-            ``auto_executed``.
+            The :class:`Decision` row written to the repo (or
+            constructed in memory if no repo is configured).
+            ``disposition`` is always :attr:`Disposition.PENDING` — the
+            agent never writes ``auto_executed``.
 
         Raises:
             ToolNotAllowedError: The LLM tried to call a tool that is
@@ -233,6 +245,14 @@ class WorkflowAgent:
                 bug, surfaced eagerly.
             WorkflowRuntimeError: Any other runtime invariant breach.
         """
+        # ``Decision.organization_id`` is NOT NULL in the Sprint 1 schema
+        # (migration 037). Reject turns whose auth context has no org —
+        # there is no safe scope we can attribute the audit row to.
+        if auth_context.organization_id is None:
+            raise WorkflowRuntimeError(
+                "auth_context.organization_id is required to write a Decision row"
+            )
+
         guard = HardConstraintGuard(self._constraints)
         tool_calls: list[ToolCall] = []
         decision_output: dict[str, Any] = {}
@@ -243,12 +263,12 @@ class WorkflowAgent:
         start_perf = time.perf_counter()
 
         try:
-            # Build the tools array (allow-listed + terminator) up-front so
-            # an unknown name in ``allowed_tools`` fails fast.
+            # Build the tools array (allow-listed + terminator) up-front
+            # so an unknown name in ``allowed_tools`` fails fast.
             tools = tool_registry.anthropic_schemas(workflow.allowed_tools)
             tools.append(_emit_decision_schema())
 
-            system_blocks = self._build_system_prompt(workflow)
+            system_blocks = self._build_system_prompt(workflow, permission_tier)
             messages: list[dict[str, Any]] = [
                 {
                     "role": "user",
@@ -257,6 +277,7 @@ class WorkflowAgent:
                         workflow=workflow,
                         auth_context=auth_context,
                         user_input=user_input,
+                        permission_tier=permission_tier,
                     ),
                 }
             ]
@@ -322,17 +343,15 @@ class WorkflowAgent:
 
                     # Pre-dispatch hard-constraint guard.
                     violation = guard.validate_action(block_input)
-                    t0 = time.perf_counter()
-                    output: Any
-                    is_error: bool
                     if violation is not None:
-                        output = _violation_to_error_envelope(violation)
-                        is_error = True
+                        result: Any = _violation_to_error_envelope(violation)
+                        ok = False
+                        err = violation.detail
                     else:
                         try:
-                            raw_output = await tool_registry.dispatch(name, block_input)
-                            output = _coerce_output_to_dict(raw_output)
-                            is_error = False
+                            result = await tool_registry.dispatch(name, block_input)
+                            ok = True
+                            err = None
                         except ToolNotRegisteredError:
                             # An allow-listed name pointing at nothing is
                             # a hard configuration bug.
@@ -343,21 +362,21 @@ class WorkflowAgent:
                                 workflow.name,
                                 name,
                             )
-                            output = {
+                            result = {
                                 "error": "tool_failure",
                                 "tool": name,
                                 "detail": str(exc),
                             }
-                            is_error = True
-                    duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
+                            ok = False
+                            err = str(exc)
 
                     tool_calls.append(
                         ToolCall(
                             name=name,
-                            input=block_input,
-                            output=output,
-                            duration_ms=duration_ms,
-                            is_error=is_error,
+                            arguments=block_input,
+                            result=result,
+                            ok=ok,
+                            error=err,
                         )
                     )
 
@@ -365,8 +384,8 @@ class WorkflowAgent:
                         {
                             "type": "tool_result",
                             "tool_use_id": block_id,
-                            "content": json.dumps(output, default=str),
-                            "is_error": is_error,
+                            "content": json.dumps(result, default=str),
+                            "is_error": not ok,
                         }
                     )
 
@@ -380,9 +399,7 @@ class WorkflowAgent:
                 stop_reason = getattr(response, "stop_reason", None)
                 if stop_reason == "end_turn":
                     # No more tool use coming; exit even though the model
-                    # didn't call the terminator (handled at top of loop
-                    # via the empty-tool-use branch on next iteration —
-                    # but stop_reason already signals it, so break now).
+                    # didn't call the terminator.
                     break
             else:
                 # Exhausted iterations without the model calling
@@ -404,12 +421,13 @@ class WorkflowAgent:
                 id=uuid4(),
                 workflow_id=workflow.id,
                 depot_id=depot_id,
+                organization_id=auth_context.organization_id,
                 timestamp=datetime.now(timezone.utc),
                 inputs_hash=inputs_hash,
                 tool_calls=tool_calls,
                 output=decision_output,
                 rule_applied=rule_applied,
-                disposition="pending",
+                disposition=Disposition.PENDING,
                 human_user_id=auth_context.user_id,
             )
 
@@ -423,6 +441,9 @@ class WorkflowAgent:
             raise
         except ToolNotRegisteredError:
             status = "tool_not_registered"
+            raise
+        except WorkflowRuntimeError:
+            status = "error"
             raise
         except Exception:
             status = "error"
@@ -438,13 +459,17 @@ class WorkflowAgent:
 
     # ── Prompt building ────────────────────────────────────────────────
 
-    def _build_system_prompt(self, workflow: Workflow) -> list[dict[str, Any]]:
+    def _build_system_prompt(
+        self,
+        workflow: Workflow,
+        permission_tier: PermissionTier,
+    ) -> list[dict[str, Any]]:
         """Return the Anthropic ``system`` block(s) with prompt caching.
 
-        The block is keyed on the workflow's static identity (id,
-        version, prompt body, constraint values). The depot-specific and
-        per-turn parts go in the user message so they don't bust the
-        prefix cache.
+        The block is keyed on the workflow's static identity (name,
+        version, prompt body, constraint values) plus the tier. The
+        depot-specific and per-turn parts go in the user message so
+        they don't bust the prefix cache.
         """
         constraints = self._constraints
         max_grid_line = (
@@ -453,7 +478,7 @@ class WorkflowAgent:
             else "- Site grid power must not exceed the depot's max_grid_kw at any timestep."
         )
         tier_line = (
-            f"Active permission tier: {workflow.permission_tier.value}. "
+            f"Active permission tier: {permission_tier.value}. "
             "Read this strictly — propose only what this tier permits."
         )
         body = f"""\
@@ -504,16 +529,17 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
         workflow: Workflow,
         auth_context: AuthContext,
         user_input: dict[str, Any] | None,
+        permission_tier: PermissionTier,
     ) -> str:
         """Compose the per-turn user message.
 
-        Kept outside the cached system block on purpose so the depot and
-        per-turn payload don't bust the prefix cache.
+        Kept outside the cached system block on purpose so the depot
+        and per-turn payload don't bust the prefix cache.
         """
         payload: dict[str, Any] = {
             "depot_id": str(depot_id),
-            "workflow_id": workflow.id,
-            "permission_tier": workflow.permission_tier.value,
+            "workflow_id": str(workflow.id),
+            "permission_tier": permission_tier.value,
             "actor_role": auth_context.role,
             "parameters": workflow.parameters,
         }
@@ -595,10 +621,9 @@ def _violation_to_error_envelope(violation: ConstraintViolation) -> dict[str, An
     }
 
 
-# Re-export for backwards-compatibility with the public ``__init__``.
 __all__ = [
+    "DEFAULT_PERMISSION_TIER",
     "EMIT_DECISION_TOOL_NAME",
-    "PermissionTier",  # re-exported so callers don't need a second import
     "ToolNotAllowedError",
     "WorkflowAgent",
     "WorkflowRuntimeError",

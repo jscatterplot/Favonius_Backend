@@ -1,22 +1,26 @@
-"""Workflow agent runtime — one agent, many workflows, scoped tools.
+"""Depot Agent workflows — package surface.
 
-This package implements the depot-agent workflow runtime (PRD §4.3 / §4.4):
+Sprint 1 (``models.py``, ``repository.py``, ``feature_flag.py``) shipped
+the substrate: schema + Pydantic types + a thin async repo on top of
+TimescaleDB. Sprint 2 (this PR) adds the *runtime* on top of that
+substrate:
 
-- :class:`~src.api.agent_workflows.runtime.WorkflowAgent` runs one
-  turn of a workflow against the Anthropic Messages API with tool-use.
-- :class:`~src.api.agent_workflows.tools.ToolRegistry` is the single
-  source of truth for tool callables and JSON schemas.
-- :class:`~src.api.agent_workflows.constraints.HardConstraintGuard`
-  enforces the substrate hard constraints (PRD §10.3) on every tool
-  dispatch and on the final structured output.
-- :class:`~src.api.agent_workflows.schemas.Workflow` and
-  :class:`~src.api.agent_workflows.schemas.Decision` are the
-  workflow-and-audit dataclasses (PRD §5.2, §5.3). They carry the
-  Sprint 1 contract forward inside this package; if Sprint 1 ships a
-  separate canonical location, re-export from there.
+* :mod:`~src.api.agent_workflows.runtime` — :class:`WorkflowAgent`, one
+  turn of one workflow against the Anthropic Messages API with
+  allow-list-enforced tool use.
+* :mod:`~src.api.agent_workflows.tools` — :class:`ToolRegistry`, the
+  single registry of tool name → JSON schema + async callable.
+* :mod:`~src.api.agent_workflows.constraints` — the hard-constraint
+  guard the runtime runs at both tool dispatch and final-emit time
+  (PRD §10.3).
+* :mod:`~src.api.agent_workflows.repo` — :class:`DecisionRepo` Protocol
+  + adapters around the canonical
+  :func:`~src.api.agent_workflows.repository.insert_decision` writer.
 
-The runtime is intentionally HTTP-less for v1. It is exercised via
-unit tests with fake tools and a fake Anthropic client.
+The agent itself never writes ``auto_executed`` (PRD §9.2): every
+:class:`Decision` produced by the runtime arrives at the repo with
+``disposition=Disposition.PENDING``. Humans or a later promotion
+pathway advance the disposition.
 """
 
 from src.api.agent_workflows.constraints import (
@@ -24,7 +28,17 @@ from src.api.agent_workflows.constraints import (
     DepotConstraints,
     HardConstraintGuard,
 )
+from src.api.agent_workflows.feature_flag import is_depot_agent_enabled
+from src.api.agent_workflows.models import (
+    Decision,
+    Disposition,
+    GraduationRule,
+    PermissionTier,
+    ToolCall,
+    Workflow,
+)
 from src.api.agent_workflows.repo import (
+    AsyncpgDecisionRepo,
     DecisionRepo,
     InMemoryDecisionRepo,
 )
@@ -34,12 +48,6 @@ from src.api.agent_workflows.runtime import (
     WorkflowAgent,
     WorkflowRuntimeError,
 )
-from src.api.agent_workflows.schemas import (
-    Decision,
-    PermissionTier,
-    ToolCall,
-    Workflow,
-)
 from src.api.agent_workflows.tools import (
     ToolDefinition,
     ToolNotRegisteredError,
@@ -47,11 +55,14 @@ from src.api.agent_workflows.tools import (
 )
 
 __all__ = [
+    "AsyncpgDecisionRepo",
     "ConstraintViolation",
     "Decision",
     "DecisionRepo",
     "DepotConstraints",
+    "Disposition",
     "EMIT_DECISION_TOOL_NAME",
+    "GraduationRule",
     "HardConstraintGuard",
     "InMemoryDecisionRepo",
     "PermissionTier",
@@ -63,4 +74,5 @@ __all__ = [
     "Workflow",
     "WorkflowAgent",
     "WorkflowRuntimeError",
+    "is_depot_agent_enabled",
 ]

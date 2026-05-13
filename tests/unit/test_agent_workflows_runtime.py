@@ -23,6 +23,7 @@ Coverage focus:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -35,6 +36,7 @@ from src.api.agent_workflows import (
     EMIT_DECISION_TOOL_NAME,
     Decision,
     DepotConstraints,
+    Disposition,
     HardConstraintGuard,
     InMemoryDecisionRepo,
     PermissionTier,
@@ -115,15 +117,21 @@ def auth_context(user_id: UUID, depot_id: UUID) -> AuthContext:
 
 @pytest.fixture
 def workflow() -> Workflow:
+    # Sprint 1's Workflow model takes a UUID ``id`` and required
+    # ``created_at`` / ``updated_at`` timestamps; no ``permission_tier``
+    # field (tier lives in the per-(workflow, depot) ``workflow_tiers``
+    # row and is threaded into ``run_turn`` as a kwarg).
+    ts = datetime(2026, 5, 1, 9, 0, tzinfo=timezone.utc)
     return Workflow(
-        id="wf-readiness-v1",
+        id=UUID("00000000-0000-0000-0000-0000000000c1"),
         name="daily_readiness_check",
         version="1.0.0",
         description="Confirm vehicles will be ready for pull-out.",
         prompt="Check every scheduled departure and flag risks.",
         allowed_tools=["get_vehicle_state", "propose_plan_update"],
         parameters={"lead_minutes": 60},
-        permission_tier=PermissionTier.DRAFT_AND_WAIT,
+        created_at=ts,
+        updated_at=ts,
     )
 
 
@@ -300,33 +308,30 @@ class TestCanonicalHash:
     def test_empty_hash_is_stable(self) -> None:
         assert _canonical_tool_calls_hash([]) == _canonical_tool_calls_hash([])
 
-    def test_duration_does_not_change_hash(self) -> None:
-        a = [
-            ToolCall(
-                name="t",
-                input={"x": 1},
-                output={"y": 2},
-                duration_ms=10,
-            )
-        ]
+    def test_key_order_does_not_change_hash(self) -> None:
+        a = [ToolCall(name="t", arguments={"x": 1, "y": 2}, result={"a": 1, "b": 2}, ok=True)]
+        b = [ToolCall(name="t", arguments={"y": 2, "x": 1}, result={"b": 2, "a": 1}, ok=True)]
+        assert _canonical_tool_calls_hash(a) == _canonical_tool_calls_hash(b)
+
+    def test_different_arguments_produce_different_hashes(self) -> None:
+        a = [ToolCall(name="t", arguments={"x": 1}, result={}, ok=True)]
+        b = [ToolCall(name="t", arguments={"x": 2}, result={}, ok=True)]
+        assert _canonical_tool_calls_hash(a) != _canonical_tool_calls_hash(b)
+
+    def test_ok_flag_affects_hash(self) -> None:
+        # Two runs that produced the same name+args+result but differ
+        # on ``ok`` (success vs. guard rejection) must hash differently
+        # so the audit trail distinguishes them.
+        a = [ToolCall(name="t", arguments={"x": 1}, result={"y": 2}, ok=True)]
         b = [
             ToolCall(
                 name="t",
-                input={"x": 1},
-                output={"y": 2},
-                duration_ms=999,
+                arguments={"x": 1},
+                result={"y": 2},
+                ok=False,
+                error="guard rejected",
             )
         ]
-        assert _canonical_tool_calls_hash(a) == _canonical_tool_calls_hash(b)
-
-    def test_key_order_does_not_change_hash(self) -> None:
-        a = [ToolCall(name="t", input={"x": 1, "y": 2}, output={"a": 1, "b": 2})]
-        b = [ToolCall(name="t", input={"y": 2, "x": 1}, output={"b": 2, "a": 1})]
-        assert _canonical_tool_calls_hash(a) == _canonical_tool_calls_hash(b)
-
-    def test_different_inputs_produce_different_hashes(self) -> None:
-        a = [ToolCall(name="t", input={"x": 1}, output={})]
-        b = [ToolCall(name="t", input={"x": 2}, output={})]
         assert _canonical_tool_calls_hash(a) != _canonical_tool_calls_hash(b)
 
 
@@ -387,17 +392,19 @@ class TestWorkflowAgentHappyPath:
         assert isinstance(decision, Decision)
         assert decision.workflow_id == workflow.id
         assert decision.depot_id == depot_id
-        assert decision.disposition == "pending"
+        assert decision.organization_id == auth_context.organization_id
+        assert decision.disposition == Disposition.PENDING
         assert decision.human_user_id == auth_context.user_id
         assert decision.rule_applied == "no_action_needed"
 
-        # Tool calls captured
+        # Tool calls captured (Sprint 1 ToolCall fields)
         assert len(decision.tool_calls) == 1
         tc = decision.tool_calls[0]
         assert tc.name == "get_vehicle_state"
-        assert tc.input == {"vehicle_id": "BUS-1"}
-        assert tc.output == {"vehicle_id": "BUS-1", "soc": 0.92, "plugged_in": True}
-        assert tc.is_error is False
+        assert tc.arguments == {"vehicle_id": "BUS-1"}
+        assert tc.result == {"vehicle_id": "BUS-1", "soc": 0.92, "plugged_in": True}
+        assert tc.ok is True
+        assert tc.error is None
 
         # Hash present and non-empty (sha256 hex = 64 chars)
         assert len(decision.inputs_hash) == 64
@@ -699,9 +706,12 @@ class TestHardConstraintEnforcement:
         assert len(decision.tool_calls) == 1
         tc = decision.tool_calls[0]
         assert tc.name == "propose_plan_update"
-        assert tc.is_error is True
-        assert tc.output["error"] == "hard_constraint_violation"
-        assert tc.output["constraint"] == "departure_soc_min"
+        assert tc.ok is False
+        # ``error`` carries the human-readable detail string for SQL-side
+        # filtering; the structured constraint name lives in ``result``.
+        assert tc.error is not None and "0.85" in tc.error
+        assert tc.result["error"] == "hard_constraint_violation"
+        assert tc.result["constraint"] == "departure_soc_min"
 
         # The tool_result fed back to the LLM also had is_error=True so
         # the model could read the rejection and adjust. AsyncMock stores
@@ -788,7 +798,7 @@ class TestHardConstraintEnforcement:
             "grid_power_max",
         }
         # disposition still pending — the agent itself never auto-executes.
-        assert decision.disposition == "pending"
+        assert decision.disposition == Disposition.PENDING
 
 
 # ── Hash stability ────────────────────────────────────────────────────────
@@ -939,9 +949,10 @@ class TestRuntimeDefensive:
             auth_context=auth_context,
             tool_registry=registry,
         )
-        assert decision.tool_calls[0].is_error is True
-        assert decision.tool_calls[0].output["error"] == "tool_failure"
-        assert "backend unavailable" in decision.tool_calls[0].output["detail"]
+        assert decision.tool_calls[0].ok is False
+        assert decision.tool_calls[0].error == "backend unavailable"
+        assert decision.tool_calls[0].result["error"] == "tool_failure"
+        assert "backend unavailable" in decision.tool_calls[0].result["detail"]
 
     @pytest.mark.asyncio
     async def test_unregistered_allow_listed_tool_fails_fast(
@@ -952,14 +963,16 @@ class TestRuntimeDefensive:
         repo: InMemoryDecisionRepo,
     ) -> None:
         # workflow.allowed_tools mentions a tool the registry doesn't know.
+        ts = datetime(2026, 5, 1, 9, 0, tzinfo=timezone.utc)
         broken = Workflow(
-            id="wf-broken",
+            id=UUID("00000000-0000-0000-0000-0000000000c2"),
             name="broken",
             version="1.0.0",
             description="x",
             prompt="x",
             allowed_tools=["nonexistent"],
-            permission_tier=PermissionTier.INFORM,
+            created_at=ts,
+            updated_at=ts,
         )
         responses = [
             _response(
@@ -1092,7 +1105,137 @@ class TestRuntimeDefensive:
         # Two tool calls captured.
         assert len(decision.tool_calls) == 2
         # Still pending, never auto_executed.
-        assert decision.disposition == "pending"
+        assert decision.disposition == Disposition.PENDING
+
+    @pytest.mark.asyncio
+    async def test_permission_tier_kwarg_appears_in_system_prompt_and_user_message(
+        self,
+        workflow: Workflow,
+        depot_id: UUID,
+        auth_context: AuthContext,
+        tool_registry: ToolRegistry,
+        repo: InMemoryDecisionRepo,
+    ) -> None:
+        # Sprint 1 stores per-(workflow, depot) tier in workflow_tiers,
+        # not on the workflow row. The runtime takes the resolved tier
+        # as a kwarg and bakes it into the prompts.
+        responses = [
+            _response(
+                [
+                    _tool_use_block(
+                        EMIT_DECISION_TOOL_NAME,
+                        id_="tu_emit",
+                        input_={"summary": "ok", "proposed_actions": []},
+                    )
+                ],
+                stop_reason="end_turn",
+            )
+        ]
+        client = _fake_client(responses)
+        agent = WorkflowAgent(anthropic_client=client, decision_repo=repo)
+        await agent.run_turn(
+            workflow=workflow,
+            depot_id=depot_id,
+            auth_context=auth_context,
+            tool_registry=tool_registry,
+            permission_tier=PermissionTier.ACT_AND_NOTIFY,
+        )
+
+        call_kwargs = client._create_mock.call_args.kwargs
+        assert "act_and_notify" in call_kwargs["system"][0]["text"]
+        assert "act_and_notify" in call_kwargs["messages"][0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_missing_organization_id_aborts_with_runtime_error(
+        self,
+        workflow: Workflow,
+        depot_id: UUID,
+        user_id: UUID,
+        tool_registry: ToolRegistry,
+        repo: InMemoryDecisionRepo,
+    ) -> None:
+        # ``Decision.organization_id`` is NOT NULL in the Sprint 1 schema.
+        # An AuthContext without an org has no safe scope to attribute the
+        # audit row to, so the runtime must refuse before calling the LLM.
+        from src.api.agent_workflows.runtime import WorkflowRuntimeError
+
+        auth = AuthContext(
+            user_id=user_id,
+            organization_id=None,
+            role="favonius_admin",
+            visible_depot_ids=[depot_id],
+        )
+        client = _fake_client([])
+        agent = WorkflowAgent(anthropic_client=client, decision_repo=repo)
+        with pytest.raises(WorkflowRuntimeError, match="organization_id"):
+            await agent.run_turn(
+                workflow=workflow,
+                depot_id=depot_id,
+                auth_context=auth,
+                tool_registry=tool_registry,
+            )
+        # No Anthropic call should have been made.
+        assert client._create_mock.call_count == 0
+        # No Decision should have been written.
+        assert repo.decisions == []
+
+
+# ── Repo adapters ─────────────────────────────────────────────────────────
+
+
+class TestDecisionRepo:
+    @pytest.mark.asyncio
+    async def test_in_memory_repo_collects_writes(self) -> None:
+        from src.api.agent_workflows import (
+            AsyncpgDecisionRepo,
+            DecisionRepo,
+            InMemoryDecisionRepo,
+        )
+
+        repo = InMemoryDecisionRepo()
+        # An empty repo has no ``last``.
+        with pytest.raises(IndexError):
+            _ = repo.last
+        # Sanity that both impls satisfy the Protocol.
+        assert isinstance(repo, DecisionRepo)
+        assert isinstance(AsyncpgDecisionRepo(pool=AsyncMock()), DecisionRepo)
+
+    @pytest.mark.asyncio
+    async def test_asyncpg_repo_delegates_to_insert_decision(
+        self,
+        workflow: Workflow,
+        depot_id: UUID,
+        auth_context: AuthContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from src.api.agent_workflows import AsyncpgDecisionRepo
+        from src.api.agent_workflows import repository as repository_module
+
+        seen: list[tuple[Any, Decision]] = []
+
+        async def fake_insert(pool: Any, decision: Decision) -> None:
+            seen.append((pool, decision))
+
+        monkeypatch.setattr(repository_module, "insert_decision", fake_insert)
+
+        pool_sentinel = object()
+        repo = AsyncpgDecisionRepo(pool=pool_sentinel)
+        d = Decision(
+            id=uuid4(),
+            workflow_id=workflow.id,
+            depot_id=depot_id,
+            organization_id=auth_context.organization_id,
+            timestamp=datetime.now(timezone.utc),
+            inputs_hash="sha256:test",
+            tool_calls=[],
+            output={},
+            disposition=Disposition.PENDING,
+            human_user_id=auth_context.user_id,
+        )
+        await repo.write(d)
+        assert len(seen) == 1
+        assert seen[0][0] is pool_sentinel
+        assert seen[0][1].id == d.id
 
 
 # ── Terminator schema ─────────────────────────────────────────────────────
