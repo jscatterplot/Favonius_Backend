@@ -484,9 +484,6 @@ class Application:
         if self.connection_monitor:
             stop_tasks.append(self.connection_monitor.stop_monitoring())
 
-        if self.data_sync_service:
-            stop_tasks.append(self.data_sync_service.stop())
-
         if self.api_server:
             stop_tasks.append(self.api_server.stop())
 
@@ -496,15 +493,23 @@ class Application:
         if self.health_server:
             stop_tasks.append(self.health_server.stop())
 
-        if self.timescale_client:
-            stop_tasks.append(self.timescale_client.disconnect())
-
-        if self.supabase_client:
-            stop_tasks.append(self.supabase_client.disconnect())
-
-        # Wait for all components to stop
+        # Wait for components that do not close the shared Timescale pool.
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+        # DataSyncService shares timescale_client.pg_pool; its stop() cancels
+        # the sync task but disconnect() must not close the pool until that
+        # cancellation has finished (otherwise in-flight queries see InterfaceError).
+        if self.data_sync_service:
+            await asyncio.gather(self.data_sync_service.stop(), return_exceptions=True)
+
+        db_teardown = []
+        if self.timescale_client:
+            db_teardown.append(self.timescale_client.disconnect())
+        if self.supabase_client:
+            db_teardown.append(self.supabase_client.disconnect())
+        if db_teardown:
+            await asyncio.gather(*db_teardown, return_exceptions=True)
 
         self.logger.info("Application shutdown complete")
 
