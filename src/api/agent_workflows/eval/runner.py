@@ -654,34 +654,22 @@ def _build_default_tool_registry(conn: Any, depot_id: UUID) -> ToolRegistry:
     registry = ToolRegistry()
 
     async def get_scheduled_departures() -> dict[str, Any]:
-        rows = await conn.fetch(
-            """
-            SELECT s.vehicle_id::text AS vehicle_id,
-                   s.route_id,
-                   s.departure_time::text AS departure_time,
-                   s.required_soc
-            FROM schedules s
-            JOIN vehicles v ON v.vehicle_id = s.vehicle_id
-            WHERE v.depot_id = $1
-            ORDER BY s.departure_time
-            """,
-            depot_id,
-        )
-        return {"departures": [dict(r) for r in rows]}
+        # Migration 029 removes TimescaleDB shadow tables (`schedules`, `vehicles`).
+        # Until Sprint 5 wires static-data reads through the Supabase substrate,
+        # keep this default tool deterministic and non-failing on fresh schemas.
+        return {"departures": []}
 
     async def get_vehicle_state(vehicle_id: str) -> dict[str, Any]:
         vid = _coerce_uuid(vehicle_id, field_name="get_vehicle_state.vehicle_id")
         row = await conn.fetchrow(
             """
-            SELECT t.soc, t.charger_id::text AS charger_id, t.is_plugged, t.charging_kw
-            FROM telemetry t
-            JOIN vehicles v ON v.vehicle_id = t.vehicle_id
-            WHERE t.vehicle_id = $1 AND v.depot_id = $2
-            ORDER BY t.time DESC
+            SELECT soc, charger_id::text AS charger_id, is_plugged, charging_kw
+            FROM telemetry
+            WHERE vehicle_id = $1
+            ORDER BY time DESC
             LIMIT 1
             """,
             vid,
-            depot_id,
         )
         if row is None:
             return {"vehicle_id": str(vid), "soc": None}
@@ -691,16 +679,17 @@ def _build_default_tool_registry(conn: Any, depot_id: UUID) -> ToolRegistry:
         cid = _coerce_uuid(charger_id, field_name="get_charger_state.charger_id")
         row = await conn.fetchrow(
             """
-            SELECT ocpp_id, status, rated_kw
-            FROM chargers
-            WHERE charger_id = $1 AND depot_id = $2
+            SELECT vehicle_id::text AS vehicle_id, is_plugged, charging_kw, time::text AS observed_at
+            FROM telemetry
+            WHERE charger_id = $1
+            ORDER BY time DESC
+            LIMIT 1
             """,
             cid,
-            depot_id,
         )
         if row is None:
             return {"charger_id": str(cid), "status": "unknown"}
-        return {"charger_id": str(cid), **dict(row)}
+        return {"charger_id": str(cid), "status": "observed", **dict(row)}
 
     registry.register(
         "get_scheduled_departures",
