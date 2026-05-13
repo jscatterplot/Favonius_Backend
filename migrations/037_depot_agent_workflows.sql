@@ -81,9 +81,45 @@ CREATE TABLE IF NOT EXISTS decisions (
 -- Sidecar identity table to guarantee global uniqueness of decisions.id
 -- safely under concurrency (hypertable unique constraints must include
 -- the partition key, so we cannot enforce UNIQUE(id) directly on decisions).
+-- `decision_ts` mirrors `decisions.timestamp` so rows age out on the same
+-- 90-day floor as the decisions hypertable (chunk drops do not touch this
+-- table; a Timescale user-defined job prunes by time).
 CREATE TABLE IF NOT EXISTS decision_identity_keys (
-    id UUID PRIMARY KEY
+    id           UUID         PRIMARY KEY,
+    decision_ts  TIMESTAMPTZ NOT NULL
 );
+
+DO $upgrade_decision_identity_keys$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'decision_identity_keys'
+          AND column_name = 'decision_ts'
+    ) THEN
+        RETURN;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'decision_identity_keys'
+    ) THEN
+        ALTER TABLE decision_identity_keys ADD COLUMN decision_ts TIMESTAMPTZ;
+        UPDATE decision_identity_keys k
+        SET decision_ts = COALESCE(
+            (SELECT MIN(d.timestamp) FROM decisions d WHERE d.id = k.id),
+            TIMESTAMPTZ 'epoch'
+        );
+        ALTER TABLE decision_identity_keys ALTER COLUMN decision_ts SET NOT NULL;
+    END IF;
+END;
+$upgrade_decision_identity_keys$ LANGUAGE plpgsql;
+
+CREATE INDEX IF NOT EXISTS idx_decision_identity_keys_decision_ts
+    ON decision_identity_keys (decision_ts);
 
 SELECT create_hypertable(
     'decisions',
@@ -141,8 +177,8 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO decision_identity_keys (id)
-    VALUES (NEW.id);
+    INSERT INTO decision_identity_keys (id, decision_ts)
+    VALUES (NEW.id, NEW.timestamp);
 
     RETURN NEW;
 EXCEPTION
@@ -172,3 +208,40 @@ CREATE TRIGGER trg_decisions_append_only_truncate
     BEFORE TRUNCATE ON decisions
     FOR EACH STATEMENT
     EXECUTE FUNCTION decisions_append_only_guard();
+
+-- Prune sidecar keys in lockstep with the 90-day decisions retention window.
+CREATE OR REPLACE PROCEDURE prune_decision_identity_keys(job_id int, config jsonb)
+LANGUAGE plpgsql
+AS $prune$
+BEGIN
+    DELETE FROM decision_identity_keys
+    WHERE decision_ts < NOW() - INTERVAL '90 days';
+    COMMIT;
+END;
+$prune$;
+
+DO $register_prune_job$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM timescaledb_information.jobs
+            WHERE proc_schema = 'public'
+              AND proc_name = 'prune_decision_identity_keys'
+        ) THEN
+            PERFORM add_job(
+                'prune_decision_identity_keys',
+                INTERVAL '1 day',
+                initial_start => NOW() + INTERVAL '1 minute'
+            );
+        END IF;
+    END IF;
+EXCEPTION
+    WHEN undefined_function THEN
+        RAISE NOTICE 'add_job unavailable: prune_decision_identity_keys not scheduled';
+    WHEN undefined_table THEN
+        RAISE NOTICE 'add_job skipped: timescaledb_information.jobs missing';
+    WHEN OTHERS THEN
+        RAISE NOTICE 'add_job skipped: %', SQLERRM;
+END;
+$register_prune_job$ LANGUAGE plpgsql;
