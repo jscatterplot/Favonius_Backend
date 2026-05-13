@@ -689,6 +689,7 @@ class OCPP16Session:
         #      here would delay the boot ack and could trip the charger's
         #      response timeout.
         try:
+            await self._timescale.clear_sessions_seen(cp_id)
             open_rows = await self._timescale.fetch_open_sessions(cp_id)
         except Exception as exc:
             open_rows = []
