@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from ocpp.v16.enums import AuthorizationStatus
 
+from .meter_value_utils import normalize_energy_to_wh
+
 from src.adapters.ocpp.charge_point import FleetChargePoint
 from src.adapters.ocpp.local_auth_sync import sync_charger as sync_local_auth_list
 
@@ -66,6 +68,77 @@ def _new_profile_id_fallback_counter() -> count:
 
 
 _profile_id_fallback_counter = _new_profile_id_fallback_counter()
+
+
+def _resolve_meter_stop(
+    meter_stop: Optional[int],
+    transaction_data: Optional[List[Dict[str, Any]]],
+) -> Optional[int]:
+    """Return the best available meterStop value in Wh for StopTransaction.
+
+    OCPP 1.6 declares ``meterStop`` required on ``StopTransaction``, but
+    chargers in the wild send ``None`` or ``0`` whenever the meter register
+    is unavailable (charger crash before final read, EVDisconnected with
+    no graceful stop, meter fault). When ``StopTxnSampledData`` is
+    configured (Issue 3A pushes this in BootNotification),
+    ``transactionData`` carries the final
+    ``Energy.Active.Import.Register`` sample — which is what we actually
+    want for billing.
+
+    Resolution order:
+
+      1. ``meter_stop`` (Wh int from the top-level field) when it is
+         non-None and non-zero — the spec-compliant happy path.
+      2. The maximum ``Energy.Active.Import.Register`` sample from
+         ``transaction_data`` — the fallback the recovery research
+         identified as the highest-confidence value when (1) fails.
+      3. The original ``meter_stop`` value (which may be ``None`` or ``0``)
+         when ``transaction_data`` has nothing usable; the close path
+         will detect the anomaly and leave ``energy_delivered_kwh = NULL``.
+
+    Args:
+        meter_stop: Top-level ``meterStop`` from the OCPP message (Wh).
+        transaction_data: Optional ``transactionData`` array from
+            ``StopTransaction.req``. Each entry has ``sampledValue`` /
+            ``sampled_value`` (both spellings observed in the wild) carrying
+            measurand readings.
+
+    Returns:
+        Best available ``meter_stop_wh`` value, or ``None`` if no usable
+        source exists.
+    """
+    if meter_stop is not None and meter_stop > 0:
+        return int(meter_stop)
+
+    if not transaction_data:
+        return meter_stop  # propagate None / 0 unchanged
+
+    best_wh: Optional[float] = None
+    for entry in transaction_data:
+        samples = entry.get("sampledValue") or entry.get("sampled_value") or []
+        for sample in samples:
+            if sample.get("measurand") != "Energy.Active.Import.Register":
+                continue
+            value = sample.get("value")
+            if value is None:
+                continue
+            try:
+                wh = normalize_energy_to_wh(
+                    float(value),
+                    sample.get("unit"),
+                    sample.get("multiplier"),
+                )
+            except (TypeError, ValueError):
+                continue
+            if wh < 0:
+                continue
+            if best_wh is None or wh > best_wh:
+                best_wh = wh
+
+    if best_wh is not None:
+        return int(best_wh)
+    return meter_stop
+
 
 _OCPP16_AUTH_FROM_STATUS: dict[RFIDAuthStatus, AuthorizationStatus] = {
     RFIDAuthStatus.ACCEPTED: AuthorizationStatus.accepted,
@@ -126,6 +199,7 @@ class OCPP16Session:
         self._pending_start: Optional[Dict[str, Any]] = None
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
+        self._metering_config_task: Optional[asyncio.Task[None]] = None
         self._boot_trigger_task: Optional[asyncio.Task[None]] = None
         self._background_tasks: Set[asyncio.Task[Any]] = set()
         self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
@@ -616,6 +690,11 @@ class OCPP16Session:
         #      here would delay the boot ack and could trip the charger's
         #      response timeout.
         try:
+            await self._timescale.clear_sessions_seen(cp_id)
+        except Exception as exc:
+            logger.error("clear_sessions_seen failed for station=%s: %s", cp_id, exc)
+
+        try:
             open_rows = await self._timescale.fetch_open_sessions(cp_id)
         except Exception as exc:
             open_rows = []
@@ -649,12 +728,20 @@ class OCPP16Session:
         # RFID tags while offline. Runs after the queued-command replay so
         # SetChargingProfile and SendLocalList don't race on the same socket
         # for vendors that mishandle interleaved request/response cycles.
-        if (
-            self._local_auth_sync_task is not None
-            and not self._local_auth_sync_task.done()
-        ):
+        if self._local_auth_sync_task is not None and not self._local_auth_sync_task.done():
             self._local_auth_sync_task.cancel()
         self._local_auth_sync_task = asyncio.create_task(self._delayed_local_auth_sync())
+
+        # Push metering configuration so every connected charger emits the
+        # measurands we depend on for energy tracking (Issue 3A). This
+        # neutralises factory-default measurand sets — notably ABB Terra AC
+        # firmware versions that ship with Power-only sampling and never
+        # produce Energy.Active.Import.Register without an explicit
+        # ChangeConfiguration. Fire-and-forget so the boot ack is not
+        # blocked by a slow or unresponsive charger.
+        if self._metering_config_task is not None and not self._metering_config_task.done():
+            self._metering_config_task.cancel()
+        self._metering_config_task = asyncio.create_task(self._push_metering_config())
 
     async def _on_security_event(
         self,
@@ -768,6 +855,90 @@ class OCPP16Session:
             current = asyncio.current_task()
             if current is not None and self._local_auth_sync_task is current:
                 self._local_auth_sync_task = None
+
+    # OCPP configuration keys pushed after every BootNotification (Issue 3A).
+    # Values are conservative defaults that cover Energy.Active.Import.Register
+    # (billing source of truth) plus a few measurands we use for live UI
+    # without exceeding the ABB-safe set in adapters/ocpp/charge_point.py.
+    _METERING_CONFIG_KEYS: List[tuple[str, str]] = [
+        (
+            "MeterValuesSampledData",
+            "Energy.Active.Import.Register,Power.Active.Import,Current.Import",
+        ),
+        (
+            "StopTxnSampledData",
+            "Energy.Active.Import.Register",
+        ),
+        (
+            "MeterValueSampleInterval",
+            "60",
+        ),
+    ]
+
+    async def _push_metering_config(self) -> None:
+        """Push the metering configuration keys to the charger after boot.
+
+        Fire-and-forget: failures must NOT block the BootNotification ack or
+        the heartbeat loop. Three failure modes are tolerated explicitly:
+
+          * ``Rejected`` — charger acknowledged but refused the key (e.g.
+            Terra AC pre-1.8.32 on certain measurand combinations). Logged
+            at WARN level; the rest of the keys still attempt.
+          * ``Timeout`` — charger never responded (network drop mid-call).
+            Logged at WARN; the next BootNotification will retry.
+          * Vendor-safe refusal — ``change_configuration`` returns
+            ``NotSupported`` when the requested measurand set would exit the
+            ``_ABB_SAFE_MEASURANDS`` allowlist; that defends against the
+            Terra AC ≤1.8.21 reboot-loop bug and is logged at INFO.
+
+        Errors are swallowed locally; raising here would tear down the
+        OCPP session for a non-fatal configuration mismatch.
+        """
+        try:
+            for key, value in self._METERING_CONFIG_KEYS:
+                try:
+                    status = await asyncio.wait_for(
+                        self._cp.change_configuration(key=key, value=value),
+                        timeout=10.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "ChangeConfiguration timed out for station=%s key=%s; "
+                        "will retry on next BootNotification",
+                        self._station_id,
+                        key,
+                    )
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "ChangeConfiguration raised for station=%s key=%s: %s",
+                        self._station_id,
+                        key,
+                        exc,
+                    )
+                    continue
+                if status == "Accepted":
+                    logger.info(
+                        "ChargingMetering config accepted on station=%s: %s=%s",
+                        self._station_id,
+                        key,
+                        value,
+                    )
+                else:
+                    logger.warning(
+                        "ChargingMetering config %s on station=%s: %s=%s",
+                        status,
+                        self._station_id,
+                        key,
+                        value,
+                    )
+        except asyncio.CancelledError:
+            logger.debug("metering_config push cancelled for station=%s", self._station_id)
+            raise
+        finally:
+            current = asyncio.current_task()
+            if current is not None and self._metering_config_task is current:
+                self._metering_config_task = None
 
     def _is_connection_open(self) -> bool:
         """Best-effort check whether the charger socket is still open."""
@@ -1055,12 +1226,23 @@ class OCPP16Session:
             end_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             end_time = datetime.now(timezone.utc)
+
+        # OCPP 1.6 spec marks meterStop as required on StopTransaction, but
+        # in practice chargers (notably ABB Terra AC ≤1.8.x and several
+        # budget wallboxes) send None / 0 when the meter register is
+        # unavailable or the EV disconnected before the charger could read
+        # it. transactionData carries the final Energy.Active.Import.Register
+        # sample when StopTxnSampledData is configured — use it as a
+        # fallback so the close path produces a real meter_stop_wh.
+        meter_stop_wh = _resolve_meter_stop(meter_stop, transaction_data)
+
         try:
             close_result = await self._timescale.close_open_session(
                 cp_id,
                 int(transaction_id),
                 end_time,
-                meter_stop_wh=meter_stop,
+                meter_stop_wh=meter_stop_wh,
+                stop_reason=reason,
             )
         except Exception as exc:
             close_result = None
@@ -1079,22 +1261,25 @@ class OCPP16Session:
             meter_start_db = close_result.get("meter_start_wh")
             energy_kwh = close_result.get("energy_delivered_kwh")
             if energy_kwh is None:
-                if meter_stop is None:
+                if meter_stop_wh is None:
                     anomaly_reason = "missing_meter_stop"
                 elif meter_start_db is None:
                     anomaly_reason = "missing_meter_start"
-                elif meter_stop < int(meter_start_db):
+                elif meter_start_db == 0:
+                    anomaly_reason = "meter_start_is_zero"
+                elif meter_stop_wh < int(meter_start_db):
                     anomaly_reason = "meter_stop_lt_meter_start"
                 else:
                     anomaly_reason = "unknown"
                 logger.warning(
                     "Anomalous meter delta on station=%s tx_id=%s: %s "
-                    "(meter_start_wh=%s, meter_stop_wh=%s). Leaving "
-                    "energy_delivered_kwh NULL.",
+                    "(meter_start_wh=%s, meter_stop_wh=%s, raw_meter_stop=%s). "
+                    "Leaving energy_delivered_kwh NULL.",
                     cp_id,
                     transaction_id,
                     anomaly_reason,
                     meter_start_db,
+                    meter_stop_wh,
                     meter_stop,
                 )
 

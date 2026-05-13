@@ -170,17 +170,38 @@ async def test_insert_open_session_accepts_null_meter_start_wh():
     assert insert_call.args[-1] is None
 
 
-@pytest.mark.asyncio
-async def test_close_open_session_writes_meter_stop_and_kwh_atomically():
-    """Close must UPDATE meter_stop_wh + energy_delivered_kwh in one statement.
+def _close_session_conn(meter_start_wh, returning):
+    """Build a mock conn whose fetchrow returns SELECT then UPDATE rows in order.
 
-    Two writes would race against analytics readers — the row would
-    briefly have end_time set but the kWh column NULL. One UPDATE with
-    a CASE expression keeps the close atomic.
+    The refactored ``close_open_session`` (Issue 7A) splits the close into a
+    locked SELECT (to read ``meter_start_wh``) followed by an UPDATE (to
+    write the close + the helper-computed ``energy_delivered_kwh``).
+    Tests need to mock both in sequence.
     """
     conn = AsyncMock()
+    fetchrow_results = []
+    if meter_start_wh is not None:
+        fetchrow_results.append({"session_id": "sess-1", "meter_start_wh": meter_start_wh})
+    else:
+        fetchrow_results.append(None)  # SELECT found no open row
+    fetchrow_results.append(returning)
+    conn.fetchrow = AsyncMock(side_effect=fetchrow_results)
+    return conn
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_writes_energy_helper_value():
+    """Close must compute energy_delivered_kwh via compute_energy_kwh helper.
+
+    Verifies the refactored two-query close path:
+      1. SELECT meter_start_wh FOR UPDATE
+      2. UPDATE with helper-computed energy_kwh as a typed float parameter
+
+    The Python helper is the single source of truth; SQL no longer carries
+    a CASE expression for the kWh delta.
+    """
     matched_row = {"meter_start_wh": 1000, "energy_delivered_kwh": 4.0}
-    conn.fetchrow = AsyncMock(return_value=matched_row)
+    conn = _close_session_conn(meter_start_wh=1000, returning=matched_row)
     client, _ = _client_with_conn(conn)
 
     result = await client.close_open_session(
@@ -190,15 +211,13 @@ async def test_close_open_session_writes_meter_stop_and_kwh_atomically():
         meter_stop_wh=5000,
     )
 
-    conn.fetchrow.assert_awaited_once()
-    update_sql = conn.fetchrow.await_args.args[0]
+    assert conn.fetchrow.await_count == 2
+    update_call = conn.fetchrow.await_args_list[1]
+    update_sql = update_call.args[0]
     assert "meter_stop_wh" in update_sql
-    assert "energy_delivered_kwh" in update_sql
-    # The CASE gate: NULL meter_start_wh or meter_stop < meter_start must
-    # NOT write a bogus kWh. The SQL keeps the existing value via ELSE.
-    assert "CASE" in update_sql
-    assert "meter_start_wh IS NOT NULL" in update_sql
-    assert ">= meter_start_wh" in update_sql
+    assert "energy_delivered_kwh = $5" in update_sql  # typed float param
+    # Helper computed (5000 - 1000) / 1000 = 4.0 and passed as $5
+    assert update_call.args[5] == pytest.approx(4.0)
     assert result == matched_row
 
 
@@ -209,8 +228,7 @@ async def test_close_open_session_returns_none_when_no_row_matched():
     The caller distinguishes this from the matched-but-anomalous case
     to decide whether to log a WARN.
     """
-    conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value=None)
+    conn = _close_session_conn(meter_start_wh=None, returning=None)
     client, _ = _client_with_conn(conn)
 
     result = await client.close_open_session(
@@ -220,38 +238,63 @@ async def test_close_open_session_returns_none_when_no_row_matched():
         meter_stop_wh=5000,
     )
 
+    # SELECT returned None, UPDATE should not be issued.
     assert result is None
+    assert conn.fetchrow.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_close_open_session_returns_null_kwh_on_anomaly():
-    """RETURNING surfaces the NULL kWh so the caller can WARN.
+async def test_close_open_session_writes_null_kwh_when_helper_rejects_bracket():
+    """Helper returns None for meter_stop < meter_start; close writes NULL.
 
-    Simulates a charger sending meter_stop < meter_start (meter rollover
-    or replacement) — the SQL leaves energy_delivered_kwh untouched
-    (NULL on a fresh row) and the dict reflects that.
+    Simulates meter rollover: 5000 Wh start, 1000 Wh stop. The Python
+    helper returns None (refusing the bogus bracket), and the UPDATE
+    persists energy_delivered_kwh = NULL.
     """
-    conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value={"meter_start_wh": 5000, "energy_delivered_kwh": None})
+    returning = {"meter_start_wh": 5000, "energy_delivered_kwh": None}
+    conn = _close_session_conn(meter_start_wh=5000, returning=returning)
     client, _ = _client_with_conn(conn)
 
     result = await client.close_open_session(
         station_id="cp-1",
         transaction_id=301,
         end_time=datetime.now(timezone.utc),
-        meter_stop_wh=1000,  # < meter_start_wh
+        meter_stop_wh=1000,  # < meter_start_wh: rollover anomaly
     )
 
+    update_call = conn.fetchrow.await_args_list[1]
+    # Helper returned None; SQL receives NULL for energy_delivered_kwh ($5)
+    assert update_call.args[5] is None
     assert result is not None
-    assert result["meter_start_wh"] == 5000
     assert result["energy_delivered_kwh"] is None
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_writes_null_kwh_on_zero_meter_start():
+    """Issue 8A: meter_start_wh=0 must produce NULL energy, not a huge bogus number.
+
+    Some chargers emit meterStart=0 when the register is unavailable.
+    The helper rejects the bracket; the close path stores NULL.
+    """
+    returning = {"meter_start_wh": 0, "energy_delivered_kwh": None}
+    conn = _close_session_conn(meter_start_wh=0, returning=returning)
+    client, _ = _client_with_conn(conn)
+
+    await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=304,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=5_000_000,  # would be 5000 kWh if helper didn't guard
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    assert update_call.args[5] is None
 
 
 @pytest.mark.asyncio
 async def test_close_open_session_filters_to_live_source():
     """Close must not touch imported rows even if their end_time is NULL."""
-    conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value=None)
+    conn = _close_session_conn(meter_start_wh=None, returning=None)
     client, _ = _client_with_conn(conn)
 
     await client.close_open_session(
@@ -261,6 +304,57 @@ async def test_close_open_session_filters_to_live_source():
         meter_stop_wh=2000,
     )
 
-    update_sql = conn.fetchrow.await_args.args[0]
-    assert "source = 'live'" in update_sql
-    assert "end_time IS NULL" in update_sql
+    select_sql = conn.fetchrow.await_args_list[0].args[0]
+    assert "source = 'live'" in select_sql
+    assert "end_time IS NULL" in select_sql
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_none_meter_stop_does_not_raise():
+    """meter_stop_wh=None must not raise 'could not determine data type of parameter $4'.
+
+    The bug pattern from PR #186: chargers send StopTransaction without a
+    meterStop value. After the helper refactor the helper returns None and
+    the SQL stores NULL for both columns — the explicit ``$4::bigint`` cast
+    in the UPDATE still survives untyped NULL parameters.
+    """
+    returning = {"meter_start_wh": 1000, "energy_delivered_kwh": None}
+    conn = _close_session_conn(meter_start_wh=1000, returning=returning)
+    client, _ = _client_with_conn(conn)
+
+    # Must not raise — production bug: "could not determine data type of parameter $4"
+    result = await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=303,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=None,
+    )
+
+    assert result is not None
+    update_call = conn.fetchrow.await_args_list[1]
+    update_sql = update_call.args[0]
+    # Explicit cast must still be present so PostgreSQL types untyped NULL.
+    assert "$4::bigint" in update_sql
+    # Helper returned None because meter_stop is None
+    assert update_call.args[5] is None
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_stamps_stop_reason():
+    """stop_reason (Issue 3B/2A) is written via COALESCE so callers can pass it."""
+    returning = {"meter_start_wh": 1000, "energy_delivered_kwh": 4.0}
+    conn = _close_session_conn(meter_start_wh=1000, returning=returning)
+    client, _ = _client_with_conn(conn)
+
+    await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=305,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=5000,
+        stop_reason="EVDisconnected",
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    update_sql = update_call.args[0]
+    assert "stop_reason" in update_sql
+    assert update_call.args[6] == "EVDisconnected"

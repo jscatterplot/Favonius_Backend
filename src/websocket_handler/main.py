@@ -68,6 +68,7 @@ class Application:
         # charging_command_queue rows that the FastAPI optimizer enqueues.
         self.queue_consumer: Optional[ChargingCommandQueueConsumer] = None
         self._active_tx_reconciler_task: Optional[asyncio.Task] = None
+        self._orphan_recovery_task: Optional[asyncio.Task] = None
 
         # Alerts pipeline (see docs/plans/alerts-pipeline.md). Optional —
         # disabled by default in test envs without a Resend key.
@@ -170,6 +171,14 @@ class Application:
             # mid-transaction handler restart.
             self._active_tx_reconciler_task = asyncio.create_task(
                 self._active_tx_reconciler(), name="active_tx_reconciler"
+            )
+
+            # Orphan charging-session recovery (migration 038). Closes rows
+            # whose StopTransaction never arrived using the running
+            # last_meter_wh as a synthesized meter_stop_wh — see PR #186 /
+            # CLAUDE.md energy tracking plan.
+            self._orphan_recovery_task = asyncio.create_task(
+                self._orphan_recovery_loop(), name="orphan_recovery"
             )
 
             # Alerts dispatcher (optional). Only starts when notifications
@@ -356,6 +365,57 @@ class Application:
             return None
         return self.websocket_server.get_charge_point(cp_id)
 
+    async def _orphan_recovery_loop(self) -> None:
+        """Periodically close charging_sessions rows whose StopTransaction never arrived.
+
+        Sweep cadence and staleness threshold are tunable so accounting can
+        be tightened in production without a code change:
+
+          * ``ORPHAN_RECOVERY_INTERVAL_S`` (default 300s / 5 min) — time
+            between sweeps.
+          * ``ORPHAN_RECOVERY_THRESHOLD_S`` (default 1800s / 30 min) —
+            minimum age of ``last_seen_at`` before a row is considered
+            orphaned. Must be larger than any realistic legit pause.
+          * ``ORPHAN_RECOVERY_BATCH_LIMIT`` (default 100) — max rows
+            closed per sweep; the next sweep picks up the rest.
+
+        All errors are caught and logged; this is best-effort housekeeping
+        and must never propagate.
+        """
+        import os
+
+        interval = int(os.environ.get("ORPHAN_RECOVERY_INTERVAL_S", "300"))
+        threshold = int(os.environ.get("ORPHAN_RECOVERY_THRESHOLD_S", "1800"))
+        batch_limit = int(os.environ.get("ORPHAN_RECOVERY_BATCH_LIMIT", "100"))
+
+        # Initial delay: wait one full interval before the first sweep so
+        # legitimate in-flight sessions during a handler restart don't get
+        # closed before BootNotification reload (fetch_open_sessions) runs.
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+
+        while self.running:
+            try:
+                closed = await self.timescale_client.recover_orphaned_sessions(
+                    stale_after_seconds=threshold,
+                    batch_limit=batch_limit,
+                )
+                if closed:
+                    self.logger.warning(
+                        "orphan_recovery_loop closed %d session(s); first=%s last=%s",
+                        len(closed),
+                        closed[0].get("station_id"),
+                        closed[-1].get("station_id"),
+                    )
+            except Exception as exc:
+                self.logger.error("orphan_recovery_loop sweep failed: %s", exc)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+
     async def _active_tx_reconciler(self) -> None:
         """Refresh the ``active_transactions`` gauge from DB every 30 s.
 
@@ -407,6 +467,9 @@ class Application:
         if self._active_tx_reconciler_task:
             self._active_tx_reconciler_task.cancel()
             stop_tasks.append(self._active_tx_reconciler_task)
+        if self._orphan_recovery_task:
+            self._orphan_recovery_task.cancel()
+            stop_tasks.append(self._orphan_recovery_task)
 
         # Stop alert dispatcher before tearing down the DB pool.
         if self.alert_dispatcher:

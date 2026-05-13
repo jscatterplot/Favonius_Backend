@@ -914,6 +914,7 @@ class TestOCPP16SessionRecovery:
 
     @pytest.mark.asyncio
     async def test_on_boot_reloads_transactions_from_db(self, session, mock_timescale) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         mock_timescale.fetch_open_sessions = AsyncMock(
             return_value=[
                 {"transaction_id": 555, "connector_id": 1},
@@ -933,9 +934,11 @@ class TestOCPP16SessionRecovery:
 
         assert session._cp.transactions[1] == 555
         assert session._cp.transactions[2] == 556
+        mock_timescale.clear_sessions_seen.assert_awaited_once_with("test_station_001")
 
     @pytest.mark.asyncio
     async def test_on_boot_cancels_previous_delayed_replay(self, session, mock_timescale) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         mock_timescale.fetch_open_sessions = AsyncMock(return_value=[])
         previous = MagicMock()
         previous.done.return_value = False
@@ -960,6 +963,7 @@ class TestOCPP16SessionRecovery:
     async def test_on_boot_keeps_newest_transaction_for_connector(
         self, session, mock_timescale
     ) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         older = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc)
         newer = datetime(2026, 4, 26, 12, 5, tzinfo=timezone.utc)
         mock_timescale.fetch_open_sessions = AsyncMock(
@@ -983,6 +987,7 @@ class TestOCPP16SessionRecovery:
 
     @pytest.mark.asyncio
     async def test_on_boot_tolerates_fetch_failure(self, session, mock_timescale) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         mock_timescale.fetch_open_sessions = AsyncMock(side_effect=RuntimeError("db down"))
         # Should not raise — failures are best-effort.
         await session._on_boot(
