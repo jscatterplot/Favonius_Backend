@@ -1175,7 +1175,7 @@ class OCPP16Session:
                 connector_id,
                 stale_tx_id,
             )
-            del self._cp.transactions[connector_id]
+            self._cp.transactions.pop(connector_id, None)
             if self._cp.current_transaction_id == stale_tx_id:
                 self._cp.current_transaction_id = None
 

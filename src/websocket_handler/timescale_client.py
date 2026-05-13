@@ -2750,20 +2750,16 @@ class TimescaleClient:
         timestamp in place would let orphan recovery close an active
         session after ``stale_after_seconds`` elapses.
 
-        ``updated_at`` is bumped to NOW() so the orphan-recovery case-2
-        predicate (``COALESCE(last_meter_seen_at, updated_at, start_time)
-        < NOW() - threshold``) sees the row as freshly touched and skips
-        it. Without this, a sweep that runs between the boot reload and
-        the first post-reconnect MeterValues can close a session that
-        the WS handler has just rehydrated into memory — leaving the
-        in-memory tx_id pointing at a closed DB row.
+        We intentionally avoid touching ``updated_at`` here. Orphan recovery
+        uses ``COALESCE(last_meter_seen_at, updated_at, start_time)`` to
+        decide staleness, and bumping ``updated_at`` would make genuinely
+        stale rows look fresh for an extra threshold window.
         """
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE charging_sessions
-                   SET last_seen_at = NULL,
-                       updated_at   = NOW()
+                   SET last_seen_at = NULL
                  WHERE station_id = $1
                    AND end_time IS NULL
                    AND source = 'live'
