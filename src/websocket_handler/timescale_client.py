@@ -18,6 +18,7 @@ from cryptography import x509
 from sqlalchemy import text
 
 from .config import TimescaleConfig
+from .meter_value_utils import compute_energy_kwh, normalize_energy_to_wh
 from .monitoring import get_logger
 
 
@@ -245,10 +246,22 @@ class TimescaleClient:
 
                         # Live session metrics: keep the open charging_sessions row
                         # fresh so per-charger power/SoC is observable in real time
-                        # without requiring vehicle attribution.
+                        # without requiring vehicle attribution. When this row
+                        # carries an Energy.Active.Import.Register sample we also
+                        # advance last_meter_wh / energy_delivered_kwh on the
+                        # session — that is the running-meter source of truth the
+                        # orphan-recovery job falls back to when StopTransaction
+                        # is missing.
+                        meter_wh = self._extract_register_wh(raw_sample) if raw_sample else None
                         if station_id and transaction_id is not None:
                             await self._update_session_live_metrics(
-                                conn, station_id, transaction_id, power_kw, soc_percent, max_charge_kw
+                                conn,
+                                station_id,
+                                transaction_id,
+                                power_kw,
+                                soc_percent,
+                                max_charge_kw,
+                                meter_wh,
                             )
 
                         # Charger-keyed telemetry view (telemetry table). vehicle_id
@@ -379,6 +392,38 @@ class TimescaleClient:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _extract_register_wh(raw_sample: Dict[str, Any]) -> Optional[int]:
+        """Return Wh value when the raw OCPP sample is Energy.Active.Import.Register.
+
+        Charger-reported energy registers come through with vendor-dependent
+        units (``Wh`` / ``kWh`` / ``kVAh``) and an optional ``multiplier``
+        power-of-ten offset. ``normalize_energy_to_wh`` centralises the
+        conversion; this method just selects which samples to forward to it.
+
+        Returns ``None`` for non-register measurands, malformed values, or
+        when the normaliser rejects the unit (defence in depth — the caller
+        treats ``None`` as "no register reading in this MeterValues row").
+        """
+        if not raw_sample:
+            return None
+        if raw_sample.get("measurand") != "Energy.Active.Import.Register":
+            return None
+        value = raw_sample.get("value")
+        if value is None:
+            return None
+        try:
+            wh = normalize_energy_to_wh(
+                float(value),
+                raw_sample.get("unit"),
+                raw_sample.get("multiplier"),
+            )
+        except (TypeError, ValueError):
+            return None
+        if wh < 0:
+            return None
+        return int(wh)
+
     async def _update_session_live_metrics(
         self,
         conn: asyncpg.Connection,
@@ -387,6 +432,7 @@ class TimescaleClient:
         power_kw: Optional[float],
         soc_percent: Optional[float],
         max_charge_kw: Optional[float],
+        meter_wh: Optional[int] = None,
     ) -> None:
         """Refresh charging_sessions live fields for the open session.
 
@@ -394,6 +440,16 @@ class TimescaleClient:
         open charging_sessions row so per-charger charging rate is observable
         without joining telemetry. ``max_charge_power_kw`` is bumped only when
         the new value is higher so the column captures the session peak.
+
+        When ``meter_wh`` is supplied (Energy.Active.Import.Register sample)
+        the row's ``last_meter_wh`` advances monotonically via ``GREATEST`` —
+        guards against late/duplicate samples regressing the register. The
+        same write recomputes ``energy_delivered_kwh`` against the stored
+        ``meter_start_wh`` using the same guards as ``compute_energy_kwh``
+        (meter_start_wh > 0, meter_wh >= meter_start_wh). NULL is preserved
+        on any bracket the helper would have refused; this leaves the live
+        billing value either correct-and-current or NULL — never confidently
+        wrong.
         """
         soc = (soc_percent / 100.0) if soc_percent is not None else None
         try:
@@ -403,6 +459,23 @@ class TimescaleClient:
                    SET current_power_kw     = COALESCE($3, current_power_kw),
                        current_soc          = COALESCE($4, current_soc),
                        max_charge_power_kw  = GREATEST(max_charge_power_kw, $5),
+                       last_meter_wh        = CASE
+                           WHEN $6::bigint IS NOT NULL
+                           THEN GREATEST(COALESCE(last_meter_wh, $6::bigint), $6::bigint)
+                           ELSE last_meter_wh
+                       END,
+                       last_meter_seen_at   = CASE
+                           WHEN $6::bigint IS NOT NULL THEN NOW()
+                           ELSE last_meter_seen_at
+                       END,
+                       energy_delivered_kwh = CASE
+                           WHEN $6::bigint IS NOT NULL
+                            AND meter_start_wh IS NOT NULL
+                            AND meter_start_wh > 0
+                            AND $6::bigint >= meter_start_wh
+                           THEN ($6::bigint - meter_start_wh) / 1000.0
+                           ELSE energy_delivered_kwh
+                       END,
                        updated_at           = NOW()
                  WHERE station_id     = $1
                    AND transaction_id = $2
@@ -414,6 +487,7 @@ class TimescaleClient:
                 power_kw,
                 soc,
                 max_charge_kw,
+                meter_wh,
             )
         except Exception as exc:
             self.logger.debug(
@@ -2417,41 +2491,62 @@ class TimescaleClient:
         transaction_id: int,
         end_time: datetime,
         meter_stop_wh: Optional[int] = None,
+        stop_reason: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a ``charging_sessions`` row closed at StopTransaction.
 
-        Writes ``end_time`` and ``meter_stop_wh`` and computes
-        ``energy_delivered_kwh = (meter_stop_wh - meter_start_wh) / 1000.0``
-        atomically (migration 036). The kWh write is gated by a CASE so
-        anomalous deltas (missing meter_start_wh, meter_stop < meter_start
-        from a meter rollover or replacement) leave the column NULL — the
-        caller logs a WARN so operators can reconcile from the raw Wh
-        values rather than trust a bogus billing number.
+        Writes ``end_time`` and ``meter_stop_wh`` and stores the kWh delta
+        computed by :func:`compute_energy_kwh` against the row's stored
+        ``meter_start_wh``. The helper rejects every untrustworthy bracket
+        (missing start/stop, ``meter_start_wh = 0``, ``meter_stop < meter_start``)
+        and the caller writes ``NULL`` in those cases — NULL beats a
+        confidently-wrong billing number for accounting.
+
+        The helper is also called from the orphan-recovery job
+        (:meth:`recover_orphaned_sessions`) so the formula lives in exactly
+        one place (Issue 7A).
+
+        Args:
+            stop_reason: Optional value to stamp into ``stop_reason``.
+                ``None`` leaves the column untouched. The orphan recovery
+                job passes ``'orphaned_recovered'``; the OCPP handler passes
+                the charger-supplied ``reason`` field.
 
         Returns:
             ``None`` if no live, still-open row matched (idempotent retry,
             already-closed session, or imported source). Otherwise a dict
-            of the RETURNING values: ``meter_start_wh`` (as stored before
-            this update) and ``energy_delivered_kwh`` (NULL on anomaly,
-            else the freshly written delta). Callers compare the two
-            against the provided ``meter_stop_wh`` to decide whether to
-            emit a WARN.
+            of the RETURNING values: ``meter_start_wh`` and the freshly
+            written ``energy_delivered_kwh`` (which may be NULL on anomaly).
+            Callers use the values to decide whether to emit a WARN.
         """
         async with self.pg_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                UPDATE charging_sessions
-                   SET end_time = $3,
-                       meter_stop_wh = $4::bigint,
-                       energy_delivered_kwh = CASE
-                           WHEN $4::bigint IS NOT NULL
-                            AND meter_start_wh IS NOT NULL
-                            AND $4::bigint >= meter_start_wh
-                           THEN ($4::bigint - meter_start_wh) / 1000.0
-                           ELSE NULL
-                       END,
-                       updated_at = NOW()
+                SELECT meter_start_wh
+                  FROM charging_sessions
                  WHERE station_id = $1
+                   AND transaction_id = $2
+                   AND end_time IS NULL
+                   AND source = 'live'
+                 FOR UPDATE
+                """,
+                station_id,
+                transaction_id,
+            )
+            if row is None:
+                return None
+            meter_start_wh = row["meter_start_wh"]
+            energy_kwh = compute_energy_kwh(meter_stop_wh, meter_start_wh)
+
+            updated = await conn.fetchrow(
+                """
+                UPDATE charging_sessions
+                   SET end_time             = $3,
+                       meter_stop_wh        = $4::bigint,
+                       energy_delivered_kwh = $5,
+                       stop_reason          = COALESCE($6, stop_reason),
+                       updated_at           = NOW()
+                 WHERE station_id     = $1
                    AND transaction_id = $2
                    AND end_time IS NULL
                    AND source = 'live'
@@ -2461,10 +2556,116 @@ class TimescaleClient:
                 transaction_id,
                 end_time,
                 meter_stop_wh,
+                energy_kwh,
+                stop_reason,
             )
-            if row is None:
+            if updated is None:
+                # Lost the race to another writer between SELECT and UPDATE.
                 return None
-            return dict(row)
+            return dict(updated)
+
+    async def recover_orphaned_sessions(
+        self,
+        stale_after_seconds: int = 1800,
+        batch_limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Close charging_sessions rows whose StopTransaction never arrived.
+
+        A row is treated as orphaned when:
+
+          * ``end_time IS NULL`` and ``source = 'live'`` (still considered
+            open from the WebSocket handler's perspective), and
+          * ``last_seen_at`` is older than ``stale_after_seconds`` (the
+            WebSocket close hook stamps this column, so 'old' means the
+            charger socket has been closed for at least that long), or
+          * ``last_seen_at IS NULL`` AND ``start_time`` is older than
+            ``stale_after_seconds`` (defensive: covers handler restarts
+            that never had a chance to stamp last_seen_at).
+
+        For each orphaned row the synthesized ``meter_stop_wh`` is the
+        running ``last_meter_wh`` from migration 038 — populated by the
+        MeterValues handler — falling back to ``NULL`` (which leaves
+        ``energy_delivered_kwh = NULL`` per :func:`compute_energy_kwh`)
+        when no MeterValues with a register reading ever arrived.
+
+        Args:
+            stale_after_seconds: Threshold in seconds. 30 minutes (1800s)
+                is conservative — well past any realistic legit session
+                pause. The recovery loop in ``main.py`` reads this from
+                ``ORPHAN_RECOVERY_THRESHOLD_S``.
+            batch_limit: Maximum rows closed per call. Defends against a
+                pathological recovery sweep blocking the connection for
+                too long; the next loop iteration picks up the rest.
+
+        Returns:
+            List of dicts describing each closed row (session_id,
+            station_id, transaction_id, meter_start_wh, meter_stop_wh,
+            energy_delivered_kwh). Used by the caller to emit one
+            ``audit_log`` entry per row.
+        """
+        closed: List[Dict[str, Any]] = []
+        async with self.pg_pool.acquire() as conn:
+            stale_rows = await conn.fetch(
+                """
+                SELECT session_id,
+                       station_id,
+                       transaction_id,
+                       meter_start_wh,
+                       last_meter_wh,
+                       last_seen_at,
+                       start_time
+                  FROM charging_sessions
+                 WHERE end_time IS NULL
+                   AND source = 'live'
+                   AND transaction_id IS NOT NULL
+                   AND (
+                       (last_seen_at IS NOT NULL
+                        AND last_seen_at < NOW() - make_interval(secs => $1))
+                       OR
+                       (last_seen_at IS NULL
+                        AND start_time < NOW() - make_interval(secs => $1))
+                   )
+                 ORDER BY COALESCE(last_seen_at, start_time) ASC
+                 LIMIT $2
+                """,
+                stale_after_seconds,
+                batch_limit,
+            )
+
+            now = datetime.now(timezone.utc)
+            for row in stale_rows:
+                station_id = row["station_id"]
+                transaction_id = int(row["transaction_id"])
+                last_meter_wh = row["last_meter_wh"]
+                meter_start_wh = row["meter_start_wh"]
+                energy_kwh = compute_energy_kwh(last_meter_wh, meter_start_wh)
+                close_time = row["last_seen_at"] or now
+
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE charging_sessions
+                       SET end_time             = $3,
+                           meter_stop_wh        = $4::bigint,
+                           energy_delivered_kwh = $5,
+                           stop_reason          = 'orphaned_recovered',
+                           updated_at           = NOW()
+                     WHERE station_id     = $1
+                       AND transaction_id = $2
+                       AND end_time IS NULL
+                       AND source = 'live'
+                 RETURNING session_id, station_id, transaction_id,
+                           meter_start_wh, meter_stop_wh, energy_delivered_kwh
+                    """,
+                    station_id,
+                    transaction_id,
+                    close_time,
+                    last_meter_wh,
+                    energy_kwh,
+                )
+                if updated is not None:
+                    closed.append(dict(updated))
+
+        return closed
 
     async def mark_sessions_seen(self, station_id: str) -> None:
         """Stamp ``last_seen_at = NOW()`` on every open session at the station.
