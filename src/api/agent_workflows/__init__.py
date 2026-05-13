@@ -1,22 +1,33 @@
-"""Depot Agent workflows — sprint 1 foundations.
+"""Depot Agent workflows — package surface.
 
-This package holds the substrate for the Depot Agent V1 build defined in
-``docs/PRD_Depot_Agent.md`` (workflows as first-class objects, per-depot
-permission tiers, immutable decision log). Sprint 1 ships schema + types +
-repository only — no runtime, no tools, no API endpoints.
+Sprint 1 (``models.py``, ``repository.py``, ``feature_flag.py``) shipped
+the substrate: schema + Pydantic types + a thin async repo on top of
+TimescaleDB. Sprint 2 (this PR) adds the *runtime* on top of that
+substrate:
 
-Layout::
+* :mod:`~src.api.agent_workflows.runtime` — :class:`WorkflowAgent`, one
+  turn of one workflow against the Anthropic Messages API with
+  allow-list-enforced tool use.
+* :mod:`~src.api.agent_workflows.tools` — :class:`ToolRegistry`, the
+  single registry of tool name → JSON schema + async callable.
+* :mod:`~src.api.agent_workflows.constraints` — the hard-constraint
+  guard the runtime runs at both tool dispatch and final-emit time
+  (PRD §10.3).
+* :mod:`~src.api.agent_workflows.repo` — :class:`DecisionRepo` Protocol
+  + adapters around the canonical
+  :func:`~src.api.agent_workflows.repository.insert_decision` writer.
 
-    feature_flag.py    DEPOT_AGENT_ENABLED env-var gate
-    models.py          Pydantic v2 types: Workflow, PermissionTier,
-                       GraduationRule, Decision, ToolCall
-    repository.py      Async DB helpers backed by the TimescaleDB pool
-
-The agent runtime, tool definitions, and API endpoints arrive in later
-sprints. Do not import this package from request paths until the feature
-flag flips on and the runtime exists.
+The agent itself never writes ``auto_executed`` (PRD §9.2): every
+:class:`Decision` produced by the runtime arrives at the repo with
+``disposition=Disposition.PENDING``. Humans or a later promotion
+pathway advance the disposition.
 """
 
+from src.api.agent_workflows.constraints import (
+    ConstraintViolation,
+    DepotConstraints,
+    HardConstraintGuard,
+)
 from src.api.agent_workflows.feature_flag import is_depot_agent_enabled
 from src.api.agent_workflows.models import (
     Decision,
@@ -26,13 +37,42 @@ from src.api.agent_workflows.models import (
     ToolCall,
     Workflow,
 )
+from src.api.agent_workflows.repo import (
+    AsyncpgDecisionRepo,
+    DecisionRepo,
+    InMemoryDecisionRepo,
+)
+from src.api.agent_workflows.runtime import (
+    EMIT_DECISION_TOOL_NAME,
+    ToolNotAllowedError,
+    WorkflowAgent,
+    WorkflowRuntimeError,
+)
+from src.api.agent_workflows.tools import (
+    ToolDefinition,
+    ToolNotRegisteredError,
+    ToolRegistry,
+)
 
 __all__ = [
+    "AsyncpgDecisionRepo",
+    "ConstraintViolation",
     "Decision",
+    "DecisionRepo",
+    "DepotConstraints",
     "Disposition",
+    "EMIT_DECISION_TOOL_NAME",
     "GraduationRule",
+    "HardConstraintGuard",
+    "InMemoryDecisionRepo",
     "PermissionTier",
     "ToolCall",
+    "ToolDefinition",
+    "ToolNotAllowedError",
+    "ToolNotRegisteredError",
+    "ToolRegistry",
     "Workflow",
+    "WorkflowAgent",
+    "WorkflowRuntimeError",
     "is_depot_agent_enabled",
 ]
