@@ -103,13 +103,14 @@ async def run_migrations(target: str = "ts") -> int:
         return 1
 
     try:
-        await conn.execute("SELECT set_config('favonius.migration_mode', $1, false)", migration_mode)
         print(f"Migration mode: {migration_mode}")
 
         for path in files:
             sql = path.read_text()
             try:
-                await conn.execute(sql)
+                async with conn.transaction():
+                    await conn.execute("SELECT set_config('favonius.migration_mode', $1, true)", migration_mode)
+                    await conn.execute(sql)
             except Exception as e:
                 msg = str(e).lower()
                 if "already exists" in msg or "duplicate" in msg:
