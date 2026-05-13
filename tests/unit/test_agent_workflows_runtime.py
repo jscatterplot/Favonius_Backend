@@ -257,6 +257,10 @@ class TestHardConstraintGuard:
         guard = HardConstraintGuard()
         assert guard.validate_action({"departure_soc": 0.99}) is None
 
+    def test_treats_small_fraction_overshoot_as_fraction(self) -> None:
+        guard = HardConstraintGuard()
+        assert guard.validate_action({"departure_soc": 1.01}) is None
+
     def test_rejects_grid_kw_over_max(self) -> None:
         guard = HardConstraintGuard(DepotConstraints(max_grid_kw=500.0))
         violation = guard.validate_action({"grid_kw": 600})
