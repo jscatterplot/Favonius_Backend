@@ -17,4 +17,14 @@
 -- Safe: zero rows on Supabase to date; no code in src/ reads this from the
 -- static pool; idempotent via DROP TABLE IF EXISTS.
 
-DROP TABLE IF EXISTS public.security_events CASCADE;
+DO $$
+DECLARE
+    migration_mode text := current_setting('favonius.migration_mode', true);
+BEGIN
+    IF migration_mode = 'supabase_shared' THEN
+        RAISE NOTICE 'Skipping migration 013 drop in shared single-DB mode (%).', migration_mode;
+        RETURN;
+    END IF;
+
+    DROP TABLE IF EXISTS public.security_events CASCADE;
+END $$;

@@ -22,7 +22,18 @@
 -- tables and this migration will then drop them again — wasteful but safe,
 -- and avoids editing the historical migration 018.
 
-DROP TABLE IF EXISTS rfid_card_vehicle_assignments CASCADE;
-DROP TABLE IF EXISTS rfid_card_driver_assignments CASCADE;
-DROP TABLE IF EXISTS rfid_cards                    CASCADE;
-DROP TABLE IF EXISTS drivers                       CASCADE;
+
+DO $$
+DECLARE
+    migration_mode text := current_setting('favonius.migration_mode', true);
+BEGIN
+    IF migration_mode = 'ts_shared' THEN
+        RAISE NOTICE 'Skipping migration 039 drops in shared single-DB mode (%).', migration_mode;
+        RETURN;
+    END IF;
+
+    DROP TABLE IF EXISTS rfid_card_vehicle_assignments CASCADE;
+    DROP TABLE IF EXISTS rfid_card_driver_assignments CASCADE;
+    DROP TABLE IF EXISTS rfid_cards                    CASCADE;
+    DROP TABLE IF EXISTS drivers                       CASCADE;
+END $$;
