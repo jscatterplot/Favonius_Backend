@@ -32,6 +32,7 @@ import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import jsonschema
@@ -42,15 +43,12 @@ from src.api.agent_workflows.constraints import DepotConstraints
 from src.api.agent_workflows.models import (
     Decision,
     PermissionTier,
-    ToolCall,
     Workflow,
 )
 from src.api.agent_workflows.runtime import (
-    EMIT_DECISION_TOOL_NAME,
     WorkflowAgent,
 )
 from src.api.agent_workflows.tools import ToolRegistry
-
 
 # ── Errors ────────────────────────────────────────────────────────────────
 
@@ -100,13 +98,54 @@ _REQUIRED_TOP_LEVEL = {
 _ALLOWED_SEVERITY = {"blocking", "warning", "info"}
 _ALLOWED_TIER = {t.value for t in PermissionTier}
 
+_DEFAULT_USER_ID = UUID("aa000000-0000-4000-8000-0000000000aa")
+_DEFAULT_ORG_ID = UUID("bb000000-0000-4000-8000-0000000000bb")
+
+_WORKFLOW_EVAL_JSON_SCHEMA: Optional[dict[str, Any]] = None
+
+
+def _scenario_organization_id(scenario: dict) -> UUID:
+    """Organization for snapshot rows and auth (same default as :func:`_build_auth_context`)."""
+    auth_raw = scenario.get("auth") or {}
+    return _coerce_uuid(
+        auth_raw.get("organization_id", _DEFAULT_ORG_ID),
+        field_name="auth.organization_id",
+    )
+
+
+def _validate_scenario_json_schema(scenario: dict) -> None:
+    """Validate ``scenario`` against ``tests/golden/workflows/_schema.yaml``."""
+    global _WORKFLOW_EVAL_JSON_SCHEMA
+    from jsonschema import Draft7Validator
+    from jsonschema.exceptions import ValidationError
+
+    import yaml
+
+    if _WORKFLOW_EVAL_JSON_SCHEMA is None:
+        schema_path = (
+            Path(__file__).resolve().parents[4] / "tests" / "golden" / "workflows" / "_schema.yaml"
+        )
+        if not schema_path.is_file():
+            raise ScenarioLoadError(f"workflow eval schema file missing: {schema_path}")
+        raw = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ScenarioLoadError("workflow eval _schema.yaml must be a mapping")
+        _WORKFLOW_EVAL_JSON_SCHEMA = raw
+
+    try:
+        Draft7Validator(_WORKFLOW_EVAL_JSON_SCHEMA).validate(scenario)
+    except ValidationError as exc:
+        loc = ".".join(str(p) for p in exc.path) if exc.path else "<root>"
+        raise ScenarioLoadError(
+            f"scenario {scenario.get('id', '<unknown>')!r}: JSON schema violation at {loc}: {exc.message}"
+        ) from exc
+
 
 def _validate_scenario(scenario: dict) -> None:
     missing = _REQUIRED_TOP_LEVEL - scenario.keys()
     if missing:
         raise ScenarioLoadError(
-            f"scenario {scenario.get('id', '<unknown>')!r}: missing keys "
-            f"{sorted(missing)!r}"
+            f"scenario {scenario.get('id', '<unknown>')!r}: missing keys " f"{sorted(missing)!r}"
         )
 
     if scenario["severity"] not in _ALLOWED_SEVERITY:
@@ -124,31 +163,50 @@ def _validate_scenario(scenario: dict) -> None:
 
     snapshot = scenario["graph_snapshot"]
     if not isinstance(snapshot, dict):
+        raise ScenarioLoadError(f"scenario {scenario['id']!r}: graph_snapshot must be a mapping")
+
+    depot = snapshot.get("depot")
+    if depot is None:
+        raise ScenarioLoadError(f"scenario {scenario['id']!r}: graph_snapshot.depot is required")
+    if not isinstance(depot, dict):
         raise ScenarioLoadError(
-            f"scenario {scenario['id']!r}: graph_snapshot must be a mapping"
+            f"scenario {scenario['id']!r}: graph_snapshot.depot must be a mapping"
         )
+    if "depot_id" not in depot:
+        raise ScenarioLoadError(
+            f"scenario {scenario['id']!r}: graph_snapshot.depot.depot_id is required"
+        )
+    _coerce_uuid(depot["depot_id"], field_name="depot.depot_id")
 
     workflow = scenario["workflow"]
     if not isinstance(workflow, dict):
-        raise ScenarioLoadError(
-            f"scenario {scenario['id']!r}: workflow must be a mapping"
-        )
+        raise ScenarioLoadError(f"scenario {scenario['id']!r}: workflow must be a mapping")
     for key in ("id", "name", "version", "prompt", "allowed_tools"):
         if key not in workflow:
-            raise ScenarioLoadError(
-                f"scenario {scenario['id']!r}: workflow.{key} is required"
-            )
+            raise ScenarioLoadError(f"scenario {scenario['id']!r}: workflow.{key} is required")
 
     trace = scenario["llm_trace"]
     if not isinstance(trace, list) or not trace:
-        raise ScenarioLoadError(
-            f"scenario {scenario['id']!r}: llm_trace must be a non-empty list"
-        )
+        raise ScenarioLoadError(f"scenario {scenario['id']!r}: llm_trace must be a non-empty list")
     for i, turn in enumerate(trace):
         if not isinstance(turn, dict) or "content" not in turn:
             raise ScenarioLoadError(
                 f"scenario {scenario['id']!r}: llm_trace[{i}] missing 'content'"
             )
+        content = turn["content"]
+        if not isinstance(content, list):
+            raise ScenarioLoadError(
+                f"scenario {scenario['id']!r}: llm_trace[{i}].content must be a list, "
+                f"got {type(content).__name__}"
+            )
+        for j, raw in enumerate(content):
+            if not isinstance(raw, dict):
+                raise ScenarioLoadError(
+                    f"scenario {scenario['id']!r}: llm_trace[{i}].content[{j}] must be a mapping, "
+                    f"got {type(raw).__name__}"
+                )
+
+    _validate_scenario_json_schema(scenario)
 
 
 
@@ -238,12 +296,26 @@ def _coerce_uuid(value: Any, *, field_name: str) -> UUID:
     raise ScenarioLoadError(f"{field_name}: expected UUID, got {type(value).__name__}")
 
 
-async def _insert_depot(conn: Any, depot: dict) -> UUID:
+async def _ensure_organization(conn: Any, organization_id: UUID) -> None:
+    await conn.execute(
+        """
+        INSERT INTO organizations (organization_id, name)
+        VALUES ($1, $2)
+        ON CONFLICT (organization_id) DO NOTHING
+        """,
+        organization_id,
+        "Workflow eval scenario tenant",
+    )
+
+
+async def _insert_depot(conn: Any, depot: dict, organization_id: UUID) -> UUID:
     depot_id = _coerce_uuid(depot["depot_id"], field_name="depot.depot_id")
     await conn.execute(
         """
-        INSERT INTO depots (depot_id, name, latitude, longitude, max_grid_kw, timezone)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO depots (
+            depot_id, name, latitude, longitude, max_grid_kw, timezone, organization_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         """,
         depot_id,
         depot.get("name", "Eval depot"),
@@ -251,6 +323,7 @@ async def _insert_depot(conn: Any, depot: dict) -> UUID:
         depot.get("longitude", 25.2797),
         float(depot.get("max_grid_kw", 800.0)),
         depot.get("timezone", "UTC"),
+        organization_id,
     )
     return depot_id
 
@@ -312,9 +385,7 @@ async def _insert_drivers(conn: Any, drivers: Iterable[dict], depot_id: UUID) ->
         )
 
 
-async def _insert_schedules(
-    conn: Any, schedules: Iterable[dict], scenario_now: datetime
-) -> None:
+async def _insert_schedules(conn: Any, schedules: Iterable[dict], scenario_now: datetime) -> None:
     for s in schedules:
         await conn.execute(
             """
@@ -335,9 +406,7 @@ async def _insert_schedules(
         )
 
 
-async def _insert_telemetry(
-    conn: Any, samples: Iterable[dict], scenario_now: datetime
-) -> None:
+async def _insert_telemetry(conn: Any, samples: Iterable[dict], scenario_now: datetime) -> None:
     for sample in samples:
         charger_raw = sample.get("charger_id")
         charger_id = (
@@ -405,20 +474,18 @@ async def load_snapshot(conn: Any, scenario: dict) -> UUID:
 
     depot = snapshot.get("depot")
     if depot is None:
-        raise ScenarioLoadError(
-            f"scenario {scenario['id']!r}: graph_snapshot.depot is required"
-        )
+        raise ScenarioLoadError(f"scenario {scenario['id']!r}: graph_snapshot.depot is required")
 
-    depot_id = await _insert_depot(conn, depot)
+    organization_id = _scenario_organization_id(scenario)
+    await _ensure_organization(conn, organization_id)
+    depot_id = await _insert_depot(conn, depot, organization_id)
     await _insert_drivers(conn, snapshot.get("drivers", []), depot_id)
     await _insert_vehicles(conn, snapshot.get("vehicles", []), depot_id)
     await _insert_chargers(conn, snapshot.get("chargers", []), depot_id)
     await _insert_schedules(conn, snapshot.get("schedules", []), scenario_now)
     await _insert_telemetry(conn, snapshot.get("telemetry", []), scenario_now)
     await _insert_prices(conn, snapshot.get("prices", []), depot_id, scenario_now)
-    await _insert_building_load(
-        conn, snapshot.get("building_load", []), depot_id, scenario_now
-    )
+    await _insert_building_load(conn, snapshot.get("building_load", []), depot_id, scenario_now)
     return depot_id
 
 
@@ -548,9 +615,7 @@ def _response_from_trace_entry(entry: dict[str, Any]) -> _Response:
                 )
             )
         else:
-            raise ScenarioLoadError(
-                f"llm_trace content block has unsupported type {block_type!r}"
-            )
+            raise ScenarioLoadError(f"llm_trace content block has unsupported type {block_type!r}")
 
     usage_raw = entry.get("usage")
     usage = None
@@ -606,13 +671,15 @@ def _build_default_tool_registry(conn: Any, depot_id: UUID) -> ToolRegistry:
         vid = _coerce_uuid(vehicle_id, field_name="get_vehicle_state.vehicle_id")
         row = await conn.fetchrow(
             """
-            SELECT soc, charger_id::text AS charger_id, is_plugged, charging_kw
-            FROM telemetry
-            WHERE vehicle_id = $1
-            ORDER BY time DESC
+            SELECT t.soc, t.charger_id::text AS charger_id, t.is_plugged, t.charging_kw
+            FROM telemetry t
+            JOIN vehicles v ON v.vehicle_id = t.vehicle_id
+            WHERE t.vehicle_id = $1 AND v.depot_id = $2
+            ORDER BY t.time DESC
             LIMIT 1
             """,
             vid,
+            depot_id,
         )
         if row is None:
             return {"vehicle_id": str(vid), "soc": None}
@@ -621,8 +688,13 @@ def _build_default_tool_registry(conn: Any, depot_id: UUID) -> ToolRegistry:
     async def get_charger_state(charger_id: str) -> dict[str, Any]:
         cid = _coerce_uuid(charger_id, field_name="get_charger_state.charger_id")
         row = await conn.fetchrow(
-            "SELECT ocpp_id, status, rated_kw FROM chargers WHERE charger_id = $1",
+            """
+            SELECT ocpp_id, status, rated_kw
+            FROM chargers
+            WHERE charger_id = $1 AND depot_id = $2
+            """,
             cid,
+            depot_id,
         )
         if row is None:
             return {"charger_id": str(cid), "status": "unknown"}
@@ -660,10 +732,6 @@ def _build_default_tool_registry(conn: Any, depot_id: UUID) -> ToolRegistry:
 # ── Auth context builder ──────────────────────────────────────────────────
 
 
-_DEFAULT_USER_ID = UUID("aa000000-0000-4000-8000-0000000000aa")
-_DEFAULT_ORG_ID = UUID("bb000000-0000-4000-8000-0000000000bb")
-
-
 def _build_auth_context(scenario: dict, depot_id: UUID) -> AuthContext:
     """Build the AuthContext the runtime needs.
 
@@ -673,9 +741,7 @@ def _build_auth_context(scenario: dict, depot_id: UUID) -> AuthContext:
     """
     auth_raw = scenario.get("auth") or {}
     user_id = _coerce_uuid(auth_raw.get("user_id", _DEFAULT_USER_ID), field_name="auth.user_id")
-    organization_id = _coerce_uuid(
-        auth_raw.get("organization_id", _DEFAULT_ORG_ID), field_name="auth.organization_id"
-    )
+    organization_id = _scenario_organization_id(scenario)
     role = auth_raw.get("role", "customer_operator")
     return AuthContext(
         user_id=user_id,
@@ -691,9 +757,7 @@ def _build_auth_context(scenario: dict, depot_id: UUID) -> AuthContext:
 def _check_disposition(expected: dict, decision: Decision, failures: list[str]) -> None:
     want = expected.get("disposition")
     if want is not None and decision.disposition.value != want:
-        failures.append(
-            f"disposition: expected {want!r}, got {decision.disposition.value!r}"
-        )
+        failures.append(f"disposition: expected {want!r}, got {decision.disposition.value!r}")
 
 
 def _check_rule_applied(expected: dict, decision: Decision, failures: list[str]) -> None:
@@ -701,9 +765,7 @@ def _check_rule_applied(expected: dict, decision: Decision, failures: list[str])
         return
     want = expected["rule_applied"]
     if decision.rule_applied != want:
-        failures.append(
-            f"rule_applied: expected {want!r}, got {decision.rule_applied!r}"
-        )
+        failures.append(f"rule_applied: expected {want!r}, got {decision.rule_applied!r}")
 
 
 def _check_output(expected_output: dict, decision: Decision, failures: list[str]) -> None:
@@ -718,9 +780,7 @@ def _check_output(expected_output: dict, decision: Decision, failures: list[str]
     if "summary_contains" in expected_output:
         needle = expected_output["summary_contains"]
         if needle.lower() not in summary.lower():
-            failures.append(
-                f"output.summary_contains: {needle!r} not found in summary {summary!r}"
-            )
+            failures.append(f"output.summary_contains: {needle!r} not found in summary {summary!r}")
 
     proposed = output.get("proposed_actions") or []
 
@@ -757,12 +817,12 @@ def _check_output(expected_output: dict, decision: Decision, failures: list[str]
                 f"and type containing {action_substr!r}"
             )
 
-    forbidden_vids = {str(i.get("vehicle_id")) for i in expected_output.get("must_not_propose_for_vehicle") or []}
+    forbidden_vids = {
+        str(i.get("vehicle_id")) for i in expected_output.get("must_not_propose_for_vehicle") or []
+    }
     if forbidden_vids:
         leak = {
-            str(a.get("vehicle_id"))
-            for a in proposed
-            if str(a.get("vehicle_id")) in forbidden_vids
+            str(a.get("vehicle_id")) for a in proposed if str(a.get("vehicle_id")) in forbidden_vids
         }
         if leak:
             failures.append(
@@ -876,9 +936,7 @@ def _build_constraints(scenario: dict) -> DepotConstraints:
     raw = scenario.get("depot_constraints") or {}
     return DepotConstraints(
         min_departure_soc=float(raw.get("min_departure_soc", 0.99)),
-        max_grid_kw=(
-            float(raw["max_grid_kw"]) if raw.get("max_grid_kw") is not None else None
-        ),
+        max_grid_kw=(float(raw["max_grid_kw"]) if raw.get("max_grid_kw") is not None else None),
     )
 
 
@@ -985,10 +1043,17 @@ async def run_scenario(
             registry_builder = tool_registry_builder or _build_default_tool_registry
             tool_registry = registry_builder(conn, depot_id)
 
+            tx_repo = decision_repo
+            if decision_repo is not None:
+                from src.api.agent_workflows.repo import AsyncpgDecisionRepo
+
+                if isinstance(decision_repo, AsyncpgDecisionRepo):
+                    tx_repo = AsyncpgDecisionRepo(_TxPool(conn))
+
             fake_client = FakeAnthropicClient(llm_trace)
             agent = WorkflowAgent(
                 anthropic_client=fake_client,
-                decision_repo=decision_repo,
+                decision_repo=tx_repo,
                 constraints=constraints,
             )
 
@@ -1008,10 +1073,7 @@ async def run_scenario(
         "disposition": decision.disposition.value,
         "rule_applied": decision.rule_applied,
         "output": decision.output,
-        "tool_calls": [
-            {"name": c.name, "ok": c.ok, "error": c.error}
-            for c in decision.tool_calls
-        ],
+        "tool_calls": [{"name": c.name, "ok": c.ok, "error": c.error} for c in decision.tool_calls],
     }
     return EvalResult(
         scenario_id=scenario["id"],

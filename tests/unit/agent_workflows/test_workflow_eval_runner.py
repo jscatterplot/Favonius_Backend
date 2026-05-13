@@ -44,7 +44,6 @@ from src.api.agent_workflows.eval.runner import (
 from src.api.agent_workflows.models import Decision, Disposition, PermissionTier
 from src.api.agent_workflows.repo import InMemoryDecisionRepo
 
-
 # ── Test doubles ──────────────────────────────────────────────────────────
 
 
@@ -354,9 +353,7 @@ async def test_fake_client_replays_in_order() -> None:
     trace = [
         {
             "stop_reason": "tool_use",
-            "content": [
-                {"type": "tool_use", "id": "a", "name": "t1", "input": {"x": 1}}
-            ],
+            "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {"x": 1}}],
         },
         {
             "stop_reason": "end_turn",
@@ -431,9 +428,7 @@ async def test_fake_client_requires_tool_result_after_tool_use() -> None:
 
 def test_fake_client_rejects_unknown_block_type() -> None:
     with pytest.raises(ScenarioLoadError, match="unsupported type"):
-        FakeAnthropicClient(
-            [{"stop_reason": "tool_use", "content": [{"type": "wat"}]}]
-        )
+        FakeAnthropicClient([{"stop_reason": "tool_use", "content": [{"type": "wat"}]}])
 
 
 # ── Snapshot loader ───────────────────────────────────────────────────────
@@ -507,6 +502,7 @@ async def test_load_snapshot_inserts_full_graph() -> None:
 
     tables = {sql.split("INSERT INTO ", 1)[1].split()[0] for sql, _ in conn.executes}
     assert tables == {
+        "organizations",
         "depots",
         "vehicles",
         "chargers",
@@ -748,9 +744,7 @@ async def test_run_scenario_proposed_action_types_mismatch() -> None:
         summary="s",
         proposed_actions=[{"vehicle_id": _VEHICLE_ID, "type": "swap_charger"}],
     )
-    scenario["expected"] = {
-        "output": {"proposed_action_types": ["reassign_to_route"]}
-    }
+    scenario["expected"] = {"output": {"proposed_action_types": ["reassign_to_route"]}}
     result = await run_scenario(scenario, pool=_FakePool())
     assert not result.passed
     assert any("proposed_action_types" in f for f in result.failures)
@@ -761,9 +755,7 @@ async def test_run_scenario_proposed_action_count_bounds() -> None:
     scenario = _minimal_scenario()
     scenario["llm_trace"] = _emit_decision_trace(
         summary="s",
-        proposed_actions=[
-            {"vehicle_id": _VEHICLE_ID, "type": "swap_charger"} for _ in range(3)
-        ],
+        proposed_actions=[{"vehicle_id": _VEHICLE_ID, "type": "swap_charger"} for _ in range(3)],
     )
     scenario["expected"] = {
         "output": {"proposed_action_count_min": 1, "proposed_action_count_max": 2}
@@ -788,9 +780,7 @@ async def test_run_scenario_must_propose_for_vehicle() -> None:
     scenario = _minimal_scenario()
     scenario["llm_trace"] = _emit_decision_trace(
         summary="s",
-        proposed_actions=[
-            {"vehicle_id": _VEHICLE_ID, "type": "swap_charger"}
-        ],
+        proposed_actions=[{"vehicle_id": _VEHICLE_ID, "type": "swap_charger"}],
     )
     scenario["expected"] = {
         "output": {
@@ -824,9 +814,7 @@ async def test_run_scenario_must_not_propose_violation() -> None:
     scenario = _minimal_scenario()
     scenario["llm_trace"] = _emit_decision_trace(
         summary="s",
-        proposed_actions=[
-            {"vehicle_id": _VEHICLE_ID, "type": "swap_charger"}
-        ],
+        proposed_actions=[{"vehicle_id": _VEHICLE_ID, "type": "swap_charger"}],
     )
     scenario["expected"] = {
         "output": {"must_not_propose_for_vehicle": [{"vehicle_id": _VEHICLE_ID}]}
@@ -844,9 +832,7 @@ async def test_run_scenario_filters_constraint_violation() -> None:
     scenario["depot_constraints"] = {"min_departure_soc": 0.99, "max_grid_kw": 800.0}
     scenario["llm_trace"] = _emit_decision_trace(
         summary="s",
-        proposed_actions=[
-            {"vehicle_id": _VEHICLE_ID, "type": "x", "departure_soc": 0.5}
-        ],
+        proposed_actions=[{"vehicle_id": _VEHICLE_ID, "type": "x", "departure_soc": 0.5}],
     )
     scenario["expected"] = {
         "output": {
@@ -998,9 +984,7 @@ async def test_run_scenario_rolls_back_on_exception() -> None:
     """If the runtime raises, the harness still rolls back."""
     scenario = _minimal_scenario()
     # Empty trace makes FakeAnthropicClient raise on the first .create().
-    scenario["llm_trace"] = [
-        {"stop_reason": "tool_use", "content": [{"type": "text", "text": ""}]}
-    ]
+    scenario["llm_trace"] = [{"stop_reason": "tool_use", "content": [{"type": "text", "text": ""}]}]
     # Force the runtime to take more than one turn so the fake client
     # exhausts. Easiest path: use end_turn so the runtime exits the
     # iteration normally with a no_terminator status (no rollback
@@ -1049,9 +1033,7 @@ async def test_run_scenario_custom_tool_registry_builder() -> None:
     scenario["llm_trace"] = [
         {
             "stop_reason": "tool_use",
-            "content": [
-                {"type": "tool_use", "id": "t1", "name": "my_tool", "input": {}}
-            ],
+            "content": [{"type": "tool_use", "id": "t1", "name": "my_tool", "input": {}}],
         },
         {
             "stop_reason": "tool_use",
@@ -1067,9 +1049,7 @@ async def test_run_scenario_custom_tool_registry_builder() -> None:
     ]
     scenario["expected"] = {"tool_calls": {"names_in_order": ["my_tool"]}}
 
-    result = await run_scenario(
-        scenario, pool=_FakePool(), tool_registry_builder=builder
-    )
+    result = await run_scenario(scenario, pool=_FakePool(), tool_registry_builder=builder)
     assert result.passed, result.failures
     assert captured["called"] is True
 
@@ -1094,9 +1074,7 @@ async def test_run_scenario_coverage_mismatch() -> None:
         coverage={"vehicles_checked": 5, "chargers_checked": 0, "routes_checked": 0},
     )
     scenario["expected"] = {
-        "output": {
-            "coverage": {"vehicles_checked": 2, "chargers_checked": 0, "routes_checked": 0}
-        }
+        "output": {"coverage": {"vehicles_checked": 2, "chargers_checked": 0, "routes_checked": 0}}
     }
     result = await run_scenario(scenario, pool=_FakePool())
     assert not result.passed
@@ -1126,9 +1104,7 @@ async def test_run_scenario_all_ok_true_with_failed_call() -> None:
     scenario["llm_trace"] = [
         {
             "stop_reason": "tool_use",
-            "content": [
-                {"type": "tool_use", "id": "b1", "name": "boom", "input": {}}
-            ],
+            "content": [{"type": "tool_use", "id": "b1", "name": "boom", "input": {}}],
         },
         {
             "stop_reason": "tool_use",
@@ -1143,9 +1119,7 @@ async def test_run_scenario_all_ok_true_with_failed_call() -> None:
         },
     ]
     scenario["expected"] = {"tool_calls": {"all_ok": True}}
-    result = await run_scenario(
-        scenario, pool=_FakePool(), tool_registry_builder=builder
-    )
+    result = await run_scenario(scenario, pool=_FakePool(), tool_registry_builder=builder)
     assert not result.passed
     assert any("all_ok=true" in f for f in result.failures)
 
@@ -1180,9 +1154,7 @@ async def test_default_tools_get_vehicle_state_round_trip() -> None:
             ],
         },
     ]
-    scenario["expected"] = {
-        "tool_calls": {"names_in_order": ["get_vehicle_state"], "all_ok": True}
-    }
+    scenario["expected"] = {"tool_calls": {"names_in_order": ["get_vehicle_state"], "all_ok": True}}
     # Fake fetchrow returns None → tool returns {soc: None}.
     pool = _FakePool()
     result = await run_scenario(scenario, pool=pool)
@@ -1280,9 +1252,7 @@ def test_example_scenarios_load_cleanly() -> None:
     validate. No DB required."""
     from pathlib import Path
 
-    examples_dir = (
-        Path(__file__).parent.parent.parent / "golden" / "workflows" / "_examples"
-    )
+    examples_dir = Path(__file__).parent.parent.parent / "golden" / "workflows" / "_examples"
     paths = sorted(examples_dir.glob("*.yaml"))
     assert paths, "expected at least one example scenario"
     for path in paths:

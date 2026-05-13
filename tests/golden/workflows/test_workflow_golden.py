@@ -13,10 +13,9 @@ module, the runner, the schema) is in place, and the unit tests in
 Gate behaviour
 --------------
 * ``severity: blocking`` → ``assert result.passed`` (gate fails).
-* ``severity: warning`` → emits a ``pytest.warns``-style warning on
-  failure but does not fail the gate.
-* ``severity: info``    → result is logged via ``caplog`` and never
-  fails.
+* ``severity: warning`` / ``info`` → on failure, the diff is written to
+  real stderr via ``capfd`` (visible under pytest capture); blocking
+  still uses ``pytest.fail``.
 
 The example scenarios are exercised via a dedicated test below that
 opts in by name — they are NOT part of the gated dir, so the CI gate
@@ -26,9 +25,10 @@ path.
 
 from __future__ import annotations
 
+import sys
 import warnings
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -41,17 +41,12 @@ from src.api.agent_workflows.eval import (
 
 from tests.golden.workflows.conftest import EXAMPLES_DIR, WORKFLOW_GOLDEN_DIR
 
-
 # ── Scenario discovery ────────────────────────────────────────────────────
 
 
 def _gated_scenario_paths() -> list[Path]:
     """Every *.yaml directly under tests/golden/workflows/ except the schema."""
-    return sorted(
-        p
-        for p in WORKFLOW_GOLDEN_DIR.glob("*.yaml")
-        if p.name != "_schema.yaml"
-    )
+    return sorted(p for p in WORKFLOW_GOLDEN_DIR.glob("*.yaml") if p.name != "_schema.yaml")
 
 
 def _example_scenario_paths() -> list[Path]:
@@ -95,7 +90,7 @@ def test_examples_have_unique_ids() -> None:
 
 
 def test_examples_validate_against_schema() -> None:
-    """Every example scenario must pass the runner's structural validation.
+    """Every example scenario must satisfy ``_schema.yaml`` (via :func:`load_scenario`).
 
     This is the cheap, no-DB check: failing here means the example file
     is malformed (missing key, bad enum, etc.) — independent of whether
@@ -128,7 +123,9 @@ _GATED_PATHS = _gated_scenario_paths()
     _GATED_PATHS,
     ids=[_scenario_id(p) for p in _GATED_PATHS] if _GATED_PATHS else None,
 )
-async def test_workflow_golden_gated(scenario_path: Path, workflow_test_db_pool: Any) -> None:
+async def test_workflow_golden_gated(
+    scenario_path: Path, workflow_test_db_pool: Any, capfd: pytest.CaptureFixture[str]
+) -> None:
     """Run every gated scenario through the harness.
 
     A failure here blocks the PR. Sprint 5 lands the actual scenarios
@@ -142,7 +139,7 @@ async def test_workflow_golden_gated(scenario_path: Path, workflow_test_db_pool:
     scenario = load_scenario(scenario_path.read_text(encoding="utf-8"))
     result = await run_scenario(scenario, pool=workflow_test_db_pool)
 
-    _enforce_severity(result, scenario_path)
+    _enforce_severity(result, scenario_path, capfd=capfd)
 
 
 def test_workflow_golden_gate_skips_when_empty() -> None:
@@ -169,7 +166,7 @@ _EXAMPLE_PATHS = _example_scenario_paths()
     ids=[_scenario_id(p) for p in _EXAMPLE_PATHS] if _EXAMPLE_PATHS else None,
 )
 async def test_workflow_golden_examples(
-    scenario_path: Path, workflow_test_db_pool: Any
+    scenario_path: Path, workflow_test_db_pool: Any, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """Run the example scenarios end-to-end against a real DB.
 
@@ -185,18 +182,24 @@ async def test_workflow_golden_examples(
     scenario = load_scenario(scenario_path.read_text(encoding="utf-8"))
     result = await run_scenario(scenario, pool=workflow_test_db_pool)
 
-    _enforce_severity(result, scenario_path)
+    _enforce_severity(result, scenario_path, capfd=capfd)
 
 
 # ── Severity-aware assertion helper ───────────────────────────────────────
 
 
-def _enforce_severity(result: EvalResult, scenario_path: Path) -> None:
+def _enforce_severity(
+    result: EvalResult,
+    scenario_path: Path,
+    *,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
     """Translate ``severity`` into a pass/fail signal for pytest.
 
-    Blocking failures `assert`; warnings emit ``warnings.warn``; info-
-    level failures print and pass. All three branches surface the unified
-    diff so a fix is one paste away.
+    Blocking failures use ``pytest.fail``. Warning and info failures
+    print the unified diff to real stderr (``capfd`` disabled) so CI
+    shows the signal even when pytest captures stdout and suppresses
+    the warnings summary.
     """
     if result.passed:
         return
@@ -212,7 +215,13 @@ def _enforce_severity(result: EvalResult, scenario_path: Path) -> None:
     if result.severity == "blocking":
         pytest.fail(msg, pytrace=False)
     elif result.severity == "warning":
-        warnings.warn(msg, stacklevel=2)
+        with capfd.disabled():
+            print(msg, file=sys.stderr)
+        warnings.warn(
+            f"{result.scenario_id}: workflow golden warning (see stderr above)",
+            UserWarning,
+            stacklevel=2,
+        )
     else:  # info
-        # Nothing to assert; bubble the diff up via the test report.
-        print(msg)
+        with capfd.disabled():
+            print(msg, file=sys.stderr)
