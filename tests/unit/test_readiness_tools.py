@@ -67,6 +67,7 @@ def _build(static_pool, ts_pool, *, auth=None, now: datetime | None = _FRESH_NOW
         static_pool=static_pool,
         ts_pool=ts_pool,
         auth=auth or _auth(),
+        depot_id=DEPOT_A,
         now=now,
     )
 
@@ -166,6 +167,20 @@ class TestScheduledDepartures:
             "get_scheduled_departures",
             {
                 "depot_id": str(DEPOT_OTHER),
+                "window_start": "2026-05-12T05:00:00+00:00",
+                "window_end": "2026-05-12T09:00:00+00:00",
+            },
+        )
+        assert result == {"departures": []}
+        pool.fetch.assert_not_awaited()
+
+    async def test_mismatched_depot_from_turn_context_returns_empty(self):
+        pool = _pool(fetch=[{"vehicle_id": str(uuid4())}])
+        registry = _build(pool, _pool(), auth=_auth([DEPOT_A, DEPOT_B]))
+        result = await registry.dispatch(
+            "get_scheduled_departures",
+            {
+                "depot_id": str(DEPOT_B),
                 "window_start": "2026-05-12T05:00:00+00:00",
                 "window_end": "2026-05-12T09:00:00+00:00",
             },
@@ -341,6 +356,7 @@ class TestVehicleState:
             static_pool=static_pool,
             ts_pool=ts_pool,
             auth=_auth(),
+            depot_id=DEPOT_A,
         )
         result = await registry.dispatch("get_vehicle_state", {"vehicle_id": str(vehicle_id)})
         assert result["telemetry_fresh"] is True
