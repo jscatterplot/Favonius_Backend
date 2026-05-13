@@ -150,6 +150,7 @@ def _now(now: Optional[datetime]) -> datetime:
 def _make_get_scheduled_departures(
     static_pool: Any,
     auth: AuthContext,
+    workflow_depot_id: UUID,
 ):
     async def get_scheduled_departures(
         depot_id: str,
@@ -161,6 +162,11 @@ def _make_get_scheduled_departures(
         start_dt = _parse_datetime(window_start)
         end_dt = _parse_datetime(window_end)
 
+        # This workflow runs against a single turn-level depot context.
+        # Reject LLM-supplied depot IDs that do not match the bound
+        # context to prevent cross-depot reads within the same turn.
+        if depot_uuid != workflow_depot_id:
+            return {"departures": []}
         if not _depot_in_scope(depot_uuid, auth):
             return {"departures": []}
 
@@ -470,6 +476,7 @@ def build_readiness_tool_registry(
     static_pool: Any,
     ts_pool: Any,
     auth: AuthContext,
+    depot_id: UUID,
     now: Optional[datetime] = None,
 ) -> ToolRegistry:
     """Build a Sprint-2 :class:`ToolRegistry` for the readiness workflow.
@@ -488,6 +495,9 @@ def build_readiness_tool_registry(
             (``telemetry``, ``connector_status``, ``optimization_runs``).
         auth: The caller's :class:`AuthContext`. Tools filter every
             read by ``auth.visible_depot_ids``.
+        depot_id: Turn-level depot context. ``get_scheduled_departures``
+            is bound to this value and returns an empty result when the
+            LLM supplies a different depot_id.
         now: Optional clock override for the telemetry freshness
             check. Defaults to ``datetime.now(timezone.utc)``. Tests
             pass a fixed datetime to make the staleness boundary
@@ -510,7 +520,7 @@ def build_readiness_tool_registry(
             "departure_time (ISO-8601), required_soc (0..1)."
         ),
         input_schema=_SCHEDULED_DEPARTURES_SCHEMA,
-        fn=_make_get_scheduled_departures(static_pool, auth),
+        fn=_make_get_scheduled_departures(static_pool, auth, depot_id),
     )
     registry.register(
         "get_vehicle_state",
