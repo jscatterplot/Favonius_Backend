@@ -541,7 +541,17 @@ class OCPP16Session:
         """
         pending = self._pending_start
         self._pending_start = None
-        tx_id = await self._timescale.next_transaction_id()
+        try:
+            tx_id = await self._timescale.next_transaction_id()
+        except Exception:
+            if pending is not None:
+                fallback_tx_id = self._cp.transactions.get(pending["connector_id"])
+                if fallback_tx_id is not None:
+                    try:
+                        self._in_memory_only_tx_ids.add(int(fallback_tx_id))
+                    except (TypeError, ValueError):
+                        pass
+            raise
         if pending is not None:
             try:
                 await self._timescale.insert_open_session(

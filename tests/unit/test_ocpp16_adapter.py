@@ -1423,6 +1423,26 @@ class TestOCPP16SessionRecovery:
         assert session._pending_start is None
 
     @pytest.mark.asyncio
+    async def test_next_transaction_id_marks_fallback_tx_as_in_memory_only_when_sequence_fails(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.next_transaction_id = AsyncMock(side_effect=RuntimeError("db down"))
+        session._pending_start = {
+            "connector_id": 1,
+            "evse_id": 1,
+            "id_tag": "TAG_Y",
+            "start_time": datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc),
+        }
+        session._cp.transactions[1] = 9001
+
+        with pytest.raises(RuntimeError):
+            await session._next_transaction_id()
+
+        assert 9001 in session._in_memory_only_tx_ids
+        assert session._pending_start is None
+
+
+    @pytest.mark.asyncio
     async def test_next_transaction_id_skips_insert_without_pending(
         self, session, mock_timescale
     ) -> None:
