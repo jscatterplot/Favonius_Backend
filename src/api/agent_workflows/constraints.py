@@ -176,10 +176,9 @@ class HardConstraintGuard:
 def _coerce_float(value: Any) -> Optional[float]:
     """Best-effort coercion. Returns ``None`` for non-numeric input."""
     if isinstance(value, bool):
-        # ``bool`` is a subclass of ``int``; reject explicitly so a
-        # mis-typed action with ``departure_soc=True`` doesn't silently
-        # coerce to 1.0 and pass.
-        return None
+        # ``bool`` is a subclass of ``int``; coercing here ensures
+        # ``False`` is checked as 0.0 and cannot bypass SoC validation.
+        return float(value)
     if isinstance(value, (int, float)):
         coerced = float(value)
         return coerced if math.isfinite(coerced) else None

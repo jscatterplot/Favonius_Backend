@@ -289,10 +289,12 @@ class TestHardConstraintGuard:
         assert violations[0].constraint == "malformed_action"
 
     def test_bool_field_not_coerced_to_float(self) -> None:
-        # ``True`` is a subclass of int; the guard must reject this kind
-        # of malformed input rather than treat ``True`` as 1.0 SoC.
+        # ``bool`` is a subclass of int; ``False`` must be validated as
+        # 0.0 so the hard minimum check still fires.
         guard = HardConstraintGuard()
-        assert guard.validate_action({"departure_soc": True}) is None
+        violation = guard.validate_action({"departure_soc": False})
+        assert violation is not None
+        assert violation.constraint == "departure_soc_min"
 
     def test_string_numeric_is_coerced(self) -> None:
         guard = HardConstraintGuard()
