@@ -174,6 +174,16 @@ def _emit_decision_schema() -> dict[str, Any]:
                     "type": ["string", "null"],
                     "description": "Name or identifier of the rule that produced the conclusion, if any.",
                 },
+                "coverage": {
+                    "type": "object",
+                    "description": ("Optional counts of depot entities reviewed during this turn."),
+                    "additionalProperties": False,
+                    "properties": {
+                        "vehicles_checked": {"type": "integer", "minimum": 0},
+                        "chargers_checked": {"type": "integer", "minimum": 0},
+                        "routes_checked": {"type": "integer", "minimum": 0},
+                    },
+                },
             },
             "required": ["summary"],
         },
@@ -599,6 +609,14 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
                 for v in violations
             ],
         }
+        raw_coverage = block_input.get("coverage")
+        if isinstance(raw_coverage, dict):
+            coverage: dict[str, Any] = {}
+            for key in ("vehicles_checked", "chargers_checked", "routes_checked"):
+                if key in raw_coverage:
+                    coverage[key] = raw_coverage[key]
+            if coverage:
+                output["coverage"] = coverage
         rule_applied = block_input.get("rule_applied")
         return output, (str(rule_applied) if rule_applied else None)
 
