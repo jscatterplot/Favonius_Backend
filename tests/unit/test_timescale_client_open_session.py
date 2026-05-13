@@ -181,7 +181,7 @@ def _close_session_conn(meter_start_wh, returning):
     conn = AsyncMock()
     fetchrow_results = []
     if meter_start_wh is not None:
-        fetchrow_results.append({"meter_start_wh": meter_start_wh})
+        fetchrow_results.append({"session_id": "sess-1", "meter_start_wh": meter_start_wh})
     else:
         fetchrow_results.append(None)  # SELECT found no open row
     fetchrow_results.append(returning)

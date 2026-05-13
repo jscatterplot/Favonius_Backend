@@ -2532,7 +2532,7 @@ class TimescaleClient:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     """
-                    SELECT meter_start_wh
+                    SELECT session_id, meter_start_wh
                       FROM charging_sessions
                      WHERE station_id = $1
                        AND transaction_id = $2
@@ -2545,6 +2545,7 @@ class TimescaleClient:
                 )
                 if row is None:
                     return None
+                session_id = row["session_id"]
                 meter_start_wh = row["meter_start_wh"]
                 energy_kwh = compute_energy_kwh(meter_stop_wh, meter_start_wh)
 
@@ -2569,6 +2570,7 @@ class TimescaleClient:
                     meter_stop_wh,
                     energy_kwh,
                     stop_reason,
+                    session_id,
                 )
                 if updated is None:
                     # Lost the race to another writer between SELECT and UPDATE.
