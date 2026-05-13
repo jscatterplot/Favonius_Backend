@@ -171,22 +171,16 @@ _EXAMPLE_PATHS = _example_scenario_paths()
 async def test_workflow_golden_examples(
     scenario_path: Path, workflow_test_db_pool: Any
 ) -> None:
-    """Run the example scenarios.
+    """Run the example scenarios end-to-end against a real DB.
 
     Examples are NOT part of the gated dir — they ship as proof the
-    harness works end-to-end and as a template for sprint 5. They use
-    the ``eval_demo_readiness`` workflow that the conftest in
-    ``tests/unit/agent_workflows/`` also registers; see that conftest
-    for the handler definition.
+    harness works end-to-end and as a template for sprint 5. The
+    runner constructs the :class:`Workflow` and the ToolRegistry from
+    each scenario YAML, so no module-level workflow registration is
+    needed here.
     """
     if not _EXAMPLE_PATHS:
         pytest.skip("no example scenarios present")
-
-    # Ensure the demo workflow is registered. The unit-test conftest
-    # registers it process-wide; importing it here is enough.
-    from tests.unit.agent_workflows import (  # noqa: F401 — import for side-effect
-        _demo_readiness,
-    )
 
     scenario = load_scenario(scenario_path.read_text(encoding="utf-8"))
     result = await run_scenario(scenario, pool=workflow_test_db_pool)

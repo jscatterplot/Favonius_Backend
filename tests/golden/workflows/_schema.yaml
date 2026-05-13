@@ -1,33 +1,55 @@
 # Workflow eval scenario — schema reference
 #
-# Sibling to tests/golden/agent_consumption.yaml (which gates the chat
-# agent). This file is the JSON-schema-style description for every
-# scenario YAML under tests/golden/workflows/. Per PRD principle 6 the
-# harness ships before the workflow; the real 10 readiness scenarios
-# land in sprint 5 against this same schema.
+# Sibling to tests/golden/agent_consumption.yaml (the chat-agent gate).
+# This file is the JSON-schema-style description for every scenario
+# YAML under tests/golden/workflows/. Per PRD principle 6 the harness
+# ships before the workflow; the real 10 readiness scenarios land in
+# sprint 5 against this same schema.
 #
-# Conventions:
-#   - Anything time-relative is anchored to `scenario_now`. Use ISO
-#     strings, signed seconds (`+3600`), or duration suffixes (`+2h`,
-#     `-15m`, `+45s`). The runner refuses to load a snapshot that
-#     contains a bare `now()`-style field.
-#   - All UUIDs are explicit and stable across runs. No `gen_random_uuid`
-#     inside the snapshot.
-#   - Numbers are floats unless schema says otherwise.
+# Determinism contract
+# --------------------
+# * `Decision.id`, `Decision.timestamp`, and `Decision.inputs_hash` are
+#   non-deterministic (uuid4 / wall-clock / hash over tool_calls) and
+#   are deliberately excluded from assertions. The fake AnthropicClient
+#   in the runner replays `llm_trace` exactly, so the LLM-driven part
+#   of the turn is deterministic; the wall-clock fields are not, but
+#   nothing in `expected` depends on them.
+# * Anything time-relative inside `graph_snapshot` is anchored to
+#   `scenario_now` (ISO-8601 string, signed-seconds integer, or
+#   `+2h`/`-15m`/`+45s` duration suffix). Bare `now()`-style fields
+#   are refused.
+# * All UUIDs in the snapshot are explicit and stable. No
+#   `gen_random_uuid()` inside the snapshot.
 #
-# The runner validates every scenario against this schema before loading
-# it into the savepoint. Adding a new field here requires updating
-# src/api/agent_workflows/eval/runner.py and the runner unit tests.
+# Real-runtime alignment (sprint 1 + 2)
+# -------------------------------------
+# The harness drives Sprint 2's `WorkflowAgent.run_turn(workflow,
+# depot_id, auth_context, tool_registry, user_input, *,
+# permission_tier=...)` directly. The scenario therefore carries:
+#   * a `workflow` block — name + version + prompt + allowed_tools.
+#   * a `graph_snapshot` — depot/vehicles/chargers/schedules/drivers/
+#     telemetry/prices/building_load rows loaded into a transactional
+#     savepoint on the real test database.
+#   * an `auth` block — user_id + organization_id + role for the
+#     synthesised AuthContext. `visible_depot_ids` is implicitly the
+#     snapshot's depot.
+#   * an `llm_trace` — a list of canned Anthropic responses the harness
+#     replays through a fake AnthropicClient. Each entry is one
+#     model turn (a tool_use sequence ending in either a regular tool
+#     or the reserved `emit_decision` terminator).
+#   * an `expected` block — assertions against `Decision.output` and
+#     `Decision.tool_calls`.
 
 $schema: "https://json-schema.org/draft-07/schema#"
 title: "Workflow eval scenario"
 type: object
 required:
   - id
-  - workflow
   - description
   - scenario_now
+  - workflow
   - graph_snapshot
+  - llm_trace
   - expected
   - severity
 additionalProperties: false
@@ -40,24 +62,65 @@ properties:
       e.g. `readiness-all-clear`, `readiness-charger-fault`.
     pattern: "^[a-z][a-z0-9_-]*$"
 
-  workflow:
-    type: string
-    description: |
-      Name the workflow was registered under via `register_workflow(...)`.
-      Must match one of `workflow_registry().names()` at test time, else
-      the runner raises `WorkflowNotRegisteredError`.
-
   description:
     type: string
-    description: One-line human-readable summary of what the scenario tests.
 
   scenario_now:
     type: string
     description: |
-      Logical "now" for the run, as an ISO-8601 timestamp. Workflows
-      receive this as `ctx.now`; all snapshot times are resolved
-      relative to it. Determinism: never wall-clock.
+      Logical "now" anchor for snapshot time fields. Note that
+      Sprint 2's runtime stamps `Decision.timestamp` with
+      `datetime.now(timezone.utc)`, NOT this value — `scenario_now` is
+      only used to resolve snapshot timestamps deterministically and
+      surfaces in the workflow's user message via the harness.
     format: date-time
+
+  workflow:
+    type: object
+    description: |
+      The `Workflow` Pydantic model the harness passes into
+      `WorkflowAgent.run_turn`. Mirrors src/api/agent_workflows/models.py.
+    required: [id, name, version, prompt, allowed_tools]
+    additionalProperties: false
+    properties:
+      id:             { type: string, format: uuid }
+      name:           { type: string, minLength: 1 }
+      version:        { type: string, minLength: 1 }
+      description:    { type: string }
+      prompt:         { type: string }
+      allowed_tools:  { type: array, items: { type: string } }
+      parameters:     { type: object }
+
+  auth:
+    type: object
+    description: |
+      Auth context the workflow turn runs under. `organization_id` is
+      NOT NULL in migration 037 — turns without it are rejected by the
+      runtime, so the harness defaults this to the snapshot depot's
+      derived org when absent.
+    additionalProperties: false
+    properties:
+      user_id:         { type: string, format: uuid }
+      organization_id: { type: string, format: uuid }
+      role:            { type: string }
+
+  permission_tier:
+    type: string
+    enum: [inform, draft_and_wait, act_and_notify, autonomous]
+    description: |
+      Per-(workflow, depot) tier passed to `run_turn`. Defaults to
+      `draft_and_wait` when omitted (the runtime's launch default).
+
+  depot_constraints:
+    type: object
+    description: |
+      Per-scenario override of the `DepotConstraints` the
+      HardConstraintGuard applies. Mirrors
+      `src/api/agent_workflows/constraints.py::DepotConstraints`.
+    additionalProperties: false
+    properties:
+      min_departure_soc: { type: number, minimum: 0, maximum: 1 }
+      max_grid_kw:       { type: [number, "null"] }
 
   graph_snapshot:
     type: object
@@ -75,13 +138,8 @@ properties:
           longitude:       { type: number }
           max_grid_kw:     { type: number, minimum: 0 }
           timezone:        { type: string }
-
       vehicles:
         type: array
-        description: |
-          Each vehicle record matches the `vehicles` table columns the
-          harness understands (vehicle_id, depot_id, external_id,
-          vehicle_type, battery_kwh, max_charge_kw, id_tag).
         items:
           type: object
           required: [vehicle_id]
@@ -93,13 +151,8 @@ properties:
             battery_kwh:    { type: number, minimum: 0 }
             max_charge_kw:  { type: number, minimum: 0 }
             id_tag:         { type: [string, "null"] }
-
       chargers:
         type: array
-        description: |
-          Charger records. `status` is the live OCPP status that the
-          readiness workflow reads (e.g. "Available", "Faulted",
-          "Unavailable").
         items:
           type: object
           required: [charger_id]
@@ -111,13 +164,8 @@ properties:
             efficiency:      { type: number, exclusiveMinimum: 0, maximum: 1 }
             connector_type:  { type: string }
             status:          { type: string, enum: ["Available", "Occupied", "Faulted", "Unavailable"] }
-
       schedules:
         type: array
-        description: |
-          Route assignments for the day. `departure_time` and
-          `return_time` accept the same time-shorthand as the rest of
-          the snapshot (ISO, signed seconds, or duration suffix).
         items:
           type: object
           required: [vehicle_id, departure_time, return_time]
@@ -130,13 +178,8 @@ properties:
             return_time:     { oneOf: [{ type: string }, { type: number }] }
             energy_kwh:      { type: number, minimum: 0 }
             required_soc:    { type: number, minimum: 0, maximum: 1 }
-
       drivers:
         type: array
-        description: |
-          Driver roster. Sprint 4 will join `driver_id` onto schedules;
-          for now drivers exist as a static-table fixture so workflows
-          can already exercise the "no driver assigned" branch.
         items:
           type: object
           required: [driver_id]
@@ -146,10 +189,8 @@ properties:
             external_driver_id:  { type: string }
             display_name:        { type: string }
             status:              { type: string, enum: ["active", "inactive"] }
-
       telemetry:
         type: array
-        description: Latest-SoC samples per vehicle.
         items:
           type: object
           required: [vehicle_id, soc]
@@ -161,10 +202,8 @@ properties:
             soc:            { type: number, minimum: 0, maximum: 1 }
             is_plugged:     { type: boolean }
             charging_kw:    { type: number, minimum: 0 }
-
       prices:
         type: array
-        description: Price points for the depot.
         items:
           type: object
           required: [time, energy_kwh]
@@ -173,10 +212,8 @@ properties:
             time:        { oneOf: [{ type: string }, { type: number }] }
             energy_kwh:  { type: number }
             source:      { type: string }
-
       building_load:
         type: array
-        description: Building-load samples.
         items:
           type: object
           required: [time, power_kw]
@@ -186,74 +223,128 @@ properties:
             power_kw: { type: number, minimum: 0 }
             source:   { type: string }
 
+  llm_trace:
+    type: array
+    description: |
+      Sequence of model turns the fake AnthropicClient hands back.
+      Each entry is one `client.messages.create(...)` response. The
+      harness emits these in order, regardless of what the runtime
+      sends in `messages` — workflows that branch on tool results will
+      need a scenario per branch, by design (one input → one trace).
+    minItems: 1
+    items:
+      type: object
+      additionalProperties: false
+      required: [content]
+      properties:
+        stop_reason:
+          type: string
+          enum: [tool_use, end_turn, max_tokens]
+        content:
+          type: array
+          description: |
+            Anthropic content blocks. Each block is either a `text`
+            block or a `tool_use` block. The runtime's terminator is
+            `tool_use` with `name: emit_decision` whose input becomes
+            `Decision.output`.
+          items:
+            type: object
+            additionalProperties: false
+            required: [type]
+            properties:
+              type:
+                type: string
+                enum: [text, tool_use]
+              text:  { type: string }
+              id:    { type: string }
+              name:  { type: string }
+              input: { type: object }
+        usage:
+          type: object
+          additionalProperties: true
+          description: Optional Anthropic usage block for token-count metric tests.
+
   expected:
     type: object
     description: |
-      Assertions against `Decision.output`. The runner builds a unified
-      diff of expected vs actual on failure (see EvalResult.diff()).
+      Assertions against the returned `Decision`. All fields are
+      optional; missing fields are not asserted. `Decision.id`,
+      `Decision.timestamp`, and `Decision.inputs_hash` are NEVER
+      asserted (they are non-deterministic by design).
     additionalProperties: false
-    required: [status]
     properties:
-      status:
+      disposition:
         type: string
-        enum: [all_clear, exceptions_present]
+        enum: [pending, approved, edited, rejected, auto_executed]
         description: |
-          Top-level state of the workflow's today-view output. PRD §6.1
-          allows either; `all_clear` requires `exception_count_max: 0`.
+          Almost always `pending` — the runtime never writes
+          `auto_executed`. Asserting this is a regression guard.
 
-      coverage:
+      rule_applied:
+        type: [string, "null"]
+
+      output:
         type: object
-        description: Coverage counts the workflow MUST report.
+        description: |
+          Subset of `Decision.output` that must match. Top-level keys
+          mirror PRD §6.1's today-view shape but the harness only
+          asserts keys present here — the workflow can return extra
+          fields without failing the gate.
         additionalProperties: false
         properties:
-          vehicles_checked: { type: integer, minimum: 0 }
-          chargers_checked: { type: integer, minimum: 0 }
-          routes_checked:   { type: integer, minimum: 0 }
+          summary:                { type: string }
+          summary_contains:       { type: string }
+          proposed_action_types:  { type: array, items: { type: string } }
+          proposed_action_count_min: { type: integer, minimum: 0 }
+          proposed_action_count_max: { type: integer, minimum: 0 }
+          must_propose_for_vehicle:
+            type: array
+            items:
+              type: object
+              required: [vehicle_id]
+              additionalProperties: false
+              properties:
+                vehicle_id: { type: string, format: uuid }
+                action_type_contains: { type: string }
+          must_not_propose_for_vehicle:
+            type: array
+            items:
+              type: object
+              required: [vehicle_id]
+              additionalProperties: false
+              properties:
+                vehicle_id: { type: string, format: uuid }
+          filtered_violations_min: { type: integer, minimum: 0 }
+          filtered_violations_max: { type: integer, minimum: 0 }
+          coverage:
+            type: object
+            description: |
+              Optional `coverage` block under `Decision.output` —
+              vehicles_checked / chargers_checked / routes_checked.
+            additionalProperties: false
+            properties:
+              vehicles_checked: { type: integer, minimum: 0 }
+              chargers_checked: { type: integer, minimum: 0 }
+              routes_checked:   { type: integer, minimum: 0 }
 
-      exception_count_min:
-        type: integer
-        minimum: 0
-        description: |
-          Inclusive lower bound on the number of exceptions in
-          `Decision.output.exceptions`.
-
-      exception_count_max:
-        type: integer
-        minimum: 0
-        description: Inclusive upper bound on exception count.
-
-      must_include_exceptions:
-        type: array
-        description: |
-          Exception assertions that must be present. Match is on
-          `vehicle_id` exact + `issue_contains` substring (case-insensitive).
-        items:
-          type: object
-          required: [vehicle_id]
-          additionalProperties: false
-          properties:
-            vehicle_id:      { type: string, format: uuid }
-            issue_contains:  { type: string }
-
-      must_not_include:
-        type: array
-        description: |
-          Vehicle IDs that MUST NOT appear in the exception list.
-        items:
-          type: object
-          required: [vehicle_id]
-          additionalProperties: false
-          properties:
-            vehicle_id: { type: string, format: uuid }
-
-      action_type_allow_list:
-        type: array
-        description: |
-          Optional. If present, every exception with a `proposed_action`
-          must have a `type` field in this list (anti-flapping guard so
-          the workflow doesn't invent new action verbs unnoticed).
-        items:
-          type: string
+      tool_calls:
+        type: object
+        additionalProperties: false
+        properties:
+          count_min: { type: integer, minimum: 0 }
+          count_max: { type: integer, minimum: 0 }
+          names_in_order:
+            type: array
+            items: { type: string }
+            description: |
+              Strict ordered subsequence of recorded `tool_calls[*].name`.
+              Useful for asserting "the agent always reads schedule
+              before vehicle state". The actual list may be longer.
+          all_ok:
+            type: boolean
+            description: |
+              When `true`, every `ToolCall.ok` must be true. When
+              `false`, at least one must be false. Omitted = no check.
 
   severity:
     type: string
@@ -263,5 +354,3 @@ properties:
         blocking — failing this scenario fails the workflow-golden gate.
         warning  — reported but does not fail the gate.
         info     — purely informational.
-      The runner records this in `EvalResult.severity`; the pytest
-      plugin uses it to decide between `assert` and `pytest.warns`.

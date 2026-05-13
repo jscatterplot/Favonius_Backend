@@ -53,9 +53,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Run runner unit tests with coverage
+        # Coverage is scoped to the eval module — runtime/repository
+        # have their own dedicated suites
+        # (tests/unit/test_agent_workflows_*.py). This job's job is to
+        # gate the harness itself.
         run: |
           pytest tests/unit/agent_workflows/ \
-            --cov=src/api/agent_workflows \
+            --cov=src/api/agent_workflows/eval \
             --cov-report=term \
             --cov-fail-under=90
 
