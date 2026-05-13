@@ -72,6 +72,17 @@ class _FakeConnection:
         self.fetches: list[tuple[str, tuple[Any, ...]]] = []
         self.fetch_responses: dict[str, list[Any]] = {}
         self.fetchrow_responses: dict[str, list[Any]] = {}
+        self.existing_tables: set[str] = {
+            "organizations",
+            "depots",
+            "vehicles",
+            "chargers",
+            "drivers",
+            "schedules",
+            "telemetry",
+            "prices",
+            "building_load",
+        }
         self.transactions: list[_FakeTransaction] = []
 
     async def execute(self, sql: str, *args: Any) -> str:
@@ -94,6 +105,8 @@ class _FakeConnection:
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         self.fetches.append((sql, args))
+        if "to_regclass" in sql and args:
+            return args[0] if args[0] in self.existing_tables else None
         return None
 
     def transaction(self) -> _FakeTransaction:

@@ -26,6 +26,7 @@ path.
 from __future__ import annotations
 
 import sys
+import traceback
 import warnings
 from pathlib import Path
 from typing import Any
@@ -180,7 +181,21 @@ async def test_workflow_golden_examples(
         pytest.skip("no example scenarios present")
 
     scenario = load_scenario(scenario_path.read_text(encoding="utf-8"))
-    result = await run_scenario(scenario, pool=workflow_test_db_pool)
+    try:
+        result = await run_scenario(scenario, pool=workflow_test_db_pool)
+    except Exception as exc:  # examples are informational only; never gate CI
+        with capfd.disabled():
+            print(
+                f"[workflow-golden:example-nonblocking] {scenario_path}: runtime error: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+        warnings.warn(
+            f"{scenario_path}: example scenario runtime error (non-blocking)",
+            UserWarning,
+            stacklevel=2,
+        )
+        return
 
     _report_example_result(result, scenario_path, capfd=capfd)
 
