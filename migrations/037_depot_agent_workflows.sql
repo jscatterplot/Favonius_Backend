@@ -57,8 +57,8 @@ CREATE INDEX IF NOT EXISTS idx_workflow_tiers_depot
 
 -- ── decisions (hypertable) ───────────────────────────────────────────────
 -- TimescaleDB requires the time partition column to be part of the
--- primary key, so PK is `(id, timestamp)` — `id` alone remains unique
--- in practice via gen_random_uuid().
+-- primary key, so PK is `(id, timestamp)`. Logical decision identity is still
+-- globally unique on `id`, enforced by an INSERT trigger (see below).
 CREATE TABLE IF NOT EXISTS decisions (
     id                  UUID         NOT NULL DEFAULT gen_random_uuid(),
     workflow_id         UUID         NOT NULL REFERENCES workflows(id),
@@ -97,6 +97,9 @@ CREATE INDEX IF NOT EXISTS idx_decisions_workflow_depot_time
     ON decisions (workflow_id, depot_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_org_time
     ON decisions (organization_id, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_id
+    ON decisions (id);
 CREATE INDEX IF NOT EXISTS idx_decisions_parent
     ON decisions (parent_decision_id)
     WHERE parent_decision_id IS NOT NULL;
@@ -118,6 +121,32 @@ BEGIN
     USING ERRCODE = 'check_violation';
 END;
 $$;
+
+
+
+-- Enforce logical decision identity uniqueness on `id` even though the
+-- hypertable primary key must include `timestamp`.
+CREATE OR REPLACE FUNCTION decisions_enforce_unique_id()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM decisions WHERE id = NEW.id LIMIT 1) THEN
+        RAISE EXCEPTION
+            'duplicate decisions.id: % already exists',
+            NEW.id
+        USING ERRCODE = 'unique_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_decisions_unique_id ON decisions;
+CREATE TRIGGER trg_decisions_unique_id
+    BEFORE INSERT ON decisions
+    FOR EACH ROW
+    EXECUTE FUNCTION decisions_enforce_unique_id();
 
 DROP TRIGGER IF EXISTS trg_decisions_append_only ON decisions;
 CREATE TRIGGER trg_decisions_append_only
