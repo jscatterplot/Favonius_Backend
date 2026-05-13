@@ -1,10 +1,11 @@
-"""End-to-end test for the readiness workflow tools.
+"""End-to-end test for the Sprint-4 readiness tools.
 
 Seeds an isolated Postgres schema (``readiness_e2e``) with the static
 and time-series tables the tools touch, drops a depot containing two
-vehicles, two chargers, one schedule, and one driver, then resolves
-each tool through the global :class:`ToolRegistry` and asserts the
-joined shape end-to-end.
+vehicles, two chargers, one schedule, and one driver, then dispatches
+each tool through the Sprint-2 :class:`ToolRegistry` built by
+:func:`build_readiness_tool_registry` and asserts the joined shape
+end-to-end.
 
 If the test database is unreachable the suite skips — the unit tests
 still cover the pure-Python paths.
@@ -22,7 +23,7 @@ import pytest
 import pytest_asyncio
 
 from src.api.agent.auth_context import AuthContext
-from src.api.agent_workflows import get_registry
+from src.api.agent_workflows.readiness_tools import build_readiness_tool_registry
 
 # ── Schema bootstrap ──────────────────────────────────────────────────────
 
@@ -37,7 +38,6 @@ DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE;
 CREATE SCHEMA {_SCHEMA};
 SET search_path TO {_SCHEMA};
 
--- Static (Supabase-shaped) tables --------------------------------------
 CREATE TABLE organizations (
     id   UUID PRIMARY KEY,
     name VARCHAR(255) NOT NULL
@@ -84,7 +84,6 @@ CREATE TABLE schedules (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Time-series tables ---------------------------------------------------
 CREATE TABLE telemetry (
     time            TIMESTAMPTZ NOT NULL,
     station_id      TEXT NOT NULL,
@@ -180,7 +179,6 @@ async def db_pools():
 
 @pytest_asyncio.fixture
 async def seeded(db_pools):
-    """Seed a depot with 2 vehicles, 2 chargers, 1 schedule, 1 driver."""
     static_pool, ts_pool = db_pools
     now = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -231,8 +229,6 @@ async def seeded(db_pools):
         )
 
     async with ts_pool.acquire() as conn:
-        # Fresh telemetry for both vehicles. VEHICLE_1 is plugged in to
-        # CHARGER_1; VEHICLE_2 is parked offline.
         await conn.executemany(
             """
             INSERT INTO telemetry (
@@ -246,7 +242,6 @@ async def seeded(db_pools):
             ],
         )
 
-        # Connector status: CP-001 charging, CP-002 available.
         await conn.executemany(
             "INSERT INTO connector_status (station_id, connector_id, status, "
             "error_code, timestamp) VALUES ($1, $2, $3, $4, $5)",
@@ -256,7 +251,6 @@ async def seeded(db_pools):
             ],
         )
 
-        # An optimization run with a per-vehicle plan for VEHICLE_1 only.
         import json
 
         await conn.execute(
@@ -284,91 +278,86 @@ async def seeded(db_pools):
             ),
         )
 
-    return {
-        "static_pool": static_pool,
-        "ts_pool": ts_pool,
-        "now": now,
-    }
+    return {"static_pool": static_pool, "ts_pool": ts_pool, "now": now}
 
 
-def _auth() -> AuthContext:
+def _auth_for(depots: list[UUID]) -> AuthContext:
     return AuthContext(
         user_id=USER_A,
         organization_id=ORG_A,
         role="customer_admin",
-        visible_depot_ids=[DEPOT_A],
+        visible_depot_ids=depots,
     )
 
 
-# ── The test ──────────────────────────────────────────────────────────────
+# ── The tests ─────────────────────────────────────────────────────────────
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_readiness_tools_end_to_end(seeded):
-    """Call every readiness tool through the registry and assert the shapes."""
     static_pool: Any = seeded["static_pool"]
     ts_pool: Any = seeded["ts_pool"]
     now: datetime = seeded["now"]
-    auth = _auth()
-    registry = get_registry()
 
-    # 1) get_scheduled_departures ----------------------------------------
-    scheduled = await registry.get("get_scheduled_departures")(
-        auth,
-        static_pool,
-        DEPOT_A,
-        now,
-        now + timedelta(hours=24),
+    registry = build_readiness_tool_registry(
+        static_pool=static_pool,
+        ts_pool=ts_pool,
+        auth=_auth_for([DEPOT_A]),
+        now=now,
     )
-    assert len(scheduled) == 1
-    row = scheduled[0]
-    assert row["vehicle_id"] == VEHICLE_1
+
+    # 1) get_scheduled_departures
+    scheduled = await registry.dispatch(
+        "get_scheduled_departures",
+        {
+            "depot_id": str(DEPOT_A),
+            "window_start": now.isoformat(),
+            "window_end": (now + timedelta(hours=24)).isoformat(),
+        },
+    )
+    assert len(scheduled["departures"]) == 1
+    row = scheduled["departures"][0]
+    assert row["vehicle_id"] == str(VEHICLE_1)
     assert row["route_id"] == ROUTE_ID
     assert row["required_soc"] == 0.85
 
-    # 2) get_vehicle_state — fresh telemetry, plugged in -----------------
-    state_v1 = await registry.get("get_vehicle_state")(
-        auth, static_pool, ts_pool, VEHICLE_1, now=now
-    )
-    assert state_v1["vehicle_id"] == VEHICLE_1
+    # 2) get_vehicle_state — fresh, plugged in
+    state_v1 = await registry.dispatch("get_vehicle_state", {"vehicle_id": str(VEHICLE_1)})
+    assert state_v1["vehicle_id"] == str(VEHICLE_1)
     assert state_v1["current_soc"] == pytest.approx(0.72)
-    assert state_v1["plugged_in_to"] == CHARGER_1
+    assert state_v1["plugged_in_to"] == str(CHARGER_1)
     assert state_v1["max_charge_kw"] == pytest.approx(120.0)
     assert state_v1["telemetry_fresh"] is True
 
-    # Vehicle 2 — not plugged in, charger should be None.
-    state_v2 = await registry.get("get_vehicle_state")(
-        auth, static_pool, ts_pool, VEHICLE_2, now=now
-    )
+    # Vehicle 2 — not plugged in, charger field nulled.
+    state_v2 = await registry.dispatch("get_vehicle_state", {"vehicle_id": str(VEHICLE_2)})
     assert state_v2["plugged_in_to"] is None
     assert state_v2["telemetry_fresh"] is True
 
-    # 3) get_charger_state ------------------------------------------------
-    chg = await registry.get("get_charger_state")(auth, static_pool, ts_pool, CHARGER_1)
+    # 3) get_charger_state
+    chg = await registry.dispatch("get_charger_state", {"charger_id": str(CHARGER_1)})
     assert chg["status"] == "Charging"
     assert chg["fault_code"] is None
     assert chg["current_kw"] == pytest.approx(40.0)
     assert chg["last_update_at"] is not None
 
-    # 4) get_charging_plan ------------------------------------------------
-    plan = await registry.get("get_charging_plan")(auth, static_pool, ts_pool, VEHICLE_1)
-    assert len(plan) == 4
-    assert plan[0] == {"timestep": 0, "target_kw": 40.0, "projected_soc": 0.72}
-    assert plan[-1]["projected_soc"] == pytest.approx(0.95)
+    # 4) get_charging_plan
+    plan = await registry.dispatch("get_charging_plan", {"vehicle_id": str(VEHICLE_1)})
+    assert len(plan["plan"]) == 4
+    assert plan["plan"][0] == {"timestep": 0, "target_kw": 40.0, "projected_soc": 0.72}
+    assert plan["plan"][-1]["projected_soc"] == pytest.approx(0.95)
 
-    # Vehicle 2 has no per-vehicle entry in the run → empty plan.
-    plan_v2 = await registry.get("get_charging_plan")(auth, static_pool, ts_pool, VEHICLE_2)
-    assert plan_v2 == []
+    plan_v2 = await registry.dispatch("get_charging_plan", {"vehicle_id": str(VEHICLE_2)})
+    assert plan_v2 == {"plan": []}
 
-    # 5) get_driver_assignment -------------------------------------------
-    assignment = await registry.get("get_driver_assignment")(auth, static_pool, ROUTE_ID)
-    assert assignment["driver_id"] == DRIVER_1
+    # 5) get_driver_assignment
+    assignment = await registry.dispatch("get_driver_assignment", {"route_id": ROUTE_ID})
+    assert assignment["driver_id"] == str(DRIVER_1)
     assert assignment["driver_name"] == "John Smith"
     assert assignment["shift_valid_for_route"] is True
 
-    # Unknown route → invalid.
-    missing = await registry.get("get_driver_assignment")(auth, static_pool, "R-DOES-NOT-EXIST")
+    missing = await registry.dispatch("get_driver_assignment", {"route_id": "R-DOES-NOT-EXIST"})
     assert missing["driver_id"] is None
     assert missing["shift_valid_for_route"] is False
 
@@ -381,32 +370,33 @@ async def test_cross_org_isolation_e2e(seeded):
     ts_pool = seeded["ts_pool"]
     now: datetime = seeded["now"]
     other_depot = UUID("88888888-8888-4888-8888-888888888888")
-    other_auth = AuthContext(
-        user_id=USER_A,
-        organization_id=UUID("99999999-9999-4999-8999-999999999999"),
-        role="customer_admin",
-        visible_depot_ids=[other_depot],
-    )
-    registry = get_registry()
 
-    assert (
-        await registry.get("get_scheduled_departures")(
-            other_auth, static_pool, DEPOT_A, now, now + timedelta(hours=24)
-        )
-        == []
+    registry = build_readiness_tool_registry(
+        static_pool=static_pool,
+        ts_pool=ts_pool,
+        auth=_auth_for([other_depot]),
+        now=now,
     )
 
-    state = await registry.get("get_vehicle_state")(
-        other_auth, static_pool, ts_pool, VEHICLE_1, now=now
+    scheduled = await registry.dispatch(
+        "get_scheduled_departures",
+        {
+            "depot_id": str(DEPOT_A),
+            "window_start": now.isoformat(),
+            "window_end": (now + timedelta(hours=24)).isoformat(),
+        },
     )
+    assert scheduled == {"departures": []}
+
+    state = await registry.dispatch("get_vehicle_state", {"vehicle_id": str(VEHICLE_1)})
     assert state["current_soc"] is None
     assert state["telemetry_fresh"] is False
 
-    chg = await registry.get("get_charger_state")(other_auth, static_pool, ts_pool, CHARGER_1)
+    chg = await registry.dispatch("get_charger_state", {"charger_id": str(CHARGER_1)})
     assert chg["status"] is None
 
-    plan = await registry.get("get_charging_plan")(other_auth, static_pool, ts_pool, VEHICLE_1)
-    assert plan == []
+    plan = await registry.dispatch("get_charging_plan", {"vehicle_id": str(VEHICLE_1)})
+    assert plan == {"plan": []}
 
-    assignment = await registry.get("get_driver_assignment")(other_auth, static_pool, ROUTE_ID)
+    assignment = await registry.dispatch("get_driver_assignment", {"route_id": ROUTE_ID})
     assert assignment["driver_id"] is None

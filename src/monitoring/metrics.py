@@ -110,6 +110,27 @@ AGENT_RESOLVER_MISSES = Counter(
     ["kind"],  # kind: not_found | ambiguous
 )
 
+# Depot workflow agent runtime metrics (PRD §4.3/§4.4, sprint 2).
+# Naming mirrors the existing agent_search metrics one level up.
+WORKFLOW_TURNS = Counter(
+    "favonius_workflow_turns_total",
+    "Total depot workflow agent turns by workflow, depot, and outcome",
+    ["workflow", "depot", "status"],
+)
+
+WORKFLOW_TURN_DURATION = Histogram(
+    "favonius_workflow_turn_duration_seconds",
+    "End-to-end latency of a workflow turn (one Anthropic Messages loop)",
+    ["workflow"],
+    buckets=[0.5, 1, 2, 4, 8, 15, 30, 60, 120],
+)
+
+WORKFLOW_LLM_TOKENS = Counter(
+    "favonius_workflow_llm_tokens_total",
+    "LLM tokens consumed by the workflow agent, split by workflow, model, direction",
+    ["workflow", "model", "direction"],  # direction: input | output
+)
+
 # Control loop metrics
 # Per PRD Section 10.2: System availability ≥ 99.5%
 CONTROL_LOOP_UPTIME = Gauge(
