@@ -181,12 +181,12 @@ def _coerce_float(value: Any) -> Optional[float]:
         # coerce to 1.0 and pass.
         return None
     if isinstance(value, (int, float)):
-        numeric = float(value)
-        return numeric if math.isfinite(numeric) else None
+        coerced = float(value)
+        return coerced if math.isfinite(coerced) else None
     if isinstance(value, str):
         try:
-            numeric = float(value)
-            return numeric if math.isfinite(numeric) else None
+            coerced = float(value)
+            return coerced if math.isfinite(coerced) else None
         except ValueError:
             return None
     return None
