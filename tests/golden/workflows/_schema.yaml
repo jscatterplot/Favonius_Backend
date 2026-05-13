@@ -75,6 +75,11 @@ properties:
       surfaces in the workflow's user message via the harness.
     format: date-time
 
+  user_input:
+    type: [string, "null"]
+    description: |
+      Optional operator message passed through to ``WorkflowAgent.run_turn`` as ``user_input``.
+
   workflow:
     type: object
     description: |
