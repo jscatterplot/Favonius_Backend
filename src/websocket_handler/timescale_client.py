@@ -2558,6 +2558,7 @@ class TimescaleClient:
                            updated_at           = NOW()
                      WHERE station_id     = $1
                        AND transaction_id = $2
+                       AND session_id     = $7
                        AND end_time IS NULL
                        AND source = 'live'
                  RETURNING meter_start_wh, energy_delivered_kwh
@@ -2668,6 +2669,7 @@ class TimescaleClient:
                            updated_at           = NOW()
                      WHERE station_id     = $1
                        AND transaction_id = $2
+                       AND session_id     = $7
                        AND end_time IS NULL
                        AND source = 'live'
                        AND (
@@ -2688,6 +2690,7 @@ class TimescaleClient:
                     last_meter_wh,
                     energy_kwh,
                     stale_after_seconds,
+                    row["session_id"],
                 )
                 if updated is not None:
                     closed.append(dict(updated))
