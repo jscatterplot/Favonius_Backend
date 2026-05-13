@@ -457,13 +457,8 @@ async def _insert_building_load(
         )
 
 
-async def load_snapshot(conn: Any, scenario: dict) -> UUID:
-    """Insert ``graph_snapshot`` rows on the given (open-transaction) connection.
-
-    The caller owns the transaction lifecycle. :func:`run_scenario`
-    handles that; callers using ``load_snapshot`` directly must too.
-    """
-    _validate_scenario(scenario)
+async def _load_snapshot_after_validate(conn: Any, scenario: dict) -> UUID:
+    """Insert ``graph_snapshot`` rows; caller must have run :func:`_validate_scenario`."""
     scenario_now = _parse_scenario_now(scenario["scenario_now"])
     snapshot = scenario["graph_snapshot"]
 
@@ -482,6 +477,16 @@ async def load_snapshot(conn: Any, scenario: dict) -> UUID:
     await _insert_prices(conn, snapshot.get("prices", []), depot_id, scenario_now)
     await _insert_building_load(conn, snapshot.get("building_load", []), depot_id, scenario_now)
     return depot_id
+
+
+async def load_snapshot(conn: Any, scenario: dict) -> UUID:
+    """Insert ``graph_snapshot`` rows on the given (open-transaction) connection.
+
+    The caller owns the transaction lifecycle. :func:`run_scenario`
+    handles that; callers using ``load_snapshot`` directly must too.
+    """
+    _validate_scenario(scenario)
+    return await _load_snapshot_after_validate(conn, scenario)
 
 
 # ── Fake Anthropic client + content blocks ────────────────────────────────
@@ -1033,7 +1038,7 @@ async def run_scenario(
         transaction = conn.transaction()
         await transaction.start()
         try:
-            depot_id = await load_snapshot(conn, scenario)
+            depot_id = await _load_snapshot_after_validate(conn, scenario)
             auth = _build_auth_context(scenario, depot_id)
 
             registry_builder = tool_registry_builder or _build_default_tool_registry
