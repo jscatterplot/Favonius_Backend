@@ -193,7 +193,7 @@ def test_load_scenario_rejects_non_mapping() -> None:
 
 
 def test_load_scenario_rejects_missing_keys() -> None:
-    with pytest.raises(ScenarioLoadError, match="missing keys"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario("id: incomplete\n")
 
 
@@ -202,7 +202,7 @@ def test_load_scenario_rejects_bad_severity() -> None:
     s["severity"] = "critical"
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="severity must be one of"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -211,7 +211,7 @@ def test_load_scenario_rejects_bad_tier() -> None:
     s["permission_tier"] = "supreme_overlord"
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="permission_tier must be one of"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -220,7 +220,7 @@ def test_load_scenario_rejects_non_mapping_snapshot() -> None:
     s["graph_snapshot"] = "not a dict"
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="graph_snapshot must be a mapping"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -229,7 +229,7 @@ def test_load_scenario_rejects_non_mapping_workflow() -> None:
     s["workflow"] = ["name", "version"]
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="workflow must be a mapping"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -238,7 +238,7 @@ def test_load_scenario_rejects_missing_workflow_keys() -> None:
     s["workflow"].pop("prompt")
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="workflow.prompt is required"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -247,7 +247,17 @@ def test_load_scenario_rejects_empty_llm_trace() -> None:
     s["llm_trace"] = []
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="llm_trace must be a non-empty list"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+        load_scenario(yaml.safe_dump(s))
+
+
+def test_load_scenario_rejects_unknown_top_level_field() -> None:
+    s = _minimal_scenario()
+    s["typo"] = True
+
+    import yaml
+
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -256,7 +266,7 @@ def test_load_scenario_rejects_trace_entry_missing_content() -> None:
     s["llm_trace"] = [{"stop_reason": "tool_use"}]
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="missing 'content'"):
+    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -355,11 +365,18 @@ async def test_fake_client_replays_in_order() -> None:
     ]
     client = FakeAnthropicClient(trace)
 
-    r1 = await client.messages.create(model="m", messages=[])
+    r1 = await client.messages.create(model="m", messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
     assert r1.content[0].type == "tool_use"
     assert r1.content[0].name == "t1"
 
-    r2 = await client.messages.create(model="m", messages=[])
+    r2 = await client.messages.create(
+        model="m",
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {"x": 1}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "ok"}]},
+        ],
+    )
     assert r2.content[0].type == "text"
     assert r2.stop_reason == "end_turn"
 
@@ -369,7 +386,7 @@ async def test_fake_client_records_calls() -> None:
     client = FakeAnthropicClient(
         [{"stop_reason": "tool_use", "content": [{"type": "text", "text": ""}]}]
     )
-    await client.messages.create(model="m", system=[{"text": "hi"}], tools=[], messages=[])
+    await client.messages.create(model="m", system=[{"text": "hi"}], tools=[], messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
     assert len(client.messages.calls) == 1
     assert client.messages.calls[0]["model"] == "m"
 
@@ -385,7 +402,7 @@ async def test_fake_client_carries_usage_when_present() -> None:
             }
         ]
     )
-    r = await client.messages.create()
+    r = await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
     assert r.usage.input_tokens == 10
     assert r.usage.output_tokens == 20
 
@@ -395,9 +412,21 @@ async def test_fake_client_raises_when_exhausted() -> None:
     client = FakeAnthropicClient(
         [{"stop_reason": "tool_use", "content": [{"type": "text", "text": "ok"}]}]
     )
-    await client.messages.create()
+    await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
     with pytest.raises(AssertionError, match="exhausted"):
-        await client.messages.create()
+        await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+
+
+@pytest.mark.asyncio
+async def test_fake_client_requires_tool_result_after_tool_use() -> None:
+    trace = [
+        {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {}}]},
+        {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]},
+    ]
+    client = FakeAnthropicClient(trace)
+    await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    with pytest.raises(AssertionError, match="tool_result context"):
+        await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "next"}]}])
 
 
 def test_fake_client_rejects_unknown_block_type() -> None:
