@@ -13,7 +13,7 @@
 --
 -- We don't yet have a customer-side routes system; ``schedules`` rows are
 -- the per-day route representation in V1. Each ``schedules.route_id`` may
--- repeat across days, so the view exposes one row per (route_id) by
+-- repeat across days, so the view exposes one row per (site_id, route_id) by
 -- folding the per-day departure/return into the earliest start and latest
 -- end seen for that route, with the most-recent ``energy_kwh`` as the
 -- estimate. This gives the agent a stable Route shape it can join against
@@ -36,25 +36,40 @@
 CREATE OR REPLACE VIEW public.routes AS
 SELECT
     s.route_id                              AS id,
-    MAX(s.energy_kwh)                       AS energy_estimate_kwh,
+    (array_agg(
+        s.energy_kwh
+        ORDER BY
+            s.departure_time DESC NULLS LAST,
+            s.created_at DESC NULLS LAST
+    ))[1]                                   AS energy_estimate_kwh,
     MIN(s.departure_time)                   AS start_time,
     MAX(s.return_time)                      AS end_time,
     NULL::text                              AS contract_id,
     -- The fields below are not part of the PRD Route dataclass; they let
     -- the readiness tool scope by depot / vehicle / driver without a
     -- second join against schedules.
-    MAX(v.site_id)                          AS site_id,
-    MAX(s.vehicle_id)                       AS vehicle_id,
-    MAX(s.driver_id)                        AS driver_id,
+    v.site_id                               AS site_id,
+    (array_agg(
+        s.vehicle_id
+        ORDER BY
+            s.departure_time DESC NULLS LAST,
+            s.created_at DESC NULLS LAST
+    ))[1]                                   AS vehicle_id,
+    (array_agg(
+        s.driver_id
+        ORDER BY
+            s.departure_time DESC NULLS LAST,
+            s.created_at DESC NULLS LAST
+    ))[1]                                   AS driver_id,
     MAX(s.required_soc)                     AS required_soc
 FROM public.schedules s
 JOIN public.vehicles  v ON v.id = s.vehicle_id
 WHERE s.route_id IS NOT NULL
-GROUP BY s.route_id;
+GROUP BY s.route_id, v.site_id;
 
 COMMENT ON VIEW public.routes IS
     'Stable Route shape for the depot agent, aliased over the schedules '
     'table until a customer-side routes system ships. One row per '
-    'route_id; energy_estimate_kwh is the most recent estimate, '
+    '(site_id, route_id); energy_estimate_kwh is the most recent estimate, '
     'start_time/end_time bound the union of all per-day departures and '
     'returns for that route. See docs/PRD_Depot_Agent.md §5.1.';
