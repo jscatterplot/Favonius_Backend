@@ -139,6 +139,7 @@ def _resolve_meter_stop(
         return int(best_wh)
     return meter_stop
 
+
 _OCPP16_AUTH_FROM_STATUS: dict[RFIDAuthStatus, AuthorizationStatus] = {
     RFIDAuthStatus.ACCEPTED: AuthorizationStatus.accepted,
     RFIDAuthStatus.EXPIRED: AuthorizationStatus.expired,
@@ -690,6 +691,10 @@ class OCPP16Session:
         #      response timeout.
         try:
             await self._timescale.clear_sessions_seen(cp_id)
+        except Exception as exc:
+            logger.error("clear_sessions_seen failed for station=%s: %s", cp_id, exc)
+
+        try:
             open_rows = await self._timescale.fetch_open_sessions(cp_id)
         except Exception as exc:
             open_rows = []
@@ -723,10 +728,7 @@ class OCPP16Session:
         # RFID tags while offline. Runs after the queued-command replay so
         # SetChargingProfile and SendLocalList don't race on the same socket
         # for vendors that mishandle interleaved request/response cycles.
-        if (
-            self._local_auth_sync_task is not None
-            and not self._local_auth_sync_task.done()
-        ):
+        if self._local_auth_sync_task is not None and not self._local_auth_sync_task.done():
             self._local_auth_sync_task.cancel()
         self._local_auth_sync_task = asyncio.create_task(self._delayed_local_auth_sync())
 
@@ -737,10 +739,7 @@ class OCPP16Session:
         # produce Energy.Active.Import.Register without an explicit
         # ChangeConfiguration. Fire-and-forget so the boot ack is not
         # blocked by a slow or unresponsive charger.
-        if (
-            self._metering_config_task is not None
-            and not self._metering_config_task.done()
-        ):
+        if self._metering_config_task is not None and not self._metering_config_task.done():
             self._metering_config_task.cancel()
         self._metering_config_task = asyncio.create_task(self._push_metering_config())
 
@@ -934,9 +933,7 @@ class OCPP16Session:
                         value,
                     )
         except asyncio.CancelledError:
-            logger.debug(
-                "metering_config push cancelled for station=%s", self._station_id
-            )
+            logger.debug("metering_config push cancelled for station=%s", self._station_id)
             raise
         finally:
             current = asyncio.current_task()
