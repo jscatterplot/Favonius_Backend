@@ -300,6 +300,12 @@ class TestHardConstraintGuard:
         assert violation is not None
         assert violation.constraint == "departure_soc_min"
 
+    @pytest.mark.parametrize("bad_value", ["nan", "NaN", "inf", "infinity"])
+    def test_non_finite_string_values_are_ignored(self, bad_value: str) -> None:
+        guard = HardConstraintGuard(DepotConstraints(max_grid_kw=500.0))
+        assert guard.validate_action({"departure_soc": bad_value}) is None
+        assert guard.validate_action({"grid_kw": bad_value}) is None
+
 
 # ── _canonical_tool_calls_hash ─────────────────────────────────────────────
 
