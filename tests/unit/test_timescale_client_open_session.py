@@ -361,11 +361,8 @@ async def test_close_open_session_stamps_stop_reason():
 
 
 @pytest.mark.asyncio
-async def test_clear_sessions_seen_also_bumps_updated_at():
-    """clear_sessions_seen must bump ``updated_at`` so a freshly reconnected
-    session is not closed by the orphan-recovery case-2 predicate
-    (``COALESCE(last_meter_seen_at, updated_at, start_time) < threshold``).
-    """
+async def test_clear_sessions_seen_clears_last_seen_only():
+    """clear_sessions_seen must only null ``last_seen_at`` on open live sessions."""
     conn = AsyncMock()
     client, _ = _client_with_conn(conn)
 
@@ -373,7 +370,7 @@ async def test_clear_sessions_seen_also_bumps_updated_at():
 
     update_sql = conn.execute.await_args.args[0]
     assert "last_seen_at = NULL" in update_sql
-    assert "updated_at" in update_sql and "NOW()" in update_sql
+    assert "updated_at" not in update_sql
     # The WHERE clause must still scope to live, still-open sessions.
     assert "end_time IS NULL" in update_sql
     assert "source = 'live'" in update_sql

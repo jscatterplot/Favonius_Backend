@@ -197,6 +197,10 @@ class OCPP16Session:
         # row alongside the generated tx_id. Safe because FleetChargePoint
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
+        # tx_ids accepted by the in-memory gate but not yet durable in DB
+        # because insert_open_session failed. These must continue to block
+        # sibling StartTransaction retries on the same connector.
+        self._in_memory_only_tx_ids: Set[int] = set()
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
         self._metering_config_task: Optional[asyncio.Task[None]] = None
@@ -552,7 +556,9 @@ class OCPP16Session:
                     card_id=pending.get("card_id"),
                     meter_start_wh=pending.get("meter_start_wh"),
                 )
+                self._in_memory_only_tx_ids.discard(int(tx_id))
             except Exception as exc:
+                self._in_memory_only_tx_ids.add(int(tx_id))
                 logger.warning(
                     "insert_open_session failed for station=%s tx_id=%s: %s",
                     self._station_id,
@@ -1168,6 +1174,15 @@ class OCPP16Session:
                     stale_tx_id,
                 )
                 return AuthorizationStatus.concurrent_tx
+            if int(stale_tx_id) in self._in_memory_only_tx_ids:
+                logger.warning(
+                    "Rejecting StartTransaction for station=%s connector=%s: "
+                    "tx_id=%s is active in-memory while DB row is missing",
+                    cp_id,
+                    connector_id,
+                    stale_tx_id,
+                )
+                return AuthorizationStatus.concurrent_tx
             logger.warning(
                 "Self-healing stale in-memory transaction for station=%s "
                 "connector=%s tx_id=%s (DB says closed)",
@@ -1175,9 +1190,11 @@ class OCPP16Session:
                 connector_id,
                 stale_tx_id,
             )
-            self._cp.transactions.pop(connector_id, None)
+            if self._cp.transactions.get(connector_id) == stale_tx_id:
+                self._cp.transactions.pop(connector_id, None)
             if self._cp.current_transaction_id == stale_tx_id:
                 self._cp.current_transaction_id = None
+            self._in_memory_only_tx_ids.discard(int(stale_tx_id))
 
         decision = await self._authz.authorize(cp_id, id_tag, "StartTransaction")
         auth_status = self._map_auth_status(decision.status)
@@ -1299,6 +1316,7 @@ class OCPP16Session:
                 transaction_id,
                 exc,
             )
+        self._in_memory_only_tx_ids.discard(int(transaction_id))
         # Surface meter-delta anomalies so operators can reconcile the row
         # from the raw Wh values rather than from a NULL billing kWh. The
         # close already matched a row; we just couldn't compute the delta.
