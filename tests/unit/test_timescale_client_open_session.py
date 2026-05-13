@@ -358,3 +358,45 @@ async def test_close_open_session_stamps_stop_reason():
     update_sql = update_call.args[0]
     assert "stop_reason" in update_sql
     assert update_call.args[6] == "EVDisconnected"
+
+
+@pytest.mark.asyncio
+async def test_clear_sessions_seen_clears_last_seen_only():
+    """clear_sessions_seen must only null ``last_seen_at`` on open live sessions."""
+    conn = AsyncMock()
+    client, _ = _client_with_conn(conn)
+
+    await client.clear_sessions_seen("cp-1")
+
+    update_sql = conn.execute.await_args.args[0]
+    assert "last_seen_at = NULL" in update_sql
+    assert "updated_at" not in update_sql
+    # The WHERE clause must still scope to live, still-open sessions.
+    assert "end_time IS NULL" in update_sql
+    assert "source = 'live'" in update_sql
+
+
+@pytest.mark.asyncio
+async def test_is_transaction_open_returns_true_when_row_open():
+    """``is_transaction_open`` returns True when a matching live row exists with end_time IS NULL."""
+    conn = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=1)
+    client, _ = _client_with_conn(conn)
+
+    assert await client.is_transaction_open("cp-1", 42) is True
+
+    sql = conn.fetchval.await_args.args[0]
+    assert "end_time IS NULL" in sql
+    assert "source = 'live'" in sql
+    assert conn.fetchval.await_args.args[1] == "cp-1"
+    assert conn.fetchval.await_args.args[2] == 42
+
+
+@pytest.mark.asyncio
+async def test_is_transaction_open_returns_false_when_no_row():
+    """Missing or closed row -> False; caller drops in-memory cache entry."""
+    conn = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=None)
+    client, _ = _client_with_conn(conn)
+
+    assert await client.is_transaction_open("cp-1", 42) is False

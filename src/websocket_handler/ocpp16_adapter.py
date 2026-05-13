@@ -197,6 +197,10 @@ class OCPP16Session:
         # row alongside the generated tx_id. Safe because FleetChargePoint
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
+        # tx_ids accepted by the in-memory gate but not yet durable in DB
+        # because insert_open_session failed. These must continue to block
+        # sibling StartTransaction retries on the same connector.
+        self._in_memory_only_tx_ids: Set[int] = set()
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
         self._metering_config_task: Optional[asyncio.Task[None]] = None
@@ -537,7 +541,17 @@ class OCPP16Session:
         """
         pending = self._pending_start
         self._pending_start = None
-        tx_id = await self._timescale.next_transaction_id()
+        try:
+            tx_id = await self._timescale.next_transaction_id()
+        except Exception:
+            if pending is not None:
+                fallback_tx_id = self._cp.transactions.get(pending["connector_id"])
+                if fallback_tx_id is not None:
+                    try:
+                        self._in_memory_only_tx_ids.add(int(fallback_tx_id))
+                    except (TypeError, ValueError):
+                        pass
+            raise
         if pending is not None:
             try:
                 await self._timescale.insert_open_session(
@@ -552,7 +566,9 @@ class OCPP16Session:
                     card_id=pending.get("card_id"),
                     meter_start_wh=pending.get("meter_start_wh"),
                 )
+                self._in_memory_only_tx_ids.discard(int(tx_id))
             except Exception as exc:
+                self._in_memory_only_tx_ids.add(int(tx_id))
                 logger.warning(
                     "insert_open_session failed for station=%s tx_id=%s: %s",
                     self._station_id,
@@ -1138,18 +1154,76 @@ class OCPP16Session:
         meter_start: int,
         timestamp: str,
     ) -> AuthorizationStatus:
+        # In-memory ``_cp.transactions`` is a cache populated by the boot
+        # reload (line 714) and cleared by StopTransaction. Orphan recovery
+        # can close the DB row without notifying this layer, so a hit here
+        # may point at a closed session. DB is the source of truth — verify
+        # before rejecting, and self-heal the cache when stale.
         if connector_id in self._cp.transactions:
+            stale_tx_id = self._cp.transactions[connector_id]
+            try:
+                still_open = await self._timescale.is_transaction_open(cp_id, int(stale_tx_id))
+            except Exception as exc:
+                # Fail closed: a DB blip must never let two open sessions
+                # exist on the same connector.
+                logger.warning(
+                    "is_transaction_open failed for station=%s connector=%s tx_id=%s: %s; "
+                    "rejecting StartTransaction with ConcurrentTx",
+                    cp_id,
+                    connector_id,
+                    stale_tx_id,
+                    exc,
+                )
+                return AuthorizationStatus.concurrent_tx
+            if still_open:
+                logger.warning(
+                    "Rejecting StartTransaction for station=%s connector=%s: "
+                    "active transaction already exists (tx_id=%s)",
+                    cp_id,
+                    connector_id,
+                    stale_tx_id,
+                )
+                return AuthorizationStatus.concurrent_tx
+            if int(stale_tx_id) in self._in_memory_only_tx_ids:
+                logger.warning(
+                    "Rejecting StartTransaction for station=%s connector=%s: "
+                    "tx_id=%s is active in-memory while DB row is missing",
+                    cp_id,
+                    connector_id,
+                    stale_tx_id,
+                )
+                return AuthorizationStatus.concurrent_tx
             logger.warning(
-                "Rejecting StartTransaction for station=%s connector=%s: active transaction already exists",
+                "Self-healing stale in-memory transaction for station=%s "
+                "connector=%s tx_id=%s (DB says closed)",
                 cp_id,
                 connector_id,
+                stale_tx_id,
             )
-            return AuthorizationStatus.concurrent_tx
+            if self._cp.transactions.get(connector_id) == stale_tx_id:
+                self._cp.transactions.pop(connector_id, None)
+            if self._cp.current_transaction_id == stale_tx_id:
+                self._cp.current_transaction_id = None
+            self._in_memory_only_tx_ids.discard(int(stale_tx_id))
 
         decision = await self._authz.authorize(cp_id, id_tag, "StartTransaction")
         auth_status = self._map_auth_status(decision.status)
         if auth_status != AuthorizationStatus.accepted:
             return auth_status
+
+        # Concurrency re-check: between the gate above and here, a sibling
+        # StartTransaction on the same connector (a charger retry storm)
+        # could have raced through and stashed its own _pending_start.
+        # The in-memory dict is the only signal we have until the DB
+        # insert happens in ``_next_transaction_id``, so re-check it now.
+        if connector_id in self._cp.transactions:
+            logger.warning(
+                "concurrent_start_race_blocked station=%s connector=%s: "
+                "sibling StartTransaction beat us to the gate",
+                cp_id,
+                connector_id,
+            )
+            return AuthorizationStatus.concurrent_tx
 
         try:
             start_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -1252,6 +1326,7 @@ class OCPP16Session:
                 transaction_id,
                 exc,
             )
+        self._in_memory_only_tx_ids.discard(int(transaction_id))
         # Surface meter-delta anomalies so operators can reconcile the row
         # from the raw Wh values rather than from a NULL billing kWh. The
         # close already matched a row; we just couldn't compute the delta.
