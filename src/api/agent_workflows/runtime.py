@@ -116,19 +116,21 @@ class _ClientFacade(Protocol):
 
 
 def _canonical_tool_calls_hash(tool_calls: Sequence[ToolCall]) -> str:
-    """Return a stable sha256 over the tool-call arguments and results.
+    """Return a stable sha256 over each tool call's name and arguments only.
+
+    Excludes ``result``/``ok``/``error`` so the digest captures the
+    *inputs* the LLM asked for, not what the live tool returned. Two
+    runs that ask the same tools the same questions hash identically
+    even when the depot state behind the tool varies — matching the
+    PRD §5.3 / §10.4 ``inputs_hash`` contract.
 
     The canonical form is a JSON dump with sorted keys and
     ``default=str`` so UUIDs and datetimes serialise deterministically.
-    Mirrors the inputs-hash contract in PRD §5.3 / §10.4.
     """
     serialisable = [
         {
             "name": tc.name,
             "arguments": tc.arguments,
-            "result": tc.result,
-            "ok": tc.ok,
-            "error": tc.error,
         }
         for tc in tool_calls
     ]
@@ -326,9 +328,9 @@ class WorkflowAgent:
                     if name == EMIT_DECISION_TOOL_NAME:
                         decision_output, rule_applied = self._capture_terminator(block_input, guard)
                         emit_called = True
-                        # Don't append a tool_result for emit_decision: it
-                        # is the terminator, the loop exits below.
-                        continue
+                        # Terminator: do not append a tool_result; do not
+                        # process further tool_use blocks in this response.
+                        break
 
                     if name not in workflow.allowed_tools:
                         # Strict allow-list enforcement. The model only
@@ -407,14 +409,16 @@ class WorkflowAgent:
                 # the audit captures everything we observed.
                 status = "max_iterations"
 
-            if not emit_called and status == "success":
+            if not emit_called and status in ("success", "max_iterations"):
                 # The model exited via stop_reason=end_turn after a
-                # regular tool call without ever calling the terminator.
-                # Populate audit defaults and flag the outcome.
+                # regular tool call without ever calling the terminator,
+                # or the iteration budget was exhausted. Populate audit
+                # defaults; only the former is reclassified as no_terminator.
                 decision_output.setdefault("summary", "")
                 decision_output.setdefault("proposed_actions", [])
                 decision_output.setdefault("filtered_violations", [])
-                status = "no_terminator"
+                if status == "success":
+                    status = "no_terminator"
 
             inputs_hash = _canonical_tool_calls_hash(tool_calls)
             decision = Decision(

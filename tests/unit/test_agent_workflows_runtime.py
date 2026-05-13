@@ -318,21 +318,22 @@ class TestCanonicalHash:
         b = [ToolCall(name="t", arguments={"x": 2}, result={}, ok=True)]
         assert _canonical_tool_calls_hash(a) != _canonical_tool_calls_hash(b)
 
-    def test_ok_flag_affects_hash(self) -> None:
-        # Two runs that produced the same name+args+result but differ
-        # on ``ok`` (success vs. guard rejection) must hash differently
-        # so the audit trail distinguishes them.
+    def test_result_and_ok_do_not_affect_hash(self) -> None:
+        # ``inputs_hash`` is over *inputs*, not over live tool results.
+        # The same name+arguments must hash identically even when one
+        # call succeeded and the other failed (e.g. a flaky downstream
+        # or a hard-constraint rejection).
         a = [ToolCall(name="t", arguments={"x": 1}, result={"y": 2}, ok=True)]
         b = [
             ToolCall(
                 name="t",
                 arguments={"x": 1},
-                result={"y": 2},
+                result={"error": "oops"},
                 ok=False,
-                error="guard rejected",
+                error="oops",
             )
         ]
-        assert _canonical_tool_calls_hash(a) != _canonical_tool_calls_hash(b)
+        assert _canonical_tool_calls_hash(a) == _canonical_tool_calls_hash(b)
 
 
 # ── WorkflowAgent.run_turn ─────────────────────────────────────────────────
