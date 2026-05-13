@@ -2751,17 +2751,13 @@ class TimescaleClient:
         session after ``stale_after_seconds`` elapses.
 
         ``last_seen_at`` is nulled so the row is not treated as "just
-        disconnected" by case-1 of orphan recovery. ``updated_at`` is set to
-        ``NOW()`` so case-2's ``COALESCE(last_meter_seen_at, updated_at,
-        start_time)`` does not fall through to a stale insert/start time
-        before the first post-reconnect MeterValues arrives.
+        disconnected" by case-1 of orphan recovery.
         """
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE charging_sessions
-                   SET last_seen_at = NULL,
-                       updated_at = NOW()
+                   SET last_seen_at = NULL
                  WHERE station_id = $1
                    AND end_time IS NULL
                    AND source = 'live'
