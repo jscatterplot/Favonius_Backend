@@ -702,3 +702,4 @@ This PRD describes the product layer. The underlying systems are documented sepa
 ### 15.3 Document history
 
 - v0.1 — Initial draft from founder + agent design conversation. Supersedes the previous `PRD_v2_7_Building_Integration.md` for product-level direction; substrate technical specs continue to live in the documents listed in §15.2.
+- Sprint 1 (foundations) — Schema + types + repository for workflows, per-(workflow, depot) permission tiers, and the append-only `decisions` audit log (PRD §4.4, §5.2, §5.3, §9, §10.4). Migration `037_depot_agent_workflows.sql` adds a TimescaleDB hypertable on `decisions` with a 90-day retention policy and a row-level trigger that blocks UPDATE/DELETE. Python types and async repository live in `src/api/agent_workflows/`. Gated by the `DEPOT_AGENT_ENABLED` env var (default off; no runtime yet). PR: https://github.com/jscatterplot/Favonius_Backend/pull/177.
