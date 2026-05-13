@@ -36,6 +36,7 @@ hard quantities the PRD calls out:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Iterable, Optional
 
 # Field names the guard recognises as "departure SoC" / "grid power".
@@ -180,10 +181,12 @@ def _coerce_float(value: Any) -> Optional[float]:
         # coerce to 1.0 and pass.
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        coerced = float(value)
+        return coerced if math.isfinite(coerced) else None
     if isinstance(value, str):
         try:
-            return float(value)
+            coerced = float(value)
+            return coerced if math.isfinite(coerced) else None
         except ValueError:
             return None
     return None

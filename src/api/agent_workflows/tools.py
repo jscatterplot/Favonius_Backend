@@ -27,6 +27,7 @@ Errors:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Awaitable, Callable, Iterable
 
 ToolCallable = Callable[..., Awaitable[Any]]
@@ -51,6 +52,9 @@ class ToolDefinition:
     input_schema: dict[str, Any]
     fn: ToolCallable
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 
 
 class ToolRegistry:
@@ -82,6 +86,10 @@ class ToolRegistry:
         metadata: dict[str, Any] | None = None,
     ) -> ToolDefinition:
         """Register a new tool. Raises ``ValueError`` on duplicate name."""
+        if not _TOOL_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"invalid tool name {name!r}; expected 1-128 chars matching [a-zA-Z0-9_-]"
+            )
         if name in self._tools:
             raise ValueError(f"tool {name!r} is already registered")
         defn = ToolDefinition(
@@ -124,7 +132,11 @@ class ToolRegistry:
         ``Workflow.allowed_tools``.
         """
         schemas: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for name in allowed:
+            if name in seen:
+                continue
+            seen.add(name)
             defn = self.get(name)
             schemas.append(
                 {

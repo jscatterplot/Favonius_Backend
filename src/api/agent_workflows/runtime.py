@@ -267,6 +267,11 @@ class WorkflowAgent:
         try:
             # Build the tools array (allow-listed + terminator) up-front
             # so an unknown name in ``allowed_tools`` fails fast.
+            if EMIT_DECISION_TOOL_NAME in workflow.allowed_tools:
+                raise WorkflowRuntimeError(
+                    f"workflow {workflow.name!r} includes reserved tool name {EMIT_DECISION_TOOL_NAME!r}"
+                )
+
             tools = tool_registry.anthropic_schemas(workflow.allowed_tools)
             tools.append(_emit_decision_schema())
 
