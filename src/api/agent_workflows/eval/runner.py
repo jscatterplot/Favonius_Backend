@@ -273,6 +273,8 @@ def _coerce_uuid(value: Any, *, field_name: str) -> UUID:
 
 
 async def _ensure_organization(conn: Any, organization_id: UUID) -> None:
+    if not await _table_exists(conn, "organizations"):
+        return
     await conn.execute(
         """
         INSERT INTO organizations (organization_id, name)
@@ -286,6 +288,8 @@ async def _ensure_organization(conn: Any, organization_id: UUID) -> None:
 
 async def _insert_depot(conn: Any, depot: dict, organization_id: UUID) -> UUID:
     depot_id = _coerce_uuid(depot["depot_id"], field_name="depot.depot_id")
+    if not await _table_exists(conn, "depots"):
+        return depot_id
     await conn.execute(
         """
         INSERT INTO depots (
@@ -305,6 +309,8 @@ async def _insert_depot(conn: Any, depot: dict, organization_id: UUID) -> UUID:
 
 
 async def _insert_vehicles(conn: Any, vehicles: Iterable[dict], depot_id: UUID) -> None:
+    if not await _table_exists(conn, "vehicles"):
+        return
     for v in vehicles:
         await conn.execute(
             """
@@ -325,6 +331,8 @@ async def _insert_vehicles(conn: Any, vehicles: Iterable[dict], depot_id: UUID) 
 
 
 async def _insert_chargers(conn: Any, chargers: Iterable[dict], depot_id: UUID) -> None:
+    if not await _table_exists(conn, "chargers"):
+        return
     for c in chargers:
         await conn.execute(
             """
@@ -362,6 +370,8 @@ async def _insert_drivers(conn: Any, drivers: Iterable[dict], depot_id: UUID) ->
 
 
 async def _insert_schedules(conn: Any, schedules: Iterable[dict], scenario_now: datetime) -> None:
+    if not await _table_exists(conn, "schedules"):
+        return
     for s in schedules:
         await conn.execute(
             """
@@ -383,27 +393,36 @@ async def _insert_schedules(conn: Any, schedules: Iterable[dict], scenario_now: 
 
 
 async def _insert_telemetry(conn: Any, samples: Iterable[dict], scenario_now: datetime) -> None:
-    for sample in samples:
+    for idx, sample in enumerate(samples):
         charger_raw = sample.get("charger_id")
         charger_id = (
             _coerce_uuid(charger_raw, field_name="telemetry.charger_id")
             if charger_raw is not None
             else None
         )
+        station_id = str(sample.get("station_id") or charger_raw or "unknown")
+        connector_id = int(sample.get("connector_id") or idx + 1)
         await conn.execute(
             """
             INSERT INTO telemetry (
-                time, vehicle_id, charger_id, soc, is_plugged, charging_kw
+                time, station_id, connector_id, vehicle_id, charger_id, soc, is_plugged, charging_kw
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             """,
             _resolve_time(sample.get("time", scenario_now), scenario_now),
+            station_id,
+            connector_id,
             _coerce_uuid(sample["vehicle_id"], field_name="telemetry.vehicle_id"),
             charger_id,
             float(sample["soc"]),
             bool(sample.get("is_plugged", False)),
             float(sample.get("charging_kw", 0.0)),
         )
+
+
+async def _table_exists(conn: Any, table_name: str) -> bool:
+    value = await conn.fetchval("SELECT to_regclass($1)", table_name)
+    return value is not None
 
 
 async def _insert_prices(
