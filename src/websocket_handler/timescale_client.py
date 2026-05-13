@@ -269,7 +269,9 @@ class TimescaleClient:
                         # idTag/session mapping is unavailable.
                         vehicle_id = data.get("vehicle_id")
                         if not vehicle_id:
-                            vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
+                            vehicle_id = await self._resolve_vehicle_id_from_session(
+                                conn, session_id
+                            )
 
                         charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
                         soc = (soc_percent / 100.0) if soc_percent is not None else None
@@ -472,8 +474,17 @@ class TimescaleClient:
                            WHEN $6::bigint IS NOT NULL
                             AND meter_start_wh IS NOT NULL
                             AND meter_start_wh > 0
-                            AND $6::bigint >= meter_start_wh
-                           THEN ($6::bigint - meter_start_wh) / 1000.0
+                            AND GREATEST(
+                                COALESCE(last_meter_wh, $6::bigint),
+                                $6::bigint
+                            ) >= meter_start_wh
+                           THEN (
+                               GREATEST(
+                                   COALESCE(last_meter_wh, $6::bigint),
+                                   $6::bigint
+                               )
+                               - meter_start_wh
+                           ) / 1000.0
                            ELSE energy_delivered_kwh
                        END,
                        updated_at           = NOW()
@@ -2356,9 +2367,7 @@ class TimescaleClient:
             self._log_missing_reference_table_once("rfid_card_driver_assignments", exc)
             return None
 
-    def _log_missing_reference_table_once(
-        self, table_label: str, exc: BaseException
-    ) -> None:
+    def _log_missing_reference_table_once(self, table_label: str, exc: BaseException) -> None:
         """Log a missing-relation error at WARNING, once per process.
 
         Schema drift (e.g. a deployment running without ``vehicles``)
@@ -2520,49 +2529,50 @@ class TimescaleClient:
             Callers use the values to decide whether to emit a WARN.
         """
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT meter_start_wh
-                  FROM charging_sessions
-                 WHERE station_id = $1
-                   AND transaction_id = $2
-                   AND end_time IS NULL
-                   AND source = 'live'
-                 FOR UPDATE
-                """,
-                station_id,
-                transaction_id,
-            )
-            if row is None:
-                return None
-            meter_start_wh = row["meter_start_wh"]
-            energy_kwh = compute_energy_kwh(meter_stop_wh, meter_start_wh)
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT meter_start_wh
+                      FROM charging_sessions
+                     WHERE station_id = $1
+                       AND transaction_id = $2
+                       AND end_time IS NULL
+                       AND source = 'live'
+                     FOR UPDATE
+                    """,
+                    station_id,
+                    transaction_id,
+                )
+                if row is None:
+                    return None
+                meter_start_wh = row["meter_start_wh"]
+                energy_kwh = compute_energy_kwh(meter_stop_wh, meter_start_wh)
 
-            updated = await conn.fetchrow(
-                """
-                UPDATE charging_sessions
-                   SET end_time             = $3,
-                       meter_stop_wh        = $4::bigint,
-                       energy_delivered_kwh = $5,
-                       stop_reason          = COALESCE($6, stop_reason),
-                       updated_at           = NOW()
-                 WHERE station_id     = $1
-                   AND transaction_id = $2
-                   AND end_time IS NULL
-                   AND source = 'live'
-             RETURNING meter_start_wh, energy_delivered_kwh
-                """,
-                station_id,
-                transaction_id,
-                end_time,
-                meter_stop_wh,
-                energy_kwh,
-                stop_reason,
-            )
-            if updated is None:
-                # Lost the race to another writer between SELECT and UPDATE.
-                return None
-            return dict(updated)
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE charging_sessions
+                       SET end_time             = $3,
+                           meter_stop_wh        = $4::bigint,
+                           energy_delivered_kwh = $5,
+                           stop_reason          = COALESCE($6, stop_reason),
+                           updated_at           = NOW()
+                     WHERE station_id     = $1
+                       AND transaction_id = $2
+                       AND end_time IS NULL
+                       AND source = 'live'
+                 RETURNING meter_start_wh, energy_delivered_kwh
+                    """,
+                    station_id,
+                    transaction_id,
+                    end_time,
+                    meter_stop_wh,
+                    energy_kwh,
+                    stop_reason,
+                )
+                if updated is None:
+                    # Lost the race to another writer between SELECT and UPDATE.
+                    return None
+                return dict(updated)
 
     async def recover_orphaned_sessions(
         self,
