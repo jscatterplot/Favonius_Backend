@@ -19,6 +19,8 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
+from pydantic_core import to_jsonable_python
+
 from src.api.agent_workflows.models import (
     Decision,
     Disposition,
@@ -42,8 +44,7 @@ class WorkflowNotFoundError(LookupError):
 
 
 _WORKFLOW_COLUMNS = (
-    "id, name, version, description, prompt, allowed_tools, parameters, "
-    "created_at, updated_at"
+    "id, name, version, description, prompt, allowed_tools, parameters, " "created_at, updated_at"
 )
 
 
@@ -164,9 +165,11 @@ async def insert_decision(pool: Any, decision: Decision) -> None:
     ``parent_decision_id`` references the original.
     """
     tool_calls_json = json.dumps([_tool_call_to_dict(tc) for tc in decision.tool_calls])
-    output_json = json.dumps(decision.output)
+    output_json = json.dumps(to_jsonable_python(decision.output))
     diff_json = (
-        json.dumps(decision.diff_if_edited) if decision.diff_if_edited is not None else None
+        json.dumps(to_jsonable_python(decision.diff_if_edited))
+        if decision.diff_if_edited is not None
+        else None
     )
 
     async with pool.acquire() as conn:
