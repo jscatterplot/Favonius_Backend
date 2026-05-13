@@ -624,7 +624,7 @@ class TestDriverAssignment:
         registry = _build(pool, _pool())
         result = await registry.dispatch("get_driver_assignment", {"route_id": "R-NO-DRV"})
         assert result["driver_id"] is None
-        assert result["shift_valid_for_route"] is False
+        assert result["shift_valid_for_route"] is True
 
     async def test_cross_org_returns_empty(self):
         pool = _pool(fetchrow=None)

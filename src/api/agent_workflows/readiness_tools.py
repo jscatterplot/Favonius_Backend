@@ -384,8 +384,11 @@ def _make_get_charging_plan(
         if not isinstance(payload, dict):
             return {"plan": []}
 
-        per_vehicle = (payload.get("schedule") or {}).get(str(vid))
-        if per_vehicle is None:
+        schedule = payload.get("schedule")
+        if not isinstance(schedule, dict):
+            return {"plan": []}
+        per_vehicle = schedule.get(str(vid))
+        if not isinstance(per_vehicle, dict):
             return {"plan": []}
         powers = per_vehicle.get("charging_power") or []
         socs = per_vehicle.get("soc") or []
@@ -439,7 +442,7 @@ def _make_get_driver_assignment(
             return empty
 
         if row["driver_id"] is None:
-            return {**empty, "shift_valid_for_route": False}
+            return {**empty, "shift_valid_for_route": True}
 
         # Shifts are not yet plumbed in V1; surface None and treat the
         # assignment as valid (no evidence to invalidate it). The
