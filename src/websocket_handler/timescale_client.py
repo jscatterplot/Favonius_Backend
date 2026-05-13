@@ -2750,16 +2750,18 @@ class TimescaleClient:
         timestamp in place would let orphan recovery close an active
         session after ``stale_after_seconds`` elapses.
 
-        We intentionally avoid touching ``updated_at`` here. Orphan recovery
-        uses ``COALESCE(last_meter_seen_at, updated_at, start_time)`` to
-        decide staleness, and bumping ``updated_at`` would make genuinely
-        stale rows look fresh for an extra threshold window.
+        ``last_seen_at`` is nulled so the row is not treated as "just
+        disconnected" by case-1 of orphan recovery. ``updated_at`` is set to
+        ``NOW()`` so case-2's ``COALESCE(last_meter_seen_at, updated_at,
+        start_time)`` does not fall through to a stale insert/start time
+        before the first post-reconnect MeterValues arrives.
         """
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE charging_sessions
-                   SET last_seen_at = NULL
+                   SET last_seen_at = NULL,
+                       updated_at = NOW()
                  WHERE station_id = $1
                    AND end_time IS NULL
                    AND source = 'live'
