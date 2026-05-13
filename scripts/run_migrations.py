@@ -67,6 +67,11 @@ def _resolve_database_url(target: str) -> tuple[str, str]:
 
 async def run_migrations(target: str = "ts") -> int:
     database_url, url_source = _resolve_database_url(target)
+
+    if target == "ts":
+        migration_mode = "ts_dedicated" if url_source == "TIMESCALE_SERVICE_URL" else "ts_shared"
+    else:
+        migration_mode = "supabase_split" if os.getenv("TIMESCALE_SERVICE_URL") else "supabase_shared"
     if not database_url:
         print(
             "TIMESCALE_SERVICE_URL or DATABASE_URL must be set",
@@ -98,10 +103,14 @@ async def run_migrations(target: str = "ts") -> int:
         return 1
 
     try:
+        print(f"Migration mode: {migration_mode}")
+
         for path in files:
             sql = path.read_text()
             try:
-                await conn.execute(sql)
+                async with conn.transaction():
+                    await conn.execute("SELECT set_config('favonius.migration_mode', $1, true)", migration_mode)
+                    await conn.execute(sql)
             except Exception as e:
                 msg = str(e).lower()
                 if "already exists" in msg or "duplicate" in msg:
