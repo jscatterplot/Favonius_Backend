@@ -264,3 +264,31 @@ async def test_close_open_session_filters_to_live_source():
     update_sql = conn.fetchrow.await_args.args[0]
     assert "source = 'live'" in update_sql
     assert "end_time IS NULL" in update_sql
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_none_meter_stop_passes_explicit_cast():
+    """meter_stop_wh=None must not raise 'could not determine data type of parameter $4'.
+
+    asyncpg sends an untyped NULL when the Python value is None. PostgreSQL
+    cannot infer the type of $4 from the CASE expression context, so the
+    query fails unless the SQL carries an explicit ::bigint cast.
+    This test verifies the cast is present in the SQL text so the query
+    survives NULL meter_stop values (e.g. StopTransaction with no meterValue).
+    """
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value=None)
+    client, _ = _client_with_conn(conn)
+
+    # Must not raise — production bug: "could not determine data type of parameter $4"
+    result = await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=303,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=None,
+    )
+
+    assert result is None
+    update_sql = conn.fetchrow.await_args.args[0]
+    # Explicit cast must be present so PostgreSQL can type-check the NULL
+    assert "$4::bigint" in update_sql

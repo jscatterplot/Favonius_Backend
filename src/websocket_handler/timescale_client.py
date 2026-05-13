@@ -2442,12 +2442,12 @@ class TimescaleClient:
                 """
                 UPDATE charging_sessions
                    SET end_time = $3,
-                       meter_stop_wh = $4,
+                       meter_stop_wh = $4::bigint,
                        energy_delivered_kwh = CASE
-                           WHEN $4 IS NOT NULL
+                           WHEN $4::bigint IS NOT NULL
                             AND meter_start_wh IS NOT NULL
-                            AND $4 >= meter_start_wh
-                           THEN ($4 - meter_start_wh) / 1000.0
+                            AND $4::bigint >= meter_start_wh
+                           THEN ($4::bigint - meter_start_wh) / 1000.0
                            ELSE NULL
                        END,
                        updated_at = NOW()
