@@ -35,7 +35,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Callable, Optional, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from src.api.agent.auth_context import AuthContext
@@ -201,6 +201,7 @@ class WorkflowAgent:
         max_tokens: int = 2048,
         temperature: float = 0.0,
         constraints: Optional[DepotConstraints] = None,
+        constraints_resolver: Optional[Callable[[UUID], DepotConstraints]] = None,
     ) -> None:
         self._client = anthropic_client
         self._repo = decision_repo
@@ -209,6 +210,7 @@ class WorkflowAgent:
         self._max_tokens = int(max_tokens)
         self._temperature = float(temperature)
         self._constraints = constraints or DepotConstraints()
+        self._constraints_resolver = constraints_resolver
 
     # ── Public entry point ─────────────────────────────────────────────
 
@@ -247,7 +249,8 @@ class WorkflowAgent:
                 bug, surfaced eagerly.
             WorkflowRuntimeError: Any other runtime invariant breach.
         """
-        guard = HardConstraintGuard(self._constraints)
+        constraints = self._resolve_constraints(depot_id)
+        guard = HardConstraintGuard(constraints)
         tool_calls: list[ToolCall] = []
         decision_output: dict[str, Any] = {}
         rule_applied: Optional[str] = None
@@ -264,6 +267,10 @@ class WorkflowAgent:
                 raise WorkflowRuntimeError(
                     "auth_context.organization_id is required to write a Decision row"
                 )
+            if depot_id not in auth_context.visible_depot_ids:
+                raise WorkflowRuntimeError(
+                    f"depot {depot_id} is outside auth_context.visible_depot_ids"
+                )
 
             # Build the tools array (allow-listed + terminator) up-front
             # so an unknown name in ``allowed_tools`` fails fast.
@@ -275,7 +282,7 @@ class WorkflowAgent:
             tools = tool_registry.anthropic_schemas(workflow.allowed_tools)
             tools.append(_emit_decision_schema())
 
-            system_blocks = self._build_system_prompt(workflow)
+            system_blocks = self._build_system_prompt(workflow, constraints)
             messages: list[dict[str, Any]] = [
                 {
                     "role": "user",
@@ -468,7 +475,11 @@ class WorkflowAgent:
 
     # ── Prompt building ────────────────────────────────────────────────
 
-    def _build_system_prompt(self, workflow: Workflow) -> list[dict[str, Any]]:
+    def _build_system_prompt(
+        self,
+        workflow: Workflow,
+        constraints: DepotConstraints,
+    ) -> list[dict[str, Any]]:
         """Return the Anthropic ``system`` block(s) with prompt caching.
 
         The block is keyed on the workflow's static identity (name,
@@ -476,7 +487,6 @@ class WorkflowAgent:
         (including ``permission_tier``) go in the user message so they
         do not bust the prefix cache across depots.
         """
-        constraints = self._constraints
         max_grid_line = (
             f"- Site grid power must not exceed max_grid_kw={constraints.max_grid_kw} kW for this depot."
             if constraints.max_grid_kw is not None
@@ -520,6 +530,12 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
                 "cache_control": {"type": "ephemeral"},
             }
         ]
+
+    def _resolve_constraints(self, depot_id: UUID) -> DepotConstraints:
+        """Return hard constraints for this turn's depot."""
+        if self._constraints_resolver is None:
+            return self._constraints
+        return self._constraints_resolver(depot_id)
 
     def _format_user_message(
         self,

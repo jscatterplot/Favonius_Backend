@@ -24,10 +24,9 @@ looking for fields whose names are conventionally used for the two
 hard quantities the PRD calls out:
 
 - Departure SoC fields: ``departure_soc``, ``target_soc``,
-  ``required_soc``, ``soc_at_departure``. Values in ``[0, 2)`` are
-  treated as fractions; values ``>= 2`` are treated as percent and
-  divided by 100. This avoids a sharp boundary at exactly ``1.0`` while
-  still forgiving both conventions in workflow drafts.
+  ``required_soc``, ``soc_at_departure``. Values ``> 1`` are treated as
+  percentages and divided by 100; values in ``[0, 1]`` are treated as
+  fractions. This mirrors existing SoC normalisation in the codebase.
 - Grid power fields: ``grid_kw``, ``grid_power_kw``, ``site_grid_kw``,
   ``p_grid_kw``. The corresponding cap is the depot's ``max_grid_kw``;
   if it isn't known to the guard, the cap is not enforced (the
@@ -106,7 +105,7 @@ class HardConstraintGuard:
                 v = _coerce_float(action[fname])
                 if v is None:
                     continue
-                fraction = v / 100.0 if v >= 2.0 else v
+                fraction = v / 100.0 if v > 1.0 else v
                 if fraction < self.constraints.min_departure_soc:
                     return ConstraintViolation(
                         constraint="departure_soc_min",

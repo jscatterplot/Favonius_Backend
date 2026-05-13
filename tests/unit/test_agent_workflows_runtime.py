@@ -257,9 +257,11 @@ class TestHardConstraintGuard:
         guard = HardConstraintGuard()
         assert guard.validate_action({"departure_soc": 0.99}) is None
 
-    def test_treats_small_fraction_overshoot_as_fraction(self) -> None:
+    def test_treats_soc_above_1_0_as_percent(self) -> None:
         guard = HardConstraintGuard()
-        assert guard.validate_action({"departure_soc": 1.01}) is None
+        violation = guard.validate_action({"departure_soc": 1.01})
+        assert violation is not None
+        assert violation.constraint == "departure_soc_min"
 
     def test_rejects_grid_kw_over_max(self) -> None:
         guard = HardConstraintGuard(DepotConstraints(max_grid_kw=500.0))
@@ -430,6 +432,100 @@ class TestWorkflowAgentHappyPath:
         # Persistence
         assert repo.decisions == [decision]
         assert repo.last is decision
+
+    @pytest.mark.asyncio
+    async def test_rejects_depot_outside_auth_visibility(
+        self,
+        workflow: Workflow,
+        depot_id: UUID,
+        user_id: UUID,
+        tool_registry: ToolRegistry,
+        repo: InMemoryDecisionRepo,
+    ) -> None:
+        from src.api.agent_workflows.runtime import WorkflowRuntimeError
+
+        auth = AuthContext(
+            user_id=user_id,
+            organization_id=uuid4(),
+            role="customer_operator",
+            visible_depot_ids=[],
+        )
+        client = _fake_client([])
+        agent = WorkflowAgent(anthropic_client=client, decision_repo=repo)
+        with pytest.raises(WorkflowRuntimeError, match="outside auth_context.visible_depot_ids"):
+            await agent.run_turn(
+                workflow=workflow,
+                depot_id=depot_id,
+                auth_context=auth,
+                tool_registry=tool_registry,
+            )
+        assert client._create_mock.call_count == 0
+        assert repo.decisions == []
+
+    @pytest.mark.asyncio
+    async def test_constraints_resolved_per_depot_turn(
+        self,
+        workflow: Workflow,
+        auth_context: AuthContext,
+        tool_registry: ToolRegistry,
+        repo: InMemoryDecisionRepo,
+    ) -> None:
+        depot_a = uuid4()
+        depot_b = uuid4()
+        auth_context.visible_depot_ids = [depot_a, depot_b]
+        auth_context.organization_id = auth_context.organization_id or uuid4()
+
+        responses = [
+            _response(
+                [
+                    _tool_use_block(
+                        EMIT_DECISION_TOOL_NAME,
+                        id_="tu_emit_a",
+                        input_={"summary": "A", "proposed_actions": []},
+                    )
+                ],
+                stop_reason="end_turn",
+            ),
+            _response(
+                [
+                    _tool_use_block(
+                        EMIT_DECISION_TOOL_NAME,
+                        id_="tu_emit_b",
+                        input_={"summary": "B", "proposed_actions": []},
+                    )
+                ],
+                stop_reason="end_turn",
+            ),
+        ]
+        client = _fake_client(responses)
+        constraints_by_depot = {
+            depot_a: DepotConstraints(min_departure_soc=0.99, max_grid_kw=500.0),
+            depot_b: DepotConstraints(min_departure_soc=0.90, max_grid_kw=300.0),
+        }
+        agent = WorkflowAgent(
+            anthropic_client=client,
+            decision_repo=repo,
+            constraints_resolver=lambda d: constraints_by_depot[d],
+        )
+        await agent.run_turn(
+            workflow=workflow,
+            depot_id=depot_a,
+            auth_context=auth_context,
+            tool_registry=tool_registry,
+        )
+        await agent.run_turn(
+            workflow=workflow,
+            depot_id=depot_b,
+            auth_context=auth_context,
+            tool_registry=tool_registry,
+        )
+
+        first_system = client._create_mock.call_args_list[0].kwargs["system"][0]["text"]
+        second_system = client._create_mock.call_args_list[1].kwargs["system"][0]["text"]
+        assert "max_grid_kw=500.0" in first_system
+        assert "at least 99%" in first_system
+        assert "max_grid_kw=300.0" in second_system
+        assert "at least 90%" in second_system
 
     @pytest.mark.asyncio
     async def test_system_prompt_carries_cache_control(
