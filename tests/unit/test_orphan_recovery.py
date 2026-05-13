@@ -140,47 +140,6 @@ async def test_recover_orphaned_sessions_closes_without_meter_writes_null_energy
 
 
 @pytest.mark.asyncio
-async def test_recover_orphaned_sessions_uses_now_when_last_seen_is_null():
-    """Defensive: session started before handler had time to stamp last_seen_at."""
-    start_time = datetime(2026, 5, 13, 3, 0, 0, tzinfo=timezone.utc)
-    conn = AsyncMock()
-    conn.fetch = AsyncMock(
-        return_value=[
-            {
-                "session_id": "00000000-0000-0000-0000-000000000003",
-                "station_id": "hrx-station-3",
-                "transaction_id": 44,
-                "meter_start_wh": 1000,
-                "last_meter_wh": 3000,
-                "last_seen_at": None,  # no close hook ever fired
-                "start_time": start_time,
-            }
-        ]
-    )
-    conn.fetchrow = AsyncMock(
-        return_value={
-            "session_id": "00000000-0000-0000-0000-000000000003",
-            "station_id": "hrx-station-3",
-            "transaction_id": 44,
-            "meter_start_wh": 1000,
-            "meter_stop_wh": 3000,
-            "energy_delivered_kwh": 2.0,
-        }
-    )
-    client = _client_with_conn(conn)
-
-    closed = await client.recover_orphaned_sessions()
-
-    assert len(closed) == 1
-    update_call = conn.fetchrow.await_args
-    # close_time falls back to now() when last_seen_at is None
-    close_time = update_call.args[3]
-    assert close_time is not None
-    # And it must be a recent timestamp, not start_time from 2 hours ago
-    assert close_time > start_time
-
-
-@pytest.mark.asyncio
 async def test_recover_orphaned_sessions_filters_to_live_source():
     """Recovery must not touch imported rows or rows without transaction_id."""
     conn = AsyncMock()
@@ -194,6 +153,9 @@ async def test_recover_orphaned_sessions_filters_to_live_source():
     assert "source = 'live'" in select_sql
     assert "transaction_id IS NOT NULL" in select_sql
     assert "end_time IS NULL" in select_sql
+    assert "last_seen_at IS NOT NULL" in select_sql
+    assert "last_seen_at < NOW() - make_interval(secs => $1)" in select_sql
+    assert "last_seen_at IS NULL" not in select_sql
 
 
 @pytest.mark.asyncio
