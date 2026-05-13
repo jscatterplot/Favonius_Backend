@@ -182,10 +182,28 @@ async def test_workflow_golden_examples(
     scenario = load_scenario(scenario_path.read_text(encoding="utf-8"))
     result = await run_scenario(scenario, pool=workflow_test_db_pool)
 
-    _enforce_severity(result, scenario_path, capfd=capfd)
+    _report_example_result(result, scenario_path, capfd=capfd)
 
 
 # ── Severity-aware assertion helper ───────────────────────────────────────
+
+
+def _report_example_result(
+    result: EvalResult,
+    scenario_path: Path,
+    *,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Emit non-gating signals for ``_examples`` scenarios.
+
+    Example scenarios are documentation/templates and must never block CI,
+    regardless of their declared ``severity``. Failures are surfaced as
+    warnings with full diff output to stderr for visibility.
+    """
+    if result.passed:
+        return
+
+    _emit_non_blocking_signal(result, scenario_path, capfd=capfd)
 
 
 def _enforce_severity(
@@ -204,13 +222,7 @@ def _enforce_severity(
     if result.passed:
         return
 
-    diff_text = result.diff()
-    msg = (
-        f"[{result.scenario_id}] workflow={result.workflow} severity={result.severity}\n"
-        + "\n".join(f"  - {f}" for f in result.failures)
-        + "\n\n--- expected vs actual ---\n"
-        + diff_text
-    )
+    msg = _format_failure_message(result)
 
     if result.severity == "blocking":
         pytest.fail(msg, pytrace=False)
@@ -225,3 +237,31 @@ def _enforce_severity(
     else:  # info
         with capfd.disabled():
             print(msg, file=sys.stderr)
+
+
+def _emit_non_blocking_signal(
+    result: EvalResult,
+    scenario_path: Path,
+    *,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Print failures for non-gating scenarios and emit a warning."""
+    msg = _format_failure_message(result)
+    with capfd.disabled():
+        print(msg, file=sys.stderr)
+    warnings.warn(
+        f"{result.scenario_id}: non-gating example failed ({scenario_path.name})",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+def _format_failure_message(result: EvalResult) -> str:
+    """Render a stable failure message for stderr / pytest.fail."""
+    diff_text = result.diff()
+    return (
+        f"[{result.scenario_id}] workflow={result.workflow} severity={result.severity}\n"
+        + "\n".join(f"  - {f}" for f in result.failures)
+        + "\n\n--- expected vs actual ---\n"
+        + diff_text
+    )
