@@ -2,13 +2,16 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import asyncpg
 
 from .config import SupabaseConfig, TimescaleConfig
 from .monitoring import get_logger
 from .supabase_client import SupabaseClient
+
+if TYPE_CHECKING:
+    from .timescale_client import TimescaleClient
 
 
 class DataSyncService:
@@ -23,14 +26,29 @@ class DataSyncService:
         config: SupabaseConfig,
         supabase_client: SupabaseClient,
         timescale_config: Optional[TimescaleConfig] = None,
+        *,
+        timescale_client: Optional["TimescaleClient"] = None,
     ):
-        """Initialize data sync service."""
+        """Initialize data sync service.
+
+        Pass ``timescale_client`` to share the live ``TimescaleClient``
+        pool — preferred in production so this service does not open a
+        second 1-10 connection pool against the same Postgres. Falls back
+        to the legacy ``timescale_config`` path (dedicated pool) only when
+        the caller has no live client to hand over (e.g. older tests).
+        """
         self.config = config
         self.supabase_client = supabase_client
         self.timescale_config = timescale_config
         self.logger = get_logger(__name__)
 
-        # TimescaleDB connection
+        # When we share an external pool we must NOT close it on stop().
+        self._timescale_client = timescale_client
+        self._owns_timescale_pool = timescale_client is None
+
+        # TimescaleDB connection — populated on start(). When a client is
+        # injected we reuse its pool; otherwise start() creates a dedicated
+        # one from ``timescale_config``.
         self.timescale_pool: Optional[asyncpg.Pool] = None
 
         # Sync configuration
@@ -55,17 +73,30 @@ class DataSyncService:
     async def start(self) -> None:
         """Start the data synchronization service."""
         try:
-            # Connect to TimescaleDB using the dedicated TimescaleDB config
-            self.timescale_pool = await asyncpg.create_pool(
-                host=self.timescale_config.host,
-                port=self.timescale_config.port,
-                database=self.timescale_config.database,
-                user=self.timescale_config.user,
-                password=self.timescale_config.password,
-                ssl=self.timescale_config.sslmode,
-                min_size=1,
-                max_size=10,
-            )
+            if self._timescale_client is not None:
+                # Share the live pool — no new connections opened.
+                self.timescale_pool = self._timescale_client.pg_pool
+                if self.timescale_pool is None:
+                    raise RuntimeError(
+                        "DataSyncService given a TimescaleClient with no "
+                        "pg_pool; call client.connect() before start()."
+                    )
+            else:
+                if self.timescale_config is None:
+                    raise RuntimeError(
+                        "DataSyncService needs either timescale_client or "
+                        "timescale_config to reach TimescaleDB."
+                    )
+                self.timescale_pool = await asyncpg.create_pool(
+                    host=self.timescale_config.host,
+                    port=self.timescale_config.port,
+                    database=self.timescale_config.database,
+                    user=self.timescale_config.user,
+                    password=self.timescale_config.password,
+                    ssl=self.timescale_config.sslmode,
+                    min_size=1,
+                    max_size=10,
+                )
 
             self.sync_running = True
 
@@ -91,8 +122,9 @@ class DataSyncService:
                 pass
             self._sync_task = None
 
-        if self.timescale_pool:
+        if self._owns_timescale_pool and self.timescale_pool:
             await self.timescale_pool.close()
+        self.timescale_pool = None
 
         # Re-check missing relations on next start; the operator may have
         # added them while we were stopped.
@@ -126,7 +158,6 @@ class DataSyncService:
     def _is_known_missing(self, table_name: str) -> bool:
         """Return True if this table is on the skip-list for this process run."""
         return table_name in self._missing_relations
-
 
     @staticmethod
     def _string_or_none(value: Any) -> Optional[str]:
@@ -238,7 +269,9 @@ class DataSyncService:
                                 "session_id": self._string_or_none(session["session_id"]),
                                 "station_id": self._string_or_none(session.get("station_id")),
                                 "vehicle_id": self._string_or_none(session.get("vehicle_id")),
-                                "organization_id": self._string_or_none(session.get("fleet_operator_id")),
+                                "organization_id": self._string_or_none(
+                                    session.get("fleet_operator_id")
+                                ),
                                 "start_time": session["start_time"].isoformat(),
                                 "end_time": (
                                     session["end_time"].isoformat() if session["end_time"] else None
@@ -252,12 +285,8 @@ class DataSyncService:
                                 "session_duration_minutes": self._json_int(
                                     session["session_duration_minutes"]
                                 ),
-                                "cost_total": (
-                                    self._json_float(session["cost_total"])
-                                ),
-                                "revenue_v2g": (
-                                    self._json_float(session["revenue_v2g"])
-                                ),
+                                "cost_total": (self._json_float(session["cost_total"])),
+                                "revenue_v2g": (self._json_float(session["revenue_v2g"])),
                                 "status": session["derived_status"],
                             }
                         )
@@ -522,7 +551,9 @@ class DataSyncService:
                     self.logger.info(f"Synced {len(metrics)} energy metrics")
 
         except asyncpg.UndefinedTableError as e:
-            self._handle_missing_relation(self._CHARGING_SESSIONS_TABLE_KEY, e, "energy metrics sync")
+            self._handle_missing_relation(
+                self._CHARGING_SESSIONS_TABLE_KEY, e, "energy metrics sync"
+            )
         except asyncpg.UndefinedColumnError as e:
             self._handle_missing_relation(
                 self._ENERGY_METRICS_SYNC_COLUMN_KEY, e, "energy metrics sync (column missing)"
