@@ -35,7 +35,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-import jsonschema
 from uuid import UUID, uuid4
 
 from src.api.agent.auth_context import AuthContext
@@ -137,7 +136,8 @@ def _validate_scenario_json_schema(scenario: dict) -> None:
     except ValidationError as exc:
         loc = ".".join(str(p) for p in exc.path) if exc.path else "<root>"
         raise ScenarioLoadError(
-            f"scenario {scenario.get('id', '<unknown>')!r}: JSON schema violation at {loc}: {exc.message}"
+            f"scenario {scenario.get('id', '<unknown>')!r}: schema validation failed "
+            f"(JSON schema violation at {loc}: {exc.message})"
         ) from exc
 
 
@@ -209,29 +209,6 @@ def _validate_scenario(scenario: dict) -> None:
     _validate_scenario_json_schema(scenario)
 
 
-
-
-def _scenario_schema() -> dict[str, Any]:
-    schema_path = Path(__file__).resolve().parents[4] / "tests/golden/workflows/_schema.yaml"
-    if not schema_path.exists():
-        raise ScenarioLoadError(f"scenario schema not found at {schema_path}")
-
-    import yaml
-
-    schema = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
-    if not isinstance(schema, dict):
-        raise ScenarioLoadError("scenario schema must be a mapping")
-    return schema
-
-
-def _validate_against_schema(scenario: dict) -> None:
-    try:
-        jsonschema.validate(instance=scenario, schema=_scenario_schema())
-    except jsonschema.ValidationError as exc:
-        path = ".".join(str(p) for p in exc.absolute_path)
-        where = f" at {path}" if path else ""
-        raise ScenarioLoadError(f"scenario schema validation failed{where}: {exc.message}") from exc
-
 # ── Time resolution ───────────────────────────────────────────────────────
 
 
@@ -270,7 +247,7 @@ def _resolve_time(value: Any, scenario_now: datetime) -> datetime:
                 seconds = -seconds
             return scenario_now + timedelta(seconds=seconds)
 
-        if value.startswith(("+", "-")) and value.lstrip("+-").isdigit():
+        if len(value) > 1 and value[0] in "+-" and value[1:].isdigit():
             return scenario_now + timedelta(seconds=int(value))
 
         try:
@@ -564,7 +541,9 @@ class _MessagesFake:
             )
 
         if self._last_response is not None:
-            prev_had_tool_use = any(block.type == "tool_use" for block in self._last_response.content)
+            prev_had_tool_use = any(
+                block.type == "tool_use" for block in self._last_response.content
+            )
             if prev_had_tool_use:
                 has_tool_result = any(
                     isinstance(msg, dict)
@@ -950,7 +929,6 @@ def load_scenario(text: str) -> dict:
     scenario = yaml.safe_load(text)
     if not isinstance(scenario, dict):
         raise ScenarioLoadError("scenario YAML must be a mapping at the top level")
-    _validate_against_schema(scenario)
     _validate_scenario(scenario)
     return scenario
 

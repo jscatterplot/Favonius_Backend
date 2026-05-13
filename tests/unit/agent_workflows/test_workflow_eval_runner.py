@@ -192,7 +192,7 @@ def test_load_scenario_rejects_non_mapping() -> None:
 
 
 def test_load_scenario_rejects_missing_keys() -> None:
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match="missing keys"):
         load_scenario("id: incomplete\n")
 
 
@@ -201,7 +201,7 @@ def test_load_scenario_rejects_bad_severity() -> None:
     s["severity"] = "critical"
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match="severity must be one of"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -210,7 +210,7 @@ def test_load_scenario_rejects_bad_tier() -> None:
     s["permission_tier"] = "supreme_overlord"
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match="permission_tier must be one of"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -219,7 +219,7 @@ def test_load_scenario_rejects_non_mapping_snapshot() -> None:
     s["graph_snapshot"] = "not a dict"
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match="graph_snapshot must be a mapping"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -228,7 +228,7 @@ def test_load_scenario_rejects_non_mapping_workflow() -> None:
     s["workflow"] = ["name", "version"]
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match="workflow must be a mapping"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -237,7 +237,7 @@ def test_load_scenario_rejects_missing_workflow_keys() -> None:
     s["workflow"].pop("prompt")
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match="workflow.prompt is required"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -246,7 +246,7 @@ def test_load_scenario_rejects_empty_llm_trace() -> None:
     s["llm_trace"] = []
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match="llm_trace must be a non-empty list"):
         load_scenario(yaml.safe_dump(s))
 
 
@@ -265,7 +265,7 @@ def test_load_scenario_rejects_trace_entry_missing_content() -> None:
     s["llm_trace"] = [{"stop_reason": "tool_use"}]
     import yaml
 
-    with pytest.raises(ScenarioLoadError, match="schema validation failed"):
+    with pytest.raises(ScenarioLoadError, match=r"llm_trace\[0\] missing 'content'"):
         load_scenario(yaml.safe_dump(s))
 
 
