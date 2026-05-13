@@ -2685,6 +2685,27 @@ class TimescaleClient:
                 station_id,
             )
 
+    async def clear_sessions_seen(self, station_id: str) -> None:
+        """Clear stale ``last_seen_at`` stamps for open live sessions.
+
+        Called from the boot/reconnect path before open sessions are
+        reloaded into memory. A disconnect can legitimately be followed by
+        a reconnect while charging continues; leaving the old disconnect
+        timestamp in place would let orphan recovery close an active
+        session after ``stale_after_seconds`` elapses.
+        """
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charging_sessions
+                   SET last_seen_at = NULL
+                 WHERE station_id = $1
+                   AND end_time IS NULL
+                   AND source = 'live'
+                """,
+                station_id,
+            )
+
     async def mark_connectors_unavailable(self, station_id: str) -> None:
         """Append an ``Unavailable`` row for every known connector at the station.
 
