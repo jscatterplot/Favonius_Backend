@@ -168,3 +168,10 @@ def test_resolve_cap_wh_bad_env_falls_back(monkeypatch):
     """Garbage env value falls back to the safe default."""
     monkeypatch.setenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH", "garbage")
     assert _resolve_cap_wh(None) == DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+
+
+def test_resolve_cap_wh_non_positive_cli_falls_back(monkeypatch):
+    """Non-positive CLI cap falls back to default (does not read env)."""
+    monkeypatch.setenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH", "30")
+    assert _resolve_cap_wh(-5.0) == DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+    assert _resolve_cap_wh(0.0) == DEFAULT_SYNTHESIZED_DELTA_CAP_WH

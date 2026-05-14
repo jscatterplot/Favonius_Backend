@@ -1537,6 +1537,12 @@ class OCPP16Session:
         # `close_result is None` covers the idempotent retry / no-match
         # case, which is silent on purpose.
         if close_result is not None:
+            if close_result.get("synthesized"):
+                logger.info(
+                    "StopTransaction closed with synthesized_delta energy (station=%s tx_id=%s)",
+                    cp_id,
+                    transaction_id,
+                )
             meter_start_db = close_result.get("meter_start_wh")
             last_meter_db = close_result.get("last_meter_wh")
             energy_kwh = close_result.get("energy_delivered_kwh")

@@ -83,7 +83,9 @@ def _resolve_database_url() -> str:
 def _resolve_cap_wh(cli_kwh: Optional[float]) -> int:
     """CLI overrides the env var; env overrides the default."""
     if cli_kwh is not None:
-        return int(cli_kwh * 1000)
+        if cli_kwh > 0:
+            return int(cli_kwh * 1000)
+        return DEFAULT_SYNTHESIZED_DELTA_CAP_WH
     env_raw = os.getenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH")
     if env_raw:
         try:
@@ -204,11 +206,7 @@ async def _classify_and_backfill(
         if new_energy_kwh is not None:
             new_meter_start = earliest
             decision = "register"
-    elif (
-        meter_stop is not None
-        and meter_stop > 0
-        and last_meter is None
-    ):
+    elif meter_stop is not None and meter_stop > 0 and last_meter is None:
         # Path 2: Phase 2 synthesis. Triple-NULL state (no start, no
         # running register), meter_stop is the only signal.
         synthesized = synthesize_energy_kwh_from_meter_stop(meter_stop, cap_wh=cap_wh)
@@ -306,7 +304,7 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Override synthesized-delta cap (kWh). Falls back to "
-             "OCPP_SYNTHESIZED_DELTA_CAP_KWH env var, then 50.",
+        "OCPP_SYNTHESIZED_DELTA_CAP_KWH env var, then 50.",
     )
     return p.parse_args()
 
