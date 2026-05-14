@@ -40,7 +40,7 @@ REPLAY_BACKOFF_SECONDS = 1.0
 # nudging it via TriggerMessage. Some ABB Terra AC firmwares (and other
 # OCPP 1.6 implementations) skip BootNotification on WebSocket reconnect,
 # leaving the heartbeat interval un-negotiated and the session stuck.
-BOOT_TRIGGER_GRACE_SECONDS = 5.0
+BOOT_TRIGGER_GRACE_SECONDS = 5
 
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
@@ -201,6 +201,13 @@ class OCPP16Session:
         # because insert_open_session failed. These must continue to block
         # sibling StartTransaction retries on the same connector.
         self._in_memory_only_tx_ids: Set[int] = set()
+        # Per-session inbound frame counter. Set by ``_on_message_received``
+        # for every OCPP frame the charger sends. ``_force_boot_notification``
+        # reads this after the grace period to decide whether the charger is
+        # silent (trigger needed) or already chatting (skip — re-bootstrapping
+        # a clearly-alive charger on every reconnect is what caused the HRX
+        # Vilnius reconfig loop).
+        self._inbound_frame_count: int = 0
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
         self._metering_config_task: Optional[asyncio.Task[None]] = None
@@ -240,6 +247,12 @@ class OCPP16Session:
         Fire-and-forget — a slow notify must not backpressure OCPP
         message processing.
         """
+        # Used by ``_force_boot_notification`` to skip the synthetic
+        # TriggerMessage(BootNotification) when the charger is clearly alive
+        # (sending StatusNotification, Heartbeat, etc.) but has not yet sent
+        # its own BootNotification. A bounded counter is enough — we only
+        # check "> 0" — and overflow is impossible in practice.
+        self._inbound_frame_count += 1
         if self._connection_manager is not None:
             try:
                 await self._connection_manager.update_heartbeat(self._station_id)
@@ -262,6 +275,12 @@ class OCPP16Session:
     async def start(self) -> None:
         """Start processing messages from the charger (blocks until disconnect)."""
         self._stop_telemetry_flush.clear()
+        # Reset per-session inbound frame counter so the boot-trigger gate
+        # makes its decision against frames received in *this* connection,
+        # not anything stale from a previous adapter instance (which won't
+        # happen with the current lifecycle but defends against future
+        # reuse).
+        self._inbound_frame_count = 0
         self._telemetry_flush_task = asyncio.create_task(self._flush_telemetry_queue())
         self._boot_trigger_task = asyncio.create_task(self._force_boot_notification())
         try:
@@ -284,7 +303,7 @@ class OCPP16Session:
                 self._background_tasks.clear()
 
     async def _force_boot_notification(self) -> None:
-        """Nudge spec-violating chargers that skip BootNotification on reconnect.
+        """Nudge silent chargers that skip BootNotification on reconnect.
 
         OCPP 1.6 §4.2 requires the charger to send BootNotification on connect,
         and the central system's response carries the negotiated heartbeat
@@ -292,11 +311,27 @@ class OCPP16Session:
         WebSocket reconnects after the initial cold boot, leaving the session
         with no heartbeat cadence. TriggerMessage(BootNotification) is the
         spec-sanctioned way to wake them up (OCPP 1.6 §4.18).
+
+        Three conditions are checked after the grace period elapses:
+
+          1. ``last_boot_at`` is set — the charger volunteered a
+             BootNotification within the grace, no trigger needed.
+          2. Still no boot after grace (even if other frames arrived) —
+             Trigger BootNotification so ``_on_boot`` remains reachable
+             for this session (queued command replay, local auth sync,
+             metering bootstrap).
         """
         try:
             await asyncio.sleep(BOOT_TRIGGER_GRACE_SECONDS)
             if self._cp.last_boot_at is not None:
                 return
+            if self._inbound_frame_count > 0:
+                logger.info(
+                    "force_boot_notification station=%s proceeding after grace: "
+                    "charger sent %d frame(s) without BootNotification",
+                    self._station_id,
+                    self._inbound_frame_count,
+                )
             status = await self._cp.trigger_message("BootNotification")
             logger.info(
                 "force_boot_notification station=%s status=%s",
@@ -842,12 +877,7 @@ class OCPP16Session:
                         raise
                 except Exception:
                     pass
-            pool = None
-            static_pool_fn = getattr(self._timescale, "_static_pool", None)
-            if callable(static_pool_fn):
-                pool = static_pool_fn()
-            if pool is None:
-                pool = getattr(self._timescale, "pg_pool", None)
+            pool = self._resolve_static_pool()
             if pool is None:
                 logger.debug(
                     "local_auth_sync station=%s skipped: no static or timescale pool available",
@@ -891,6 +921,135 @@ class OCPP16Session:
         ),
     ]
 
+    # OCPP statuses that mean "the key is at the desired value as far as the
+    # charger is concerned". ``Accepted`` is the obvious one. ``RebootRequired``
+    # means the charger acknowledged the new value but will only apply it on
+    # next restart — for idempotency that still counts as "applied" because
+    # re-pushing on the very next reconnect will just produce the same
+    # response. Everything else (``Rejected``, ``NotSupported``, timeout)
+    # is treated as a non-success and disables the cache stamp for this
+    # firmware so we re-attempt next time.
+    _METERING_CONFIG_SUCCESS_STATUSES: frozenset[str] = frozenset({"Accepted", "RebootRequired"})
+
+    async def _metering_config_already_applied(self) -> bool:
+        """Return True iff the metering config was successfully pushed to
+        this station on its current firmware version.
+
+        Reads ``charging_stations.metering_config_applied_firmware`` (added
+        by migration 014) and compares against the firmware string from the
+        current BootNotification. A match means every key in
+        ``_METERING_CONFIG_KEYS`` was confirmed by the charger on this
+        firmware — re-pushing on reconnect is wasted work and exactly the
+        round-trip storm that caused the HRX Vilnius reconfig loop.
+
+        Returns ``False`` in three cases:
+          1. The current firmware is unknown (no BootNotification yet, or
+             the charger omitted ``firmware_version``). We can't scope a
+             cache lookup without it.
+          2. The probe column is missing — migration 014 not applied yet.
+             Falling back to the always-push behaviour preserves the
+             pre-migration semantics while keeping the new code safe on
+             older DB schemas.
+          3. The cached firmware doesn't match the live firmware — the
+             charger updated and we have to re-verify the keys still take.
+
+        DB errors are caught and the function returns ``False`` so the push
+        runs (failure-open for a non-critical optimisation).
+        """
+        current_fw = getattr(self._cp, "firmware_version", None)
+        if not current_fw:
+            return False
+        pool = self._resolve_static_pool()
+        if pool is None:
+            return False
+        try:
+            row = await pool.fetchrow(
+                """
+                SELECT metering_config_applied_firmware
+                FROM charging_stations
+                WHERE station_id = $1
+                """,
+                self._station_id,
+            )
+        except Exception as exc:
+            # ``42703`` (undefined_column) — migration 014 not applied.
+            # Anything else (DB blip, pool exhausted) — fall back to push.
+            if getattr(exc, "sqlstate", None) == "42703":
+                logger.warning(
+                    "metering_config_cache station=%s schema missing applied_firmware "
+                    "column (apply migrations/supabase/014_metering_config_cache.sql) — "
+                    "will re-push metering config every reconnect",
+                    self._station_id,
+                )
+            else:
+                logger.warning(
+                    "metering_config_cache station=%s lookup failed (%s); "
+                    "will push metering config",
+                    self._station_id,
+                    exc,
+                )
+            return False
+        if row is None:
+            return False
+        applied_fw = row.get("metering_config_applied_firmware")
+        return applied_fw == current_fw
+
+    async def _record_metering_config_applied(self) -> None:
+        """Stamp the metering-config cache columns after a clean push.
+
+        Errors (including missing schema) are logged and swallowed: the
+        cache is an optimisation, not a correctness requirement. The next
+        reconnect will simply re-push.
+        """
+        current_fw = getattr(self._cp, "firmware_version", None)
+        if not current_fw:
+            return
+        pool = self._resolve_static_pool()
+        if pool is None:
+            return
+        try:
+            await pool.execute(
+                """
+                UPDATE charging_stations
+                SET metering_config_applied_firmware = $1,
+                    metering_config_applied_at = NOW()
+                WHERE station_id = $2
+                """,
+                current_fw,
+                self._station_id,
+            )
+        except Exception as exc:
+            if getattr(exc, "sqlstate", None) == "42703":
+                # Migration 014 not applied — silent fail. The legacy log
+                # in ``_metering_config_already_applied`` already warned on
+                # the read path; no need to spam again on the write.
+                return
+            logger.warning(
+                "metering_config_cache station=%s update failed (%s); "
+                "next reconnect will re-push",
+                self._station_id,
+                exc,
+            )
+
+    def _resolve_static_pool(self) -> Any:
+        """Return the static asyncpg pool used for charging_stations writes,
+        falling back to the timescale pool if the static one is not wired.
+
+        Mirrors the discovery logic in ``_delayed_local_auth_sync`` so both
+        paths read the same DB regardless of how the WS handler is
+        configured (single-pool vs split static / timescale pools).
+        """
+        pool = None
+        static_pool_fn = getattr(self._timescale, "_static_pool", None)
+        if callable(static_pool_fn):
+            try:
+                pool = static_pool_fn()
+            except Exception:
+                pool = None
+        if pool is None:
+            pool = getattr(self._timescale, "pg_pool", None)
+        return pool
+
     async def _push_metering_config(self) -> None:
         """Push the metering configuration keys to the charger after boot.
 
@@ -907,10 +1066,28 @@ class OCPP16Session:
             ``_ABB_SAFE_MEASURANDS`` allowlist; that defends against the
             Terra AC ≤1.8.21 reboot-loop bug and is logged at INFO.
 
+        Per-firmware idempotency: once every key in
+        ``_METERING_CONFIG_KEYS`` was accepted by the charger on its
+        current firmware, the bootstrap is short-circuited on subsequent
+        reconnects until the charger reports a new ``firmware_version``.
+        This is the fix for the HRX Vilnius reconfig loop where ABB Terra
+        AC chargers reconnected every ~60 s and the full ~15 s bootstrap
+        re-ran on every cycle. See migration 014.
+
         Errors are swallowed locally; raising here would tear down the
         OCPP session for a non-fatal configuration mismatch.
         """
         try:
+            if await self._metering_config_already_applied():
+                logger.info(
+                    "metering_config_cache_hit station=%s firmware=%s — "
+                    "skipping ChangeConfiguration sequence",
+                    self._station_id,
+                    getattr(self._cp, "firmware_version", None),
+                )
+                return
+
+            all_keys_applied = True
             for key, value in self._METERING_CONFIG_KEYS:
                 try:
                     status = await asyncio.wait_for(
@@ -924,6 +1101,7 @@ class OCPP16Session:
                         self._station_id,
                         key,
                     )
+                    all_keys_applied = False
                     continue
                 except Exception as exc:
                     logger.warning(
@@ -932,10 +1110,12 @@ class OCPP16Session:
                         key,
                         exc,
                     )
+                    all_keys_applied = False
                     continue
-                if status == "Accepted":
+                if status in self._METERING_CONFIG_SUCCESS_STATUSES:
                     logger.info(
-                        "ChargingMetering config accepted on station=%s: %s=%s",
+                        "ChargingMetering config %s on station=%s: %s=%s",
+                        status,
                         self._station_id,
                         key,
                         value,
@@ -948,6 +1128,9 @@ class OCPP16Session:
                         key,
                         value,
                     )
+                    all_keys_applied = False
+            if all_keys_applied:
+                await self._record_metering_config_applied()
         except asyncio.CancelledError:
             logger.debug("metering_config push cancelled for station=%s", self._station_id)
             raise
