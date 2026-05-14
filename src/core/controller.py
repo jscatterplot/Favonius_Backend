@@ -843,9 +843,6 @@ class DepotController:
                         self.depot_id,
                     )
                     self._running = False
-                    self.trigger_monitor.stop()
-                    if self._monitor_task and not self._monitor_task.done():
-                        self._monitor_task.cancel()
                     break
 
                 # Update uptime metric
