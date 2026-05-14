@@ -41,7 +41,6 @@ REPLAY_BACKOFF_SECONDS = 1.0
 # OCPP 1.6 implementations) skip BootNotification on WebSocket reconnect,
 # leaving the heartbeat interval un-negotiated and the session stuck.
 BOOT_TRIGGER_GRACE_SECONDS = 5
-BOOT_TRIGGER_FOLLOWUP_SECONDS = 25.0
 
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
