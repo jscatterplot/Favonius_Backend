@@ -634,7 +634,7 @@ async def sync_charger(
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
         if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED:
-            if not legacy_schema and current_fw is not None:
+            if not legacy_schema:
                 await _record_probe_outcome(
                     db,
                     station_row["id"],
