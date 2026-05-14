@@ -591,13 +591,14 @@ async def sync_charger(
     if needs_probe:
         probe_result = await _probe_local_auth_support(cp, station_id)
         if probe_result is False:
-            await _record_probe_outcome(
-                db,
-                station_row["id"],
-                supported=False,
-                firmware=current_fw,
-                last_status="UnsupportedFeatureProfile",
-            )
+            if current_fw is not None:
+                await _record_probe_outcome(
+                    db,
+                    station_row["id"],
+                    supported=False,
+                    firmware=current_fw,
+                    last_status="UnsupportedFeatureProfile",
+                )
             logger.info(
                 "local_auth_sync station=%s status=UnsupportedFeatureProfile "
                 "entries=0 version=%d first_sync=%s reason=probe_negative",
@@ -647,7 +648,11 @@ async def sync_charger(
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
         if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED:
-            if not legacy_schema and not probe_positive:
+            if (
+                not legacy_schema
+                and not probe_positive
+                and current_fw is not None
+            ):
                 await _record_probe_outcome(
                     db,
                     station_row["id"],

@@ -542,6 +542,37 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         assert update_call.args[3] == "UnsupportedFromBootstrap"
 
     @pytest.mark.asyncio
+    async def test_bootstrap_unsupported_with_unknown_firmware_skips_negative_cache(
+        self, monkeypatch
+    ) -> None:
+        """Firmware-less chargers should not persist a NULL firmware probe-cache
+        negative that would indefinitely short-circuit future reconnects."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(
+            firmware_version=None,
+            get_configuration_response={"configuration_key": [], "unknown_key": []},
+        )
+        cp.change_configuration = AsyncMock(return_value="NotSupported")
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "UnsupportedFromBootstrap"
+        cp.send_local_list.assert_not_awaited()
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported" not in update_call.args[0]
+        assert "local_list_last_status" in update_call.args[0]
+        assert update_call.args[1] == "UnsupportedFromBootstrap"
+
+    @pytest.mark.asyncio
     async def test_bootstrap_success_still_calls_send_local_list(self, monkeypatch) -> None:
         """Sanity: the happy path is unchanged. If the critical key is
         accepted, SendLocalList runs and the version bumps."""
