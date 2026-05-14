@@ -19,7 +19,6 @@ class DataSyncService:
 
     _CHARGING_SESSIONS_TABLE_KEY = "charging_sessions"
     _CHARGING_SESSIONS_SYNC_COLUMN_KEY = "charging_sessions:sync_charging_sessions"
-    _ENERGY_METRICS_SYNC_COLUMN_KEY = "charging_sessions:sync_energy_metrics"
 
     def __init__(
         self,
@@ -150,7 +149,6 @@ class DataSyncService:
             self.sync_charging_sessions(),
             self.sync_vehicle_states(),
             self.sync_optimization_decisions(),
-            self.sync_energy_metrics(),
         ]
 
         await asyncio.gather(*sync_tasks, return_exceptions=True)
@@ -474,92 +472,13 @@ class DataSyncService:
             self.logger.error(f"Failed to sync optimization decisions: {e}")
 
     async def sync_energy_metrics(self) -> None:
-        """Sync energy metrics and analytics to Supabase."""
-        if self._is_known_missing(self._CHARGING_SESSIONS_TABLE_KEY) or self._is_known_missing(
-            self._ENERGY_METRICS_SYNC_COLUMN_KEY
-        ):
-            return
-        try:
-            if not self.timescale_pool:
-                return
-
-            # Get last sync time
-            last_sync = self.last_sync_times.get(
-                "energy_metrics", datetime.now(timezone.utc) - timedelta(hours=1)
-            )
-
-            async with self.timescale_pool.acquire() as conn:
-                # Query energy metrics
-                query = """
-                    SELECT
-                        fleet_operator_id,
-                        DATE(start_time) as date,
-                        COUNT(DISTINCT vehicle_id) as vehicles_charged,
-                        SUM(energy_delivered_kwh) as total_energy_charged,
-                        SUM(energy_received_kwh) as total_energy_discharged,
-                        AVG(EXTRACT(EPOCH FROM (end_time - start_time))/60)
-                            AS avg_session_duration,
-                        SUM(cost_total) as total_cost,
-                        SUM(revenue_v2g) as total_v2g_revenue
-                    FROM charging_sessions
-                    WHERE start_time > $1
-                        AND end_time IS NOT NULL
-                    GROUP BY fleet_operator_id, DATE(start_time)
-                    ORDER BY date DESC
-                    LIMIT $2
-                """
-
-                metrics = await conn.fetch(query, last_sync, self.batch_size)
-
-                if metrics:
-                    # Update daily energy summary in Supabase
-                    for metric in metrics:
-                        await self.supabase_client.client.table("daily_energy_summary").upsert(
-                            {
-                                "organization_id": metric["fleet_operator_id"],
-                                "date": metric["date"].isoformat(),
-                                "vehicles_charged": metric["vehicles_charged"],
-                                "total_energy_charged": (
-                                    float(metric["total_energy_charged"])
-                                    if metric["total_energy_charged"]
-                                    else 0
-                                ),
-                                "total_energy_discharged": (
-                                    float(metric["total_energy_discharged"])
-                                    if metric["total_energy_discharged"]
-                                    else 0
-                                ),
-                                "avg_session_duration": (
-                                    float(metric["avg_session_duration"])
-                                    if metric["avg_session_duration"]
-                                    else 0
-                                ),
-                                "total_cost": (
-                                    float(metric["total_cost"]) if metric["total_cost"] else 0
-                                ),
-                                "total_v2g_revenue": (
-                                    float(metric["total_v2g_revenue"])
-                                    if metric["total_v2g_revenue"]
-                                    else 0
-                                ),
-                            }
-                        ).execute()
-
-                    # Update last sync time
-                    self.last_sync_times["energy_metrics"] = datetime.now(timezone.utc)
-
-                    self.logger.info(f"Synced {len(metrics)} energy metrics")
-
-        except asyncpg.UndefinedTableError as e:
-            self._handle_missing_relation(
-                self._CHARGING_SESSIONS_TABLE_KEY, e, "energy metrics sync"
-            )
-        except asyncpg.UndefinedColumnError as e:
-            self._handle_missing_relation(
-                self._ENERGY_METRICS_SYNC_COLUMN_KEY, e, "energy metrics sync (column missing)"
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to sync energy metrics: {e}")
+        """No-op: daily_energy_summary is a view that aggregates live from
+        charging_sessions_summary, so there is nothing for the backend to
+        upsert. Earlier revisions wrote rows here and Supabase returned 500
+        because PostgREST cannot write to an aggregating view. The method
+        is retained so force_sync("energy_metrics") stays valid.
+        """
+        return
 
     async def sync_active_sessions(self, sessions: List[Dict[str, Any]]) -> None:
         """Sync active charging sessions to Supabase."""
