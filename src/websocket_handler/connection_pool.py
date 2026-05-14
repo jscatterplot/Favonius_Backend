@@ -560,3 +560,28 @@ async def shutdown_pools() -> None:
     if _pool_manager:
         await _pool_manager.close_all()
         _pool_manager = None
+
+
+async def open_dedicated_connection(config: TimescaleConfig) -> asyncpg.Connection:
+    """Open a single asyncpg connection outside any pool.
+
+    Long-lived ``LISTEN``/``NOTIFY`` consumers (alerts dispatcher,
+    charging_command_queue consumer) previously parked on a pool slot for
+    their entire lifetime, shrinking the pool's effective working capacity
+    by two. A dedicated connection costs exactly one cluster slot — the
+    same as before — but keeps it OFF the pool's books so ``max_size``
+    reflects real query throughput, not throughput-minus-listeners.
+
+    The caller owns the connection's lifecycle: handle ``OSError`` /
+    ``asyncpg.PostgresConnectionError`` and call ``conn.close()`` on
+    shutdown.
+    """
+    sslmode = getattr(config, "sslmode", "require")
+    return await asyncpg.connect(
+        host=config.host,
+        port=config.port,
+        database=config.database,
+        user=config.user,
+        password=config.password,
+        ssl=ssl_context_for_postgres_sslmode(str(sslmode)),
+    )

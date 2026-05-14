@@ -151,6 +151,101 @@ class TestSchemaPreflight:
             await disp.stop()
 
     @pytest.mark.asyncio
+    async def test_listen_uses_dedicated_factory_when_provided(self, caplog):
+        """When a factory is wired (production path), use it instead of pool.acquire.
+
+        Background: parking the LISTEN connection on a pool slot for the
+        lifetime of the process shrinks the pool's effective working
+        capacity by one. The dedicated-connection path keeps the slot off
+        the pool's books so ``max_size`` reflects real query throughput.
+        Stop() must close the dedicated connection (not call pool.release).
+        """
+        pool, _ = _make_pool_with_fetchval(True)
+        pool.release = AsyncMock()  # would be wrong to call when factory used
+
+        dedicated_conn = MagicMock()
+        dedicated_conn.add_listener = AsyncMock()
+        dedicated_conn.remove_listener = AsyncMock()
+        dedicated_conn.close = AsyncMock()
+
+        factory = AsyncMock(return_value=dedicated_conn)
+
+        disp = AlertDispatcher(
+            pool=pool,
+            email_client=FakeEmailClient(),
+            default_from="x@y.com",
+            poll_interval_s=300.0,
+            listen_connection_factory=factory,
+        )
+
+        try:
+            await disp.start()
+            factory.assert_awaited_once()
+            dedicated_conn.add_listener.assert_awaited_once()
+            assert disp._listener_conn is dedicated_conn
+            assert disp._listener_owns_connection is True
+        finally:
+            await disp.stop()
+
+        # On stop, close the dedicated conn; never call pool.release
+        dedicated_conn.close.assert_awaited_once()
+        pool.release.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_listen_falls_back_to_pool_acquire_without_factory(self):
+        """Without a factory (test/legacy path), keep using pool.acquire/release.
+
+        This preserves the existing fake-pool fixture behaviour so the rest
+        of the test suite doesn't need to know about the factory plumbing.
+        """
+        pool, conn = _make_pool_with_fetchval(True)
+        # Replace pool.acquire with one whose entry yields a fresh conn for
+        # the LISTEN setup. The schema preflight conn (already returning True)
+        # is yielded from the same fixture; here we want a separate
+        # add_listener-capable conn.
+        listener_conn = MagicMock()
+        listener_conn.add_listener = AsyncMock()
+        listener_conn.remove_listener = AsyncMock()
+
+        @asynccontextmanager
+        async def _preflight_ctx():
+            yield conn
+
+        async def _bare_acquire():
+            return listener_conn
+
+        # MagicMock can hold both an async-context manager (preflight) and a
+        # plain awaitable (listener). The dispatcher uses ``async with`` for
+        # preflight and ``await`` for the listener acquire — distinct shapes.
+        call = {"n": 0}
+
+        def _acquire_dispatch(*_a, **_kw):
+            call["n"] += 1
+            if call["n"] == 1:
+                return _preflight_ctx()
+            return _bare_acquire()
+
+        pool.acquire = _acquire_dispatch
+        pool.release = AsyncMock()
+
+        disp = AlertDispatcher(
+            pool=pool,
+            email_client=FakeEmailClient(),
+            default_from="x@y.com",
+            poll_interval_s=300.0,
+        )
+
+        try:
+            await disp.start()
+            assert disp._listener_owns_connection is False
+            assert disp._listener_conn is listener_conn
+        finally:
+            await disp.stop()
+
+        listener_conn.remove_listener.assert_awaited_once()
+        pool.release.assert_awaited_once_with(listener_conn)
+
+    @pytest.mark.asyncio
     async def test_preflight_failure_assumes_present(self, caplog):
         """A transient pool error at startup must NOT permanently disable
         the dispatcher — fall through to the (resilient) main loop instead."""

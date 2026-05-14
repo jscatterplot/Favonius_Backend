@@ -18,6 +18,7 @@ from src.notifications.resend_client import ResendEmailClient
 from .config import Config
 from .config_validator import ConfigValidator
 from .connection_monitor import ConnectionMonitor
+from .connection_pool import open_dedicated_connection
 from .data_sync import DataSyncService
 from .database_schema import create_schema_from_config
 from .health import HealthCheckServer
@@ -588,6 +589,7 @@ class Application:
                 "FakeEmailClient — emails will NOT be delivered"
             )
 
+        timescale_cfg = self.timescale_client.config
         self.alert_dispatcher = AlertDispatcher(
             pool=self.timescale_client.pg_pool,
             email_client=self._email_client,
@@ -595,6 +597,7 @@ class Application:
             poll_interval_s=notifications_cfg.poll_interval_s,
             resend_interval_s=notifications_cfg.resend_interval_s,
             batch_size=notifications_cfg.batch_size,
+            listen_connection_factory=lambda: open_dedicated_connection(timescale_cfg),
         )
         await self.alert_dispatcher.start()
 
