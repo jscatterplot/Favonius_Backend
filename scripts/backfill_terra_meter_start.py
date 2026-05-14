@@ -62,7 +62,7 @@ if str(_SRC) not in sys.path:
 
 from db.postgres_url import prepare_asyncpg_url_and_ssl  # noqa: E402
 
-from src.websocket_handler.meter_value_utils import (  # noqa: E402
+from websocket_handler.meter_value_utils import (  # noqa: E402
     DEFAULT_SYNTHESIZED_DELTA_CAP_WH,
     compute_energy_kwh,
     synthesize_energy_kwh_from_meter_stop,
