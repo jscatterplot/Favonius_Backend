@@ -1125,7 +1125,8 @@ class OCPP16Session:
                     continue
                 if status in self._METERING_CONFIG_SUCCESS_STATUSES:
                     logger.info(
-                        "ChargingMetering config accepted on station=%s: %s=%s",
+                        "ChargingMetering config %s on station=%s: %s=%s",
+                        status,
                         self._station_id,
                         key,
                         value,
