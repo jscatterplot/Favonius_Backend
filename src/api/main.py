@@ -8817,12 +8817,11 @@ async def reset_charger_local_auth_cache_endpoint(
         raise DatabaseError("Database not available")
 
     async with db_pools.static.acquire() as conn:
-        async with conn.transaction():
-            result = await db_queries.reset_local_auth_cache(
-                conn,
-                depot_id=depot_id,
-                charger_id=charger_id,
-            )
+        result = await db_queries.reset_local_auth_cache(
+            conn,
+            depot_id=depot_id,
+            charger_id=charger_id,
+        )
 
     if result is None:
         raise HTTPException(
