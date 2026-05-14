@@ -185,6 +185,8 @@ class OCPPWebSocketServer:
         # Background task tracking
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._rate_limit_task: Optional[asyncio.Task] = None
+        # Strong refs for fire-and-forget ``websocket.close()`` tasks (Python 3.12+).
+        self._websocket_close_tasks: set[asyncio.Task] = set()
 
         # Suppress noisy ERROR logs from TCP health probes (zero-byte connections).
         # Applied once per server instance; harmless if added multiple times.
@@ -957,9 +959,11 @@ class OCPPWebSocketServer:
         # connection's setup. Safe to schedule even when the websocket has
         # already closed naturally (the helper's try/except swallows it).
         close_reason = "Replaced by reconnect" if replaced_by_reconnect else "Session ended"
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._close_connection_gracefully(websocket, code=1001, reason=close_reason)
         )
+        self._websocket_close_tasks.add(task)
+        task.add_done_callback(self._websocket_close_tasks.discard)
 
         self.logger.info(f"Cleaned up connection {connection_id} (station: {station_id})")
 
