@@ -395,6 +395,8 @@ async def _insert_schedules(conn: Any, schedules: Iterable[dict], scenario_now: 
 
 
 async def _insert_telemetry(conn: Any, samples: Iterable[dict], scenario_now: datetime) -> None:
+    if not await _table_exists(conn, "telemetry"):
+        return
     for idx, sample in enumerate(samples):
         charger_raw = sample.get("charger_id")
         charger_id = (
@@ -430,6 +432,8 @@ async def _table_exists(conn: Any, table_name: str) -> bool:
 async def _insert_prices(
     conn: Any, prices: Iterable[dict], depot_id: UUID, scenario_now: datetime
 ) -> None:
+    if not await _table_exists(conn, "prices"):
+        return
     for p in prices:
         await conn.execute(
             """
@@ -446,6 +450,8 @@ async def _insert_prices(
 async def _insert_building_load(
     conn: Any, samples: Iterable[dict], depot_id: UUID, scenario_now: datetime
 ) -> None:
+    if not await _table_exists(conn, "building_load"):
+        return
     for s in samples:
         await conn.execute(
             """
