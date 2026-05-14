@@ -8758,6 +8758,114 @@ async def rotate_charger_credentials_endpoint(
 
 
 @app.post(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/local_auth/reset",
+    tags=["admin"],
+    summary="Clear cached LocalAuthorizationList support outcome for a charger",
+)
+async def reset_charger_local_auth_cache_endpoint(
+    depot_id: str,
+    charger_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Force a re-probe of LocalAuthListManagement support on the next reconnect.
+
+    Use cases:
+      * Firmware was upgraded on the charger to a version that now
+        supports LocalAuthListManagement, and we want to retest WITHOUT
+        waiting for the per-firmware cache to invalidate naturally.
+      * A transient internal error on a supported charger caused us to
+        cache ``supported=False`` and we want to give it another chance.
+      * Ops debugging a specific charger's bootstrap behavior.
+
+    Side effect: zeros ``charging_stations.local_list_supported``,
+    ``local_list_probed_firmware``, ``local_list_probed_at``,
+    ``local_list_last_status`` AND ``local_list_version``. The version
+    reset means the next sync runs the first-sync code path including
+    the bootstrap ChangeConfiguration sequence — exactly the same
+    behavior as a brand-new charger. The bootstrap fail-fast (PR #207)
+    keeps a worst-case outcome bounded.
+
+    Authorization:
+      - favonius_admin: always allowed.
+      - customer_admin: allowed only when caller's organization_id
+        matches the depot's organization_id.
+      - others: 403.
+
+    Audit: writes ``charger.local_auth.cache_reset`` row with the
+    previous cache state in metadata so ops can see what was cleared.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin"):
+        raise _forbidden(
+            "FORBIDDEN_ROLE", "favonius_admin or customer_admin role required"
+        )
+
+    depot_row, _ = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name=(
+            "POST /admin/depots/{depot_id}/chargers/{charger_id}/local_auth/reset"
+        ),
+    )
+    # _resolve_depot_for_admin enforces tenant access for customer_admin
+    # and cross-org for favonius_admin.
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        async with conn.transaction():
+            result = await db_queries.reset_local_auth_cache(
+                conn,
+                depot_id=depot_id,
+                charger_id=charger_id,
+            )
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "CHARGER_NOT_FOUND",
+                "message": "Charger not found in this depot",
+            },
+        )
+
+    await _record_admin_action(
+        user=user,
+        action="charger.local_auth.cache_reset",
+        depot_id=depot_id,
+        organization_id_override=(
+            str(depot_row.get("organization_id"))
+            if depot_row.get("organization_id")
+            else None
+        ),
+        target_type="charger",
+        target_id=str(charger_id),
+        metadata={
+            "endpoint": (
+                "POST /admin/depots/{depot_id}/chargers/{charger_id}/local_auth/reset"
+            ),
+            "ocpp_id": result["ocpp_id"],
+            "previous_supported": result["previous_supported"],
+            "previous_probed_firmware": result["previous_probed_firmware"],
+            "legacy_schema": result.get("legacy_schema", False),
+        },
+    )
+
+    return {
+        "depot_id": depot_id,
+        "charger_id": charger_id,
+        "ocpp_id": result["ocpp_id"],
+        "previous_supported": result["previous_supported"],
+        "previous_probed_firmware": result["previous_probed_firmware"],
+        "reset_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post(
     "/admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize",
     tags=["admin"],
     summary="Authorize a charging session at a charger without an RFID scan",
