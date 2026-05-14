@@ -1084,6 +1084,10 @@ class FleetChargePoint(CP16):
         unknown-vendor-before-boot) chargers, the call is refused with
         ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_change_configuration_had_error = False
+
         if _requires_abb_safe_measurands(self.vendor) and key in {
             "MeterValuesSampledData",
             "MeterValuesAlignedData",
@@ -1100,10 +1104,6 @@ class FleetChargePoint(CP16):
                     sorted(_ABB_SAFE_MEASURANDS),
                 )
                 return "NotSupported"
-
-        # Best-effort transport signal for higher-level orchestration logic.
-        # True means status came from local exception fallback, not charger reply.
-        self._last_change_configuration_had_error = False
 
         try:
             payload = call.ChangeConfiguration(key=key, value=value)
@@ -1162,6 +1162,10 @@ class FleetChargePoint(CP16):
         operator falls back to central authorization. Truncating silently
         would create a security gap (some idTags would never authorize).
         """
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         if os.getenv("OCPP_DISABLE_LOCAL_AUTH_LIST", "false").lower() == "true":
             logger.info(
                 "SendLocalList to %s suppressed by OCPP_DISABLE_LOCAL_AUTH_LIST=true; use central Authorize",
@@ -1195,10 +1199,6 @@ class FleetChargePoint(CP16):
                 _LOCAL_LIST_MAX_ENTRIES,
                 self.vendor,
             )
-
-        # Best-effort transport signal for higher-level orchestration logic.
-        # True means status came from local exception fallback, not charger reply.
-        self._last_send_local_list_had_error = False
 
         try:
             kwargs: dict[str, Any] = {
