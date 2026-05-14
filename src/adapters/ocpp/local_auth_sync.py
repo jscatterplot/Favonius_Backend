@@ -677,6 +677,7 @@ async def sync_charger(
                 reason="bootstrap_unsupported",
             )
 
+    send_local_list_raised = False
     try:
         status = await cp.send_local_list(
             list_version=new_version,
@@ -691,6 +692,7 @@ async def sync_charger(
             station_id,
             exc,
         )
+        send_local_list_raised = True
         status = "Failed"
 
     # Fallback caching: record a firmware-scoped negative when the charger
@@ -705,8 +707,10 @@ async def sync_charger(
     # * ``Failed`` — ambiguous in spec, but firmware-permanent in practice
     #   on ABB Terra AC V1.8.x where the ChangeConfiguration bootstrap was
     #   accepted but ``SendLocalList`` returned ``Failed`` rather than the
-    #   spec-mandated ``NotSupported``. Cache ONLY when we don't already
-    #   have positive evidence of support (``probe_positive`` is False —
+    #   spec-mandated ``NotSupported``. Cache ONLY for charger-returned
+    #   ``Failed`` statuses (not transport/timeout exceptions) when we
+    #   don't already have positive evidence of support
+    #   (``probe_positive`` is False —
     #   probe returned False/None or no probe outcome ever recorded
     #   positive). This protects chargers that genuinely support the
     #   feature but returned ``Failed`` once due to a transient internal
@@ -718,7 +722,7 @@ async def sync_charger(
     if not legacy_schema and current_fw is not None and len(entries) <= _LOCAL_LIST_MAX_ENTRIES:
         if status == "NotSupported":
             cache_negative = True
-        elif status == "Failed" and not probe_positive:
+        elif status == "Failed" and not probe_positive and not send_local_list_raised:
             cache_negative = True
     if cache_negative:
         await _record_probe_outcome(
