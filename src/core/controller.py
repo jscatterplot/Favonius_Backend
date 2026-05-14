@@ -864,6 +864,14 @@ class DepotController:
                 logger.error(f"Control loop error: {e}", exc_info=True)
                 await asyncio.sleep(60)
 
+        self.trigger_monitor.stop()
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
         # Update state metric
         CONTROLLER_STATE.labels(depot_id=self.depot_id).set(0)
         logger.info(f"Control loop stopped for depot {self.depot_id}")
