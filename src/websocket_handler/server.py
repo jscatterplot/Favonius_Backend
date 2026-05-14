@@ -957,17 +957,9 @@ class OCPPWebSocketServer:
         # connection's setup. Safe to schedule even when the websocket has
         # already closed naturally (the helper's try/except swallows it).
         close_reason = "Replaced by reconnect" if replaced_by_reconnect else "Session ended"
-        try:
-            asyncio.create_task(
-                self._close_connection_gracefully(websocket, code=1001, reason=close_reason)
-            )
-        except RuntimeError:
-            # No running loop (e.g. some test harnesses). Best-effort
-            # synchronous close — failure here is non-fatal.
-            try:
-                await self._close_connection_gracefully(websocket, code=1001, reason=close_reason)
-            except Exception:
-                pass
+        asyncio.create_task(
+            self._close_connection_gracefully(websocket, code=1001, reason=close_reason)
+        )
 
         self.logger.info(f"Cleaned up connection {connection_id} (station: {station_id})")
 
