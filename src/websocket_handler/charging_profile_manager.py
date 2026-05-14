@@ -992,7 +992,7 @@ class ChargingCommandQueueConsumer:
 
         if self._listen_conn is not None:
             try:
-                await self.timescale_client.pg_pool.release(self._listen_conn)
+                await self._listen_conn.close()
             except Exception:
                 pass
             self._listen_conn = None
