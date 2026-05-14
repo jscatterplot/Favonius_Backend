@@ -1,6 +1,7 @@
 """Enhanced connection pooling and performance optimizations."""
 
 import asyncio
+import os
 import ssl
 import time
 from dataclasses import dataclass
@@ -156,7 +157,22 @@ class EnhancedConnectionPool:
             raise
 
     async def _create_sqlalchemy_engine(self) -> None:
-        """Create SQLAlchemy engine with optimizations."""
+        """Create SQLAlchemy engine with optimizations.
+
+        The asyncpg pool above handles the hot path. The SQLAlchemy engine
+        exists only for a few cold ``pd.read_sql`` reporting calls in
+        ``timescale_client.py`` (``get_hourly_energy_aggregates``,
+        ``get_daily_fleet_metrics``) and a ``health_check`` ping. Sizing it
+        to mirror the asyncpg pool doubled the per-replica TimescaleDB
+        connection budget without benefit, so under load Postgres started
+        rejecting acquires with ``53300 too_many_connections`` ("remaining
+        connection slots are reserved for ... pg_use_reserved_connections"),
+        which surfaced as the periodic data_sync ERROR.
+
+        Cap small and independent. Override via ``SQLALCHEMY_POOL_SIZE`` /
+        ``SQLALCHEMY_MAX_OVERFLOW`` if a deployment genuinely needs more
+        concurrent pandas reporting.
+        """
         try:
             service_url = getattr(self.config, "service_url", None)
             if not service_url:
@@ -166,11 +182,14 @@ class EnhancedConnectionPool:
                 # SQLAlchemy expects the canonical dialect name "postgresql".
                 service_url = service_url.replace("postgres://", "postgresql://", 1)
 
+            sqlalchemy_pool_size = int(os.getenv("SQLALCHEMY_POOL_SIZE", "1"))
+            sqlalchemy_max_overflow = int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", "4"))
+
             self.sqlalchemy_engine = create_engine(
                 service_url,
                 poolclass=QueuePool,
-                pool_size=self.min_connections,
-                max_overflow=self.max_connections - self.min_connections,
+                pool_size=sqlalchemy_pool_size,
+                max_overflow=sqlalchemy_max_overflow,
                 pool_timeout=self.connection_timeout,
                 pool_recycle=600,  # 10 minutes - faster recovery after DB restarts
                 pool_pre_ping=True,
@@ -178,7 +197,12 @@ class EnhancedConnectionPool:
                 connect_args={"options": "-c timezone=utc -c statement_timeout=30000"},
             )
 
-            self.logger.info("SQLAlchemy engine created with optimizations")
+            self.logger.info(
+                "SQLAlchemy engine created with pool_size=%s, max_overflow=%s "
+                "(cold reporting only; asyncpg owns the hot path)",
+                sqlalchemy_pool_size,
+                sqlalchemy_max_overflow,
+            )
 
         except Exception as e:
             self.logger.warning(
