@@ -576,6 +576,16 @@ class _MessagesFake:
                 block.type == "tool_use" for block in self._last_response.content
             )
             if prev_had_tool_use:
+                # Only inspect messages after the latest assistant turn; the runtime
+                # keeps full history, so scanning the whole list would let stale
+                # tool_result blocks from earlier turns satisfy this check.
+                tail_start: Optional[int] = None
+                for i in range(len(messages) - 1, -1, -1):
+                    msg = messages[i]
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        tail_start = i + 1
+                        break
+                tail = messages[tail_start:] if tail_start is not None else []
                 has_tool_result = any(
                     isinstance(msg, dict)
                     and isinstance(msg.get("content"), list)
@@ -583,7 +593,7 @@ class _MessagesFake:
                         isinstance(block, dict) and block.get("type") == "tool_result"
                         for block in msg["content"]
                     )
-                    for msg in messages
+                    for msg in tail
                 )
                 if not has_tool_result:
                     raise AssertionError(
