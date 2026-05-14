@@ -2286,6 +2286,18 @@ async def reset_local_auth_cache(
             row = await db.fetchrow(legacy_fetch, charger_id, depot_id)
             if row is None:
                 return None
+            # 011-only schema: probe columns (012) are absent, but version and
+            # last_status exist — reset them so the next sync uses first-sync.
+            await db.execute(
+                """
+                UPDATE charging_stations
+                SET local_list_last_status = NULL,
+                    local_list_version     = 0
+                WHERE id = $1::uuid AND site_id = $2::uuid
+                """,
+                charger_id,
+                depot_id,
+            )
             return {
                 "ocpp_id": row["ocpp_id"],
                 "previous_supported": None,
