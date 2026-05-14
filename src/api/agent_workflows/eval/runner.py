@@ -404,8 +404,14 @@ async def _insert_telemetry(conn: Any, samples: Iterable[dict], scenario_now: da
             if charger_raw is not None
             else None
         )
-        station_id = str(sample.get("station_id") or charger_raw or "unknown")
-        connector_id = int(sample.get("connector_id") or idx + 1)
+        _station_id = sample.get("station_id")
+        station_id = (
+            str(_station_id)
+            if _station_id is not None
+            else str(charger_raw) if charger_raw is not None else "unknown"
+        )
+        _connector_id = sample.get("connector_id")
+        connector_id = int(_connector_id) if _connector_id is not None else idx + 1
         await conn.execute(
             """
             INSERT INTO telemetry (
