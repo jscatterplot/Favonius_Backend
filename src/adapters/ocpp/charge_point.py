@@ -962,6 +962,10 @@ class FleetChargePoint(CP16):
         Returns:
             True if accepted, False otherwise
         """
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         try:
             kwargs: dict[str, Any] = {
                 "connector_id": connector_id,
@@ -1048,6 +1052,10 @@ class FleetChargePoint(CP16):
 
         Returns 'Accepted', 'Rejected', or 'NotImplemented'.
         """
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         try:
             kwargs: dict[str, Any] = {"requested_message": requested_message}
             if connector_id is not None:
@@ -1101,6 +1109,10 @@ class FleetChargePoint(CP16):
                 )
                 return "NotSupported"
 
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_change_configuration_had_error = False
+
         try:
             payload = call.ChangeConfiguration(key=key, value=value)
             response = await self.call(payload)
@@ -1108,6 +1120,7 @@ class FleetChargePoint(CP16):
             logger.info(f"ChangeConfiguration to {self.id}: {key}={value} -> {response.status}")
             return response.status
         except Exception as e:
+            self._last_change_configuration_had_error = True
             logger.error(f"Error ChangeConfiguration to {self.id}: {e}")
             return "Rejected"
 
@@ -1191,6 +1204,10 @@ class FleetChargePoint(CP16):
                 self.vendor,
             )
 
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         try:
             kwargs: dict[str, Any] = {
                 "list_version": list_version,
@@ -1203,6 +1220,7 @@ class FleetChargePoint(CP16):
             logger.info(f"SendLocalList to {self.id}: {response.status}")
             return response.status
         except Exception as e:
+            self._last_send_local_list_had_error = True
             logger.error(f"Error SendLocalList to {self.id}: {e}")
             return "Failed"
 
@@ -1228,6 +1246,10 @@ class FleetChargePoint(CP16):
 
         Returns 'Accepted', 'Faulted', 'Occupied', 'Rejected', or 'Unavailable'.
         """
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         try:
             kwargs: dict[str, Any] = {
                 "connector_id": connector_id,
@@ -1264,6 +1286,10 @@ class FleetChargePoint(CP16):
         retry_interval: Optional[int] = None,
     ) -> None:
         """Request charger to download and install firmware."""
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         try:
             kwargs: dict[str, Any] = {
                 "location": location,
@@ -1288,6 +1314,10 @@ class FleetChargePoint(CP16):
         retry_interval: Optional[int] = None,
     ) -> Optional[str]:
         """Request charger to upload diagnostics. Returns filename or None."""
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         try:
             kwargs: dict[str, Any] = {"location": location}
             if start_time:
@@ -1317,6 +1347,10 @@ class FleetChargePoint(CP16):
 
         Returns (status, response_data).
         """
+        # Best-effort transport signal for higher-level orchestration logic.
+        # True means status came from local exception fallback, not charger reply.
+        self._last_send_local_list_had_error = False
+
         try:
             kwargs: dict[str, Any] = {"vendor_id": vendor_id}
             if message_id:
