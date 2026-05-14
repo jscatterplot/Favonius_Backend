@@ -984,5 +984,193 @@ class TestServerCleanupConnectionRace:
         server.timescale_client.mark_sessions_seen.assert_not_called()
 
 
+class TestServerCleanupConnectionLoopSafety:
+    """Edge cases that previously could turn the reconnect path into a loop:
+
+    1. Double ``_release_client_ip`` for the old connection across eager and
+       late cleanups, silently disabling the per-IP cap.
+    2. The old websocket dangling because ``_cleanup_connection`` never
+       closes it, so the old recv loop only returns when the OS times the
+       socket out.
+    3. A hung DB call in ``_cleanup_connection`` wedging the new
+       connection's setup, since the eager branch awaits cleanup
+       synchronously.
+    """
+
+    @pytest.fixture
+    def server(self):
+        from src.websocket_handler.config import Config
+        from src.websocket_handler.server import OCPPWebSocketServer
+
+        config = Mock(spec=Config)
+        config.websocket = Mock()
+        config.websocket.host = "localhost"
+        config.websocket.port = 9000
+        config.websocket.max_message_size = 65536
+        config.websocket.max_connections = 100
+        config.websocket.heartbeat_interval = 30
+        config.websocket.message_timeout = 60
+        config.websocket.rate_limit_per_minute = 100
+        config.tls = Mock()
+        config.tls.cert_path = None
+        config.tls.key_path = None
+        config.tls.ca_path = None
+        config.tls.verify_client = False
+        timescale = Mock()
+        timescale.mark_connectors_unavailable = AsyncMock()
+        timescale.mark_sessions_seen = AsyncMock()
+        s = OCPPWebSocketServer(config, timescale)
+        cm = Mock()
+        cm.unregister_connection = AsyncMock()
+        s.connection_manager = cm
+        return s
+
+    # ---- Fix #1: per-IP counter parity across eager + late cleanup ----
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_per_ip_counter_decremented_exactly_once_per_connection(self, server):
+        """Eager cleanup of OLD followed by late cleanup of OLD must release
+        the per-IP counter only once."""
+        station = "hrx-uab_hrx-vilnius-005"
+        old_id = "old-conn"
+        client_ip = "85.254.97.158"
+
+        # OLD handler accepted: simulate the +1 and the tracked-IP map.
+        server._ip_connection_count[client_ip] = 1
+        server._connection_client_ips[old_id] = client_ip
+        server.connections[old_id] = Mock()
+        server.charge_points[station] = Mock()
+        server.station_connections[station] = old_id
+
+        # Eager cleanup from the reconnect branch.
+        await server._cleanup_connection(old_id, Mock(), station_id=station)
+        assert client_ip not in server._ip_connection_count  # went to 0 → deleted
+
+        # Late cleanup from OLD handler's finally (~37 s later in prod).
+        # _connection_client_ips[old_id] is already gone — must NOT decrement
+        # again. Per-IP counter must remain at 0 (absent), not -1.
+        await server._cleanup_connection(old_id, Mock(), station_id=station)
+        assert server._ip_connection_count.get(client_ip, 0) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_late_cleanup_without_tracked_ip_does_not_decrement(self, server):
+        """Late cleanup with no entry in _connection_client_ips is a no-op
+        on the counter, even though the websocket still has a peer address."""
+        # No one was ever tracked under this connection_id.
+        server._ip_connection_count["1.2.3.4"] = 1
+
+        ws = Mock()
+        ws.remote_address = ("1.2.3.4", 5000)
+        await server._cleanup_connection("unknown-id", ws, station_id=None)
+
+        # Counter for 1.2.3.4 must NOT have been touched by this cleanup.
+        assert server._ip_connection_count["1.2.3.4"] == 1
+
+    # ---- Fix #2: fire-and-forget close of the old websocket ----
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_cleanup_force_closes_websocket(self, server):
+        """_cleanup_connection must trigger ``websocket.close`` so the OLD
+        charge_point.start() recv loop unblocks promptly."""
+        ws = Mock()
+        ws.close = AsyncMock()
+
+        await server._cleanup_connection("conn-id", ws, station_id="station-x")
+        # create_task schedules; let the loop run it.
+        await asyncio.sleep(0)
+
+        ws.close.assert_awaited_once()
+        # And the close code is "going away" (1001), not 1000 — this is a
+        # reconnect-induced replacement, not a normal closure.
+        args, _ = ws.close.call_args
+        assert args[0] == 1001
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
+    async def test_cleanup_does_not_propagate_close_failure(self, server):
+        """A failure inside the fire-and-forget close must not surface to
+        the caller. The reconnect branch awaits _cleanup_connection
+        synchronously and must always proceed."""
+        ws = Mock()
+        ws.close = AsyncMock(side_effect=RuntimeError("socket already gone"))
+
+        # Must not raise.
+        await server._cleanup_connection("conn-id", ws, station_id="station-x")
+        await asyncio.sleep(0)
+
+    # ---- Fix #3: DB calls in cleanup are time-bounded ----
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(8)
+    async def test_cleanup_does_not_wedge_on_hung_mark_connectors_unavailable(self, server):
+        """If mark_connectors_unavailable never returns, _cleanup_connection
+        must still complete within the per-op timeout. Without the
+        ``asyncio.wait_for`` wrapper, the eager reconnect branch would
+        wedge here and queue up every new connection's handler."""
+        station = "hrx-uab_hrx-vilnius-005"
+        conn_id = "current-conn"
+
+        server.connections[conn_id] = Mock()
+        server.charge_points[station] = Mock()
+        server.station_connections[station] = conn_id
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(60)  # would dwarf the test timeout
+
+        server.timescale_client.mark_connectors_unavailable = AsyncMock(side_effect=_hang)
+
+        # Patch the per-op timeout down so the test stays fast. The real
+        # default is 5.0 s.
+        original = server._await_with_timeout
+
+        async def _fast(coro, **kwargs):
+            kwargs["timeout"] = 0.1
+            return await original(coro, **kwargs)
+
+        server._await_with_timeout = _fast
+
+        # Must return well under the test's @timeout(8) ceiling.
+        await server._cleanup_connection(conn_id, Mock(), station_id=station)
+
+        # Station state was still cleaned up — the hung DB call did not
+        # block the in-memory teardown.
+        assert station not in server.station_connections
+        assert station not in server.charge_points
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(8)
+    async def test_cleanup_does_not_wedge_on_hung_unregister_connection(self, server):
+        """Same guarantee for connection_manager.unregister_connection,
+        which historically was the first await in _cleanup_connection."""
+        station = "hrx-uab_hrx-vilnius-005"
+        conn_id = "current-conn"
+
+        server.connections[conn_id] = Mock()
+        server.charge_points[station] = Mock()
+        server.station_connections[station] = conn_id
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(60)
+
+        server.connection_manager.unregister_connection = AsyncMock(side_effect=_hang)
+
+        original = server._await_with_timeout
+
+        async def _fast(coro, **kwargs):
+            kwargs["timeout"] = 0.1
+            return await original(coro, **kwargs)
+
+        server._await_with_timeout = _fast
+
+        await server._cleanup_connection(conn_id, Mock(), station_id=station)
+
+        # Successor mappings (none here, but mark_sessions_seen still ran
+        # because the per-op wrapper isolates each await).
+        server.timescale_client.mark_sessions_seen.assert_awaited_once_with(station)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
