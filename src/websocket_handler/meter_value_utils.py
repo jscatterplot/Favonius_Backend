@@ -118,3 +118,62 @@ def compute_energy_kwh(
     if meter_stop_wh < meter_start_wh:
         return None
     return (meter_stop_wh - meter_start_wh) / 1000.0
+
+
+# Default synthesized-delta cap (Wh). Sized for our pilot fleet — all
+# vehicles in operation through 2026 have battery packs ≤ 200 kWh, and
+# a single AC session realistically delivers ≤ 50 kWh (single-phase 7kW
+# for ~7h, or 3-phase 22kW for ~2.5h). Anything above this cap is much
+# more likely to be a charger sending an absolute register value (which
+# would be billed bogus) than a legitimate single-session delta.
+# Override via ``OCPP_SYNTHESIZED_DELTA_CAP_KWH`` env var in
+# timescale_client.py.
+DEFAULT_SYNTHESIZED_DELTA_CAP_WH: int = 50_000
+
+
+def synthesize_energy_kwh_from_meter_stop(
+    meter_stop_wh: Optional[int],
+    cap_wh: int = DEFAULT_SYNTHESIZED_DELTA_CAP_WH,
+) -> Optional[float]:
+    """Treat ``meter_stop_wh`` as a synthetic session delta — bounded fallback.
+
+    Only the close path should call this, and only when:
+
+      * ``compute_energy_kwh`` has already returned ``None`` (the proper
+        bracket-based delta is unavailable), and
+      * ``meter_start_wh`` is ``NULL`` (never set, never backfilled — so
+        the deferred-backfill path of ``_update_session_live_metrics``
+        also failed because no Energy.Active.Import.Register sample
+        ever arrived), and
+      * ``last_meter_wh`` is ``NULL`` (same: no running register samples).
+
+    In that triple-NULL state, the charger is configured such that its
+    only energy signal is ``StopTransaction.meterStop`` — typical of ABB
+    Terra AC firmwares whose measurand config refused our
+    ``ChangeConfiguration`` push (see ocpp16_adapter.py:786-795). Some of
+    those firmwares emit a per-session delta in ``meterStop`` rather than
+    an absolute cumulative register; treating it as the session's
+    delivered energy is the best signal we have.
+
+    The cap is the safety belt: anything above it is rejected. With the
+    50 kWh default a misinterpreted absolute register (cumulative since
+    install, typically tens of MWh) is filtered out, while a real
+    single-session AC delta (≤ ~50 kWh on our pilot fleet) passes.
+
+    Args:
+        meter_stop_wh: ``StopTransaction.meterStop`` after
+            ``_resolve_meter_stop`` fallback. Must be positive; 0 / NULL
+            are rejected.
+        cap_wh: Upper bound; values strictly above this are rejected.
+
+    Returns:
+        Synthesised energy delivered in kWh, or ``None`` if the value is
+        absent, non-positive, or above the cap.
+    """
+    if meter_stop_wh is None:
+        return None
+    if meter_stop_wh <= 0:
+        return None
+    if meter_stop_wh > cap_wh:
+        return None
+    return meter_stop_wh / 1000.0

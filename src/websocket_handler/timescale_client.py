@@ -18,8 +18,33 @@ from cryptography import x509
 from sqlalchemy import text
 
 from .config import TimescaleConfig
-from .meter_value_utils import compute_energy_kwh, normalize_energy_to_wh
+from .meter_value_utils import (
+    DEFAULT_SYNTHESIZED_DELTA_CAP_WH,
+    compute_energy_kwh,
+    normalize_energy_to_wh,
+    synthesize_energy_kwh_from_meter_stop,
+)
 from .monitoring import get_logger
+
+
+def _synthesized_delta_cap_wh() -> int:
+    """Resolve the synthesized-delta cap (Wh) from env, with a safe default.
+
+    Env var ``OCPP_SYNTHESIZED_DELTA_CAP_KWH`` is read in kWh (operator-
+    friendly) and converted to Wh. Non-numeric / non-positive values fall
+    back to ``DEFAULT_SYNTHESIZED_DELTA_CAP_WH`` (50 kWh) so a typo in the
+    deployment env never widens the cap silently.
+    """
+    raw = os.getenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH")
+    if not raw:
+        return DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+    try:
+        cap_kwh = float(raw)
+    except ValueError:
+        return DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+    if cap_kwh <= 0:
+        return DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+    return int(cap_kwh * 1000)
 
 
 class TimescaleClient:
@@ -469,13 +494,25 @@ class TimescaleClient:
 
         When ``meter_wh`` is supplied (Energy.Active.Import.Register sample)
         the row's ``last_meter_wh`` advances monotonically via ``GREATEST`` —
-        guards against late/duplicate samples regressing the register. The
-        same write recomputes ``energy_delivered_kwh`` against the stored
-        ``meter_start_wh`` using the same guards as ``compute_energy_kwh``
-        (meter_start_wh > 0, meter_wh >= meter_start_wh). NULL is preserved
-        on any bracket the helper would have refused; this leaves the live
-        billing value either correct-and-current or NULL — never confidently
-        wrong.
+        guards against late/duplicate samples regressing the register.
+
+        If ``meter_start_wh`` is NULL on the row (the "deferred" sentinel
+        set when StartTransaction carried meterStart=0 — see
+        ocpp16_adapter._on_transaction_start) the same write backfills it
+        with the first positive sample so the rest of the energy pipeline
+        (live UPDATE, close, orphan recovery) can compute a delta.
+        Trade-off: we lose the small slice of energy delivered between
+        StartTransaction and the first MeterValues frame (typically
+        ≤ 50 Wh at AC speeds), but we recover the whole-session kWh
+        attribution that would otherwise be NULL forever.
+
+        Energy is recomputed against the *effective* start register —
+        ``COALESCE(meter_start_wh, sample_when_positive)`` — so on the
+        very first backfilled sample the result is 0.0 (correct: no energy
+        accumulated on our deferred baseline yet); subsequent samples
+        produce real deltas. The same guards as ``compute_energy_kwh``
+        apply (start > 0, current >= start). NULL is preserved on any
+        bracket the helper would have refused.
         """
         soc = (soc_percent / 100.0) if soc_percent is not None else None
         try:
@@ -485,6 +522,13 @@ class TimescaleClient:
                    SET current_power_kw     = COALESCE($3, current_power_kw),
                        current_soc          = COALESCE($4, current_soc),
                        max_charge_power_kw  = GREATEST(max_charge_power_kw, $5),
+                       meter_start_wh       = CASE
+                           WHEN meter_start_wh IS NULL
+                            AND $6::bigint IS NOT NULL
+                            AND $6::bigint > 0
+                           THEN $6::bigint
+                           ELSE meter_start_wh
+                       END,
                        last_meter_wh        = CASE
                            WHEN $6::bigint IS NOT NULL
                            THEN GREATEST(COALESCE(last_meter_wh, $6::bigint), $6::bigint)
@@ -496,18 +540,30 @@ class TimescaleClient:
                        END,
                        energy_delivered_kwh = CASE
                            WHEN $6::bigint IS NOT NULL
-                            AND meter_start_wh IS NOT NULL
-                            AND meter_start_wh > 0
+                            AND COALESCE(
+                                meter_start_wh,
+                                CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                            ) IS NOT NULL
+                            AND COALESCE(
+                                meter_start_wh,
+                                CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                            ) > 0
                             AND GREATEST(
                                 COALESCE(last_meter_wh, $6::bigint),
                                 $6::bigint
-                            ) >= meter_start_wh
+                            ) >= COALESCE(
+                                meter_start_wh,
+                                CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                            )
                            THEN (
                                GREATEST(
                                    COALESCE(last_meter_wh, $6::bigint),
                                    $6::bigint
                                )
-                               - meter_start_wh
+                               - COALESCE(
+                                   meter_start_wh,
+                                   CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                               )
                            ) / 1000.0
                            ELSE energy_delivered_kwh
                        END,
@@ -2548,15 +2604,18 @@ class TimescaleClient:
         Returns:
             ``None`` if no live, still-open row matched (idempotent retry,
             already-closed session, or imported source). Otherwise a dict
-            of the RETURNING values: ``meter_start_wh`` and the freshly
-            written ``energy_delivered_kwh`` (which may be NULL on anomaly).
-            Callers use the values to decide whether to emit a WARN.
+            of the RETURNING values: ``meter_start_wh``, ``last_meter_wh``
+            (running register at close time — distinguishes "deferred start
+            never backfilled" from "legacy row" in the anomaly classifier),
+            and the freshly written ``energy_delivered_kwh`` (which may be
+            NULL on anomaly). Callers use the values to decide whether to
+            emit a WARN.
         """
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     """
-                    SELECT session_id, meter_start_wh
+                    SELECT session_id, meter_start_wh, last_meter_wh
                       FROM charging_sessions
                      WHERE station_id = $1
                        AND transaction_id = $2
@@ -2571,7 +2630,50 @@ class TimescaleClient:
                     return None
                 session_id = row["session_id"]
                 meter_start_wh = row["meter_start_wh"]
+                last_meter_wh = row["last_meter_wh"]
                 energy_kwh = compute_energy_kwh(meter_stop_wh, meter_start_wh)
+                effective_stop_reason = stop_reason
+
+                # Phase 2 synthesis fallback. Only fires when:
+                #   * the bracket-based delta refused (compute returned None)
+                #   * no meter_start_wh was ever recorded (deferred-and-not-
+                #     backfilled — first-MeterValues backfill never happened)
+                #   * no last_meter_wh either (charger never sent a register
+                #     sample)
+                # In that triple-NULL state ``meter_stop_wh`` is the only
+                # energy signal we have. Some ABB Terra AC firmwares emit
+                # it as a per-session delta rather than an absolute register
+                # so we trust it under a 50 kWh cap (operator-tunable via
+                # ``OCPP_SYNTHESIZED_DELTA_CAP_KWH``). The stop_reason is
+                # suffixed so the row is queryable for audit; operators can
+                # filter ``LIKE '%synthesized_delta%'`` to find them.
+                synthesized = False
+                if (
+                    energy_kwh is None
+                    and meter_start_wh is None
+                    and last_meter_wh is None
+                    and meter_stop_wh is not None
+                ):
+                    energy_kwh = synthesize_energy_kwh_from_meter_stop(
+                        meter_stop_wh,
+                        cap_wh=_synthesized_delta_cap_wh(),
+                    )
+                    if energy_kwh is not None:
+                        synthesized = True
+                        suffix = "synthesized_delta"
+                        base = stop_reason or "unknown"
+                        # Defensive: keep within stop_reason VARCHAR(64).
+                        effective_stop_reason = f"{base}|{suffix}"[:64]
+                        self.logger.info(
+                            "Synthesized energy_delivered_kwh=%.3f from meter_stop_wh=%s "
+                            "for station=%s tx_id=%s (no meter_start_wh, no register "
+                            "samples). Capped at %s kWh. stop_reason suffixed.",
+                            energy_kwh,
+                            meter_stop_wh,
+                            station_id,
+                            transaction_id,
+                            _synthesized_delta_cap_wh() / 1000.0,
+                        )
 
                 updated = await conn.fetchrow(
                     """
@@ -2586,20 +2688,27 @@ class TimescaleClient:
                        AND session_id     = $7
                        AND end_time IS NULL
                        AND source = 'live'
-                 RETURNING meter_start_wh, energy_delivered_kwh
+                 RETURNING meter_start_wh, last_meter_wh, energy_delivered_kwh
                     """,
                     station_id,
                     transaction_id,
                     end_time,
                     meter_stop_wh,
                     energy_kwh,
-                    stop_reason,
+                    effective_stop_reason,
                     session_id,
                 )
                 if updated is None:
                     # Lost the race to another writer between SELECT and UPDATE.
                     return None
-                return dict(updated)
+                result = dict(updated)
+                # Surface the synthesis flag so the OCPP handler can pick a
+                # distinct log line / metric without re-deriving the
+                # condition. Not a column on charging_sessions — the
+                # ``synthesized_delta`` suffix on stop_reason is the durable
+                # audit trail.
+                result["synthesized"] = synthesized
+                return result
 
     async def recover_orphaned_sessions(
         self,
