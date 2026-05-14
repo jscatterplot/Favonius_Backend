@@ -317,12 +317,7 @@ class OCPP16Session:
 
           1. ``last_boot_at`` is set — the charger volunteered a
              BootNotification within the grace, no trigger needed.
-          2. ``_inbound_frame_count > 0`` — the charger sent some other
-             OCPP frame (StatusNotification, Heartbeat, MeterValues, …)
-             within the grace, so we defer the trigger by
-             ``BOOT_TRIGGER_FOLLOWUP_SECONDS`` to avoid immediately
-             re-running bootstrap on short reconnect loops.
-          3. Still no boot after the optional follow-up wait —
+          2. Still no boot after grace (even if other frames arrived) —
              Trigger BootNotification so ``_on_boot`` remains reachable
              for this session (queued command replay, local auth sync,
              metering bootstrap).
@@ -333,16 +328,11 @@ class OCPP16Session:
                 return
             if self._inbound_frame_count > 0:
                 logger.info(
-                    "force_boot_notification station=%s deferred: "
-                    "charger sent %d frame(s) during grace period without "
-                    "BootNotification; waiting %ss follow-up before trigger",
+                    "force_boot_notification station=%s proceeding after grace: "
+                    "charger sent %d frame(s) without BootNotification",
                     self._station_id,
                     self._inbound_frame_count,
-                    BOOT_TRIGGER_FOLLOWUP_SECONDS,
                 )
-                await asyncio.sleep(BOOT_TRIGGER_FOLLOWUP_SECONDS)
-                if self._cp.last_boot_at is not None:
-                    return
             status = await self._cp.trigger_message("BootNotification")
             logger.info(
                 "force_boot_notification station=%s status=%s",
