@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .cache_manager import CacheManager
+from .connection_pool import open_dedicated_connection
 from .monitoring import (
     CHARGING_COMMAND_QUEUE_DEPTH,
     PROFILE_PUSH_LATENCY,
@@ -1080,22 +1081,23 @@ class ChargingCommandQueueConsumer:
 
         Drops back to polling-only on any error — correctness does not
         depend on this path, only latency.
+
+        Uses a dedicated connection (not a pool slot). Parking on a pool
+        slot for the lifetime of the process shrinks the pool's effective
+        working capacity by one; a dedicated connection costs the same
+        cluster slot but keeps the pool's ``max_size`` honest.
         """
-        try:
-            pool = self.timescale_client.pg_pool
-        except AttributeError:
-            self.logger.warning("No pg_pool exposed; LISTEN disabled")
-            return
-        if pool is None:
+        config = getattr(self.timescale_client, "config", None)
+        if config is None:
+            self.logger.warning("No timescale config exposed; LISTEN disabled")
             return
 
         while self._running:
             try:
-                conn = await pool.acquire()
+                conn = await open_dedicated_connection(config)
                 self._listen_conn = conn
                 await conn.add_listener(self.NOTIFY_CHANNEL, self._on_notify)
                 self.logger.info("Listening on PostgreSQL channel '%s'", self.NOTIFY_CHANNEL)
-                # Hold the connection open until cancelled.
                 while self._running:
                     await asyncio.sleep(60)
             except asyncio.CancelledError:
@@ -1112,7 +1114,7 @@ class ChargingCommandQueueConsumer:
                     except Exception:
                         pass
                     try:
-                        await pool.release(self._listen_conn)
+                        await self._listen_conn.close()
                     except Exception:
                         pass
                     self._listen_conn = None

@@ -15,12 +15,12 @@ The fix: cap the SQLAlchemy engine small and independent
 ``SQLALCHEMY_POOL_SIZE`` / ``SQLALCHEMY_MAX_OVERFLOW``).
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.websocket_handler.config import TimescaleConfig
-from src.websocket_handler.connection_pool import EnhancedConnectionPool
+from src.websocket_handler.connection_pool import EnhancedConnectionPool, open_dedicated_connection
 
 
 @pytest.fixture
@@ -91,6 +91,40 @@ async def test_sqlalchemy_pool_honours_env_overrides(config, monkeypatch):
 
     assert captured["kwargs"]["pool_size"] == 3
     assert captured["kwargs"]["max_overflow"] == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_open_dedicated_connection_uses_config_credentials(config):
+    """``open_dedicated_connection`` must pass through the TimescaleConfig fields.
+
+    The LISTEN consumers (alerts dispatcher, charging_command_queue) use
+    this helper to open a single asyncpg connection that sits outside the
+    pool. The contract is: connection credentials and SSL mode come from
+    the same TimescaleConfig as the pool itself, so an operator only has
+    to rotate one set of secrets.
+    """
+    captured: dict = {}
+    fake_conn = MagicMock()
+
+    async def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return fake_conn
+
+    with patch(
+        "src.websocket_handler.connection_pool.asyncpg.connect", side_effect=fake_connect
+    ):
+        conn = await open_dedicated_connection(config)
+
+    assert conn is fake_conn
+    assert captured["host"] == config.host
+    assert captured["port"] == config.port
+    assert captured["database"] == config.database
+    assert captured["user"] == config.user
+    assert captured["password"] == config.password
+    # SSL context is built from sslmode and must be present (not just True/False);
+    # exact type is provided by ssl_context_for_postgres_sslmode.
+    assert "ssl" in captured
 
 
 @pytest.mark.asyncio

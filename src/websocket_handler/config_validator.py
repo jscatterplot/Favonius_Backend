@@ -1,5 +1,6 @@
 """Configuration validation and startup checks."""
 
+import asyncio
 import os
 from typing import Any, Dict
 
@@ -143,15 +144,15 @@ class ConfigValidator:
                 self.logger.error(message)
                 return False
 
-            # Test connection
-            conn = await asyncpg.connect(
-                host=self.config.timescale.host,
-                port=self.config.timescale.port,
-                database=self.config.timescale.database,
-                user=self.config.timescale.user,
-                password=self.config.timescale.password,
-                ssl=ssl_context_for_postgres_sslmode(str(self.config.timescale.sslmode)),
-            )
+            # Test connection. The cluster may be under transient connection-slot
+            # pressure (TooManyConnectionsError / SQLSTATE 53300) at startup
+            # because previous replicas haven't released their slots yet, or
+            # because a sibling service is churning. Failing the validator on
+            # the first 53300 makes main.py exit and Railway restart us,
+            # which opens MORE connect attempts and worsens the contention.
+            # Retry only that specific error with bounded backoff so we ride
+            # out a brief slot squeeze instead of crash-looping.
+            conn = await self._connect_with_slot_pressure_retry()
 
             # Test TimescaleDB extension
             result = await conn.fetchval("SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'")
@@ -189,6 +190,48 @@ class ConfigValidator:
             self._record_detail("timescale", detail)
             self.logger.error(f"TimescaleDB validation failed: {e}")
             return False
+
+    async def _connect_with_slot_pressure_retry(self) -> asyncpg.Connection:
+        """Open one TimescaleDB connection, retrying on transient slot pressure.
+
+        Only ``TooManyConnectionsError`` (SQLSTATE 53300, raised as the message
+        "remaining connection slots are reserved for ...") is retried. Auth
+        failures, DNS failures, and other ``InterfaceError``/``OSError`` cases
+        propagate immediately so a real misconfiguration still fails fast.
+
+        Budget is intentionally short — Railway's restart loop is also short.
+        Override via ``TIMESCALE_VALIDATOR_RETRY_BUDGET_S`` if a fleet's cluster
+        recovers slower than the 30s default.
+        """
+        budget_s = float(os.getenv("TIMESCALE_VALIDATOR_RETRY_BUDGET_S", "30"))
+        attempt = 0
+        deadline = asyncio.get_event_loop().time() + budget_s
+        while True:
+            attempt += 1
+            try:
+                return await asyncpg.connect(
+                    host=self.config.timescale.host,
+                    port=self.config.timescale.port,
+                    database=self.config.timescale.database,
+                    user=self.config.timescale.user,
+                    password=self.config.timescale.password,
+                    ssl=ssl_context_for_postgres_sslmode(str(self.config.timescale.sslmode)),
+                )
+            except asyncpg.exceptions.TooManyConnectionsError as exc:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise
+                backoff = min(2 ** (attempt - 1), 8.0, max(remaining, 0.1))
+                self.logger.warning(
+                    "TimescaleDB connection-slot pressure on validator attempt %d; "
+                    "retrying in %.1fs (%.1fs of %.0fs budget remaining): %s",
+                    attempt,
+                    backoff,
+                    remaining,
+                    budget_s,
+                    exc,
+                )
+                await asyncio.sleep(backoff)
 
     def _timescale_target_descriptor(self) -> str:
         """Return a redacted host/port descriptor for log lines.
