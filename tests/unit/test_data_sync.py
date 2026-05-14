@@ -642,3 +642,160 @@ class TestDataSyncSchemaResilience:
         await service.stop()
 
         assert service._missing_relations == set()
+
+
+class TestDataSyncPoolExhaustionResilience:
+    """Regression coverage for transient Postgres connection-slot exhaustion.
+
+    Background: when the cluster hits its ``max_connections`` ceiling, asyncpg
+    raises ``TooManyConnectionsError`` ("remaining connection slots are
+    reserved for ... pg_use_reserved_connections"). Before the fix the sync
+    loop logged ERROR every 5 minutes, paging on what is a transient
+    operational condition. The fix downgrades the first occurrence to a
+    single WARNING, suppresses re-logging until recovery, and emits one INFO
+    line when pressure clears.
+    """
+
+    @pytest.fixture
+    def config(self):
+        return SupabaseConfig(
+            url="https://test.supabase.co",
+            anon_key="test_anon_key",
+            service_key="test_service_key",
+            db_host="localhost",
+            db_port=5432,
+            db_name="testdb",
+            db_user="test",
+            db_password="test",
+            max_connections=10,
+            connection_timeout=30,
+            enable_realtime=True,
+        )
+
+    @pytest.fixture
+    def supabase_client(self):
+        client = AsyncMock()
+        client.sync_session_summaries = AsyncMock()
+        client.sync_vehicle_states = AsyncMock()
+        client.client.table.return_value.upsert.return_value.execute = AsyncMock()
+        return client
+
+    @pytest.fixture
+    def timescale_config(self):
+        return TimescaleConfig(
+            service_url="postgresql://test:test@localhost:5432/testdb",
+            host="localhost",
+            port=5432,
+            database="testdb",
+            user="test",
+            password="test",
+        )
+
+    @pytest.fixture
+    def service(self, config, supabase_client, timescale_config):
+        return DataSyncService(config, supabase_client, timescale_config)
+
+    @staticmethod
+    def _make_too_many_connections_error() -> asyncpg.exceptions.TooManyConnectionsError:
+        return asyncpg.exceptions.TooManyConnectionsError(
+            "remaining connection slots are reserved for roles with privileges of the "
+            '"pg_use_reserved_connections" role'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_charging_sessions_exhaustion_logs_warning_not_error(self, service):
+        """SQLSTATE 53300 must downgrade ERROR → WARNING and not re-log on the next tick."""
+        conn = AsyncMock()
+        conn.fetch.side_effect = self._make_too_many_connections_error()
+        service.timescale_pool = _make_pool_yielding(conn)
+        service.logger = MagicMock()
+
+        await service.sync_charging_sessions()
+        await service.sync_charging_sessions()
+
+        # Exactly one WARNING covering both ticks.
+        assert service.logger.warning.call_count == 1
+        msg = service.logger.warning.call_args.args[0]
+        assert "Postgres reports no available connection slots" in msg
+        assert "charging session sync" in msg
+        # Critically: no ERROR — the alert that was firing every 5 minutes
+        # in production must be silenced for this transient condition.
+        service.logger.error.assert_not_called()
+        # The flag stays set until a successful tick clears it.
+        assert service._pool_exhaustion_warned is True
+        # The pool was still hit twice — we don't pre-emptively skip on
+        # exhaustion (unlike missing relations). The acquire is cheap; only
+        # the WARNING is dedup'd.
+        assert conn.fetch.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_pool_exhaustion_recovery_emits_info_once(self, service):
+        """First successful tick after exhaustion logs INFO and clears the flag."""
+        conn = AsyncMock()
+        # First call: exhausted. Second call: empty rowset (success).
+        conn.fetch.side_effect = [self._make_too_many_connections_error(), []]
+        service.timescale_pool = _make_pool_yielding(conn)
+        service.logger = MagicMock()
+
+        await service.sync_charging_sessions()
+        assert service._pool_exhaustion_warned is True
+
+        await service.sync_charging_sessions()
+        assert service._pool_exhaustion_warned is False
+
+        info_msgs = [str(c.args[0]) for c in service.logger.info.call_args_list]
+        assert any("connection slot pressure cleared" in m for m in info_msgs)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_vehicle_states_exhaustion_logs_warning_not_error(self, service):
+        """Same downgrade for the vehicle_states sync path."""
+        conn = AsyncMock()
+        conn.fetch.side_effect = self._make_too_many_connections_error()
+        service.timescale_pool = _make_pool_yielding(conn)
+        service.logger = MagicMock()
+
+        await service.sync_vehicle_states()
+
+        assert service.logger.warning.call_count == 1
+        assert "vehicle state sync" in service.logger.warning.call_args.args[0]
+        service.logger.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_optimization_decisions_exhaustion_logs_warning_not_error(self, service):
+        """Same downgrade for the optimization_decisions sync path."""
+        conn = AsyncMock()
+        conn.fetch.side_effect = self._make_too_many_connections_error()
+        service.timescale_pool = _make_pool_yielding(conn)
+        service.logger = MagicMock()
+
+        await service.sync_optimization_decisions()
+
+        assert service.logger.warning.call_count == 1
+        assert "optimization decision sync" in service.logger.warning.call_args.args[0]
+        service.logger.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_exhaustion_dedup_is_global_across_sync_methods(self, service):
+        """The dedup flag is service-wide, not per-table.
+
+        When the cluster is exhausted, every sync method hits the same wall.
+        Logging once per method per tick is still 3x the noise. The flag is
+        shared so the first method to hit it gets the WARNING and the others
+        stay silent until recovery.
+        """
+        conn = AsyncMock()
+        conn.fetch.side_effect = self._make_too_many_connections_error()
+        service.timescale_pool = _make_pool_yielding(conn)
+        service.logger = MagicMock()
+
+        await service.sync_charging_sessions()
+        await service.sync_vehicle_states()
+        await service.sync_optimization_decisions()
+
+        assert service.logger.warning.call_count == 1
+        service.logger.error.assert_not_called()

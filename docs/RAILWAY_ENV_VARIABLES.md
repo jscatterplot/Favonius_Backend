@@ -112,8 +112,10 @@ These are for the Supabase **client** (REST API, auth, optional sync). Get them 
 | **SUPABASE_MAX_CONNECTIONS** | `20` | Max connections to Supabase DB. |
 | **SUPABASE_CONNECTION_TIMEOUT** | `30` | Connection timeout in seconds. |
 | **SUPABASE_ENABLE_REALTIME** | `true` | Enable Supabase Realtime subscriptions. |
-| **TIMESCALE_MAX_CONNECTIONS** | `100` | Max Timescale/Postgres connections from this service. |
-| **TIMESCALE_POOL_SIZE** | `20` | Connection pool size. |
+| **TIMESCALE_MAX_CONNECTIONS** | `15` | Per-replica ceiling for the asyncpg pool against TimescaleDB. The handler also opens a small independent SQLAlchemy QueuePool (≈5 conns) for cold pandas reporting, so per-replica ≈ this + 5. Multiply by replica count + the API's `DB_POOL_MAX_SIZE` (default 25) and stay under the cluster's Postgres `max_connections` (TigerCloud Free ≈ 25, Pro ≈ 100, Supabase Pro ≈ 200). Raising above `15` without first confirming the cluster ceiling reproduces the `53300 too_many_connections` error in `data_sync`. |
+| **TIMESCALE_POOL_SIZE** | `3` | Minimum/idle asyncpg connections held warm. Raise only when steady-state concurrency genuinely needs more. |
+| **SQLALCHEMY_POOL_SIZE** | `1` | Optional. Size of the reporting-only SQLAlchemy QueuePool. |
+| **SQLALCHEMY_MAX_OVERFLOW** | `4` | Optional. Overflow capacity for the SQLAlchemy QueuePool. |
 
 ---
 

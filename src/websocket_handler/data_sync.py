@@ -69,6 +69,15 @@ class DataSyncService:
         # re-checks (the operator may have backfilled in the meantime).
         self._missing_relations: Set[str] = set()
 
+        # Pool-exhaustion suppression. When Postgres rejects acquires with
+        # SQLSTATE 53300 ("remaining connection slots are reserved for ...
+        # pg_use_reserved_connections") the underlying issue is upstream
+        # connection pressure, not a bug in this sync loop. Logging at ERROR
+        # every 5 minutes pages on a transient condition. Track the
+        # "already-warned" state so consecutive exhausted ticks log only
+        # once, with a single recovery log when the next tick succeeds.
+        self._pool_exhaustion_warned: bool = False
+
     async def start(self) -> None:
         """Start the data synchronization service."""
         try:
@@ -128,6 +137,7 @@ class DataSyncService:
         # Re-check missing relations on next start; the operator may have
         # added them while we were stopped.
         self._missing_relations.clear()
+        self._pool_exhaustion_warned = False
 
         self.logger.info("Data sync service stopped")
 
@@ -183,6 +193,37 @@ class DataSyncService:
         if value is None:
             return default
         return int(round(float(value)))
+
+    def _handle_pool_exhaustion(self, sync_label: str, exc: BaseException) -> None:
+        """Log a Postgres connection-slot exhaustion at WARNING, dedup'd.
+
+        Postgres returns SQLSTATE 53300 ("too_many_connections") with the
+        text "remaining connection slots are reserved for roles with
+        privileges of the pg_use_reserved_connections role" when the cluster
+        is at its ``max_connections`` ceiling. This is a transient
+        operational condition (other clients eating slots, a noisy restart,
+        a Supabase pooler hiccup) — not a sync bug. Log once at WARNING and
+        let the next 5-min tick naturally retry.
+        """
+        if self._pool_exhaustion_warned:
+            return
+        self._pool_exhaustion_warned = True
+        self.logger.warning(
+            f"Skipping {sync_label}: Postgres reports no available connection "
+            f"slots (likely cluster-wide max_connections pressure). Subsequent "
+            f"ticks will be silent until the pool recovers. Underlying error: {exc}"
+        )
+
+    def _note_pool_recovery(self) -> None:
+        """First successful sync after exhaustion — log once at INFO and reset.
+
+        Lets operators see in the log that pressure has cleared without
+        having to grep for the absence of WARNINGs.
+        """
+        if not self._pool_exhaustion_warned:
+            return
+        self._pool_exhaustion_warned = False
+        self.logger.info("Postgres connection slot pressure cleared; data sync resumed")
 
     def _handle_missing_relation(
         self, table_name: str, exc: BaseException, sync_label: str
@@ -308,6 +349,8 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(sessions)} charging sessions")
 
+                self._note_pool_recovery()
+
         except asyncpg.UndefinedColumnError as e:
             # Defence in depth: if a deployment is somehow on a charging_sessions
             # variant we do not recognise (e.g. a future column rename), log
@@ -319,6 +362,8 @@ class DataSyncService:
             self._handle_missing_relation(
                 self._CHARGING_SESSIONS_TABLE_KEY, e, "charging session sync"
             )
+        except asyncpg.TooManyConnectionsError as e:
+            self._handle_pool_exhaustion("charging session sync", e)
         except Exception as e:
             self.logger.error(f"Failed to sync charging sessions: {e}")
 
@@ -389,12 +434,16 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(states)} vehicle states")
 
+                self._note_pool_recovery()
+
         except asyncpg.UndefinedTableError as e:
             self._handle_missing_relation("vehicle_telemetry", e, "vehicle state sync")
         except asyncpg.UndefinedColumnError as e:
             self._handle_missing_relation(
                 "vehicle_telemetry", e, "vehicle state sync (column missing)"
             )
+        except asyncpg.TooManyConnectionsError as e:
+            self._handle_pool_exhaustion("vehicle state sync", e)
         except Exception as e:
             self.logger.error(f"Failed to sync vehicle states: {e}")
 
@@ -462,12 +511,16 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(decisions)} optimization decisions")
 
+                self._note_pool_recovery()
+
         except asyncpg.UndefinedTableError as e:
             self._handle_missing_relation("optimization_decisions", e, "optimization decision sync")
         except asyncpg.UndefinedColumnError as e:
             self._handle_missing_relation(
                 "optimization_decisions", e, "optimization decision sync (column missing)"
             )
+        except asyncpg.TooManyConnectionsError as e:
+            self._handle_pool_exhaustion("optimization decision sync", e)
         except Exception as e:
             self.logger.error(f"Failed to sync optimization decisions: {e}")
 
