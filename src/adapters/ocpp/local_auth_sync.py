@@ -374,7 +374,20 @@ async def _bootstrap_local_auth_config(
         )
         return BootstrapOutcome.UNSUPPORTED
 
+    critical_transport_error = (
+        getattr(cp, "_last_change_configuration_had_error", False) is True
+    )
     if critical_status not in {"Accepted", "RebootRequired"}:
+        if critical_transport_error:
+            logger.warning(
+                "local_auth_bootstrap_config station=%s key=%s value=%s status=%s — "
+                "transport fallback; treating as transient unknown",
+                station_id,
+                critical_key,
+                critical_value,
+                critical_status,
+            )
+            return BootstrapOutcome.UNKNOWN
         logger.info(
             "local_auth_bootstrap_config station=%s key=%s value=%s status=%s — "
             "treating as firmware-permanent unsupported",
@@ -634,7 +647,7 @@ async def sync_charger(
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
         if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED:
-            if not legacy_schema:
+            if not legacy_schema and not probe_positive:
                 await _record_probe_outcome(
                     db,
                     station_row["id"],
@@ -678,11 +691,15 @@ async def sync_charger(
             )
 
     send_local_list_raised = False
+    send_local_list_transport_error = False
     try:
         status = await cp.send_local_list(
             list_version=new_version,
             update_type="Full",
             local_authorization_list=entries,
+        )
+        send_local_list_transport_error = (
+            getattr(cp, "_last_send_local_list_had_error", False) is True
         )
     except Exception as exc:
         # FleetChargePoint.send_local_list catches its own exceptions, but
@@ -722,7 +739,12 @@ async def sync_charger(
     if not legacy_schema and current_fw is not None and len(entries) <= _LOCAL_LIST_MAX_ENTRIES:
         if status == "NotSupported":
             cache_negative = True
-        elif status == "Failed" and not probe_positive and not send_local_list_raised:
+        elif (
+            status == "Failed"
+            and not probe_positive
+            and not send_local_list_raised
+            and not send_local_list_transport_error
+        ):
             cache_negative = True
     if cache_negative:
         await _record_probe_outcome(
