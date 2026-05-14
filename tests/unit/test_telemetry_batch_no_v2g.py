@@ -98,8 +98,9 @@ async def test_update_session_live_metrics_writes_expected_sql():
     assert "GREATEST" in sql
     assert "end_time IS NULL" in sql
     assert "source = 'live'" in sql
-    # Args: station_id, transaction_id, power_kw, soc_fraction, max_charge_kw
-    assert args == ("cp-1", 42, 11.0, 0.75, 22.0)
+    # Args: station_id, transaction_id, power_kw, soc_fraction, max_charge_kw,
+    # meter_wh (None when MeterValues lacks an Energy.Active.Import.Register sample)
+    assert args == ("cp-1", 42, 11.0, 0.75, 22.0, None)
 
 
 @pytest.mark.asyncio
@@ -113,6 +114,100 @@ async def test_update_session_live_metrics_swallows_db_errors():
     await client._update_session_live_metrics(
         conn, "cp-1", 1, power_kw=1.0, soc_percent=None, max_charge_kw=None
     )
+
+
+@pytest.mark.asyncio
+async def test_update_session_live_metrics_backfills_deferred_meter_start():
+    """The UPDATE backfills meter_start_wh from a positive register sample when NULL.
+
+    Phase 1 of the Terra AC fix: meterStart=0 at StartTransaction is
+    written as NULL ("deferred"). The first MeterValues sample that
+    carries a positive Energy.Active.Import.Register backfills it on the
+    same UPDATE that advances last_meter_wh. The SQL pattern must:
+
+      * Backfill meter_start_wh only when it's currently NULL (never
+        overwrite a legitimate non-zero start).
+      * Use the backfilled value inline in the energy calculation
+        (``COALESCE(meter_start_wh, $6 when positive)``) so on the first
+        sample we get 0 kWh (no accumulated energy yet) rather than NULL.
+    """
+    conn = AsyncMock()
+    client = _client()
+
+    await client._update_session_live_metrics(
+        conn,
+        station_id="cp-1",
+        transaction_id=42,
+        power_kw=11.0,
+        soc_percent=75.0,
+        max_charge_kw=22.0,
+        meter_wh=3000,
+    )
+
+    sql = conn.execute.await_args.args[0]
+    args = conn.execute.await_args.args[1:]
+
+    # Backfill CASE for meter_start_wh: only when currently NULL and the
+    # incoming sample is positive.
+    assert "meter_start_wh       = CASE" in sql
+    assert "WHEN meter_start_wh IS NULL" in sql
+
+    # Energy CASE references the COALESCE so the backfilled value is
+    # picked up on the same UPDATE.
+    assert "COALESCE(\n                                meter_start_wh," in sql
+
+    # meter_wh is the 6th positional bind ($6::bigint).
+    assert args[-1] == 3000
+
+
+@pytest.mark.asyncio
+async def test_update_session_live_metrics_no_backfill_on_null_sample():
+    """When meter_wh is None the backfill CASE leaves meter_start_wh alone."""
+    conn = AsyncMock()
+    client = _client()
+
+    await client._update_session_live_metrics(
+        conn,
+        station_id="cp-1",
+        transaction_id=42,
+        power_kw=11.0,
+        soc_percent=75.0,
+        max_charge_kw=22.0,
+        meter_wh=None,
+    )
+
+    args = conn.execute.await_args.args[1:]
+    assert args[-1] is None  # $6 is NULL → both CASE branches preserve column
+
+
+@pytest.mark.asyncio
+async def test_update_session_live_metrics_zero_sample_does_not_backfill():
+    """A MeterValues sample of 0 Wh is just as poisonous as meterStart=0.
+
+    Don't backfill meter_start_wh with 0 — the energy CASE would still
+    refuse it via the ``> 0`` guard, but writing 0 into the column
+    re-creates the original bug. Belt-and-suspenders: the backfill CASE
+    also gates on ``$6 > 0``.
+    """
+    conn = AsyncMock()
+    client = _client()
+
+    await client._update_session_live_metrics(
+        conn,
+        station_id="cp-1",
+        transaction_id=42,
+        power_kw=11.0,
+        soc_percent=75.0,
+        max_charge_kw=22.0,
+        meter_wh=0,
+    )
+
+    sql = conn.execute.await_args.args[0]
+    args = conn.execute.await_args.args[1:]
+    # The SQL contains the guard.
+    assert "AND $6::bigint > 0" in sql
+    # The bind is the literal 0.
+    assert args[-1] == 0
 
 
 # ---------------------------------------------------------------------------

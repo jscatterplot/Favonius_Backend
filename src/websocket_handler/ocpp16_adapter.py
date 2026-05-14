@@ -1417,12 +1417,33 @@ class OCPP16Session:
         # in OCPP 1.6. meter_start_wh is persisted in the DB so a restart
         # between Start and Stop still yields a billing-grade kWh delta on
         # close (migration 036).
+        #
+        # meterStart=0 (or negative) is treated as "deferred" — some chargers
+        # (ABB Terra AC firmwares are the documented case) emit 0 at
+        # StartTransaction when the meter register isn't ready, then report
+        # real values on the first MeterValues frame. Persisting NULL lets
+        # ``_update_session_live_metrics`` backfill meter_start_wh from the
+        # first positive Energy.Active.Import.Register sample. Without this
+        # the row keeps a poison 0 that ``compute_energy_kwh`` rejects forever,
+        # voiding the entire session's energy delta.
+        if meter_start is not None and meter_start > 0:
+            meter_start_wh: Optional[int] = meter_start
+        else:
+            meter_start_wh = None
+            logger.info(
+                "StartTransaction meter_start=%s on station=%s connector=%s; "
+                "deferring meter_start_wh — will backfill from first MeterValues "
+                "Energy.Active.Import.Register sample",
+                meter_start,
+                cp_id,
+                connector_id,
+            )
         self._pending_start = {
             "connector_id": connector_id,
             "evse_id": connector_id,
             "id_tag": id_tag,
             "start_time": start_time,
-            "meter_start_wh": meter_start,
+            "meter_start_wh": meter_start_wh,
         }
         self._pending_start.update(
             {
@@ -1516,14 +1537,38 @@ class OCPP16Session:
         # `close_result is None` covers the idempotent retry / no-match
         # case, which is silent on purpose.
         if close_result is not None:
+            if close_result.get("synthesized"):
+                logger.info(
+                    "StopTransaction closed with synthesized_delta energy (station=%s tx_id=%s)",
+                    cp_id,
+                    transaction_id,
+                )
             meter_start_db = close_result.get("meter_start_wh")
+            last_meter_db = close_result.get("last_meter_wh")
             energy_kwh = close_result.get("energy_delivered_kwh")
             if energy_kwh is None:
                 if meter_stop_wh is None:
                     anomaly_reason = "missing_meter_stop"
                 elif meter_start_db is None:
-                    anomaly_reason = "missing_meter_start"
+                    # Two scenarios reach NULL meter_start_wh: a legacy row
+                    # inserted before migration 036, or a "deferred" row from
+                    # the meterStart=0 path that never saw a positive
+                    # Energy.Active.Import.Register sample to backfill from.
+                    # last_meter_wh tells them apart — if it's NULL too, the
+                    # charger never sent register samples (the configuration
+                    # push that switches Terra AC into the right measurand
+                    # set failed, or the firmware truly lacks it). Operators
+                    # need to investigate measurand configuration rather than
+                    # reconcile from a legacy backfill.
+                    if last_meter_db is None:
+                        anomaly_reason = "deferred_meter_start_never_backfilled"
+                    else:
+                        anomaly_reason = "missing_meter_start"
                 elif meter_start_db == 0:
+                    # Defensive: post-Phase-1 we coerce meterStart=0 to NULL
+                    # at the OCPP boundary so this branch should be dead in
+                    # production. Kept to catch rows inserted by external
+                    # tooling or tests that bypass the adapter.
                     anomaly_reason = "meter_start_is_zero"
                 elif meter_stop_wh < int(meter_start_db):
                     anomaly_reason = "meter_stop_lt_meter_start"
@@ -1531,12 +1576,13 @@ class OCPP16Session:
                     anomaly_reason = "unknown"
                 logger.warning(
                     "Anomalous meter delta on station=%s tx_id=%s: %s "
-                    "(meter_start_wh=%s, meter_stop_wh=%s, raw_meter_stop=%s). "
-                    "Leaving energy_delivered_kwh NULL.",
+                    "(meter_start_wh=%s, last_meter_wh=%s, meter_stop_wh=%s, "
+                    "raw_meter_stop=%s). Leaving energy_delivered_kwh NULL.",
                     cp_id,
                     transaction_id,
                     anomaly_reason,
                     meter_start_db,
+                    last_meter_db,
                     meter_stop_wh,
                     meter_stop,
                 )

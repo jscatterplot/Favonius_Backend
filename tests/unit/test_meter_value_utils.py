@@ -9,8 +9,10 @@ from __future__ import annotations
 import pytest
 
 from src.websocket_handler.meter_value_utils import (
+    DEFAULT_SYNTHESIZED_DELTA_CAP_WH,
     compute_energy_kwh,
     normalize_energy_to_wh,
+    synthesize_energy_kwh_from_meter_stop,
 )
 
 
@@ -103,3 +105,45 @@ class TestComputeEnergyKwh:
         """Wh -> kWh divides by 1000 — preserves Wh-level precision."""
         result = compute_energy_kwh(meter_stop_wh=1234, meter_start_wh=1)
         assert result == pytest.approx(1.233)
+
+
+# ─── synthesize_energy_kwh_from_meter_stop ────────────────────────────
+
+
+class TestSynthesizeEnergyKwh:
+    """Phase 2 fallback for chargers that send only meterStop and no register samples."""
+
+    def test_default_cap_is_50_kwh(self):
+        """The pilot fleet has ≤200 kWh batteries; 50 kWh is the per-session ceiling."""
+        assert DEFAULT_SYNTHESIZED_DELTA_CAP_WH == 50_000
+
+    def test_returns_kwh_when_under_cap(self):
+        """The tx_id=18 case: meter_stop=2982 → 2.982 kWh."""
+        result = synthesize_energy_kwh_from_meter_stop(meter_stop_wh=2982)
+        assert result == pytest.approx(2.982)
+
+    def test_returns_kwh_exactly_at_cap(self):
+        """Boundary: cap is inclusive."""
+        result = synthesize_energy_kwh_from_meter_stop(meter_stop_wh=50_000)
+        assert result == pytest.approx(50.0)
+
+    def test_rejects_above_cap(self):
+        """Above-cap is almost certainly an absolute register, not a session delta."""
+        assert synthesize_energy_kwh_from_meter_stop(meter_stop_wh=50_001) is None
+
+    def test_rejects_zero(self):
+        """Zero is the poison signal that motivated this whole module."""
+        assert synthesize_energy_kwh_from_meter_stop(meter_stop_wh=0) is None
+
+    def test_rejects_negative(self):
+        """Defensive: negative meter values must not synthesize."""
+        assert synthesize_energy_kwh_from_meter_stop(meter_stop_wh=-100) is None
+
+    def test_rejects_none(self):
+        """No meter_stop → no synthesis."""
+        assert synthesize_energy_kwh_from_meter_stop(meter_stop_wh=None) is None
+
+    def test_custom_cap_widens_or_narrows(self):
+        """The cap is configurable per call (timescale_client reads env var)."""
+        assert synthesize_energy_kwh_from_meter_stop(meter_stop_wh=99_000, cap_wh=100_000) == pytest.approx(99.0)
+        assert synthesize_energy_kwh_from_meter_stop(meter_stop_wh=10_000, cap_wh=5_000) is None

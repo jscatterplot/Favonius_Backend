@@ -864,7 +864,10 @@ class TestOCPP16SessionCallbacks:
         mock_timescale.lookup_id_tag.assert_any_await("TAG-001", station_id="test_station_001")
         assert session._pending_start is not None
         assert session._pending_start["connector_id"] == 1
-        assert session._pending_start["meter_start_wh"] == 0
+        # meterStart=0 is now coerced to NULL on the deferred-backfill path.
+        # ``_update_session_live_metrics`` will set meter_start_wh from the
+        # first positive Energy.Active.Import.Register MeterValues sample.
+        assert session._pending_start["meter_start_wh"] is None
 
     @pytest.mark.asyncio
     async def test_on_transaction_start_self_heal_clears_current_transaction_id(
@@ -1481,6 +1484,69 @@ class TestOCPP16SessionRecovery:
         assert session._pending_start["meter_start_wh"] == 17500
 
     @pytest.mark.asyncio
+    async def test_on_transaction_start_defers_zero_meter_start_to_none(
+        self, session, mock_timescale
+    ) -> None:
+        """meterStart=0 from ABB Terra AC must be coerced to NULL ("deferred").
+
+        The poison 0 would otherwise be rejected forever by
+        ``compute_energy_kwh`` and the live UPDATE's CASE gate, voiding
+        the session's energy delta. Backfilling NULL from the first
+        MeterValues Energy.Active.Import.Register sample is the
+        recovery path.
+        """
+        await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-04-26T12:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert session._pending_start is not None
+        assert session._pending_start["meter_start_wh"] is None
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_defers_negative_meter_start_to_none(
+        self, session, mock_timescale
+    ) -> None:
+        """Defensive: a charger sending a negative meterStart is also poison."""
+        await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=-5,
+            timestamp="2026-04-26T12:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert session._pending_start is not None
+        assert session._pending_start["meter_start_wh"] is None
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_logs_deferred_on_zero(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """Deferred path emits an INFO log so the deferred state is greppable."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_start(
+                cp_id="test_station_001",
+                connector_id=1,
+                id_tag="TAG-001",
+                meter_start=0,
+                timestamp="2026-04-26T12:00:00Z",
+            )
+            await asyncio.sleep(0)
+
+        infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+        assert any(
+            "deferring meter_start_wh" in m and "test_station_001" in m for m in infos
+        ), f"Expected deferred INFO log; got: {infos}"
+
+    @pytest.mark.asyncio
     async def test_next_transaction_id_persists_meter_start_wh(
         self, session, mock_timescale
     ) -> None:
@@ -1517,7 +1583,11 @@ class TestOCPP16SessionRecovery:
 
         # Simulates the DB-side CASE gate leaving energy_delivered_kwh NULL.
         mock_timescale.close_open_session = AsyncMock(
-            return_value={"meter_start_wh": 9000, "energy_delivered_kwh": None}
+            return_value={
+                "meter_start_wh": 9000,
+                "last_meter_wh": 9100,
+                "energy_delivered_kwh": None,
+            }
         )
 
         with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
@@ -1539,15 +1609,23 @@ class TestOCPP16SessionRecovery:
     async def test_on_transaction_stop_warns_on_missing_meter_start(
         self, session, mock_timescale, caplog
     ) -> None:
-        """Legacy row inserted before mig 036 has meter_start_wh NULL.
+        """Legacy row with meter_start_wh NULL but last_meter_wh present.
 
-        Close cannot compute a delta; operator gets a WARN with the
-        reason tag so they can reconcile manually.
+        Distinct from the deferred-and-never-backfilled case: here the
+        charger DID send MeterValues with register samples (so last_meter_wh
+        is non-NULL) but for some reason meter_start_wh is missing — most
+        likely a row predating migration 036 that was reopened after the
+        upgrade. Classifier returns ``missing_meter_start`` so the operator
+        knows this is a legacy reconcile, not a measurand-config issue.
         """
         import logging
 
         mock_timescale.close_open_session = AsyncMock(
-            return_value={"meter_start_wh": None, "energy_delivered_kwh": None}
+            return_value={
+                "meter_start_wh": None,
+                "last_meter_wh": 5000,
+                "energy_delivered_kwh": None,
+            }
         )
 
         with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
@@ -1561,9 +1639,56 @@ class TestOCPP16SessionRecovery:
             )
 
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        # Use a regex-style exact-substring check that excludes the
+        # ``deferred_meter_start_never_backfilled`` substring (which also
+        # contains "missing" only implicitly via the operator's mental model
+        # but not literally; defensive anyway).
+        missing_only = [
+            m for m in warnings
+            if "missing_meter_start" in m
+            and "deferred_meter_start_never_backfilled" not in m
+        ]
+        assert missing_only, (
+            f"Expected missing_meter_start WARN (with last_meter_wh present); got: {warnings}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_warns_deferred_never_backfilled(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """meter_start_wh IS NULL AND last_meter_wh IS NULL → deferred + no register samples.
+
+        This is the post-Phase-1 failure mode: StartTransaction carried
+        meterStart=0 (so we wrote NULL), and MeterValues during the session
+        never produced an Energy.Active.Import.Register sample (charger's
+        measurand config refused the ChangeConfiguration push, or firmware
+        lacks the measurand entirely). Operators investigate the charger's
+        configuration, not legacy data.
+        """
+        import logging
+
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={
+                "meter_start_wh": None,
+                "last_meter_wh": None,
+                "energy_delivered_kwh": None,
+            }
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_stop(
+                cp_id="test_station_001",
+                transaction_id=4246,
+                id_tag="TAG_X",
+                meter_stop=5000,
+                timestamp="2026-04-26T13:00:00Z",
+                reason="EVDisconnected",
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert any(
-            "missing_meter_start" in m for m in warnings
-        ), f"Expected missing_meter_start WARN; got: {warnings}"
+            "deferred_meter_start_never_backfilled" in m for m in warnings
+        ), f"Expected deferred_meter_start_never_backfilled WARN; got: {warnings}"
 
     @pytest.mark.asyncio
     async def test_on_transaction_stop_no_warn_on_happy_path(
@@ -1573,7 +1698,11 @@ class TestOCPP16SessionRecovery:
         import logging
 
         mock_timescale.close_open_session = AsyncMock(
-            return_value={"meter_start_wh": 1000, "energy_delivered_kwh": 4.0}
+            return_value={
+                "meter_start_wh": 1000,
+                "last_meter_wh": 5000,
+                "energy_delivered_kwh": 4.0,
+            }
         )
 
         with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):

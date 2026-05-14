@@ -170,20 +170,38 @@ async def test_insert_open_session_accepts_null_meter_start_wh():
     assert insert_call.args[-1] is None
 
 
-def _close_session_conn(meter_start_wh, returning):
+def _close_session_conn(
+    meter_start_wh,
+    returning,
+    *,
+    last_meter_wh=None,
+    select_finds_row=True,
+):
     """Build a mock conn whose fetchrow returns SELECT then UPDATE rows in order.
 
     The refactored ``close_open_session`` (Issue 7A) splits the close into a
-    locked SELECT (to read ``meter_start_wh``) followed by an UPDATE (to
-    write the close + the helper-computed ``energy_delivered_kwh``).
-    Tests need to mock both in sequence.
+    locked SELECT (to read ``meter_start_wh`` + ``last_meter_wh``) followed
+    by an UPDATE (to write the close + the helper-computed
+    ``energy_delivered_kwh``). Tests need to mock both in sequence.
+
+    ``select_finds_row=False`` simulates the idempotent-retry case where
+    the SELECT finds no open row; in that case the UPDATE is never issued.
+    ``meter_start_wh`` / ``last_meter_wh`` are the column values on the
+    returned SELECT row — both default to None so synthesis-fallback tests
+    can express "open row with both columns NULL" naturally.
     """
     conn = AsyncMock()
     fetchrow_results = []
-    if meter_start_wh is not None:
-        fetchrow_results.append({"session_id": "sess-1", "meter_start_wh": meter_start_wh})
+    if select_finds_row:
+        fetchrow_results.append(
+            {
+                "session_id": "sess-1",
+                "meter_start_wh": meter_start_wh,
+                "last_meter_wh": last_meter_wh,
+            }
+        )
     else:
-        fetchrow_results.append(None)  # SELECT found no open row
+        fetchrow_results.append(None)
     fetchrow_results.append(returning)
     conn.fetchrow = AsyncMock(side_effect=fetchrow_results)
     return conn
@@ -218,7 +236,13 @@ async def test_close_open_session_writes_energy_helper_value():
     assert "energy_delivered_kwh = $5" in update_sql  # typed float param
     # Helper computed (5000 - 1000) / 1000 = 4.0 and passed as $5
     assert update_call.args[5] == pytest.approx(4.0)
-    assert result == matched_row
+    # The returned dict carries the UPDATE RETURNING values plus a
+    # ``synthesized`` flag (Phase 2 audit trail). Compare on the keys we
+    # care about rather than exact equality.
+    assert result is not None
+    assert result["meter_start_wh"] == 1000
+    assert result["energy_delivered_kwh"] == 4.0
+    assert result["synthesized"] is False
 
 
 @pytest.mark.asyncio
@@ -228,7 +252,9 @@ async def test_close_open_session_returns_none_when_no_row_matched():
     The caller distinguishes this from the matched-but-anomalous case
     to decide whether to log a WARN.
     """
-    conn = _close_session_conn(meter_start_wh=None, returning=None)
+    conn = _close_session_conn(
+        meter_start_wh=None, returning=None, select_finds_row=False
+    )
     client, _ = _client_with_conn(conn)
 
     result = await client.close_open_session(
@@ -294,7 +320,9 @@ async def test_close_open_session_writes_null_kwh_on_zero_meter_start():
 @pytest.mark.asyncio
 async def test_close_open_session_filters_to_live_source():
     """Close must not touch imported rows even if their end_time is NULL."""
-    conn = _close_session_conn(meter_start_wh=None, returning=None)
+    conn = _close_session_conn(
+        meter_start_wh=None, returning=None, select_finds_row=False
+    )
     client, _ = _client_with_conn(conn)
 
     await client.close_open_session(
@@ -358,6 +386,239 @@ async def test_close_open_session_stamps_stop_reason():
     update_sql = update_call.args[0]
     assert "stop_reason" in update_sql
     assert update_call.args[6] == "EVDisconnected"
+
+
+# ─── Phase 2 synthesis fallback (close path) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_synthesizes_when_both_meter_columns_null():
+    """meter_start_wh IS NULL AND last_meter_wh IS NULL → synthesize from meter_stop_wh.
+
+    The tx_id=18 case: Terra AC sent meterStart=0 (coerced to NULL by Phase
+    1), never produced an Energy.Active.Import.Register sample (so no
+    backfill, no last_meter_wh), then sent StopTransaction with
+    meterStop=2982 Wh. Phase 2 treats the small meter_stop as a per-session
+    delta under the 50 kWh cap.
+    """
+    returning = {
+        "meter_start_wh": None,
+        "last_meter_wh": None,
+        "energy_delivered_kwh": 2.982,
+    }
+    conn = _close_session_conn(
+        meter_start_wh=None,
+        last_meter_wh=None,
+        returning=returning,
+    )
+    client, _ = _client_with_conn(conn)
+
+    result = await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=18,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=2982,
+        stop_reason="EVDisconnected",
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    assert update_call.args[5] == pytest.approx(2.982)  # $5 = synthesised kWh
+    # stop_reason ($6) is suffixed for audit
+    assert update_call.args[6] == "EVDisconnected|synthesized_delta"
+    assert result is not None
+    assert result["synthesized"] is True
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_synthesis_respects_50_kwh_cap():
+    """meter_stop > 50 kWh is rejected by the synthesizer; energy stays NULL."""
+    returning = {
+        "meter_start_wh": None,
+        "last_meter_wh": None,
+        "energy_delivered_kwh": None,
+    }
+    conn = _close_session_conn(
+        meter_start_wh=None,
+        last_meter_wh=None,
+        returning=returning,
+    )
+    client, _ = _client_with_conn(conn)
+
+    result = await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=19,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=51_000,  # 51 kWh — above the 50 kWh default cap
+        stop_reason="EVDisconnected",
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    # Synthesizer refused (too high to be a single-session delta on the
+    # pilot fleet), so $5 stays NULL.
+    assert update_call.args[5] is None
+    # stop_reason is NOT suffixed.
+    assert update_call.args[6] == "EVDisconnected"
+    assert result["synthesized"] is False
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_does_not_synthesize_when_last_meter_present():
+    """Phase 1 won: we have register samples. Don't synthesize from meter_stop.
+
+    If last_meter_wh is non-NULL it means MeterValues DID carry an
+    Energy.Active.Import.Register sample during the session — so meter_start_wh
+    was either non-NULL all along (real meterStart) or got backfilled by the
+    live UPDATE. compute_energy_kwh handled the proper bracket already; if it
+    refused, the bracket itself is broken (rollover/replacement) and the
+    operator should investigate, not have us synthesize a guess.
+    """
+    returning = {
+        "meter_start_wh": None,
+        "last_meter_wh": 5000,  # register samples arrived
+        "energy_delivered_kwh": None,
+    }
+    conn = _close_session_conn(
+        meter_start_wh=None,
+        last_meter_wh=5000,
+        returning=returning,
+    )
+    client, _ = _client_with_conn(conn)
+
+    result = await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=20,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=2000,
+        stop_reason="Local",
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    # Synthesis would have computed 2.0 — but last_meter_wh is non-NULL,
+    # so the synthesis branch is suppressed.
+    assert update_call.args[5] is None
+    assert update_call.args[6] == "Local"  # no suffix
+    assert result["synthesized"] is False
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_synthesis_handles_missing_stop_reason():
+    """When no OCPP reason was supplied, synthesis still tags the row.
+
+    Defensive: a charger that omits ``reason`` from StopTransaction must
+    not blow up the f-string suffix. The synthesizer falls back to
+    'unknown' as the base.
+    """
+    returning = {
+        "meter_start_wh": None,
+        "last_meter_wh": None,
+        "energy_delivered_kwh": 2.982,
+    }
+    conn = _close_session_conn(
+        meter_start_wh=None,
+        last_meter_wh=None,
+        returning=returning,
+    )
+    client, _ = _client_with_conn(conn)
+
+    await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=21,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=2982,
+        stop_reason=None,  # charger omitted
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    assert update_call.args[6] == "unknown|synthesized_delta"
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_synthesis_cap_overridable_by_env(monkeypatch):
+    """OCPP_SYNTHESIZED_DELTA_CAP_KWH widens (or narrows) the cap at runtime."""
+    monkeypatch.setenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH", "10")  # narrow to 10 kWh
+
+    returning = {
+        "meter_start_wh": None,
+        "last_meter_wh": None,
+        "energy_delivered_kwh": None,
+    }
+    conn = _close_session_conn(
+        meter_start_wh=None,
+        last_meter_wh=None,
+        returning=returning,
+    )
+    client, _ = _client_with_conn(conn)
+
+    result = await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=22,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=20_000,  # 20 kWh, above the narrowed 10 kWh cap
+        stop_reason="EVDisconnected",
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    assert update_call.args[5] is None  # cap rejected
+    assert result["synthesized"] is False
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_synthesis_invalid_env_falls_back_to_default(monkeypatch):
+    """Bad env value must not silently widen the cap — fall back to 50 kWh default."""
+    monkeypatch.setenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH", "not-a-number")
+
+    returning = {
+        "meter_start_wh": None,
+        "last_meter_wh": None,
+        "energy_delivered_kwh": 30.0,
+    }
+    conn = _close_session_conn(
+        meter_start_wh=None,
+        last_meter_wh=None,
+        returning=returning,
+    )
+    client, _ = _client_with_conn(conn)
+
+    await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=23,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=30_000,  # 30 kWh — under the default 50 kWh cap
+        stop_reason="Local",
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    assert update_call.args[5] == pytest.approx(30.0)
+
+
+@pytest.mark.asyncio
+async def test_close_open_session_synthesis_negative_env_falls_back_to_default(monkeypatch):
+    """Negative env value (operator typo) falls back to the safe default."""
+    monkeypatch.setenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH", "-1")
+
+    returning = {
+        "meter_start_wh": None,
+        "last_meter_wh": None,
+        "energy_delivered_kwh": 30.0,
+    }
+    conn = _close_session_conn(
+        meter_start_wh=None,
+        last_meter_wh=None,
+        returning=returning,
+    )
+    client, _ = _client_with_conn(conn)
+
+    await client.close_open_session(
+        station_id="cp-1",
+        transaction_id=24,
+        end_time=datetime.now(timezone.utc),
+        meter_stop_wh=30_000,
+        stop_reason="Local",
+    )
+
+    update_call = conn.fetchrow.await_args_list[1]
+    # Default cap kicked in, synthesis succeeded.
+    assert update_call.args[5] == pytest.approx(30.0)
 
 
 @pytest.mark.asyncio
