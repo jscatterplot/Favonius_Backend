@@ -40,7 +40,8 @@ REPLAY_BACKOFF_SECONDS = 1.0
 # nudging it via TriggerMessage. Some ABB Terra AC firmwares (and other
 # OCPP 1.6 implementations) skip BootNotification on WebSocket reconnect,
 # leaving the heartbeat interval un-negotiated and the session stuck.
-BOOT_TRIGGER_GRACE_SECONDS = 5.0
+BOOT_TRIGGER_GRACE_SECONDS = 5
+BOOT_TRIGGER_FOLLOWUP_SECONDS = 25.0
 
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
@@ -318,13 +319,13 @@ class OCPP16Session:
              BootNotification within the grace, no trigger needed.
           2. ``_inbound_frame_count > 0`` — the charger sent some other
              OCPP frame (StatusNotification, Heartbeat, MeterValues, …)
-             within the grace, so we know it is alive and configured.
-             Triggering BootNotification here would synthesise a fresh
-             bootstrap pipeline on every reconnect, which is what caused
-             the HRX Vilnius reconfig loop (chargers reconnect every
-             ~60 s, the boot trigger fires, bootstrap runs ~15 s, drop
-             mid-bootstrap, loop).
-          3. Neither — the charger is fully silent. Trigger BootNotification.
+             within the grace, so we defer the trigger by
+             ``BOOT_TRIGGER_FOLLOWUP_SECONDS`` to avoid immediately
+             re-running bootstrap on short reconnect loops.
+          3. Still no boot after the optional follow-up wait —
+             Trigger BootNotification so ``_on_boot`` remains reachable
+             for this session (queued command replay, local auth sync,
+             metering bootstrap).
         """
         try:
             await asyncio.sleep(BOOT_TRIGGER_GRACE_SECONDS)
@@ -332,13 +333,16 @@ class OCPP16Session:
                 return
             if self._inbound_frame_count > 0:
                 logger.info(
-                    "force_boot_notification station=%s skipped: "
+                    "force_boot_notification station=%s deferred: "
                     "charger sent %d frame(s) during grace period without "
-                    "BootNotification; treating as alive",
+                    "BootNotification; waiting %ss follow-up before trigger",
                     self._station_id,
                     self._inbound_frame_count,
+                    BOOT_TRIGGER_FOLLOWUP_SECONDS,
                 )
-                return
+                await asyncio.sleep(BOOT_TRIGGER_FOLLOWUP_SECONDS)
+                if self._cp.last_boot_at is not None:
+                    return
             status = await self._cp.trigger_message("BootNotification")
             logger.info(
                 "force_boot_notification station=%s status=%s",

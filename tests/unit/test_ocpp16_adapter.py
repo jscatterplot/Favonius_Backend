@@ -281,20 +281,22 @@ class TestOCPP16SessionForceBootNotification:
         await session._force_boot_notification()  # must not raise
 
     @pytest.mark.asyncio
-    async def test_skips_trigger_when_inbound_frames_received(self, session, monkeypatch) -> None:
-        """Charger that sends StatusNotification etc. during the grace window
-        is treated as alive — synthetic BootNotification is suppressed so the
-        bootstrap pipeline does not re-run on every reconnect. This is the
-        HRX Vilnius regression: chargers reconnected every ~60 s, sent
-        StatusNotification immediately, and the forced bootstrap downstream
-        of our trigger kept the reconfig loop alive."""
+    async def test_defers_then_triggers_when_inbound_frames_received(
+        self, session, monkeypatch
+    ) -> None:
+        """If frames arrive but BootNotification does not, defer then trigger.
+
+        This keeps `_on_boot` reachable for reconnect sessions that skip boot
+        while still avoiding an immediate trigger on every short reconnect.
+        """
         session._cp.last_boot_at = None
         session._cp.trigger_message = AsyncMock()
         # Simulate inbound frames arriving before the grace deadline.
         session._inbound_frame_count = 2
         monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_FOLLOWUP_SECONDS", 0)
         await session._force_boot_notification()
-        session._cp.trigger_message.assert_not_called()
+        session._cp.trigger_message.assert_awaited_once_with("BootNotification")
 
     @pytest.mark.asyncio
     async def test_inbound_frame_counter_incremented_on_message_received(
