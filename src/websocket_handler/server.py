@@ -745,7 +745,10 @@ class OCPPWebSocketServer:
             # Clean up old connection
             if old_connection_id in self.connections:
                 await self._cleanup_connection(
-                    old_connection_id, self.connections[old_connection_id], station_id
+                    old_connection_id,
+                    self.connections[old_connection_id],
+                    station_id,
+                    replaced_by_reconnect=True,
                 )
 
         # Store connection
@@ -836,7 +839,12 @@ class OCPPWebSocketServer:
         return await self.connection_manager.check_message_rate_limit(station_id)
 
     async def _cleanup_connection(
-        self, connection_id: str, websocket: WebSocketServerProtocol, station_id: str = None
+        self,
+        connection_id: str,
+        websocket: WebSocketServerProtocol,
+        station_id: str = None,
+        *,
+        replaced_by_reconnect: bool = False,
     ) -> None:
         """Cleanup connection resources.
 
@@ -948,19 +956,16 @@ class OCPPWebSocketServer:
         # hung close on a half-open socket must NOT block the new
         # connection's setup. Safe to schedule even when the websocket has
         # already closed naturally (the helper's try/except swallows it).
+        close_reason = "Replaced by reconnect" if replaced_by_reconnect else "Session ended"
         try:
             asyncio.create_task(
-                self._close_connection_gracefully(
-                    websocket, code=1001, reason="Replaced by reconnect"
-                )
+                self._close_connection_gracefully(websocket, code=1001, reason=close_reason)
             )
         except RuntimeError:
             # No running loop (e.g. some test harnesses). Best-effort
             # synchronous close — failure here is non-fatal.
             try:
-                await self._close_connection_gracefully(
-                    websocket, code=1001, reason="Replaced by reconnect"
-                )
+                await self._close_connection_gracefully(websocket, code=1001, reason=close_reason)
             except Exception:
                 pass
 
@@ -1048,7 +1053,9 @@ class OCPPWebSocketServer:
 
         Defaults match the previous behavior for the server-shutdown
         callsite. ``_cleanup_connection`` passes ``reason="Replaced by
-        reconnect"`` so logs distinguish the two close paths.
+        reconnect"`` only when ``replaced_by_reconnect=True`` (eager
+        reconnect cleanup); otherwise ``"Session ended"`` so monitoring
+        can distinguish the two paths.
         """
         try:
             await websocket.close(code, reason)
