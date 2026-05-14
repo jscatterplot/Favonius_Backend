@@ -36,6 +36,8 @@ from typing import Any, Iterable, Optional
 
 from uuid import UUID, uuid4
 
+from asyncpg.exceptions import UniqueViolationError
+
 from src.api.agent.auth_context import AuthContext
 from src.api.agent_workflows.constraints import DepotConstraints
 from src.api.agent_workflows.models import (
@@ -290,21 +292,27 @@ async def _insert_depot(conn: Any, depot: dict, organization_id: UUID) -> UUID:
     depot_id = _coerce_uuid(depot["depot_id"], field_name="depot.depot_id")
     if not await _table_exists(conn, "depots"):
         return depot_id
-    await conn.execute(
-        """
-        INSERT INTO depots (
-            depot_id, name, latitude, longitude, max_grid_kw, timezone, organization_id
+    try:
+        await conn.execute(
+            """
+            INSERT INTO depots (
+                depot_id, name, latitude, longitude, max_grid_kw, timezone, organization_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            depot_id,
+            depot.get("name", "Eval depot"),
+            depot.get("latitude", 54.6872),
+            depot.get("longitude", 25.2797),
+            float(depot.get("max_grid_kw", 800.0)),
+            depot.get("timezone", "UTC"),
+            organization_id,
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """,
-        depot_id,
-        depot.get("name", "Eval depot"),
-        depot.get("latitude", 54.6872),
-        depot.get("longitude", 25.2797),
-        float(depot.get("max_grid_kw", 800.0)),
-        depot.get("timezone", "UTC"),
-        organization_id,
-    )
+    except UniqueViolationError as exc:
+        raise ScenarioLoadError(
+            f"graph_snapshot.depot.depot_id {depot_id} already exists in the database; "
+            "remove conflicting seed data or use an unused UUID."
+        ) from exc
     return depot_id
 
 
@@ -404,14 +412,8 @@ async def _insert_telemetry(conn: Any, samples: Iterable[dict], scenario_now: da
             if charger_raw is not None
             else None
         )
-        _station_id = sample.get("station_id")
-        station_id = (
-            str(_station_id)
-            if _station_id is not None
-            else str(charger_raw) if charger_raw is not None else "unknown"
-        )
-        _connector_id = sample.get("connector_id")
-        connector_id = int(_connector_id) if _connector_id is not None else idx + 1
+        station_id = str(charger_raw) if charger_raw is not None else "unknown"
+        connector_id = idx + 1
         await conn.execute(
             """
             INSERT INTO telemetry (
