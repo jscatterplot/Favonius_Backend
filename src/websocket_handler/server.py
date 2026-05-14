@@ -850,6 +850,28 @@ class OCPPWebSocketServer:
         on a loop. The connection-level pops (``connections``,
         ``_connection_client_ips``) are always safe — they're keyed by
         connection_id.
+
+        Loop-safety properties:
+
+        * **Per-IP counter parity.** ``_release_client_ip`` is only called
+          when ``_connection_client_ips.pop`` actually returned a value.
+          Otherwise the late stale cleanup of a connection that was already
+          released by the eager reconnect branch would double-decrement
+          ``_ip_connection_count`` and silently disable the per-IP cap.
+        * **Old socket is force-closed.** A fire-and-forget close on the
+          provided ``websocket`` wakes the OLD ``charge_point.start()``
+          recv loop on reconnect-induced cleanup so it returns promptly
+          rather than dangling until the OS reaps the half-open TCP
+          socket. Already-closed sockets handle the redundant close in
+          the helper's try/except.
+        * **DB calls are time-bounded.** Each external await
+          (``connection_manager.unregister_connection``,
+          ``mark_connectors_unavailable``, ``mark_sessions_seen``) is
+          wrapped in ``asyncio.wait_for``. The reconnect branch awaits
+          this method synchronously, so a hung Postgres (we have seen
+          ``TooManyConnectionsError`` at startup) must not wedge every
+          new connection's setup and turn the reconnect path into an
+          unbounded queue of stalled handlers.
         """
         client_ip = self._connection_client_ips.pop(connection_id, None)
 
@@ -881,7 +903,12 @@ class OCPPWebSocketServer:
             # thing per-connection, even when the station mapping has
             # already moved on.
             if self.connection_manager:
-                await self.connection_manager.unregister_connection(station_id, connection_id)
+                await self._await_with_timeout(
+                    self.connection_manager.unregister_connection(station_id, connection_id),
+                    op="connection_manager.unregister_connection",
+                    station_id=station_id,
+                    connection_id=connection_id,
+                )
 
             # Persist that the charger is gone so reads (alerts, state) and
             # the boot-replay path can distinguish a stale-but-open session
@@ -891,31 +918,88 @@ class OCPPWebSocketServer:
             # connected. Both calls are best-effort; the connection is
             # already torn down.
             if is_current and self.timescale_client is not None:
-                try:
-                    await self.timescale_client.mark_connectors_unavailable(station_id)
-                except Exception as exc:
-                    self.logger.warning(
-                        "mark_connectors_unavailable failed for station=%s: %s",
-                        station_id,
-                        exc,
-                    )
-                try:
-                    await self.timescale_client.mark_sessions_seen(station_id)
-                except Exception as exc:
-                    self.logger.warning(
-                        "mark_sessions_seen failed for station=%s: %s",
-                        station_id,
-                        exc,
-                    )
+                await self._await_with_timeout(
+                    self.timescale_client.mark_connectors_unavailable(station_id),
+                    op="mark_connectors_unavailable",
+                    station_id=station_id,
+                    connection_id=connection_id,
+                )
+                await self._await_with_timeout(
+                    self.timescale_client.mark_sessions_seen(station_id),
+                    op="mark_sessions_seen",
+                    station_id=station_id,
+                    connection_id=connection_id,
+                )
 
         # Clean rate limit data - handled by RateLimiter class cleanup
         # self.rate_limits.pop(connection_id, None)  # Removed - using RateLimiter class
 
-        # Decrement per-IP counter
-        client_ip = client_ip or self._get_peer_ip(websocket)
-        self._release_client_ip(client_ip)
+        # Decrement per-IP counter only if we actually tracked this
+        # connection — otherwise the late stale cleanup of a connection
+        # the eager reconnect branch already released would double-decrement
+        # ``_ip_connection_count`` and silently disable the per-IP cap.
+        if client_ip is not None:
+            self._release_client_ip(client_ip)
+
+        # Force the underlying socket closed so the OLD charge_point.start()
+        # recv loop unblocks promptly instead of dangling until the OS reaps
+        # the half-open TCP socket. Fire-and-forget — the caller in the
+        # eager reconnect branch awaits this method synchronously, and a
+        # hung close on a half-open socket must NOT block the new
+        # connection's setup. Safe to schedule even when the websocket has
+        # already closed naturally (the helper's try/except swallows it).
+        try:
+            asyncio.create_task(
+                self._close_connection_gracefully(
+                    websocket, code=1001, reason="Replaced by reconnect"
+                )
+            )
+        except RuntimeError:
+            # No running loop (e.g. some test harnesses). Best-effort
+            # synchronous close — failure here is non-fatal.
+            try:
+                await self._close_connection_gracefully(
+                    websocket, code=1001, reason="Replaced by reconnect"
+                )
+            except Exception:
+                pass
 
         self.logger.info(f"Cleaned up connection {connection_id} (station: {station_id})")
+
+    async def _await_with_timeout(
+        self,
+        coro,
+        *,
+        op: str,
+        station_id: Optional[str],
+        connection_id: Optional[str],
+        timeout: float = 5.0,
+    ) -> None:
+        """Await a cleanup-time coroutine with a bounded timeout.
+
+        Used by ``_cleanup_connection`` to ensure that a single hung DB
+        call cannot wedge every new connection's setup, since the
+        reconnect branch in ``_handle_connection`` awaits cleanup
+        synchronously before registering the successor.
+        """
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "%s timed out after %.1fs for station=%s connection=%s",
+                op,
+                timeout,
+                station_id,
+                connection_id,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "%s failed for station=%s connection=%s: %s",
+                op,
+                station_id,
+                connection_id,
+                exc,
+            )
 
     def get_charge_point(self, station_id: str) -> Optional[EnhancedOCPPChargePoint]:
         """Get charge point for a station."""
@@ -954,10 +1038,20 @@ class OCPPWebSocketServer:
 
         return await charge_point.clear_der_control()
 
-    async def _close_connection_gracefully(self, websocket: WebSocketServerProtocol) -> None:
-        """Close connection gracefully with proper cleanup."""
+    async def _close_connection_gracefully(
+        self,
+        websocket: WebSocketServerProtocol,
+        code: int = 1001,
+        reason: str = "Server shutdown",
+    ) -> None:
+        """Close connection gracefully with proper cleanup.
+
+        Defaults match the previous behavior for the server-shutdown
+        callsite. ``_cleanup_connection`` passes ``reason="Replaced by
+        reconnect"`` so logs distinguish the two close paths.
+        """
         try:
-            await websocket.close(1001, "Server shutdown")
+            await websocket.close(code, reason)
         except Exception:
             pass
 
