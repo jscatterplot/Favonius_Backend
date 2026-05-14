@@ -137,6 +137,7 @@ class DataSyncService:
         # Re-check missing relations on next start; the operator may have
         # added them while we were stopped.
         self._missing_relations.clear()
+        self._pool_exhaustion_warned = False
 
         self.logger.info("Data sync service stopped")
 
