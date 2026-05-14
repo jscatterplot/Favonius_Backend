@@ -626,6 +626,32 @@ class DepotController:
 
         logger.debug(f"Stored optimization result {result.run_id}")
 
+    async def _depot_exists_in_supabase(self) -> bool:
+        """Return True iff the depot row still exists in Supabase ``sites``.
+
+        Used by the run loop and alert emitter to avoid emitting alerts or
+        running optimizations for depots whose tenant has been deleted upstream.
+        The local TimescaleDB ``organizations`` mirror is not authoritative for
+        org lifecycle — Supabase is — so this check has to go to the static pool.
+
+        Fails open on transport errors (returns True) so a transient Supabase
+        outage cannot stop every controller in the fleet.
+        """
+        try:
+            async with self.pools.static.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT 1 FROM sites WHERE id = $1",
+                    self.depot_id,
+                )
+        except Exception as e:  # pragma: no cover - logged for ops visibility
+            logger.warning(
+                "depot liveness check failed for %s (%s); assuming live",
+                self.depot_id,
+                e,
+            )
+            return True
+        return row is not None
+
     async def _emit_readiness_alerts(
         self,
         snapshot: "OptimizationInputSnapshot",
@@ -646,6 +672,20 @@ class DepotController:
             return
         readiness = snapshot.readiness
         depot_id = self.depot_id
+
+        # Don't write alerts for depots whose Supabase row is gone (org
+        # deleted upstream). The TimescaleDB org row may linger after a
+        # Supabase tenant deletion; without this guard the dispatcher logs
+        # "no recipients for org=…" on every tick forever.
+        if not await self._depot_exists_in_supabase():
+            logger.info(
+                "skipping readiness alert: depot %s no longer exists in sites "
+                "(org=%s, type=%s)",
+                depot_id,
+                org_id,
+                "missing_input" if readiness.is_blocking else "degraded_optimization",
+            )
+            return
 
         try:
             from uuid import UUID  # noqa: PLC0415
@@ -791,6 +831,19 @@ class DepotController:
         while self._running:
             try:
                 now = datetime.utcnow()
+
+                # Bail out if the depot has been deleted upstream (Supabase).
+                # Avoids running optimizations and emitting alerts for a
+                # tenant that no longer exists. Fails open on transient
+                # errors so a Supabase blip doesn't drain every controller.
+                if not await self._depot_exists_in_supabase():
+                    logger.warning(
+                        "depot %s no longer exists in Supabase sites; "
+                        "stopping controller",
+                        self.depot_id,
+                    )
+                    self._running = False
+                    break
 
                 # Update uptime metric
                 if self._start_time:
