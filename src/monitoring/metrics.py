@@ -149,3 +149,15 @@ CONTROLLER_MANAGER_UP = Gauge(
     "favonius_controller_manager_up",
     "1 if controller manager initialized successfully, 0 if startup failed",
 )
+
+# Solver process-pool metrics (PR: move MILP solves off the asyncio event loop).
+SOLVER_POOL_INFLIGHT = Gauge(
+    "favonius_solver_pool_inflight",
+    "Solves currently in flight in the solver process pool (queued + executing)",
+)
+
+SOLVER_POOL_BROKEN = Counter(
+    "favonius_solver_pool_broken_total",
+    "Times the solver process pool became broken and was recreated",
+    ["reason"],  # 'broken_pool' | 'timeout'
+)

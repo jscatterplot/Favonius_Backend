@@ -15,17 +15,9 @@ from .exceptions import (
     SolverTimeoutError,
 )
 from .milp_model import build_optimization_model, optimize
+from .pool import SolverPool, get_solver_pool, set_solver_pool
 from .solver import solve_model
 from .warm_start import warm_start_model
-
-__all__ = [
-    "build_optimization_model",
-    "optimize",
-    "solve_model",
-    "warm_start_model",
-    "allocate_chargers",
-    "ChargerAssignment",
-]
 
 __all__ = [
     # Functions
@@ -33,6 +25,12 @@ __all__ = [
     "solve_model",
     "optimize",
     "warm_start_model",
+    "allocate_chargers",
+    "ChargerAssignment",
+    # Process pool
+    "SolverPool",
+    "get_solver_pool",
+    "set_solver_pool",
     # Data classes
     "DepotState",
     "DepotConfig",
