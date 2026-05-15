@@ -713,15 +713,25 @@ async def sync_charger(
     send_local_list_raised = False
     send_local_list_transport_error = False
     method = getattr(cp, "send_local_list_with_error", None)
-    if method is not None and (
+    if callable(method) and (
         "send_local_list_with_error" in vars(cp)
         or hasattr(type(cp), "send_local_list_with_error")
     ):
-        status, send_local_list_transport_error = await method(
-            list_version=new_version,
-            update_type="Full",
-            local_authorization_list=entries,
-        )
+        try:
+            maybe_result = method(
+                list_version=new_version,
+                update_type="Full",
+                local_authorization_list=entries,
+            )
+            if not hasattr(maybe_result, "__await__"):
+                raise TypeError("send_local_list_with_error returned non-awaitable")
+            status, send_local_list_transport_error = await maybe_result
+        except TypeError:
+            status = await cp.send_local_list(
+                list_version=new_version,
+                update_type="Full",
+                local_authorization_list=entries,
+            )
     else:
         try:
             status = await cp.send_local_list(
