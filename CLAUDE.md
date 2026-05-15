@@ -763,6 +763,9 @@ test(api): add coverage for handoff rate limiting
 | `OPTIMIZATION_SOC_TARGET` | `0.8` | Target SoC before departure |
 | `GUROBI_LICENSE_FILE` | — | Path to `gurobi.lic` |
 | `GUROBI_LIC_CONTENT` | — | License file contents (for Railway) |
+| `SOLVER_PROCESS_POOL_SIZE` | `2` | Worker processes for MILP solves. Solves run out of the API process so the asyncio loop stays responsive. |
+| `SOLVER_WORKER_AS_LIMIT_MB` | `1500` | Per-worker `RLIMIT_AS` ceiling. A runaway solve crashes the worker, not the API container. |
+| `SOLVER_PROCESS_POOL_DISABLED` | `false` | Set `true` to fall back to running solves in a thread inside the API process (loop will block briefly). Debug only. |
 
 ### Price feeder
 | Variable | Default | Description |
@@ -840,6 +843,12 @@ On shutdown: stop controllers → stop OCPP server → close DB pool.
 **HiGHS (fallback):**
 - Used automatically when Gurobi is unavailable or license fails
 - `solver_used` field in `OptimizationResult` records which solver ran
+
+**Process-pool execution (`src/core/optimizer/pool.py`):**
+- Each MILP solve runs in a child process via `ProcessPoolExecutor` (spawn mode), so the FastAPI event loop stays responsive during a 60 s solve. Default 2 workers (`SOLVER_PROCESS_POOL_SIZE`); per-worker virtual-memory ceiling via `RLIMIT_AS` (`SOLVER_WORKER_AS_LIMIT_MB`, default 1500 MiB).
+- `SolverPool` catches `BrokenProcessPool` and parent-side `asyncio.TimeoutError`, recreates the executor, and retries once. Second failure raises `SolverError` / `SolverTimeoutError`.
+- Wired in `src/api/main.py` lifespan, exposed via `core.optimizer.pool.get_solver_pool()`. `src/core/controller.py` dispatches through the pool when one is installed; falls back to `asyncio.to_thread(optimize, …)` when no pool is set (unit tests and emergency disable).
+- Disable for local debugging only: `SOLVER_PROCESS_POOL_DISABLED=true`.
 
 **Julia reference implementation:** `optimization/mip_solver.jl` (not used in production; for algorithm validation only)
 
