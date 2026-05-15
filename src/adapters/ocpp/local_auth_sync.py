@@ -151,6 +151,12 @@ class _ChargePointProto(Protocol):
         update_type: str = ...,
         local_authorization_list: Optional[list[dict]] = ...,
     ) -> str: ...
+    async def send_local_list_with_error(
+        self,
+        list_version: int,
+        update_type: str = ...,
+        local_authorization_list: Optional[list[dict]] = ...,
+    ) -> tuple[str, bool]: ...
 
     async def change_configuration(self, key: str, value: str) -> str: ...
     async def change_configuration_with_error(self, key: str, value: str) -> tuple[str, bool]: ...
@@ -706,25 +712,28 @@ async def sync_charger(
 
     send_local_list_raised = False
     send_local_list_transport_error = False
-    try:
-        status = await cp.send_local_list(
+    method = getattr(cp, "send_local_list_with_error", None)
+    if callable(method):
+        status, send_local_list_transport_error = await method(
             list_version=new_version,
             update_type="Full",
             local_authorization_list=entries,
         )
-        send_local_list_transport_error = (
-            getattr(cp, "_last_send_local_list_had_error", False) is True
-        )
-    except Exception as exc:
-        # FleetChargePoint.send_local_list catches its own exceptions, but
-        # a duck-typed fake might not — keep the orchestration safe.
-        logger.error(
-            "local_auth_sync station=%s send_local_list raised: %s",
-            station_id,
-            exc,
-        )
-        send_local_list_raised = True
-        status = "Failed"
+    else:
+        try:
+            status = await cp.send_local_list(
+                list_version=new_version,
+                update_type="Full",
+                local_authorization_list=entries,
+            )
+        except Exception as exc:
+            logger.error(
+                "local_auth_sync station=%s send_local_list raised: %s",
+                station_id,
+                exc,
+            )
+            send_local_list_raised = True
+            status = "Failed"
 
     # Fallback caching: record a firmware-scoped negative when the charger
     # itself reports the feature as broken so the next reconnect

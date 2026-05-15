@@ -175,6 +175,29 @@ def _requires_abb_safe_measurands(vendor: Optional[str]) -> bool:
     return _is_abb_or_unknown_vendor(vendor)
 
 
+def _guard_abb_measurands(
+    *, vendor: Optional[str], key: str, value: str, charge_point_id: str
+) -> Optional[str]:
+    """Return refusal status when ABB-safe measurand guard should block."""
+    if _requires_abb_safe_measurands(vendor) and key in {
+        "MeterValuesSampledData",
+        "MeterValuesAlignedData",
+    }:
+        requested = {m.strip() for m in value.split(",") if m.strip()}
+        unsupported = requested - _ABB_SAFE_MEASURANDS
+        if unsupported:
+            logger.warning(
+                "Refusing ChangeConfiguration(%s) to %s: measurands outside "
+                "ABB-safe set: %s. Allowed: %s",
+                key,
+                charge_point_id,
+                sorted(unsupported),
+                sorted(_ABB_SAFE_MEASURANDS),
+            )
+            return "NotSupported"
+    return None
+
+
 def _is_abb_or_unknown_vendor(vendor: Optional[str]) -> bool:
     """Return whether ABB-specific safety constraints should be applied."""
     if not vendor or not vendor.strip():
@@ -1084,22 +1107,11 @@ class FleetChargePoint(CP16):
         unknown-vendor-before-boot) chargers, the call is refused with
         ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
-        if _requires_abb_safe_measurands(self.vendor) and key in {
-            "MeterValuesSampledData",
-            "MeterValuesAlignedData",
-        }:
-            requested = {m.strip() for m in value.split(",") if m.strip()}
-            unsupported = requested - _ABB_SAFE_MEASURANDS
-            if unsupported:
-                logger.warning(
-                    "Refusing ChangeConfiguration(%s) to %s: measurands outside "
-                    "ABB-safe set: %s. Allowed: %s",
-                    key,
-                    self.id,
-                    sorted(unsupported),
-                    sorted(_ABB_SAFE_MEASURANDS),
-                )
-                return "NotSupported"
+        blocked_status = _guard_abb_measurands(
+            vendor=self.vendor, key=key, value=value, charge_point_id=self.id
+        )
+        if blocked_status is not None:
+            return blocked_status
 
         try:
             payload = call.ChangeConfiguration(key=key, value=value)
@@ -1113,22 +1125,11 @@ class FleetChargePoint(CP16):
 
     async def change_configuration_with_error(self, key: str, value: str) -> tuple[str, bool]:
         """Change a configuration key and return (status, transport_error)."""
-        if _requires_abb_safe_measurands(self.vendor) and key in {
-            "MeterValuesSampledData",
-            "MeterValuesAlignedData",
-        }:
-            requested = {m.strip() for m in value.split(",") if m.strip()}
-            unsupported = requested - _ABB_SAFE_MEASURANDS
-            if unsupported:
-                logger.warning(
-                    "Refusing ChangeConfiguration(%s) to %s: measurands outside "
-                    "ABB-safe set: %s. Allowed: %s",
-                    key,
-                    self.id,
-                    sorted(unsupported),
-                    sorted(_ABB_SAFE_MEASURANDS),
-                )
-                return "NotSupported", False
+        blocked_status = _guard_abb_measurands(
+            vendor=self.vendor, key=key, value=value, charge_point_id=self.id
+        )
+        if blocked_status is not None:
+            return blocked_status, False
 
         try:
             payload = call.ChangeConfiguration(key=key, value=value)
@@ -1239,6 +1240,62 @@ class FleetChargePoint(CP16):
             self._last_send_local_list_had_error = True
             logger.error(f"Error SendLocalList to {self.id}: {e}")
             return "Failed"
+
+    async def send_local_list_with_error(
+        self,
+        list_version: int,
+        update_type: str = "Full",
+        local_authorization_list: Optional[list[dict]] = None,
+    ) -> tuple[str, bool]:
+        """Send local list and return (status, transport_error)."""
+        if os.getenv("OCPP_DISABLE_LOCAL_AUTH_LIST", "false").lower() == "true":
+            logger.info(
+                "SendLocalList to %s suppressed by OCPP_DISABLE_LOCAL_AUTH_LIST=true; use central Authorize",
+                self.id,
+            )
+            return "NotSupported", False
+
+        if (
+            _is_abb_or_unknown_vendor(self.vendor)
+            and local_authorization_list is not None
+            and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
+        ):
+            logger.warning(
+                "SendLocalList to %s: ABB/unknown vendor with %d entries exceeds "
+                "%d-entry cap; refusing — caller should fall back to central Authorize.",
+                self.id,
+                len(local_authorization_list),
+                _LOCAL_LIST_MAX_ENTRIES,
+            )
+            return "NotSupported", False
+
+        if (
+            local_authorization_list is not None
+            and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
+        ):
+            logger.warning(
+                "SendLocalList to %s: %d entries exceeds ABB-specific %d-entry cap, "
+                "but charger vendor is %r so request is allowed.",
+                self.id,
+                len(local_authorization_list),
+                _LOCAL_LIST_MAX_ENTRIES,
+                self.vendor,
+            )
+
+        try:
+            kwargs: dict[str, Any] = {
+                "list_version": list_version,
+                "update_type": update_type,
+            }
+            if local_authorization_list is not None:
+                kwargs["local_authorization_list"] = local_authorization_list
+            payload = call.SendLocalList(**kwargs)
+            response = await self.call(payload)
+            logger.info(f"SendLocalList to {self.id}: {response.status}")
+            return response.status, False
+        except Exception as e:
+            logger.error(f"Error SendLocalList to {self.id}: {e}")
+            return "Failed", True
 
     async def get_local_list_version(self) -> int:
         """Get current local list version. Returns version number (-1 on error)."""
