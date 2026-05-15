@@ -1107,21 +1107,8 @@ class FleetChargePoint(CP16):
         unknown-vendor-before-boot) chargers, the call is refused with
         ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
-        blocked_status = _guard_abb_measurands(
-            vendor=self.vendor, key=key, value=value, charge_point_id=self.id
-        )
-        if blocked_status is not None:
-            return blocked_status
-
-        try:
-            payload = call.ChangeConfiguration(key=key, value=value)
-            response = await self.call(payload)
-            _record_ocpp_metric("outbound", "ChangeConfiguration", response.status)
-            logger.info(f"ChangeConfiguration to {self.id}: {key}={value} -> {response.status}")
-            return response.status
-        except Exception as e:
-            logger.error(f"Error ChangeConfiguration to {self.id}: {e}")
-            return "Rejected"
+        status, _ = await self.change_configuration_with_error(key, value)
+        return status
 
     async def change_configuration_with_error(self, key: str, value: str) -> tuple[str, bool]:
         """Change a configuration key and return (status, transport_error)."""
@@ -1190,56 +1177,12 @@ class FleetChargePoint(CP16):
         # Best-effort transport signal for higher-level orchestration logic.
         # True means status came from local exception fallback, not charger reply.
         self._last_send_local_list_had_error = False
-
-        if os.getenv("OCPP_DISABLE_LOCAL_AUTH_LIST", "false").lower() == "true":
-            logger.info(
-                "SendLocalList to %s suppressed by OCPP_DISABLE_LOCAL_AUTH_LIST=true; use central Authorize",
-                self.id,
-            )
-            return "NotSupported"
-
-        if (
-            _is_abb_or_unknown_vendor(self.vendor)
-            and local_authorization_list is not None
-            and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
-        ):
-            logger.warning(
-                "SendLocalList to %s: ABB/unknown vendor with %d entries exceeds "
-                "%d-entry cap; refusing — caller should fall back to central Authorize.",
-                self.id,
-                len(local_authorization_list),
-                _LOCAL_LIST_MAX_ENTRIES,
-            )
-            return "NotSupported"
-
-        if (
-            local_authorization_list is not None
-            and len(local_authorization_list) > _LOCAL_LIST_MAX_ENTRIES
-        ):
-            logger.warning(
-                "SendLocalList to %s: %d entries exceeds ABB-specific %d-entry cap, "
-                "but charger vendor is %r so request is allowed.",
-                self.id,
-                len(local_authorization_list),
-                _LOCAL_LIST_MAX_ENTRIES,
-                self.vendor,
-            )
-
-        try:
-            kwargs: dict[str, Any] = {
-                "list_version": list_version,
-                "update_type": update_type,
-            }
-            if local_authorization_list is not None:
-                kwargs["local_authorization_list"] = local_authorization_list
-            payload = call.SendLocalList(**kwargs)
-            response = await self.call(payload)
-            logger.info(f"SendLocalList to {self.id}: {response.status}")
-            return response.status
-        except Exception as e:
+        status, transport_error = await self.send_local_list_with_error(
+            list_version, update_type, local_authorization_list
+        )
+        if transport_error:
             self._last_send_local_list_had_error = True
-            logger.error(f"Error SendLocalList to {self.id}: {e}")
-            return "Failed"
+        return status
 
     async def send_local_list_with_error(
         self,
