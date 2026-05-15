@@ -153,6 +153,7 @@ class _ChargePointProto(Protocol):
     ) -> str: ...
 
     async def change_configuration(self, key: str, value: str) -> str: ...
+    async def change_configuration_with_error(self, key: str, value: str) -> tuple[str, bool]: ...
 
     async def get_configuration(self, keys: Optional[list[str]] = ...) -> dict: ...
 
@@ -338,6 +339,16 @@ async def _bootstrap_local_auth_config(
     we observed at HRX Vilnius (~10-60 s) and the bootstrap never gets
     to fail before the connection is gone.
     """
+    async def _change_configuration_with_error(key: str, value: str) -> tuple[str, bool]:
+        method = getattr(cp, "change_configuration_with_error", None)
+        if method is not None and (
+            "change_configuration_with_error" in vars(cp)
+            or hasattr(type(cp), "change_configuration_with_error")
+        ):
+            return await method(key, value)
+        status = await cp.change_configuration(key, value)
+        return status, False
+
     if not _BOOTSTRAP_CONFIG_KEYS:
         return BootstrapOutcome.SUCCESS  # pragma: no cover — defensive
 
@@ -346,9 +357,10 @@ async def _bootstrap_local_auth_config(
 
     # --- Critical key: fail-fast ---
     critical_status: Optional[str] = None
+    critical_transport_error = False
     try:
-        critical_status = await asyncio.wait_for(
-            cp.change_configuration(critical_key, critical_value),
+        critical_status, critical_transport_error = await asyncio.wait_for(
+            _change_configuration_with_error(critical_key, critical_value),
             timeout=_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
@@ -374,9 +386,6 @@ async def _bootstrap_local_auth_config(
         )
         return BootstrapOutcome.UNSUPPORTED
 
-    critical_transport_error = (
-        getattr(cp, "_last_change_configuration_had_error", False) is True
-    )
     if critical_status not in {"Accepted", "RebootRequired"}:
         if critical_transport_error:
             logger.warning(
@@ -401,8 +410,8 @@ async def _bootstrap_local_auth_config(
     # --- Auxiliary keys: best-effort, do not gate SendLocalList ---
     for key, value in auxiliary:
         try:
-            status = await asyncio.wait_for(
-                cp.change_configuration(key, value),
+            status, _ = await asyncio.wait_for(
+                _change_configuration_with_error(key, value),
                 timeout=_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
             )
         except asyncio.TimeoutError:

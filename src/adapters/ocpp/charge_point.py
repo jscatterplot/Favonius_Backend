@@ -1084,10 +1084,6 @@ class FleetChargePoint(CP16):
         unknown-vendor-before-boot) chargers, the call is refused with
         ``NotSupported`` to avoid known reboot-loop firmware behavior.
         """
-        # Best-effort transport signal for higher-level orchestration logic.
-        # True means status came from local exception fallback, not charger reply.
-        self._last_change_configuration_had_error = False
-
         if _requires_abb_safe_measurands(self.vendor) and key in {
             "MeterValuesSampledData",
             "MeterValuesAlignedData",
@@ -1112,9 +1108,37 @@ class FleetChargePoint(CP16):
             logger.info(f"ChangeConfiguration to {self.id}: {key}={value} -> {response.status}")
             return response.status
         except Exception as e:
-            self._last_change_configuration_had_error = True
             logger.error(f"Error ChangeConfiguration to {self.id}: {e}")
             return "Rejected"
+
+    async def change_configuration_with_error(self, key: str, value: str) -> tuple[str, bool]:
+        """Change a configuration key and return (status, transport_error)."""
+        if _requires_abb_safe_measurands(self.vendor) and key in {
+            "MeterValuesSampledData",
+            "MeterValuesAlignedData",
+        }:
+            requested = {m.strip() for m in value.split(",") if m.strip()}
+            unsupported = requested - _ABB_SAFE_MEASURANDS
+            if unsupported:
+                logger.warning(
+                    "Refusing ChangeConfiguration(%s) to %s: measurands outside "
+                    "ABB-safe set: %s. Allowed: %s",
+                    key,
+                    self.id,
+                    sorted(unsupported),
+                    sorted(_ABB_SAFE_MEASURANDS),
+                )
+                return "NotSupported", False
+
+        try:
+            payload = call.ChangeConfiguration(key=key, value=value)
+            response = await self.call(payload)
+            _record_ocpp_metric("outbound", "ChangeConfiguration", response.status)
+            logger.info(f"ChangeConfiguration to {self.id}: {key}={value} -> {response.status}")
+            return response.status, False
+        except Exception as e:
+            logger.error(f"Error ChangeConfiguration to {self.id}: {e}")
+            return "Rejected", True
 
     async def get_configuration(self, keys: Optional[list[str]] = None) -> dict:
         """Get configuration values from charger.
