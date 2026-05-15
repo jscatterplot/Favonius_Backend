@@ -20,6 +20,7 @@ from .models import (
     ReadinessReport,
 )
 from .optimizer import optimize
+from .optimizer.pool import get_solver_pool
 from .state.assembler import StateAssembler
 from .state.readiness import build_snapshot, evaluate_readiness
 from .state.triggers import TriggerConfig, TriggerMonitor
@@ -290,11 +291,26 @@ class DepotController:
 
         for attempt in range(max_retries + 1):
             try:
-                # Build and solve
+                # Build and solve. Route through the SolverPool when one is
+                # installed (production) so the MILP solve runs in a child
+                # process and the asyncio loop stays responsive. With no pool
+                # set (unit tests, fallback), drop to a thread so a patched
+                # ``optimize`` symbol is still picked up.
                 try:
-                    result = optimize(
-                        state, self.config, time_limit=self.controller_config.optimization_timeout
-                    )
+                    pool = get_solver_pool()
+                    if pool is not None:
+                        result = await pool.solve(
+                            state,
+                            self.config,
+                            time_limit=self.controller_config.optimization_timeout,
+                        )
+                    else:
+                        result = await asyncio.to_thread(
+                            optimize,
+                            state,
+                            self.config,
+                            time_limit=self.controller_config.optimization_timeout,
+                        )
                 except Exception as e:
                     error_msg = str(e).lower()
                     if "timeout" in error_msg or "time limit" in error_msg:
