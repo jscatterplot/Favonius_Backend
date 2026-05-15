@@ -713,7 +713,10 @@ async def sync_charger(
     send_local_list_raised = False
     send_local_list_transport_error = False
     method = getattr(cp, "send_local_list_with_error", None)
-    if callable(method):
+    if method is not None and (
+        "send_local_list_with_error" in vars(cp)
+        or hasattr(type(cp), "send_local_list_with_error")
+    ):
         status, send_local_list_transport_error = await method(
             list_version=new_version,
             update_type="Full",
