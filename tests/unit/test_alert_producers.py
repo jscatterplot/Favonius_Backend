@@ -161,17 +161,27 @@ class _StubAssembler:
 class _StubController:
     """Minimal stand-in for DepotController exposing what the helper needs."""
 
-    def __init__(self, depot_id: str, organization_id: UUID, pool):
+    def __init__(
+        self,
+        depot_id: str,
+        organization_id: UUID,
+        pool,
+        static_pool=None,
+    ):
         self.depot_id = depot_id
         self.assembler = _StubAssembler(organization_id)
         pools = MagicMock()
         pools.ts = pool
+        # Liveness guard reads from the static (Supabase) pool. Default to a
+        # pool that reports the depot as live so existing tests keep passing.
+        pools.static = static_pool or _make_live_static_pool()
         self.pools = pools
 
-    # Attach the real method under test.
+    # Attach the real methods under test.
     from src.core.controller import DepotController  # noqa: PLC0415
 
     _emit_readiness_alerts = DepotController._emit_readiness_alerts
+    _depot_exists_in_supabase = DepotController._depot_exists_in_supabase
 
 
 def _make_pool():
@@ -180,6 +190,20 @@ def _make_pool():
     pool.acquire.return_value.__aenter__.return_value = conn
     pool.acquire.return_value.__aexit__.return_value = None
     return pool, conn
+
+
+def _make_live_static_pool():
+    """Return a static-pool mock whose ``sites`` lookup returns one row."""
+    pool, conn = _make_pool()
+    conn.fetchrow = AsyncMock(return_value={"?column?": 1})
+    return pool
+
+
+def _make_dead_static_pool():
+    """Return a static-pool mock whose ``sites`` lookup returns no row."""
+    pool, conn = _make_pool()
+    conn.fetchrow = AsyncMock(return_value=None)
+    return pool
 
 
 class TestMissingInputProducer:
@@ -349,3 +373,82 @@ class TestStaleTelemetryProducer:
             await DepotController._emit_readiness_alerts(ctrl, snapshot, run_status=None)
 
         upsert.assert_not_awaited()
+
+
+class TestStaleDepotSupabaseGuard:
+    """Liveness guard for the depot's Supabase ``sites`` row.
+
+    Prevents the controller from emitting alerts (and the dispatcher from
+    logging "no recipients for org=…") after the org has been deleted
+    upstream in Supabase but the local TimescaleDB org mirror still exists.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_sites_row_skips_alert_emission(self):
+        org_id = uuid4()
+        depot_id = str(uuid4())
+        pool, _ = _make_pool()
+        ctrl = _StubController(
+            depot_id, org_id, pool, static_pool=_make_dead_static_pool()
+        )
+        snapshot = _StubSnapshot(
+            readiness=_StubReadiness(
+                is_blocking=True,
+                missing_inputs=["building_load"],
+                degraded_reasons=[],
+                assumptions={},
+            )
+        )
+
+        with patch(
+            "src.notifications.alerts.upsert_alert", new_callable=AsyncMock
+        ) as upsert, patch(
+            "src.notifications.alerts.resolve_alert", new_callable=AsyncMock
+        ) as resolve:
+            await ctrl._emit_readiness_alerts(snapshot, run_status=None)
+
+        upsert.assert_not_awaited()
+        resolve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_supabase_error_fails_open_and_still_emits(self):
+        """Transient Supabase errors should NOT silence the alert pipeline."""
+        org_id = uuid4()
+        depot_id = str(uuid4())
+        pool, _ = _make_pool()
+
+        # Static pool that raises on fetchrow — represents a Supabase blip.
+        bad_static, bad_conn = _make_pool()
+        bad_conn.fetchrow = AsyncMock(side_effect=RuntimeError("connection reset"))
+
+        ctrl = _StubController(depot_id, org_id, pool, static_pool=bad_static)
+        snapshot = _StubSnapshot(
+            readiness=_StubReadiness(
+                is_blocking=True,
+                missing_inputs=["building_load"],
+                degraded_reasons=[],
+                assumptions={},
+            )
+        )
+
+        with patch(
+            "src.notifications.alerts.upsert_alert", new_callable=AsyncMock
+        ) as upsert:
+            await ctrl._emit_readiness_alerts(snapshot, run_status=None)
+
+        upsert.assert_awaited_once()
+        assert upsert.await_args.kwargs["alert_type"] == "missing_input"
+
+    @pytest.mark.asyncio
+    async def test_depot_exists_in_supabase_returns_true_on_hit(self):
+        pool, _ = _make_pool()
+        ctrl = _StubController(str(uuid4()), uuid4(), pool)
+        assert await ctrl._depot_exists_in_supabase() is True
+
+    @pytest.mark.asyncio
+    async def test_depot_exists_in_supabase_returns_false_on_miss(self):
+        pool, _ = _make_pool()
+        ctrl = _StubController(
+            str(uuid4()), uuid4(), pool, static_pool=_make_dead_static_pool()
+        )
+        assert await ctrl._depot_exists_in_supabase() is False

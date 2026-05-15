@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -85,6 +86,10 @@ def mock_timescale() -> MagicMock:
     tc.next_transaction_id = AsyncMock(return_value=4242)
     tc.next_charging_profile_id = AsyncMock(return_value=123456)
     tc.store_security_event = AsyncMock()
+    # Default to "DB confirms open" so the existing ConcurrentTx-rejection
+    # test path keeps its semantics. Tests that exercise the self-heal
+    # branch override this per-test to return False.
+    tc.is_transaction_open = AsyncMock(return_value=True)
     return tc
 
 
@@ -274,6 +279,247 @@ class TestOCPP16SessionForceBootNotification:
         session._cp.trigger_message = AsyncMock(side_effect=RuntimeError("boom"))
         monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
         await session._force_boot_notification()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_triggers_after_grace_when_inbound_frames_received(
+        self, session, monkeypatch
+    ) -> None:
+        """If frames arrive but BootNotification does not, still trigger.
+
+        We only wait through the primary grace window so the task is less
+        likely to be canceled on flappy 10-20s reconnect cycles before
+        ``_on_boot`` can run for that connection.
+        """
+        session._cp.last_boot_at = None
+        session._cp.trigger_message = AsyncMock()
+        # Simulate inbound frames arriving before the grace deadline.
+        session._inbound_frame_count = 2
+        monkeypatch.setattr("src.websocket_handler.ocpp16_adapter.BOOT_TRIGGER_GRACE_SECONDS", 0)
+        await session._force_boot_notification()
+        session._cp.trigger_message.assert_awaited_once_with("BootNotification")
+
+    @pytest.mark.asyncio
+    async def test_inbound_frame_counter_incremented_on_message_received(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """``_on_message_received`` must bump the per-session frame counter
+        so the boot-trigger gate sees it; every OCPP frame counts, including
+        the ones the handler doesn't act on (action=null responses, etc.)."""
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        s = OCPP16Session(
+            station_id="frame_count_001",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+        )
+        assert s._inbound_frame_count == 0
+        await s._on_message_received()
+        await s._on_message_received()
+        assert s._inbound_frame_count == 2
+
+
+class TestOCPP16SessionMeteringConfigCache:
+    """Per-firmware idempotency for ``_push_metering_config``.
+
+    Without the cache the handler re-runs the full sequential
+    ``ChangeConfiguration`` storm on every WebSocket reconnect. ABB Terra AC
+    chargers that drop and reconnect every ~60 s never escape the bootstrap
+    long enough to handle real OCPP traffic — this is the HRX Vilnius
+    reconfig loop in production logs from 2026-05-14.
+    """
+
+    @pytest.fixture()
+    def _session_with_pool(self, mock_websocket, mock_timescale, mock_message_handler):
+        """Wires a fake asyncpg pool onto the session so ``fetchrow`` and
+        ``execute`` calls in the cache helpers land somewhere predictable.
+
+        The fake exposes ``fetchrow_return`` and ``executed`` attributes the
+        tests can assert on. ``sqlstate`` can be set to simulate the
+        "migration 014 not applied" path (column missing → sqlstate 42703).
+        """
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        class _FakePool:
+            def __init__(self) -> None:
+                self.fetchrow_return: Any = None
+                self.fetchrow_raises: Optional[Exception] = None
+                self.execute_raises: Optional[Exception] = None
+                self.executed: list[tuple[str, tuple[Any, ...]]] = []
+
+            async def fetchrow(self, _query: str, *args: Any) -> Any:
+                if self.fetchrow_raises is not None:
+                    raise self.fetchrow_raises
+                return self.fetchrow_return
+
+            async def execute(self, query: str, *args: Any) -> None:
+                if self.execute_raises is not None:
+                    raise self.execute_raises
+                self.executed.append((query, args))
+
+        s = OCPP16Session(
+            station_id="metering_001",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+        )
+        pool = _FakePool()
+        # Mirror the production wiring: WS handler exposes the static pool
+        # via a callable on the timescale client.
+        mock_timescale._static_pool = lambda: pool
+        return s, pool
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_change_configuration(self, _session_with_pool) -> None:
+        """Same firmware as last successful push → no ChangeConfiguration
+        calls. This is the core HRX Vilnius fix."""
+        s, pool = _session_with_pool
+        s._cp.firmware_version = "V1.8.36"
+        s._cp.change_configuration = AsyncMock()
+        pool.fetchrow_return = {
+            "metering_config_applied_firmware": "V1.8.36",
+        }
+
+        await s._push_metering_config()
+
+        s._cp.change_configuration.assert_not_called()
+        # Cache hit doesn't write either — _record_metering_config_applied
+        # is only called after a fresh push completes.
+        assert pool.executed == []
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_pushes_all_keys_and_stamps_firmware(self, _session_with_pool) -> None:
+        """Different firmware → push every key, then stamp the cache row."""
+        s, pool = _session_with_pool
+        s._cp.firmware_version = "V1.8.37"
+        s._cp.change_configuration = AsyncMock(return_value="Accepted")
+        # Previously applied on an older firmware.
+        pool.fetchrow_return = {
+            "metering_config_applied_firmware": "V1.8.36",
+        }
+
+        await s._push_metering_config()
+
+        # Every key in _METERING_CONFIG_KEYS should have been pushed.
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        expected_calls = len(OCPP16Session._METERING_CONFIG_KEYS)
+        assert s._cp.change_configuration.await_count == expected_calls
+        # One UPDATE stamping metering_config_applied_firmware to V1.8.37.
+        assert len(pool.executed) == 1
+        update_sql, update_args = pool.executed[0]
+        assert "metering_config_applied_firmware" in update_sql
+        assert update_args[0] == "V1.8.37"
+        assert update_args[1] == "metering_001"
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_does_not_stamp_cache(self, _session_with_pool) -> None:
+        """If even one key returns ``Rejected``/``NotSupported``/timeout, the
+        cache is not stamped — so the next reconnect retries the full set
+        rather than skipping based on a half-applied bootstrap."""
+        s, pool = _session_with_pool
+        s._cp.firmware_version = "V1.8.36"
+        # First key accepted, second rejected, third accepted again.
+        s._cp.change_configuration = AsyncMock(side_effect=["Accepted", "Rejected", "Accepted"])
+        pool.fetchrow_return = None  # never cached
+
+        await s._push_metering_config()
+
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        assert s._cp.change_configuration.await_count == len(OCPP16Session._METERING_CONFIG_KEYS)
+        # No UPDATE — partial success doesn't earn a cache stamp.
+        assert pool.executed == []
+
+    @pytest.mark.asyncio
+    async def test_reboot_required_counts_as_applied(self, _session_with_pool) -> None:
+        """``RebootRequired`` means the charger accepted the new value and
+        will apply it on next restart. Re-pushing on every reconnect would
+        produce the same response indefinitely — treat it as success for
+        cache purposes."""
+        s, pool = _session_with_pool
+        s._cp.firmware_version = "V1.8.36"
+        s._cp.change_configuration = AsyncMock(return_value="RebootRequired")
+        pool.fetchrow_return = None
+
+        await s._push_metering_config()
+
+        # Cache stamped because every key returned a success status.
+        assert len(pool.executed) == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_column_falls_back_to_always_push(self, _session_with_pool) -> None:
+        """Pre-migration-014 DB: SELECT raises sqlstate 42703. The cache
+        check must return False (cache miss) so the bootstrap still runs."""
+        s, pool = _session_with_pool
+        s._cp.firmware_version = "V1.8.36"
+        s._cp.change_configuration = AsyncMock(return_value="Accepted")
+
+        # asyncpg.UndefinedColumnError carries ``sqlstate='42703'``; the
+        # production code only reads that attribute, so a plain exception
+        # with it monkey-patched on works just as well and keeps the test
+        # independent of asyncpg's import surface.
+        def _undefined_column_error() -> Exception:
+            exc = RuntimeError('column "metering_config_applied_firmware" does not exist')
+            exc.sqlstate = "42703"  # type: ignore[attr-defined]
+            return exc
+
+        pool.fetchrow_raises = _undefined_column_error()
+        # Same exception class on the write side so the stamp is silently
+        # skipped (no crash, no infinite retry).
+        pool.execute_raises = _undefined_column_error()
+
+        await s._push_metering_config()
+
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        # All keys still pushed because the cache lookup failed open.
+        assert s._cp.change_configuration.await_count == len(OCPP16Session._METERING_CONFIG_KEYS)
+
+    @pytest.mark.asyncio
+    async def test_unknown_firmware_does_not_query_cache(self, _session_with_pool) -> None:
+        """Without ``firmware_version`` we cannot scope a cache lookup, so we
+        always push and skip the stamp (nothing to key off)."""
+        s, pool = _session_with_pool
+        s._cp.firmware_version = None
+        s._cp.change_configuration = AsyncMock(return_value="Accepted")
+
+        # Sentinel: if fetchrow runs, the test should fail because the
+        # cache check shouldn't happen without a firmware string.
+        async def _explode(*_a: Any, **_kw: Any) -> Any:
+            raise AssertionError("fetchrow called without firmware_version")
+
+        pool.fetchrow = _explode  # type: ignore[assignment]
+
+        await s._push_metering_config()
+
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        assert s._cp.change_configuration.await_count == len(OCPP16Session._METERING_CONFIG_KEYS)
+        # Stamp also skipped (no firmware to record).
+        assert pool.executed == []
+
+    @pytest.mark.asyncio
+    async def test_change_configuration_timeout_blocks_cache_stamp(
+        self, _session_with_pool
+    ) -> None:
+        """A ``ChangeConfiguration`` timeout (charger unresponsive mid-call)
+        leaves the key un-applied; the cache must not be stamped or we
+        would silently skip the retry on the next BootNotification."""
+        s, pool = _session_with_pool
+        s._cp.firmware_version = "V1.8.36"
+        s._cp.change_configuration = AsyncMock(
+            side_effect=[
+                "Accepted",
+                asyncio.TimeoutError(),
+                "Accepted",
+            ]
+        )
+        pool.fetchrow_return = None
+
+        await s._push_metering_config()
+
+        assert pool.executed == []
 
 
 class TestOCPP16SessionSecurityEventPersistence:
@@ -564,10 +810,15 @@ class TestOCPP16SessionCallbacks:
     async def test_on_transaction_start_rejects_active_connector_with_concurrent_tx(
         self, session, mock_timescale, mock_message_handler
     ) -> None:
-        """OCPP 1.6 ConcurrentTx: EVSE already in transaction (not card Blocked)."""
+        """OCPP 1.6 ConcurrentTx: EVSE already in transaction (not card Blocked).
+
+        DB confirms the in-memory cache: tx is genuinely open. Authorize
+        is skipped and the rejection is returned without touching the
+        message handler.
+        """
         from ocpp.v16.enums import AuthorizationStatus
 
-        session._cp.transactions[1] = MagicMock()
+        session._cp.transactions[1] = 999
         result = await session._on_transaction_start(
             cp_id="test_station_001",
             connector_id=1,
@@ -576,7 +827,165 @@ class TestOCPP16SessionCallbacks:
             timestamp="2026-01-01T00:00:00Z",
         )
         assert result == AuthorizationStatus.concurrent_tx
+        mock_timescale.is_transaction_open.assert_awaited_once_with("test_station_001", 999)
         mock_timescale.lookup_id_tag.assert_not_awaited()
+        mock_message_handler._push_to_main_api.assert_not_awaited()
+        # The cache entry survives a confirmed ConcurrentTx so a subsequent
+        # retry against the same still-open tx is also rejected.
+        assert session._cp.transactions[1] == 999
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_self_heals_when_db_says_closed(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        """In-memory cache holds a tx_id whose DB row is already closed.
+
+        Self-heal: drop the cache entry, fall through to Authorize +
+        Accept. This is the production failure mode where orphan recovery
+        closed the row but the WS layer never saw it.
+        """
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        mock_timescale.is_transaction_open = AsyncMock(return_value=False)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert result == AuthorizationStatus.accepted
+        assert 1 not in session._cp.transactions
+        mock_timescale.is_transaction_open.assert_awaited_once_with("test_station_001", 999)
+        mock_timescale.lookup_id_tag.assert_any_await("TAG-001", station_id="test_station_001")
+        assert session._pending_start is not None
+        assert session._pending_start["connector_id"] == 1
+        # meterStart=0 is now coerced to NULL on the deferred-backfill path.
+        # ``_update_session_live_metrics`` will set meter_start_wh from the
+        # first positive Energy.Active.Import.Register MeterValues sample.
+        assert session._pending_start["meter_start_wh"] is None
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_self_heal_clears_current_transaction_id(
+        self, session, mock_timescale
+    ) -> None:
+        """Self-heal also clears the ``current_transaction_id`` backward-compat field."""
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        session._cp.current_transaction_id = 999
+        mock_timescale.is_transaction_open = AsyncMock(return_value=False)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.accepted
+        assert session._cp.current_transaction_id is None
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_self_heal_preserves_other_current_transaction_id(
+        self, session, mock_timescale
+    ) -> None:
+        """Self-healing tx 999 must not clear current_transaction_id when it points elsewhere."""
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        # Connector 2 still has an active session that we should leave alone.
+        session._cp.current_transaction_id = 1234
+        mock_timescale.is_transaction_open = AsyncMock(return_value=False)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.accepted
+        assert session._cp.current_transaction_id == 1234
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_db_error_keeps_concurrent_tx_default(
+        self, session, mock_timescale, mock_message_handler
+    ) -> None:
+        """A DB blip on ``is_transaction_open`` must fail closed (reject), not open."""
+        from ocpp.v16.enums import AuthorizationStatus
+
+        session._cp.transactions[1] = 999
+        mock_timescale.is_transaction_open = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.concurrent_tx
+        mock_timescale.lookup_id_tag.assert_not_awaited()
+        mock_message_handler._push_to_main_api.assert_not_awaited()
+        # Cache entry preserved so subsequent retries continue to fail
+        # closed until the DB recovers.
+        assert session._cp.transactions[1] == 999
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_post_authorize_race_check_blocks_sibling(
+        self, session, mock_message_handler
+    ) -> None:
+        """Sibling StartTransaction beats us between Authorize and _pending_start stash.
+
+        Simulates a charger retry storm: the in-memory cache is empty when
+        we enter, but a concurrent task populates ``_cp.transactions[1]``
+        while we ``await self._authz.authorize(...)``. The post-Authorize
+        re-check must catch this and return ConcurrentTx without stashing
+        ``_pending_start`` (which would otherwise produce a second open
+        ``charging_sessions`` row on the same connector).
+        """
+        from ocpp.v16.enums import AuthorizationStatus
+
+        from src.websocket_handler.rfid_authorization import (
+            RFIDAuthDecision,
+            RFIDAuthStatus,
+        )
+
+        async def _authorize_then_seed_dict(cp_id, id_tag, source):
+            # A sibling racer stashed its tx in the dict while we awaited.
+            session._cp.transactions[1] = 5555
+            return RFIDAuthDecision(
+                status=RFIDAuthStatus.ACCEPTED,
+                source="test",
+                reason="race-test",
+                vehicle_id="vehicle-1",
+                driver_id=None,
+                card_id=None,
+            )
+
+        session._authz = MagicMock()
+        session._authz.authorize = AsyncMock(side_effect=_authorize_then_seed_dict)
+
+        result = await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+
+        assert result == AuthorizationStatus.concurrent_tx
+        # _pending_start must NOT be populated — that would let the
+        # framework call _next_transaction_id and create a duplicate row.
+        assert session._pending_start is None
         mock_message_handler._push_to_main_api.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -914,6 +1323,7 @@ class TestOCPP16SessionRecovery:
 
     @pytest.mark.asyncio
     async def test_on_boot_reloads_transactions_from_db(self, session, mock_timescale) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         mock_timescale.fetch_open_sessions = AsyncMock(
             return_value=[
                 {"transaction_id": 555, "connector_id": 1},
@@ -933,9 +1343,11 @@ class TestOCPP16SessionRecovery:
 
         assert session._cp.transactions[1] == 555
         assert session._cp.transactions[2] == 556
+        mock_timescale.clear_sessions_seen.assert_awaited_once_with("test_station_001")
 
     @pytest.mark.asyncio
     async def test_on_boot_cancels_previous_delayed_replay(self, session, mock_timescale) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         mock_timescale.fetch_open_sessions = AsyncMock(return_value=[])
         previous = MagicMock()
         previous.done.return_value = False
@@ -960,6 +1372,7 @@ class TestOCPP16SessionRecovery:
     async def test_on_boot_keeps_newest_transaction_for_connector(
         self, session, mock_timescale
     ) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         older = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc)
         newer = datetime(2026, 4, 26, 12, 5, tzinfo=timezone.utc)
         mock_timescale.fetch_open_sessions = AsyncMock(
@@ -983,6 +1396,7 @@ class TestOCPP16SessionRecovery:
 
     @pytest.mark.asyncio
     async def test_on_boot_tolerates_fetch_failure(self, session, mock_timescale) -> None:
+        mock_timescale.clear_sessions_seen = AsyncMock()
         mock_timescale.fetch_open_sessions = AsyncMock(side_effect=RuntimeError("db down"))
         # Should not raise — failures are best-effort.
         await session._on_boot(
@@ -1070,6 +1484,69 @@ class TestOCPP16SessionRecovery:
         assert session._pending_start["meter_start_wh"] == 17500
 
     @pytest.mark.asyncio
+    async def test_on_transaction_start_defers_zero_meter_start_to_none(
+        self, session, mock_timescale
+    ) -> None:
+        """meterStart=0 from ABB Terra AC must be coerced to NULL ("deferred").
+
+        The poison 0 would otherwise be rejected forever by
+        ``compute_energy_kwh`` and the live UPDATE's CASE gate, voiding
+        the session's energy delta. Backfilling NULL from the first
+        MeterValues Energy.Active.Import.Register sample is the
+        recovery path.
+        """
+        await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=0,
+            timestamp="2026-04-26T12:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert session._pending_start is not None
+        assert session._pending_start["meter_start_wh"] is None
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_defers_negative_meter_start_to_none(
+        self, session, mock_timescale
+    ) -> None:
+        """Defensive: a charger sending a negative meterStart is also poison."""
+        await session._on_transaction_start(
+            cp_id="test_station_001",
+            connector_id=1,
+            id_tag="TAG-001",
+            meter_start=-5,
+            timestamp="2026-04-26T12:00:00Z",
+        )
+        await asyncio.sleep(0)
+
+        assert session._pending_start is not None
+        assert session._pending_start["meter_start_wh"] is None
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_start_logs_deferred_on_zero(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """Deferred path emits an INFO log so the deferred state is greppable."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_start(
+                cp_id="test_station_001",
+                connector_id=1,
+                id_tag="TAG-001",
+                meter_start=0,
+                timestamp="2026-04-26T12:00:00Z",
+            )
+            await asyncio.sleep(0)
+
+        infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+        assert any(
+            "deferring meter_start_wh" in m and "test_station_001" in m for m in infos
+        ), f"Expected deferred INFO log; got: {infos}"
+
+    @pytest.mark.asyncio
     async def test_next_transaction_id_persists_meter_start_wh(
         self, session, mock_timescale
     ) -> None:
@@ -1106,7 +1583,11 @@ class TestOCPP16SessionRecovery:
 
         # Simulates the DB-side CASE gate leaving energy_delivered_kwh NULL.
         mock_timescale.close_open_session = AsyncMock(
-            return_value={"meter_start_wh": 9000, "energy_delivered_kwh": None}
+            return_value={
+                "meter_start_wh": 9000,
+                "last_meter_wh": 9100,
+                "energy_delivered_kwh": None,
+            }
         )
 
         with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
@@ -1128,15 +1609,23 @@ class TestOCPP16SessionRecovery:
     async def test_on_transaction_stop_warns_on_missing_meter_start(
         self, session, mock_timescale, caplog
     ) -> None:
-        """Legacy row inserted before mig 036 has meter_start_wh NULL.
+        """Legacy row with meter_start_wh NULL but last_meter_wh present.
 
-        Close cannot compute a delta; operator gets a WARN with the
-        reason tag so they can reconcile manually.
+        Distinct from the deferred-and-never-backfilled case: here the
+        charger DID send MeterValues with register samples (so last_meter_wh
+        is non-NULL) but for some reason meter_start_wh is missing — most
+        likely a row predating migration 036 that was reopened after the
+        upgrade. Classifier returns ``missing_meter_start`` so the operator
+        knows this is a legacy reconcile, not a measurand-config issue.
         """
         import logging
 
         mock_timescale.close_open_session = AsyncMock(
-            return_value={"meter_start_wh": None, "energy_delivered_kwh": None}
+            return_value={
+                "meter_start_wh": None,
+                "last_meter_wh": 5000,
+                "energy_delivered_kwh": None,
+            }
         )
 
         with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
@@ -1150,9 +1639,56 @@ class TestOCPP16SessionRecovery:
             )
 
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        # Use a regex-style exact-substring check that excludes the
+        # ``deferred_meter_start_never_backfilled`` substring (which also
+        # contains "missing" only implicitly via the operator's mental model
+        # but not literally; defensive anyway).
+        missing_only = [
+            m for m in warnings
+            if "missing_meter_start" in m
+            and "deferred_meter_start_never_backfilled" not in m
+        ]
+        assert missing_only, (
+            f"Expected missing_meter_start WARN (with last_meter_wh present); got: {warnings}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_transaction_stop_warns_deferred_never_backfilled(
+        self, session, mock_timescale, caplog
+    ) -> None:
+        """meter_start_wh IS NULL AND last_meter_wh IS NULL → deferred + no register samples.
+
+        This is the post-Phase-1 failure mode: StartTransaction carried
+        meterStart=0 (so we wrote NULL), and MeterValues during the session
+        never produced an Energy.Active.Import.Register sample (charger's
+        measurand config refused the ChangeConfiguration push, or firmware
+        lacks the measurand entirely). Operators investigate the charger's
+        configuration, not legacy data.
+        """
+        import logging
+
+        mock_timescale.close_open_session = AsyncMock(
+            return_value={
+                "meter_start_wh": None,
+                "last_meter_wh": None,
+                "energy_delivered_kwh": None,
+            }
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
+            await session._on_transaction_stop(
+                cp_id="test_station_001",
+                transaction_id=4246,
+                id_tag="TAG_X",
+                meter_stop=5000,
+                timestamp="2026-04-26T13:00:00Z",
+                reason="EVDisconnected",
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert any(
-            "missing_meter_start" in m for m in warnings
-        ), f"Expected missing_meter_start WARN; got: {warnings}"
+            "deferred_meter_start_never_backfilled" in m for m in warnings
+        ), f"Expected deferred_meter_start_never_backfilled WARN; got: {warnings}"
 
     @pytest.mark.asyncio
     async def test_on_transaction_stop_no_warn_on_happy_path(
@@ -1162,7 +1698,11 @@ class TestOCPP16SessionRecovery:
         import logging
 
         mock_timescale.close_open_session = AsyncMock(
-            return_value={"meter_start_wh": 1000, "energy_delivered_kwh": 4.0}
+            return_value={
+                "meter_start_wh": 1000,
+                "last_meter_wh": 5000,
+                "energy_delivered_kwh": 4.0,
+            }
         )
 
         with caplog.at_level(logging.WARNING, logger="src.websocket_handler.ocpp16_adapter"):
@@ -1251,6 +1791,25 @@ class TestOCPP16SessionRecovery:
 
         with pytest.raises(RuntimeError):
             await session._next_transaction_id()
+        assert session._pending_start is None
+
+    @pytest.mark.asyncio
+    async def test_next_transaction_id_marks_fallback_tx_as_in_memory_only_when_sequence_fails(
+        self, session, mock_timescale
+    ) -> None:
+        mock_timescale.next_transaction_id = AsyncMock(side_effect=RuntimeError("db down"))
+        session._pending_start = {
+            "connector_id": 1,
+            "evse_id": 1,
+            "id_tag": "TAG_Y",
+            "start_time": datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc),
+        }
+        session._cp.transactions[1] = 9001
+
+        with pytest.raises(RuntimeError):
+            await session._next_transaction_id()
+
+        assert 9001 in session._in_memory_only_tx_ids
         assert session._pending_start is None
 
     @pytest.mark.asyncio

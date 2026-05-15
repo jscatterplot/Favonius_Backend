@@ -18,7 +18,33 @@ from cryptography import x509
 from sqlalchemy import text
 
 from .config import TimescaleConfig
+from .meter_value_utils import (
+    DEFAULT_SYNTHESIZED_DELTA_CAP_WH,
+    compute_energy_kwh,
+    normalize_energy_to_wh,
+    synthesize_energy_kwh_from_meter_stop,
+)
 from .monitoring import get_logger
+
+
+def _synthesized_delta_cap_wh() -> int:
+    """Resolve the synthesized-delta cap (Wh) from env, with a safe default.
+
+    Env var ``OCPP_SYNTHESIZED_DELTA_CAP_KWH`` is read in kWh (operator-
+    friendly) and converted to Wh. Non-numeric / non-positive values fall
+    back to ``DEFAULT_SYNTHESIZED_DELTA_CAP_WH`` (50 kWh) so a typo in the
+    deployment env never widens the cap silently.
+    """
+    raw = os.getenv("OCPP_SYNTHESIZED_DELTA_CAP_KWH")
+    if not raw:
+        return DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+    try:
+        cap_kwh = float(raw)
+    except ValueError:
+        return DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+    if cap_kwh <= 0:
+        return DEFAULT_SYNTHESIZED_DELTA_CAP_WH
+    return int(cap_kwh * 1000)
 
 
 class TimescaleClient:
@@ -245,10 +271,22 @@ class TimescaleClient:
 
                         # Live session metrics: keep the open charging_sessions row
                         # fresh so per-charger power/SoC is observable in real time
-                        # without requiring vehicle attribution.
+                        # without requiring vehicle attribution. When this row
+                        # carries an Energy.Active.Import.Register sample we also
+                        # advance last_meter_wh / energy_delivered_kwh on the
+                        # session — that is the running-meter source of truth the
+                        # orphan-recovery job falls back to when StopTransaction
+                        # is missing.
+                        meter_wh = self._extract_register_wh(raw_sample) if raw_sample else None
                         if station_id and transaction_id is not None:
                             await self._update_session_live_metrics(
-                                conn, station_id, transaction_id, power_kw, soc_percent, max_charge_kw
+                                conn,
+                                station_id,
+                                transaction_id,
+                                power_kw,
+                                soc_percent,
+                                max_charge_kw,
+                                meter_wh,
                             )
 
                         # Charger-keyed telemetry view (telemetry table). vehicle_id
@@ -256,7 +294,9 @@ class TimescaleClient:
                         # idTag/session mapping is unavailable.
                         vehicle_id = data.get("vehicle_id")
                         if not vehicle_id:
-                            vehicle_id = await self._resolve_vehicle_id_from_session(conn, session_id)
+                            vehicle_id = await self._resolve_vehicle_id_from_session(
+                                conn, session_id
+                            )
 
                         charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
                         soc = (soc_percent / 100.0) if soc_percent is not None else None
@@ -324,6 +364,30 @@ class TimescaleClient:
             value = row.get("connector_id")
             return int(value) if value is not None else None
 
+    async def is_transaction_open(self, station_id: str, transaction_id: int) -> bool:
+        """Return True iff a live charging_sessions row exists with end_time IS NULL.
+
+        Used by ``_on_transaction_start`` in the OCPP 1.6 adapter to
+        self-heal stale in-memory state after orphan recovery closes a DB
+        row. The DB is the source of truth; the in-memory transactions
+        dict is a cache that can drift when the recovery loop closes a
+        row without notifying the WS layer.
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchval(
+                """
+                SELECT 1 FROM charging_sessions
+                 WHERE station_id = $1
+                   AND transaction_id = $2
+                   AND end_time IS NULL
+                   AND source = 'live'
+                 LIMIT 1
+                """,
+                station_id,
+                transaction_id,
+            )
+            return row is not None
+
     async def _resolve_vehicle_id_from_session(
         self, conn: asyncpg.Connection, session_id: Optional[str]
     ) -> Optional[str]:
@@ -379,6 +443,38 @@ class TimescaleClient:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _extract_register_wh(raw_sample: Dict[str, Any]) -> Optional[int]:
+        """Return Wh value when the raw OCPP sample is Energy.Active.Import.Register.
+
+        Charger-reported energy registers come through with vendor-dependent
+        units (``Wh`` / ``kWh`` / ``kVAh``) and an optional ``multiplier``
+        power-of-ten offset. ``normalize_energy_to_wh`` centralises the
+        conversion; this method just selects which samples to forward to it.
+
+        Returns ``None`` for non-register measurands, malformed values, or
+        when the normaliser rejects the unit (defence in depth — the caller
+        treats ``None`` as "no register reading in this MeterValues row").
+        """
+        if not raw_sample:
+            return None
+        if raw_sample.get("measurand") != "Energy.Active.Import.Register":
+            return None
+        value = raw_sample.get("value")
+        if value is None:
+            return None
+        try:
+            wh = normalize_energy_to_wh(
+                float(value),
+                raw_sample.get("unit"),
+                raw_sample.get("multiplier"),
+            )
+        except (TypeError, ValueError):
+            return None
+        if wh < 0:
+            return None
+        return int(wh)
+
     async def _update_session_live_metrics(
         self,
         conn: asyncpg.Connection,
@@ -387,6 +483,7 @@ class TimescaleClient:
         power_kw: Optional[float],
         soc_percent: Optional[float],
         max_charge_kw: Optional[float],
+        meter_wh: Optional[int] = None,
     ) -> None:
         """Refresh charging_sessions live fields for the open session.
 
@@ -394,6 +491,28 @@ class TimescaleClient:
         open charging_sessions row so per-charger charging rate is observable
         without joining telemetry. ``max_charge_power_kw`` is bumped only when
         the new value is higher so the column captures the session peak.
+
+        When ``meter_wh`` is supplied (Energy.Active.Import.Register sample)
+        the row's ``last_meter_wh`` advances monotonically via ``GREATEST`` —
+        guards against late/duplicate samples regressing the register.
+
+        If ``meter_start_wh`` is NULL on the row (the "deferred" sentinel
+        set when StartTransaction carried meterStart=0 — see
+        ocpp16_adapter._on_transaction_start) the same write backfills it
+        with the first positive sample so the rest of the energy pipeline
+        (live UPDATE, close, orphan recovery) can compute a delta.
+        Trade-off: we lose the small slice of energy delivered between
+        StartTransaction and the first MeterValues frame (typically
+        ≤ 50 Wh at AC speeds), but we recover the whole-session kWh
+        attribution that would otherwise be NULL forever.
+
+        Energy is recomputed against the *effective* start register —
+        ``COALESCE(meter_start_wh, sample_when_positive)`` — so on the
+        very first backfilled sample the result is 0.0 (correct: no energy
+        accumulated on our deferred baseline yet); subsequent samples
+        produce real deltas. The same guards as ``compute_energy_kwh``
+        apply (start > 0, current >= start). NULL is preserved on any
+        bracket the helper would have refused.
         """
         soc = (soc_percent / 100.0) if soc_percent is not None else None
         try:
@@ -403,6 +522,51 @@ class TimescaleClient:
                    SET current_power_kw     = COALESCE($3, current_power_kw),
                        current_soc          = COALESCE($4, current_soc),
                        max_charge_power_kw  = GREATEST(max_charge_power_kw, $5),
+                       meter_start_wh       = CASE
+                           WHEN meter_start_wh IS NULL
+                            AND $6::bigint IS NOT NULL
+                            AND $6::bigint > 0
+                           THEN $6::bigint
+                           ELSE meter_start_wh
+                       END,
+                       last_meter_wh        = CASE
+                           WHEN $6::bigint IS NOT NULL
+                           THEN GREATEST(COALESCE(last_meter_wh, $6::bigint), $6::bigint)
+                           ELSE last_meter_wh
+                       END,
+                       last_meter_seen_at   = CASE
+                           WHEN $6::bigint IS NOT NULL THEN NOW()
+                           ELSE last_meter_seen_at
+                       END,
+                       energy_delivered_kwh = CASE
+                           WHEN $6::bigint IS NOT NULL
+                            AND COALESCE(
+                                meter_start_wh,
+                                CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                            ) IS NOT NULL
+                            AND COALESCE(
+                                meter_start_wh,
+                                CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                            ) > 0
+                            AND GREATEST(
+                                COALESCE(last_meter_wh, $6::bigint),
+                                $6::bigint
+                            ) >= COALESCE(
+                                meter_start_wh,
+                                CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                            )
+                           THEN (
+                               GREATEST(
+                                   COALESCE(last_meter_wh, $6::bigint),
+                                   $6::bigint
+                               )
+                               - COALESCE(
+                                   meter_start_wh,
+                                   CASE WHEN $6::bigint > 0 THEN $6::bigint END
+                               )
+                           ) / 1000.0
+                           ELSE energy_delivered_kwh
+                       END,
                        updated_at           = NOW()
                  WHERE station_id     = $1
                    AND transaction_id = $2
@@ -414,6 +578,7 @@ class TimescaleClient:
                 power_kw,
                 soc,
                 max_charge_kw,
+                meter_wh,
             )
         except Exception as exc:
             self.logger.debug(
@@ -2282,9 +2447,7 @@ class TimescaleClient:
             self._log_missing_reference_table_once("rfid_card_driver_assignments", exc)
             return None
 
-    def _log_missing_reference_table_once(
-        self, table_label: str, exc: BaseException
-    ) -> None:
+    def _log_missing_reference_table_once(self, table_label: str, exc: BaseException) -> None:
         """Log a missing-relation error at WARNING, once per process.
 
         Schema drift (e.g. a deployment running without ``vehicles``)
@@ -2417,54 +2580,257 @@ class TimescaleClient:
         transaction_id: int,
         end_time: datetime,
         meter_stop_wh: Optional[int] = None,
+        stop_reason: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a ``charging_sessions`` row closed at StopTransaction.
 
-        Writes ``end_time`` and ``meter_stop_wh`` and computes
-        ``energy_delivered_kwh = (meter_stop_wh - meter_start_wh) / 1000.0``
-        atomically (migration 036). The kWh write is gated by a CASE so
-        anomalous deltas (missing meter_start_wh, meter_stop < meter_start
-        from a meter rollover or replacement) leave the column NULL — the
-        caller logs a WARN so operators can reconcile from the raw Wh
-        values rather than trust a bogus billing number.
+        Writes ``end_time`` and ``meter_stop_wh`` and stores the kWh delta
+        computed by :func:`compute_energy_kwh` against the row's stored
+        ``meter_start_wh``. The helper rejects every untrustworthy bracket
+        (missing start/stop, ``meter_start_wh = 0``, ``meter_stop < meter_start``)
+        and the caller writes ``NULL`` in those cases — NULL beats a
+        confidently-wrong billing number for accounting.
+
+        The helper is also called from the orphan-recovery job
+        (:meth:`recover_orphaned_sessions`) so the formula lives in exactly
+        one place (Issue 7A).
+
+        Args:
+            stop_reason: Optional value to stamp into ``stop_reason``.
+                ``None`` leaves the column untouched. The orphan recovery
+                job passes ``'orphaned_recovered'``; the OCPP handler passes
+                the charger-supplied ``reason`` field.
 
         Returns:
             ``None`` if no live, still-open row matched (idempotent retry,
             already-closed session, or imported source). Otherwise a dict
-            of the RETURNING values: ``meter_start_wh`` (as stored before
-            this update) and ``energy_delivered_kwh`` (NULL on anomaly,
-            else the freshly written delta). Callers compare the two
-            against the provided ``meter_stop_wh`` to decide whether to
+            of the RETURNING values: ``meter_start_wh``, ``last_meter_wh``
+            (running register at close time — distinguishes "deferred start
+            never backfilled" from "legacy row" in the anomaly classifier),
+            and the freshly written ``energy_delivered_kwh`` (which may be
+            NULL on anomaly). Callers use the values to decide whether to
             emit a WARN.
         """
         async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT session_id, meter_start_wh, last_meter_wh
+                      FROM charging_sessions
+                     WHERE station_id = $1
+                       AND transaction_id = $2
+                       AND end_time IS NULL
+                       AND source = 'live'
+                     FOR UPDATE
+                    """,
+                    station_id,
+                    transaction_id,
+                )
+                if row is None:
+                    return None
+                session_id = row["session_id"]
+                meter_start_wh = row["meter_start_wh"]
+                last_meter_wh = row["last_meter_wh"]
+                energy_kwh = compute_energy_kwh(meter_stop_wh, meter_start_wh)
+                effective_stop_reason = stop_reason
+
+                # Phase 2 synthesis fallback. Only fires when:
+                #   * the bracket-based delta refused (compute returned None)
+                #   * no meter_start_wh was ever recorded (deferred-and-not-
+                #     backfilled — first-MeterValues backfill never happened)
+                #   * no last_meter_wh either (charger never sent a register
+                #     sample)
+                # In that triple-NULL state ``meter_stop_wh`` is the only
+                # energy signal we have. Some ABB Terra AC firmwares emit
+                # it as a per-session delta rather than an absolute register
+                # so we trust it under a 50 kWh cap (operator-tunable via
+                # ``OCPP_SYNTHESIZED_DELTA_CAP_KWH``). The stop_reason is
+                # suffixed so the row is queryable for audit; operators can
+                # filter ``LIKE '%synthesized_delta%'`` to find them.
+                synthesized = False
+                if (
+                    energy_kwh is None
+                    and meter_start_wh is None
+                    and last_meter_wh is None
+                    and meter_stop_wh is not None
+                ):
+                    energy_kwh = synthesize_energy_kwh_from_meter_stop(
+                        meter_stop_wh,
+                        cap_wh=_synthesized_delta_cap_wh(),
+                    )
+                    if energy_kwh is not None:
+                        synthesized = True
+                        suffix = "synthesized_delta"
+                        base = stop_reason or "unknown"
+                        # Defensive: keep within stop_reason VARCHAR(64).
+                        effective_stop_reason = f"{base}|{suffix}"[:64]
+                        self.logger.info(
+                            "Synthesized energy_delivered_kwh=%.3f from meter_stop_wh=%s "
+                            "for station=%s tx_id=%s (no meter_start_wh, no register "
+                            "samples). Capped at %s kWh. stop_reason suffixed.",
+                            energy_kwh,
+                            meter_stop_wh,
+                            station_id,
+                            transaction_id,
+                            _synthesized_delta_cap_wh() / 1000.0,
+                        )
+
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE charging_sessions
+                       SET end_time             = $3,
+                           meter_stop_wh        = $4::bigint,
+                           energy_delivered_kwh = $5,
+                           stop_reason          = COALESCE($6, stop_reason),
+                           updated_at           = NOW()
+                     WHERE station_id     = $1
+                       AND transaction_id = $2
+                       AND session_id     = $7
+                       AND end_time IS NULL
+                       AND source = 'live'
+                 RETURNING meter_start_wh, last_meter_wh, energy_delivered_kwh
+                    """,
+                    station_id,
+                    transaction_id,
+                    end_time,
+                    meter_stop_wh,
+                    energy_kwh,
+                    effective_stop_reason,
+                    session_id,
+                )
+                if updated is None:
+                    # Lost the race to another writer between SELECT and UPDATE.
+                    return None
+                result = dict(updated)
+                # Surface the synthesis flag so the OCPP handler can pick a
+                # distinct log line / metric without re-deriving the
+                # condition. Not a column on charging_sessions — the
+                # ``synthesized_delta`` suffix on stop_reason is the durable
+                # audit trail.
+                result["synthesized"] = synthesized
+                return result
+
+    async def recover_orphaned_sessions(
+        self,
+        stale_after_seconds: int = 1800,
+        batch_limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Close charging_sessions rows whose StopTransaction never arrived.
+
+        A row is treated as orphaned when:
+
+          * ``end_time IS NULL`` and ``source = 'live'`` (still considered
+            open from the WebSocket handler's perspective), and
+          * ``last_seen_at`` is older than ``stale_after_seconds`` (the
+            WebSocket close hook stamps this column, so 'old' means the
+            charger socket has been closed for at least that long), or
+          * ``last_seen_at IS NULL`` AND ``start_time`` is older than
+            ``stale_after_seconds`` AND the row has no recent handler
+            activity (``COALESCE(last_meter_seen_at, updated_at,
+            start_time)`` older than the same threshold). Covers handler
+            restarts that never stamped ``last_seen_at``, and excludes
+            live sessions (MeterValues refresh ``updated_at`` /
+            ``last_meter_seen_at``) including after ``clear_sessions_seen``
+            nulls ``last_seen_at`` on reconnect.
+
+        For each orphaned row the synthesized ``meter_stop_wh`` is the
+        running ``last_meter_wh`` from migration 038 — populated by the
+        MeterValues handler — falling back to ``NULL`` (which leaves
+        ``energy_delivered_kwh = NULL`` per :func:`compute_energy_kwh`)
+        when no MeterValues with a register reading ever arrived.
+
+        Args:
+            stale_after_seconds: Threshold in seconds. 30 minutes (1800s)
+                is conservative — well past any realistic legit session
+                pause. The recovery loop in ``main.py`` reads this from
+                ``ORPHAN_RECOVERY_THRESHOLD_S``.
+            batch_limit: Maximum rows closed per call. Defends against a
+                pathological recovery sweep blocking the connection for
+                too long; the next loop iteration picks up the rest.
+
+        Returns:
+            List of dicts describing each closed row (session_id,
+            station_id, transaction_id, meter_start_wh, meter_stop_wh,
+            energy_delivered_kwh). Used by the caller to emit one
+            ``audit_log`` entry per row.
+        """
+        closed: List[Dict[str, Any]] = []
+        async with self.pg_pool.acquire() as conn:
+            stale_rows = await conn.fetch(
                 """
-                UPDATE charging_sessions
-                   SET end_time = $3,
-                       meter_stop_wh = $4,
-                       energy_delivered_kwh = CASE
-                           WHEN $4 IS NOT NULL
-                            AND meter_start_wh IS NOT NULL
-                            AND $4 >= meter_start_wh
-                           THEN ($4 - meter_start_wh) / 1000.0
-                           ELSE NULL
-                       END,
-                       updated_at = NOW()
-                 WHERE station_id = $1
-                   AND transaction_id = $2
-                   AND end_time IS NULL
+                SELECT session_id,
+                       station_id,
+                       transaction_id,
+                       meter_start_wh,
+                       last_meter_wh,
+                       last_seen_at,
+                       start_time
+                  FROM charging_sessions
+                 WHERE end_time IS NULL
                    AND source = 'live'
-             RETURNING meter_start_wh, energy_delivered_kwh
+                   AND transaction_id IS NOT NULL
+                   AND (
+                       (last_seen_at IS NOT NULL
+                        AND last_seen_at < NOW() - make_interval(secs => $1))
+                       OR
+                       (last_seen_at IS NULL
+                        AND start_time < NOW() - make_interval(secs => $1)
+                        AND COALESCE(last_meter_seen_at, updated_at, start_time)
+                            < NOW() - make_interval(secs => $1))
+                   )
+                 ORDER BY COALESCE(last_seen_at, start_time) ASC
+                 LIMIT $2
                 """,
-                station_id,
-                transaction_id,
-                end_time,
-                meter_stop_wh,
+                stale_after_seconds,
+                batch_limit,
             )
-            if row is None:
-                return None
-            return dict(row)
+
+            now = datetime.now(timezone.utc)
+            for row in stale_rows:
+                station_id = row["station_id"]
+                transaction_id = int(row["transaction_id"])
+                last_meter_wh = row["last_meter_wh"]
+                meter_start_wh = row["meter_start_wh"]
+                energy_kwh = compute_energy_kwh(last_meter_wh, meter_start_wh)
+                close_time = row["last_seen_at"] or now
+
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE charging_sessions
+                       SET end_time             = $3,
+                           meter_stop_wh        = $4::bigint,
+                           energy_delivered_kwh = $5,
+                           stop_reason          = 'orphaned_recovered',
+                           updated_at           = NOW()
+                     WHERE station_id     = $1
+                       AND transaction_id = $2
+                       AND session_id     = $7
+                       AND end_time IS NULL
+                       AND source = 'live'
+                       AND (
+                           (last_seen_at IS NOT NULL
+                            AND last_seen_at < NOW() - make_interval(secs => $6))
+                           OR
+                           (last_seen_at IS NULL
+                            AND start_time < NOW() - make_interval(secs => $6)
+                            AND COALESCE(last_meter_seen_at, updated_at, start_time)
+                                < NOW() - make_interval(secs => $6))
+                       )
+                 RETURNING session_id, station_id, transaction_id,
+                           meter_start_wh, meter_stop_wh, energy_delivered_kwh
+                    """,
+                    station_id,
+                    transaction_id,
+                    close_time,
+                    last_meter_wh,
+                    energy_kwh,
+                    stale_after_seconds,
+                    row["session_id"],
+                )
+                if updated is not None:
+                    closed.append(dict(updated))
+
+        return closed
 
     async def mark_sessions_seen(self, station_id: str) -> None:
         """Stamp ``last_seen_at = NOW()`` on every open session at the station.
@@ -2477,6 +2843,30 @@ class TimescaleClient:
                 """
                 UPDATE charging_sessions
                    SET last_seen_at = NOW()
+                 WHERE station_id = $1
+                   AND end_time IS NULL
+                   AND source = 'live'
+                """,
+                station_id,
+            )
+
+    async def clear_sessions_seen(self, station_id: str) -> None:
+        """Clear stale ``last_seen_at`` stamps for open live sessions.
+
+        Called from the boot/reconnect path before open sessions are
+        reloaded into memory. A disconnect can legitimately be followed by
+        a reconnect while charging continues; leaving the old disconnect
+        timestamp in place would let orphan recovery close an active
+        session after ``stale_after_seconds`` elapses.
+
+        ``last_seen_at`` is nulled so the row is not treated as "just
+        disconnected" by case-1 of orphan recovery.
+        """
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charging_sessions
+                   SET last_seen_at = NULL
                  WHERE station_id = $1
                    AND end_time IS NULL
                    AND source = 'live'

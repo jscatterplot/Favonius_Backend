@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from ocpp.v16.enums import AuthorizationStatus
 
+from .meter_value_utils import normalize_energy_to_wh
+
 from src.adapters.ocpp.charge_point import FleetChargePoint
 from src.adapters.ocpp.local_auth_sync import sync_charger as sync_local_auth_list
 
@@ -38,7 +40,7 @@ REPLAY_BACKOFF_SECONDS = 1.0
 # nudging it via TriggerMessage. Some ABB Terra AC firmwares (and other
 # OCPP 1.6 implementations) skip BootNotification on WebSocket reconnect,
 # leaving the heartbeat interval un-negotiated and the session stuck.
-BOOT_TRIGGER_GRACE_SECONDS = 5.0
+BOOT_TRIGGER_GRACE_SECONDS = 5
 
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
@@ -66,6 +68,77 @@ def _new_profile_id_fallback_counter() -> count:
 
 
 _profile_id_fallback_counter = _new_profile_id_fallback_counter()
+
+
+def _resolve_meter_stop(
+    meter_stop: Optional[int],
+    transaction_data: Optional[List[Dict[str, Any]]],
+) -> Optional[int]:
+    """Return the best available meterStop value in Wh for StopTransaction.
+
+    OCPP 1.6 declares ``meterStop`` required on ``StopTransaction``, but
+    chargers in the wild send ``None`` or ``0`` whenever the meter register
+    is unavailable (charger crash before final read, EVDisconnected with
+    no graceful stop, meter fault). When ``StopTxnSampledData`` is
+    configured (Issue 3A pushes this in BootNotification),
+    ``transactionData`` carries the final
+    ``Energy.Active.Import.Register`` sample — which is what we actually
+    want for billing.
+
+    Resolution order:
+
+      1. ``meter_stop`` (Wh int from the top-level field) when it is
+         non-None and non-zero — the spec-compliant happy path.
+      2. The maximum ``Energy.Active.Import.Register`` sample from
+         ``transaction_data`` — the fallback the recovery research
+         identified as the highest-confidence value when (1) fails.
+      3. The original ``meter_stop`` value (which may be ``None`` or ``0``)
+         when ``transaction_data`` has nothing usable; the close path
+         will detect the anomaly and leave ``energy_delivered_kwh = NULL``.
+
+    Args:
+        meter_stop: Top-level ``meterStop`` from the OCPP message (Wh).
+        transaction_data: Optional ``transactionData`` array from
+            ``StopTransaction.req``. Each entry has ``sampledValue`` /
+            ``sampled_value`` (both spellings observed in the wild) carrying
+            measurand readings.
+
+    Returns:
+        Best available ``meter_stop_wh`` value, or ``None`` if no usable
+        source exists.
+    """
+    if meter_stop is not None and meter_stop > 0:
+        return int(meter_stop)
+
+    if not transaction_data:
+        return meter_stop  # propagate None / 0 unchanged
+
+    best_wh: Optional[float] = None
+    for entry in transaction_data:
+        samples = entry.get("sampledValue") or entry.get("sampled_value") or []
+        for sample in samples:
+            if sample.get("measurand") != "Energy.Active.Import.Register":
+                continue
+            value = sample.get("value")
+            if value is None:
+                continue
+            try:
+                wh = normalize_energy_to_wh(
+                    float(value),
+                    sample.get("unit"),
+                    sample.get("multiplier"),
+                )
+            except (TypeError, ValueError):
+                continue
+            if wh < 0:
+                continue
+            if best_wh is None or wh > best_wh:
+                best_wh = wh
+
+    if best_wh is not None:
+        return int(best_wh)
+    return meter_stop
+
 
 _OCPP16_AUTH_FROM_STATUS: dict[RFIDAuthStatus, AuthorizationStatus] = {
     RFIDAuthStatus.ACCEPTED: AuthorizationStatus.accepted,
@@ -124,8 +197,20 @@ class OCPP16Session:
         # row alongside the generated tx_id. Safe because FleetChargePoint
         # serialises message handling per charger socket.
         self._pending_start: Optional[Dict[str, Any]] = None
+        # tx_ids accepted by the in-memory gate but not yet durable in DB
+        # because insert_open_session failed. These must continue to block
+        # sibling StartTransaction retries on the same connector.
+        self._in_memory_only_tx_ids: Set[int] = set()
+        # Per-session inbound frame counter. Set by ``_on_message_received``
+        # for every OCPP frame the charger sends. ``_force_boot_notification``
+        # reads this after the grace period to decide whether the charger is
+        # silent (trigger needed) or already chatting (skip — re-bootstrapping
+        # a clearly-alive charger on every reconnect is what caused the HRX
+        # Vilnius reconfig loop).
+        self._inbound_frame_count: int = 0
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
+        self._metering_config_task: Optional[asyncio.Task[None]] = None
         self._boot_trigger_task: Optional[asyncio.Task[None]] = None
         self._background_tasks: Set[asyncio.Task[Any]] = set()
         self._telemetry_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1024)
@@ -162,6 +247,12 @@ class OCPP16Session:
         Fire-and-forget — a slow notify must not backpressure OCPP
         message processing.
         """
+        # Used by ``_force_boot_notification`` to skip the synthetic
+        # TriggerMessage(BootNotification) when the charger is clearly alive
+        # (sending StatusNotification, Heartbeat, etc.) but has not yet sent
+        # its own BootNotification. A bounded counter is enough — we only
+        # check "> 0" — and overflow is impossible in practice.
+        self._inbound_frame_count += 1
         if self._connection_manager is not None:
             try:
                 await self._connection_manager.update_heartbeat(self._station_id)
@@ -184,6 +275,12 @@ class OCPP16Session:
     async def start(self) -> None:
         """Start processing messages from the charger (blocks until disconnect)."""
         self._stop_telemetry_flush.clear()
+        # Reset per-session inbound frame counter so the boot-trigger gate
+        # makes its decision against frames received in *this* connection,
+        # not anything stale from a previous adapter instance (which won't
+        # happen with the current lifecycle but defends against future
+        # reuse).
+        self._inbound_frame_count = 0
         self._telemetry_flush_task = asyncio.create_task(self._flush_telemetry_queue())
         self._boot_trigger_task = asyncio.create_task(self._force_boot_notification())
         try:
@@ -206,7 +303,7 @@ class OCPP16Session:
                 self._background_tasks.clear()
 
     async def _force_boot_notification(self) -> None:
-        """Nudge spec-violating chargers that skip BootNotification on reconnect.
+        """Nudge silent chargers that skip BootNotification on reconnect.
 
         OCPP 1.6 §4.2 requires the charger to send BootNotification on connect,
         and the central system's response carries the negotiated heartbeat
@@ -214,11 +311,27 @@ class OCPP16Session:
         WebSocket reconnects after the initial cold boot, leaving the session
         with no heartbeat cadence. TriggerMessage(BootNotification) is the
         spec-sanctioned way to wake them up (OCPP 1.6 §4.18).
+
+        Three conditions are checked after the grace period elapses:
+
+          1. ``last_boot_at`` is set — the charger volunteered a
+             BootNotification within the grace, no trigger needed.
+          2. Still no boot after grace (even if other frames arrived) —
+             Trigger BootNotification so ``_on_boot`` remains reachable
+             for this session (queued command replay, local auth sync,
+             metering bootstrap).
         """
         try:
             await asyncio.sleep(BOOT_TRIGGER_GRACE_SECONDS)
             if self._cp.last_boot_at is not None:
                 return
+            if self._inbound_frame_count > 0:
+                logger.info(
+                    "force_boot_notification station=%s proceeding after grace: "
+                    "charger sent %d frame(s) without BootNotification",
+                    self._station_id,
+                    self._inbound_frame_count,
+                )
             status = await self._cp.trigger_message("BootNotification")
             logger.info(
                 "force_boot_notification station=%s status=%s",
@@ -463,7 +576,17 @@ class OCPP16Session:
         """
         pending = self._pending_start
         self._pending_start = None
-        tx_id = await self._timescale.next_transaction_id()
+        try:
+            tx_id = await self._timescale.next_transaction_id()
+        except Exception:
+            if pending is not None:
+                fallback_tx_id = self._cp.transactions.get(pending["connector_id"])
+                if fallback_tx_id is not None:
+                    try:
+                        self._in_memory_only_tx_ids.add(int(fallback_tx_id))
+                    except (TypeError, ValueError):
+                        pass
+            raise
         if pending is not None:
             try:
                 await self._timescale.insert_open_session(
@@ -478,7 +601,9 @@ class OCPP16Session:
                     card_id=pending.get("card_id"),
                     meter_start_wh=pending.get("meter_start_wh"),
                 )
+                self._in_memory_only_tx_ids.discard(int(tx_id))
             except Exception as exc:
+                self._in_memory_only_tx_ids.add(int(tx_id))
                 logger.warning(
                     "insert_open_session failed for station=%s tx_id=%s: %s",
                     self._station_id,
@@ -616,6 +741,11 @@ class OCPP16Session:
         #      here would delay the boot ack and could trip the charger's
         #      response timeout.
         try:
+            await self._timescale.clear_sessions_seen(cp_id)
+        except Exception as exc:
+            logger.error("clear_sessions_seen failed for station=%s: %s", cp_id, exc)
+
+        try:
             open_rows = await self._timescale.fetch_open_sessions(cp_id)
         except Exception as exc:
             open_rows = []
@@ -649,12 +779,20 @@ class OCPP16Session:
         # RFID tags while offline. Runs after the queued-command replay so
         # SetChargingProfile and SendLocalList don't race on the same socket
         # for vendors that mishandle interleaved request/response cycles.
-        if (
-            self._local_auth_sync_task is not None
-            and not self._local_auth_sync_task.done()
-        ):
+        if self._local_auth_sync_task is not None and not self._local_auth_sync_task.done():
             self._local_auth_sync_task.cancel()
         self._local_auth_sync_task = asyncio.create_task(self._delayed_local_auth_sync())
+
+        # Push metering configuration so every connected charger emits the
+        # measurands we depend on for energy tracking (Issue 3A). This
+        # neutralises factory-default measurand sets — notably ABB Terra AC
+        # firmware versions that ship with Power-only sampling and never
+        # produce Energy.Active.Import.Register without an explicit
+        # ChangeConfiguration. Fire-and-forget so the boot ack is not
+        # blocked by a slow or unresponsive charger.
+        if self._metering_config_task is not None and not self._metering_config_task.done():
+            self._metering_config_task.cancel()
+        self._metering_config_task = asyncio.create_task(self._push_metering_config())
 
     async def _on_security_event(
         self,
@@ -739,12 +877,7 @@ class OCPP16Session:
                         raise
                 except Exception:
                     pass
-            pool = None
-            static_pool_fn = getattr(self._timescale, "_static_pool", None)
-            if callable(static_pool_fn):
-                pool = static_pool_fn()
-            if pool is None:
-                pool = getattr(self._timescale, "pg_pool", None)
+            pool = self._resolve_static_pool()
             if pool is None:
                 logger.debug(
                     "local_auth_sync station=%s skipped: no static or timescale pool available",
@@ -768,6 +901,243 @@ class OCPP16Session:
             current = asyncio.current_task()
             if current is not None and self._local_auth_sync_task is current:
                 self._local_auth_sync_task = None
+
+    # OCPP configuration keys pushed after every BootNotification (Issue 3A).
+    # Values are conservative defaults that cover Energy.Active.Import.Register
+    # (billing source of truth) plus a few measurands we use for live UI
+    # without exceeding the ABB-safe set in adapters/ocpp/charge_point.py.
+    _METERING_CONFIG_KEYS: List[tuple[str, str]] = [
+        (
+            "MeterValuesSampledData",
+            "Energy.Active.Import.Register,Power.Active.Import,Current.Import",
+        ),
+        (
+            "StopTxnSampledData",
+            "Energy.Active.Import.Register",
+        ),
+        (
+            "MeterValueSampleInterval",
+            "60",
+        ),
+    ]
+
+    # OCPP statuses that mean "the key is at the desired value as far as the
+    # charger is concerned". ``Accepted`` is the obvious one. ``RebootRequired``
+    # means the charger acknowledged the new value but will only apply it on
+    # next restart — for idempotency that still counts as "applied" because
+    # re-pushing on the very next reconnect will just produce the same
+    # response. Everything else (``Rejected``, ``NotSupported``, timeout)
+    # is treated as a non-success and disables the cache stamp for this
+    # firmware so we re-attempt next time.
+    _METERING_CONFIG_SUCCESS_STATUSES: frozenset[str] = frozenset({"Accepted", "RebootRequired"})
+
+    async def _metering_config_already_applied(self) -> bool:
+        """Return True iff the metering config was successfully pushed to
+        this station on its current firmware version.
+
+        Reads ``charging_stations.metering_config_applied_firmware`` (added
+        by migration 014) and compares against the firmware string from the
+        current BootNotification. A match means every key in
+        ``_METERING_CONFIG_KEYS`` was confirmed by the charger on this
+        firmware — re-pushing on reconnect is wasted work and exactly the
+        round-trip storm that caused the HRX Vilnius reconfig loop.
+
+        Returns ``False`` in three cases:
+          1. The current firmware is unknown (no BootNotification yet, or
+             the charger omitted ``firmware_version``). We can't scope a
+             cache lookup without it.
+          2. The probe column is missing — migration 014 not applied yet.
+             Falling back to the always-push behaviour preserves the
+             pre-migration semantics while keeping the new code safe on
+             older DB schemas.
+          3. The cached firmware doesn't match the live firmware — the
+             charger updated and we have to re-verify the keys still take.
+
+        DB errors are caught and the function returns ``False`` so the push
+        runs (failure-open for a non-critical optimisation).
+        """
+        current_fw = getattr(self._cp, "firmware_version", None)
+        if not current_fw:
+            return False
+        pool = self._resolve_static_pool()
+        if pool is None:
+            return False
+        try:
+            row = await pool.fetchrow(
+                """
+                SELECT metering_config_applied_firmware
+                FROM charging_stations
+                WHERE station_id = $1
+                """,
+                self._station_id,
+            )
+        except Exception as exc:
+            # ``42703`` (undefined_column) — migration 014 not applied.
+            # Anything else (DB blip, pool exhausted) — fall back to push.
+            if getattr(exc, "sqlstate", None) == "42703":
+                logger.warning(
+                    "metering_config_cache station=%s schema missing applied_firmware "
+                    "column (apply migrations/supabase/014_metering_config_cache.sql) — "
+                    "will re-push metering config every reconnect",
+                    self._station_id,
+                )
+            else:
+                logger.warning(
+                    "metering_config_cache station=%s lookup failed (%s); "
+                    "will push metering config",
+                    self._station_id,
+                    exc,
+                )
+            return False
+        if row is None:
+            return False
+        applied_fw = row.get("metering_config_applied_firmware")
+        return applied_fw == current_fw
+
+    async def _record_metering_config_applied(self) -> None:
+        """Stamp the metering-config cache columns after a clean push.
+
+        Errors (including missing schema) are logged and swallowed: the
+        cache is an optimisation, not a correctness requirement. The next
+        reconnect will simply re-push.
+        """
+        current_fw = getattr(self._cp, "firmware_version", None)
+        if not current_fw:
+            return
+        pool = self._resolve_static_pool()
+        if pool is None:
+            return
+        try:
+            await pool.execute(
+                """
+                UPDATE charging_stations
+                SET metering_config_applied_firmware = $1,
+                    metering_config_applied_at = NOW()
+                WHERE station_id = $2
+                """,
+                current_fw,
+                self._station_id,
+            )
+        except Exception as exc:
+            if getattr(exc, "sqlstate", None) == "42703":
+                # Migration 014 not applied — silent fail. The legacy log
+                # in ``_metering_config_already_applied`` already warned on
+                # the read path; no need to spam again on the write.
+                return
+            logger.warning(
+                "metering_config_cache station=%s update failed (%s); "
+                "next reconnect will re-push",
+                self._station_id,
+                exc,
+            )
+
+    def _resolve_static_pool(self) -> Any:
+        """Return the static asyncpg pool used for charging_stations writes,
+        falling back to the timescale pool if the static one is not wired.
+
+        Mirrors the discovery logic in ``_delayed_local_auth_sync`` so both
+        paths read the same DB regardless of how the WS handler is
+        configured (single-pool vs split static / timescale pools).
+        """
+        pool = None
+        static_pool_fn = getattr(self._timescale, "_static_pool", None)
+        if callable(static_pool_fn):
+            try:
+                pool = static_pool_fn()
+            except Exception:
+                pool = None
+        if pool is None:
+            pool = getattr(self._timescale, "pg_pool", None)
+        return pool
+
+    async def _push_metering_config(self) -> None:
+        """Push the metering configuration keys to the charger after boot.
+
+        Fire-and-forget: failures must NOT block the BootNotification ack or
+        the heartbeat loop. Three failure modes are tolerated explicitly:
+
+          * ``Rejected`` — charger acknowledged but refused the key (e.g.
+            Terra AC pre-1.8.32 on certain measurand combinations). Logged
+            at WARN level; the rest of the keys still attempt.
+          * ``Timeout`` — charger never responded (network drop mid-call).
+            Logged at WARN; the next BootNotification will retry.
+          * Vendor-safe refusal — ``change_configuration`` returns
+            ``NotSupported`` when the requested measurand set would exit the
+            ``_ABB_SAFE_MEASURANDS`` allowlist; that defends against the
+            Terra AC ≤1.8.21 reboot-loop bug and is logged at INFO.
+
+        Per-firmware idempotency: once every key in
+        ``_METERING_CONFIG_KEYS`` was accepted by the charger on its
+        current firmware, the bootstrap is short-circuited on subsequent
+        reconnects until the charger reports a new ``firmware_version``.
+        This is the fix for the HRX Vilnius reconfig loop where ABB Terra
+        AC chargers reconnected every ~60 s and the full ~15 s bootstrap
+        re-ran on every cycle. See migration 014.
+
+        Errors are swallowed locally; raising here would tear down the
+        OCPP session for a non-fatal configuration mismatch.
+        """
+        try:
+            if await self._metering_config_already_applied():
+                logger.info(
+                    "metering_config_cache_hit station=%s firmware=%s — "
+                    "skipping ChangeConfiguration sequence",
+                    self._station_id,
+                    getattr(self._cp, "firmware_version", None),
+                )
+                return
+
+            all_keys_applied = True
+            for key, value in self._METERING_CONFIG_KEYS:
+                try:
+                    status = await asyncio.wait_for(
+                        self._cp.change_configuration(key=key, value=value),
+                        timeout=10.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "ChangeConfiguration timed out for station=%s key=%s; "
+                        "will retry on next BootNotification",
+                        self._station_id,
+                        key,
+                    )
+                    all_keys_applied = False
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "ChangeConfiguration raised for station=%s key=%s: %s",
+                        self._station_id,
+                        key,
+                        exc,
+                    )
+                    all_keys_applied = False
+                    continue
+                if status in self._METERING_CONFIG_SUCCESS_STATUSES:
+                    logger.info(
+                        "ChargingMetering config %s on station=%s: %s=%s",
+                        status,
+                        self._station_id,
+                        key,
+                        value,
+                    )
+                else:
+                    logger.warning(
+                        "ChargingMetering config %s on station=%s: %s=%s",
+                        status,
+                        self._station_id,
+                        key,
+                        value,
+                    )
+                    all_keys_applied = False
+            if all_keys_applied:
+                await self._record_metering_config_applied()
+        except asyncio.CancelledError:
+            logger.debug("metering_config push cancelled for station=%s", self._station_id)
+            raise
+        finally:
+            current = asyncio.current_task()
+            if current is not None and self._metering_config_task is current:
+                self._metering_config_task = None
 
     def _is_connection_open(self) -> bool:
         """Best-effort check whether the charger socket is still open."""
@@ -967,18 +1337,76 @@ class OCPP16Session:
         meter_start: int,
         timestamp: str,
     ) -> AuthorizationStatus:
+        # In-memory ``_cp.transactions`` is a cache populated by the boot
+        # reload (line 714) and cleared by StopTransaction. Orphan recovery
+        # can close the DB row without notifying this layer, so a hit here
+        # may point at a closed session. DB is the source of truth — verify
+        # before rejecting, and self-heal the cache when stale.
         if connector_id in self._cp.transactions:
+            stale_tx_id = self._cp.transactions[connector_id]
+            try:
+                still_open = await self._timescale.is_transaction_open(cp_id, int(stale_tx_id))
+            except Exception as exc:
+                # Fail closed: a DB blip must never let two open sessions
+                # exist on the same connector.
+                logger.warning(
+                    "is_transaction_open failed for station=%s connector=%s tx_id=%s: %s; "
+                    "rejecting StartTransaction with ConcurrentTx",
+                    cp_id,
+                    connector_id,
+                    stale_tx_id,
+                    exc,
+                )
+                return AuthorizationStatus.concurrent_tx
+            if still_open:
+                logger.warning(
+                    "Rejecting StartTransaction for station=%s connector=%s: "
+                    "active transaction already exists (tx_id=%s)",
+                    cp_id,
+                    connector_id,
+                    stale_tx_id,
+                )
+                return AuthorizationStatus.concurrent_tx
+            if int(stale_tx_id) in self._in_memory_only_tx_ids:
+                logger.warning(
+                    "Rejecting StartTransaction for station=%s connector=%s: "
+                    "tx_id=%s is active in-memory while DB row is missing",
+                    cp_id,
+                    connector_id,
+                    stale_tx_id,
+                )
+                return AuthorizationStatus.concurrent_tx
             logger.warning(
-                "Rejecting StartTransaction for station=%s connector=%s: active transaction already exists",
+                "Self-healing stale in-memory transaction for station=%s "
+                "connector=%s tx_id=%s (DB says closed)",
                 cp_id,
                 connector_id,
+                stale_tx_id,
             )
-            return AuthorizationStatus.concurrent_tx
+            if self._cp.transactions.get(connector_id) == stale_tx_id:
+                self._cp.transactions.pop(connector_id, None)
+            if self._cp.current_transaction_id == stale_tx_id:
+                self._cp.current_transaction_id = None
+            self._in_memory_only_tx_ids.discard(int(stale_tx_id))
 
         decision = await self._authz.authorize(cp_id, id_tag, "StartTransaction")
         auth_status = self._map_auth_status(decision.status)
         if auth_status != AuthorizationStatus.accepted:
             return auth_status
+
+        # Concurrency re-check: between the gate above and here, a sibling
+        # StartTransaction on the same connector (a charger retry storm)
+        # could have raced through and stashed its own _pending_start.
+        # The in-memory dict is the only signal we have until the DB
+        # insert happens in ``_next_transaction_id``, so re-check it now.
+        if connector_id in self._cp.transactions:
+            logger.warning(
+                "concurrent_start_race_blocked station=%s connector=%s: "
+                "sibling StartTransaction beat us to the gate",
+                cp_id,
+                connector_id,
+            )
+            return AuthorizationStatus.concurrent_tx
 
         try:
             start_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -989,12 +1417,33 @@ class OCPP16Session:
         # in OCPP 1.6. meter_start_wh is persisted in the DB so a restart
         # between Start and Stop still yields a billing-grade kWh delta on
         # close (migration 036).
+        #
+        # meterStart=0 (or negative) is treated as "deferred" — some chargers
+        # (ABB Terra AC firmwares are the documented case) emit 0 at
+        # StartTransaction when the meter register isn't ready, then report
+        # real values on the first MeterValues frame. Persisting NULL lets
+        # ``_update_session_live_metrics`` backfill meter_start_wh from the
+        # first positive Energy.Active.Import.Register sample. Without this
+        # the row keeps a poison 0 that ``compute_energy_kwh`` rejects forever,
+        # voiding the entire session's energy delta.
+        if meter_start is not None and meter_start > 0:
+            meter_start_wh: Optional[int] = meter_start
+        else:
+            meter_start_wh = None
+            logger.info(
+                "StartTransaction meter_start=%s on station=%s connector=%s; "
+                "deferring meter_start_wh — will backfill from first MeterValues "
+                "Energy.Active.Import.Register sample",
+                meter_start,
+                cp_id,
+                connector_id,
+            )
         self._pending_start = {
             "connector_id": connector_id,
             "evse_id": connector_id,
             "id_tag": id_tag,
             "start_time": start_time,
-            "meter_start_wh": meter_start,
+            "meter_start_wh": meter_start_wh,
         }
         self._pending_start.update(
             {
@@ -1055,12 +1504,23 @@ class OCPP16Session:
             end_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             end_time = datetime.now(timezone.utc)
+
+        # OCPP 1.6 spec marks meterStop as required on StopTransaction, but
+        # in practice chargers (notably ABB Terra AC ≤1.8.x and several
+        # budget wallboxes) send None / 0 when the meter register is
+        # unavailable or the EV disconnected before the charger could read
+        # it. transactionData carries the final Energy.Active.Import.Register
+        # sample when StopTxnSampledData is configured — use it as a
+        # fallback so the close path produces a real meter_stop_wh.
+        meter_stop_wh = _resolve_meter_stop(meter_stop, transaction_data)
+
         try:
             close_result = await self._timescale.close_open_session(
                 cp_id,
                 int(transaction_id),
                 end_time,
-                meter_stop_wh=meter_stop,
+                meter_stop_wh=meter_stop_wh,
+                stop_reason=reason,
             )
         except Exception as exc:
             close_result = None
@@ -1070,31 +1530,60 @@ class OCPP16Session:
                 transaction_id,
                 exc,
             )
+        self._in_memory_only_tx_ids.discard(int(transaction_id))
         # Surface meter-delta anomalies so operators can reconcile the row
         # from the raw Wh values rather than from a NULL billing kWh. The
         # close already matched a row; we just couldn't compute the delta.
         # `close_result is None` covers the idempotent retry / no-match
         # case, which is silent on purpose.
         if close_result is not None:
+            if close_result.get("synthesized"):
+                logger.info(
+                    "StopTransaction closed with synthesized_delta energy (station=%s tx_id=%s)",
+                    cp_id,
+                    transaction_id,
+                )
             meter_start_db = close_result.get("meter_start_wh")
+            last_meter_db = close_result.get("last_meter_wh")
             energy_kwh = close_result.get("energy_delivered_kwh")
             if energy_kwh is None:
-                if meter_stop is None:
+                if meter_stop_wh is None:
                     anomaly_reason = "missing_meter_stop"
                 elif meter_start_db is None:
-                    anomaly_reason = "missing_meter_start"
-                elif meter_stop < int(meter_start_db):
+                    # Two scenarios reach NULL meter_start_wh: a legacy row
+                    # inserted before migration 036, or a "deferred" row from
+                    # the meterStart=0 path that never saw a positive
+                    # Energy.Active.Import.Register sample to backfill from.
+                    # last_meter_wh tells them apart — if it's NULL too, the
+                    # charger never sent register samples (the configuration
+                    # push that switches Terra AC into the right measurand
+                    # set failed, or the firmware truly lacks it). Operators
+                    # need to investigate measurand configuration rather than
+                    # reconcile from a legacy backfill.
+                    if last_meter_db is None:
+                        anomaly_reason = "deferred_meter_start_never_backfilled"
+                    else:
+                        anomaly_reason = "missing_meter_start"
+                elif meter_start_db == 0:
+                    # Defensive: post-Phase-1 we coerce meterStart=0 to NULL
+                    # at the OCPP boundary so this branch should be dead in
+                    # production. Kept to catch rows inserted by external
+                    # tooling or tests that bypass the adapter.
+                    anomaly_reason = "meter_start_is_zero"
+                elif meter_stop_wh < int(meter_start_db):
                     anomaly_reason = "meter_stop_lt_meter_start"
                 else:
                     anomaly_reason = "unknown"
                 logger.warning(
                     "Anomalous meter delta on station=%s tx_id=%s: %s "
-                    "(meter_start_wh=%s, meter_stop_wh=%s). Leaving "
-                    "energy_delivered_kwh NULL.",
+                    "(meter_start_wh=%s, last_meter_wh=%s, meter_stop_wh=%s, "
+                    "raw_meter_stop=%s). Leaving energy_delivered_kwh NULL.",
                     cp_id,
                     transaction_id,
                     anomaly_reason,
                     meter_start_db,
+                    last_meter_db,
+                    meter_stop_wh,
                     meter_stop,
                 )
 

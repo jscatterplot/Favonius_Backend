@@ -4,9 +4,12 @@
 -- distinct from the security_audit_log hypertable (NKSC / NIS2 compliance log).
 --
 -- This table records *application-level* admin actions (e.g. cross-org reads
--- by favonius_admin, credential rotations, depot setup edits). It is queried
--- by tenant + actor and by target (depot/charger), so it lives in static
--- (Supabase) DB rather than the time-series hypertable.
+-- by favonius_admin, credential rotations, depot setup edits). It lives on
+-- TimescaleDB (the ``ts`` pool) — writes go via
+-- ``src/security/admin_audit.py::write_admin_audit_row`` with
+-- ``db_pools.ts``. Querying patterns are actor / org / depot / target keyed;
+-- the row volume is low so a plain Postgres table on Tiger is fine without
+-- hypertable conversion.
 --
 -- Idempotent: every statement uses IF NOT EXISTS or equivalent.
 

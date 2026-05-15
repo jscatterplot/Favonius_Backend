@@ -44,6 +44,7 @@ class AlertDispatcher:
         poll_interval_s: float = 30.0,
         resend_interval_s: int = 3600,
         batch_size: int = 50,
+        listen_connection_factory: Optional[Callable[[], Awaitable[Any]]] = None,
     ) -> None:
         self._pool = pool
         self._email_client = email_client
@@ -51,6 +52,13 @@ class AlertDispatcher:
         self._poll_interval_s = poll_interval_s
         self._resend_interval_s = resend_interval_s
         self._batch_size = batch_size
+        # When provided, the dispatcher opens its own asyncpg connection for
+        # the LISTEN loop instead of parking on a pool slot for the lifetime
+        # of the process. Production wires this to ``open_dedicated_connection``;
+        # tests omit it and the dispatcher falls back to ``pool.acquire()`` so
+        # existing fake-pool fixtures keep working.
+        self._listen_connection_factory = listen_connection_factory
+        self._listener_owns_connection = False
 
         self._currently_sending: set[UUID] = set()
         self._wake_event = asyncio.Event()
@@ -126,9 +134,12 @@ class AlertDispatcher:
             except Exception:
                 logger.debug("alerts: remove_listener failed (already torn down)", exc_info=True)
             try:
-                await self._pool.release(self._listener_conn)
+                if self._listener_owns_connection:
+                    await self._listener_conn.close()
+                else:
+                    await self._pool.release(self._listener_conn)
             except Exception:
-                logger.debug("alerts: pool.release failed", exc_info=True)
+                logger.debug("alerts: listener teardown failed", exc_info=True)
         logger.info("alerts: dispatcher stopped")
 
     @staticmethod
@@ -156,7 +167,12 @@ class AlertDispatcher:
     # ------------------------------------------------------------------
 
     async def _start_listener(self) -> None:
-        self._listener_conn = await self._pool.acquire()
+        if self._listen_connection_factory is not None:
+            self._listener_conn = await self._listen_connection_factory()
+            self._listener_owns_connection = True
+        else:
+            self._listener_conn = await self._pool.acquire()
+            self._listener_owns_connection = False
         await self._listener_conn.add_listener(_NOTIFY_CHANNEL, self._on_notify)
 
     def _on_notify(self, *_args: Any) -> None:

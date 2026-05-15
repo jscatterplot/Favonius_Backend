@@ -18,6 +18,7 @@ from src.notifications.resend_client import ResendEmailClient
 from .config import Config
 from .config_validator import ConfigValidator
 from .connection_monitor import ConnectionMonitor
+from .connection_pool import open_dedicated_connection
 from .data_sync import DataSyncService
 from .database_schema import create_schema_from_config
 from .health import HealthCheckServer
@@ -68,6 +69,7 @@ class Application:
         # charging_command_queue rows that the FastAPI optimizer enqueues.
         self.queue_consumer: Optional[ChargingCommandQueueConsumer] = None
         self._active_tx_reconciler_task: Optional[asyncio.Task] = None
+        self._orphan_recovery_task: Optional[asyncio.Task] = None
 
         # Alerts pipeline (see docs/plans/alerts-pipeline.md). Optional —
         # disabled by default in test envs without a Resend key.
@@ -144,8 +146,11 @@ class Application:
             await self.health_server.start()
             await self.api_server.start(port=self.config.monitoring.api_port)
 
-            # Start data sync service
-            await self.data_sync_service.start()
+            # Start data sync service (skipped silently when Supabase was
+            # unavailable — the service is then None and there is nothing
+            # to sync).
+            if self.data_sync_service is not None:
+                await self.data_sync_service.start()
 
             # Initialize connection monitoring
             self.connection_monitor = ConnectionMonitor(
@@ -170,6 +175,14 @@ class Application:
             # mid-transaction handler restart.
             self._active_tx_reconciler_task = asyncio.create_task(
                 self._active_tx_reconciler(), name="active_tx_reconciler"
+            )
+
+            # Orphan charging-session recovery (migration 038). Closes rows
+            # whose StopTransaction never arrived using the running
+            # last_meter_wh as a synthesized meter_stop_wh — see PR #186 /
+            # CLAUDE.md energy tracking plan.
+            self._orphan_recovery_task = asyncio.create_task(
+                self._orphan_recovery_loop(), name="orphan_recovery"
             )
 
             # Alerts dispatcher (optional). Only starts when notifications
@@ -356,6 +369,57 @@ class Application:
             return None
         return self.websocket_server.get_charge_point(cp_id)
 
+    async def _orphan_recovery_loop(self) -> None:
+        """Periodically close charging_sessions rows whose StopTransaction never arrived.
+
+        Sweep cadence and staleness threshold are tunable so accounting can
+        be tightened in production without a code change:
+
+          * ``ORPHAN_RECOVERY_INTERVAL_S`` (default 300s / 5 min) — time
+            between sweeps.
+          * ``ORPHAN_RECOVERY_THRESHOLD_S`` (default 1800s / 30 min) —
+            minimum age of ``last_seen_at`` before a row is considered
+            orphaned. Must be larger than any realistic legit pause.
+          * ``ORPHAN_RECOVERY_BATCH_LIMIT`` (default 100) — max rows
+            closed per sweep; the next sweep picks up the rest.
+
+        All errors are caught and logged; this is best-effort housekeeping
+        and must never propagate.
+        """
+        import os
+
+        interval = int(os.environ.get("ORPHAN_RECOVERY_INTERVAL_S", "300"))
+        threshold = int(os.environ.get("ORPHAN_RECOVERY_THRESHOLD_S", "1800"))
+        batch_limit = int(os.environ.get("ORPHAN_RECOVERY_BATCH_LIMIT", "100"))
+
+        # Initial delay: wait one full interval before the first sweep so
+        # legitimate in-flight sessions during a handler restart don't get
+        # closed before BootNotification reload (fetch_open_sessions) runs.
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+
+        while self.running:
+            try:
+                closed = await self.timescale_client.recover_orphaned_sessions(
+                    stale_after_seconds=threshold,
+                    batch_limit=batch_limit,
+                )
+                if closed:
+                    self.logger.warning(
+                        "orphan_recovery_loop closed %d session(s); first=%s last=%s",
+                        len(closed),
+                        closed[0].get("station_id"),
+                        closed[-1].get("station_id"),
+                    )
+            except Exception as exc:
+                self.logger.error("orphan_recovery_loop sweep failed: %s", exc)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+
     async def _active_tx_reconciler(self) -> None:
         """Refresh the ``active_transactions`` gauge from DB every 30 s.
 
@@ -407,6 +471,9 @@ class Application:
         if self._active_tx_reconciler_task:
             self._active_tx_reconciler_task.cancel()
             stop_tasks.append(self._active_tx_reconciler_task)
+        if self._orphan_recovery_task:
+            self._orphan_recovery_task.cancel()
+            stop_tasks.append(self._orphan_recovery_task)
 
         # Stop alert dispatcher before tearing down the DB pool.
         if self.alert_dispatcher:
@@ -418,9 +485,6 @@ class Application:
         if self.connection_monitor:
             stop_tasks.append(self.connection_monitor.stop_monitoring())
 
-        if self.data_sync_service:
-            stop_tasks.append(self.data_sync_service.stop())
-
         if self.api_server:
             stop_tasks.append(self.api_server.stop())
 
@@ -430,15 +494,23 @@ class Application:
         if self.health_server:
             stop_tasks.append(self.health_server.stop())
 
-        if self.timescale_client:
-            stop_tasks.append(self.timescale_client.disconnect())
-
-        if self.supabase_client:
-            stop_tasks.append(self.supabase_client.disconnect())
-
-        # Wait for all components to stop
+        # Wait for components that do not close the shared Timescale pool.
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+        # DataSyncService shares timescale_client.pg_pool; its stop() cancels
+        # the sync task but disconnect() must not close the pool until that
+        # cancellation has finished (otherwise in-flight queries see InterfaceError).
+        if self.data_sync_service:
+            await asyncio.gather(self.data_sync_service.stop(), return_exceptions=True)
+
+        db_teardown = []
+        if self.timescale_client:
+            db_teardown.append(self.timescale_client.disconnect())
+        if self.supabase_client:
+            db_teardown.append(self.supabase_client.disconnect())
+        if db_teardown:
+            await asyncio.gather(*db_teardown, return_exceptions=True)
 
         self.logger.info("Application shutdown complete")
 
@@ -474,6 +546,11 @@ class Application:
                 except Exception:
                     pass
                 self.analytics_service = None
+            # DataSyncService now shares the TimescaleClient pool — it lives
+            # in the TimescaleDB-init phase, so reset it here. It is safe to
+            # null without calling .stop() because the pool we'd want to
+            # close is owned by ``self.timescale_client`` (closed below).
+            self.data_sync_service = None
             if self.timescale_client:
                 try:
                     await self.timescale_client.disconnect()
@@ -496,9 +573,7 @@ class Application:
             return
 
         if not self.timescale_client or not self.timescale_client.pg_pool:
-            self.logger.warning(
-                "alerts: dispatcher not started; timescale pg_pool unavailable"
-            )
+            self.logger.warning("alerts: dispatcher not started; timescale pg_pool unavailable")
             return
 
         if notifications_cfg.resend_api_key:
@@ -514,6 +589,7 @@ class Application:
                 "FakeEmailClient — emails will NOT be delivered"
             )
 
+        timescale_cfg = self.timescale_client.config
         self.alert_dispatcher = AlertDispatcher(
             pool=self.timescale_client.pg_pool,
             email_client=self._email_client,
@@ -521,6 +597,7 @@ class Application:
             poll_interval_s=notifications_cfg.poll_interval_s,
             resend_interval_s=notifications_cfg.resend_interval_s,
             batch_size=notifications_cfg.batch_size,
+            listen_connection_factory=lambda: open_dedicated_connection(timescale_cfg),
         )
         await self.alert_dispatcher.start()
 
@@ -553,10 +630,11 @@ class Application:
             # Create auth manager
             self.auth_manager = AuthManager(self.config.supabase, self.supabase_client)
 
-            # Create data sync service
-            self.data_sync_service = DataSyncService(
-                self.config.supabase, self.supabase_client, self.config.timescale
-            )
+            # DataSyncService is constructed later in
+            # _initialize_timescale_components so it can share the live
+            # TimescaleClient pool instead of opening its own. Leaving the
+            # attribute None here keeps the cleanup paths safe.
+            self.data_sync_service = None
 
             self.logger.info("Supabase components initialized successfully")
 
@@ -597,6 +675,17 @@ class Application:
             # Authorize/StartTransaction is rejected as Invalid.
             if self.supabase_client is not None:
                 self.timescale_client.set_supabase_client(self.supabase_client)
+
+            # Create data sync service now that the TimescaleClient pool
+            # exists; share its pool so we do not open a second 1-10
+            # connection pool against the same Postgres.
+            if self.supabase_client is not None:
+                self.data_sync_service = DataSyncService(
+                    self.config.supabase,
+                    self.supabase_client,
+                    self.config.timescale,
+                    timescale_client=self.timescale_client,
+                )
 
             # Initialize analytics service
             self.analytics_service = AnalyticsService(

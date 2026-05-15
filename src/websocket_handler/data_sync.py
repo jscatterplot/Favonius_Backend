@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import asyncpg
 
@@ -10,27 +10,44 @@ from .config import SupabaseConfig, TimescaleConfig
 from .monitoring import get_logger
 from .supabase_client import SupabaseClient
 
+if TYPE_CHECKING:
+    from .timescale_client import TimescaleClient
+
 
 class DataSyncService:
     """Service for synchronizing data between TimescaleDB and Supabase."""
 
     _CHARGING_SESSIONS_TABLE_KEY = "charging_sessions"
     _CHARGING_SESSIONS_SYNC_COLUMN_KEY = "charging_sessions:sync_charging_sessions"
-    _ENERGY_METRICS_SYNC_COLUMN_KEY = "charging_sessions:sync_energy_metrics"
 
     def __init__(
         self,
         config: SupabaseConfig,
         supabase_client: SupabaseClient,
         timescale_config: Optional[TimescaleConfig] = None,
+        *,
+        timescale_client: Optional["TimescaleClient"] = None,
     ):
-        """Initialize data sync service."""
+        """Initialize data sync service.
+
+        Pass ``timescale_client`` to share the live ``TimescaleClient``
+        pool — preferred in production so this service does not open a
+        second 1-10 connection pool against the same Postgres. Falls back
+        to the legacy ``timescale_config`` path (dedicated pool) only when
+        the caller has no live client to hand over (e.g. older tests).
+        """
         self.config = config
         self.supabase_client = supabase_client
         self.timescale_config = timescale_config
         self.logger = get_logger(__name__)
 
-        # TimescaleDB connection
+        # When we share an external pool we must NOT close it on stop().
+        self._timescale_client = timescale_client
+        self._owns_timescale_pool = timescale_client is None
+
+        # TimescaleDB connection — populated on start(). When a client is
+        # injected we reuse its pool; otherwise start() creates a dedicated
+        # one from ``timescale_config``.
         self.timescale_pool: Optional[asyncpg.Pool] = None
 
         # Sync configuration
@@ -52,20 +69,42 @@ class DataSyncService:
         # re-checks (the operator may have backfilled in the meantime).
         self._missing_relations: Set[str] = set()
 
+        # Pool-exhaustion suppression. When Postgres rejects acquires with
+        # SQLSTATE 53300 ("remaining connection slots are reserved for ...
+        # pg_use_reserved_connections") the underlying issue is upstream
+        # connection pressure, not a bug in this sync loop. Logging at ERROR
+        # every 5 minutes pages on a transient condition. Track the
+        # "already-warned" state so consecutive exhausted ticks log only
+        # once, with a single recovery log when the next tick succeeds.
+        self._pool_exhaustion_warned: bool = False
+
     async def start(self) -> None:
         """Start the data synchronization service."""
         try:
-            # Connect to TimescaleDB using the dedicated TimescaleDB config
-            self.timescale_pool = await asyncpg.create_pool(
-                host=self.timescale_config.host,
-                port=self.timescale_config.port,
-                database=self.timescale_config.database,
-                user=self.timescale_config.user,
-                password=self.timescale_config.password,
-                ssl=self.timescale_config.sslmode,
-                min_size=1,
-                max_size=10,
-            )
+            if self._timescale_client is not None:
+                # Share the live pool — no new connections opened.
+                self.timescale_pool = self._timescale_client.pg_pool
+                if self.timescale_pool is None:
+                    raise RuntimeError(
+                        "DataSyncService given a TimescaleClient with no "
+                        "pg_pool; call client.connect() before start()."
+                    )
+            else:
+                if self.timescale_config is None:
+                    raise RuntimeError(
+                        "DataSyncService needs either timescale_client or "
+                        "timescale_config to reach TimescaleDB."
+                    )
+                self.timescale_pool = await asyncpg.create_pool(
+                    host=self.timescale_config.host,
+                    port=self.timescale_config.port,
+                    database=self.timescale_config.database,
+                    user=self.timescale_config.user,
+                    password=self.timescale_config.password,
+                    ssl=self.timescale_config.sslmode,
+                    min_size=1,
+                    max_size=10,
+                )
 
             self.sync_running = True
 
@@ -91,12 +130,14 @@ class DataSyncService:
                 pass
             self._sync_task = None
 
-        if self.timescale_pool:
+        if self._owns_timescale_pool and self.timescale_pool:
             await self.timescale_pool.close()
+        self.timescale_pool = None
 
         # Re-check missing relations on next start; the operator may have
         # added them while we were stopped.
         self._missing_relations.clear()
+        self._pool_exhaustion_warned = False
 
         self.logger.info("Data sync service stopped")
 
@@ -118,7 +159,6 @@ class DataSyncService:
             self.sync_charging_sessions(),
             self.sync_vehicle_states(),
             self.sync_optimization_decisions(),
-            self.sync_energy_metrics(),
         ]
 
         await asyncio.gather(*sync_tasks, return_exceptions=True)
@@ -126,7 +166,6 @@ class DataSyncService:
     def _is_known_missing(self, table_name: str) -> bool:
         """Return True if this table is on the skip-list for this process run."""
         return table_name in self._missing_relations
-
 
     @staticmethod
     def _string_or_none(value: Any) -> Optional[str]:
@@ -154,6 +193,37 @@ class DataSyncService:
         if value is None:
             return default
         return int(round(float(value)))
+
+    def _handle_pool_exhaustion(self, sync_label: str, exc: BaseException) -> None:
+        """Log a Postgres connection-slot exhaustion at WARNING, dedup'd.
+
+        Postgres returns SQLSTATE 53300 ("too_many_connections") with the
+        text "remaining connection slots are reserved for roles with
+        privileges of the pg_use_reserved_connections role" when the cluster
+        is at its ``max_connections`` ceiling. This is a transient
+        operational condition (other clients eating slots, a noisy restart,
+        a Supabase pooler hiccup) — not a sync bug. Log once at WARNING and
+        let the next 5-min tick naturally retry.
+        """
+        if self._pool_exhaustion_warned:
+            return
+        self._pool_exhaustion_warned = True
+        self.logger.warning(
+            f"Skipping {sync_label}: Postgres reports no available connection "
+            f"slots (likely cluster-wide max_connections pressure). Subsequent "
+            f"ticks will be silent until the pool recovers. Underlying error: {exc}"
+        )
+
+    def _note_pool_recovery(self) -> None:
+        """First successful sync after exhaustion — log once at INFO and reset.
+
+        Lets operators see in the log that pressure has cleared without
+        having to grep for the absence of WARNINGs.
+        """
+        if not self._pool_exhaustion_warned:
+            return
+        self._pool_exhaustion_warned = False
+        self.logger.info("Postgres connection slot pressure cleared; data sync resumed")
 
     def _handle_missing_relation(
         self, table_name: str, exc: BaseException, sync_label: str
@@ -238,7 +308,9 @@ class DataSyncService:
                                 "session_id": self._string_or_none(session["session_id"]),
                                 "station_id": self._string_or_none(session.get("station_id")),
                                 "vehicle_id": self._string_or_none(session.get("vehicle_id")),
-                                "organization_id": self._string_or_none(session.get("fleet_operator_id")),
+                                "organization_id": self._string_or_none(
+                                    session.get("fleet_operator_id")
+                                ),
                                 "start_time": session["start_time"].isoformat(),
                                 "end_time": (
                                     session["end_time"].isoformat() if session["end_time"] else None
@@ -252,12 +324,8 @@ class DataSyncService:
                                 "session_duration_minutes": self._json_int(
                                     session["session_duration_minutes"]
                                 ),
-                                "cost_total": (
-                                    self._json_float(session["cost_total"])
-                                ),
-                                "revenue_v2g": (
-                                    self._json_float(session["revenue_v2g"])
-                                ),
+                                "cost_total": (self._json_float(session["cost_total"])),
+                                "revenue_v2g": (self._json_float(session["revenue_v2g"])),
                                 "status": session["derived_status"],
                             }
                         )
@@ -281,6 +349,8 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(sessions)} charging sessions")
 
+                self._note_pool_recovery()
+
         except asyncpg.UndefinedColumnError as e:
             # Defence in depth: if a deployment is somehow on a charging_sessions
             # variant we do not recognise (e.g. a future column rename), log
@@ -292,6 +362,8 @@ class DataSyncService:
             self._handle_missing_relation(
                 self._CHARGING_SESSIONS_TABLE_KEY, e, "charging session sync"
             )
+        except asyncpg.TooManyConnectionsError as e:
+            self._handle_pool_exhaustion("charging session sync", e)
         except Exception as e:
             self.logger.error(f"Failed to sync charging sessions: {e}")
 
@@ -362,12 +434,16 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(states)} vehicle states")
 
+                self._note_pool_recovery()
+
         except asyncpg.UndefinedTableError as e:
             self._handle_missing_relation("vehicle_telemetry", e, "vehicle state sync")
         except asyncpg.UndefinedColumnError as e:
             self._handle_missing_relation(
                 "vehicle_telemetry", e, "vehicle state sync (column missing)"
             )
+        except asyncpg.TooManyConnectionsError as e:
+            self._handle_pool_exhaustion("vehicle state sync", e)
         except Exception as e:
             self.logger.error(f"Failed to sync vehicle states: {e}")
 
@@ -435,100 +511,27 @@ class DataSyncService:
 
                     self.logger.info(f"Synced {len(decisions)} optimization decisions")
 
+                self._note_pool_recovery()
+
         except asyncpg.UndefinedTableError as e:
             self._handle_missing_relation("optimization_decisions", e, "optimization decision sync")
         except asyncpg.UndefinedColumnError as e:
             self._handle_missing_relation(
                 "optimization_decisions", e, "optimization decision sync (column missing)"
             )
+        except asyncpg.TooManyConnectionsError as e:
+            self._handle_pool_exhaustion("optimization decision sync", e)
         except Exception as e:
             self.logger.error(f"Failed to sync optimization decisions: {e}")
 
     async def sync_energy_metrics(self) -> None:
-        """Sync energy metrics and analytics to Supabase."""
-        if self._is_known_missing(self._CHARGING_SESSIONS_TABLE_KEY) or self._is_known_missing(
-            self._ENERGY_METRICS_SYNC_COLUMN_KEY
-        ):
-            return
-        try:
-            if not self.timescale_pool:
-                return
-
-            # Get last sync time
-            last_sync = self.last_sync_times.get(
-                "energy_metrics", datetime.now(timezone.utc) - timedelta(hours=1)
-            )
-
-            async with self.timescale_pool.acquire() as conn:
-                # Query energy metrics
-                query = """
-                    SELECT
-                        fleet_operator_id,
-                        DATE(start_time) as date,
-                        COUNT(DISTINCT vehicle_id) as vehicles_charged,
-                        SUM(energy_delivered_kwh) as total_energy_charged,
-                        SUM(energy_received_kwh) as total_energy_discharged,
-                        AVG(EXTRACT(EPOCH FROM (end_time - start_time))/60)
-                            AS avg_session_duration,
-                        SUM(cost_total) as total_cost,
-                        SUM(revenue_v2g) as total_v2g_revenue
-                    FROM charging_sessions
-                    WHERE start_time > $1
-                        AND end_time IS NOT NULL
-                    GROUP BY fleet_operator_id, DATE(start_time)
-                    ORDER BY date DESC
-                    LIMIT $2
-                """
-
-                metrics = await conn.fetch(query, last_sync, self.batch_size)
-
-                if metrics:
-                    # Update daily energy summary in Supabase
-                    for metric in metrics:
-                        await self.supabase_client.client.table("daily_energy_summary").upsert(
-                            {
-                                "organization_id": metric["fleet_operator_id"],
-                                "date": metric["date"].isoformat(),
-                                "vehicles_charged": metric["vehicles_charged"],
-                                "total_energy_charged": (
-                                    float(metric["total_energy_charged"])
-                                    if metric["total_energy_charged"]
-                                    else 0
-                                ),
-                                "total_energy_discharged": (
-                                    float(metric["total_energy_discharged"])
-                                    if metric["total_energy_discharged"]
-                                    else 0
-                                ),
-                                "avg_session_duration": (
-                                    float(metric["avg_session_duration"])
-                                    if metric["avg_session_duration"]
-                                    else 0
-                                ),
-                                "total_cost": (
-                                    float(metric["total_cost"]) if metric["total_cost"] else 0
-                                ),
-                                "total_v2g_revenue": (
-                                    float(metric["total_v2g_revenue"])
-                                    if metric["total_v2g_revenue"]
-                                    else 0
-                                ),
-                            }
-                        ).execute()
-
-                    # Update last sync time
-                    self.last_sync_times["energy_metrics"] = datetime.now(timezone.utc)
-
-                    self.logger.info(f"Synced {len(metrics)} energy metrics")
-
-        except asyncpg.UndefinedTableError as e:
-            self._handle_missing_relation(self._CHARGING_SESSIONS_TABLE_KEY, e, "energy metrics sync")
-        except asyncpg.UndefinedColumnError as e:
-            self._handle_missing_relation(
-                self._ENERGY_METRICS_SYNC_COLUMN_KEY, e, "energy metrics sync (column missing)"
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to sync energy metrics: {e}")
+        """No-op: daily_energy_summary is a view that aggregates live from
+        charging_sessions_summary, so there is nothing for the backend to
+        upsert. Earlier revisions wrote rows here and Supabase returned 500
+        because PostgREST cannot write to an aggregating view. The method
+        is retained so force_sync("energy_metrics") stays valid.
+        """
+        return
 
     async def sync_active_sessions(self, sessions: List[Dict[str, Any]]) -> None:
         """Sync active charging sessions to Supabase."""

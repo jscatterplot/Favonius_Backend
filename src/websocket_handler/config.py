@@ -98,8 +98,29 @@ class TimescaleConfig(BaseModel):
     user: str = Field(description="Database user")
     password: str = Field(description="Database password")
     sslmode: str = Field(default="require", description="SSL mode")
-    max_connections: int = Field(default=100, description="Maximum database connections")
-    pool_size: int = Field(default=20, description="Connection pool size")
+    max_connections: int = Field(
+        default=6,
+        description=(
+            "Maximum database connections (per-replica ceiling for the "
+            "EnhancedConnectionPool). Sized for a single-depot pilot on a "
+            "shared Postgres cluster where multiple services (API + this "
+            "WS handler) compete for the same `max_connections` budget. "
+            "The LISTEN consumers (charging_command_queue, "
+            "notification_alerts_new) hold dedicated connections OUTSIDE "
+            "this pool — total per-replica slot usage is "
+            "``max_connections + 2``. Raise via TIMESCALE_MAX_CONNECTIONS "
+            "when scaling to a larger fleet."
+        ),
+    )
+    pool_size: int = Field(
+        default=2,
+        description=(
+            "Minimum/idle connection count held by the pool. Kept small "
+            "by default so restart loops don't exhaust the DB's "
+            "max_connections ceiling; raise via TIMESCALE_POOL_SIZE when "
+            "the workload steady-state needs more concurrent queries."
+        ),
+    )
     statement_timeout: int = Field(default=30, description="Statement timeout in seconds")
     idle_timeout: int = Field(default=600, description="Idle timeout in seconds")
     chunk_time_interval: str = Field(default="1 day", description="Hypertable chunk interval")
@@ -118,7 +139,16 @@ class SupabaseConfig(BaseModel):
     db_name: str = Field(default="postgres", description="Database name")
     db_user: str = Field(description="Database user")
     db_password: str = Field(description="Database password")
-    max_connections: int = Field(default=20, description="Maximum database connections")
+    max_connections: int = Field(
+        default=10,
+        description=(
+            "Maximum Supabase DB connections (per-replica ceiling for "
+            "``SupabaseClient.db_pool``). Sized conservatively so the WS "
+            "handler does not compete with the API service's own pool for "
+            "the same Supabase ``max_connections`` ceiling; raise via "
+            "MAX_CONNECTIONS when the workload genuinely needs more."
+        ),
+    )
     connection_timeout: int = Field(default=30, description="Connection timeout in seconds")
     enable_realtime: bool = Field(default=True, description="Enable real-time subscriptions")
 
@@ -308,11 +338,11 @@ def _timescale_config_from_env(secrets_manager: SecretsManager) -> TimescaleConf
         sslmode=sm_m,
         max_connections=int(
             secrets_manager.get_secret("TIMESCALE_MAX_CONNECTIONS")
-            or os.getenv("TIMESCALE_MAX_CONNECTIONS", "100")
+            or os.getenv("TIMESCALE_MAX_CONNECTIONS", "6")
         ),
         pool_size=int(
             secrets_manager.get_secret("TIMESCALE_POOL_SIZE")
-            or os.getenv("TIMESCALE_POOL_SIZE", "20")
+            or os.getenv("TIMESCALE_POOL_SIZE", "2")
         ),
         statement_timeout=int(
             secrets_manager.get_secret("TIMESCALE_STATEMENT_TIMEOUT")
@@ -423,7 +453,7 @@ class Config(BaseModel):
                 or os.getenv("SUPABASE_DB_PASSWORD"),
                 max_connections=int(
                     secrets_manager.get_secret("SUPABASE_MAX_CONNECTIONS")
-                    or os.getenv("SUPABASE_MAX_CONNECTIONS", "20")
+                    or os.getenv("SUPABASE_MAX_CONNECTIONS", "10")
                 ),
                 connection_timeout=int(
                     secrets_manager.get_secret("SUPABASE_CONNECTION_TIMEOUT")

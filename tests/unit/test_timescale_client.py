@@ -380,6 +380,24 @@ class TestTimescaleClient:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
+    async def test_clear_sessions_seen_filters_to_live_source(self, timescale_client):
+        """Reconnect clear must only touch open live rows."""
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_pool.acquire.return_value.__aexit__.return_value = None
+        timescale_client.pg_pool = mock_pool
+
+        await timescale_client.clear_sessions_seen("CP-1")
+
+        query = mock_conn.execute.await_args.args[0]
+        assert "SET last_seen_at = NULL" in query
+        assert "end_time IS NULL" in query
+        assert "source = 'live'" in query
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_ensure_station_alias_inserts_when_canonical_exists(self, timescale_client):
         """A new alias is upserted with the canonical-exists guard + ON CONFLICT."""
         mock_conn = AsyncMock()
