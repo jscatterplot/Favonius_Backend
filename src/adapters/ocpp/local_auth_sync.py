@@ -35,6 +35,7 @@ keeps reconciliation simple.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -42,6 +43,28 @@ from enum import Enum
 from typing import Any, Optional, Protocol
 
 logger = logging.getLogger(__name__)
+
+
+def _get_explicit_callable(obj: Any, name: str):
+    """Return a real callable attribute, ignoring MagicMock auto-created children.
+
+    Unit tests and duck-typed adapters sometimes use ``MagicMock``/proxy objects
+    that synthesize callable child attributes for any missing name. Treating those
+    placeholders as optional helper methods makes the orchestration await a
+    non-awaitable mock instead of falling back to the base OCPP method. A helper
+    is considered real only when it is present directly on the instance or on the
+    concrete type.
+    """
+    method = getattr(obj, name, None)
+    if not callable(method):
+        return None
+    try:
+        instance_vars = vars(obj)
+    except TypeError:
+        instance_vars = {}
+    if name in instance_vars or hasattr(type(obj), name):
+        return method
+    return None
 
 
 # Per-call timeout for ``ChangeConfiguration`` in the bootstrap. Mirrors the
@@ -92,6 +115,7 @@ def _normalize_firmware(firmware: Optional[str]) -> Optional[str]:
     if firmware is None:
         return None
     return firmware.strip()
+
 
 # Local-cap enforced inside ``FleetChargePoint.send_local_list``. Mirrored
 # here so we can tell apart a ``NotSupported`` that came back from the
@@ -318,9 +342,7 @@ def _format_entries(id_tag_rows: list[dict]) -> list[dict]:
     ]
 
 
-async def _bootstrap_local_auth_config(
-    cp: _ChargePointProto, station_id: str
-) -> BootstrapOutcome:
+async def _bootstrap_local_auth_config(cp: _ChargePointProto, station_id: str) -> BootstrapOutcome:
     """Fail-fast: enable LocalAuthList + cache + pre-authorize on first sync.
 
     The first key in ``_BOOTSTRAP_CONFIG_KEYS`` (``LocalAuthListEnabled``) is
@@ -345,12 +367,10 @@ async def _bootstrap_local_auth_config(
     we observed at HRX Vilnius (~10-60 s) and the bootstrap never gets
     to fail before the connection is gone.
     """
+
     async def _change_configuration_with_error(key: str, value: str) -> tuple[str, bool]:
-        method = getattr(cp, "change_configuration_with_error", None)
-        if method is not None and (
-            "change_configuration_with_error" in vars(cp)
-            or hasattr(type(cp), "change_configuration_with_error")
-        ):
+        method = _get_explicit_callable(cp, "change_configuration_with_error")
+        if method is not None:
             return await method(key, value)
         status = await cp.change_configuration(key, value)
         return status, False
@@ -528,9 +548,7 @@ async def sync_charger(
                     station_id,
                     legacy_exc,
                 )
-                return SyncResult(
-                    status="skipped", version=0, entries=0, reason="db_error"
-                )
+                return SyncResult(status="skipped", version=0, entries=0, reason="db_error")
         else:
             logger.error(
                 "local_auth_sync station=%s db_error fetching station row: %s",
@@ -600,9 +618,7 @@ async def sync_charger(
     # response is firmware-permanent (cache it) or transient (don't cache).
     # Conservative default: a True cache entry OR a positive probe result.
     probe_positive = supported_cached is True
-    needs_probe = not legacy_schema and (
-        supported_cached is None or probed_fw != current_fw
-    )
+    needs_probe = not legacy_schema and (supported_cached is None or probed_fw != current_fw)
     if needs_probe:
         probe_result = await _probe_local_auth_support(cp, station_id)
         if probe_result is False:
@@ -663,11 +679,7 @@ async def sync_charger(
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
         if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED:
-            if (
-                not legacy_schema
-                and not probe_positive
-                and current_fw is not None
-            ):
+            if not legacy_schema and not probe_positive and current_fw is not None:
                 await _record_probe_outcome(
                     db,
                     station_row["id"],
@@ -712,33 +724,42 @@ async def sync_charger(
 
     send_local_list_raised = False
     send_local_list_transport_error = False
-    method = getattr(cp, "send_local_list_with_error", None)
-    if callable(method) and (
-        "send_local_list_with_error" in vars(cp)
-        or hasattr(type(cp), "send_local_list_with_error")
-    ):
+
+    async def _send_local_list_without_error_helper() -> str:
+        return await cp.send_local_list(
+            list_version=new_version,
+            update_type="Full",
+            local_authorization_list=entries,
+        )
+
+    method = _get_explicit_callable(cp, "send_local_list_with_error")
+    if method is not None:
         try:
             maybe_result = method(
                 list_version=new_version,
                 update_type="Full",
                 local_authorization_list=entries,
             )
-            if not hasattr(maybe_result, "__await__"):
-                raise TypeError("send_local_list_with_error returned non-awaitable")
-            status, send_local_list_transport_error = await maybe_result
-        except TypeError:
-            status = await cp.send_local_list(
-                list_version=new_version,
-                update_type="Full",
-                local_authorization_list=entries,
+            if inspect.isawaitable(maybe_result):
+                status, send_local_list_transport_error = await maybe_result
+            else:
+                logger.warning(
+                    "local_auth_sync station=%s send_local_list_with_error returned "
+                    "non-awaitable; falling back to send_local_list",
+                    station_id,
+                )
+                status = await _send_local_list_without_error_helper()
+        except Exception as exc:
+            logger.error(
+                "local_auth_sync station=%s send_local_list_with_error raised: %s",
+                station_id,
+                exc,
             )
+            send_local_list_raised = True
+            status = "Failed"
     else:
         try:
-            status = await cp.send_local_list(
-                list_version=new_version,
-                update_type="Full",
-                local_authorization_list=entries,
-            )
+            status = await _send_local_list_without_error_helper()
         except Exception as exc:
             logger.error(
                 "local_auth_sync station=%s send_local_list raised: %s",

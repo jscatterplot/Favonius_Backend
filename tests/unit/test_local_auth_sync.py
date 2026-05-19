@@ -353,6 +353,80 @@ class TestSyncChargerFailureModes:
         assert result.version == 1
 
 
+class TestSyncChargerSendLocalListWithErrorDispatch:
+    @pytest.mark.asyncio
+    async def test_magicmock_placeholder_helper_is_ignored(self, monkeypatch) -> None:
+        """MagicMock auto-creates callable child attrs for missing helpers.
+
+        The optional ``send_local_list_with_error`` fast path should only be
+        used when the adapter explicitly provides the helper; otherwise the
+        normal ``send_local_list`` fallback remains the source of truth.
+        """
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={"id": "uuid-1", "local_list_version": 3},
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(send_status="Accepted")
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "Accepted"
+        cp.send_local_list.assert_awaited_once()
+        # Accessing the missing helper creates a child MagicMock, but it must
+        # never be called or awaited.
+        cp.send_local_list_with_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_explicit_helper_exception_is_caught_as_failed(self, monkeypatch) -> None:
+        """Duck-typed helpers may raise instead of swallowing adapter errors.
+
+        sync_charger should preserve the orchestration-layer contract: record a
+        Failed status without propagating the exception or writing a negative
+        firmware-capability cache entry.
+        """
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(
+            firmware_version="V1.8.36",
+            get_configuration_response={"configuration_key": [], "unknown_key": []},
+        )
+        cp.send_local_list_with_error = AsyncMock(side_effect=RuntimeError("socket closed"))
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "Failed"
+        cp.send_local_list_with_error.assert_awaited_once()
+        cp.send_local_list.assert_not_awaited()
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported" not in update_call.args[0]
+        assert update_call.args[1] == "Failed"
+
+    @pytest.mark.asyncio
+    async def test_explicit_nonawaitable_helper_falls_back_safely(self, monkeypatch) -> None:
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={"id": "uuid-1", "local_list_version": 2},
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(send_status="Accepted")
+        cp.send_local_list_with_error = MagicMock(return_value=("Failed", False))
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "Accepted"
+        cp.send_local_list_with_error.assert_called_once()
+        cp.send_local_list.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap config defensiveness
 # ---------------------------------------------------------------------------
@@ -484,9 +558,7 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
     sequence on every reconnect (HRX Vilnius ABB Terra AC V1.8.x)."""
 
     @pytest.mark.asyncio
-    async def test_critical_key_notsupported_skips_send_and_writes_cache(
-        self, monkeypatch
-    ) -> None:
+    async def test_critical_key_notsupported_skips_send_and_writes_cache(self, monkeypatch) -> None:
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
         db = _make_db(
             station_row={
@@ -669,9 +741,7 @@ class TestSyncChargerFailedFallbackCache:
         assert update_call.args[3] == "Failed"
 
     @pytest.mark.asyncio
-    async def test_failed_after_positive_probe_does_not_cache_negative(
-        self, monkeypatch
-    ) -> None:
+    async def test_failed_after_positive_probe_does_not_cache_negative(self, monkeypatch) -> None:
         """If we already have positive evidence of support (probe returned
         True this turn), a Failed is treated as transient — last_status
         only, no firmware-permanent cache."""
@@ -710,9 +780,7 @@ class TestSyncChargerFailedFallbackCache:
         assert update_call.args[1] == "Failed"
 
     @pytest.mark.asyncio
-    async def test_failed_after_cached_positive_does_not_cache_negative(
-        self, monkeypatch
-    ) -> None:
+    async def test_failed_after_cached_positive_does_not_cache_negative(self, monkeypatch) -> None:
         """Same protection on subsequent reconnects: if the cache already
         says supported=True for this firmware, a Failed stays transient."""
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
@@ -1224,9 +1292,7 @@ class TestSyncChargerLegacySchemaFallback:
         # legacy shape returns a minimal row.
         db.fetchrow = AsyncMock(
             side_effect=[
-                _UndefinedColumnError(
-                    'column "local_list_supported" does not exist'
-                ),
+                _UndefinedColumnError('column "local_list_supported" does not exist'),
                 {"id": "uuid-1", "local_list_version": 0},
             ]
         )
@@ -1275,9 +1341,7 @@ class TestSyncChargerLegacySchemaFallback:
         db = MagicMock()
         db.fetchrow = AsyncMock(
             side_effect=[
-                _UndefinedColumnError(
-                    'column "local_list_supported" does not exist'
-                ),
+                _UndefinedColumnError('column "local_list_supported" does not exist'),
                 {"id": "uuid-1", "local_list_version": 0},
             ]
         )
