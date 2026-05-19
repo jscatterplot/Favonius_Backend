@@ -1,0 +1,123 @@
+# Sprint 5 scenario 04 — scheduled departure with no driver assigned.
+#
+# BUS-401 has a healthy charger and projected SoC, but no driver row
+# covers route R-401. The agent emits a hold_route proposal and flags
+# requires_manager=true (assigning a driver needs human input). The
+# driver-side tool isn't in the default harness registry — the LLM
+# emits the hold proposal directly based on schedule context.
+
+id: readiness-04-no-driver
+description: >
+  Scheduled departure for BUS-401 on route R-401 with no driver
+  assigned. Expected: exactly one hold_route proposal flagged
+  requires_manager=true.
+severity: blocking
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+workflow:
+  id: "10000000-0000-4000-8000-00000000d004"
+  name: daily_readiness_check
+  version: "1.0.0"
+  description: Daily readiness check (PRD §6.1).
+  prompt: |
+    You confirm every vehicle will be ready for its assigned route at
+    scheduled departure, and surface anything that won't.
+  allowed_tools:
+    - get_scheduled_departures
+    - get_vehicle_state
+    - get_charger_state
+  parameters:
+    lead_time_min: 60
+    soc_tolerance_pct: 1.0
+    escalation_threshold: 3
+
+permission_tier: inform
+
+graph_snapshot:
+  depot:
+    depot_id: "11111111-1111-4111-8111-1111111100d4"
+    name: "Vilnius depot"
+    latitude: 54.6872
+    longitude: 25.2797
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000004d1"
+      external_id: "BUS-401"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "ccccccc0-0000-4000-8000-0000000004d1"
+      ocpp_id: "CP-401"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000004d1"
+      route_id: "R-401"
+      departure_time: "+2h"
+      return_time: "+12h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+
+  telemetry:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000004d1"
+      charger_id: "ccccccc0-0000-4000-8000-0000000004d1"
+      time: "-5m"
+      soc: 0.97
+      is_plugged: true
+      charging_kw: 60.0
+
+llm_trace:
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_04_sched"
+        name: get_scheduled_departures
+        input: {}
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_04_emit"
+        name: emit_decision
+        input:
+          summary: >-
+            R-401 has no driver assigned for the 07:00 pull-out. Hold the
+            route until operations assigns a driver.
+          rule_applied: "no_driver_hold"
+          proposed_actions:
+            - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000004d1"
+              type: "hold_route"
+              route_id: "R-401"
+              requires_manager: true
+              justification: "No driver assigned to R-401; hold until assignment confirmed."
+          coverage:
+            vehicles_checked: 1
+            chargers_checked: 1
+            routes_checked: 1
+
+expected:
+  disposition: pending
+  rule_applied: no_driver_hold
+  output:
+    summary_contains: "no driver"
+    proposed_action_types:
+      - hold_route
+    proposed_action_count_min: 1
+    proposed_action_count_max: 1
+    must_propose_for_vehicle:
+      - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000004d1"
+        action_type_contains: "hold"
+    filtered_violations_max: 0
+    coverage:
+      vehicles_checked: 1
+      chargers_checked: 1
+      routes_checked: 1
+  tool_calls:
+    count_min: 1
+    names_in_order:
+      - get_scheduled_departures
+    all_ok: true

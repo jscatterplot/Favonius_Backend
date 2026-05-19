@@ -49,6 +49,7 @@ from src.api.agent_workflows.repository import (  # noqa: E402
     insert_decision,
     list_decisions,
     set_tier,
+    upsert_workflow,
 )
 
 
@@ -216,6 +217,45 @@ class TestGetWorkflow:
         conn.fetchrow.return_value = None
         with pytest.raises(WorkflowNotFoundError):
             await get_workflow(pool, "ghost")
+
+
+@pytest.mark.asyncio
+class TestUpsertWorkflow:
+    async def test_returns_workflow_with_upsert_sql(self, mock_asyncpg_pool):
+        pool, conn = mock_asyncpg_pool
+        # The upsert RETURNING clause echoes the same columns get_workflow reads.
+        conn.fetchrow.return_value = _workflow_row(
+            name="daily_readiness_check",
+            version="1.0.0",
+            allowed_tools=[
+                "get_scheduled_departures",
+                "get_vehicle_state",
+                "get_charger_state",
+                "get_charging_plan",
+                "get_driver_assignment",
+            ],
+            parameters={"lead_time_min": 60},
+        )
+        wf = await upsert_workflow(
+            pool,
+            name="daily_readiness_check",
+            version="1.0.0",
+            description="Daily readiness check",
+            prompt="You are the readiness agent.",
+            allowed_tools=["get_scheduled_departures", "get_vehicle_state"],
+            parameters={"lead_time_min": 60},
+        )
+        assert wf.name == "daily_readiness_check"
+        assert wf.version == "1.0.0"
+
+        sql, *params = conn.fetchrow.call_args[0]
+        assert "INSERT INTO workflows" in sql
+        assert "ON CONFLICT (name) DO UPDATE" in sql
+        assert "RETURNING" in sql
+        assert params[0] == "daily_readiness_check"
+        assert params[1] == "1.0.0"
+        # allowed_tools is positional arg #4 (index 4) — passed as TEXT[].
+        assert params[4] == ["get_scheduled_departures", "get_vehicle_state"]
 
 
 # ── get_tier / set_tier ──────────────────────────────────────────────────

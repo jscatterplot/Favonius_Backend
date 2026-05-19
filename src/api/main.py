@@ -572,6 +572,34 @@ async def lifespan(app: FastAPI):
             )
             logger.info("Data source scheduler + recovery started")
 
+    # ── Depot agent — daily readiness workflow (sprint 5) ────────────────────
+    # Behind DEPOT_AGENT_ENABLED. Upserts the `daily_readiness_check` row in
+    # `workflows` and seeds `workflow_tiers` at tier='inform' for every depot
+    # the static schema knows about. Idempotent on every cold start; failures
+    # log but never block startup so the rest of the API stays up.
+    from .agent_workflows.feature_flag import is_depot_agent_enabled  # noqa: PLC0415
+
+    if is_depot_agent_enabled():
+        try:
+            from .agent_workflows.readiness_workflow import (  # noqa: PLC0415
+                register_daily_readiness_workflow,
+            )
+
+            result = await register_daily_readiness_workflow(
+                static_pool=static_pool,
+                ts_pool=ts_pool,
+            )
+            logger.info(
+                "Daily readiness workflow registered: %s (tiers_seeded=%d, depots_seen=%d)",
+                result["workflow_id"],
+                result["tiers_seeded"],
+                result["depots_seen"],
+            )
+        except Exception as exc:  # pragma: no cover — never block startup
+            logger.error(
+                "Failed to register daily readiness workflow: %s", exc, exc_info=True
+            )
+
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────

@@ -64,6 +64,52 @@ async def get_workflow(pool: Any, name: str) -> Workflow:
     return _workflow_from_row(row)
 
 
+async def upsert_workflow(
+    pool: Any,
+    *,
+    name: str,
+    version: str,
+    description: str,
+    prompt: str,
+    allowed_tools: list[str],
+    parameters: dict[str, Any],
+) -> Workflow:
+    """Upsert a workflow row by unique ``name``.
+
+    Used by the per-workflow startup registration paths (sprint 5 +
+    later workflows). The row is fully rewritten on every call so the
+    DB always tracks the code's prompt + tool allow-list + parameter
+    defaults — drift is impossible.
+
+    Returns the resulting :class:`Workflow` (insert or update — the
+    returned row reflects whichever happened).
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            INSERT INTO workflows
+                (name, version, description, prompt, allowed_tools, parameters,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW())
+            ON CONFLICT (name) DO UPDATE SET
+                version       = EXCLUDED.version,
+                description   = EXCLUDED.description,
+                prompt        = EXCLUDED.prompt,
+                allowed_tools = EXCLUDED.allowed_tools,
+                parameters    = EXCLUDED.parameters,
+                updated_at    = NOW()
+            RETURNING {_WORKFLOW_COLUMNS}
+            """,
+            name,
+            version,
+            description,
+            prompt,
+            list(allowed_tools),
+            json.dumps(parameters),
+        )
+    return _workflow_from_row(row)
+
+
 # ── workflow_tiers ────────────────────────────────────────────────────────
 
 
