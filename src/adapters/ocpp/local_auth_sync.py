@@ -714,9 +714,9 @@ async def sync_charger(
         # reconnect on a stuck-in-first-sync charger fires the full
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
-        if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED and not probe_positive:
+        if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED:
             await _disable_freevend_best_effort(cp, station_id)
-            if not legacy_schema and current_fw is not None:
+            if not probe_positive and not legacy_schema and current_fw is not None:
                 await _record_probe_outcome(
                     db,
                     station_row["id"],
@@ -724,7 +724,7 @@ async def sync_charger(
                     firmware=current_fw,
                     last_status="UnsupportedFromBootstrap",
                 )
-            else:
+            elif not probe_positive:
                 # Legacy schema: stamp last_status on the columns that DO exist
                 # so ops can still see "we gave up at the bootstrap step".
                 try:

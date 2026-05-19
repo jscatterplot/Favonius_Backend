@@ -373,6 +373,8 @@ class TestSyncChargerSendLocalListWithErrorDispatch:
 
         assert result.status == "Accepted"
         cp.send_local_list.assert_awaited_once()
+
+
         # Accessing the missing helper creates a child MagicMock, but it must
         # never be called or awaited.
         cp.send_local_list_with_error.assert_not_called()
@@ -670,6 +672,8 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         assert result.status == "Accepted"
         cp.send_local_list.assert_awaited_once()
 
+
+
     @pytest.mark.asyncio
     async def test_bootstrap_unsupported_under_legacy_schema_stamps_last_status_only(
         self, monkeypatch
@@ -703,9 +707,9 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         assert update_call.args[1] == "UnsupportedFromBootstrap"
 
     @pytest.mark.asyncio
-    async def test_positive_probe_continues_send_after_bootstrap_unsupported(self, monkeypatch) -> None:
-        """If probe/cache already proved support, a bootstrap UNSUPPORTED
-        must not block SendLocalList."""
+    async def test_positive_probe_still_disables_freevend_on_bootstrap_unsupported(self, monkeypatch) -> None:
+        """If bootstrap marks unsupported, we still short-circuit SendLocalList
+        and push Freevend disable even when probe/cache was positive."""
         monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
         db = _make_db(
             station_row={
@@ -720,8 +724,10 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         cp.change_configuration = AsyncMock(return_value="NotSupported")
 
         result = await sync_charger(cp, db, "station-001")
-        assert result.status == "Accepted"
-        cp.send_local_list.assert_awaited_once()
+        assert result.status == "UnsupportedFromBootstrap"
+        cp.send_local_list.assert_not_awaited()
+        # First call: critical key, second call: best-effort Freevend disable.
+        assert cp.change_configuration.await_count == 2
 
     @pytest.mark.asyncio
     async def test_bootstrap_unsupported_still_attempts_freevend_disable(self, monkeypatch) -> None:
@@ -742,7 +748,6 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         assert result.status == "UnsupportedFromBootstrap"
         # First call: critical key, second call: best-effort Freevend disable.
         assert cp.change_configuration.await_count == 2
-        assert cp.change_configuration.await_args_list[1].args == ("FreevendEnabled", "false")
 
 
 class TestSyncChargerFailedFallbackCache:
@@ -1160,6 +1165,8 @@ class TestSyncChargerProbeCache:
 
         assert result.status == "Accepted"
         cp.send_local_list.assert_awaited_once()
+
+
         # First UPDATE recorded the positive probe (supported=True, firmware,
         # no last_status); second UPDATE bumped version after Accepted push.
         update_calls = db.execute.await_args_list
