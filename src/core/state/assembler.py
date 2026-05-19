@@ -371,64 +371,50 @@ class StateAssembler:
             List of prices in $/kWh, one per timestep
 
         Note:
-            Handles missing price data by forward-filling from last known price
-            within 1 hour. Falls back to default $0.15/kWh if no data available.
+            Delegates the DB read + 1-hour forward-fill to the canonical
+            ``src.db.queries.fetch_prices_with_fill``. Hours that helper
+            can't fill (no known price within 1h) get the optimizer's
+            $0.15/kWh default — this default is a solver-input concern
+            and lives here, not in the helper, because billing code in
+            ``src/core/billing/`` must NOT fabricate prices the same way.
 
         Raises:
             asyncpg.PostgresError: If database query fails
         """
-        query = """
-        SELECT time, energy_kwh as price_per_kwh
-        FROM prices
-        WHERE depot_id = $1 AND time >= $2 AND time < $3
-        ORDER BY time
-        """
+        from ...db.queries import fetch_prices_with_fill
+
         try:
             async with self.pools.ts.acquire() as conn:
-                rows = await conn.fetch(query, self.depot_id, start, end)
+                price_map = await fetch_prices_with_fill(
+                    conn, self.depot_id, start, end
+                )
         except asyncpg.PostgresError as e:
             logger.error(
                 f"Database error fetching prices for depot {self.depot_id}: {e}. "
                 "Using default prices."
             )
-            # Fallback to default prices on database error
             return [0.15] * n_steps
 
-        if not rows:
+        if not price_map:
             logger.warning(
                 f"No price data found for depot {self.depot_id} "
                 f"between {start} and {end}, using default $0.15/kWh"
             )
-            return [0.15] * n_steps  # Default price
+            return [0.15] * n_steps
 
-        # Build time-indexed price map
-        price_map = {row["time"]: float(row["price_per_kwh"]) for row in rows}
-
-        # Generate prices for each timestep
         delta_t = timedelta(hours=self.config.delta_t)
-        prices = []
-        last_price = 0.15  # Default fallback
+        prices: list[float] = []
+        last_price = 0.15
 
         for t in range(n_steps):
             step_time = start + t * delta_t
-
-            # Find closest price (exact match or forward-fill)
-            if step_time in price_map:
-                last_price = price_map[step_time]
-            # Forward-fill: use last known price if within 1 hour
-            elif price_map:
-                closest_time = min(
-                    price_map.keys(),
-                    key=lambda x: abs((x - step_time).total_seconds()),
-                )
-                time_diff = abs((closest_time - step_time).total_seconds())
-                if time_diff < 3600:  # Within 1 hour
-                    last_price = price_map[closest_time]
-
+            hour_floor = step_time.replace(minute=0, second=0, microsecond=0)
+            if hour_floor in price_map:
+                last_price = price_map[hour_floor]
             prices.append(last_price)
 
         logger.debug(
-            f"Price interpolation: {len(price_map)} price points -> {len(prices)} timesteps"
+            f"Price interpolation: {len(price_map)} priced hours -> {len(prices)} timesteps"
         )
         return prices[:n_steps]
 

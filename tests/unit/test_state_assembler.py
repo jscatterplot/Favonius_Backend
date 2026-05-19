@@ -161,7 +161,7 @@ class TestGetPrices:
         rows = []
         base_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
         for i in range(6):
-            row_data = {"time": base_time + timedelta(hours=i), "price_per_kwh": 0.10 + i * 0.01}
+            row_data = {"time": base_time + timedelta(hours=i), "energy_kwh": 0.10 + i * 0.01}
             row = MagicMock()
             row.__getitem__ = lambda self, k, d=row_data: d[k]
             rows.append(row)
@@ -204,8 +204,8 @@ class TestGetPrices:
         base_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
 
         # Create proper mock rows
-        row1_data = {"time": base_time, "price_per_kwh": 0.10}
-        row2_data = {"time": base_time + timedelta(hours=1), "price_per_kwh": 0.20}
+        row1_data = {"time": base_time, "energy_kwh": 0.10}
+        row2_data = {"time": base_time + timedelta(hours=1), "energy_kwh": 0.20}
 
         row1 = MagicMock()
         row1.__getitem__ = lambda self, k, d=row1_data: d[k]
@@ -237,7 +237,7 @@ class TestGetPrices:
                 **{
                     "__getitem__.side_effect": lambda k, t=base_time, p=0.10: {
                         "time": t,
-                        "price_per_kwh": p,
+                        "energy_kwh": p,
                     }[k]
                 }
             ),
@@ -791,7 +791,7 @@ class TestGetCurrentState:
                         **{
                             "__getitem__.side_effect": lambda k, t=datetime.utcnow(), p=0.10: {
                                 "time": t,
-                                "price_per_kwh": p,
+                                "energy_kwh": p,
                             }[k]
                         }
                     ),
@@ -867,7 +867,7 @@ class TestGetCurrentState:
                         **{
                             "__getitem__.side_effect": lambda k, t=datetime.utcnow(), p=0.10: {
                                 "time": t,
-                                "price_per_kwh": p,
+                                "energy_kwh": p,
                             }[k]
                         }
                     ),
@@ -1131,7 +1131,7 @@ class TestPriceHandling:
                 hours=i
             ), p=0.10 + i * 0.01: {
                 "time": t,
-                "price_per_kwh": p,
+                "energy_kwh": p,
             }[
                 k
             ]
@@ -1182,7 +1182,7 @@ class TestPriceHandling:
             mock_row = MagicMock()
             mock_row.__getitem__ = lambda self, k, time=t: {
                 "time": time,
-                "price_per_kwh": 0.12,
+                "energy_kwh": 0.12,
             }[k]
             price_rows.append(mock_row)
 

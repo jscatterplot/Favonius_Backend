@@ -219,6 +219,79 @@ async def insert_price(
     await db.execute(query, timestamp, depot_id, energy_kwh, demand_kw, source)
 
 
+async def fetch_prices_with_fill(
+    db,
+    depot_id: UUID,
+    start_time: datetime,
+    end_time: datetime,
+    forward_fill_window: timedelta = timedelta(hours=1),
+) -> dict[datetime, float]:
+    """Return a {hour_floor_utc: $/kWh} map for [start_time, end_time).
+
+    Reads the ``prices`` hypertable for ``depot_id`` and forward-fills any
+    missing hour from the most recent known price within
+    ``forward_fill_window``. Hours with no known price within the window
+    are absent from the returned dict — the caller decides whether that
+    counts as 'unpriceable'.
+
+    This is the canonical price lookup shared by the optimizer's
+    ``_get_prices`` (which adds a $0.15/kWh solver-input fallback on top)
+    and the cost calculator in ``src/core/billing/session_cost.py``
+    (which treats missing hours as 'unpriceable' rather than fabricating).
+
+    Args:
+        db: Database connection or pool.
+        depot_id: Depot UUID.
+        start_time: Inclusive start (any timezone-aware datetime; the
+            ``prices`` table stores UTC).
+        end_time: Exclusive end.
+        forward_fill_window: Maximum age of the last known price that
+            can be used to fill a missing hour. Defaults to 1 hour to
+            match the optimizer's behavior.
+
+    Returns:
+        Dict keyed by the start-of-hour timestamp (UTC) covered by
+        ``[start_time, end_time)`` whose value is the $/kWh price for
+        that hour. Hours absent from the dict have no usable price.
+    """
+    rows = await db.fetch(
+        """
+        SELECT time, energy_kwh
+        FROM prices
+        WHERE depot_id = $1 AND time >= $2 AND time < $3
+        ORDER BY time
+        """,
+        depot_id,
+        start_time - forward_fill_window,
+        end_time,
+    )
+
+    if not rows:
+        return {}
+
+    known: list[tuple[datetime, float]] = [
+        (row["time"], float(row["energy_kwh"])) for row in rows
+    ]
+
+    filled: dict[datetime, float] = {}
+    first_hour = start_time.replace(minute=0, second=0, microsecond=0)
+    if first_hour < start_time:
+        first_hour = first_hour + timedelta(hours=1)
+    cursor = first_hour
+    while cursor < end_time:
+        candidate = None
+        for ts, price in known:
+            if ts <= cursor and (cursor - ts) <= forward_fill_window:
+                candidate = price
+            elif ts > cursor:
+                break
+        if candidate is not None:
+            filled[cursor] = candidate
+        cursor += timedelta(hours=1)
+
+    return filled
+
+
 # ============ SCHEDULE QUERIES ============
 
 

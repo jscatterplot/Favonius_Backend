@@ -2702,13 +2702,80 @@ class TimescaleClient:
                     # Lost the race to another writer between SELECT and UPDATE.
                     return None
                 result = dict(updated)
+                result["session_id"] = session_id
                 # Surface the synthesis flag so the OCPP handler can pick a
                 # distinct log line / metric without re-deriving the
                 # condition. Not a column on charging_sessions — the
                 # ``synthesized_delta`` suffix on stop_reason is the durable
                 # audit trail.
                 result["synthesized"] = synthesized
-                return result
+        # Transaction committed + connection released. Schedule the cost
+        # calculation as a fire-and-forget task — if it crashes, the row
+        # stays cost_total=NULL and the backfill script catches it on the
+        # next run (its predicate covers exactly this case).
+        self._schedule_session_cost(session_id)
+        return result
+
+    def _schedule_session_cost(self, session_id: uuid.UUID) -> None:
+        """Schedule the post-commit cost calculation for one session.
+
+        Fire-and-forget. ``_compute_and_write_cost`` swallows every
+        exception so close-path callers are never affected. Errors are
+        logged and counted via ``SESSION_COST_COMPUTE_FAILURES``.
+        """
+        asyncio.create_task(
+            self._compute_and_write_cost(session_id),
+            name=f"session-cost-{session_id}",
+        )
+
+    async def _compute_and_write_cost(self, session_id: uuid.UUID) -> None:
+        """Fetch the just-closed session, run the cost calculator, update the row.
+
+        Lazy-imports ``src.core.billing`` and ``src.monitoring.metrics``
+        to keep the legacy WS handler's hot import path lean.
+        """
+        from ..core.billing import compute_session_cost, write_session_cost
+        from ..monitoring.metrics import (
+            SESSION_COST_COMPUTE_FAILURES,
+            SESSION_COST_COMPUTED,
+            SESSION_COST_DURATION,
+        )
+
+        started = time.monotonic()
+        try:
+            async with self.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT session_id, site_id, vehicle_id, start_time, end_time,
+                           energy_delivered_kwh, cost_total, cost_total_source
+                      FROM charging_sessions
+                     WHERE session_id = $1
+                    """,
+                    session_id,
+                )
+            if row is None:
+                self.logger.warning(
+                    "Session %s vanished before cost calc could read it",
+                    session_id,
+                )
+                return
+            result = await compute_session_cost(self.pg_pool, dict(row))
+            await write_session_cost(self.pg_pool, session_id, result)
+            SESSION_COST_COMPUTED.labels(source=result.source).inc()
+        except asyncpg.PostgresError as exc:
+            self.logger.exception(
+                "DB error computing cost for session %s: %s", session_id, exc
+            )
+            SESSION_COST_COMPUTE_FAILURES.labels(reason="db_error").inc()
+        except Exception as exc:  # noqa: BLE001 — fire-and-forget must not raise
+            self.logger.exception(
+                "Unexpected error computing cost for session %s: %s",
+                session_id,
+                exc,
+            )
+            SESSION_COST_COMPUTE_FAILURES.labels(reason="unexpected").inc()
+        finally:
+            SESSION_COST_DURATION.observe(time.monotonic() - started)
 
     async def recover_orphaned_sessions(
         self,
@@ -2830,6 +2897,11 @@ class TimescaleClient:
                 if updated is not None:
                     closed.append(dict(updated))
 
+        # Schedule cost calcs for every orphan-recovered row. Done after
+        # the connection has been released so the post-commit tasks run
+        # against the canonical row state.
+        for row in closed:
+            self._schedule_session_cost(row["session_id"])
         return closed
 
     async def mark_sessions_seen(self, station_id: str) -> None:

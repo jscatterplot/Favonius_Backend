@@ -268,6 +268,10 @@ Sprint 4 ships the five tools the daily-readiness workflow needs (PRD §6.1) on 
 
 Tools registered: `get_scheduled_departures(depot_id, window_start, window_end)`, `get_vehicle_state(vehicle_id)`, `get_charger_state(charger_id)`, `get_charging_plan(vehicle_id)`, `get_driver_assignment(route_id)`. The data plumbing this depends on: Supabase migration 013 (`schedules.driver_id`) and migration 014 (`routes` view aliasing `schedules` to the PRD §5.1 `Route` shape).
 
+### Per-session billing (`src/core/billing/session_cost.py`)
+
+`compute_session_cost(ts_pool, session_row)` returns a `SessionCostResult` (`cost`, `source`, diagnostics). Two strategies, automatic selection: **granular** integrates `charging_kw × Δt × price(t)` via TimescaleDB `time_bucket('1 hour', telemetry.time)` (trapezoidal between consecutive samples) joined to `prices`, **fallback_average** uses `energy_delivered_kwh × avg(price over [start,end])`. The granular path is gated: telemetry timestamps must cover ≥80% of the session AND telemetry-implied energy must reconcile to within ±10% of `energy_delivered_kwh`. The chosen strategy is written to `charging_sessions.cost_total_source` (migration 040). Missing prices → `'unpriceable'`, `cost_total` stays NULL; billing never fabricates a price. Price lookups go through the shared `src/db/queries.py::fetch_prices_with_fill` helper (also used by `StateAssembler._get_prices`). The OCPP close path (`TimescaleClient.close_open_session`, `recover_orphaned_sessions`) schedules the calc as a post-commit `asyncio.create_task`; if it fails, the row stays NULL and `scripts/backfill_session_cost.py` sweeps it on the next run (predicate `WHERE cost_total IS NULL OR cost_total = 0`). Backfill is chunked (default 500 rows) with `SELECT FOR UPDATE SKIP LOCKED` and is safely re-runnable. Metrics: `favonius_session_cost_computed_total{source}`, `favonius_session_cost_compute_failures_total{reason}`, `favonius_session_cost_duration_seconds`.
+
 ### Optimization Control Loop
 
 ```
@@ -401,6 +405,7 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 - `optimization_runs.status` values: `'optimal'` | `'feasible'` | `'degraded'` | `'infeasible'` | `'timeout'`
 - `charging_command_queue.status` values: `'pending'` | `'sent'` | `'acked'` | `'failed'` | `'expired'`
 - `ocpp_transaction_id` / `ocpp_charging_profile_id` sequences (migration 012) provide restart-safe OCPP 1.6 integer IDs
+- `charging_sessions.cost_total_source` values (migration 040): `'granular'` | `'fallback_average'` | `'unpriceable'` | `'no_energy'` | `'no_depot'` | `'manual'`. Written by `src/core/billing/session_cost.py`; the calculator never overwrites `'manual'` or any non-zero externally-sourced cost.
 
 ### Migrations
 Migrations in `migrations/` run automatically on `docker-compose up` (mounted to `/docker-entrypoint-initdb.d`). To run manually: `python scripts/run_migrations.py`.
