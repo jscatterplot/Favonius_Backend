@@ -392,12 +392,12 @@ async def _bootstrap_local_auth_config(cp: _ChargePointProto, station_id: str) -
     except asyncio.TimeoutError:
         logger.warning(
             "local_auth_bootstrap_config station=%s key=%s timed_out_after=%.1fs — "
-            "treating as firmware-permanent unsupported",
+            "treating as transient unknown",
             station_id,
             critical_key,
             _BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
         )
-        return BootstrapOutcome.UNSUPPORTED
+        return BootstrapOutcome.UNKNOWN
     except asyncio.CancelledError:
         # WebSocket dropped mid-bootstrap; propagate so the sync task
         # terminates cleanly. The next reconnect retries the probe.
@@ -468,6 +468,42 @@ async def _bootstrap_local_auth_config(cp: _ChargePointProto, station_id: str) -
             )
 
     return BootstrapOutcome.SUCCESS
+
+
+async def _disable_freevend_best_effort(cp: _ChargePointProto, station_id: str) -> None:
+    """Try to push FreevendEnabled=false even if critical bootstrap key failed."""
+    key, value = "FreevendEnabled", "false"
+    try:
+        status = await asyncio.wait_for(
+            cp.change_configuration(key, value),
+            timeout=_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s timed_out_after=%.1fs",
+            station_id,
+            key,
+            _BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+        )
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s error=%s",
+            station_id,
+            key,
+            exc,
+        )
+        return
+    if status not in {"Accepted", "RebootRequired"}:
+        logger.info(
+            "local_auth_bootstrap_config station=%s key=%s value=%s status=%s",
+            station_id,
+            key,
+            value,
+            status,
+        )
 
 
 async def sync_charger(
@@ -678,8 +714,9 @@ async def sync_charger(
         # reconnect on a stuck-in-first-sync charger fires the full
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
-        if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED:
-            if not legacy_schema and not probe_positive and current_fw is not None:
+        if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED and not probe_positive:
+            await _disable_freevend_best_effort(cp, station_id)
+            if not legacy_schema and current_fw is not None:
                 await _record_probe_outcome(
                     db,
                     station_row["id"],

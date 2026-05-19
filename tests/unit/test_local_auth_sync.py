@@ -481,7 +481,7 @@ class TestBootstrapConfig:
         assert cp.change_configuration.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_critical_key_timeout_returns_unsupported_and_skips_rest(self) -> None:
+    async def test_critical_key_timeout_returns_unknown_and_skips_rest(self) -> None:
         """The HRX Vilnius failure mode: bootstrap hangs because the charger
         ACKed the WS at TCP level but never returned the ChangeConfiguration
         result. The per-call wait_for must catch this."""
@@ -502,7 +502,7 @@ class TestBootstrapConfig:
         finally:
             module_under_test._BOOTSTRAP_CHANGECONFIG_TIMEOUT_S = original_timeout
 
-        assert outcome is BootstrapOutcome.UNSUPPORTED
+        assert outcome is BootstrapOutcome.UNKNOWN
         assert cp.change_configuration.await_count == 1
 
     @pytest.mark.asyncio
@@ -701,6 +701,48 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         assert "local_list_supported" not in update_call.args[0]
         assert "local_list_last_status" in update_call.args[0]
         assert update_call.args[1] == "UnsupportedFromBootstrap"
+
+    @pytest.mark.asyncio
+    async def test_positive_probe_continues_send_after_bootstrap_unsupported(self, monkeypatch) -> None:
+        """If probe/cache already proved support, a bootstrap UNSUPPORTED
+        must not block SendLocalList."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": True,
+                "local_list_probed_firmware": "V1.9.0",
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(firmware_version="V1.9.0", send_status="Accepted")
+        cp.change_configuration = AsyncMock(return_value="NotSupported")
+
+        result = await sync_charger(cp, db, "station-001")
+        assert result.status == "Accepted"
+        cp.send_local_list.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_unsupported_still_attempts_freevend_disable(self, monkeypatch) -> None:
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(firmware_version="V1.8.36")
+        cp.change_configuration = AsyncMock(side_effect=["NotSupported", "Accepted"])
+
+        result = await sync_charger(cp, db, "station-001")
+        assert result.status == "UnsupportedFromBootstrap"
+        # First call: critical key, second call: best-effort Freevend disable.
+        assert cp.change_configuration.await_count == 2
+        assert cp.change_configuration.await_args_list[1].args == ("FreevendEnabled", "false")
 
 
 class TestSyncChargerFailedFallbackCache:
