@@ -594,18 +594,21 @@ class _MessagesFake:
                         tail_start = i + 1
                         break
                 tail = messages[tail_start:] if tail_start is not None else []
-                has_tool_result = any(
-                    isinstance(msg, dict)
-                    and isinstance(msg.get("content"), list)
-                    and any(
-                        isinstance(block, dict) and block.get("type") == "tool_result"
-                        for block in msg["content"]
-                    )
+                expected_tool_use_ids = {
+                    block.id for block in self._last_response.content if block.type == "tool_use"
+                }
+                actual_tool_result_ids = {
+                    str(block.get("tool_use_id"))
                     for msg in tail
-                )
-                if not has_tool_result:
+                    if isinstance(msg, dict) and isinstance(msg.get("content"), list)
+                    for block in msg["content"]
+                    if isinstance(block, dict) and block.get("type") == "tool_result"
+                }
+                missing_tool_results = expected_tool_use_ids - actual_tool_result_ids
+                if missing_tool_results:
                     raise AssertionError(
-                        "FakeAnthropicClient expected tool_result context after tool_use response"
+                        "FakeAnthropicClient expected tool_result context after tool_use response "
+                        f"for tool_use_id(s): {sorted(missing_tool_results)!r}"
                     )
 
         response = self._responses.pop(0)

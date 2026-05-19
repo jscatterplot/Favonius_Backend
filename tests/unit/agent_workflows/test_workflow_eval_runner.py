@@ -375,7 +375,9 @@ async def test_fake_client_replays_in_order() -> None:
     ]
     client = FakeAnthropicClient(trace)
 
-    r1 = await client.messages.create(model="m", messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    r1 = await client.messages.create(
+        model="m", messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    )
     assert r1.content[0].type == "tool_use"
     assert r1.content[0].name == "t1"
 
@@ -383,8 +385,14 @@ async def test_fake_client_replays_in_order() -> None:
         model="m",
         messages=[
             {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {"x": 1}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "ok"}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {"x": 1}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "a", "content": "ok"}],
+            },
         ],
     )
     assert r2.content[0].type == "text"
@@ -396,7 +404,12 @@ async def test_fake_client_records_calls() -> None:
     client = FakeAnthropicClient(
         [{"stop_reason": "tool_use", "content": [{"type": "text", "text": ""}]}]
     )
-    await client.messages.create(model="m", system=[{"text": "hi"}], tools=[], messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    await client.messages.create(
+        model="m",
+        system=[{"text": "hi"}],
+        tools=[],
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    )
     assert len(client.messages.calls) == 1
     assert client.messages.calls[0]["model"] == "m"
 
@@ -412,7 +425,9 @@ async def test_fake_client_carries_usage_when_present() -> None:
             }
         ]
     )
-    r = await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    r = await client.messages.create(
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    )
     assert r.usage.input_tokens == 10
     assert r.usage.output_tokens == 20
 
@@ -422,21 +437,87 @@ async def test_fake_client_raises_when_exhausted() -> None:
     client = FakeAnthropicClient(
         [{"stop_reason": "tool_use", "content": [{"type": "text", "text": "ok"}]}]
     )
-    await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    await client.messages.create(
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    )
     with pytest.raises(AssertionError, match="exhausted"):
-        await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+        await client.messages.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        )
 
 
 @pytest.mark.asyncio
 async def test_fake_client_requires_tool_result_after_tool_use() -> None:
     trace = [
-        {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {}}]},
+        {
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {}}],
+        },
         {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]},
     ]
     client = FakeAnthropicClient(trace)
-    await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    await client.messages.create(
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    )
     with pytest.raises(AssertionError, match="tool_result context"):
-        await client.messages.create(messages=[{"role": "user", "content": [{"type": "text", "text": "next"}]}])
+        await client.messages.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "next"}]}]
+        )
+
+
+@pytest.mark.asyncio
+async def test_fake_client_requires_tool_result_for_latest_tool_use_id() -> None:
+    trace = [
+        {
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {}}],
+        },
+        {
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "b", "name": "t2", "input": {}}],
+        },
+        {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]},
+    ]
+    client = FakeAnthropicClient(trace)
+    await client.messages.create(
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    )
+    await client.messages.create(
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "a", "content": "ok"}],
+            },
+        ]
+    )
+
+    with pytest.raises(AssertionError, match=r"tool_use_id\(s\): \['b'\]"):
+        await client.messages.create(
+            messages=[
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "a", "name": "t1", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "a", "content": "ok"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "b", "name": "t2", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "a", "content": "stale"}],
+                },
+            ]
+        )
 
 
 def test_fake_client_rejects_unknown_block_type() -> None:
