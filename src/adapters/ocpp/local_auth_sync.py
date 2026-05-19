@@ -704,6 +704,7 @@ async def sync_charger(
 
     entries = _format_entries(rows)
 
+    bootstrap_outcome: Optional[BootstrapOutcome] = None
     if is_first_sync:
         bootstrap_outcome = await _bootstrap_local_auth_config(cp, station_id)
         # L3: if the critical ChangeConfiguration key failed (Rejected,
@@ -714,15 +715,25 @@ async def sync_charger(
         # reconnect on a stuck-in-first-sync charger fires the full
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
-        if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED:
+        if bootstrap_outcome in {BootstrapOutcome.UNSUPPORTED, BootstrapOutcome.UNKNOWN}:
             await _disable_freevend_best_effort(cp, station_id)
-            if not probe_positive and not legacy_schema and current_fw is not None:
+            bootstrap_status = (
+                "UnsupportedFromBootstrap"
+                if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
+                else "UnknownFromBootstrap"
+            )
+            if (
+                bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
+                and not probe_positive
+                and not legacy_schema
+                and current_fw is not None
+            ):
                 await _record_probe_outcome(
                     db,
                     station_row["id"],
                     supported=False,
                     firmware=current_fw,
-                    last_status="UnsupportedFromBootstrap",
+                    last_status=bootstrap_status,
                 )
             elif not probe_positive:
                 # Legacy schema: stamp last_status on the columns that DO exist
@@ -734,7 +745,7 @@ async def sync_charger(
                         SET local_list_last_status = $1
                         WHERE id = $2
                         """,
-                        "UnsupportedFromBootstrap",
+                        bootstrap_status,
                         station_row["id"],
                     )
                 except Exception as exc:
@@ -745,18 +756,19 @@ async def sync_charger(
                         exc,
                     )
             logger.info(
-                "local_auth_sync station=%s status=UnsupportedFromBootstrap "
+                "local_auth_sync station=%s status=%s "
                 "entries=%d version=%d first_sync=%s reason=bootstrap_unsupported",
                 station_id,
+                bootstrap_status,
                 len(entries),
                 current_version,
                 is_first_sync,
             )
             return SyncResult(
-                status="UnsupportedFromBootstrap",
+                status=bootstrap_status,
                 version=current_version,
                 entries=len(entries),
-                reason="bootstrap_unsupported",
+                reason="bootstrap_unsupported" if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED else "bootstrap_unknown",
             )
 
     send_local_list_raised = False
@@ -835,6 +847,7 @@ async def sync_charger(
             cache_negative = True
         elif (
             status == "Failed"
+            and bootstrap_outcome is not BootstrapOutcome.UNKNOWN
             and not probe_positive
             and not send_local_list_raised
             and not send_local_list_transport_error

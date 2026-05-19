@@ -749,6 +749,31 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         # First call: critical key, second call: best-effort Freevend disable.
         assert cp.change_configuration.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_bootstrap_unknown_skips_send_without_negative_cache(self, monkeypatch) -> None:
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(firmware_version="V1.8.36")
+        cp.change_configuration_with_error = AsyncMock(return_value=("UNKNOWN", True))
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "UnknownFromBootstrap"
+        assert result.reason == "bootstrap_unknown"
+        cp.send_local_list.assert_not_awaited()
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported" not in update_call.args[0]
+        assert "local_list_last_status" in update_call.args[0]
+        assert update_call.args[1] == "UnknownFromBootstrap"
+
 
 class TestSyncChargerFailedFallbackCache:
     """L4 contract: ``SendLocalList: Failed`` is cached as firmware-permanent
