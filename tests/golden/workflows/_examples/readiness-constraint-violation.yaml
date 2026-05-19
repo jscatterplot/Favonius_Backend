@@ -1,0 +1,116 @@
+# Example scenario — LLM proposes a constraint-violating action.
+#
+# Proves the HardConstraintGuard (PRD §10.3) filters a departure_soc
+# below the depot's min_departure_soc out of the LLM's
+# `proposed_actions` and records it under `filtered_violations`.
+#
+# This is the harness's check on principle 5 ("Hard operational
+# constraints are never violated"): even though the canned LLM trace
+# *attempts* to propose an unsafe action, the runtime must drop it
+# before the Decision row is written.
+
+id: readiness-constraint-violation
+description: >
+  The replayed LLM proposes a route reassignment with
+  departure_soc=0.50 — well below the 0.99 minimum. The guard must
+  filter that out, leaving proposed_actions empty and recording the
+  rejection under filtered_violations.
+severity: blocking
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+workflow:
+  id: "10000000-0000-4000-8000-000000000003"
+  name: readiness_check
+  version: "v1"
+  description: Daily readiness brief — sprint-5 stub for harness wiring.
+  prompt: |
+    You confirm every vehicle will be ready for its assigned route
+    at scheduled departure, and surface anything that won't be.
+  allowed_tools:
+    - get_scheduled_departures
+    - get_vehicle_state
+  parameters: {}
+
+permission_tier: draft_and_wait
+
+depot_constraints:
+  min_departure_soc: 0.99
+  max_grid_kw: 800.0
+
+graph_snapshot:
+  depot:
+    depot_id: "33333333-3333-4333-8333-333333333333"
+    name: "Klaipeda depot"
+    latitude: 55.7033
+    longitude: 21.1443
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+      external_id: "BUS-201"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "eeeeee01-0000-4000-8000-000000000001"
+      ocpp_id: "CP-201"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+      route_id: "R-201"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 260.0
+      required_soc: 0.99
+
+  telemetry:
+    - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+      charger_id: "eeeeee01-0000-4000-8000-000000000001"
+      time: "-5m"
+      soc: 0.71
+      is_plugged: true
+      charging_kw: 60.0
+
+llm_trace:
+  # Turn 1 — gather context.
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_cv_sched"
+        name: get_scheduled_departures
+        input: {}
+  # Turn 2 — emit a decision that *tries* to propose an unsafe departure SoC.
+  # The guard filters it; the Decision row records the rejection.
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_cv_emit"
+        name: emit_decision
+        input:
+          summary: "BUS-201 underprepared for R-201; would be unsafe to depart."
+          rule_applied: "min_departure_soc_guard"
+          proposed_actions:
+            - vehicle_id: "ccccccc1-0000-4000-8000-000000000001"
+              type: "reassign_to_route"
+              candidate_route_id: "R-LIGHT"
+              # Below the 0.99 guard — must be filtered out.
+              departure_soc: 0.50
+              justification: "Picked a lower-energy route given current SoC."
+
+expected:
+  disposition: pending
+  rule_applied: min_departure_soc_guard
+  output:
+    summary_contains: "BUS-201"
+    proposed_action_count_max: 0
+    filtered_violations_min: 1
+    filtered_violations_max: 1
+  tool_calls:
+    count_min: 1
+    names_in_order:
+      - get_scheduled_departures
+    all_ok: true

@@ -99,7 +99,16 @@ For every specific issue (bug, smell, design concern, risk):
 Favonius_Backend/
 ├── src/                         # Primary application code (new architecture)
 │   ├── api/
-│   │   └── main.py              # FastAPI app, all REST endpoints, OCPP WebSocket mount
+│   │   ├── main.py              # FastAPI app, all REST endpoints, OCPP WebSocket mount
+│   │   ├── agent/               # Depot chat agent (Agent Search) — see "Depot Chat Agent" section
+│   │   └── agent_workflows/     # Depot agent runtime + eval harness
+│   │       ├── models.py        # Workflow, Decision, ToolCall, PermissionTier, Disposition (Pydantic)
+│   │       ├── runtime.py       # WorkflowAgent.run_turn — Anthropic tool-use loop + allow-list + guard
+│   │       ├── tools.py         # ToolRegistry (single source of truth for tool name → schema+fn)
+│   │       ├── constraints.py   # HardConstraintGuard (PRD §10.3)
+│   │       ├── repo.py          # DecisionRepo Protocol + asyncpg / in-memory adapters
+│   │       ├── repository.py    # Canonical insert_decision writer (sprint 1)
+│   │       └── eval/runner.py   # Scenario loader, savepoint executor, FakeAnthropicClient, assertions
 │   ├── core/
 │   │   ├── controller.py        # DepotController — main control loop
 │   │   ├── controller_config.py # ControllerConfig dataclass
@@ -250,6 +259,9 @@ The workflow runtime is the Depot Agent product surface (PRD §4.3, §4.4). Spri
 
 The runtime never queries `workflow_tiers` itself — callers resolve the per-(workflow, depot) tier via Sprint 1's `get_tier(pool, workflow_id, depot_id)` and pass it through. `auth_context.organization_id` is required (it's NOT NULL on the `decisions` row) — turns with no org abort with `WorkflowRuntimeError` before the LLM is called. Prompt caching matches the `src/api/agent/llm.py` pattern: the workflow's system block carries `cache_control={"type": "ephemeral"}` so repeat turns of the same workflow hit Anthropic's prefix cache; the per-turn user message (depot id, parameters, user input) is kept out of the cached block. Prometheus metrics: `favonius_workflow_turns_total{workflow,depot,status}`, `favonius_workflow_turn_duration_seconds`, `favonius_workflow_llm_tokens_total`. **No HTTP endpoint yet** — the runtime is exercised via `tests/unit/test_agent_workflows_runtime.py` with fake tools and a fake Anthropic client. The agent is gated by `DEPOT_AGENT_ENABLED` (default off; Sprint 1's feature flag).
 
+### Depot Agent — Eval Harness (`src/api/agent_workflows/eval/`)
+
+Sprint 3 lands the eval harness ahead of any workflow definition (PRD principle 6: "the evaluation harness ships before the workflow"). The harness in `src/api/agent_workflows/eval/runner.py` drives Sprint 2's `WorkflowAgent.run_turn` against a frozen `graph_snapshot` loaded into a transactional savepoint on the **real test DB** (no mocked DDL — we want to catch schema drift). Scenarios live as YAML under `tests/golden/workflows/` against the JSON-schema-style reference in `_schema.yaml`. Each scenario carries (1) a `workflow` block (name, version, prompt, allowed_tools), (2) a `graph_snapshot` (depot, vehicles, chargers, schedules, drivers, telemetry, prices, building_load), (3) an `llm_trace` — a deterministic sequence of Anthropic tool_use turns the harness replays through a fake `AnthropicClient` so the gate doesn't need a real LLM, and (4) an `expected` block that asserts against `Decision.output` + `Decision.tool_calls`. Determinism: `Decision.id`, `timestamp`, and `inputs_hash` are excluded from assertions; everything the test pins is reproducible across runs. Tools the workflow needs in the harness are registered in a per-scenario `ToolRegistry` whose callables read from the savepoint via a thin asyncpg-like adapter. The pytest plugin in `tests/golden/workflows/conftest.py` registers the `workflow_golden` marker; `test_workflow_golden.py` parametrises across every `*.yaml` directly under the gated dir (excluding `_schema.yaml`). Three placeholder scenarios under `_examples/` (`readiness-all-clear`, `readiness-charger-fault`, `readiness-constraint-violation`) prove the harness end-to-end. CI gate: `.github/workflows/workflow-golden.yml` spins up TimescaleDB, applies migrations, runs the harness, and enforces a 90% runner coverage floor. Sprint 5 lands the first 10 readiness scenarios under the gated path.
 ### Depot Agent — Sprint 4 readiness tools (`src/api/agent_workflows/readiness_tools.py`)
 
 Sprint 4 ships the five tools the daily-readiness workflow needs (PRD §6.1) on top of the Sprint-2 runtime. `build_readiness_tool_registry(static_pool, ts_pool, auth, *, depot_id, now=None)` returns a populated `ToolRegistry` whose callables take `**kwargs` matching their JSON input schema (UUIDs come in as strings from the LLM). Auth, pools, and the caller's visible-depot scope are captured in the closure at registry-build time so the runtime can keep dispatching as `await fn(**input)` without threading auth through Anthropic. Every tool filters by `auth.visible_depot_ids` against `sites.organization_id` — the same auth boundary as `src/api/agent/resolve.py` — and uses `src.security.data_freshness.MAX_TELEMETRY_AGE` (15 min) for the staleness threshold, matching `StateAssembler`. Tools never raise on empty data; they return `[]` or `None`-bearing dicts with explicit freshness flags so the runtime can reason about gaps without aborting the turn.

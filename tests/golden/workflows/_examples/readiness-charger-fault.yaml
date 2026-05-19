@@ -1,0 +1,160 @@
+# Example scenario — one vehicle plugged into a faulted charger.
+#
+# Proves the harness propagates a `swap_charger` proposal through the
+# runtime and that must_propose_for_vehicle matches on vehicle_id +
+# action substring. Mirrors PRD §6.1's second sketched scenario.
+
+id: readiness-charger-fault
+description: >
+  Two vehicles plugged in for the morning pull-out. CP-001 is faulted,
+  so BUS-101 should surface a swap_charger proposal. BUS-102 sits on
+  a healthy charger and must not appear in proposed_actions.
+severity: blocking
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+workflow:
+  id: "10000000-0000-4000-8000-000000000002"
+  name: readiness_check
+  version: "v1"
+  description: Daily readiness brief — sprint-5 stub for harness wiring.
+  prompt: |
+    You confirm every vehicle will be ready for its assigned route
+    at scheduled departure, and surface anything that won't be.
+  allowed_tools:
+    - get_scheduled_departures
+    - get_vehicle_state
+    - get_charger_state
+  parameters:
+    lead_time_minutes: 60
+
+permission_tier: draft_and_wait
+
+graph_snapshot:
+  depot:
+    depot_id: "22222222-2222-4222-8222-222222222222"
+    name: "Kaunas depot"
+    latitude: 54.8985
+    longitude: 23.9036
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+      external_id: "BUS-101"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+      external_id: "BUS-102"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "dddddd01-0000-4000-8000-000000000001"
+      ocpp_id: "CP-001"
+      rated_kw: 80.0
+      status: "Faulted"
+    - charger_id: "dddddd01-0000-4000-8000-000000000002"
+      ocpp_id: "CP-002"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+      route_id: "R-101"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+      route_id: "R-102"
+      departure_time: "+2h"
+      return_time: "+10h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+
+  telemetry:
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+      charger_id: "dddddd01-0000-4000-8000-000000000001"
+      time: "-5m"
+      soc: 0.92
+      is_plugged: true
+      charging_kw: 0.0
+    - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+      charger_id: "dddddd01-0000-4000-8000-000000000002"
+      time: "-5m"
+      soc: 0.96
+      is_plugged: true
+      charging_kw: 60.0
+
+llm_trace:
+  # Turn 1 — read schedules.
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_cf_sched"
+        name: get_scheduled_departures
+        input: {}
+  # Turn 2 — check BUS-101's vehicle state.
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_cf_veh"
+        name: get_vehicle_state
+        input:
+          vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+  # Turn 3 — check the offending charger.
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_cf_charger"
+        name: get_charger_state
+        input:
+          charger_id: "dddddd01-0000-4000-8000-000000000001"
+  # Turn 4 — emit decision with the swap proposal.
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_cf_emit"
+        name: emit_decision
+        input:
+          summary: "BUS-101 plugged into faulted CP-001; recommend swap to CP-002."
+          rule_applied: "charger_fault_swap"
+          proposed_actions:
+            - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+              type: "swap_charger"
+              from_charger_id: "dddddd01-0000-4000-8000-000000000001"
+              to_charger_id: "dddddd01-0000-4000-8000-000000000002"
+              justification: "Source charger CP-001 is Faulted; CP-002 is Available with matching kW."
+          coverage:
+            vehicles_checked: 2
+            chargers_checked: 2
+            routes_checked: 2
+
+expected:
+  disposition: pending
+  rule_applied: charger_fault_swap
+  output:
+    summary_contains: "faulted"
+    proposed_action_types:
+      - swap_charger
+    proposed_action_count_min: 1
+    proposed_action_count_max: 1
+    must_propose_for_vehicle:
+      - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000001"
+        action_type_contains: "swap"
+    must_not_propose_for_vehicle:
+      - vehicle_id: "bbbbbbb1-0000-4000-8000-000000000002"
+    filtered_violations_max: 0
+    coverage:
+      vehicles_checked: 2
+      chargers_checked: 2
+      routes_checked: 2
+  tool_calls:
+    count_min: 3
+    names_in_order:
+      - get_scheduled_departures
+      - get_vehicle_state
+      - get_charger_state
+    all_ok: true
