@@ -2792,6 +2792,11 @@ class TimescaleClient:
             row_dict["bidding_zone"] = await self._resolve_bidding_zone(row_dict.get("site_id"))
 
             result = await compute_session_cost(self.pg_pool, row_dict)
+            # Only count the metric when the UPDATE actually landed.
+            # write_session_cost returns False on lost-race (another
+            # writer beat us to it) or when the row stopped being
+            # eligible — neither is a "computed total" event. Counting
+            # those would inflate the dashboard's success rate.
             wrote = await write_session_cost(self.pg_pool, session_id, result)
             if wrote:
                 SESSION_COST_COMPUTED.labels(source=result.source).inc()

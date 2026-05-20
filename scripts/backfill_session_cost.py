@@ -76,6 +76,15 @@ from src.db.queries import fetch_prices_by_zone, resolve_bidding_zone  # noqa: E
 logger = logging.getLogger("backfill_session_cost")
 
 
+# A within-run ``session_id > $3`` cursor advances the candidate set
+# forward. Without it, rows the calculator just tagged
+# ``'unpriceable'`` / ``'no_energy'`` / ``'no_depot'`` (cost_total
+# stays NULL) keep re-matching the predicate on every chunk — the
+# loop never terminates short of ``--max-rows`` because the same
+# rows are picked, re-classified, and re-locked indefinitely. A new
+# backfill run starts with the cursor at the zero UUID, so terminal
+# rows do get a fresh attempt later (the publication-lag recovery
+# story): publication-lag rows just have to wait for the next run.
 _CANDIDATE_SQL = """
     SELECT session_id, site_id, vehicle_id, station_id, connector_id,
            transaction_id, start_time, end_time,
@@ -87,7 +96,8 @@ _CANDIDATE_SQL = """
        AND cost_total_source IS DISTINCT FROM 'no_energy'
        AND cost_total_source IS DISTINCT FROM 'no_depot'
        AND ($1::uuid IS NULL OR site_id = $1)
-     ORDER BY end_time
+       AND session_id > $3::uuid
+     ORDER BY session_id
      LIMIT $2
        FOR UPDATE SKIP LOCKED
 """
@@ -104,10 +114,15 @@ _CANDIDATE_BY_SESSION_SQL = """
        AND cost_total_source IS DISTINCT FROM 'no_depot'
        AND ($1::uuid IS NULL OR site_id = $1)
        AND session_id = ANY($3::uuid[])
-     ORDER BY end_time
+       AND session_id > $4::uuid
+     ORDER BY session_id
      LIMIT $2
        FOR UPDATE SKIP LOCKED
 """
+
+# All-zeros UUID — strictly less than every legitimate ``gen_random_uuid()``
+# value, so the first chunk uses it as a lower-bound that admits all rows.
+_UUID_FLOOR = UUID("00000000-0000-0000-0000-000000000000")
 
 
 class LRUPriceLookup:
@@ -245,6 +260,11 @@ async def _run(args: argparse.Namespace) -> int:
         zone_resolver = ZoneResolver(static_pool)
         counts: Counter[str] = Counter()
         processed = 0
+        # Within-run cursor advances past every session we already
+        # touched — prevents terminal rows (``'unpriceable'`` /
+        # ``'no_energy'`` / ``'no_depot'`` whose cost_total stays NULL)
+        # from looping infinitely.
+        cursor_id: UUID = _UUID_FLOOR
 
         while True:
             if args.max_rows is not None and processed >= args.max_rows:
@@ -262,17 +282,27 @@ async def _run(args: argparse.Namespace) -> int:
                         args.depot_id,
                         chunk_limit,
                         session_ids,
+                        cursor_id,
                     )
                 else:
                     rows = await conn.fetch(
                         _CANDIDATE_SQL,
                         args.depot_id,
                         chunk_limit,
+                        cursor_id,
                     )
                 if not rows:
                     break
 
+                # Advance the cursor before processing, so even if the
+                # write path raises mid-chunk we don't re-pick the
+                # already-locked rows. Combined with the source-exclusion
+                # filter in _CANDIDATE_SQL this fully terminates the
+                # loop: rows that landed terminal are now both behind
+                # the cursor and filtered out of subsequent chunks.
+                cursor_id = rows[-1]["session_id"]
                 chunk_priced = 0
+
                 for row in rows:
                     row_dict = dict(row)
                     row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))

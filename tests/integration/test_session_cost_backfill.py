@@ -394,3 +394,67 @@ async def test_backfill_resweeps_unpriceable_when_prices_arrive(pool, cleanup, m
         )
     assert after["cost_total"] == Decimal("10.0000")  # 20 kWh × €0.50
     assert after["cost_total_source"] == "fallback_average"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_backfill_terminates_when_all_candidates_are_terminal(
+    pool, cleanup, monkeypatch,
+):
+    """Regression: rows whose calculator outcome is terminal
+    (``'unpriceable'`` / ``'no_energy'`` / ``'no_depot'``) keep
+    ``cost_total = NULL`` and so keep matching the candidate
+    predicate. Without a within-run cursor the loop would re-pick
+    them forever. The session_id-ordered cursor advances past them
+    so the loop terminates after one pass."""
+    site_id = uuid4()
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+    # No prices seeded → every session is 'unpriceable' / terminal.
+    session_id_a = uuid4()
+    session_id_b = uuid4()
+    cleanup["sessions"].extend([session_id_a, session_id_b])
+    await _seed_session(
+        pool, session_id=session_id_a, site_id=site_id,
+        start=_utc(2026, 5, 5, 8), end=_utc(2026, 5, 5, 9),
+        energy_kwh=10.0, cost_total=0, cost_total_source=None,
+    )
+    await _seed_session(
+        pool, session_id=session_id_b, site_id=site_id,
+        start=_utc(2026, 5, 5, 9), end=_utc(2026, 5, 5, 10),
+        energy_kwh=10.0, cost_total=0, cost_total_source=None,
+    )
+
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL",
+                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL",
+                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    # batch_size=1 forces multiple chunks; without the cursor fix the
+    # first session keeps re-matching and the loop never terminates.
+    # ``asyncio.wait_for`` is the watchdog — if the bug regresses we
+    # fail fast with a clear timeout rather than hanging the suite.
+    import asyncio as _asyncio
+    await _asyncio.wait_for(
+        bf._run(_args(
+            depot_id=site_id,
+            session_ids=[session_id_a, session_id_b],
+            batch_size=1,
+        )),
+        timeout=15.0,
+    )
+
+    # Both rows reached terminal state (no prices → 'unpriceable').
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT cost_total_source FROM charging_sessions "
+            "WHERE session_id = ANY($1::uuid[])",
+            [session_id_a, session_id_b],
+        )
+    assert {r["cost_total_source"] for r in rows} == {"unpriceable"}

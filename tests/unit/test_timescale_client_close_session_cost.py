@@ -22,6 +22,8 @@ from uuid import uuid4
 
 import pytest
 
+import pytest
+
 from src.websocket_handler.config import TimescaleConfig
 from src.websocket_handler.timescale_client import TimescaleClient
 
@@ -151,3 +153,44 @@ async def test_schedule_session_cost_creates_named_task():
     assert captured_name, "create_task was not called"
     assert str(session_id) in captured_name[0]
     assert captured_name[0].startswith("session-cost-")
+
+
+@pytest.mark.asyncio
+async def test_compute_and_write_cost_only_counts_metric_on_successful_write():
+    """Regression: SESSION_COST_COMPUTED should not increment when
+    write_session_cost returns False (lost race / row no longer
+    eligible). Counting failed writes inflates Prometheus' apparent
+    cost-persistence success rate."""
+    from unittest.mock import patch as _patch
+    import src.monitoring.metrics as _metrics
+
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value={
+        "session_id": uuid4(),
+        "site_id": uuid4(),
+        "vehicle_id": None,
+        "start_time": datetime.now(timezone.utc),
+        "end_time": datetime.now(timezone.utc),
+        "energy_delivered_kwh": 10.0,
+        "cost_total": None,
+        "cost_total_source": None,
+        "station_id": None,
+        "connector_id": None,
+        "transaction_id": None,
+    })
+    client, _ = _client_with_conn(conn)
+    client._static_pool = lambda: None
+
+    # Patch at the lazy-import site (the metric module) so the
+    # in-function ``from ..monitoring.metrics import …`` picks up the
+    # fake. Track .labels(...).inc() calls.
+    fake_computed = MagicMock()
+    with _patch.object(_metrics, "SESSION_COST_COMPUTED", fake_computed), \
+         _patch(
+             "src.core.billing.session_cost.write_session_cost",
+             new=AsyncMock(return_value=False),
+         ):
+        await client._compute_and_write_cost(uuid4())
+
+    # ``.labels(source=...).inc()`` should not have been called.
+    fake_computed.labels.assert_not_called()
