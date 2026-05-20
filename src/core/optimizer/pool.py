@@ -206,8 +206,6 @@ class SolverPool:
             finally:
                 SOLVER_POOL_INFLIGHT.dec()
 
-        if isinstance(last_exc, asyncio.TimeoutError):
-            raise SolverTimeoutError(time_limit)
         raise SolverError(f"Solver pool broken twice; last error: {last_exc}", "broken_pool")
 
 
