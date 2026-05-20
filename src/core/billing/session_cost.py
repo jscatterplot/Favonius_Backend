@@ -46,7 +46,7 @@ from uuid import UUID
 
 import asyncpg
 
-from ...db.queries import fetch_prices_by_zone
+from ...db.queries import fetch_or_pull_prices_by_zone
 
 logger = logging.getLogger(__name__)
 
@@ -174,9 +174,13 @@ async def compute_session_cost(
         return SessionCostResult(cost=None, source="unpriceable")
 
     # Fetch prices once for the whole window. Both strategies read this map.
+    # ``fetch_or_pull_prices_by_zone`` checks ``electricity_prices`` first
+    # and falls back to the ENTSO-E API on cache miss — that's what saves
+    # billing in deployments where the WS-handler price feeder isn't
+    # populating the table.
     if price_lookup is None:
         async with ts_pool.acquire() as conn:
-            price_map = await fetch_prices_by_zone(
+            price_map = await fetch_or_pull_prices_by_zone(
                 conn,
                 bidding_zone,
                 start_time,

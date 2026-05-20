@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -334,6 +335,141 @@ async def fetch_prices_by_zone(
         cursor += timedelta(hours=1)
 
     return filled
+
+
+async def fetch_or_pull_prices_by_zone(
+    ts_db,
+    bidding_zone: str,
+    start_time: datetime,
+    end_time: datetime,
+    forward_fill_window: timedelta = timedelta(hours=1),
+) -> dict[datetime, float]:
+    """Same shape as :func:`fetch_prices_by_zone`, but with a read-through
+    cache to the ENTSO-E Transparency Platform API.
+
+    The ``electricity_prices`` table is populated by the WS handler's
+    price feeder (see ``src/websocket_handler/price_feeder.py``). In
+    deployments where that feeder isn't running, isn't configured for
+    the right zone, or is writing to a different DB, the table is
+    empty and every cost calculation lands ``'unpriceable'`` despite
+    real ENTSO-E DAM data being available.
+
+    This helper closes the gap. On cache miss it calls
+    :class:`~src.adapters.entsoe.prices.ENTSOEAdapter` directly,
+    persists the hourly result to ``electricity_prices`` (skipping
+    hours that already exist so a concurrent feeder write doesn't
+    duplicate), and re-reads through the standard forward-fill path
+    so callers get a uniformly shaped dict.
+
+    Requires the ``EUROPEAN_ELECTRICITY_API`` env var (same token the
+    price feeder uses). Without it, the API call is skipped and the
+    function falls back to whatever ``electricity_prices`` already
+    contains.
+
+    Args:
+        ts_db: TimescaleDB connection / pool — used for both reads and
+            the persist step. Must accept ``.fetch`` and ``.execute``
+            / ``.executemany`` (asyncpg.Pool, asyncpg.Connection, or
+            a context wrapping one).
+        bidding_zone: ENTSO-E EIC area code.
+        start_time, end_time: UTC window; naive datetimes are accepted
+            and normalized.
+        forward_fill_window: same semantics as :func:`fetch_prices_by_zone`.
+
+    Returns:
+        ``{hour_floor_utc: €/kWh}`` dict, same as
+        ``fetch_prices_by_zone``. The dict may still be incomplete
+        when the ENTSO-E API has no data for the window (e.g. far-past
+        archive that the API doesn't serve, or an API outage).
+    """
+    cached = await fetch_prices_by_zone(
+        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+    )
+
+    start_aware = _as_utc_aware(start_time)
+    end_aware = _as_utc_aware(end_time)
+    expected_hours: list[datetime] = []
+    cursor = _hour_floor_utc(start_aware)
+    while cursor < end_aware:
+        expected_hours.append(cursor)
+        cursor += timedelta(hours=1)
+
+    missing_hours = [h for h in expected_hours if h not in cached]
+    if not missing_hours:
+        return cached
+
+    if not os.environ.get("EUROPEAN_ELECTRICITY_API"):
+        logger.warning(
+            "fetch_or_pull_prices_by_zone: cache miss for zone=%s "
+            "[%s, %s) missing=%d hours; EUROPEAN_ELECTRICITY_API "
+            "unset — returning partial cache",
+            bidding_zone, start_aware, end_aware, len(missing_hours),
+        )
+        return cached
+
+    # Lazy import — keep src/db/ free of an adapters/ dep at import time.
+    from ..adapters.entsoe.prices import ENTSOEAdapter
+
+    try:
+        adapter = ENTSOEAdapter()
+        # Fetch a window aligned to the missing hours. ENTSO-E charges
+        # rate-limit budget per request, not per hour, so one call for
+        # the whole window is cheaper than per-hour calls.
+        fetched = await adapter.get_day_ahead_prices(
+            start_aware, end_aware, bidding_zone=bidding_zone,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_or_pull_prices_by_zone: ENTSO-E API call failed "
+            "for zone=%s [%s, %s): %s — returning partial cache",
+            bidding_zone, start_aware, end_aware, exc,
+        )
+        return cached
+
+    if not fetched:
+        return cached
+
+    # Persist only hours that aren't already in the table. The schema
+    # has no unique constraint on ``(time, node_id, market_type)`` so
+    # we can't rely on ON CONFLICT — do the existence check ourselves.
+    existing_rows = await ts_db.fetch(
+        """
+        SELECT time
+          FROM electricity_prices
+         WHERE node_id     = $1
+           AND market_type = 'ENTSOE_DAM'
+           AND time       >= $2
+           AND time        < $3
+        """,
+        bidding_zone, start_aware, end_aware,
+    )
+    existing_times = {_as_utc_aware(r["time"]) for r in existing_rows}
+
+    new_rows = [
+        (_as_utc_aware(p.timestamp), bidding_zone, p.price_per_kwh * 1000.0)
+        for p in fetched
+        if _as_utc_aware(p.timestamp) not in existing_times
+    ]
+    if new_rows:
+        await ts_db.executemany(
+            """
+            INSERT INTO electricity_prices
+                (time, node_id, market_type, lmp_price_mwh)
+            VALUES ($1, $2, 'ENTSOE_DAM', $3)
+            """,
+            new_rows,
+        )
+        logger.info(
+            "fetch_or_pull_prices_by_zone: pulled %d hours from "
+            "ENTSO-E into electricity_prices (zone=%s)",
+            len(new_rows), bidding_zone,
+        )
+
+    # Re-read with forward-fill so the returned dict matches the cache
+    # path's shape and semantics exactly.
+    return await fetch_prices_by_zone(
+        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+    )
 
 
 async def resolve_bidding_zone(static_db, site_id: UUID) -> Optional[str]:

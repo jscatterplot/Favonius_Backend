@@ -401,7 +401,7 @@ class StateAssembler:
         from ...db.queries import (
             _as_utc_aware,
             _hour_floor_utc,
-            fetch_prices_by_zone,
+            fetch_or_pull_prices_by_zone,
             resolve_bidding_zone,
         )
 
@@ -442,7 +442,9 @@ class StateAssembler:
 
         try:
             async with self.pools.ts.acquire() as conn:
-                price_map = await fetch_prices_by_zone(conn, zone, start_utc, end_utc)
+                price_map = await fetch_or_pull_prices_by_zone(
+                    conn, zone, start_utc, end_utc,
+                )
         except asyncpg.PostgresError as e:
             logger.error(
                 f"Database error fetching prices for depot {self.depot_id} "

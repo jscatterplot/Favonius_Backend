@@ -71,7 +71,7 @@ from src.core.billing.session_cost import (  # noqa: E402
     write_session_cost,
 )
 from src.db.postgres_url import prepare_asyncpg_url_and_ssl  # noqa: E402
-from src.db.queries import fetch_prices_by_zone, resolve_bidding_zone  # noqa: E402
+from src.db.queries import fetch_or_pull_prices_by_zone, resolve_bidding_zone  # noqa: E402
 
 logger = logging.getLogger("backfill_session_cost")
 
@@ -127,7 +127,7 @@ class LRUPriceLookup:
 
     Keys are ``(bidding_zone, hour_floor_utc)``. The cache is populated
     as needed by delegating uncovered ranges to
-    :func:`fetch_prices_by_zone` and merging the result. Repeat zones
+    :func:`fetch_or_pull_prices_by_zone` and merging the result. Repeat zones
     within a chunk skip the DB round-trip — the win that motivates the
     cache.
     """
@@ -146,7 +146,7 @@ class LRUPriceLookup:
         needed = _expected_hour_buckets(start, end)
         if not needed:
             async with self._pool.acquire() as conn:
-                return await fetch_prices_by_zone(conn, bidding_zone, start, end)
+                return await fetch_or_pull_prices_by_zone(conn, bidding_zone, start, end)
 
         result: dict[datetime, float] = {}
         for hour in needed:
@@ -159,7 +159,7 @@ class LRUPriceLookup:
             return result
 
         async with self._pool.acquire() as conn:
-            fresh = await fetch_prices_by_zone(conn, bidding_zone, start, end)
+            fresh = await fetch_or_pull_prices_by_zone(conn, bidding_zone, start, end)
         for hour, price in fresh.items():
             self._put(bidding_zone, hour, price)
         for hour in needed:
