@@ -73,6 +73,15 @@ class TimescaleClient:
         # in isolation continue to use ``pg_pool``.
         self._supabase_client: Any = None
 
+        # Strong references to in-flight fire-and-forget cost tasks.
+        # ``asyncio.create_task`` only registers a weak reference with
+        # the event loop, so a task whose only reference is the local
+        # variable in the scheduler is eligible for garbage collection
+        # before it completes (officially documented in asyncio).
+        # Holding it in a set + ``add_done_callback`` to discard on
+        # completion is the canonical pattern.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
     def set_supabase_client(self, supabase_client: Any) -> None:
         """Attach a SupabaseClient for static-identity lookups.
 
@@ -2746,11 +2755,21 @@ class TimescaleClient:
         Fire-and-forget. ``_compute_and_write_cost`` swallows every
         exception so close-path callers are never affected. Errors are
         logged and counted via ``SESSION_COST_COMPUTE_FAILURES``.
+
+        The task is held in ``self._background_tasks`` so the event
+        loop's weak-reference table doesn't lose track of it mid-flight
+        — a stray garbage collection between the StopTransaction commit
+        and this task's first ``await`` would otherwise silently drop
+        the cost calc (the row sits at ``cost_total=NULL`` until the
+        next backfill run, which is the documented safety net but
+        defeats the whole point of the live close path).
         """
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._compute_and_write_cost(session_id),
             name=f"session-cost-{session_id}",
         )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _compute_and_write_cost(self, session_id: uuid.UUID) -> None:
         """Fetch the just-closed session, run the cost calculator, update the row.

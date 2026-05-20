@@ -465,11 +465,22 @@ async def fetch_or_pull_prices_by_zone(
         if _as_utc_aware(p.timestamp) not in existing_times
     ]
     if new_rows:
+        # ``ON CONFLICT DO NOTHING`` against the
+        # ``uq_electricity_prices_node_time_market`` unique index
+        # (migration 041) makes the insert race-proof. Two concurrent
+        # cache-miss callers (or the WS-handler feeder running in
+        # parallel) both observing the row as absent and both INSERTing
+        # would otherwise produce duplicates that the helper's
+        # ``ORDER BY time`` cannot deterministically resolve. The
+        # SELECT-based existence check above is still worth keeping —
+        # it eliminates most candidates without a conflict round-trip
+        # and keeps the audit log clean.
         await ts_db.executemany(
             """
             INSERT INTO electricity_prices
                 (time, node_id, market_type, lmp_price_mwh)
             VALUES ($1, $2, 'ENTSOE_DAM', $3)
+            ON CONFLICT (time, node_id, market_type) DO NOTHING
             """,
             new_rows,
         )

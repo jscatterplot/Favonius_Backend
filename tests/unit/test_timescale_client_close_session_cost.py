@@ -144,6 +144,14 @@ async def test_schedule_session_cost_creates_named_task():
         class _Stub:
             def get_name(self):
                 return name
+
+            def add_done_callback(self, cb, *, context=None):
+                # The scheduler also registers a done-callback to discard
+                # the task from ``self._background_tasks`` once it
+                # completes. We don't fire the callback here because the
+                # task is fake — the production code's strong-ref pattern
+                # is exercised by the dedicated regression test below.
+                pass
         return _Stub()
 
     with patch.object(client, "_compute_and_write_cost", return_value=AsyncMock()()):
@@ -194,3 +202,55 @@ async def test_compute_and_write_cost_only_counts_metric_on_successful_write():
 
     # ``.labels(source=...).inc()`` should not have been called.
     fake_computed.labels.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_schedule_session_cost_holds_strong_reference_to_task():
+    """Regression: ``asyncio.create_task`` only registers a weak
+    reference with the event loop, so a task whose only handle is the
+    local variable in ``_schedule_session_cost`` could be
+    garbage-collected before its first await. The scheduler retains
+    the task in ``self._background_tasks`` and drops it via
+    ``add_done_callback`` when the task completes."""
+    import asyncio
+    import gc
+
+    config = TimescaleConfig(
+        service_url="postgresql://user:pass@localhost:5432/tsdb",
+        host="localhost", user="user", password="pass",
+    )
+    client = TimescaleClient(config)
+    client.pg_pool = MagicMock()
+
+    # Use a real coroutine that blocks long enough for us to inspect
+    # the strong-ref set, then completes so the done-callback can
+    # remove it.
+    finished = asyncio.Event()
+
+    async def fake_compute(_session_id):
+        await asyncio.sleep(0.01)
+        finished.set()
+
+    session_id = uuid4()
+    with patch.object(client, "_compute_and_write_cost", side_effect=fake_compute):
+        client._schedule_session_cost(session_id)
+
+        # Right after scheduling, the task is held in the set so a
+        # garbage-collection cycle can't drop it.
+        assert len(client._background_tasks) == 1, (
+            "scheduler must retain a strong reference to the task"
+        )
+        gc.collect()
+        assert len(client._background_tasks) == 1, (
+            "task was GC'd despite the strong-ref set"
+        )
+
+        # Let it run and finish.
+        await asyncio.wait_for(finished.wait(), timeout=1.0)
+        # Yield once so the done-callback fires.
+        await asyncio.sleep(0)
+
+    # Completed task is removed from the set.
+    assert len(client._background_tasks) == 0, (
+        "done-callback must discard the finished task"
+    )
