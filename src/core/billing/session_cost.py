@@ -263,11 +263,16 @@ _GRANULAR_TELEMETRY_SQL = """
                 MIN(time) AS first_time,
                 MAX(time) AS last_time,
                 COUNT(*) AS sample_count,
-                -- observed_seconds is the SUM of every interval's
-                -- duration. With LEAD un-partitioned, this captures
-                -- cross-hour intervals too. Used by the coverage gate
-                -- (instead of last-first span, which let two sparse
-                -- boundary samples masquerade as full coverage).
+                -- observed_seconds: SUM of (i) every standard interval
+                -- (sample → next sample, clipped at end_time) plus
+                -- (ii) the tail interval (last sample → end_time).
+                -- Without (ii), the last in-window sample contributes
+                -- 0 because LEAD(time) is NULL, systematically losing
+                -- 0–1 sample-cadence of coverage and energy per
+                -- session (a few percent on dense telemetry). The
+                -- ``next_time IS NULL`` filter selects exactly the
+                -- last row of the CTE — by ORDER BY, it's the latest
+                -- in-window sample.
                 COALESCE(
                     SUM(
                         EXTRACT(
@@ -277,12 +282,21 @@ _GRANULAR_TELEMETRY_SQL = """
                         )
                     ) FILTER (WHERE next_time IS NOT NULL),
                     0
+                ) + COALESCE(
+                    SUM(
+                        EXTRACT(EPOCH FROM (${time_end}::timestamptz - time))
+                    ) FILTER (WHERE next_time IS NULL),
+                    0
                 ) AS observed_seconds,
                 -- Trapezoidal integration: average the two endpoints
                 -- of each interval before multiplying by Δt. Earlier
                 -- draft used left-Riemann (kw_i × Δt) which mis-prices
                 -- ramping/tapering sessions. Clip each segment at
                 -- end_time so LEAD past the session window is not billed.
+                -- The tail term assumes the last observed kW persists
+                -- to end_time (left-Riemann); we have no later sample
+                -- to average with, and dropping it would systematically
+                -- undercount.
                 COALESCE(
                     SUM(
                         (charging_kw + COALESCE(next_kw, charging_kw)) / 2.0
@@ -292,6 +306,13 @@ _GRANULAR_TELEMETRY_SQL = """
                             )
                         ) / 3600.0
                     ) FILTER (WHERE next_time IS NOT NULL),
+                    0
+                ) + COALESCE(
+                    SUM(
+                        charging_kw
+                        * EXTRACT(EPOCH FROM (${time_end}::timestamptz - time))
+                        / 3600.0
+                    ) FILTER (WHERE next_time IS NULL),
                     0
                 ) AS energy_kwh
             FROM bucketed
@@ -312,18 +333,20 @@ async def _fetch_granular_telemetry_rows(
 ) -> list[asyncpg.Record]:
     """Load bucketed telemetry for granular billing.
 
-    Prefer ``vehicle_id`` when present; otherwise use charger keys from the
-    session row (migration 035 primary key). When ``transaction_id`` is set,
-    scope charger telemetry to that OCPP transaction.
+    Cascade: ``vehicle_id`` → ``(station_id, connector_id, transaction_id)``
+    → ``(station_id, connector_id)``. The transaction-id stage scopes the
+    query to the OCPP transaction (one-to-one with a charging_sessions row)
+    when telemetry carries that column; on empty result we fall through to
+    the station+connector query so legacy telemetry with NULL
+    ``transaction_id`` still gets priced (e.g. MeterValues that arrived
+    before the StartTransaction handler associated them, or reconnects
+    that re-emitted samples without the txn id).
     """
-    time_start = 2
-    time_end = 3
-
     if vehicle_id is not None:
         sql = _GRANULAR_TELEMETRY_SQL.format(
             where_clause="t.vehicle_id = $1",
-            time_start=time_start,
-            time_end=time_end,
+            time_start=2,
+            time_end=3,
         )
         rows = await conn.fetch(sql, vehicle_id, start_time, end_time)
         if rows:
@@ -334,11 +357,20 @@ async def _fetch_granular_telemetry_rows(
 
     if transaction_id is not None:
         sql = _GRANULAR_TELEMETRY_SQL.format(
-            where_clause=("t.station_id = $1 AND t.connector_id = $2 " "AND t.transaction_id = $3"),
+            where_clause=(
+                "t.station_id = $1 AND t.connector_id = $2 "
+                "AND t.transaction_id = $3"
+            ),
             time_start=4,
             time_end=5,
         )
-        return await conn.fetch(sql, station_id, connector_id, transaction_id, start_time, end_time)
+        rows = await conn.fetch(
+            sql, station_id, connector_id, transaction_id, start_time, end_time,
+        )
+        if rows:
+            return rows
+        # Fall through: telemetry may have NULL transaction_id but
+        # still be the correct samples for this (station, connector).
 
     sql = _GRANULAR_TELEMETRY_SQL.format(
         where_clause="t.station_id = $1 AND t.connector_id = $2",
