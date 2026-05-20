@@ -69,8 +69,19 @@ class WebSocketConfig(BaseModel):
         default=100, description="Maximum concurrent connections (simplified)"
     )
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
-    ping_interval: int = Field(default=45, description="Server ping interval in seconds")
-    ping_timeout: int = Field(default=30, description="Server ping timeout in seconds")
+    ping_interval: int = Field(
+        default=15,
+        description=(
+            "Server WebSocket ping interval in seconds. ABB Terra AC v1.8.x and "
+            "similar OCPP 1.6 chargers tear down the socket when their internal "
+            "keepalive timer (~25–30s) expires without inbound traffic; keep the "
+            "interval well below that floor."
+        ),
+    )
+    ping_timeout: int = Field(
+        default=20,
+        description="Seconds to wait for a pong before considering the connection dead.",
+    )
     absolute_silence_seconds: int = Field(
         default=1800,
         description=(
@@ -425,8 +436,8 @@ class Config(BaseModel):
                 host=os.getenv("WEBSOCKET_HOST", "0.0.0.0"),
                 max_connections=int(os.getenv("MAX_CONNECTIONS", "100")),
                 heartbeat_interval=int(os.getenv("HEARTBEAT_INTERVAL", "30")),
-                ping_interval=int(os.getenv("WEBSOCKET_PING_INTERVAL", "45")),
-                ping_timeout=int(os.getenv("WEBSOCKET_PING_TIMEOUT", "30")),
+                ping_interval=int(os.getenv("WEBSOCKET_PING_INTERVAL", "15")),
+                ping_timeout=int(os.getenv("WEBSOCKET_PING_TIMEOUT", "20")),
                 absolute_silence_seconds=int(os.getenv("OCPP_ABSOLUTE_SILENCE_SECONDS", "1800")),
                 message_timeout=int(os.getenv("MESSAGE_TIMEOUT", "60")),
                 max_message_size=int(os.getenv("MAX_MESSAGE_SIZE", "1048576")),

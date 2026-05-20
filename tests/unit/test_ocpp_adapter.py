@@ -289,16 +289,19 @@ async def test_set_charging_profile_rejects_relative_chargepointmaxprofile(
 
 @pytest.mark.asyncio
 async def test_route_message_invokes_on_message_received(mock_websocket, sample_charge_point_id):
-    """Liveness hook fires for every received OCPP frame.
+    """Liveness hook fires for every received OCPP frame and receives the
+    raw frame length so ``ConnectionManager`` can update its
+    ``messages_received`` / ``bytes_received`` counters per connection
+    (the ``Messages: X/Y`` audit on the unregister log).
 
     The websocket-handler stale-connection sweeper relies on this to keep
     OCPP 1.6 sockets alive when the charger sends only StatusNotification
     or MeterValues between Heartbeats.
     """
-    received = []
+    received: list[int] = []
 
-    async def on_msg() -> None:
-        received.append(True)
+    async def on_msg(message_size: int) -> None:
+        received.append(message_size)
 
     cp = FleetChargePoint(
         sample_charge_point_id,
@@ -306,18 +309,20 @@ async def test_route_message_invokes_on_message_received(mock_websocket, sample_
         on_message_received=on_msg,
     )
     # Bypass the upstream library router; we only care that the hook fires.
+    heartbeat = '[2,"abc","Heartbeat",{}]'
+    status = '[2,"def","StatusNotification",{}]'
     with patch("ocpp.v16.ChargePoint.route_message", new=AsyncMock()):
-        await cp.route_message('[2,"abc","Heartbeat",{}]')
-        await cp.route_message('[2,"def","StatusNotification",{}]')
+        await cp.route_message(heartbeat)
+        await cp.route_message(status)
 
-    assert len(received) == 2
+    assert received == [len(heartbeat), len(status)]
 
 
 @pytest.mark.asyncio
 async def test_route_message_swallows_callback_exceptions(mock_websocket, sample_charge_point_id):
     """A failing liveness hook must never break message routing."""
 
-    async def on_msg() -> None:
+    async def on_msg(message_size: int) -> None:
         raise RuntimeError("connection_manager unavailable")
 
     cp = FleetChargePoint(

@@ -222,7 +222,7 @@ class FleetChargePoint(CP16):
         on_firmware_status: Optional[Callable] = None,
         on_data_transfer: Optional[Callable] = None,
         on_security_event: Optional[Callable] = None,
-        on_message_received: Optional[Callable[[], Awaitable[None]]] = None,
+        on_message_received: Optional[Callable[[int], Awaitable[None]]] = None,
         tx_id_provider: Optional[Callable[[], Awaitable[int]]] = None,
     ):
         """Initialize FleetChargePoint.
@@ -301,7 +301,7 @@ class FleetChargePoint(CP16):
 
         if self._cb_message_received is not None:
             try:
-                await self._cb_message_received()
+                await self._cb_message_received(len(message))
             except Exception:
                 logger.exception("on_message_received callback failed for %s", self.id)
 
