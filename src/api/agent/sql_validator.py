@@ -295,7 +295,7 @@ def validate_sql(
     for fn in functions_used:
         if fn not in HYPERTABLE_FUNCTIONS:
             continue
-        if not branch_wheres:
+        if not branch_wheres or any(w is None for w in branch_wheres):
             return _reject(
                 "missing_time_filter",
                 f"agent_views.{fn} requires a time predicate (e.g. "
@@ -369,10 +369,10 @@ def _has_time_predicate(where: exp.Where) -> bool:
     return False
 
 
-def _collect_branch_wheres(tree: exp.Expression) -> list[exp.Where]:
+def _collect_branch_wheres(tree: exp.Expression) -> list[Optional[exp.Where]]:
     if isinstance(tree, exp.Select):
         where = tree.args.get("where")
-        return [where] if isinstance(where, exp.Where) else []
+        return [where] if isinstance(where, exp.Where) else [None]
     if isinstance(tree, exp.SetOperation):
         return _collect_branch_wheres(tree.this) + _collect_branch_wheres(tree.expression)
     return []
