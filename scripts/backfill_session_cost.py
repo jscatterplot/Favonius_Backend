@@ -162,15 +162,19 @@ async def _run(args: argparse.Namespace) -> int:
             session_ids = getattr(args, "session_ids", None) or []
 
             async with pool.acquire() as conn, conn.transaction():
-                candidate_sql = (
-                    _CANDIDATE_BY_SESSION_SQL if session_ids else _CANDIDATE_SQL
-                )
-                rows = await conn.fetch(
-                    candidate_sql,
-                    args.depot_id,
-                    chunk_limit,
-                    session_ids,
-                )
+                if session_ids:
+                    rows = await conn.fetch(
+                        _CANDIDATE_BY_SESSION_SQL,
+                        args.depot_id,
+                        chunk_limit,
+                        session_ids,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        _CANDIDATE_SQL,
+                        args.depot_id,
+                        chunk_limit,
+                    )
                 if not rows:
                     break
 
