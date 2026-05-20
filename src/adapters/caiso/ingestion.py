@@ -59,6 +59,8 @@ class PriceIngestionService:
         node: Optional[str] = None,
         depot_timezone: Optional[str] = None,
         fetched_zones: Optional[set[str]] = None,
+        window_start: Optional[datetime] = None,
+        window_end: Optional[datetime] = None,
     ) -> int:
         """Fetch and store prices for a single depot.
 
@@ -71,17 +73,26 @@ class PriceIngestionService:
             depot_timezone: Depot IANA timezone for region detection
             fetched_zones: Optional set tracking ENTSO-E zones already
                 pulled in the current ingestion run. When the resolved
-                zone is already in the set, the per-depot pull reads from
-                the cache instead of hitting the ENTSO-E API a second
-                time. Pass a shared set when iterating multiple depots
-                from the same run.
+                zone is already in the set, the per-depot pull is
+                short-circuited — ``electricity_prices`` is keyed by
+                zone, so the first depot in the zone covers every
+                other depot in the same zone for free.
+            window_start: Optional shared start of the fetch window.
+                Defaults to ``datetime.utcnow()``. When iterating many
+                depots from one batch, pass a shared value so depots
+                later in the loop don't drift to a later ``now`` and
+                miss the trailing hour the earlier depots claimed.
+            window_end: Optional shared end of the fetch window.
+                Defaults to ``window_start + 48h``.
 
         Returns:
             Number of prices stored
         """
         try:
-            now = datetime.utcnow()
-            end_date = now + timedelta(hours=48)
+            now = window_start if window_start is not None else datetime.utcnow()
+            end_date = (
+                window_end if window_end is not None else now + timedelta(hours=48)
+            )
 
             if depot_timezone and is_european_timezone(depot_timezone):
                 return await self._fetch_entsoe_prices(
@@ -275,8 +286,17 @@ class PriceIngestionService:
             # ENTSO-E bidding zone don't each fire an independent
             # ``GetPublicationDocument`` request. The first depot
             # populates ``electricity_prices`` (use_cache=False); every
-            # later depot in that zone reads from cache.
+            # later depot in that zone short-circuits.
             fetched_zones: set[str] = set()
+
+            # Fix the run's fetch window upfront so every depot ingests
+            # the same [start, end). With per-call ``datetime.utcnow()``,
+            # depots iterated later in the loop drift to a slightly
+            # later ``now`` — if the loop crosses an hour boundary, the
+            # zone-dedup early-return would short-circuit them and the
+            # trailing hour they wanted goes missing until the next run.
+            run_start = datetime.utcnow()
+            run_end = run_start + timedelta(hours=48)
 
             for row in rows:
                 depot_id = str(row["depot_id"])
@@ -287,6 +307,8 @@ class PriceIngestionService:
                     stored_count = await self.fetch_and_store_prices_for_depot(
                         depot_id, node, depot_timezone=depot_timezone,
                         fetched_zones=fetched_zones,
+                        window_start=run_start,
+                        window_end=run_end,
                     )
                     results[depot_id] = stored_count
                 except Exception as e:

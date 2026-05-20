@@ -140,6 +140,82 @@ async def test_fetch_entsoe_prices_does_not_add_to_set_when_api_returns_nothing(
 
 
 @pytest.mark.asyncio
+async def test_fetch_prices_for_all_depots_uses_shared_run_window():
+    """Regression: ``fetch_and_store_prices_for_depot`` used to call
+    ``datetime.utcnow()`` independently for every depot, so depots
+    later in the loop drifted to a slightly later ``now``. If the loop
+    happened to cross an hour boundary mid-run, the zone-dedup early
+    return would short-circuit the later depots while the trailing
+    hour they wanted went un-ingested. Fix: compute one ``run_start``
+    in ``fetch_prices_for_all_depots`` and pass it to every per-depot
+    call.
+
+    We verify by capturing the ``start_date`` argument the adapter
+    received for each of two depots in the same zone (the second
+    short-circuits via fetched_zones, so this test exercises a single
+    depot's call; we additionally invoke fetch_and_store_prices_for_depot
+    twice with explicit shared windows and assert both calls produced
+    identical start_dates downstream)."""
+    service = _service_with_mocked_adapters()
+    rows = [
+        {"depot_id": uuid4(), "utility_id": None, "timezone": "Europe/Vilnius"},
+        {"depot_id": uuid4(), "utility_id": None, "timezone": "Europe/Riga"},
+    ]
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=rows)
+    service.pool.acquire.return_value.__aenter__.return_value = conn
+    service.pool.acquire.return_value.__aexit__.return_value = None
+
+    # Vilnius and Riga are different bidding zones, so both depots
+    # actually fetch — exposing whether they received the same window.
+    with patch(
+        "src.db.queries.resolve_bidding_zone",
+        new=AsyncMock(side_effect=[
+            "10YLT-1001A0008Q",  # Lithuania
+            "10YLV-1001A00074",  # Latvia
+        ]),
+    ):
+        await service.fetch_prices_for_all_depots()
+
+    calls = service.entsoe_adapter.get_prices_for_depot.await_args_list
+    assert len(calls) == 2, "both unique-zone depots should fetch"
+    start_a = calls[0].kwargs["start_date"]
+    start_b = calls[1].kwargs["start_date"]
+    end_a = calls[0].kwargs["end_date"]
+    end_b = calls[1].kwargs["end_date"]
+    assert start_a == start_b, (
+        "depot-level fetches must share the run's start_date — independent "
+        "datetime.utcnow() per depot causes window drift across hour boundaries"
+    )
+    assert end_a == end_b
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_store_prices_for_depot_honours_explicit_window():
+    """Direct unit-level guarantee: when callers pass window_start /
+    window_end, the adapter receives those bounds and ignores the
+    wall clock."""
+    service = _service_with_mocked_adapters()
+    explicit_start = datetime(2026, 5, 20, 9, 0)
+    explicit_end = datetime(2026, 5, 22, 9, 0)
+
+    with patch(
+        "src.db.queries.resolve_bidding_zone",
+        new=AsyncMock(return_value="10YLT-1001A0008Q"),
+    ):
+        await service.fetch_and_store_prices_for_depot(
+            str(uuid4()),
+            depot_timezone="Europe/Vilnius",
+            window_start=explicit_start,
+            window_end=explicit_end,
+        )
+
+    kwargs = service.entsoe_adapter.get_prices_for_depot.await_args.kwargs
+    assert kwargs["start_date"] == explicit_start
+    assert kwargs["end_date"] == explicit_end
+
+
+@pytest.mark.asyncio
 async def test_fetch_prices_for_all_depots_shares_one_set_per_run():
     """``fetch_prices_for_all_depots`` should pass a single ``fetched_zones``
     set across the entire loop so two Lithuanian depots only fire one

@@ -594,11 +594,23 @@ def _fallback_average(
 
 
 def _normalize_hour(dt: datetime) -> datetime:
-    """Floor to UTC hour start for price-map lookups."""
-    floored = dt.replace(minute=0, second=0, microsecond=0)
-    if floored.tzinfo is None:
-        return floored.replace(tzinfo=timezone.utc)
-    return floored.astimezone(timezone.utc)
+    """Floor to UTC hour start for price-map lookups.
+
+    Convert-then-floor: for non-whole-hour offset timezones (IST +05:30,
+    NPT +05:45), flooring in local time before converting to UTC yields
+    a UTC datetime that's NOT an hour boundary (e.g. ``14:15+05:30``
+    floored to ``14:00+05:30`` → ``08:30 UTC``), missing the price-map
+    key. All current ENTSO-E zones are whole-hour offsets so the bug
+    is dormant, but the canonical helper ``_hour_floor_utc`` in
+    ``src/db/queries.py`` does it the right way around; bringing this
+    helper into sync prevents future drift between key-write and
+    key-read paths.
+    """
+    if dt.tzinfo is None:
+        aware = dt.replace(tzinfo=timezone.utc)
+    else:
+        aware = dt.astimezone(timezone.utc)
+    return aware.replace(minute=0, second=0, microsecond=0)
 
 
 def _price_for_hour(price_map: dict[datetime, float], hour: datetime) -> Optional[float]:

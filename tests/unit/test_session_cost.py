@@ -358,6 +358,55 @@ async def test_fallback_average_is_duration_weighted_across_partial_hours() -> N
     assert abs((result.avg_price_used or 0) - 0.30) < 1e-9
 
 
+def test_normalize_hour_converts_then_floors_for_fractional_offsets() -> None:
+    """Regression: ``_normalize_hour`` used to floor in local time before
+    converting to UTC, which produces a non-hour-boundary UTC datetime
+    for timezones with fractional offsets (IST +05:30, NPT +05:45).
+
+    Example: ``14:15+05:30`` floored-then-converted →
+      ``14:00+05:30`` → ``08:30 UTC``  (NOT an hour boundary)
+
+    Convert-then-floor gives the right answer:
+      ``14:15+05:30`` → ``08:45 UTC`` → ``08:00 UTC``
+
+    The price-map keys are aware-UTC hour starts, so any non-boundary
+    output silently misses every lookup. All current ENTSO-E zones are
+    whole-hour offsets so the bug is dormant in production, but the
+    canonical helper ``_hour_floor_utc`` in ``src/db/queries.py`` does
+    it the right way — pinning that contract here prevents drift.
+    """
+    from datetime import timezone as _tz
+    from src.core.billing.session_cost import _normalize_hour
+
+    # IST +05:30 — the canonical fractional-offset case.
+    ist = _tz(timedelta(hours=5, minutes=30))
+    local_dt = datetime(2026, 5, 19, 14, 15, tzinfo=ist)
+    out = _normalize_hour(local_dt)
+
+    assert out.tzinfo is not None and out.utcoffset() == timedelta(0), (
+        "result must be UTC-aware"
+    )
+    assert out == datetime(2026, 5, 19, 8, 0, tzinfo=_tz.utc), (
+        f"expected 08:00 UTC (14:15+05:30 → 08:45 UTC → floor 08:00 UTC), got {out}"
+    )
+
+    # NPT +05:45 — the rarer fractional-offset case (Nepal).
+    npt = _tz(timedelta(hours=5, minutes=45))
+    out = _normalize_hour(datetime(2026, 5, 19, 14, 15, tzinfo=npt))
+    assert out == datetime(2026, 5, 19, 8, 0, tzinfo=_tz.utc), (
+        f"NPT 14:15 → 08:30 UTC → floor 08:00 UTC, got {out}"
+    )
+
+    # Whole-hour offset (the only case in production) — also correct.
+    eet = _tz(timedelta(hours=2))
+    out = _normalize_hour(datetime(2026, 5, 19, 14, 15, tzinfo=eet))
+    assert out == datetime(2026, 5, 19, 12, 0, tzinfo=_tz.utc)
+
+    # Naive datetime — treated as UTC.
+    out = _normalize_hour(datetime(2026, 5, 19, 14, 15))
+    assert out == datetime(2026, 5, 19, 14, 0, tzinfo=_tz.utc)
+
+
 def test_granular_sql_admits_pre_start_anchor_sample() -> None:
     """Regression: the granular SQL used to filter ``t.time >= start_time``
     strictly, dropping the interval from start_time to the first
