@@ -46,25 +46,19 @@ logger = logging.getLogger(__name__)
 
 
 def _get_explicit_callable(obj: Any, name: str):
-    """Return a real callable attribute, ignoring MagicMock auto-created children.
+    """Return a callable only when the attribute is explicitly defined.
 
-    Unit tests and duck-typed adapters sometimes use ``MagicMock``/proxy objects
-    that synthesize callable child attributes for any missing name. Treating those
-    placeholders as optional helper methods makes the orchestration await a
-    non-awaitable mock instead of falling back to the base OCPP method. A helper
-    is considered real only when it is present directly on the instance or on the
-    concrete type.
+    We intentionally avoid dynamic ``__getattr__`` fallbacks (for example from
+    ``MagicMock``) by first resolving the attribute statically. If the attribute
+    is not present on the instance/class, return ``None`` so callers use their
+    compatibility fallback path.
     """
-    method = getattr(obj, name, None)
-    if not callable(method):
-        return None
     try:
-        instance_vars = vars(obj)
-    except TypeError:
-        instance_vars = {}
-    if name in instance_vars or hasattr(type(obj), name):
-        return method
-    return None
+        inspect.getattr_static(obj, name)
+    except AttributeError:
+        return None
+    method = getattr(obj, name, None)
+    return method if callable(method) else None
 
 
 # Per-call timeout for ``ChangeConfiguration`` in the bootstrap. Mirrors the
@@ -768,7 +762,11 @@ async def sync_charger(
                 status=bootstrap_status,
                 version=current_version,
                 entries=len(entries),
-                reason="bootstrap_unsupported" if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED else "bootstrap_unknown",
+                reason=(
+                    "bootstrap_unsupported"
+                    if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
+                    else "bootstrap_unknown"
+                ),
             )
 
     send_local_list_raised = False
