@@ -654,10 +654,253 @@ def _violation_to_error_envelope(violation: ConstraintViolation) -> dict[str, An
     }
 
 
+# ── Q&A extension (depot chat agent SQL mode) ──────────────────────────────
+#
+# The depot chat agent's SQL mode reuses the same Anthropic tool-use loop
+# but writes to ``agent_runs`` instead of ``decisions``, has no Decision /
+# disposition / permission-tier semantics, and uses a different
+# terminator tool. The loop logic is otherwise identical to ``run_turn``,
+# so the implementation here is intentionally a thin twin rather than a
+# refactor of the existing path — the workflow runtime is gated by golden
+# tests and we do not want to perturb its shape for this change.
+
+
+class QAResult:
+    """Outcome of one Q&A tool-use loop.
+
+    Attributes mirror what the chat agent's :func:`agent_runs_close` path
+    needs: the final answer text, the per-step tool-call trace, the row
+    evidence count from the terminator, and a status string.
+    """
+
+    __slots__ = ("text", "tool_calls", "status", "row_evidence", "iterations")
+
+    def __init__(
+        self,
+        *,
+        text: str,
+        tool_calls: list[ToolCall],
+        status: str,
+        row_evidence: int = 0,
+        iterations: int = 0,
+    ) -> None:
+        self.text = text
+        self.tool_calls = tool_calls
+        self.status = status
+        self.row_evidence = row_evidence
+        self.iterations = iterations
+
+
+# Reserved terminator name for the SQL agent. The runtime closes the
+# Q&A loop when the LLM calls this. Defined here (not imported from
+# sql_tools) to keep this module dep-free of the agent SQL package.
+QA_TERMINATOR_TOOL_NAME: str = "emit_final_answer"
+
+
+async def run_qa_turn(
+    *,
+    anthropic_client: _ClientFacade,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    tool_registry: ToolRegistry,
+    allowed_tools: Sequence[str],
+    max_iterations: int = 8,
+    max_tokens: int = 2048,
+    temperature: float = 0.0,
+    on_step: Optional[Callable[[ToolCall], Any]] = None,
+) -> QAResult:
+    """Run one Anthropic tool-use loop in Q&A mode (no Decision row).
+
+    Mirrors :meth:`WorkflowAgent.run_turn` minus the workflow-specific
+    machinery: no :class:`HardConstraintGuard`, no Decision write, no
+    per-(workflow, depot) permission_tier. The caller is the depot chat
+    agent's controller, which writes the trace to ``agent_runs`` via
+    the existing ``audit.py`` writers.
+
+    Args:
+        anthropic_client: Facade exposing ``.messages.create``.
+        model: Model ID (e.g. ``"claude-sonnet-4-6"``).
+        system_prompt: The cacheable system prompt body. Passed as a
+            single text block with ``cache_control: ephemeral``.
+        user_message: Per-turn user message (kept OUTSIDE the cache).
+        tool_registry: Registry containing the SQL agent tools and the
+            ``emit_final_answer`` terminator.
+        allowed_tools: Tool names from ``tool_registry`` the LLM may
+            call. Must include :data:`QA_TERMINATOR_TOOL_NAME`.
+        max_iterations: Hard cap on tool-use turns. Default 8.
+        max_tokens, temperature: Anthropic Messages API parameters.
+        on_step: Optional async callback invoked after each tool call
+            with the populated :class:`ToolCall`. Used by the controller
+            to write ``agent_runs.steps_json`` and SSE step events.
+
+    Returns:
+        :class:`QAResult`.
+
+    Raises:
+        ToolNotAllowedError: LLM tried to call something outside
+            ``allowed_tools`` and not the terminator.
+        ToolNotRegisteredError: a registered name has no callable.
+    """
+    if QA_TERMINATOR_TOOL_NAME not in allowed_tools:
+        raise WorkflowRuntimeError(
+            f"allowed_tools must include the terminator "
+            f"{QA_TERMINATOR_TOOL_NAME!r}"
+        )
+
+    tools = tool_registry.anthropic_schemas(list(allowed_tools))
+    system_blocks: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+
+    tool_calls: list[ToolCall] = []
+    final_text: str = ""
+    row_evidence: int = 0
+    status: str = "success"
+    iterations: int = 0
+
+    for iterations in range(1, max_iterations + 1):
+        response = await anthropic_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_blocks,
+            tools=tools,
+            messages=messages,
+        )
+
+        assistant_content = list(response.content)
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        tool_use_blocks = [
+            b for b in assistant_content if getattr(b, "type", None) == "tool_use"
+        ]
+
+        if not tool_use_blocks:
+            # No tool call — model returned text only. Treat as failure
+            # to terminate properly; we still surface whatever text the
+            # model produced as the answer.
+            text_blocks = [
+                getattr(b, "text", "")
+                for b in assistant_content
+                if getattr(b, "type", None) == "text"
+            ]
+            final_text = "".join(text_blocks).strip()
+            status = "no_terminator"
+            break
+
+        tool_results: list[dict[str, Any]] = []
+        terminated = False
+        for block in tool_use_blocks:
+            name = getattr(block, "name", None) or ""
+            block_id = getattr(block, "id", "") or ""
+            block_input = dict(getattr(block, "input", {}) or {})
+
+            if name == QA_TERMINATOR_TOOL_NAME:
+                final_text = str(block_input.get("text", "")).strip()
+                try:
+                    row_evidence = int(block_input.get("row_evidence", 0) or 0)
+                except (TypeError, ValueError):
+                    row_evidence = 0
+                terminated = True
+                # Record the terminator call as a tool_call so the trace
+                # shows the closing step.
+                tc = ToolCall(
+                    name=name,
+                    arguments=block_input,
+                    result={"text": final_text, "row_evidence": row_evidence},
+                    ok=True,
+                    error=None,
+                )
+                tool_calls.append(tc)
+                if on_step is not None:
+                    await _safe_on_step(on_step, tc)
+                break
+
+            if name not in allowed_tools:
+                status = "tool_not_allowed"
+                raise ToolNotAllowedError(
+                    f"SQL agent attempted to call disallowed tool {name!r}"
+                )
+
+            try:
+                result = await tool_registry.dispatch(name, block_input)
+                ok = True
+                err = None
+            except ToolNotRegisteredError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("SQL agent tool dispatch failed: %s", name)
+                result = {"error": "tool_failure", "tool": name, "detail": str(exc)}
+                ok = False
+                err = str(exc)
+
+            tc = ToolCall(
+                name=name,
+                arguments=block_input,
+                result=result,
+                ok=ok,
+                error=err,
+            )
+            tool_calls.append(tc)
+            if on_step is not None:
+                await _safe_on_step(on_step, tc)
+
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block_id,
+                    "content": json.dumps(result, default=str),
+                    "is_error": not ok,
+                }
+            )
+
+        if terminated:
+            break
+
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "end_turn":
+            status = "no_terminator"
+            break
+    else:
+        status = "max_iterations"
+
+    return QAResult(
+        text=final_text,
+        tool_calls=tool_calls,
+        status=status,
+        row_evidence=row_evidence,
+        iterations=iterations,
+    )
+
+
+async def _safe_on_step(
+    cb: Callable[[ToolCall], Any], tc: ToolCall
+) -> None:
+    """Run the on_step callback; swallow its errors to protect the loop."""
+    try:
+        result = cb(tc)
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:  # noqa: BLE001
+        logger.exception("on_step callback raised; continuing")
+
+
 __all__ = [
     "DEFAULT_PERMISSION_TIER",
     "EMIT_DECISION_TOOL_NAME",
+    "QA_TERMINATOR_TOOL_NAME",
+    "QAResult",
     "ToolNotAllowedError",
     "WorkflowAgent",
     "WorkflowRuntimeError",
+    "run_qa_turn",
 ]

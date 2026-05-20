@@ -110,6 +110,39 @@ AGENT_RESOLVER_MISSES = Counter(
     ["kind"],  # kind: not_found | ambiguous
 )
 
+# Text-to-SQL agent metrics — gated by AGENT_SQL_MODE_ENABLED.
+# Naming follows the favonius_agent_* family; granular labels so we can
+# distinguish validator rejections from executor failures in dashboards.
+AGENT_SQL_VALIDATIONS = Counter(
+    "favonius_agent_sql_validations_total",
+    "SQL validator outcomes for LLM-emitted SELECTs",
+    ["verdict"],  # verdict: accepted | rejected:<error_kind>
+)
+
+AGENT_SQL_EXECUTIONS = Counter(
+    "favonius_agent_sql_executions_total",
+    "Executor outcomes after validator acceptance",
+    ["outcome", "pool"],  # outcome: success|timeout|plan_error|role_error|error
+)
+
+AGENT_SQL_EXECUTION_DURATION = Histogram(
+    "favonius_agent_sql_execution_seconds",
+    "Wall-clock duration of one validated SELECT against agent_views.*",
+    buckets=[0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+)
+
+AGENT_SQL_ROWS_RETURNED = Histogram(
+    "favonius_agent_sql_rows_returned",
+    "Rows returned per SELECT (post-cap)",
+    buckets=[0, 1, 10, 50, 100, 250, 500],
+)
+
+AGENT_SQL_TOOL_TURNS = Histogram(
+    "favonius_agent_sql_tool_turns",
+    "Tool-call turns per SQL-route agent turn",
+    buckets=[1, 2, 3, 5, 8, 12],
+)
+
 # Depot workflow agent runtime metrics (PRD §4.3/§4.4, sprint 2).
 # Naming mirrors the existing agent_search metrics one level up.
 WORKFLOW_TURNS = Counter(

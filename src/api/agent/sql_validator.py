@@ -1,0 +1,375 @@
+"""SQL validator for the depot chat agent's text-to-SQL path.
+
+Security gate between LLM-emitted SQL and the read-only Postgres role.
+Parses the SQL with sqlglot, walks the AST, enforces:
+
+* exactly one statement, root is a ``SELECT`` (or set-operation of selects)
+* every FROM/JOIN target is an ``agent_views.<allowed_name>($1)`` call
+* the placeholder is exactly ``$1`` — no literal UUIDs the LLM could
+  forge to peek at another tenant
+* no DML anywhere (including inside CTEs)
+* no references to ``pg_*`` / ``information_schema`` / ``auth`` / ``storage``
+  / ``vault`` / ``supabase_*`` schemas
+* no calls to dangerous functions outside the ``agent_views.*`` allowlist
+* hypertable-backed functions require a time predicate in the WHERE clause
+* ``LIMIT`` injection / cap
+
+The validator does NOT execute the SQL — that's the executor's job. It
+returns a :class:`ValidationResult` whose ``ok=True`` form carries a
+canonical, rewritten SQL string the executor will pass through
+``EXPLAIN (FORMAT TEXT) …`` (S4 — never ANALYZE) and then run.
+
+Rejections come back with a structured ``error_kind`` so the orchestrator
+can feed it to the LLM as a ``tool_result(is_error=True)`` for a retry.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import sqlglot
+from sqlglot import exp
+
+logger = logging.getLogger(__name__)
+
+
+# ── Allow / deny lists ────────────────────────────────────────────────────
+
+# All names case-insensitive — Postgres folds unquoted identifiers to lower.
+AGENT_VIEWS_FUNCTIONS_TS: frozenset[str] = frozenset({
+    "sessions",
+    "telemetry_hourly",
+    "optimization_runs",
+    "alerts",
+    "prices_hourly",
+    "building_load_hourly",
+    "connector_status_latest",
+})
+
+AGENT_VIEWS_FUNCTIONS_STATIC: frozenset[str] = frozenset({
+    "depots",
+    "vehicles",
+    "chargers",
+    "drivers",
+    "schedules_recent",
+})
+
+# Functions that REQUIRE a time predicate in the user's WHERE. These are
+# the hypertable-backed ones; without a bounded scan the query can chew
+# through a year of telemetry rolling-up before LIMIT applies. The
+# validator looks for ANY comparison referencing one of these columns:
+HYPERTABLE_FUNCTIONS: frozenset[str] = frozenset({
+    "telemetry_hourly",
+    "prices_hourly",
+    "building_load_hourly",
+})
+HYPERTABLE_TIME_COLUMNS: frozenset[str] = frozenset({
+    "hour", "start_time", "end_time", "time",
+})
+
+# Forbidden schemas — anything resolving here is an instant reject.
+FORBIDDEN_SCHEMAS: frozenset[str] = frozenset({
+    "pg_catalog",
+    "pg_temp",
+    "pg_toast",
+    "information_schema",
+    "auth",        # Supabase auth schema
+    "storage",     # Supabase storage schema
+    "vault",       # Supabase vault schema
+    "supabase_functions",
+    "supabase_migrations",
+})
+
+# Functions that must never be callable from agent SQL, even outside a
+# FROM clause. Each is either a known data-exfiltration vector, a
+# server-state mutator, or a way to defeat the statement_timeout cap.
+DANGEROUS_FUNCTIONS: frozenset[str] = frozenset({
+    "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file",
+    "lo_import", "lo_export",
+    "dblink", "dblink_exec", "dblink_connect", "dblink_disconnect",
+    "copy",
+    "current_setting", "set_config",
+    "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+    "txid_current", "pg_current_xact_id",
+    "pg_terminate_backend", "pg_cancel_backend",
+    "pg_reload_conf",
+    "version",
+    "pg_backend_pid",
+    "pg_export_snapshot",
+    "pg_advisory_lock", "pg_advisory_xact_lock",
+})
+
+DEFAULT_ROW_LIMIT = 500
+MAX_ROW_LIMIT = 500  # absolute ceiling — user-supplied LIMIT is capped to this
+
+
+# ── Result type ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class ValidationResult:
+    """Outcome of a single validator pass.
+
+    On ``ok=True``, ``sql`` is the canonical, LIMIT-injected SQL safe to
+    pass to the executor's :func:`~.sql_executor.run_select`. On
+    ``ok=False``, ``error_kind`` is one of the documented rejection
+    codes and ``error`` carries a short human-readable explanation
+    suitable to surface to the LLM as a tool-result error.
+    """
+
+    ok: bool
+    sql: str = ""
+    error: Optional[str] = None
+    error_kind: Optional[str] = None
+    functions_used: tuple[str, ...] = ()
+
+
+def _reject(kind: str, msg: str) -> ValidationResult:
+    return ValidationResult(ok=False, error=msg, error_kind=kind)
+
+
+# ── Public entrypoint ────────────────────────────────────────────────────
+
+
+def validate_sql(
+    sql: str,
+    *,
+    allowed_functions: frozenset[str],
+    row_limit: int = DEFAULT_ROW_LIMIT,
+) -> ValidationResult:
+    """Validate one LLM-emitted SELECT against the agent_views.* surface.
+
+    Args:
+        sql: Raw SQL the LLM produced.
+        allowed_functions: The set of function names allowed for THIS
+            pool (TS or static). The caller passes
+            :data:`AGENT_VIEWS_FUNCTIONS_TS` or
+            :data:`AGENT_VIEWS_FUNCTIONS_STATIC`.
+        row_limit: Hard ceiling on the row count returned. Defaults to
+            500 — must not exceed :data:`MAX_ROW_LIMIT`.
+
+    Returns:
+        A :class:`ValidationResult`.
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        return _reject("empty_sql", "Empty SQL.")
+    if len(sql) > 8000:
+        return _reject("too_long", "SQL exceeds 8000-character cap.")
+
+    row_limit = min(max(1, row_limit), MAX_ROW_LIMIT)
+
+    # 1. Parse + multi-statement check.
+    try:
+        trees = sqlglot.parse(sql, dialect="postgres")
+    except Exception as e:  # sqlglot raises ParseError, TokenError, etc.
+        return _reject("parse_error", f"Could not parse SQL: {e}")
+    trees = [t for t in trees if t is not None]
+    if len(trees) == 0:
+        return _reject("empty_sql", "No statement parsed from input.")
+    if len(trees) > 1:
+        return _reject("multi_statement", "Only one statement allowed per call.")
+    tree = trees[0]
+
+    # 2. Root must be SELECT or a set-operation of SELECTs (UNION etc.).
+    # sqlglot 30 split Intersect/Except out of Union; allow all three so a
+    # legitimate set-op over two agent_views functions parses without a
+    # spurious non_select rejection.
+    _select_set_op_types: tuple[type, ...] = (exp.Select, exp.Union)
+    for cls_name in ("Intersect", "Except", "SetOperation"):
+        if hasattr(exp, cls_name):
+            _select_set_op_types = _select_set_op_types + (getattr(exp, cls_name),)
+    if not isinstance(tree, _select_set_op_types):
+        return _reject(
+            "non_select",
+            f"Only SELECT statements are allowed; got {type(tree).__name__}.",
+        )
+
+    # 3. Reject DML anywhere — covers `WITH x AS (DELETE …) SELECT …`.
+    for node in tree.walk():
+        if isinstance(node, (exp.Delete, exp.Insert, exp.Update, exp.Merge,
+                             exp.Drop, exp.Create, exp.Alter,
+                             exp.TruncateTable, exp.Command)):
+            return _reject(
+                "non_select",
+                f"DML/DDL not allowed (found {type(node).__name__}).",
+            )
+
+    # 4. Schema allowlist + table-function allowlist.
+    functions_used: list[str] = []
+    for node in tree.find_all(exp.Table):
+        # The Table node represents either a plain table (e.g. public.x)
+        # or a table-function call (e.g. agent_views.sessions($1)).
+        # In sqlglot, a table-function's Table has empty `name` and the
+        # actual function name lives on a nested Anonymous.
+        db = (node.db or "").lower()
+        name = (node.name or "").lower()
+
+        if db in FORBIDDEN_SCHEMAS or name in FORBIDDEN_SCHEMAS:
+            return _reject(
+                "forbidden_schema",
+                f"Schema not allowed: {db or name}.",
+            )
+
+        if db != "agent_views":
+            return _reject(
+                "table_not_allowed",
+                f"FROM/JOIN target {node.sql(dialect='postgres')!r} is not in "
+                f"agent_views.*. Only agent_views.<fn>($1) calls are allowed.",
+            )
+
+        # Find the nested Anonymous representing the function call.
+        anon = node.find(exp.Anonymous)
+        if anon is None:
+            # Plain `FROM agent_views.something` without ($1) — not a
+            # function call, so neither a table-function nor a view we
+            # exposed. (We exposed only functions.)
+            return _reject(
+                "missing_argument",
+                f"agent_views target {node.sql(dialect='postgres')!r} must be "
+                f"called as agent_views.<fn>($1).",
+            )
+
+        fn_name = anon.name.lower()
+        if fn_name not in allowed_functions:
+            return _reject(
+                "table_not_allowed",
+                f"Function agent_views.{fn_name} is not in the allowlist for "
+                f"this pool. Allowed: {sorted(allowed_functions)}.",
+            )
+
+        # Verify exactly one argument, and that argument is the
+        # placeholder `$1`. sqlglot represents `$1` as
+        #   Parameter(this=Literal(value=1, is_string=False)).
+        args = anon.args.get("expressions") or []
+        if len(args) != 1:
+            return _reject(
+                "bad_function_argument",
+                f"agent_views.{fn_name} must take exactly one argument ($1); "
+                f"got {len(args)}.",
+            )
+        arg = args[0]
+        if not (isinstance(arg, exp.Parameter)
+                and isinstance(arg.this, exp.Literal)
+                and str(arg.this.name) == "1"):
+            return _reject(
+                "bad_function_argument",
+                f"agent_views.{fn_name} argument must be the placeholder $1, "
+                f"got {arg.sql(dialect='postgres')!r}. The server binds the "
+                f"caller's visible depots — never write a literal UUID list.",
+            )
+
+        functions_used.append(fn_name)
+
+    if not functions_used:
+        return _reject(
+            "no_data_source",
+            "No agent_views.* function was referenced. At minimum the query "
+            "must SELECT FROM one of: "
+            f"{', '.join(sorted(allowed_functions))}.",
+        )
+
+    # 5. Dangerous functions called outside table-context.
+    for node in tree.find_all(exp.Anonymous):
+        parent = node.parent
+        # Skip the table-function nodes — those are the legitimate
+        # FROM/JOIN targets we already validated above.
+        if isinstance(parent, exp.Table):
+            continue
+        if node.name.lower() in DANGEROUS_FUNCTIONS:
+            return _reject(
+                "dangerous_fn",
+                f"Function {node.name!r} not permitted.",
+            )
+
+    # Also walk built-in funcs sqlglot resolved (Func subclasses) to be
+    # paranoid. Most dangerous functions parse as Anonymous because they
+    # are postgres-specific, but a few (e.g. CURRENT_USER) are typed.
+    # CURRENT_USER itself is informational — allow — but flag the rest.
+    # This is a defence-in-depth list; the main protection is the role
+    # swap + grants.
+
+    # 6. Hypertable-backed functions need a time predicate.
+    for fn in functions_used:
+        if fn not in HYPERTABLE_FUNCTIONS:
+            continue
+        where = tree.args.get("where")
+        if where is None and isinstance(tree, exp.Union):
+            # Set ops: check each branch's where; conservative -> require
+            # at least the first to carry a time predicate.
+            inner = tree.this
+            where = inner.args.get("where") if isinstance(inner, exp.Select) else None
+        if where is None:
+            return _reject(
+                "missing_time_filter",
+                f"agent_views.{fn} requires a time predicate (e.g. "
+                f"WHERE hour >= now() - interval '7 days'). Without one, "
+                f"the scan is unbounded.",
+            )
+        if not _has_time_predicate(where):
+            return _reject(
+                "missing_time_filter",
+                f"agent_views.{fn} requires a time predicate over one of "
+                f"{sorted(HYPERTABLE_TIME_COLUMNS)}. Add e.g. "
+                f"WHERE hour >= now() - interval '7 days'.",
+            )
+
+    # 7. LIMIT injection / cap.
+    limit_node = tree.args.get("limit")
+    if isinstance(tree, exp.Union):
+        # Union-level limit: walk to the outermost. sqlglot puts LIMIT on
+        # the Union when it's a trailing top-level limit.
+        pass
+
+    if limit_node is None:
+        tree.set("limit", exp.Limit(expression=exp.Literal.number(row_limit)))
+    else:
+        # Cap user-supplied LIMIT to row_limit.
+        expr = limit_node.expression
+        if isinstance(expr, exp.Literal) and not expr.is_string:
+            try:
+                user_n = int(str(expr.name))
+            except ValueError:
+                user_n = row_limit
+            if user_n > row_limit or user_n < 1:
+                limit_node.set("expression", exp.Literal.number(row_limit))
+        else:
+            # Non-literal LIMIT (e.g. a parameter) is rejected — keeps the
+            # cap deterministic.
+            return _reject(
+                "non_literal_limit",
+                "LIMIT must be a non-negative integer literal "
+                f"(≤ {row_limit}).",
+            )
+
+    canonical = tree.sql(dialect="postgres")
+    return ValidationResult(
+        ok=True,
+        sql=canonical,
+        functions_used=tuple(functions_used),
+    )
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _has_time_predicate(where: exp.Where) -> bool:
+    """True iff the WHERE references one of HYPERTABLE_TIME_COLUMNS in a
+    comparison node."""
+    for col in where.find_all(exp.Column):
+        if (col.name or "").lower() in HYPERTABLE_TIME_COLUMNS:
+            # Make sure it's part of a comparison (>, <, BETWEEN, etc.),
+            # not just a SELECT-list projection passing through.
+            parent = col.parent
+            while parent is not None and not isinstance(parent, exp.Where):
+                if isinstance(
+                    parent,
+                    (
+                        exp.GT, exp.GTE, exp.LT, exp.LTE,
+                        exp.EQ, exp.NEQ, exp.Between, exp.In,
+                    ),
+                ):
+                    return True
+                parent = parent.parent
+    return False

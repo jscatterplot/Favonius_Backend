@@ -60,6 +60,8 @@ dependencies = [
     # TimescaleDB integration
     "psycopg2-binary>=2.9.7",
     "sqlalchemy>=2.0.0",
+    # SQL parser/validator for the depot chat agent's text-to-SQL path
+    "sqlglot>=23.0.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     # Optimization (MILP solver)

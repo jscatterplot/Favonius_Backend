@@ -47,13 +47,27 @@ from src.api.agent.auth_context import (
 )
 from src.api.agent.intents.consumption_by_user import compile_consumption_by_user
 from src.api.agent.plan import QueryPlan
+from src.api.agent.planner import classify as planner_classify
+from src.api.agent.prompts import (
+    build_sql_agent_system_prompt,
+    format_sql_agent_user_message,
+)
 from src.api.agent.resolve import (
     load_depot_timezones,
     resolve_entities,
     resolve_time_window,
 )
+from src.api.agent.sql_tools import (
+    SQL_AGENT_TOOL_NAMES,
+    build_sql_agent_tool_registry,
+)
 from src.api.agent.stream import SSEEventStream
-from src.monitoring.metrics import AGENT_RESOLVER_MISSES
+from src.api.agent_workflows.runtime import run_qa_turn
+from src.api.agent_workflows.tools import ToolNotRegisteredError
+from src.monitoring.metrics import (
+    AGENT_RESOLVER_MISSES,
+    AGENT_SQL_TOOL_TURNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +289,46 @@ async def run_turn(
             await sse.emit("step", {"name": name, "summary": summary})
 
     try:
+        # 0. Planner — pick consumption fast path, sql_general, or refuse.
+        decision = planner_classify(
+            message, organization_id=auth.organization_id
+        )
+        await agent_runs_step(
+            ts_pool,
+            run_id,
+            "planner_decision",
+            {"route": decision.route, "reason": decision.reason},
+        )
+        await _emit_step("planner_decision", f"{decision.route} ({decision.reason})")
+
+        if decision.route == "refuse":
+            reply = AgentReply(
+                run_id=run_id,
+                status="not_found",
+                text=(
+                    "I can only answer depot analytics questions, and right "
+                    "now my analytical mode is disabled for your organisation. "
+                    "Try a consumption question like 'how much did <driver> "
+                    "charge last month?'."
+                ),
+                intent="refuse",
+            )
+            await agent_runs_close(ts_pool, run_id, "not_found", reply)
+            if sse is not None:
+                await sse.emit("answer", reply.model_dump(mode="json"))
+            return reply
+
+        if decision.route == "sql_general":
+            return await _run_sql_general_turn(
+                run_id=run_id,
+                message=message,
+                auth=auth,
+                static_pool=static_pool,
+                ts_pool=ts_pool,
+                sse=sse,
+                emit_step=_emit_step,
+            )
+
         # 1. Extract the plan.
         plan = await llm_client.extract_plan(message)
         await agent_runs_step(ts_pool, run_id, "extract_plan", plan.model_dump())
@@ -367,3 +421,120 @@ async def run_turn(
         except Exception:  # pragma: no cover - audit close is best-effort
             logger.exception("Failed to close agent_run %s in error state", run_id)
         raise
+
+
+# ── SQL-mode (general analytics) sub-orchestrator ──────────────────────────
+
+
+async def _run_sql_general_turn(
+    *,
+    run_id: UUID,
+    message: str,
+    auth: Any,
+    static_pool: Any,
+    ts_pool: Any,
+    sse: Optional[SSEEventStream],
+    emit_step: Any,
+) -> AgentReply:
+    """Drive the text-to-SQL agent loop via WorkflowAgent.run_qa_turn.
+
+    The Anthropic client + model selection are reused from
+    ``src.api.agent.llm`` so a single Anthropic singleton serves both
+    paths. Per-tool-call step events flow into both ``agent_runs`` and
+    the SSE stream via the ``on_step`` callback.
+    """
+    from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
+
+    client = agent_llm._get_client()
+    config = agent_llm.get_config()
+
+    registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
+
+    async def _on_step(tool_call: Any) -> None:
+        name = tool_call.name
+        # Strip oversized payloads so steps_json stays readable.
+        result = tool_call.result
+        if isinstance(result, dict) and isinstance(result.get("rows"), list):
+            rows = result["rows"]
+            preview = {
+                **{k: v for k, v in result.items() if k != "rows"},
+                "row_preview": rows[:3],
+                "row_total": result.get("row_count", len(rows)),
+            }
+        else:
+            preview = result
+        payload = {
+            "tool": name,
+            "ok": tool_call.ok,
+            "input": tool_call.arguments,
+            "result_preview": preview,
+            "error": tool_call.error,
+        }
+        await agent_runs_step(ts_pool, run_id, "tool_call", payload)
+        summary = f"{name}: {'ok' if tool_call.ok else 'error'}"
+        await emit_step("tool_call", summary)
+
+    try:
+        qa = await run_qa_turn(
+            anthropic_client=client,
+            model=config.model,
+            system_prompt=build_sql_agent_system_prompt(),
+            user_message=format_sql_agent_user_message(message),
+            tool_registry=registry,
+            allowed_tools=SQL_AGENT_TOOL_NAMES,
+            max_iterations=8,
+            max_tokens=2048,
+            temperature=0.0,
+            on_step=_on_step,
+        )
+    except ToolNotRegisteredError as exc:
+        logger.error("SQL agent ToolNotRegisteredError: %s", exc)
+        reply = AgentReply.error(run_id=run_id)
+        await agent_runs_close(ts_pool, run_id, "error", reply)
+        if sse is not None:
+            await sse.emit("answer", reply.model_dump(mode="json"))
+        return reply
+
+    AGENT_SQL_TOOL_TURNS.observe(qa.iterations)
+    await agent_runs_step(
+        ts_pool,
+        run_id,
+        "sql_loop_complete",
+        {
+            "iterations": qa.iterations,
+            "tool_call_count": len(qa.tool_calls),
+            "row_evidence": qa.row_evidence,
+            "status": qa.status,
+        },
+    )
+
+    if qa.status == "success" and qa.text:
+        # Count SQL executions in the trace for audit metadata.
+        sql_executions = sum(
+            1 for tc in qa.tool_calls if tc.name in ("run_select_ts", "run_select_static")
+        )
+        await write_agent_query_audit(ts_pool, auth, run_id, "sql_general", qa.row_evidence)
+        reply = AgentReply.success(run_id=run_id, intent="sql_general", text=qa.text)
+        await agent_runs_close(ts_pool, run_id, "success", reply)
+        if sse is not None:
+            await sse.emit("answer", reply.model_dump(mode="json"))
+        _ = sql_executions  # currently unused beyond the count; left for future audit metadata
+        return reply
+
+    # Non-success outcomes: terminator missing, max iterations hit, etc.
+    text = qa.text.strip() if qa.text else ""
+    if not text:
+        text = (
+            "I wasn't able to compose a complete answer to that question. "
+            "Try rephrasing, or break it into smaller questions."
+        )
+    reply = AgentReply(
+        run_id=run_id,
+        status="not_found" if qa.status in ("no_terminator", "max_iterations") else "error",
+        text=text,
+        intent="sql_general",
+    )
+    await agent_runs_close(ts_pool, run_id, reply.status, reply)
+    if sse is not None:
+        await sse.emit("answer", reply.model_dump(mode="json"))
+    return reply
