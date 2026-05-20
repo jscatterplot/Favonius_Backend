@@ -101,6 +101,13 @@ logger = logging.getLogger("backfill_session_cost")
 # ``'unpriceable'`` always resweeps — prices in ``electricity_prices``
 # can arrive later (ENTSO-E publication lag) and we can't cheaply join
 # at the SQL level to detect that.
+# Depot scoping admits NULL-site rows with a station_id so the
+# SiteResolver path can recover them. Without this, ``--depot-id <X>``
+# runs would skip every live/imported row whose ``site_id`` is still
+# NULL even when the station_id maps to depot X — exactly the rows
+# operators most often need to backfill (failed post-close cost task,
+# pre-site_id-backfill imports). The Python loop filters by the
+# resolved depot after ``SiteResolver`` runs.
 _CANDIDATE_SQL = """
     SELECT session_id, site_id, vehicle_id, station_id, connector_id,
            transaction_id, start_time, end_time,
@@ -118,7 +125,11 @@ _CANDIDATE_SQL = """
            AND site_id IS NULL
            AND station_id IS NULL
        )
-       AND ($1::uuid IS NULL OR site_id = $1)
+       AND (
+           $1::uuid IS NULL
+           OR site_id = $1
+           OR (site_id IS NULL AND station_id IS NOT NULL)
+       )
        AND session_id > $3::uuid
      ORDER BY session_id
      LIMIT $2
@@ -141,7 +152,11 @@ _CANDIDATE_BY_SESSION_SQL = """
            AND site_id IS NULL
            AND station_id IS NULL
        )
-       AND ($1::uuid IS NULL OR site_id = $1)
+       AND (
+           $1::uuid IS NULL
+           OR site_id = $1
+           OR (site_id IS NULL AND station_id IS NOT NULL)
+       )
        AND session_id = ANY($3::uuid[])
        AND session_id > $4::uuid
      ORDER BY session_id
@@ -257,6 +272,13 @@ class SiteResolver:
     Supabase's ``charging_stations`` table maps OCPP ``station_id`` →
     ``site_id``. Stations rarely move between depots; one cached
     lookup per station covers thousands of sessions.
+
+    ``ORDER BY id`` makes the lookup deterministic across runs:
+    ``charging_stations.station_id`` is only indexed (not unique) at
+    the Supabase layer, so duplicate ``station_id`` values can return
+    arbitrary rows depending on plan/order. Resolving the wrong
+    ``site_id`` writes incorrect costs for every affected session.
+    Ordering by the row UUID picks the same depot every time.
     """
 
     def __init__(self, static_pool: asyncpg.Pool) -> None:
@@ -270,7 +292,8 @@ class SiteResolver:
             return self._cache[station_id]
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT site_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                "SELECT site_id FROM charging_stations "
+                "WHERE station_id = $1 ORDER BY id LIMIT 1",
                 station_id,
             )
         site_id = row["site_id"] if row else None
@@ -406,6 +429,15 @@ async def _run(args: argparse.Namespace) -> int:
                 # to rescue. Cached one round-trip per station_id.
                 if row_dict.get("site_id") is None:
                     row_dict["site_id"] = await site_resolver(row_dict.get("station_id"))
+                # Depot-scoped runs admit NULL-site candidates at the SQL
+                # level so SiteResolver can recover them. After resolution,
+                # skip any row whose resolved site doesn't match the
+                # requested depot — otherwise ``--depot-id X`` would price
+                # rows belonging to other depots that happen to share a
+                # station_id with X (rare but possible at integration time).
+                if args.depot_id is not None and row_dict.get("site_id") != args.depot_id:
+                    counts["__skipped_other_depot"] += 1
+                    continue
                 row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))
                 result = await compute_session_cost(
                     ts_pool,

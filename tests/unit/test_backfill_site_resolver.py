@@ -17,7 +17,27 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from scripts.backfill_session_cost import SiteResolver
+from scripts.backfill_session_cost import (
+    SiteResolver,
+    _CANDIDATE_BY_SESSION_SQL,
+    _CANDIDATE_SQL,
+)
+
+
+def test_candidate_sql_admits_null_site_rows_under_depot_scope():
+    """Regression: ``--depot-id <X>`` runs used to apply ``site_id = $1``
+    at the SQL layer, dropping every live/imported row where
+    ``site_id`` is still NULL even when their ``station_id`` belongs
+    to depot X. Those are the rows operators most often need to
+    backfill (post-close cost task crashed; pre-site_id-backfill
+    imports). The predicate now also admits NULL-site rows that have
+    a station_id; the Python loop filters by resolved site after
+    ``SiteResolver`` runs."""
+    for sql in (_CANDIDATE_SQL, _CANDIDATE_BY_SESSION_SQL):
+        assert "site_id IS NULL AND station_id IS NOT NULL" in sql, (
+            "depot-scoped candidate predicate must admit NULL-site rows "
+            "with a recoverable station_id"
+        )
 
 
 def _pool_returning(rows):
@@ -89,6 +109,28 @@ async def test_site_resolver_handles_none_or_empty_station_id():
     assert await resolver(None) is None
     assert await resolver("") is None
     conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_site_resolver_lookup_is_deterministic():
+    """Regression: ``charging_stations.station_id`` is only indexed (not
+    unique) in Supabase, so the lookup must include ``ORDER BY id`` to
+    return the same depot deterministically across runs. Without the
+    ORDER BY, duplicate station_id rows could resolve to arbitrary
+    site_ids — every affected session would then be priced against the
+    wrong bidding zone."""
+    expected = uuid4()
+    pool, conn = _pool_returning({"site_id": expected})
+    resolver = SiteResolver(pool)
+
+    await resolver("CP-001")
+    sql = conn.fetchrow.await_args.args[0]
+    assert "ORDER BY id" in sql, (
+        "SiteResolver lookup must be deterministic — duplicate station_id "
+        "rows in Supabase would otherwise produce non-reproducible site_id "
+        "resolutions across backfill runs"
+    )
+    assert "LIMIT 1" in sql
 
 
 @pytest.mark.asyncio

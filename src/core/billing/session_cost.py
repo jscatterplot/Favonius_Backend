@@ -239,9 +239,9 @@ async def compute_session_cost(
 
 
 _GRANULAR_TELEMETRY_SQL = """
-            WITH bucketed AS (
+            WITH samples AS (
                 SELECT
-                    t.time,
+                    t.time AS raw_time,
                     t.charging_kw,
                     -- LEAD across the whole vehicle/charger timeline, not
                     -- partitioned by hour. Partitioning would set
@@ -253,10 +253,34 @@ _GRANULAR_TELEMETRY_SQL = """
                     LEAD(t.charging_kw) OVER (ORDER BY t.time) AS next_kw
                 FROM telemetry t
                 WHERE {where_clause}
-                  AND t.time >= ${time_start}
+                  -- 15-minute lookback admits the most recent pre-start
+                  -- sample so the start_time → first-in-window interval
+                  -- gets integrated. Earlier draft filtered ``t.time >=
+                  -- start_time`` strictly, which systematically dropped
+                  -- one cadence-tick of energy at session head and
+                  -- could push the coverage/mismatch gate below the
+                  -- ±10% threshold for short sessions. The bucketed CTE
+                  -- below clamps the anchor sample's effective time to
+                  -- ``start_time`` so its interval starts at the session
+                  -- boundary, not at the raw pre-start timestamp.
+                  AND t.time >= ${time_start}::timestamptz - INTERVAL '15 minutes'
                   AND t.time < ${time_end}
                   AND t.charging_kw IS NOT NULL
                   AND t.charging_kw > 0
+            ),
+            bucketed AS (
+                -- Clamp the pre-start anchor's effective sample time to
+                -- ``start_time``. Samples whose entire interval is
+                -- pre-session (raw_time < start_time AND next_time <=
+                -- start_time) are dropped — they have no overlap.
+                SELECT
+                    GREATEST(raw_time, ${time_start}::timestamptz) AS time,
+                    charging_kw,
+                    next_time,
+                    next_kw
+                FROM samples
+                WHERE next_time IS NULL
+                   OR next_time > ${time_start}::timestamptz
             )
             SELECT
                 time_bucket('1 hour', time) AS hour,

@@ -533,6 +533,84 @@ async def test_candidate_sql_skips_stranded_terminal_rows(
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_candidate_sql_under_depot_scope_admits_null_site_rows(
+    db_pools: IntegrationPools, pool, cleanup,
+):
+    """Regression: ``--depot-id <X>`` applied ``site_id = $1`` strictly,
+    dropping every NULL-site row even when the row's ``station_id``
+    could resolve to depot X via ``SiteResolver``. The candidate SQL
+    now also admits rows where ``site_id IS NULL AND station_id IS
+    NOT NULL`` so the Python loop can run resolution + an exact-match
+    post-filter. Without this, depot-scoped remediation misses
+    exactly the rows operators most need to backfill (post-close
+    cost task crashed; pre-site_id-backfill imports)."""
+    _require_seedable_sites(db_pools)
+    site_id = uuid4()
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
+
+    # Three fixtures to verify the depot-scoped clause:
+    explicit_match = uuid4()       # site_id = depot_id → admitted
+    null_with_station = uuid4()    # site_id NULL + station_id set → admitted (SiteResolver path)
+    null_without_station = uuid4() # site_id NULL + station_id NULL → excluded (no recovery)
+    for sid in (explicit_match, null_with_station, null_without_station):
+        cleanup["sessions"].append(sid)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, 'cp-bf', 1, 1, $2, $3, 10.0, $4, 'no-vehicle', 'import', 0, NULL)
+            """,
+            explicit_match, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15), site_id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, 'cp-bf', 1, 1, $2, $3, 10.0, NULL, 'no-vehicle', 'import', 0, NULL)
+            """,
+            null_with_station, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15),
+        )
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, NULL, 1, 1, $2, $3, 10.0, NULL, 'no-vehicle', 'import', 0, NULL)
+            """,
+            null_without_station, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15),
+        )
+
+        rows = await conn.fetch(
+            bf._CANDIDATE_BY_SESSION_SQL,
+            site_id,
+            100,
+            [explicit_match, null_with_station, null_without_station],
+            bf._UUID_FLOOR,
+        )
+
+    picked = {r["session_id"] for r in rows}
+    assert explicit_match in picked
+    assert null_with_station in picked, (
+        "depot-scoped run must admit NULL-site rows with a station_id "
+        "so SiteResolver can recover them"
+    )
+    assert null_without_station not in picked, (
+        "rows with no recovery path (site_id NULL AND station_id NULL) "
+        "stay excluded — they would land 'no_depot' again"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_backfill_dry_run_iterates_all_chunks(
     db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls, caplog,
 ):

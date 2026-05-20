@@ -609,6 +609,10 @@ class TimescaleClient:
         telemetry batch with it. ``_static_pool`` falls back to ``pg_pool``
         for tests and legacy deployments without a Supabase wiring.
 
+        ``ORDER BY id`` makes the lookup deterministic — Supabase only
+        indexes ``station_id`` (no UNIQUE constraint), so duplicates
+        would otherwise return arbitrary rows depending on plan order.
+
         Returns ``None`` when the station is unknown — telemetry rows are
         still inserted with a NULL ``charger_id``.
         """
@@ -617,12 +621,14 @@ class TimescaleClient:
         if conn is None:
             async with self._static_pool().acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                    "SELECT id AS charger_id FROM charging_stations "
+                    "WHERE station_id = $1 ORDER BY id LIMIT 1",
                     station_id,
                 )
         else:
             row = await conn.fetchrow(
-                "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                "SELECT id AS charger_id FROM charging_stations "
+                "WHERE station_id = $1 ORDER BY id LIMIT 1",
                 station_id,
             )
         return row["charger_id"] if row else None
@@ -2790,7 +2796,11 @@ class TimescaleClient:
         try:
             async with static_pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT site_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                    # ORDER BY id is deterministic — station_id is indexed
+                    # but not unique in Supabase, so duplicates would
+                    # otherwise return arbitrary rows depending on plan.
+                    "SELECT site_id FROM charging_stations "
+                    "WHERE station_id = $1 ORDER BY id LIMIT 1",
                     station_id,
                 )
         except Exception as exc:  # noqa: BLE001

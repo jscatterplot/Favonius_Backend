@@ -358,6 +358,38 @@ async def test_fallback_average_is_duration_weighted_across_partial_hours() -> N
     assert abs((result.avg_price_used or 0) - 0.30) < 1e-9
 
 
+def test_granular_sql_admits_pre_start_anchor_sample() -> None:
+    """Regression: the granular SQL used to filter ``t.time >= start_time``
+    strictly, dropping the interval from start_time to the first
+    in-window sample. For fixed-cadence telemetry where the nearest
+    sample falls just before the session boundary, that's a systematic
+    undercount at session head — also lowers the coverage gate's
+    observed_seconds and can force unnecessary fallback. The fix
+    widens the lower bound to ``start_time - INTERVAL '15 minutes'``
+    and clamps the anchor sample's effective time to start_time so
+    the integration interval is correctly bounded."""
+    from src.core.billing.session_cost import _GRANULAR_TELEMETRY_SQL
+
+    assert "INTERVAL '15 minutes'" in _GRANULAR_TELEMETRY_SQL, (
+        "granular SQL must widen the lower bound by 15 minutes to admit "
+        "one pre-start anchor sample"
+    )
+    assert "GREATEST(raw_time" in _GRANULAR_TELEMETRY_SQL, (
+        "granular SQL must clamp the anchor sample's effective time to "
+        "start_time — without GREATEST, the pre-start sample's interval "
+        "would be integrated from its raw timestamp instead of from "
+        "start_time, over-counting the pre-session sliver"
+    )
+    # The interval-drop guard: samples whose entire interval is
+    # pre-session (raw_time and next_time both < start_time) are dropped.
+    assert "next_time > ${time_start}" in _GRANULAR_TELEMETRY_SQL.replace(
+        "${time_start}::timestamptz", "${time_start}"
+    ), (
+        "samples whose interval is entirely pre-session must be dropped — "
+        "otherwise they'd contribute zero-overlap rows that distort sample_count"
+    )
+
+
 @pytest.mark.asyncio
 async def test_fallback_average_aligned_session_matches_unweighted_mean() -> None:
     """Sessions that exactly align to hour boundaries (e.g. 13:00 → 15:00)
