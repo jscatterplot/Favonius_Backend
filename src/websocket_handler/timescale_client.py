@@ -630,42 +630,60 @@ class TimescaleClient:
     # Electricity Prices — ``electricity_prices`` hypertable (migration 034)
 
     async def store_electricity_prices(self, price_points: List[Dict[str, Any]]) -> None:
-        """Store electricity price points into the ``electricity_prices`` hypertable."""
+        """Store electricity price points into the ``electricity_prices`` hypertable.
+
+        Migration 041 added a uniqueness constraint on
+        ``(time, node_id, market_type)``. The feeder runs on a ~15-minute
+        cadence and pulls the same day-ahead window every interval, so
+        most rows in any given call already exist. Earlier draft used
+        ``copy_records_to_table`` which has no conflict-resolution
+        semantics — the next periodic run would have hit unique-key
+        violations and silently skipped refreshing the table. Switched
+        to ``INSERT … ON CONFLICT DO NOTHING`` so re-ingesting the
+        same hour is a no-op. Volume is modest (≤ 24 hours × handful
+        of zones per tick); the COPY-speed advantage was overkill for
+        this rate.
+        """
         if not price_points:
             return
 
+        rows = [
+            (
+                point["time"],
+                point["node_id"],
+                point["market_type"],
+                point.get("lmp_price_mwh"),
+                point.get("energy_component_mwh"),
+                point.get("congestion_component_mwh"),
+                point.get("loss_component_mwh"),
+                point.get("ghg_adder_mwh"),
+                point.get("price_confidence"),
+                point.get("forecast_horizon_minutes"),
+            )
+            for point in price_points
+        ]
+
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.copy_records_to_table(
-                    "electricity_prices",
-                    records=[
-                        (
-                            point["time"],
-                            point["node_id"],
-                            point["market_type"],
-                            point.get("lmp_price_mwh"),
-                            point.get("energy_component_mwh"),
-                            point.get("congestion_component_mwh"),
-                            point.get("loss_component_mwh"),
-                            point.get("ghg_adder_mwh"),
-                            point.get("price_confidence"),
-                            point.get("forecast_horizon_minutes"),
-                        )
-                        for point in price_points
-                    ],
-                    columns=[
-                        "time",
-                        "node_id",
-                        "market_type",
-                        "lmp_price_mwh",
-                        "energy_component_mwh",
-                        "congestion_component_mwh",
-                        "loss_component_mwh",
-                        "ghg_adder_mwh",
-                        "price_confidence",
-                        "forecast_horizon_minutes",
-                    ],
-                )
+                async with conn.transaction():
+                    await conn.executemany(
+                        """
+                        INSERT INTO electricity_prices (
+                            time,
+                            node_id,
+                            market_type,
+                            lmp_price_mwh,
+                            energy_component_mwh,
+                            congestion_component_mwh,
+                            loss_component_mwh,
+                            ghg_adder_mwh,
+                            price_confidence,
+                            forecast_horizon_minutes
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT (time, node_id, market_type) DO NOTHING
+                        """,
+                        rows,
+                    )
                 self.logger.debug(
                     "Stored %s electricity price records (electricity_prices)",
                     len(price_points),
