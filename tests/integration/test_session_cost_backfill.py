@@ -531,3 +531,69 @@ async def test_backfill_continues_past_unpriceable_chunk_to_priceable_rows(
         )
     assert priced["cost_total_source"] == "fallback_average"
     assert priced["cost_total"] == Decimal("10.0000")  # 20 kWh × €0.50
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_backfill_reprices_no_depot_row_after_site_id_repair(
+    pool, cleanup, monkeypatch,
+):
+    """Regression: a row tagged ``'no_depot'`` on a previous run
+    (e.g. import missing ``site_id``) must become eligible again on
+    the next backfill once the underlying data is repaired. An earlier
+    draft excluded ``cost_total_source IN ('no_energy', 'no_depot')``
+    from the candidate set, which permanently stranded those rows."""
+    session_id = uuid4()
+    cleanup["sessions"].append(session_id)
+    # First, the row exists with no site_id and cost_total_source=no_depot
+    # (simulates the prior run's verdict).
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, 'cp-bf', 1, 1, $2, $3, $4, NULL, 'no-vehicle',
+                      'import', NULL, 'no_depot')
+            """,
+            session_id,
+            _utc(2026, 7, 1, 10), _utc(2026, 7, 1, 11), 30.0,
+        )
+    # Operator fixes the import: backfill site_id, seed price + sites row.
+    site_id = uuid4()
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+    await _seed_price(pool, _utc(2026, 7, 1, 10), 0.40)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE charging_sessions SET site_id = $1 WHERE session_id = $2",
+            site_id, session_id,
+        )
+
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL",
+                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL",
+                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    import asyncio as _asyncio
+    await _asyncio.wait_for(
+        bf._run(_args(depot_id=site_id, session_ids=[session_id])),
+        timeout=15.0,
+    )
+
+    async with pool.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT cost_total, cost_total_source FROM charging_sessions "
+            "WHERE session_id = $1",
+            session_id,
+        )
+    # Re-priced via fallback (no telemetry seeded).
+    assert after["cost_total_source"] == "fallback_average"
+    assert after["cost_total"] == Decimal("12.0000")  # 30 kWh × €0.40

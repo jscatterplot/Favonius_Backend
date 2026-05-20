@@ -76,15 +76,16 @@ from src.db.queries import fetch_prices_by_zone, resolve_bidding_zone  # noqa: E
 logger = logging.getLogger("backfill_session_cost")
 
 
-# A within-run ``session_id > $3`` cursor advances the candidate set
-# forward. Without it, rows the calculator just tagged
-# ``'unpriceable'`` / ``'no_energy'`` / ``'no_depot'`` (cost_total
-# stays NULL) keep re-matching the predicate on every chunk — the
-# loop never terminates short of ``--max-rows`` because the same
-# rows are picked, re-classified, and re-locked indefinitely. A new
-# backfill run starts with the cursor at the zero UUID, so terminal
-# rows do get a fresh attempt later (the publication-lag recovery
-# story): publication-lag rows just have to wait for the next run.
+# Spin prevention is owned by the ``session_id > $cursor`` guard alone.
+# Earlier drafts also excluded ``cost_total_source = 'no_energy' /
+# 'no_depot'`` as belt-and-suspenders, but that permanently strands
+# rows whose underlying data was misclassified once — a backfill of
+# ``charging_sessions.site_id`` or a re-import that fixes
+# ``energy_delivered_kwh`` should let the row land granular /
+# fallback_average on the next run. Only ``'manual'`` is sacrosanct
+# (operator-supplied cost). The cursor + ``not rows`` termination
+# handle the spin case; subsequent runs reset the cursor and pick
+# up every still-NULL row regardless of prior provenance.
 _CANDIDATE_SQL = """
     SELECT session_id, site_id, vehicle_id, station_id, connector_id,
            transaction_id, start_time, end_time,
