@@ -127,10 +127,42 @@ class PriceIngestionService:
         the read-through cache in ``src/db/queries.py`` use. The
         ``depot_id`` is retained as a log key and for the adapter's
         per-depot timezone resolution but is no longer a storage key.
+
+        Resolves the bidding zone using the same cascade as the
+        readers (``src.db.queries.resolve_bidding_zone``):
+        ``sites.tariff_config['entsoe_zone']`` first, then
+        ``get_bidding_zone(sites.timezone)``. Earlier draft used
+        ``get_bidding_zone(depot_timezone)`` directly, which ignored
+        operator overrides set in ``tariff_config`` — for a depot in
+        a country with multiple bidding zones (DK, NO, SE, IT), or
+        a depot whose timezone doesn't match its actual electricity
+        market, ingestion stored data under one ``node_id`` while
+        billing looked for another. The cascade resolver fixes that.
         """
         from ..entsoe.mappings import get_bidding_zone
+        from ...db.queries import resolve_bidding_zone
 
-        zone = get_bidding_zone(depot_timezone)
+        # Prefer the canonical resolver — it honours
+        # tariff_config['entsoe_zone'] overrides that the bare
+        # timezone lookup misses. The CAISO ingestion service has a
+        # single pool that may or may not host the ``sites`` table;
+        # if the lookup raises (sites lives on a separate DB) we
+        # fall back to the timezone-derived zone so ingestion still
+        # runs.
+        zone: Optional[str] = None
+        try:
+            from uuid import UUID
+            zone = await resolve_bidding_zone(self.pool, UUID(str(depot_id)))
+        except Exception as exc:
+            logger.debug(
+                "resolve_bidding_zone unavailable for depot %s "
+                "(%s); falling back to timezone-derived zone",
+                depot_id, exc,
+            )
+
+        if zone is None:
+            zone = get_bidding_zone(depot_timezone)
+
         if zone is None:
             logger.warning(
                 f"No ENTSO-E bidding zone for depot {depot_id} "
