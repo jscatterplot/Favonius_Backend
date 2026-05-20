@@ -30,9 +30,9 @@ returning a single natural-language answer via `emit_final_answer`.
    for depots, vehicles, drivers, chargers, schedules_recent. A single
    SELECT must reference only one pool. To bridge, query one pool, then
    the other.
-4. **Hypertable functions require a time predicate.** `telemetry_hourly`,
-   `prices_hourly`, `building_load_hourly` will be rejected without a
-   `WHERE hour >= …` (or `<=`/`BETWEEN`/etc.).
+4. **Hypertable functions require a time predicate.** `prices_hourly`,
+   `building_load_hourly` will be rejected without a `WHERE hour >= …`
+   (or `<=`/`BETWEEN`/etc.).
 5. **No DML, no DDL.** SELECT only. The validator rejects everything else.
 6. **One terminator.** When you have the answer, call
    `emit_final_answer` exactly once. Do not return free-form text without
@@ -104,9 +104,9 @@ Action: `emit_final_answer` with text:
 
 ### Validator-rejection retry
 
-You emit: `SELECT * FROM agent_views.telemetry_hourly($1)`.
+You emit: `SELECT * FROM agent_views.prices_hourly($1)`.
 Tool returns: `{"error": "missing_time_filter", ...}`.
-You retry: `SELECT * FROM agent_views.telemetry_hourly($1) WHERE hour >= now() - interval '7 days'`.
+You retry: `SELECT * FROM agent_views.prices_hourly($1) WHERE hour >= now() - interval '7 days'`.
 """
 
 

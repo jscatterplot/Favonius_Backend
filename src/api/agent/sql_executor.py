@@ -27,6 +27,7 @@ includes the SQL but not the values.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -41,6 +42,9 @@ from src.monitoring.metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Postgres interval literals accepted by SET LOCAL statement_timeout.
+_STATEMENT_TIMEOUT_RE = re.compile(r"^(?:0|\d+(?:\.\d+)?(?:ms|s|min|h|d)?)$")
 
 
 class SqlExecutorError(Exception):
@@ -134,6 +138,11 @@ async def run_select(
     if role not in {"agent_reader_ts", "agent_reader_static"}:
         # Programming error — the caller MUST pick a valid role.
         raise SqlExecutorError(f"Unknown agent role: {role!r}")
+    if not _STATEMENT_TIMEOUT_RE.fullmatch(statement_timeout):
+        raise SqlExecutorError(
+            f"Invalid statement_timeout: {statement_timeout!r}. "
+            "Use a Postgres interval literal (e.g. '5s', '500ms', '0')."
+        )
 
     started = time.monotonic()
     outcome = "success"
