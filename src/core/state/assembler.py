@@ -421,11 +421,17 @@ class StateAssembler:
                 async with self.pools.static.acquire() as static_conn:
                     zone = await resolve_bidding_zone(static_conn, self.depot_id)
             except asyncpg.PostgresError as e:
+                # Don't poison the cache on a transient DB error —
+                # the next solve should retry the static-pool lookup
+                # once the DB recovers. ``None`` is a legitimate
+                # ``resolve_bidding_zone`` result meaning "this depot
+                # has no zone configured", and we DO want to cache
+                # that on the success path below. The sentinel stays
+                # set here so the next call hits this branch again.
                 logger.error(
                     f"Failed to resolve bidding zone for depot {self.depot_id}: {e}. "
-                    "Using default prices."
+                    "Using default prices for this solve; will retry on next call."
                 )
-                self._bidding_zone_cache = None
                 return [0.15] * n_steps
             self._bidding_zone_cache = zone
 

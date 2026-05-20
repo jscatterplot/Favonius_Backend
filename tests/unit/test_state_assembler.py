@@ -262,6 +262,61 @@ class TestGetPrices:
         # Should forward-fill from first hour (within 1 hour window)
         assert all(p == 0.10 for p in prices)
 
+    @pytest.mark.asyncio
+    async def test_zone_resolution_db_error_does_not_poison_cache(
+        self, mock_db_pools, depot_id, depot_config,
+    ):
+        """Regression: a transient PostgresError on the static-pool
+        zone lookup must not poison ``_bidding_zone_cache``. Earlier
+        draft cached ``None`` on the exception path, so every
+        subsequent solve returned the $0.15 default until the process
+        restarted — even after the static DB recovered. The fix
+        leaves the sentinel intact so the next call retries."""
+        from unittest.mock import patch
+        import asyncpg
+
+        a = StateAssembler(mock_db_pools, depot_id, depot_config)
+        # No pre-set zone cache: force the resolver call.
+
+        # First call: resolver raises PostgresError → no caching.
+        # Use an hour-aligned start so the mocked single price row
+        # below lands exactly on the floored bucket.
+        start = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        with patch(
+            "src.db.queries.resolve_bidding_zone",
+            new=AsyncMock(side_effect=asyncpg.PostgresError("DB hiccup")),
+        ):
+            prices_1 = await a._get_prices(start, start + timedelta(hours=1), n_steps=4)
+        # Got default prices, AND cache was not poisoned.
+        assert all(p == 0.15 for p in prices_1)
+        assert getattr(a, "_bidding_zone_cache", _SENTINEL_FOR_TEST) is _SENTINEL_FOR_TEST
+
+        # Second call: resolver recovers (returns a real zone).
+        # The price query should now use that zone instead of the
+        # poisoned-None branch (which would have short-circuited to
+        # the default).
+        mock_conn = AsyncMock()
+        # Stub the TS-pool fetch so _get_prices completes.
+        mock_db_pools.ts.acquire.return_value.__aenter__.return_value = mock_conn
+        row_data = {"time": start, "lmp_price_mwh": 200.0}
+        row = MagicMock()
+        row.__getitem__ = lambda self, k, d=row_data: d[k]
+        mock_conn.fetch.return_value = [row]
+        with patch(
+            "src.db.queries.resolve_bidding_zone",
+            new=AsyncMock(return_value="10YLT-1001A0008Q"),
+        ):
+            prices_2 = await a._get_prices(start, start + timedelta(hours=1), n_steps=4)
+        # Cache populated with the real zone now.
+        assert a._bidding_zone_cache == "10YLT-1001A0008Q"
+        # Got the priced value, not the default.
+        assert any(p == 0.20 for p in prices_2)
+
+
+# Sentinel used by the regression test above. Must match the marker
+# the production module uses for "not yet resolved".
+_SENTINEL_FOR_TEST = object()
+
 
 class TestGetSchedules:
     """Test _get_schedules method."""
