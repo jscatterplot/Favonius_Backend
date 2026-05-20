@@ -73,6 +73,15 @@ class TimescaleClient:
         # in isolation continue to use ``pg_pool``.
         self._supabase_client: Any = None
 
+        # Strong references to in-flight fire-and-forget cost tasks.
+        # ``asyncio.create_task`` only registers a weak reference with
+        # the event loop, so a task whose only reference is the local
+        # variable in the scheduler is eligible for garbage collection
+        # before it completes (officially documented in asyncio).
+        # Holding it in a set + ``add_done_callback`` to discard on
+        # completion is the canonical pattern.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
     def set_supabase_client(self, supabase_client: Any) -> None:
         """Attach a SupabaseClient for static-identity lookups.
 
@@ -600,6 +609,10 @@ class TimescaleClient:
         telemetry batch with it. ``_static_pool`` falls back to ``pg_pool``
         for tests and legacy deployments without a Supabase wiring.
 
+        ``ORDER BY id`` makes the lookup deterministic — Supabase only
+        indexes ``station_id`` (no UNIQUE constraint), so duplicates
+        would otherwise return arbitrary rows depending on plan order.
+
         Returns ``None`` when the station is unknown — telemetry rows are
         still inserted with a NULL ``charger_id``.
         """
@@ -608,12 +621,14 @@ class TimescaleClient:
         if conn is None:
             async with self._static_pool().acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                    "SELECT id AS charger_id FROM charging_stations "
+                    "WHERE station_id = $1 ORDER BY id LIMIT 1",
                     station_id,
                 )
         else:
             row = await conn.fetchrow(
-                "SELECT id AS charger_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                "SELECT id AS charger_id FROM charging_stations "
+                "WHERE station_id = $1 ORDER BY id LIMIT 1",
                 station_id,
             )
         return row["charger_id"] if row else None
@@ -621,42 +636,60 @@ class TimescaleClient:
     # Electricity Prices — ``electricity_prices`` hypertable (migration 034)
 
     async def store_electricity_prices(self, price_points: List[Dict[str, Any]]) -> None:
-        """Store electricity price points into the ``electricity_prices`` hypertable."""
+        """Store electricity price points into the ``electricity_prices`` hypertable.
+
+        Migration 041 added a uniqueness constraint on
+        ``(time, node_id, market_type)``. The feeder runs on a ~15-minute
+        cadence and pulls the same day-ahead window every interval, so
+        most rows in any given call already exist. Earlier draft used
+        ``copy_records_to_table`` which has no conflict-resolution
+        semantics — the next periodic run would have hit unique-key
+        violations and silently skipped refreshing the table. Switched
+        to ``INSERT … ON CONFLICT DO NOTHING`` so re-ingesting the
+        same hour is a no-op. Volume is modest (≤ 24 hours × handful
+        of zones per tick); the COPY-speed advantage was overkill for
+        this rate.
+        """
         if not price_points:
             return
 
+        rows = [
+            (
+                point["time"],
+                point["node_id"],
+                point["market_type"],
+                point.get("lmp_price_mwh"),
+                point.get("energy_component_mwh"),
+                point.get("congestion_component_mwh"),
+                point.get("loss_component_mwh"),
+                point.get("ghg_adder_mwh"),
+                point.get("price_confidence"),
+                point.get("forecast_horizon_minutes"),
+            )
+            for point in price_points
+        ]
+
         try:
             async with self.pg_pool.acquire() as conn:
-                await conn.copy_records_to_table(
-                    "electricity_prices",
-                    records=[
-                        (
-                            point["time"],
-                            point["node_id"],
-                            point["market_type"],
-                            point.get("lmp_price_mwh"),
-                            point.get("energy_component_mwh"),
-                            point.get("congestion_component_mwh"),
-                            point.get("loss_component_mwh"),
-                            point.get("ghg_adder_mwh"),
-                            point.get("price_confidence"),
-                            point.get("forecast_horizon_minutes"),
-                        )
-                        for point in price_points
-                    ],
-                    columns=[
-                        "time",
-                        "node_id",
-                        "market_type",
-                        "lmp_price_mwh",
-                        "energy_component_mwh",
-                        "congestion_component_mwh",
-                        "loss_component_mwh",
-                        "ghg_adder_mwh",
-                        "price_confidence",
-                        "forecast_horizon_minutes",
-                    ],
-                )
+                async with conn.transaction():
+                    await conn.executemany(
+                        """
+                        INSERT INTO electricity_prices (
+                            time,
+                            node_id,
+                            market_type,
+                            lmp_price_mwh,
+                            energy_component_mwh,
+                            congestion_component_mwh,
+                            loss_component_mwh,
+                            ghg_adder_mwh,
+                            price_confidence,
+                            forecast_horizon_minutes
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT (time, node_id, market_type) DO NOTHING
+                        """,
+                        rows,
+                    )
                 self.logger.debug(
                     "Stored %s electricity price records (electricity_prices)",
                     len(price_points),
@@ -2702,13 +2735,172 @@ class TimescaleClient:
                     # Lost the race to another writer between SELECT and UPDATE.
                     return None
                 result = dict(updated)
+                result["session_id"] = session_id
                 # Surface the synthesis flag so the OCPP handler can pick a
                 # distinct log line / metric without re-deriving the
                 # condition. Not a column on charging_sessions — the
                 # ``synthesized_delta`` suffix on stop_reason is the durable
                 # audit trail.
                 result["synthesized"] = synthesized
-                return result
+        # Transaction committed + connection released. Schedule the cost
+        # calculation as a fire-and-forget task — if it crashes, the row
+        # stays cost_total=NULL and the backfill script catches it on the
+        # next run (its predicate covers exactly this case).
+        self._schedule_session_cost(session_id)
+        return result
+
+    async def _resolve_bidding_zone(self, site_id: Optional[uuid.UUID]) -> Optional[str]:
+        """Cross-pool helper: site_id (Supabase) → ENTSO-E EIC code.
+
+        Returns ``None`` when no static pool is configured (legacy tests
+        with no SupabaseClient) or when the depot has no
+        ``tariff_config.entsoe_zone`` and no recognized
+        ``sites.timezone``. The cost task treats ``None`` as
+        ``unpriceable``.
+        """
+        if site_id is None:
+            return None
+        static_pool = self._static_pool()
+        if static_pool is None:
+            return None
+        # Lazy import — keeps the WS handler's import path lean.
+        from ..db.queries import resolve_bidding_zone
+
+        try:
+            async with static_pool.acquire() as conn:
+                return await resolve_bidding_zone(conn, site_id)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("resolve_bidding_zone failed for site %s: %s", site_id, exc)
+            return None
+
+    async def _resolve_site_id_for_station(self, station_id: Optional[str]) -> Optional[uuid.UUID]:
+        """Cross-pool helper: OCPP ``station_id`` → ``sites.id`` (Supabase).
+
+        ``insert_open_session`` writes the OCPP station_id but not
+        ``site_id`` (it has no Supabase round-trip on the StartTransaction
+        hot path), so live ``charging_sessions`` rows close with
+        ``site_id IS NULL``. The cost calculator short-circuits to
+        ``'no_depot'`` for those rows — meaning every live session would
+        skip pricing entirely. This helper backfills the join from
+        Supabase's ``charging_stations`` so the cost task gets a real
+        depot identifier without bloating the close-path commit.
+
+        Returns ``None`` when the static pool isn't configured (legacy
+        single-pool tests) or when the station_id doesn't match any row.
+        """
+        if not station_id:
+            return None
+        static_pool = self._static_pool()
+        if static_pool is None:
+            return None
+        try:
+            async with static_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    # ORDER BY id is deterministic — station_id is indexed
+                    # but not unique in Supabase, so duplicates would
+                    # otherwise return arbitrary rows depending on plan.
+                    "SELECT site_id FROM charging_stations "
+                    "WHERE station_id = $1 ORDER BY id LIMIT 1",
+                    station_id,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "site_id lookup failed for station %s: %s", station_id, exc
+            )
+            return None
+        return row["site_id"] if row else None
+
+    def _schedule_session_cost(self, session_id: uuid.UUID) -> None:
+        """Schedule the post-commit cost calculation for one session.
+
+        Fire-and-forget. ``_compute_and_write_cost`` swallows every
+        exception so close-path callers are never affected. Errors are
+        logged and counted via ``SESSION_COST_COMPUTE_FAILURES``.
+
+        The task is held in ``self._background_tasks`` so the event
+        loop's weak-reference table doesn't lose track of it mid-flight
+        — a stray garbage collection between the StopTransaction commit
+        and this task's first ``await`` would otherwise silently drop
+        the cost calc (the row sits at ``cost_total=NULL`` until the
+        next backfill run, which is the documented safety net but
+        defeats the whole point of the live close path).
+        """
+        task = asyncio.create_task(
+            self._compute_and_write_cost(session_id),
+            name=f"session-cost-{session_id}",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _compute_and_write_cost(self, session_id: uuid.UUID) -> None:
+        """Fetch the just-closed session, run the cost calculator, update the row.
+
+        Lazy-imports ``src.core.billing`` and ``src.monitoring.metrics``
+        to keep the legacy WS handler's hot import path lean.
+        """
+        from ..core.billing import compute_session_cost, write_session_cost
+        from ..monitoring.metrics import (
+            SESSION_COST_COMPUTE_FAILURES,
+            SESSION_COST_COMPUTED,
+            SESSION_COST_DURATION,
+        )
+
+        started = time.monotonic()
+        try:
+            async with self.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT session_id, site_id, vehicle_id, station_id, connector_id,
+                           transaction_id, start_time, end_time,
+                           energy_delivered_kwh, cost_total, cost_total_source
+                      FROM charging_sessions
+                     WHERE session_id = $1
+                    """,
+                    session_id,
+                )
+            if row is None:
+                self.logger.warning(
+                    "Session %s vanished before cost calc could read it",
+                    session_id,
+                )
+                return
+
+            # Resolve the bidding zone for this session's depot via the
+            # static (Supabase) pool. The calculator never crosses pools
+            # itself; the WS handler owns the join.
+            row_dict = dict(row)
+            # Live sessions land with site_id=NULL because insert_open_session
+            # doesn't write it (no Supabase round-trip on the StartTransaction
+            # hot path). Backfill from station_id via Supabase so the cost
+            # calculator can resolve a bidding zone and avoid the
+            # ``'no_depot'`` short-circuit for every live row.
+            if row_dict.get("site_id") is None:
+                row_dict["site_id"] = await self._resolve_site_id_for_station(
+                    row_dict.get("station_id")
+                )
+            row_dict["bidding_zone"] = await self._resolve_bidding_zone(row_dict.get("site_id"))
+
+            result = await compute_session_cost(self.pg_pool, row_dict)
+            # Only count the metric when the UPDATE actually landed.
+            # write_session_cost returns False on lost-race (another
+            # writer beat us to it) or when the row stopped being
+            # eligible — neither is a "computed total" event. Counting
+            # those would inflate the dashboard's success rate.
+            wrote = await write_session_cost(self.pg_pool, session_id, result)
+            if wrote:
+                SESSION_COST_COMPUTED.labels(source=result.source).inc()
+        except asyncpg.PostgresError as exc:
+            self.logger.exception("DB error computing cost for session %s: %s", session_id, exc)
+            SESSION_COST_COMPUTE_FAILURES.labels(reason="db_error").inc()
+        except Exception as exc:  # noqa: BLE001 — fire-and-forget must not raise
+            self.logger.exception(
+                "Unexpected error computing cost for session %s: %s",
+                session_id,
+                exc,
+            )
+            SESSION_COST_COMPUTE_FAILURES.labels(reason="unexpected").inc()
+        finally:
+            SESSION_COST_DURATION.observe(time.monotonic() - started)
 
     async def recover_orphaned_sessions(
         self,
@@ -2830,6 +3022,11 @@ class TimescaleClient:
                 if updated is not None:
                     closed.append(dict(updated))
 
+        # Schedule cost calcs for every orphan-recovered row. Done after
+        # the connection has been released so the post-commit tasks run
+        # against the canonical row state.
+        for row in closed:
+            self._schedule_session_cost(row["session_id"])
         return closed
 
     async def mark_sessions_seen(self, station_id: str) -> None:

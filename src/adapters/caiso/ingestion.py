@@ -58,6 +58,9 @@ class PriceIngestionService:
         depot_id: str,
         node: Optional[str] = None,
         depot_timezone: Optional[str] = None,
+        fetched_zones: Optional[set[str]] = None,
+        window_start: Optional[datetime] = None,
+        window_end: Optional[datetime] = None,
     ) -> int:
         """Fetch and store prices for a single depot.
 
@@ -68,16 +71,34 @@ class PriceIngestionService:
             depot_id: Depot identifier
             node: Pricing node for CAISO (defaults to adapter default)
             depot_timezone: Depot IANA timezone for region detection
+            fetched_zones: Optional set tracking ENTSO-E zones already
+                pulled in the current ingestion run. When the resolved
+                zone is already in the set, the per-depot pull is
+                short-circuited — ``electricity_prices`` is keyed by
+                zone, so the first depot in the zone covers every
+                other depot in the same zone for free.
+            window_start: Optional shared start of the fetch window.
+                Defaults to ``datetime.utcnow()``. When iterating many
+                depots from one batch, pass a shared value so depots
+                later in the loop don't drift to a later ``now`` and
+                miss the trailing hour the earlier depots claimed.
+            window_end: Optional shared end of the fetch window.
+                Defaults to ``window_start + 48h``.
 
         Returns:
             Number of prices stored
         """
         try:
-            now = datetime.utcnow()
-            end_date = now + timedelta(hours=48)
+            now = window_start if window_start is not None else datetime.utcnow()
+            end_date = (
+                window_end if window_end is not None else now + timedelta(hours=48)
+            )
 
             if depot_timezone and is_european_timezone(depot_timezone):
-                return await self._fetch_entsoe_prices(depot_id, now, end_date, depot_timezone)
+                return await self._fetch_entsoe_prices(
+                    depot_id, now, end_date, depot_timezone,
+                    fetched_zones=fetched_zones,
+                )
             else:
                 return await self._fetch_caiso_prices(depot_id, now, end_date, node)
 
@@ -119,29 +140,114 @@ class PriceIngestionService:
         start_date: datetime,
         end_date: datetime,
         depot_timezone: str,
+        *,
+        fetched_zones: Optional[set[str]] = None,
     ) -> int:
-        """Fetch and store ENTSO-E prices for a European depot."""
+        """Fetch and store ENTSO-E prices for a European depot.
+
+        Prices are persisted to ``electricity_prices`` keyed by ENTSO-E
+        bidding zone — the same hypertable the WS-handler feeder and
+        the read-through cache in ``src/db/queries.py`` use. The
+        ``depot_id`` is retained as a log key and for the adapter's
+        per-depot timezone resolution but is no longer a storage key.
+
+        Resolves the bidding zone using the same cascade as the
+        readers (``src.db.queries.resolve_bidding_zone``):
+        ``sites.tariff_config['entsoe_zone']`` first, then
+        ``get_bidding_zone(sites.timezone)``. Earlier draft used
+        ``get_bidding_zone(depot_timezone)`` directly, which ignored
+        operator overrides set in ``tariff_config`` — for a depot in
+        a country with multiple bidding zones (DK, NO, SE, IT), or
+        a depot whose timezone doesn't match its actual electricity
+        market, ingestion stored data under one ``node_id`` while
+        billing looked for another. The cascade resolver fixes that.
+
+        When ``fetched_zones`` is supplied and already contains the
+        resolved zone, the underlying adapter call reads from the
+        ``electricity_prices`` cache (just-populated by an earlier
+        depot in this run) instead of hitting the ENTSO-E API a
+        second time. Without the dedup, a depot fleet with N sites
+        in the same zone (e.g. multiple Lithuanian depots) would
+        burn N API calls per ingestion tick.
+        """
+        from ..entsoe.mappings import get_bidding_zone
+        from ...db.queries import resolve_bidding_zone
+
+        # Prefer the canonical resolver — it honours
+        # tariff_config['entsoe_zone'] overrides that the bare
+        # timezone lookup misses. The CAISO ingestion service has a
+        # single pool that may or may not host the ``sites`` table;
+        # if the lookup raises (sites lives on a separate DB) we
+        # fall back to the timezone-derived zone so ingestion still
+        # runs.
+        zone: Optional[str] = None
+        try:
+            from uuid import UUID
+            zone = await resolve_bidding_zone(self.pool, UUID(str(depot_id)))
+        except Exception as exc:
+            logger.debug(
+                "resolve_bidding_zone unavailable for depot %s "
+                "(%s); falling back to timezone-derived zone",
+                depot_id, exc,
+            )
+
+        if zone is None:
+            zone = get_bidding_zone(depot_timezone)
+
+        if zone is None:
+            logger.warning(
+                f"No ENTSO-E bidding zone for depot {depot_id} "
+                f"(timezone: {depot_timezone}); skipping"
+            )
+            return 0
+
+        # ``electricity_prices`` is keyed by zone, so once one depot
+        # in this run has fetched + stored, every other depot in the
+        # same zone is reading the same hypertable rows. Earlier draft
+        # toggled ``use_cache=True`` for depots 2..N, but that read
+        # back any non-empty slice from the table — including stale
+        # rows left by a prior day's ingestion — and called it done.
+        # Short-circuiting here keeps depots 2..N from hitting the
+        # cache (or the API) at all: the first depot did the only
+        # ingestion work the zone needs, and the calculator / optimizer
+        # will read the freshly-stored rows directly when they next
+        # consult ``electricity_prices``.
+        if fetched_zones is not None and zone in fetched_zones:
+            logger.debug(
+                "Zone %s already ingested this run (depot=%s); skipping",
+                zone, depot_id,
+            )
+            return 0
+
+        # ``get_prices_for_depot`` already calls ``store_prices_to_db``
+        # internally when it fetches fresh data (see entsoe/prices.py).
+        # Earlier draft also called ``store_prices_to_db`` here on the
+        # returned list — with ON CONFLICT DO NOTHING that second pass
+        # was harmless but ran a full insert batch inside a transaction
+        # every ingestion tick for zero effect. Drop the duplicate and
+        # rely on the adapter's storage path; the returned list is the
+        # fetch count, which we report directly.
         prices = await self.entsoe_adapter.get_prices_for_depot(
             depot_id=depot_id,
             start_date=start_date,
             end_date=end_date,
             depot_timezone=depot_timezone,
+            bidding_zone=zone,
             use_cache=False,
             source="entsoe_dam",
         )
 
         if prices:
-            stored = await self.entsoe_adapter.store_prices_to_db(
-                prices, depot_id, source="entsoe_dam"
-            )
             logger.info(
-                f"Stored {stored} ENTSO-E prices for depot {depot_id} "
-                f"(timezone: {depot_timezone})"
+                f"Fetched {len(prices)} ENTSO-E prices for zone {zone} "
+                f"(depot={depot_id}, timezone={depot_timezone})"
             )
-            return stored
+            if fetched_zones is not None:
+                fetched_zones.add(zone)
+            return len(prices)
         else:
             logger.warning(
-                f"No ENTSO-E prices fetched for depot {depot_id} " f"(timezone: {depot_timezone})"
+                f"No ENTSO-E prices fetched for depot {depot_id} (timezone: {depot_timezone})"
             )
             return 0
 
@@ -176,6 +282,22 @@ class PriceIngestionService:
                 f"({eu_count} European, {len(rows) - eu_count} non-European)"
             )
 
+            # Shared across the per-run iteration so depots in the same
+            # ENTSO-E bidding zone don't each fire an independent
+            # ``GetPublicationDocument`` request. The first depot
+            # populates ``electricity_prices`` (use_cache=False); every
+            # later depot in that zone short-circuits.
+            fetched_zones: set[str] = set()
+
+            # Fix the run's fetch window upfront so every depot ingests
+            # the same [start, end). With per-call ``datetime.utcnow()``,
+            # depots iterated later in the loop drift to a slightly
+            # later ``now`` — if the loop crosses an hour boundary, the
+            # zone-dedup early-return would short-circuit them and the
+            # trailing hour they wanted goes missing until the next run.
+            run_start = datetime.utcnow()
+            run_end = run_start + timedelta(hours=48)
+
             for row in rows:
                 depot_id = str(row["depot_id"])
                 depot_timezone = row.get("timezone")
@@ -183,7 +305,10 @@ class PriceIngestionService:
 
                 try:
                     stored_count = await self.fetch_and_store_prices_for_depot(
-                        depot_id, node, depot_timezone=depot_timezone
+                        depot_id, node, depot_timezone=depot_timezone,
+                        fetched_zones=fetched_zones,
+                        window_start=run_start,
+                        window_end=run_end,
                     )
                     results[depot_id] = stored_count
                 except Exception as e:

@@ -6,7 +6,7 @@ Reference: Development plan Step 4.1, PRD.md#5-system-architecture
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -20,6 +20,12 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Sentinel for the lazy bidding-zone cache on StateAssembler instances:
+# ``None`` is a valid resolved value meaning "this depot has no zone";
+# we need a distinct marker to distinguish "not yet resolved" from
+# "resolved to nothing".
+_SENTINEL = object()
 
 
 class StateAssembler:
@@ -371,64 +377,127 @@ class StateAssembler:
             List of prices in $/kWh, one per timestep
 
         Note:
-            Handles missing price data by forward-filling from last known price
-            within 1 hour. Falls back to default $0.15/kWh if no data available.
+            Normalizes ``start`` / ``end`` to aware UTC before calling
+            the price helper. asyncpg returns ``electricity_prices.time``
+            as aware TIMESTAMPTZ, and the helper now returns a dict
+            keyed by aware datetimes; controllers built around naive
+            ``datetime.utcnow()`` would otherwise look up aware keys
+            with naive ones and miss every match.
+
+        Note:
+            Resolves the depot's ENTSO-E bidding zone via
+            :func:`src.db.queries.resolve_bidding_zone` (cached on the
+            assembler instance), then delegates to
+            :func:`src.db.queries.fetch_prices_by_zone`. Hours that
+            helper can't fill (no known price within 1h) get the
+            optimizer's $0.15/kWh default — this default is a
+            solver-input concern and lives here, not in the helper,
+            because billing code in ``src/core/billing/`` must NOT
+            fabricate prices the same way.
 
         Raises:
             asyncpg.PostgresError: If database query fails
         """
-        query = """
-        SELECT time, energy_kwh as price_per_kwh
-        FROM prices
-        WHERE depot_id = $1 AND time >= $2 AND time < $3
-        ORDER BY time
-        """
-        try:
-            async with self.pools.ts.acquire() as conn:
-                rows = await conn.fetch(query, self.depot_id, start, end)
-        except asyncpg.PostgresError as e:
-            logger.error(
-                f"Database error fetching prices for depot {self.depot_id}: {e}. "
-                "Using default prices."
+        from ...db.queries import (
+            _as_utc_aware,
+            _hour_floor_utc,
+            fetch_or_pull_prices_by_zone,
+            resolve_bidding_zone,
+        )
+
+        # Normalize to aware UTC so dict lookups against the helper's
+        # aware-keyed map line up regardless of caller-side flavor.
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
+        # Cache the zone on the instance — sites.tariff_config / sites.timezone
+        # don't change inside a controller's lifetime, and this avoids a
+        # static-pool round-trip on every solve.
+        zone = getattr(self, "_bidding_zone_cache", _SENTINEL)
+        if zone is _SENTINEL:
+            try:
+                async with self.pools.static.acquire() as static_conn:
+                    zone = await resolve_bidding_zone(static_conn, self.depot_id)
+            except asyncpg.PostgresError as e:
+                # Don't poison the cache on a transient DB error —
+                # the next solve should retry the static-pool lookup
+                # once the DB recovers. ``None`` is a legitimate
+                # ``resolve_bidding_zone`` result meaning "this depot
+                # has no zone configured", and we DO want to cache
+                # that on the success path below. The sentinel stays
+                # set here so the next call hits this branch again.
+                logger.error(
+                    f"Failed to resolve bidding zone for depot {self.depot_id}: {e}. "
+                    "Using default prices for this solve; will retry on next call."
+                )
+                return [0.15] * n_steps
+            self._bidding_zone_cache = zone
+
+        if not zone:
+            logger.warning(
+                f"No bidding zone configured for depot {self.depot_id} "
+                "(set sites.tariff_config.entsoe_zone or sites.timezone); "
+                "using default $0.15/kWh."
             )
-            # Fallback to default prices on database error
             return [0.15] * n_steps
 
-        if not rows:
+        start_utc = _as_utc_aware(start)
+        end_utc = _as_utc_aware(end)
+
+        try:
+            async with self.pools.ts.acquire() as conn:
+                price_map = await fetch_or_pull_prices_by_zone(
+                    conn, zone, start_utc, end_utc,
+                )
+        except asyncpg.PostgresError as e:
+            logger.error(
+                f"Database error fetching prices for depot {self.depot_id} "
+                f"(zone {zone}): {e}. Using default prices."
+            )
+            return [0.15] * n_steps
+
+        if not price_map:
             logger.warning(
                 f"No price data found for depot {self.depot_id} "
-                f"between {start} and {end}, using default $0.15/kWh"
+                f"(zone {zone}) between {start} and {end}, "
+                "using default $0.15/kWh"
             )
-            return [0.15] * n_steps  # Default price
+            return [0.15] * n_steps
 
-        # Build time-indexed price map
-        price_map = {row["time"]: float(row["price_per_kwh"]) for row in rows}
-
-        # Generate prices for each timestep
+        default_price_kwh = 0.15
         delta_t = timedelta(hours=self.config.delta_t)
-        prices = []
-        last_price = 0.15  # Default fallback
-
+        prices: list[float] = []
+        # Per-step lookup: each timestep maps to its hour-floor and is
+        # priced from price_map at that hour. Earlier draft carried a
+        # ``last_price`` cursor that survived across hour gaps, so a
+        # multi-hour price gap silently extended the most recent priced
+        # hour's value across all later timesteps instead of reverting
+        # to default. fetch_prices_by_zone already forward-fills within
+        # 1h before the dict reaches us; if the hour is still missing
+        # we hunt for the closest known hour within 1h (defense in
+        # depth) and finally fall back to ``default_price_kwh``.
         for t in range(n_steps):
-            step_time = start + t * delta_t
-
-            # Find closest price (exact match or forward-fill)
-            if step_time in price_map:
-                last_price = price_map[step_time]
-            # Forward-fill: use last known price if within 1 hour
+            step_time = start_utc + t * delta_t
+            hour_floor = _hour_floor_utc(step_time)
+            if hour_floor in price_map:
+                price = price_map[hour_floor]
             elif price_map:
                 closest_time = min(
                     price_map.keys(),
-                    key=lambda x: abs((x - step_time).total_seconds()),
+                    key=lambda x: abs((x - hour_floor).total_seconds()),
                 )
-                time_diff = abs((closest_time - step_time).total_seconds())
-                if time_diff < 3600:  # Within 1 hour
-                    last_price = price_map[closest_time]
-
-            prices.append(last_price)
+                if abs((closest_time - hour_floor).total_seconds()) < 3600:
+                    price = price_map[closest_time]
+                else:
+                    price = default_price_kwh
+            else:
+                price = default_price_kwh
+            prices.append(price)
 
         logger.debug(
-            f"Price interpolation: {len(price_map)} price points -> {len(prices)} timesteps"
+            f"Price interpolation: {len(price_map)} priced hours -> {len(prices)} timesteps"
         )
         return prices[:n_steps]
 
@@ -772,17 +841,13 @@ class StateAssembler:
         # cycles — treat anything else as monthly so this stays safe.
         period = (self.config.cap_billing_period or "monthly").lower()
         if period == "monthly":
-            period_start = now.replace(
-                day=1, hour=0, minute=0, second=0, microsecond=0
-            )
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         else:
             logger.warning(
                 f"Unknown cap_billing_period '{period}' for depot {self.depot_id}, "
                 "treating as monthly"
             )
-            period_start = now.replace(
-                day=1, hour=0, minute=0, second=0, microsecond=0
-            )
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
         # Resolve depot charger IDs from static DB, then query telemetry from
         # TimescaleDB to avoid cross-database references.
@@ -1008,9 +1073,7 @@ class StateAssembler:
         ``get_current_state`` so the extra DB roundtrips don't show up
         for callers that only need the optimization state.
         """
-        features, forecast_id = await self._get_weather_features(
-            horizon_start, horizon_end
-        )
+        features, forecast_id = await self._get_weather_features(horizon_start, horizon_end)
         self._last_weather_features = features
         self._last_weather_forecast_id = forecast_id
         self._last_organization_id = await self._get_organization_id()
@@ -1072,7 +1135,9 @@ class StateAssembler:
             for row in rows
         ]
 
-    async def _get_weather_features(self, start: datetime, end: datetime) -> tuple[list[dict], UUID | None]:
+    async def _get_weather_features(
+        self, start: datetime, end: datetime
+    ) -> tuple[list[dict], UUID | None]:
         """Fetch weather features for the horizon (snapshot context only).
 
         After migration 021 ``weather_forecasts`` is an insert-only
@@ -1129,9 +1194,7 @@ class StateAssembler:
                     end,
                 )
         except asyncpg.PostgresError as e:
-            logger.debug(
-                f"weather_forecasts unavailable for depot {self.depot_id}: {e}"
-            )
+            logger.debug(f"weather_forecasts unavailable for depot {self.depot_id}: {e}")
             return [], None
         if not rows:
             return [], None
@@ -1141,34 +1204,12 @@ class StateAssembler:
             {
                 # ``time`` is preserved as the public payload key for
                 # backwards compatibility with the snapshot schema.
-                "time": (
-                    row["forecast_for"].isoformat()
-                    if row["forecast_for"]
-                    else None
-                ),
-                "temp_f": (
-                    float(row["temp_f"]) if row["temp_f"] is not None else None
-                ),
-                "temp_max_f": (
-                    float(row["temp_max_f"])
-                    if row["temp_max_f"] is not None
-                    else None
-                ),
-                "temp_min_f": (
-                    float(row["temp_min_f"])
-                    if row["temp_min_f"] is not None
-                    else None
-                ),
-                "precip_in": (
-                    float(row["precip_in"])
-                    if row["precip_in"] is not None
-                    else None
-                ),
-                "solar_rad": (
-                    float(row["solar_rad"])
-                    if row["solar_rad"] is not None
-                    else None
-                ),
+                "time": (row["forecast_for"].isoformat() if row["forecast_for"] else None),
+                "temp_f": (float(row["temp_f"]) if row["temp_f"] is not None else None),
+                "temp_max_f": (float(row["temp_max_f"]) if row["temp_max_f"] is not None else None),
+                "temp_min_f": (float(row["temp_min_f"]) if row["temp_min_f"] is not None else None),
+                "precip_in": (float(row["precip_in"]) if row["precip_in"] is not None else None),
+                "solar_rad": (float(row["solar_rad"]) if row["solar_rad"] is not None else None),
             }
             for row in rows
         ]
@@ -1179,8 +1220,7 @@ class StateAssembler:
         try:
             async with self.pools.static.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT organization_id::text AS organization_id "
-                    "FROM sites WHERE id = $1",
+                    "SELECT organization_id::text AS organization_id " "FROM sites WHERE id = $1",
                     self.depot_id,
                 )
         except asyncpg.PostgresError as e:
@@ -1328,9 +1368,7 @@ class StateAssembler:
         access_default = str(depot_row["charger_vehicle_access_default"])
         tariff_type = str(depot_row["tariff_type"])
         energy_cap_kwh = (
-            float(depot_row["energy_cap_kwh"])
-            if depot_row["energy_cap_kwh"] is not None
-            else None
+            float(depot_row["energy_cap_kwh"]) if depot_row["energy_cap_kwh"] is not None else None
         )
         under_cap_rate = (
             float(depot_row["under_cap_rate_per_kwh"])
