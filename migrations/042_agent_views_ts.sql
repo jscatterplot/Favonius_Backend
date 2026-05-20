@@ -54,6 +54,27 @@ REVOKE ALL ON SCHEMA information_schema FROM agent_reader_ts;
 CREATE SCHEMA IF NOT EXISTS agent_views;
 GRANT  USAGE  ON SCHEMA agent_views TO agent_reader_ts;
 
+-- Grant the runtime login role membership in agent_reader_ts so the
+-- executor's `SET LOCAL ROLE agent_reader_ts` actually succeeds. We
+-- grant to `current_user` (the role that's applying this migration)
+-- on the assumption that migrations and the runtime share a DB user,
+-- which is the case in Railway/Docker/Supabase pooler setups. If
+-- migrations run as a different role than the application, an
+-- operator must manually run `GRANT agent_reader_ts TO <app_user>`
+-- — and the executor's `current_user` assertion (S2) surfaces the
+-- mismatch as `role_error` at the first SQL turn. Idempotent.
+DO $grant$
+BEGIN
+    EXECUTE format('GRANT agent_reader_ts TO %I', current_user);
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE WARNING
+            'Could not GRANT agent_reader_ts TO %: '
+            'manual grant required for SQL agent mode to function.',
+            current_user;
+END
+$grant$;
+
 -- ── Table-functions ──────────────────────────────────────────────────────
 --
 -- Each function:

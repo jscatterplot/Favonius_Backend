@@ -40,6 +40,21 @@ REVOKE ALL ON SCHEMA information_schema FROM agent_reader_static;
 CREATE SCHEMA IF NOT EXISTS agent_views;
 GRANT  USAGE  ON SCHEMA agent_views TO agent_reader_static;
 
+-- Grant the runtime login role membership in agent_reader_static so
+-- the executor's `SET LOCAL ROLE agent_reader_static` succeeds. See
+-- migrations/042_agent_views_ts.sql for the full rationale. Idempotent.
+DO $grant$
+BEGIN
+    EXECUTE format('GRANT agent_reader_static TO %I', current_user);
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE WARNING
+            'Could not GRANT agent_reader_static TO %: '
+            'manual grant required for SQL agent mode to function.',
+            current_user;
+END
+$grant$;
+
 -- depots ─────────────────────────────────────────────────────────────────
 -- The Supabase table is `sites`; the backend vocabulary is "depot".
 -- The function returns the depot-vocabulary view so the LLM sees consistent

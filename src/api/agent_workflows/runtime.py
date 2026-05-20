@@ -839,6 +839,17 @@ async def run_qa_turn(
                 result = {"error": "tool_failure", "tool": name, "detail": str(exc)}
                 ok = False
                 err = str(exc)
+            else:
+                # A tool may signal logical failure by returning an error
+                # envelope (top-level "error" key) without raising —
+                # e.g. the SQL agent's validator/executor wraps the
+                # rejection reason for the LLM. Treat that as ok=False
+                # so audit aggregation in the controller and the
+                # tool_result is_error flag downstream both match what
+                # actually happened. See PR #216 review thread.
+                if isinstance(result, dict) and "error" in result:
+                    ok = False
+                    err = str(result.get("error_kind") or result.get("error") or "tool error")
 
             tc = ToolCall(
                 name=name,

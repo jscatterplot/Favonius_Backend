@@ -259,6 +259,67 @@ async def test_terminator_must_be_in_allowed_tools():
 
 
 @pytest.mark.asyncio
+async def test_error_envelope_return_marks_tool_call_as_failure():
+    """A tool that returns ``{"error": ...}`` (without raising) must be
+    surfaced to the runtime as ``ok=False`` so audit aggregation and
+    tool_result(is_error=True) downstream both match what actually
+    happened. See PR #216 review thread."""
+    reg = ToolRegistry()
+
+    async def _envelope_failer(*, sql: str, **_):
+        return {"error": "rejected by validator", "error_kind": "table_not_allowed"}
+
+    async def _terminator(*, text: str, row_evidence: int = 0, **_):
+        return {"text": text, "row_evidence": row_evidence}
+
+    reg.register(
+        "run_select_ts",
+        description="select",
+        input_schema={
+            "type": "object",
+            "properties": {"sql": {"type": "string"}},
+            "required": ["sql"],
+        },
+        fn=_envelope_failer,
+    )
+    reg.register(
+        QA_TERMINATOR_TOOL_NAME,
+        description="terminator",
+        input_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        fn=_terminator,
+    )
+
+    script = [
+        _FakeResponse([_tool_use("run_select_ts", "b1", {"sql": "SELECT * FROM public.x"})]),
+        _FakeResponse([
+            _tool_use(
+                QA_TERMINATOR_TOOL_NAME, "b2",
+                {"text": "I cannot answer because the validator rejected my SQL."}
+            )
+        ]),
+    ]
+    client = _FakeClient(script)
+
+    result = await run_qa_turn(
+        anthropic_client=client,
+        model="claude-haiku-4-5",
+        system_prompt="sys",
+        user_message="q",
+        tool_registry=reg,
+        allowed_tools=["run_select_ts", QA_TERMINATOR_TOOL_NAME],
+    )
+
+    failed = next(tc for tc in result.tool_calls if tc.name == "run_select_ts")
+    assert failed.ok is False
+    assert "table_not_allowed" in (failed.error or "")
+    assert result.status == "success"
+
+
+@pytest.mark.asyncio
 async def test_tool_dispatch_error_is_returned_to_model():
     """A tool that raises mid-loop must produce a tool_result(error=True)
     and not abort the whole turn."""

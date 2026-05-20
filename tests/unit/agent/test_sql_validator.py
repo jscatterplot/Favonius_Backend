@@ -360,6 +360,7 @@ class TestTimePredicate:
         )
 
     def test_or_true_bypass_rejected(self):
+        # `WHERE hour >= ... OR 1=1` — the OR-TRUE neutralises the bound.
         _rej(
             "SELECT * FROM agent_views.prices_hourly($1) "
             "WHERE hour >= now() - interval '7 days' OR 1=1",
@@ -373,6 +374,46 @@ class TestTimePredicate:
             kind="missing_time_filter",
         )
 
+    def test_self_ref_arithmetic_tautology_rejected(self):
+        # `hour >= hour - interval '1 day'` — time column on both sides.
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= hour - interval '1 day'",
+            kind="missing_time_filter",
+        )
+
+    def test_self_ref_function_wrap_tautology_rejected(self):
+        # `date_trunc('day', hour) = hour` — same column, both sides.
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE date_trunc('day', hour) = hour",
+            kind="missing_time_filter",
+        )
+
+    def test_and_combined_predicates_accepted(self):
+        # AND-combining the bound with another predicate is fine.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '1 day' AND depot_id IS NOT NULL"
+        )
+
+
+class TestOffset:
+    def test_offset_nonzero_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) OFFSET 1000",
+            kind="offset_not_allowed",
+        )
+
+    def test_offset_zero_accepted(self):
+        # OFFSET 0 is benign; LIMIT still injected.
+        _ok("SELECT * FROM agent_views.sessions($1) OFFSET 0")
+
+    def test_offset_huge_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) OFFSET 1000000000",
+            kind="offset_not_allowed",
+        )
 
 # ── LIMIT injection / cap ────────────────────────────────────────────────
 

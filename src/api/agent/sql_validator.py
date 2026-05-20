@@ -333,9 +333,32 @@ def validate_sql(
                     f"NOT count.",
                 )
 
-    # 7. LIMIT injection / cap — every SELECT branch and the root.
+    # 7. OFFSET reject + LIMIT injection / cap on every SELECT branch + root.
+    #
+    # OFFSET is rejected outright (not capped). The agent loop never needs
+    # client-side pagination, and large OFFSETs force Postgres to skip
+    # rows BEFORE the LIMIT applies — defeating the row-cap protection.
+    # Check OFFSET on every Select branch (UNION branches can carry their
+    # own OFFSET; they all need to be zero/absent).
+    for select_node in _iter_selects(tree):
+        offset_node = select_node.args.get("offset")
+        if offset_node is not None and not _is_zero_literal(offset_node.expression):
+            return _reject(
+                "offset_not_allowed",
+                "OFFSET is not permitted (a large value defeats the row "
+                "cap by forcing a full scan). Use a more selective WHERE.",
+            )
+    root_offset = tree.args.get("offset") if not isinstance(tree, exp.Select) else None
+    if root_offset is not None and not _is_zero_literal(root_offset.expression):
+        return _reject(
+            "offset_not_allowed",
+            "OFFSET is not permitted (a large value defeats the row "
+            "cap by forcing a full scan). Use a more selective WHERE.",
+        )
+
     # Per-branch LIMITs on UNION/INTERSECT/EXCEPT run before the outer
     # LIMIT; uncapped branches can scan huge row sets within the timeout.
+    # Cap each branch AND the root.
     for select_node in _iter_selects(tree):
         rej = _apply_row_limit_on_node(select_node, row_limit)
         if rej is not None:
@@ -353,6 +376,15 @@ def validate_sql(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _is_zero_literal(expr: exp.Expression | None) -> bool:
+    """True iff ``expr`` is the integer literal 0 (used for OFFSET 0)."""
+    return (
+        isinstance(expr, exp.Literal)
+        and not expr.is_string
+        and str(expr.name) == "0"
+    )
 
 
 def _apply_row_limit_on_node(
@@ -424,16 +456,25 @@ def _iter_from_join_tables(node: exp.Expression):
 
 
 def _has_bounding_time_predicate(where: exp.Where) -> bool:
-    """True iff the WHERE contains a comparison that bounds one of
-    HYPERTABLE_TIME_COLUMNS against a non-column expression.
+    """True iff the WHERE contains a bounding time-column comparison
+    that's NOT neutralised by being inside an OR with a non-bounding
+    branch and isn't a self-referential tautology.
 
-    Tautologies like ``hour = hour`` are rejected: BOTH sides must
-    NOT be the same Column reference for the comparison to count.
-    BETWEEN and IN counts as bounding even if the children include
-    column refs — those still constrain the range to a finite set.
+    Defeats handled:
+
+    * ``WHERE hour = hour`` — both sides are the same column. The
+      ``_is_genuine_bound`` check below catches this.
+    * ``WHERE hour >= hour - interval '1 day'`` — the time column
+      appears on BOTH sides via an arithmetic expression. Same check.
+    * ``WHERE date_trunc('day', hour) = hour`` — same column on both
+      sides via a function wrap. Same check.
 
     Predicates inside EXISTS/subquery branches are ignored — they
     bound a nested scan, not this SELECT's hypertable FROM target.
+    OR-TRUE bypass (``... OR 1=1`` / ``... OR TRUE``) is detected
+    separately by ``_has_or_true_bypass`` in the main validate flow.
+    Legitimate OR-of-bounds queries (``hour > X OR hour < Y``) still
+    pass; we don't reject every OR ancestor.
     """
     for col in _iter_where_columns(where.this):
         if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
@@ -441,15 +482,8 @@ def _has_bounding_time_predicate(where: exp.Where) -> bool:
         comparison = _ancestor_comparison(col)
         if comparison is None:
             continue
-        if isinstance(comparison, (exp.Between, exp.In)):
-            return True
-        # Binary comparison: at least one side must not be a Column.
-        left = comparison.this
-        right = comparison.args.get("expression")
-        if left is None or right is None:
+        if not _is_genuine_bound(comparison, col):
             continue
-        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-            continue  # `hour = hour` style tautology — does not bound
         return True
     return False
 
@@ -464,6 +498,50 @@ def _iter_where_columns(node: exp.Expression | None):
         yield node
     for child in node.iter_expressions():
         yield from _iter_where_columns(child)
+
+
+def _is_genuine_bound(comparison: exp.Expression, time_col: exp.Column) -> bool:
+    """True iff ``comparison`` bounds the time column without being a
+    self-referential tautology.
+
+    Rules:
+
+    * ``BETWEEN`` / ``IN`` count as bounds — they constrain to a finite
+      set regardless of nested expressions.
+    * Binary comparison (``>=`` etc.): the time column must appear on
+      EXACTLY ONE side; the OTHER side must not contain a Column ref
+      to the SAME time column (catches ``hour >= hour - interval '…'``
+      and ``date_trunc('day', hour) = hour``).
+    """
+    if isinstance(comparison, (exp.Between, exp.In)):
+        return True
+    left = comparison.args.get("this")
+    right = comparison.args.get("expression")
+    if left is None or right is None:
+        return False
+    target_name = (time_col.name or "").lower()
+    left_time_cols = _columns_matching(left, target_name)
+    right_time_cols = _columns_matching(right, target_name)
+    if left_time_cols and right_time_cols:
+        # Time column on both sides — `hour = hour`, `hour >= hour - …`,
+        # `date_trunc('day', hour) = hour`, etc. Not a bound.
+        return False
+    if not left_time_cols and not right_time_cols:
+        # Neither side references the time column (shouldn't reach here
+        # via _ancestor_comparison, but defensive).
+        return False
+    return True
+
+
+def _columns_matching(node: exp.Expression, name: str) -> list[exp.Column]:
+    """Return Column nodes (anywhere inside `node`) whose name matches."""
+    out: list[exp.Column] = []
+    if isinstance(node, exp.Column) and (node.name or "").lower() == name:
+        out.append(node)
+    for c in node.find_all(exp.Column):
+        if (c.name or "").lower() == name and c is not node:
+            out.append(c)
+    return out
 
 
 def _ancestor_comparison(node: exp.Expression) -> exp.Expression | None:
@@ -483,6 +561,7 @@ def _has_or_true_bypass(where: exp.Where) -> bool:
     """Detect OR branches that neutralize safety predicates.
 
     Examples: ``... OR 1=1`` and ``... OR TRUE``.
+    Legitimate ``... OR hour < X OR hour > Y`` queries are not affected.
     """
     for node in where.find_all(exp.Or):
         if _is_unconditional_true(node.this) or _is_unconditional_true(node.expression):
