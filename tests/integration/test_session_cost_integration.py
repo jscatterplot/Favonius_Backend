@@ -9,7 +9,14 @@ Exercises:
 
 Run with::
 
+    # Local (single DB with sites + Timescale tables):
     TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/favonius_test \\
+        pytest tests/integration/test_session_cost_integration.py -v
+
+    # Staging split (TigerCloud + Supabase static):
+    TEST_DATABASE_URL=$TIMESCALE_SERVICE_URL \\
+    SUPABASE_DB_HOST=... SUPABASE_DB_PASSWORD=... \\
+    SUPABASE_DB_USER=postgres.<ref> SUPABASE_DB_PORT=6543 \\
         pytest tests/integration/test_session_cost_integration.py -v
 """
 
@@ -29,7 +36,7 @@ from src.core.billing.session_cost import (
     write_session_cost,
 )
 from src.db.queries import fetch_prices_by_zone, resolve_bidding_zone
-from tests.integration.conftest import create_integration_pool
+from tests.integration.conftest import HRX_PILOT_SITE_ID, IntegrationPools
 
 
 # A real ENTSO-E EIC code (Lithuania, the HRX pilot zone). The bidding
@@ -43,10 +50,8 @@ def _utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> dat
 
 
 @pytest_asyncio.fixture
-async def pool():
-    db_pool = await create_integration_pool()
-    yield db_pool
-    await db_pool.close()
+async def pool(db_pools: IntegrationPools):
+    yield db_pools.ts_pool
 
 
 @pytest_asyncio.fixture
@@ -292,12 +297,12 @@ async def test_write_skips_manual_rows(pool, cleanup_ids):
 
 
 @pytest_asyncio.fixture
-async def cleanup_sites(pool):
-    """Track sites.id rows the test seeded and remove on teardown."""
+async def cleanup_sites(db_pools: IntegrationPools):
+    """Track sites.id rows the test seeded and remove on teardown (combined DB only)."""
     site_ids: list[UUID] = []
     yield site_ids
-    if site_ids:
-        async with pool.acquire() as conn:
+    if site_ids and db_pools.can_seed_sites:
+        async with db_pools.static_pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM sites WHERE id = ANY($1::uuid[])", site_ids,
             )
@@ -328,40 +333,73 @@ async def _seed_site(
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_resolve_bidding_zone_uses_tariff_config_first(pool, cleanup_sites):
+async def test_resolve_bidding_zone_uses_tariff_config_first(
+    db_pools: IntegrationPools, cleanup_sites,
+):
+    if not db_pools.can_seed_sites:
+        pytest.skip("sites INSERT requires combined TEST_DATABASE_URL (local test DB)")
     site_id = uuid4()
     cleanup_sites.append(site_id)
-    # Tariff config wins over timezone fallback.
     await _seed_site(
-        pool, site_id,
+        db_pools.static_pool, site_id,
         timezone_name="Europe/Vilnius",
         tariff_config={"entsoe_zone": "10YDE-RWENET---I"},
     )
-    async with pool.acquire() as conn:
+    async with db_pools.static_pool.acquire() as conn:
         zone = await resolve_bidding_zone(conn, site_id)
     assert zone == "10YDE-RWENET---I"
 
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_resolve_bidding_zone_falls_back_to_timezone(pool, cleanup_sites):
-    site_id = uuid4()
-    cleanup_sites.append(site_id)
-    await _seed_site(pool, site_id, timezone_name="Europe/Vilnius", tariff_config=None)
-    async with pool.acquire() as conn:
+async def test_resolve_bidding_zone_falls_back_to_timezone(
+    db_pools: IntegrationPools, cleanup_sites,
+):
+    if not db_pools.static_sites_readable:
+        pytest.skip("needs Supabase static pool (STATIC_DATABASE_URL or SUPABASE_DB_*)")
+    if db_pools.can_seed_sites:
+        site_id = uuid4()
+        cleanup_sites.append(site_id)
+        await _seed_site(
+            db_pools.static_pool, site_id,
+            timezone_name="Europe/Vilnius", tariff_config=None,
+        )
+    else:
+        site_id = UUID(HRX_PILOT_SITE_ID)
+    async with db_pools.static_pool.acquire() as conn:
         zone = await resolve_bidding_zone(conn, site_id)
     assert zone == "10YLT-1001A0008Q"  # Lithuania
 
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_resolve_bidding_zone_unknown_returns_none(pool, cleanup_sites):
+async def test_resolve_bidding_zone_unknown_returns_none(
+    db_pools: IntegrationPools, cleanup_sites,
+):
+    if not db_pools.static_sites_readable:
+        pytest.skip("needs Supabase static pool (STATIC_DATABASE_URL or SUPABASE_DB_*)")
     site_id = uuid4()
-    cleanup_sites.append(site_id)
-    await _seed_site(pool, site_id, timezone_name="America/Los_Angeles", tariff_config=None)
-    async with pool.acquire() as conn:
+    if db_pools.can_seed_sites:
+        cleanup_sites.append(site_id)
+        await _seed_site(
+            db_pools.static_pool, site_id,
+            timezone_name="America/Los_Angeles", tariff_config=None,
+        )
+    async with db_pools.static_pool.acquire() as conn:
         zone = await resolve_bidding_zone(conn, site_id)
     assert zone is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_resolve_hrx_pilot_site_readonly(db_pools: IntegrationPools):
+    """Read-only check against Supabase ``sites`` (TigerCloud + Supabase split)."""
+    if not db_pools.is_split or not db_pools.static_sites_readable:
+        pytest.skip("needs split pools + Supabase STATIC_DATABASE_URL / SUPABASE_DB_*")
+    site_id = UUID(HRX_PILOT_SITE_ID)
+    async with db_pools.static_pool.acquire() as conn:
+        zone = await resolve_bidding_zone(conn, site_id)
+    assert zone == "10YLT-1001A0008Q"
 
 
 @pytest.mark.asyncio
@@ -467,12 +505,14 @@ async def test_idempotent_write(pool, cleanup_ids):
             "SELECT * FROM charging_sessions WHERE session_id = $1", session_id,
         ))
     row["vehicle_id"] = UUID(row["vehicle_id"])
+    row["bidding_zone"] = TEST_ZONE
 
     result_one = await compute_session_cost(pool, row)
     wrote_one = await write_session_cost(pool, session_id, result_one)
     assert wrote_one is True
+    assert result_one.source == "fallback_average"
+    assert result_one.cost == Decimal("10.0000")
 
-    # Refetch the row — cost_total now populated → predicate excludes it.
     async with pool.acquire() as conn:
         row2 = dict(await conn.fetchrow(
             "SELECT * FROM charging_sessions WHERE session_id = $1", session_id,
@@ -481,8 +521,6 @@ async def test_idempotent_write(pool, cleanup_ids):
     row2["bidding_zone"] = TEST_ZONE
 
     result_two = await compute_session_cost(pool, row2)
-    # The pre-existing non-zero cost is now respected as 'manual' sentinel
-    # (calculator's contract — see comment in compute_session_cost).
-    # We assert: second write is a no-op.
     wrote_two = await write_session_cost(pool, session_id, result_two)
+    # cost_total is already non-zero → UPDATE predicate excludes the row.
     assert wrote_two is False

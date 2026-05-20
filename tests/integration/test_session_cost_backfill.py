@@ -8,6 +8,10 @@ Run with::
 
     TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/favonius_test \\
         pytest tests/integration/test_session_cost_backfill.py -v
+
+    # Staging HRX dry-run (split pools, no site INSERT):
+    TEST_DATABASE_URL=$TIMESCALE_SERVICE_URL SUPABASE_DB_*=... \\
+        pytest tests/integration/test_session_cost_backfill.py::test_backfill_hrx_pilot_dry_run_split -v
 """
 
 from __future__ import annotations
@@ -43,7 +47,11 @@ def _load_backfill_module():
 
 
 bf = _load_backfill_module()
-from tests.integration.conftest import create_integration_pool
+from tests.integration.conftest import (
+    HRX_PILOT_SITE_ID,
+    IntegrationPools,
+    integration_db_urls,
+)
 
 
 # Single fixed zone for backfill tests. We seed a sites row with this
@@ -57,14 +65,20 @@ def _utc(year: int, month: int, day: int, hour: int = 0) -> datetime:
 
 
 @pytest_asyncio.fixture
-async def pool():
-    db_pool = await create_integration_pool()
-    yield db_pool
-    await db_pool.close()
+async def pool(db_pools: IntegrationPools):
+    yield db_pools.ts_pool
+
+
+def _require_seedable_sites(db_pools: IntegrationPools) -> None:
+    if not db_pools.can_seed_sites:
+        pytest.skip(
+            "backfill integration tests INSERT sites rows; use combined "
+            "TEST_DATABASE_URL (local) or skip on TigerCloud+Supabase split"
+        )
 
 
 @pytest_asyncio.fixture
-async def cleanup(pool):
+async def cleanup(db_pools: IntegrationPools):
     """Track IDs to delete on teardown.
 
     Backfill tests seed ``sites`` (so the resolver finds a zone),
@@ -74,20 +88,21 @@ async def cleanup(pool):
     sites: list[UUID] = []
     zones: list[str] = []
     yield {"sessions": sessions, "sites": sites, "zones": zones}
-    async with pool.acquire() as conn:
+    async with db_pools.ts_pool.acquire() as conn:
         if sessions:
             await conn.execute(
                 "DELETE FROM charging_sessions WHERE session_id = ANY($1::uuid[])",
                 sessions,
             )
-        if sites:
-            await conn.execute(
-                "DELETE FROM sites WHERE id = ANY($1::uuid[])", sites,
-            )
         if zones:
             await conn.execute(
                 "DELETE FROM electricity_prices WHERE node_id = ANY($1::text[])",
                 zones,
+            )
+    if sites and db_pools.can_seed_sites:
+        async with db_pools.static_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM sites WHERE id = ANY($1::uuid[])", sites,
             )
 
 
@@ -178,13 +193,16 @@ def _args(**overrides):
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_backfill_processes_zero_cost_imports(pool, cleanup, monkeypatch):
+async def test_backfill_processes_zero_cost_imports(
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
+):
     """Imported rows with cost_total=0 are the canonical population the
     backfill targets. Verify they're processed and updated."""
+    _require_seedable_sites(db_pools)
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
     await _seed_price(pool, _utc(2026, 5, 1, 10), 0.25)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
@@ -199,16 +217,17 @@ async def test_backfill_processes_zero_cost_imports(pool, cleanup, monkeypatch):
         cost_total_source=None,
     )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
     rc = await bf._run(
-        _args(depot_id=site_id, max_rows=10, session_ids=[session_id]),
+        _args(
+            depot_id=site_id,
+            max_rows=10,
+            session_ids=[session_id],
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
     )
     assert rc == 0
 
@@ -223,11 +242,14 @@ async def test_backfill_processes_zero_cost_imports(pool, cleanup, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch):
+async def test_backfill_idempotent_second_run_is_noop(
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
+):
+    _require_seedable_sites(db_pools)
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
     await _seed_price(pool, _utc(2026, 5, 2, 12), 0.30)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
@@ -241,15 +263,17 @@ async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch
         cost_total=None,
     )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
+    await bf._run(
+        _args(
+            depot_id=site_id,
+            session_ids=[session_id],
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
     )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         first = await conn.fetchrow(
@@ -257,8 +281,14 @@ async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch
             session_id,
         )
 
-    # Re-run. Predicate filters out the now-priced row.
-    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
+    await bf._run(
+        _args(
+            depot_id=site_id,
+            session_ids=[session_id],
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
+    )
 
     async with pool.acquire() as conn:
         second = await conn.fetchrow(
@@ -272,11 +302,14 @@ async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_backfill_skips_manual_rows(pool, cleanup, monkeypatch):
+async def test_backfill_skips_manual_rows(
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
+):
+    _require_seedable_sites(db_pools)
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
     await _seed_price(pool, _utc(2026, 5, 3, 9), 0.40)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
@@ -291,15 +324,17 @@ async def test_backfill_skips_manual_rows(pool, cleanup, monkeypatch):
         cost_total_source="manual",
     )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
+    await bf._run(
+        _args(
+            depot_id=site_id,
+            session_ids=[session_id],
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
     )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         after = await conn.fetchrow(
@@ -312,11 +347,14 @@ async def test_backfill_skips_manual_rows(pool, cleanup, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_backfill_dry_run_does_not_write(pool, cleanup, monkeypatch):
+async def test_backfill_dry_run_does_not_write(
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
+):
+    _require_seedable_sites(db_pools)
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
     await _seed_price(pool, _utc(2026, 5, 4, 14), 0.20)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
@@ -330,15 +368,18 @@ async def test_backfill_dry_run_does_not_write(pool, cleanup, monkeypatch):
         cost_total=0,
     )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
+    await bf._run(
+        _args(
+            depot_id=site_id,
+            dry_run=True,
+            session_ids=[session_id],
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
     )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    await bf._run(_args(depot_id=site_id, dry_run=True, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         after = await conn.fetchrow(
@@ -352,16 +393,19 @@ async def test_backfill_dry_run_does_not_write(pool, cleanup, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_backfill_resweeps_unpriceable_when_prices_arrive(pool, cleanup, monkeypatch):
+async def test_backfill_resweeps_unpriceable_when_prices_arrive(
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
+):
     """Regression: rows the live close path tagged ``unpriceable``
     (ENTSO-E hadn't published yet) must be picked up again once prices
     land. The candidate predicate ``cost_total_source IS DISTINCT FROM
     'manual'`` includes 'unpriceable' / 'no_energy' / 'no_depot' rows
     so the backfill can heal them."""
+    _require_seedable_sites(db_pools)
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
     # Prices arrive AFTER the live close already wrote 'unpriceable'.
     await _seed_price(pool, _utc(2026, 5, 5, 8), 0.50)
     session_id = uuid4()
@@ -377,15 +421,17 @@ async def test_backfill_resweeps_unpriceable_when_prices_arrive(pool, cleanup, m
         cost_total_source="unpriceable",  # live close path's verdict
     )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
+    await bf._run(
+        _args(
+            depot_id=site_id,
+            session_ids=[session_id],
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
     )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         after = await conn.fetchrow(
@@ -399,7 +445,7 @@ async def test_backfill_resweeps_unpriceable_when_prices_arrive(pool, cleanup, m
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_backfill_terminates_when_all_candidates_are_terminal(
-    pool, cleanup, monkeypatch,
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
 ):
     """Regression: rows whose calculator outcome is terminal
     (``'unpriceable'`` / ``'no_energy'`` / ``'no_depot'``) keep
@@ -407,10 +453,11 @@ async def test_backfill_terminates_when_all_candidates_are_terminal(
     predicate. Without a within-run cursor the loop would re-pick
     them forever. The session_id-ordered cursor advances past them
     so the loop terminates after one pass."""
+    _require_seedable_sites(db_pools)
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
     # No prices seeded → every session is 'unpriceable' / terminal.
     session_id_a = uuid4()
     session_id_b = uuid4()
@@ -426,27 +473,24 @@ async def test_backfill_terminates_when_all_candidates_are_terminal(
         energy_kwh=10.0, cost_total=0, cost_total_source=None,
     )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL",
-                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL",
-                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
     # batch_size=1 forces multiple chunks; without the cursor fix the
     # first session keeps re-matching and the loop never terminates.
     # ``asyncio.wait_for`` is the watchdog — if the bug regresses we
     # fail fast with a clear timeout rather than hanging the suite.
     import asyncio as _asyncio
     await _asyncio.wait_for(
-        bf._run(_args(
-            depot_id=site_id,
-            session_ids=[session_id_a, session_id_b],
-            batch_size=1,
-        )),
+        bf._run(
+            _args(
+                depot_id=site_id,
+                session_ids=[session_id_a, session_id_b],
+                batch_size=1,
+                database_url=ts_url,
+                static_database_url=static_url,
+            ),
+        ),
         timeout=15.0,
     )
 
@@ -463,7 +507,7 @@ async def test_backfill_terminates_when_all_candidates_are_terminal(
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_backfill_continues_past_unpriceable_chunk_to_priceable_rows(
-    pool, cleanup, monkeypatch,
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
 ):
     """Regression: an earlier draft broke the chunk loop when
     ``chunk_priced == 0``, which meant a batch full of ``unpriceable``
@@ -476,10 +520,11 @@ async def test_backfill_continues_past_unpriceable_chunk_to_priceable_rows(
     Forces deterministic UUID ordering with ``UUID(int=...)`` so the
     unpriceable row is guaranteed to sort first.
     """
+    _require_seedable_sites(db_pools)
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
 
     # Low session_id, no price in DB → 'unpriceable'
     unpriceable_id = UUID(int=1)
@@ -500,26 +545,23 @@ async def test_backfill_continues_past_unpriceable_chunk_to_priceable_rows(
         energy_kwh=20.0, cost_total=0, cost_total_source=None,
     )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL",
-                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL",
-                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
     # batch_size=1 puts each session in its own chunk; if the loop
     # stops after the unpriceable chunk, the priceable row stays at
     # cost_total=0 / source=NULL and the assertion below fails.
     import asyncio as _asyncio
     await _asyncio.wait_for(
-        bf._run(_args(
-            depot_id=site_id,
-            session_ids=[unpriceable_id, priceable_id],
-            batch_size=1,
-        )),
+        bf._run(
+            _args(
+                depot_id=site_id,
+                session_ids=[unpriceable_id, priceable_id],
+                batch_size=1,
+                database_url=ts_url,
+                static_database_url=static_url,
+            ),
+        ),
         timeout=15.0,
     )
 
@@ -536,13 +578,14 @@ async def test_backfill_continues_past_unpriceable_chunk_to_priceable_rows(
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_backfill_reprices_no_depot_row_after_site_id_repair(
-    pool, cleanup, monkeypatch,
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
 ):
     """Regression: a row tagged ``'no_depot'`` on a previous run
     (e.g. import missing ``site_id``) must become eligible again on
     the next backfill once the underlying data is repaired. An earlier
     draft excluded ``cost_total_source IN ('no_energy', 'no_depot')``
     from the candidate set, which permanently stranded those rows."""
+    _require_seedable_sites(db_pools)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
     # First, the row exists with no site_id and cost_total_source=no_depot
@@ -564,7 +607,7 @@ async def test_backfill_reprices_no_depot_row_after_site_id_repair(
     site_id = uuid4()
     cleanup["sites"].append(site_id)
     cleanup["zones"].append(TEST_ZONE)
-    await _seed_site_with_zone(pool, site_id)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
     await _seed_price(pool, _utc(2026, 7, 1, 10), 0.40)
     async with pool.acquire() as conn:
         await conn.execute(
@@ -572,19 +615,19 @@ async def test_backfill_reprices_no_depot_row_after_site_id_repair(
             site_id, session_id,
         )
 
-    monkeypatch.setenv(
-        "STATIC_DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL",
-                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        os.getenv("TEST_DATABASE_URL",
-                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
-    )
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
     import asyncio as _asyncio
     await _asyncio.wait_for(
-        bf._run(_args(depot_id=site_id, session_ids=[session_id])),
+        bf._run(
+            _args(
+                depot_id=site_id,
+                session_ids=[session_id],
+                database_url=ts_url,
+                static_database_url=static_url,
+            ),
+        ),
         timeout=15.0,
     )
 
@@ -597,3 +640,26 @@ async def test_backfill_reprices_no_depot_row_after_site_id_repair(
     # Re-priced via fallback (no telemetry seeded).
     assert after["cost_total_source"] == "fallback_average"
     assert after["cost_total"] == Decimal("12.0000")  # 30 kWh × €0.40
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_backfill_hrx_pilot_dry_run_split(
+    db_pools: IntegrationPools, monkeypatch, integration_db_urls,
+):
+    """Dry-run backfill against real HRX on TigerCloud + Supabase (no site INSERT)."""
+    if not db_pools.is_split or not db_pools.static_sites_readable:
+        pytest.skip("needs TIMESCALE_SERVICE_URL + STATIC_DATABASE_URL / SUPABASE_DB_*")
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
+    rc = await bf._run(
+        _args(
+            depot_id=UUID(HRX_PILOT_SITE_ID),
+            dry_run=True,
+            max_rows=25,
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
+    )
+    assert rc == 0
