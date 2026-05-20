@@ -390,7 +390,12 @@ class StateAssembler:
         Raises:
             asyncpg.PostgresError: If database query fails
         """
-        from ...db.queries import fetch_prices_by_zone, resolve_bidding_zone
+        from ...db.queries import (
+            _as_utc_aware,
+            _hour_floor_utc,
+            fetch_prices_by_zone,
+            resolve_bidding_zone,
+        )
 
         # Cache the zone on the instance — sites.tariff_config / sites.timezone
         # don't change inside a controller's lifetime, and this avoids a
@@ -417,11 +422,12 @@ class StateAssembler:
             )
             return [0.15] * n_steps
 
+        start_utc = _as_utc_aware(start)
+        end_utc = _as_utc_aware(end)
+
         try:
             async with self.pools.ts.acquire() as conn:
-                price_map = await fetch_prices_by_zone(
-                    conn, zone, start, end
-                )
+                price_map = await fetch_prices_by_zone(conn, zone, start_utc, end_utc)
         except asyncpg.PostgresError as e:
             logger.error(
                 f"Database error fetching prices for depot {self.depot_id} "
@@ -437,16 +443,27 @@ class StateAssembler:
             )
             return [0.15] * n_steps
 
+        default_price_kwh = 0.15
         delta_t = timedelta(hours=self.config.delta_t)
         prices: list[float] = []
-        last_price = 0.15
 
         for t in range(n_steps):
-            step_time = start + t * delta_t
-            hour_floor = step_time.replace(minute=0, second=0, microsecond=0)
+            step_time = start_utc + t * delta_t
+            hour_floor = _hour_floor_utc(step_time)
             if hour_floor in price_map:
-                last_price = price_map[hour_floor]
-            prices.append(last_price)
+                price = price_map[hour_floor]
+            elif price_map:
+                closest_time = min(
+                    price_map.keys(),
+                    key=lambda x: abs((x - hour_floor).total_seconds()),
+                )
+                if abs((closest_time - hour_floor).total_seconds()) < 3600:
+                    price = price_map[closest_time]
+                else:
+                    price = default_price_kwh
+            else:
+                price = default_price_kwh
+            prices.append(price)
 
         logger.debug(
             f"Price interpolation: {len(price_map)} priced hours -> {len(prices)} timesteps"
@@ -793,17 +810,13 @@ class StateAssembler:
         # cycles — treat anything else as monthly so this stays safe.
         period = (self.config.cap_billing_period or "monthly").lower()
         if period == "monthly":
-            period_start = now.replace(
-                day=1, hour=0, minute=0, second=0, microsecond=0
-            )
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         else:
             logger.warning(
                 f"Unknown cap_billing_period '{period}' for depot {self.depot_id}, "
                 "treating as monthly"
             )
-            period_start = now.replace(
-                day=1, hour=0, minute=0, second=0, microsecond=0
-            )
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
         # Resolve depot charger IDs from static DB, then query telemetry from
         # TimescaleDB to avoid cross-database references.
@@ -1029,9 +1042,7 @@ class StateAssembler:
         ``get_current_state`` so the extra DB roundtrips don't show up
         for callers that only need the optimization state.
         """
-        features, forecast_id = await self._get_weather_features(
-            horizon_start, horizon_end
-        )
+        features, forecast_id = await self._get_weather_features(horizon_start, horizon_end)
         self._last_weather_features = features
         self._last_weather_forecast_id = forecast_id
         self._last_organization_id = await self._get_organization_id()
@@ -1093,7 +1104,9 @@ class StateAssembler:
             for row in rows
         ]
 
-    async def _get_weather_features(self, start: datetime, end: datetime) -> tuple[list[dict], UUID | None]:
+    async def _get_weather_features(
+        self, start: datetime, end: datetime
+    ) -> tuple[list[dict], UUID | None]:
         """Fetch weather features for the horizon (snapshot context only).
 
         After migration 021 ``weather_forecasts`` is an insert-only
@@ -1150,9 +1163,7 @@ class StateAssembler:
                     end,
                 )
         except asyncpg.PostgresError as e:
-            logger.debug(
-                f"weather_forecasts unavailable for depot {self.depot_id}: {e}"
-            )
+            logger.debug(f"weather_forecasts unavailable for depot {self.depot_id}: {e}")
             return [], None
         if not rows:
             return [], None
@@ -1162,34 +1173,12 @@ class StateAssembler:
             {
                 # ``time`` is preserved as the public payload key for
                 # backwards compatibility with the snapshot schema.
-                "time": (
-                    row["forecast_for"].isoformat()
-                    if row["forecast_for"]
-                    else None
-                ),
-                "temp_f": (
-                    float(row["temp_f"]) if row["temp_f"] is not None else None
-                ),
-                "temp_max_f": (
-                    float(row["temp_max_f"])
-                    if row["temp_max_f"] is not None
-                    else None
-                ),
-                "temp_min_f": (
-                    float(row["temp_min_f"])
-                    if row["temp_min_f"] is not None
-                    else None
-                ),
-                "precip_in": (
-                    float(row["precip_in"])
-                    if row["precip_in"] is not None
-                    else None
-                ),
-                "solar_rad": (
-                    float(row["solar_rad"])
-                    if row["solar_rad"] is not None
-                    else None
-                ),
+                "time": (row["forecast_for"].isoformat() if row["forecast_for"] else None),
+                "temp_f": (float(row["temp_f"]) if row["temp_f"] is not None else None),
+                "temp_max_f": (float(row["temp_max_f"]) if row["temp_max_f"] is not None else None),
+                "temp_min_f": (float(row["temp_min_f"]) if row["temp_min_f"] is not None else None),
+                "precip_in": (float(row["precip_in"]) if row["precip_in"] is not None else None),
+                "solar_rad": (float(row["solar_rad"]) if row["solar_rad"] is not None else None),
             }
             for row in rows
         ]
@@ -1200,8 +1189,7 @@ class StateAssembler:
         try:
             async with self.pools.static.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT organization_id::text AS organization_id "
-                    "FROM sites WHERE id = $1",
+                    "SELECT organization_id::text AS organization_id " "FROM sites WHERE id = $1",
                     self.depot_id,
                 )
         except asyncpg.PostgresError as e:
@@ -1349,9 +1337,7 @@ class StateAssembler:
         access_default = str(depot_row["charger_vehicle_access_default"])
         tariff_type = str(depot_row["tariff_type"])
         energy_cap_kwh = (
-            float(depot_row["energy_cap_kwh"])
-            if depot_row["energy_cap_kwh"] is not None
-            else None
+            float(depot_row["energy_cap_kwh"]) if depot_row["energy_cap_kwh"] is not None else None
         )
         under_cap_rate = (
             float(depot_row["under_cap_rate_per_kwh"])

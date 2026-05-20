@@ -10,11 +10,24 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
+
+
+def _as_utc_aware(dt: datetime) -> datetime:
+    """Normalize naive UTC or aware datetimes to timezone-aware UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _hour_floor_utc(dt: datetime) -> datetime:
+    """Floor to start of hour in UTC (for price-map keys and lookups)."""
+    aware = _as_utc_aware(dt)
+    return aware.replace(minute=0, second=0, microsecond=0)
 
 
 def _coerce_jsonb_dict(value: Any) -> dict[str, Any]:
@@ -279,12 +292,15 @@ async def fetch_prices_by_zone(
     if not rows:
         return {}
 
+    start_time = _as_utc_aware(start_time)
+    end_time = _as_utc_aware(end_time)
+
     known: list[tuple[datetime, float]] = []
     for row in rows:
         raw = row["lmp_price_mwh"]
         if raw is None:
             continue
-        known.append((row["time"], float(raw) / 1000.0))
+        known.append((_as_utc_aware(row["time"]), float(raw) / 1000.0))
 
     if not known:
         return {}
@@ -296,7 +312,7 @@ async def fetch_prices_by_zone(
     # _expected_hour_buckets in the calculator floors start the same way.
     # Skipping the floored hour here was the off-by-one that left
     # mid-hour sessions ``unpriceable`` despite DAM prices existing.
-    cursor = start_time.replace(minute=0, second=0, microsecond=0)
+    cursor = _hour_floor_utc(start_time)
     while cursor < end_time:
         candidate = None
         for ts, price in known:
@@ -356,6 +372,7 @@ async def resolve_bidding_zone(static_db, site_id: UUID) -> Optional[str]:
         return None
     # Local import keeps src/db/ free of an adapters/ dep at import time.
     from ..adapters.entsoe.mappings import get_bidding_zone
+
     return get_bidding_zone(tz)
 
 
@@ -2676,9 +2693,7 @@ async def charger_id_by_ocpp_id(db, *, depot_id: str) -> dict[str, str]:
     return {row["ocpp_id"]: row["charger_id"] for row in rows}
 
 
-async def list_active_sessions_for_depot(
-    db, *, station_ids: list[str]
-) -> list[dict]:
+async def list_active_sessions_for_depot(db, *, station_ids: list[str]) -> list[dict]:
     """Open live charging sessions across a set of OCPP station ids.
 
     Backs ``GET /depots/{id}/sessions/active``. Reads from TimescaleDB only;
@@ -2754,9 +2769,7 @@ async def list_completed_sessions_for_depot(
         params.append(cursor_ts)
         params.append(cursor_session_id)
         # Keyset: strictly older than the cursor by (end_time, session_id).
-        clauses.append(
-            f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)"
-        )
+        clauses.append(f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)")
 
     params.append(limit)
     where_sql = " AND ".join(clauses)
@@ -2783,9 +2796,7 @@ async def list_completed_sessions_for_depot(
     return [dict(r) for r in rows]
 
 
-async def latest_telemetry_for_depot_vehicles(
-    db, *, vehicle_ids: list[str]
-) -> list[dict]:
+async def latest_telemetry_for_depot_vehicles(db, *, vehicle_ids: list[str]) -> list[dict]:
     """Lightweight per-vehicle real-time state for a depot.
 
     Distinct from :func:`latest_telemetry_by_vehicles` (which keys by
