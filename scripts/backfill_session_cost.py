@@ -81,7 +81,7 @@ _CANDIDATE_SQL = """
       FROM charging_sessions
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
-       AND cost_total_source IS NULL
+       AND cost_total_source IS DISTINCT FROM 'manual'
        AND ($1::uuid IS NULL OR site_id = $1)
      ORDER BY end_time
      LIMIT $2
@@ -94,7 +94,7 @@ _CANDIDATE_BY_SESSION_SQL = """
       FROM charging_sessions
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
-       AND cost_total_source IS NULL
+       AND cost_total_source IS DISTINCT FROM 'manual'
        AND ($1::uuid IS NULL OR site_id = $1)
        AND session_id = ANY($3::uuid[])
      ORDER BY end_time

@@ -290,10 +290,7 @@ async def fetch_prices_by_zone(
         return {}
 
     filled: dict[datetime, float] = {}
-    first_hour = start_time.replace(minute=0, second=0, microsecond=0)
-    if first_hour < start_time:
-        first_hour = first_hour + timedelta(hours=1)
-    cursor = first_hour
+    cursor = start_time.replace(minute=0, second=0, microsecond=0)
     while cursor < end_time:
         candidate = None
         for ts, price in known:
