@@ -217,9 +217,7 @@ async def _open_pool(url: str, *, label: str) -> asyncpg.Pool:
     if ssl_config is not None:
         connect_kw["ssl"] = ssl_config
     logger.info("Opening %s pool", label)
-    return await asyncpg.create_pool(
-        clean_url, min_size=1, max_size=10, **connect_kw
-    )
+    return await asyncpg.create_pool(clean_url, min_size=1, max_size=10, **connect_kw)
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -227,7 +225,10 @@ async def _run(args: argparse.Namespace) -> int:
     static_url = args.static_database_url or _resolve_static_url()
     logger.info(
         "Backfill starting — dry_run=%s depot=%s batch_size=%s max_rows=%s",
-        args.dry_run, args.depot_id, args.batch_size, args.max_rows,
+        args.dry_run,
+        args.depot_id,
+        args.batch_size,
+        args.max_rows,
     )
 
     ts_pool = await _open_pool(ts_url, label="timescaledb")
@@ -269,21 +270,26 @@ async def _run(args: argparse.Namespace) -> int:
 
                 for row in rows:
                     row_dict = dict(row)
-                    row_dict["bidding_zone"] = await zone_resolver(
-                        row_dict.get("site_id")
-                    )
+                    row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))
                     result = await compute_session_cost(
-                        ts_pool, row_dict, price_lookup=price_cache,
+                        ts_pool,
+                        row_dict,
+                        price_lookup=price_cache,
                     )
                     counts[result.source] += 1
                     if args.dry_run:
                         logger.info(
                             "DRY session=%s source=%s cost=%s",
-                            row["session_id"], result.source, result.cost,
+                            row["session_id"],
+                            result.source,
+                            result.cost,
                         )
                     else:
                         wrote = await write_session_cost(
-                            ts_pool, row["session_id"], result, conn=conn,
+                            ts_pool,
+                            row["session_id"],
+                            result,
+                            conn=conn,
                         )
                         if not wrote:
                             counts["__write_lost_race"] += 1
@@ -312,21 +318,37 @@ async def _run(args: argparse.Namespace) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--dry-run", action="store_true",
-                   help="Compute but do not write. Logs every decision.")
-    p.add_argument("--depot-id", type=str, default=None,
-                   help="Restrict backfill to one depot UUID.")
-    p.add_argument("--batch-size", type=int, default=500,
-                   help="Rows per transaction (default: 500).")
-    p.add_argument("--max-rows", type=int, default=None,
-                   help="Stop after processing N rows total (default: no limit).")
-    p.add_argument("--log-level", type=str, default="INFO",
-                   help="Python logging level (default: INFO).")
-    p.add_argument("--database-url", type=str, default=None,
-                   help="TimescaleDB URL. Overrides DATABASE_URL / TIMESCALE_SERVICE_URL.")
-    p.add_argument("--static-database-url", type=str, default=None,
-                   help="Supabase static-schema URL. Overrides "
-                        "STATIC_DATABASE_URL / SUPABASE_DB_URL / DATABASE_URL.")
+    p.add_argument(
+        "--dry-run", action="store_true", help="Compute but do not write. Logs every decision."
+    )
+    p.add_argument(
+        "--depot-id", type=str, default=None, help="Restrict backfill to one depot UUID."
+    )
+    p.add_argument(
+        "--batch-size", type=int, default=500, help="Rows per transaction (default: 500)."
+    )
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Stop after processing N rows total (default: no limit).",
+    )
+    p.add_argument(
+        "--log-level", type=str, default="INFO", help="Python logging level (default: INFO)."
+    )
+    p.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        help="TimescaleDB URL. Overrides DATABASE_URL / TIMESCALE_SERVICE_URL.",
+    )
+    p.add_argument(
+        "--static-database-url",
+        type=str,
+        default=None,
+        help="Supabase static-schema URL. Overrides "
+        "STATIC_DATABASE_URL / SUPABASE_DB_URL / DATABASE_URL.",
+    )
     args = p.parse_args()
     if args.depot_id is not None:
         try:

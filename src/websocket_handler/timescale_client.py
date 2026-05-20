@@ -2732,13 +2732,12 @@ class TimescaleClient:
             return None
         # Lazy import — keeps the WS handler's import path lean.
         from ..db.queries import resolve_bidding_zone
+
         try:
             async with static_pool.acquire() as conn:
                 return await resolve_bidding_zone(conn, site_id)
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "resolve_bidding_zone failed for site %s: %s", site_id, exc
-            )
+            self.logger.warning("resolve_bidding_zone failed for site %s: %s", site_id, exc)
             return None
 
     def _schedule_session_cost(self, session_id: uuid.UUID) -> None:
@@ -2790,17 +2789,13 @@ class TimescaleClient:
             # static (Supabase) pool. The calculator never crosses pools
             # itself; the WS handler owns the join.
             row_dict = dict(row)
-            row_dict["bidding_zone"] = await self._resolve_bidding_zone(
-                row_dict.get("site_id")
-            )
+            row_dict["bidding_zone"] = await self._resolve_bidding_zone(row_dict.get("site_id"))
 
             result = await compute_session_cost(self.pg_pool, row_dict)
             await write_session_cost(self.pg_pool, session_id, result)
             SESSION_COST_COMPUTED.labels(source=result.source).inc()
         except asyncpg.PostgresError as exc:
-            self.logger.exception(
-                "DB error computing cost for session %s: %s", session_id, exc
-            )
+            self.logger.exception("DB error computing cost for session %s: %s", session_id, exc)
             SESSION_COST_COMPUTE_FAILURES.labels(reason="db_error").inc()
         except Exception as exc:  # noqa: BLE001 — fire-and-forget must not raise
             self.logger.exception(

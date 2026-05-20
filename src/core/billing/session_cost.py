@@ -51,8 +51,8 @@ from ...db.queries import fetch_prices_by_zone
 logger = logging.getLogger(__name__)
 
 # Strategy gate thresholds. Tuneable here, not at call sites.
-TELEMETRY_COVERAGE_MIN = 0.80   # ≥80% of session duration covered
-ENERGY_RECONCILE_TOL = 0.10     # ±10% vs energy_delivered_kwh
+TELEMETRY_COVERAGE_MIN = 0.80  # ≥80% of session duration covered
+ENERGY_RECONCILE_TOL = 0.10  # ±10% vs energy_delivered_kwh
 MAX_PRICE_GAP = timedelta(hours=1)  # forward-fill window
 
 
@@ -100,8 +100,7 @@ class PriceLookup(Protocol):
         bidding_zone: str,
         start: datetime,
         end: datetime,
-    ) -> dict[datetime, float]:
-        ...
+    ) -> dict[datetime, float]: ...
 
 
 async def compute_session_cost(
@@ -134,7 +133,8 @@ async def compute_session_cost(
     existing_cost = session_row.get("cost_total")
     existing_source = session_row.get("cost_total_source")
     if existing_source == "manual" or (
-        existing_cost is not None and Decimal(existing_cost) != Decimal(0)
+        existing_cost is not None
+        and Decimal(existing_cost) != Decimal(0)
         and existing_source not in (None, "fallback_average", "unpriceable")
     ):
         return SessionCostResult(
@@ -302,16 +302,11 @@ async def _fetch_granular_telemetry_rows(
 
     if transaction_id is not None:
         sql = _GRANULAR_TELEMETRY_SQL.format(
-            where_clause=(
-                "t.station_id = $1 AND t.connector_id = $2 "
-                "AND t.transaction_id = $3"
-            ),
+            where_clause=("t.station_id = $1 AND t.connector_id = $2 " "AND t.transaction_id = $3"),
             time_start=4,
             time_end=5,
         )
-        return await conn.fetch(
-            sql, station_id, connector_id, transaction_id, start_time, end_time
-        )
+        return await conn.fetch(sql, station_id, connector_id, transaction_id, start_time, end_time)
 
     sql = _GRANULAR_TELEMETRY_SQL.format(
         where_clause="t.station_id = $1 AND t.connector_id = $2",
@@ -358,10 +353,7 @@ async def _try_granular(
     first = min(r["first_time"] for r in rows)
     last = max(r["last_time"] for r in rows)
     session_seconds = (end_time - start_time).total_seconds()
-    coverage = (
-        (last - first).total_seconds() / session_seconds
-        if session_seconds > 0 else 0.0
-    )
+    coverage = (last - first).total_seconds() / session_seconds if session_seconds > 0 else 0.0
 
     # Energy reconciliation gate.
     if energy_delivered_kwh and energy_delivered_kwh > 0:
@@ -373,7 +365,11 @@ async def _try_granular(
         logger.info(
             "Granular gate failed for vehicle %s [%s, %s): "
             "coverage=%.2f, mismatch=%.2f%%. Falling back to average.",
-            vehicle_id, start_time, end_time, coverage, mismatch * 100,
+            vehicle_id,
+            start_time,
+            end_time,
+            coverage,
+            mismatch * 100,
         )
         return None
 
@@ -387,9 +383,7 @@ async def _try_granular(
             return None
         total_cost += Decimal(str(float(r["energy_kwh"]) * price))
 
-    avg_price = (
-        total_cost / Decimal(str(telem_energy)) if telem_energy > 0 else None
-    )
+    avg_price = total_cost / Decimal(str(telem_energy)) if telem_energy > 0 else None
     return SessionCostResult(
         cost=total_cost.quantize(Decimal("0.0001")),
         source="granular",
