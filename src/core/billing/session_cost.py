@@ -502,7 +502,19 @@ def _fallback_average(
     end_time: datetime,
     price_map: dict[datetime, float],
 ) -> SessionCostResult:
-    """Fallback strategy: total energy × average price across the window."""
+    """Fallback strategy: total energy × duration-weighted average price.
+
+    For a session spanning multiple hours (say 10:30 → 12:30), each
+    hour-bucket price gets a weight equal to the fraction of the
+    hour the session was actually active — 0.5h for hour 10, 1.0h
+    for hour 11, 0.5h for hour 12 in this example. Earlier draft
+    used an unweighted arithmetic mean across the bucket prices,
+    which systematically misbilled sessions whose boundary-hour
+    prices differed from mid-session prices (e.g. evening price
+    spikes catching a session's tail). The weighted form collapses
+    to the unweighted mean when the session is exactly aligned to
+    hour boundaries, so this is a strict accuracy improvement.
+    """
     expected_hours = _expected_hour_buckets(start_time, end_time)
     covered = [h for h in expected_hours if _price_for_hour(price_map, h) is not None]
     if not expected_hours or len(covered) < len(expected_hours):
@@ -511,8 +523,44 @@ def _fallback_average(
             source="unpriceable",
         )
 
-    bucket_prices = [_price_for_hour(price_map, h) for h in covered]
-    avg_price = sum(p for p in bucket_prices if p is not None) / len(covered)
+    # Normalise start/end to UTC-aware so the timedelta arithmetic
+    # below matches the hour-floor keys (which are UTC-aware).
+    # ``_normalize_hour`` floors to the hour — we need the actual
+    # start/end offset within the hour to weight boundary buckets
+    # by their real overlap fraction.
+    if start_time.tzinfo is None:
+        start_aware = start_time.replace(tzinfo=timezone.utc)
+    else:
+        start_aware = start_time.astimezone(timezone.utc)
+    if end_time.tzinfo is None:
+        end_aware = end_time.replace(tzinfo=timezone.utc)
+    else:
+        end_aware = end_time.astimezone(timezone.utc)
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for hour in expected_hours:
+        price = _price_for_hour(price_map, hour)
+        if price is None:
+            continue
+        hour_start = _normalize_hour(hour)
+        hour_end = hour_start + timedelta(hours=1)
+        overlap_start = max(start_aware, hour_start)
+        overlap_end = min(end_aware, hour_end)
+        overlap_seconds = (overlap_end - overlap_start).total_seconds()
+        if overlap_seconds <= 0:
+            continue
+        weight = overlap_seconds / 3600.0
+        weighted_sum += price * weight
+        weight_total += weight
+
+    if weight_total <= 0:
+        # ``expected_hours`` is non-empty and all hours have prices, so
+        # this only triggers when start == end (zero-duration close).
+        # Treat like 'no_energy' — there's nothing to bill across.
+        return SessionCostResult(cost=None, source="no_energy")
+
+    avg_price = weighted_sum / weight_total
     cost = Decimal(str(delivered_kwh * avg_price)).quantize(Decimal("0.0001"))
     return SessionCostResult(
         cost=cost,

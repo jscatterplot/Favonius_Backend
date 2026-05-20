@@ -312,6 +312,75 @@ async def test_no_telemetry_uses_fallback() -> None:
     assert result.cost == Decimal("15.0000")  # 50 * 0.30
 
 
+@pytest.mark.asyncio
+async def test_fallback_average_is_duration_weighted_across_partial_hours() -> None:
+    """Regression: ``_fallback_average`` used to compute an unweighted
+    arithmetic mean across hour-bucket prices, treating boundary hours
+    (which the session only partially overlaps) the same as mid-session
+    hours. For a session spanning 10:30 → 12:30 across an evening
+    price spike, that systematically over- or under-billed the
+    boundary hour by ignoring its 0.5-hour weight.
+
+    Session 10:30 → 12:30 (2 hours total):
+      * hour 10: 0.5h × €0.10/kWh  → weight 0.5
+      * hour 11: 1.0h × €0.50/kWh  → weight 1.0
+      * hour 12: 0.5h × €0.10/kWh  → weight 0.5
+
+    weighted_avg = (0.5*0.10 + 1.0*0.50 + 0.5*0.10) / 2.0
+                 = (0.05 + 0.50 + 0.05) / 2.0
+                 = 0.30 €/kWh
+
+    unweighted_avg = (0.10 + 0.50 + 0.10) / 3 = 0.2333 €/kWh
+
+    The two diverge by ~30% for this profile — verifying the weighted
+    path catches the right price for boundary-spanning sessions.
+    """
+    pool = _FakePool(_FakeConn([]))  # no telemetry → fallback path
+    lookup = _make_lookup({
+        _utc(2026, 5, 19, 10, 0): 0.10,
+        _utc(2026, 5, 19, 11, 0): 0.50,
+        _utc(2026, 5, 19, 12, 0): 0.10,
+    })
+    row = _session_row(
+        start_time=_utc(2026, 5, 19, 10, 30),
+        end_time=_utc(2026, 5, 19, 12, 30),
+        energy_delivered_kwh=Decimal("20.0"),
+    )
+
+    result = await compute_session_cost(pool, row, price_lookup=lookup)
+    assert result.source == "fallback_average"
+    # 20 kWh × 0.30 €/kWh = 6.00; quantize to 4 decimals.
+    assert result.cost == Decimal("6.0000"), (
+        f"expected duration-weighted cost 6.0000, got {result.cost} — "
+        "boundary-hour weighting may have regressed back to an "
+        "unweighted mean"
+    )
+    assert abs((result.avg_price_used or 0) - 0.30) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_fallback_average_aligned_session_matches_unweighted_mean() -> None:
+    """Sessions that exactly align to hour boundaries (e.g. 13:00 → 15:00)
+    should give the same cost as the old unweighted mean — the weighted
+    path collapses to the simple average when every hour contributes
+    weight 1.0. Locks in backward-compatibility for the common case."""
+    pool = _FakePool(_FakeConn([]))
+    lookup = _make_lookup({
+        _utc(2026, 5, 19, 13, 0): 0.20,
+        _utc(2026, 5, 19, 14, 0): 0.40,
+    })
+    row = _session_row(
+        start_time=_utc(2026, 5, 19, 13, 0),
+        end_time=_utc(2026, 5, 19, 15, 0),
+        energy_delivered_kwh=Decimal("10.0"),
+    )
+
+    result = await compute_session_cost(pool, row, price_lookup=lookup)
+    assert result.source == "fallback_average"
+    # avg = (0.20 + 0.40) / 2 = 0.30; cost = 10 * 0.30 = 3.0
+    assert result.cost == Decimal("3.0000")
+
+
 # ─── 7. Unpriceable: no prices at all ────────────────────────────────
 
 

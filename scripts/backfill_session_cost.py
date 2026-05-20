@@ -80,16 +80,27 @@ from src.db.queries import (  # noqa: E402
 logger = logging.getLogger("backfill_session_cost")
 
 
-# Spin prevention is owned by the ``session_id > $cursor`` guard alone.
-# Earlier drafts also excluded ``cost_total_source = 'no_energy' /
-# 'no_depot'`` as belt-and-suspenders, but that permanently strands
-# rows whose underlying data was misclassified once — a backfill of
-# ``charging_sessions.site_id`` or a re-import that fixes
-# ``energy_delivered_kwh`` should let the row land granular /
-# fallback_average on the next run. Only ``'manual'`` is sacrosanct
-# (operator-supplied cost). The cursor + ``not rows`` termination
-# handle the spin case; subsequent runs reset the cursor and pick
-# up every still-NULL row regardless of prior provenance.
+# Only ``'manual'`` is sacrosanct (operator-supplied cost) — the calculator
+# never overwrites those. Beyond that we want to preserve self-healing:
+# a re-import that fixes ``energy_delivered_kwh`` or an admin populating
+# ``site_id`` on a legacy row should let the next backfill re-evaluate.
+# But unconditionally resweeping every terminal row across runs amplifies
+# the backfill cost on fleets with thousands of permanently-stranded
+# imports — rows where the underlying data hasn't changed will land the
+# same terminal source forever. The two predicates below are conservative
+# filters that skip rows whose data is still in the *exact* state that
+# produced the terminal label:
+#
+#   * ``'no_energy'`` rows whose ``energy_delivered_kwh`` is still NULL/≤0
+#     will land ``'no_energy'`` again — nothing changed.
+#   * ``'no_depot'`` rows whose ``site_id`` is still NULL AND ``station_id``
+#     is also NULL have no recovery path (the SiteResolver needs a
+#     station_id to look up). When either becomes non-NULL the predicate
+#     stops matching and the row re-enters the candidate set.
+#
+# ``'unpriceable'`` always resweeps — prices in ``electricity_prices``
+# can arrive later (ENTSO-E publication lag) and we can't cheaply join
+# at the SQL level to detect that.
 _CANDIDATE_SQL = """
     SELECT session_id, site_id, vehicle_id, station_id, connector_id,
            transaction_id, start_time, end_time,
@@ -98,6 +109,15 @@ _CANDIDATE_SQL = """
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
        AND cost_total_source IS DISTINCT FROM 'manual'
+       AND NOT (
+           cost_total_source = 'no_energy'
+           AND (energy_delivered_kwh IS NULL OR energy_delivered_kwh <= 0)
+       )
+       AND NOT (
+           cost_total_source = 'no_depot'
+           AND site_id IS NULL
+           AND station_id IS NULL
+       )
        AND ($1::uuid IS NULL OR site_id = $1)
        AND session_id > $3::uuid
      ORDER BY session_id
@@ -112,6 +132,15 @@ _CANDIDATE_BY_SESSION_SQL = """
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
        AND cost_total_source IS DISTINCT FROM 'manual'
+       AND NOT (
+           cost_total_source = 'no_energy'
+           AND (energy_delivered_kwh IS NULL OR energy_delivered_kwh <= 0)
+       )
+       AND NOT (
+           cost_total_source = 'no_depot'
+           AND site_id IS NULL
+           AND station_id IS NULL
+       )
        AND ($1::uuid IS NULL OR site_id = $1)
        AND session_id = ANY($3::uuid[])
        AND session_id > $4::uuid

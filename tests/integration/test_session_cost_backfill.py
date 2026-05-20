@@ -392,6 +392,147 @@ async def test_backfill_dry_run_does_not_write(
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_candidate_sql_skips_stranded_terminal_rows(
+    db_pools: IntegrationPools, pool, cleanup,
+):
+    """Regression: terminal rows whose underlying data is in the exact
+    state that originally produced the terminal label have no chance
+    of healing — they would land the same source on every backfill
+    run forever. The candidate predicate filters them out:
+
+      * ``'no_energy'`` rows whose ``energy_delivered_kwh`` is still
+        NULL/≤0 → skip.
+      * ``'no_depot'`` rows whose ``site_id`` AND ``station_id`` are
+        both NULL → skip (no recovery path).
+
+    Self-healing is preserved: when an admin populates either field,
+    the predicate stops matching and the row re-enters the candidate
+    set. ``'unpriceable'`` always resweeps because prices can arrive
+    later via the ENTSO-E feeder."""
+    _require_seedable_sites(db_pools)
+    site_id = uuid4()
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
+
+    # Six fixtures spanning the predicate's truth table.
+    stranded_no_energy = uuid4()
+    healing_no_energy = uuid4()
+    stranded_no_depot = uuid4()
+    healing_no_depot_via_station = uuid4()
+    healing_no_depot_via_site = uuid4()
+    always_resweep_unpriceable = uuid4()
+    for sid in [
+        stranded_no_energy, healing_no_energy,
+        stranded_no_depot, healing_no_depot_via_station,
+        healing_no_depot_via_site,
+        always_resweep_unpriceable,
+    ]:
+        cleanup["sessions"].append(sid)
+
+    # Hand-roll inserts so we can set station_id and site_id to NULL.
+    async with pool.acquire() as conn:
+        # 1) Stranded no_energy: energy still NULL.
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, 'cp-bf', 1, 1, $2, $3, NULL, $4, 'no-vehicle', 'import', NULL, 'no_energy')
+            """,
+            stranded_no_energy, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15), site_id,
+        )
+        # 2) Healing no_energy: data was repaired — energy now positive.
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, 'cp-bf', 1, 1, $2, $3, 10.0, $4, 'no-vehicle', 'import', NULL, 'no_energy')
+            """,
+            healing_no_energy, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15), site_id,
+        )
+        # 3) Stranded no_depot: site_id NULL, station_id NULL — unrecoverable.
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, NULL, 1, 1, $2, $3, 10.0, NULL, 'no-vehicle', 'import', NULL, 'no_depot')
+            """,
+            stranded_no_depot, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15),
+        )
+        # 4) Healing no_depot via station_id: SiteResolver may pick it up.
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, 'cp-bf', 1, 1, $2, $3, 10.0, NULL, 'no-vehicle', 'import', NULL, 'no_depot')
+            """,
+            healing_no_depot_via_station, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15),
+        )
+        # 5) Healing no_depot via site_id: admin patched site_id directly.
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, NULL, 1, 1, $2, $3, 10.0, $4, 'no-vehicle', 'import', NULL, 'no_depot')
+            """,
+            healing_no_depot_via_site, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15), site_id,
+        )
+        # 6) Unpriceable: prices may arrive later, always resweep.
+        await conn.execute(
+            """
+            INSERT INTO charging_sessions (
+                session_id, station_id, evse_id, connector_id,
+                start_time, end_time, energy_delivered_kwh,
+                site_id, vehicle_id, source, cost_total, cost_total_source
+            ) VALUES ($1, 'cp-bf', 1, 1, $2, $3, 10.0, $4, 'no-vehicle', 'import', NULL, 'unpriceable')
+            """,
+            always_resweep_unpriceable, _utc(2026, 5, 4, 14), _utc(2026, 5, 4, 15), site_id,
+        )
+
+        rows = await conn.fetch(
+            bf._CANDIDATE_BY_SESSION_SQL,
+            None,
+            100,
+            [
+                stranded_no_energy, healing_no_energy,
+                stranded_no_depot, healing_no_depot_via_station,
+                healing_no_depot_via_site,
+                always_resweep_unpriceable,
+            ],
+            bf._UUID_FLOOR,
+        )
+
+    picked = {r["session_id"] for r in rows}
+    assert stranded_no_energy not in picked, (
+        "no_energy row with NULL/≤0 energy must be filtered — nothing changed"
+    )
+    assert stranded_no_depot not in picked, (
+        "no_depot row with NULL site_id AND NULL station_id has no recovery path"
+    )
+    assert healing_no_energy in picked, "energy_delivered_kwh > 0 must re-enter candidate set"
+    assert healing_no_depot_via_station in picked, (
+        "no_depot row with a station_id must resweep — SiteResolver may now match"
+    )
+    assert healing_no_depot_via_site in picked, (
+        "no_depot row with a populated site_id must resweep — admin repair path"
+    )
+    assert always_resweep_unpriceable in picked, (
+        "unpriceable always resweeps — ENTSO-E publication may arrive between runs"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_backfill_dry_run_iterates_all_chunks(
     db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls, caplog,
 ):
