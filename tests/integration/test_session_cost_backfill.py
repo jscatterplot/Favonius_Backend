@@ -17,7 +17,6 @@ Run with::
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
