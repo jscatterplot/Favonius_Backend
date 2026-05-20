@@ -71,7 +71,11 @@ from src.core.billing.session_cost import (  # noqa: E402
     write_session_cost,
 )
 from src.db.postgres_url import prepare_asyncpg_url_and_ssl  # noqa: E402
-from src.db.queries import fetch_or_pull_prices_by_zone, resolve_bidding_zone  # noqa: E402
+from src.db.queries import (  # noqa: E402
+    _as_utc_aware,
+    fetch_or_pull_prices_by_zone,
+    resolve_bidding_zone,
+)
 
 logger = logging.getLogger("backfill_session_cost")
 
@@ -141,6 +145,16 @@ class LRUPriceLookup:
         start: datetime,
         end: datetime,
     ) -> dict[datetime, float]:
+        # Cache keys are aware-UTC datetimes (that's what
+        # ``fetch_or_pull_prices_by_zone`` stores via ``self._put``).
+        # Naive callers — possible when ``charging_sessions.start_time``
+        # comes back as naive from a test fake or a misconfigured
+        # asyncpg type codec — would otherwise build naive expected
+        # hour keys and miss the cache on every lookup, defeating the
+        # whole point of the LRU. Normalize so the lookups match the
+        # store keys exactly.
+        start = _as_utc_aware(start)
+        end = _as_utc_aware(end)
         needed = _expected_hour_buckets(start, end)
         if not needed:
             async with self._pool.acquire() as conn:

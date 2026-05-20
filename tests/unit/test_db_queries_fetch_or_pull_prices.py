@@ -188,6 +188,50 @@ async def test_api_failure_returns_partial_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lru_price_cache_hits_with_naive_callers(monkeypatch):
+    """Regression: ``LRUPriceLookup.__call__`` (in
+    ``scripts/backfill_session_cost.py``) builds cache lookup keys
+    from ``_expected_hour_buckets(start, end)``. If the caller passes
+    naive datetimes, the lookup keys are naive — but
+    ``fetch_or_pull_prices_by_zone`` stores aware-UTC keys. Without
+    normalization, every lookup misses the cache and the LRU is
+    useless. This test pre-populates the cache with aware keys, then
+    invokes the lookup with naive datetimes and asserts the cache
+    serves the request (no DB round-trip)."""
+    # Imported here to avoid pulling the backfill module into other
+    # unit tests' import graph.
+    import importlib.util
+    from pathlib import Path
+    REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "bf_for_lru_test", REPO_ROOT / "scripts" / "backfill_session_cost.py",
+    )
+    bf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bf)
+
+    naive_start = datetime(2026, 5, 19, 13, 0)  # no tzinfo
+    naive_end = datetime(2026, 5, 19, 15, 0)
+    aware_hour_13 = _utc(2026, 5, 19, 13)
+    aware_hour_14 = _utc(2026, 5, 19, 14)
+
+    # Pre-seed the LRU with aware-UTC keys (what fetch_or_pull
+    # would write).
+    class _PoolThatShouldNotBeUsed:
+        def acquire(self):  # pragma: no cover - failure surface
+            raise AssertionError("LRU should serve from cache, not DB")
+
+    lru = bf.LRUPriceLookup(_PoolThatShouldNotBeUsed())
+    lru._cache[(ZONE, aware_hour_13)] = 0.20
+    lru._cache[(ZONE, aware_hour_14)] = 0.30
+
+    result = await lru(ZONE, naive_start, naive_end)
+
+    # Both hours served from cache.
+    assert result[aware_hour_13] == pytest.approx(0.20)
+    assert result[aware_hour_14] == pytest.approx(0.30)
+
+
+@pytest.mark.asyncio
 async def test_existing_rows_not_re_inserted(monkeypatch):
     """Cache has hour 13 only; window covers 13:00–16:00 — hour 14 is
     served by 1h forward-fill but hour 15 is a real gap. API returns
