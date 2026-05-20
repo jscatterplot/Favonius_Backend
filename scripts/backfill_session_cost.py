@@ -44,16 +44,16 @@ from uuid import UUID
 import asyncpg
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-_SRC = REPO_ROOT / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-# Imports below intentionally after sys.path tweak.
-from core.billing import (  # noqa: E402
+# Imports below intentionally after sys.path tweak (repo root → src.* packages).
+from src.core.billing.session_cost import (  # noqa: E402
     compute_session_cost,
     write_session_cost,
 )
-from db.queries import fetch_prices_with_fill  # noqa: E402
+from src.db.postgres_url import prepare_asyncpg_url_and_ssl  # noqa: E402
+from src.db.queries import fetch_prices_with_fill  # noqa: E402
 
 logger = logging.getLogger("backfill_session_cost")
 
@@ -64,8 +64,22 @@ _CANDIDATE_SQL = """
       FROM charging_sessions
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
-       AND cost_total_source IS DISTINCT FROM 'manual'
+       AND cost_total_source IS NULL
        AND ($1::uuid IS NULL OR site_id = $1)
+     ORDER BY end_time
+     LIMIT $2
+       FOR UPDATE SKIP LOCKED
+"""
+
+_CANDIDATE_BY_SESSION_SQL = """
+    SELECT session_id, site_id, vehicle_id, start_time, end_time,
+           energy_delivered_kwh, cost_total, cost_total_source
+      FROM charging_sessions
+     WHERE end_time IS NOT NULL
+       AND (cost_total IS NULL OR cost_total = 0)
+       AND cost_total_source IS NULL
+       AND ($1::uuid IS NULL OR site_id = $1)
+       AND session_id = ANY($3::uuid[])
      ORDER BY end_time
      LIMIT $2
        FOR UPDATE SKIP LOCKED
@@ -128,7 +142,11 @@ async def _run(args: argparse.Namespace) -> int:
         "Backfill starting — dry_run=%s depot=%s batch_size=%s max_rows=%s",
         args.dry_run, args.depot_id, args.batch_size, args.max_rows,
     )
-    pool = await asyncpg.create_pool(url, min_size=2, max_size=10)
+    database_url, ssl_config = prepare_asyncpg_url_and_ssl(url)
+    connect_kw: dict = {}
+    if ssl_config is not None:
+        connect_kw["ssl"] = ssl_config
+    pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10, **connect_kw)
     try:
         price_cache = LRUPriceLookup(pool)
         counts: Counter[str] = Counter()
@@ -141,11 +159,17 @@ async def _run(args: argparse.Namespace) -> int:
             if args.max_rows is not None:
                 chunk_limit = min(chunk_limit, args.max_rows - processed)
 
+            session_ids = getattr(args, "session_ids", None) or []
+
             async with pool.acquire() as conn, conn.transaction():
+                candidate_sql = (
+                    _CANDIDATE_BY_SESSION_SQL if session_ids else _CANDIDATE_SQL
+                )
                 rows = await conn.fetch(
-                    _CANDIDATE_SQL,
+                    candidate_sql,
                     args.depot_id,
                     chunk_limit,
+                    session_ids,
                 )
                 if not rows:
                     break
@@ -162,7 +186,7 @@ async def _run(args: argparse.Namespace) -> int:
                         )
                     else:
                         wrote = await write_session_cost(
-                            pool, row["session_id"], result,
+                            pool, row["session_id"], result, conn=conn,
                         )
                         if not wrote:
                             counts["__write_lost_race"] += 1
@@ -173,6 +197,10 @@ async def _run(args: argparse.Namespace) -> int:
                     processed,
                     ", ".join(f"{k}={v}" for k, v in counts.most_common()),
                 )
+                # Dry-run never mutates rows; the candidate predicate would match
+                # the same chunk forever.
+                if args.dry_run:
+                    break
 
         logger.info(
             "Backfill complete — processed=%d sources=%s",

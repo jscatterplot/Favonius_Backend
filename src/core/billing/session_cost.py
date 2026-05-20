@@ -217,26 +217,33 @@ async def _try_granular(
     async with ts_pool.acquire() as conn:
         rows = await conn.fetch(
             """
+            WITH bucketed AS (
+                SELECT
+                    time_bucket('1 hour', t.time) AS hour,
+                    t.time,
+                    t.charging_kw,
+                    LEAD(t.time) OVER (
+                        PARTITION BY time_bucket('1 hour', t.time) ORDER BY t.time
+                    ) AS next_time
+                FROM telemetry t
+                WHERE t.vehicle_id = $1
+                  AND t.time >= $2 AND t.time < $3
+                  AND t.charging_kw IS NOT NULL
+                  AND t.charging_kw > 0
+            )
             SELECT
-                time_bucket('1 hour', t.time) AS hour,
-                MIN(t.time) AS first_time,
-                MAX(t.time) AS last_time,
+                hour,
+                MIN(time) AS first_time,
+                MAX(time) AS last_time,
                 COUNT(*) AS sample_count,
-                -- Trapezoidal: each sample's kW × seconds-to-next-sample-in-bucket / 3600.
-                -- The last sample in each bucket contributes nothing (no LEAD).
                 COALESCE(
-                  SUM(
-                    t.charging_kw *
-                    EXTRACT(EPOCH FROM (LEAD(t.time) OVER w - t.time)) / 3600.0
-                  ) FILTER (WHERE LEAD(t.time) OVER w IS NOT NULL),
-                  0
+                    SUM(
+                        charging_kw
+                        * EXTRACT(EPOCH FROM (next_time - time)) / 3600.0
+                    ) FILTER (WHERE next_time IS NOT NULL),
+                    0
                 ) AS energy_kwh
-            FROM telemetry t
-            WHERE t.vehicle_id = $1
-              AND t.time >= $2 AND t.time < $3
-              AND t.charging_kw IS NOT NULL
-              AND t.charging_kw > 0
-            WINDOW w AS (PARTITION BY time_bucket('1 hour', t.time) ORDER BY t.time)
+            FROM bucketed
             GROUP BY hour
             ORDER BY hour
             """,
@@ -352,6 +359,8 @@ async def write_session_cost(
     ts_pool: asyncpg.Pool,
     session_id: UUID,
     result: SessionCostResult,
+    *,
+    conn: Optional[asyncpg.Connection] = None,
 ) -> bool:
     """Idempotent UPDATE on charging_sessions.
 
@@ -373,9 +382,7 @@ async def write_session_cost(
 
     cost_value = result.cost if result.source in ("granular", "fallback_average") else None
 
-    async with ts_pool.acquire() as conn:
-        status = await conn.execute(
-            """
+    update_sql = """
             UPDATE charging_sessions
                SET cost_total        = COALESCE($2, cost_total),
                    cost_total_source = $3,
@@ -383,11 +390,13 @@ async def write_session_cost(
              WHERE session_id = $1
                AND (cost_total IS NULL OR cost_total = 0)
                AND cost_total_source IS DISTINCT FROM 'manual'
-            """,
-            session_id,
-            cost_value,
-            result.source,
-        )
+            """
+
+    if conn is not None:
+        status = await conn.execute(update_sql, session_id, cost_value, result.source)
+    else:
+        async with ts_pool.acquire() as pooled_conn:
+            status = await pooled_conn.execute(update_sql, session_id, cost_value, result.source)
     # asyncpg returns 'UPDATE <n>' for execute().
     try:
         affected = int(status.split()[-1])

@@ -21,33 +21,43 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import asyncpg
+import importlib.util
 import pytest
+import pytest_asyncio
 
-# Wire up the scripts/ dir so we can import the backfill module.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-SCRIPTS = REPO_ROOT / "scripts"
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-import backfill_session_cost as bf  # noqa: E402
+
+def _load_backfill_module():
+    """Load backfill script without putting scripts/ on sys.path (breaks src imports)."""
+    path = REPO_ROOT / "scripts" / "backfill_session_cost.py"
+    spec = importlib.util.spec_from_file_location("backfill_session_cost", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load backfill module from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["backfill_session_cost"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+bf = _load_backfill_module()
+from tests.integration.conftest import create_integration_pool
 
 
 def _utc(year: int, month: int, day: int, hour: int = 0) -> datetime:
     return datetime(year, month, day, hour, tzinfo=timezone.utc)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def pool():
-    url = os.getenv(
-        "TEST_DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/favonius_test",
-    )
-    pool = await asyncpg.create_pool(url, min_size=1, max_size=5)
-    yield pool
-    await pool.close()
+    db_pool = await create_integration_pool()
+    yield db_pool
+    await db_pool.close()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def cleanup(pool):
     sessions: list[UUID] = []
     depots: list[UUID] = []
@@ -96,6 +106,7 @@ def _args(**overrides):
         "batch_size": 500,
         "max_rows": None,
         "log_level": "INFO",
+        "session_ids": [],
     }
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -130,7 +141,9 @@ async def test_backfill_processes_zero_cost_imports(pool, cleanup, monkeypatch):
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
     )
-    rc = await bf._run(_args(depot_id=site_id, max_rows=10))
+    rc = await bf._run(
+        _args(depot_id=site_id, max_rows=10, session_ids=[session_id]),
+    )
     assert rc == 0
 
     async with pool.acquire() as conn:
@@ -168,7 +181,7 @@ async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
     )
-    await bf._run(_args(depot_id=site_id))
+    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         first = await conn.fetchrow(
@@ -177,7 +190,7 @@ async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch
         )
 
     # Re-run. Predicate filters out the now-priced row.
-    await bf._run(_args(depot_id=site_id))
+    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         second = await conn.fetchrow(
@@ -216,7 +229,7 @@ async def test_backfill_skips_manual_rows(pool, cleanup, monkeypatch):
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
     )
-    await bf._run(_args(depot_id=site_id))
+    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         after = await conn.fetchrow(
@@ -253,7 +266,7 @@ async def test_backfill_dry_run_does_not_write(pool, cleanup, monkeypatch):
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
     )
-    await bf._run(_args(depot_id=site_id, dry_run=True))
+    await bf._run(_args(depot_id=site_id, dry_run=True, session_ids=[session_id]))
 
     async with pool.acquire() as conn:
         after = await conn.fetchrow(

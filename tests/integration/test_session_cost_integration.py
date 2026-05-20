@@ -15,37 +15,34 @@ Run with::
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
-from src.core.billing import (
+from src.core.billing.session_cost import (
     compute_session_cost,
     write_session_cost,
 )
 from src.db.queries import fetch_prices_with_fill
+from tests.integration.conftest import create_integration_pool
 
 
 def _utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> datetime:
     return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def pool():
-    url = os.getenv(
-        "TEST_DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/favonius_test",
-    )
-    pool = await asyncpg.create_pool(url, min_size=1, max_size=5)
-    yield pool
-    await pool.close()
+    db_pool = await create_integration_pool()
+    yield db_pool
+    await db_pool.close()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def cleanup_ids(pool):
     """Track UUIDs to delete in test cleanup. Avoids leaving rows around."""
     sessions: list[UUID] = []
