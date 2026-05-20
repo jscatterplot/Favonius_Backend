@@ -57,6 +57,13 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("end_time", "timestamptz", "NULL while the session is open."),
             ColumnSpec("energy_kwh", "numeric", "Total energy delivered, kWh."),
             ColumnSpec("cost_total", "numeric", "Customer-facing cost in depot currency. NULL if unpriceable."),
+            ColumnSpec(
+                "cost_total_source",
+                "text",
+                "How cost_total was computed: 'granular' (telemetry-integrated), "
+                "'fallback_average' (avg price over window), 'unpriceable' (no prices), "
+                "'no_energy' / 'no_depot' (skipped), 'manual' (operator-set).",
+            ),
             ColumnSpec("source", "varchar", "'live' = OCPP, 'import' = XLSX backfill."),
         ),
         examples=(
@@ -285,7 +292,7 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
 # mean against the actual columns.
 GLOSSARY: tuple[str, ...] = (
     "consumption = SUM(energy_kwh) in agent_views.sessions over the window of interest.",
-    "cost / spend = SUM(cost_total) in agent_views.sessions; rows where cost_total IS NULL are 'unpriceable' and should be excluded from the headline number.",
+    "cost / spend = SUM(cost_total) in agent_views.sessions; rows where cost_total IS NULL are 'unpriceable' and should be excluded from the headline number. Use cost_total_source = 'granular' for the most accurate subset.",
     "peak demand = MAX(peak_charging_kw + peak_kw) when combining telemetry_hourly and building_load_hourly on the same depot+hour. If only one is needed, use that one directly.",
     "depot-local day boundaries: use `start_time AT TIME ZONE (SELECT timezone FROM agent_views.depots($1) WHERE depot_id = …)`.",
     "current driver of an RFID card: NOT in agent_views directly; use the lookup_entity tool with kind='rfid'.",

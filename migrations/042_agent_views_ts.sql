@@ -59,17 +59,18 @@ GRANT  USAGE  ON SCHEMA agent_views TO agent_reader_ts;
 DROP FUNCTION IF EXISTS agent_views.sessions(uuid[]);
 CREATE OR REPLACE FUNCTION agent_views.sessions(p_depot_ids uuid[])
 RETURNS TABLE (
-    session_id    uuid,
-    vehicle_id    varchar,
-    driver_id     uuid,
-    card_id       uuid,
-    station_id    varchar,
-    depot_id      uuid,
-    start_time    timestamptz,
-    end_time      timestamptz,
-    energy_kwh    numeric,
-    cost_total    numeric,
-    source        varchar
+    session_id          uuid,
+    vehicle_id          varchar,
+    driver_id           uuid,
+    card_id             uuid,
+    station_id          varchar,
+    depot_id            uuid,
+    start_time          timestamptz,
+    end_time            timestamptz,
+    energy_kwh          numeric,
+    cost_total          numeric,
+    cost_total_source   text,
+    source              varchar
 )
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, public
@@ -84,6 +85,7 @@ AS $$
            cs.end_time,
            cs.energy_delivered_kwh,
            cs.cost_total,
+           cs.cost_total_source::text,
            cs.source
     FROM public.charging_sessions cs
     WHERE cs.site_id = ANY(p_depot_ids)
@@ -158,11 +160,14 @@ GRANT  EXECUTE ON FUNCTION agent_views.optimization_runs(uuid[]) TO agent_reader
 -- alerts ─────────────────────────────────────────────────────────────────
 -- Only emits if notification_alerts exists (migration 022). Guard so the
 -- migration doesn't fail on environments that haven't applied 022.
-DO $$
+DO $outer$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'notification_alerts' AND relkind = 'r') THEN
-        EXECUTE $f$
-            DROP FUNCTION IF EXISTS agent_views.alerts(uuid[]);
+    IF EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'notification_alerts' AND n.nspname = 'public' AND c.relkind = 'r'
+    ) THEN
+        EXECUTE 'DROP FUNCTION IF EXISTS agent_views.alerts(uuid[])';
+        EXECUTE $body$
             CREATE OR REPLACE FUNCTION agent_views.alerts(p_depot_ids uuid[])
             RETURNS TABLE (
                 alert_id         uuid,
@@ -174,25 +179,28 @@ BEGIN
             )
             LANGUAGE sql STABLE SECURITY DEFINER
             SET search_path = pg_catalog, public
-            AS $body$
-                SELECT id, depot_id, created_at, severity_level, status, alert_type
+            AS 'SELECT id, depot_id, created_at, severity_level, status, alert_type
                 FROM public.notification_alerts
-                WHERE depot_id = ANY(p_depot_ids)
-            $body$;
-        $f$;
+                WHERE depot_id = ANY(p_depot_ids)'
+        $body$;
         EXECUTE 'REVOKE ALL    ON FUNCTION agent_views.alerts(uuid[]) FROM PUBLIC';
         EXECUTE 'GRANT  EXECUTE ON FUNCTION agent_views.alerts(uuid[]) TO agent_reader_ts';
     END IF;
-END $$;
+END
+$outer$;
 
 -- prices_hourly ──────────────────────────────────────────────────────────
 -- Bridges the two price tables that have shipped at different times.
--- Uses electricity_prices if present (migration 034), otherwise prices.
-DO $$
+-- Uses electricity_prices if present (migration 034 + PR #214's 041),
+-- otherwise prices (migration 001).
+DO $outer$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'electricity_prices' AND relkind = 'r') THEN
-        EXECUTE $f$
-            DROP FUNCTION IF EXISTS agent_views.prices_hourly(uuid[]);
+    EXECUTE 'DROP FUNCTION IF EXISTS agent_views.prices_hourly(uuid[])';
+    IF EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'electricity_prices' AND n.nspname = 'public' AND c.relkind = 'r'
+    ) THEN
+        EXECUTE $body$
             CREATE OR REPLACE FUNCTION agent_views.prices_hourly(p_depot_ids uuid[])
             RETURNS TABLE (
                 depot_id        uuid,
@@ -203,19 +211,16 @@ BEGIN
             )
             LANGUAGE sql STABLE SECURITY DEFINER
             SET search_path = pg_catalog, public
-            AS $body$
-                SELECT NULL::uuid AS depot_id,
-                       time_bucket('1 hour', ep.time) AS hour,
+            AS 'SELECT NULL::uuid AS depot_id,
+                       time_bucket(''1 hour''::interval, ep.time) AS hour,
                        AVG(ep.price)::numeric AS price_per_kwh,
                        MAX(ep.currency) AS currency,
                        MAX(ep.market_type) AS market_type
                 FROM public.electricity_prices ep
-                GROUP BY time_bucket('1 hour', ep.time)
-            $body$;
-        $f$;
+                GROUP BY time_bucket(''1 hour''::interval, ep.time)'
+        $body$;
     ELSE
-        EXECUTE $f$
-            DROP FUNCTION IF EXISTS agent_views.prices_hourly(uuid[]);
+        EXECUTE $body$
             CREATE OR REPLACE FUNCTION agent_views.prices_hourly(p_depot_ids uuid[])
             RETURNS TABLE (
                 depot_id        uuid,
@@ -226,21 +231,20 @@ BEGIN
             )
             LANGUAGE sql STABLE SECURITY DEFINER
             SET search_path = pg_catalog, public
-            AS $body$
-                SELECT p.depot_id,
-                       time_bucket('1 hour', p.time) AS hour,
+            AS 'SELECT p.depot_id,
+                       time_bucket(''1 hour''::interval, p.time) AS hour,
                        AVG(p.price_per_kwh)::numeric AS price_per_kwh,
                        MAX(p.currency) AS currency,
                        NULL::text AS market_type
                 FROM public.prices p
                 WHERE p.depot_id = ANY(p_depot_ids)
-                GROUP BY p.depot_id, time_bucket('1 hour', p.time)
-            $body$;
-        $f$;
+                GROUP BY p.depot_id, time_bucket(''1 hour''::interval, p.time)'
+        $body$;
     END IF;
     EXECUTE 'REVOKE ALL    ON FUNCTION agent_views.prices_hourly(uuid[]) FROM PUBLIC';
     EXECUTE 'GRANT  EXECUTE ON FUNCTION agent_views.prices_hourly(uuid[]) TO agent_reader_ts';
-END $$;
+END
+$outer$;
 
 -- building_load_hourly ───────────────────────────────────────────────────
 DROP FUNCTION IF EXISTS agent_views.building_load_hourly(uuid[]);
@@ -269,11 +273,14 @@ GRANT  EXECUTE ON FUNCTION agent_views.building_load_hourly(uuid[]) TO agent_rea
 -- connector_status_latest ────────────────────────────────────────────────
 -- Latest-row-per-(station,connector). connector_status is append-only;
 -- DISTINCT ON gives us "the current state" for each (station, connector).
-DO $$
+DO $outer$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'connector_status' AND relkind = 'r') THEN
-        EXECUTE $f$
-            DROP FUNCTION IF EXISTS agent_views.connector_status_latest(uuid[]);
+    IF EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'connector_status' AND n.nspname = 'public' AND c.relkind = 'r'
+    ) THEN
+        EXECUTE 'DROP FUNCTION IF EXISTS agent_views.connector_status_latest(uuid[])';
+        EXECUTE $body$
             CREATE OR REPLACE FUNCTION agent_views.connector_status_latest(p_depot_ids uuid[])
             RETURNS TABLE (
                 station_id        varchar,
@@ -285,8 +292,7 @@ BEGIN
             )
             LANGUAGE sql STABLE SECURITY DEFINER
             SET search_path = pg_catalog, public
-            AS $body$
-                SELECT DISTINCT ON (cs.station_id, cs.connector_id)
+            AS 'SELECT DISTINCT ON (cs.station_id, cs.connector_id)
                        cs.station_id,
                        cs.connector_id,
                        c.depot_id,
@@ -296,13 +302,13 @@ BEGIN
                 FROM public.connector_status cs
                 LEFT JOIN public.chargers c ON c.ocpp_id = cs.station_id
                 WHERE c.depot_id = ANY(p_depot_ids)
-                ORDER BY cs.station_id, cs.connector_id, cs.timestamp DESC
-            $body$;
-        $f$;
+                ORDER BY cs.station_id, cs.connector_id, cs.timestamp DESC'
+        $body$;
         EXECUTE 'REVOKE ALL    ON FUNCTION agent_views.connector_status_latest(uuid[]) FROM PUBLIC';
         EXECUTE 'GRANT  EXECUTE ON FUNCTION agent_views.connector_status_latest(uuid[]) TO agent_reader_ts';
     END IF;
-END $$;
+END
+$outer$;
 
 -- ── Append-only trigger on agent_runs (S3) ───────────────────────────────
 -- Mirrors the decisions_append_only_guard pattern from migration 037.
