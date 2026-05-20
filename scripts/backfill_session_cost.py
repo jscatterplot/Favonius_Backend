@@ -93,8 +93,6 @@ _CANDIDATE_SQL = """
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
        AND cost_total_source IS DISTINCT FROM 'manual'
-       AND cost_total_source IS DISTINCT FROM 'no_energy'
-       AND cost_total_source IS DISTINCT FROM 'no_depot'
        AND ($1::uuid IS NULL OR site_id = $1)
        AND session_id > $3::uuid
      ORDER BY session_id
@@ -110,8 +108,6 @@ _CANDIDATE_BY_SESSION_SQL = """
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
        AND cost_total_source IS DISTINCT FROM 'manual'
-       AND cost_total_source IS DISTINCT FROM 'no_energy'
-       AND cost_total_source IS DISTINCT FROM 'no_depot'
        AND ($1::uuid IS NULL OR site_id = $1)
        AND session_id = ANY($3::uuid[])
        AND session_id > $4::uuid
