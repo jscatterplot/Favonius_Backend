@@ -2235,6 +2235,110 @@ async def rotate_charger_credentials(
     }
 
 
+async def reset_local_auth_cache(
+    db, *, depot_id: str, charger_id: str
+) -> Optional[dict]:
+    """Clear the cached LocalAuthorizationList support outcome for a charger.
+
+    Sets ``local_list_supported``, ``local_list_probed_firmware``,
+    ``local_list_probed_at`` and ``local_list_last_status`` back to NULL so
+    the next BootNotification re-runs the probe + bootstrap path.
+
+    Use case: a charger was cached as ``supported=False`` (e.g. because the
+    firmware was known-bad), then ops upgraded the firmware to a version
+    that DOES support LocalAuthListManagement. Without an explicit reset,
+    the per-firmware cache invalidates automatically when the firmware
+    string changes — but if ops wants to retest BEFORE upgrading (or the
+    cache was poisoned by a transient bug), this endpoint forces a re-probe
+    on the next reconnect.
+
+    Returns ``{"ocpp_id": ..., "previous_supported": True|False|None,
+    "previous_probed_firmware": ...}`` so the caller can audit what state
+    was cleared. Returns ``None`` if the (depot, charger) pair doesn't
+    exist (caller distinguishes 403 vs 404).
+
+    Schema: relies on migration 012 columns. Callers should not invoke
+    this endpoint against a deployment that hasn't applied 012 — the
+    UPDATE will succeed (no error) but the columns it nulls out don't
+    exist yet, so the runtime path was never reading them anyway. The
+    fetch step uses ``.get()`` defensively to tolerate that case.
+    """
+    fetch_query = """
+        SELECT id,
+               station_id AS ocpp_id,
+               local_list_supported,
+               local_list_probed_firmware
+        FROM charging_stations
+        WHERE id = $1::uuid AND site_id = $2::uuid
+    """
+    try:
+        row = await db.fetchrow(fetch_query, charger_id, depot_id)
+    except Exception as exc:
+        # 42703 == undefined_column when migration 012 not applied. Fall
+        # back to the minimal shape so the endpoint still resolves 404 vs
+        # 200 correctly even on a legacy DB.
+        if getattr(exc, "sqlstate", None) == "42703":
+            legacy_fetch = """
+                SELECT id, station_id AS ocpp_id
+                FROM charging_stations
+                WHERE id = $1::uuid AND site_id = $2::uuid
+            """
+            row = await db.fetchrow(legacy_fetch, charger_id, depot_id)
+            if row is None:
+                return None
+            # 011-only schema: probe columns (012) are absent, but version and
+            # last_status exist — reset them so the next sync uses first-sync.
+            await db.execute(
+                """
+                UPDATE charging_stations
+                SET local_list_last_status = NULL,
+                    local_list_version     = 0
+                WHERE id = $1::uuid AND site_id = $2::uuid
+                """,
+                charger_id,
+                depot_id,
+            )
+            return {
+                "ocpp_id": row["ocpp_id"],
+                "previous_supported": None,
+                "previous_probed_firmware": None,
+                "legacy_schema": True,
+            }
+        raise
+
+    if row is None:
+        return None
+
+    previous_supported = row.get("local_list_supported") if hasattr(row, "get") else (
+        row["local_list_supported"] if "local_list_supported" in row.keys() else None
+    )
+    previous_probed_firmware = row.get("local_list_probed_firmware") if hasattr(row, "get") else (
+        row["local_list_probed_firmware"]
+        if "local_list_probed_firmware" in row.keys()
+        else None
+    )
+
+    await db.execute(
+        """
+        UPDATE charging_stations
+        SET local_list_supported       = NULL,
+            local_list_probed_firmware = NULL,
+            local_list_probed_at       = NULL,
+            local_list_last_status     = NULL,
+            local_list_version         = 0
+        WHERE id = $1::uuid AND site_id = $2::uuid
+        """,
+        charger_id,
+        depot_id,
+    )
+    return {
+        "ocpp_id": row["ocpp_id"],
+        "previous_supported": previous_supported,
+        "previous_probed_firmware": previous_probed_firmware,
+        "legacy_schema": False,
+    }
+
+
 # ============ Fleet List Helpers (GET /depots/{id}/chargers, /vehicles) ============
 
 

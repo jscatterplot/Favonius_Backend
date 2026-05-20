@@ -34,12 +34,84 @@ keeps reconciliation simple.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Optional, Protocol
 
 logger = logging.getLogger(__name__)
+
+
+def _get_explicit_callable(obj: Any, name: str):
+    """Return a callable only when the attribute is explicitly defined.
+
+    We intentionally avoid dynamic ``__getattr__`` fallbacks (for example from
+    ``MagicMock``) by first resolving the attribute statically. If the attribute
+    is not present on the instance/class, return ``None`` so callers use their
+    compatibility fallback path.
+    """
+    try:
+        inspect.getattr_static(obj, name)
+    except AttributeError:
+        return None
+    method = getattr(obj, name, None)
+    return method if callable(method) else None
+
+
+# Per-call timeout for ``ChangeConfiguration`` in the bootstrap. Mirrors the
+# ``_push_metering_config`` timeout in ``ocpp16_adapter._push_metering_config``.
+# The OCPP library's default call timeout is 30 s, so without this wrapper a
+# single dead key wedges the sync for 30 s × 4 keys = 2 min. The fail-fast
+# logic relies on this — a charger that drops the WebSocket mid-RPC raises
+# inside ``cp.call`` long before 30 s anyway, but ABB Terra AC V1.8.x
+# sometimes ACKs an HTTP-level keepalive without ever returning the
+# ChangeConfiguration result, and only this wall-clock timeout breaks that.
+_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S = 10.0
+
+
+class BootstrapOutcome(str, Enum):
+    """Outcome of the post-boot ``ChangeConfiguration`` bootstrap.
+
+    Used by ``sync_charger`` to decide whether to attempt ``SendLocalList``
+    or to short-circuit and cache the firmware as unsupported.
+
+    * ``SUCCESS`` — the critical key (``LocalAuthListEnabled``) was Accepted
+      or returned ``RebootRequired``. Other keys may have failed; those are
+      logged as warnings but do not block the push.
+    * ``UNSUPPORTED`` — the critical key returned ``Rejected`` or
+      ``NotSupported``, raised, or timed out. Strong evidence the charger
+      does not implement LocalAuthListManagement on its current firmware.
+      Caller MUST skip SendLocalList and record the negative outcome so
+      the next reconnect short-circuits via the probe cache.
+    * ``UNKNOWN`` — defensive default, currently unused. Kept as an
+      explicit state so future contributors can extend the branch logic
+      (e.g. a "retry once with backoff" path) without changing the enum
+      contract.
+    """
+
+    SUCCESS = "success"
+    UNSUPPORTED = "unsupported"
+    UNKNOWN = "unknown"
+
+
+def _normalize_firmware(firmware: Optional[str]) -> Optional[str]:
+    """Strip wrapping whitespace from a firmware string before cache compare.
+
+    Some ABB Terra AC firmwares occasionally pad the ``firmware_version``
+    field with trailing whitespace; without this normalisation the cache
+    miss/hit cycle churns: ``"V1.8.36"`` written this boot ≠ ``"V1.8.36 "``
+    read next boot → re-probe → re-write. ``None`` is returned unchanged, and
+    whitespace-only strings are treated as missing so we never cache a
+    firmware-scoped negative under an empty key.
+    """
+    if firmware is None:
+        return None
+    stripped = firmware.strip()
+    return stripped if stripped else None
+
 
 # Local-cap enforced inside ``FleetChargePoint.send_local_list``. Mirrored
 # here so we can tell apart a ``NotSupported`` that came back from the
@@ -99,8 +171,15 @@ class _ChargePointProto(Protocol):
         update_type: str = ...,
         local_authorization_list: Optional[list[dict]] = ...,
     ) -> str: ...
+    async def send_local_list_with_error(
+        self,
+        list_version: int,
+        update_type: str = ...,
+        local_authorization_list: Optional[list[dict]] = ...,
+    ) -> tuple[str, bool]: ...
 
     async def change_configuration(self, key: str, value: str) -> str: ...
+    async def change_configuration_with_error(self, key: str, value: str) -> tuple[str, bool]: ...
 
     async def get_configuration(self, keys: Optional[list[str]] = ...) -> dict: ...
 
@@ -259,17 +338,115 @@ def _format_entries(id_tag_rows: list[dict]) -> list[dict]:
     ]
 
 
-async def _bootstrap_local_auth_config(cp: _ChargePointProto, station_id: str) -> None:
-    """Best-effort: enable LocalAuthList + cache + pre-authorize on first sync.
+async def _bootstrap_local_auth_config(cp: _ChargePointProto, station_id: str) -> BootstrapOutcome:
+    """Fail-fast: enable LocalAuthList + cache + pre-authorize on first sync.
 
-    Errors are swallowed: the per-call status is logged but never raised, so
-    a single charger that doesn't honor a config key cannot prevent the
-    SendLocalList push that follows.
+    The first key in ``_BOOTSTRAP_CONFIG_KEYS`` (``LocalAuthListEnabled``) is
+    the most discriminating signal: if it returns ``Rejected``,
+    ``NotSupported``, raises, or times out, the charger almost certainly
+    does NOT implement LocalAuthListManagement on its current firmware
+    (ABB Terra AC V1.8.x is the documented case). In that case we return
+    ``BootstrapOutcome.UNSUPPORTED`` immediately and the caller skips the
+    remaining three ``ChangeConfiguration`` pushes AND the ``SendLocalList``
+    that would follow — limiting blast radius to a single OCPP call rather
+    than the historical 4 calls + SendLocalList that wedged the WS.
+
+    The remaining three keys (``LocalPreAuthorize``,
+    ``AuthorizationCacheEnabled``, ``FreevendEnabled``) are auxiliary; if
+    any of them fails after ``LocalAuthListEnabled`` succeeded, the failure
+    is logged as a warning but the bootstrap is still considered
+    ``SUCCESS`` for the purpose of attempting ``SendLocalList``.
+
+    Each ``change_configuration`` call is wrapped in ``asyncio.wait_for``
+    with ``_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S``. Without that wrapper the
+    OCPP library's 30 s default timeout dwarfs the WS reconnect cadence
+    we observed at HRX Vilnius (~10-60 s) and the bootstrap never gets
+    to fail before the connection is gone.
     """
-    for key, value in _BOOTSTRAP_CONFIG_KEYS:
+
+    async def _change_configuration_with_error(key: str, value: str) -> tuple[str, bool]:
+        method = _get_explicit_callable(cp, "change_configuration_with_error")
+        if method is not None:
+            return await method(key, value)
+        status = await cp.change_configuration(key, value)
+        return status, False
+
+    if not _BOOTSTRAP_CONFIG_KEYS:
+        return BootstrapOutcome.SUCCESS  # pragma: no cover — defensive
+
+    critical_key, critical_value = _BOOTSTRAP_CONFIG_KEYS[0]
+    auxiliary = _BOOTSTRAP_CONFIG_KEYS[1:]
+
+    # --- Critical key: fail-fast ---
+    critical_status: Optional[str] = None
+    critical_transport_error = False
+    try:
+        critical_status, critical_transport_error = await asyncio.wait_for(
+            _change_configuration_with_error(critical_key, critical_value),
+            timeout=_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s timed_out_after=%.1fs — "
+            "treating as transient unknown",
+            station_id,
+            critical_key,
+            _BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+        )
+        return BootstrapOutcome.UNKNOWN
+    except asyncio.CancelledError:
+        # WebSocket dropped mid-bootstrap; propagate so the sync task
+        # terminates cleanly. The next reconnect retries the probe.
+        raise
+    except Exception as exc:  # defence in depth; change_configuration catches its own
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s error=%s — "
+            "treating as firmware-permanent unsupported",
+            station_id,
+            critical_key,
+            exc,
+        )
+        return BootstrapOutcome.UNSUPPORTED
+
+    if critical_status not in {"Accepted", "RebootRequired"}:
+        if critical_transport_error:
+            logger.warning(
+                "local_auth_bootstrap_config station=%s key=%s value=%s status=%s — "
+                "transport fallback; treating as transient unknown",
+                station_id,
+                critical_key,
+                critical_value,
+                critical_status,
+            )
+            return BootstrapOutcome.UNKNOWN
+        logger.info(
+            "local_auth_bootstrap_config station=%s key=%s value=%s status=%s — "
+            "treating as firmware-permanent unsupported",
+            station_id,
+            critical_key,
+            critical_value,
+            critical_status,
+        )
+        return BootstrapOutcome.UNSUPPORTED
+
+    # --- Auxiliary keys: best-effort, do not gate SendLocalList ---
+    for key, value in auxiliary:
         try:
-            status = await cp.change_configuration(key, value)
-        except Exception as exc:  # defence in depth; change_configuration shouldn't raise
+            status, _ = await asyncio.wait_for(
+                _change_configuration_with_error(key, value),
+                timeout=_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "local_auth_bootstrap_config station=%s key=%s timed_out_after=%.1fs",
+                station_id,
+                key,
+                _BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+            )
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
             logger.warning(
                 "local_auth_bootstrap_config station=%s key=%s error=%s",
                 station_id,
@@ -285,6 +462,50 @@ async def _bootstrap_local_auth_config(cp: _ChargePointProto, station_id: str) -
                 value,
                 status,
             )
+
+    return BootstrapOutcome.SUCCESS
+
+
+async def _disable_freevend_best_effort(cp: _ChargePointProto, station_id: str) -> None:
+    """Try to push FreevendEnabled=false even if critical bootstrap key failed."""
+    key, value = "FreevendEnabled", "false"
+    try:
+        status = await asyncio.wait_for(
+            cp.change_configuration(key, value),
+            timeout=_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s timed_out_after=%.1fs",
+            station_id,
+            key,
+            _BOOTSTRAP_CHANGECONFIG_TIMEOUT_S,
+        )
+        return
+    except asyncio.CancelledError:
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s cancelled — "
+            "best-effort abort",
+            station_id,
+            key,
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s error=%s",
+            station_id,
+            key,
+            exc,
+        )
+        return
+    if status not in {"Accepted", "RebootRequired"}:
+        logger.info(
+            "local_auth_bootstrap_config station=%s key=%s value=%s status=%s",
+            station_id,
+            key,
+            value,
+            status,
+        )
 
 
 async def sync_charger(
@@ -365,9 +586,7 @@ async def sync_charger(
                     station_id,
                     legacy_exc,
                 )
-                return SyncResult(
-                    status="skipped", version=0, entries=0, reason="db_error"
-                )
+                return SyncResult(status="skipped", version=0, entries=0, reason="db_error")
         else:
             logger.error(
                 "local_auth_sync station=%s db_error fetching station row: %s",
@@ -391,7 +610,10 @@ async def sync_charger(
     # this charger cannot accept SendLocalList on its current firmware, skip
     # the whole exchange. The cache is per firmware string so a firmware
     # upgrade automatically re-probes.
-    current_fw = getattr(cp, "firmware_version", None)
+    # Normalise here so cache hits don't churn on whitespace-only differences
+    # in the BootNotification firmware string (some ABB Terra AC firmwares
+    # occasionally emit trailing whitespace).
+    current_fw = _normalize_firmware(getattr(cp, "firmware_version", None))
     if legacy_schema:
         # Probe columns don't exist on this DB — bypass cache + probe and go
         # straight to the legacy bootstrap + SendLocalList path. This matches
@@ -407,7 +629,7 @@ async def sync_charger(
         # forcing every fixture to enumerate the new probe-state columns.
         # asyncpg ``Record`` also supports ``.get()``.
         supported_cached = station_row.get("local_list_supported")
-        probed_fw = station_row.get("local_list_probed_firmware")
+        probed_fw = _normalize_firmware(station_row.get("local_list_probed_firmware"))
     if supported_cached is False and probed_fw == current_fw:
         logger.info(
             "local_auth_sync station=%s skipped: known_unsupported firmware=%s",
@@ -427,19 +649,25 @@ async def sync_charger(
     # firmware. A positive or ambiguous answer falls through to the push.
     # Skipped under legacy schema: the probe outcome has nowhere to be cached
     # so an extra GetConfiguration round-trip on every reconnect is wasted.
-    needs_probe = not legacy_schema and (
-        supported_cached is None or probed_fw != current_fw
-    )
+    #
+    # ``probe_positive`` tracks whether we have STRONG evidence that this
+    # charger supports LocalAuthListManagement on its current firmware.
+    # It is consulted below when deciding whether a ``SendLocalList: Failed``
+    # response is firmware-permanent (cache it) or transient (don't cache).
+    # Conservative default: a True cache entry OR a positive probe result.
+    probe_positive = supported_cached is True
+    needs_probe = not legacy_schema and (supported_cached is None or probed_fw != current_fw)
     if needs_probe:
         probe_result = await _probe_local_auth_support(cp, station_id)
         if probe_result is False:
-            await _record_probe_outcome(
-                db,
-                station_row["id"],
-                supported=False,
-                firmware=current_fw,
-                last_status="UnsupportedFeatureProfile",
-            )
+            if current_fw is not None:
+                await _record_probe_outcome(
+                    db,
+                    station_row["id"],
+                    supported=False,
+                    firmware=current_fw,
+                    last_status="UnsupportedFeatureProfile",
+                )
             logger.info(
                 "local_auth_sync station=%s status=UnsupportedFeatureProfile "
                 "entries=0 version=%d first_sync=%s reason=probe_negative",
@@ -460,7 +688,11 @@ async def sync_charger(
                 supported=True,
                 firmware=current_fw,
             )
+            probe_positive = True
         # probe_result is None → ambiguous; fall through to attempt the push.
+        # probe_positive stays False — we do NOT have strong evidence of
+        # support, so a subsequent ``SendLocalList: Failed`` should be
+        # treated as firmware-permanent (see L4 below).
 
     try:
         rows = await list_authorized_id_tags(db, station_id)
@@ -474,38 +706,163 @@ async def sync_charger(
 
     entries = _format_entries(rows)
 
+    bootstrap_outcome: Optional[BootstrapOutcome] = None
     if is_first_sync:
-        await _bootstrap_local_auth_config(cp, station_id)
+        bootstrap_outcome = await _bootstrap_local_auth_config(cp, station_id)
+        # L3: if the critical ChangeConfiguration key failed (Rejected,
+        # NotSupported, timeout, or exception), the charger does not honor
+        # LocalAuthListManagement on its current firmware. Skip SendLocalList
+        # entirely and persist the negative so subsequent reconnects
+        # short-circuit via the probe cache. Without this branch, every
+        # reconnect on a stuck-in-first-sync charger fires the full
+        # ChangeConfiguration → SendLocalList sequence and the WebSocket
+        # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
+        if bootstrap_outcome in {BootstrapOutcome.UNSUPPORTED, BootstrapOutcome.UNKNOWN}:
+            bootstrap_status = (
+                "UnsupportedFromBootstrap"
+                if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
+                else "UnknownFromBootstrap"
+            )
+            # Persist before best-effort Freevend disable so reconnect churn
+            # cannot drop the negative cache if the sync task is cancelled
+            # mid-RPC (HRX Vilnius ABB Terra AC reconnect cadence).
+            if (
+                bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
+                and not probe_positive
+                and not legacy_schema
+                and current_fw is not None
+            ):
+                await _record_probe_outcome(
+                    db,
+                    station_row["id"],
+                    supported=False,
+                    firmware=current_fw,
+                    last_status=bootstrap_status,
+                )
+            elif not probe_positive:
+                # Legacy schema: stamp last_status on the columns that DO exist
+                # so ops can still see "we gave up at the bootstrap step".
+                try:
+                    await db.execute(
+                        """
+                        UPDATE charging_stations
+                        SET local_list_last_status = $1
+                        WHERE id = $2
+                        """,
+                        bootstrap_status,
+                        station_row["id"],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "local_auth_sync station=%s db_error stamping bootstrap "
+                        "unsupported (legacy schema): %s",
+                        station_id,
+                        exc,
+                    )
+            await _disable_freevend_best_effort(cp, station_id)
+            logger.info(
+                "local_auth_sync station=%s status=%s "
+                "entries=%d version=%d first_sync=%s reason=bootstrap_unsupported",
+                station_id,
+                bootstrap_status,
+                len(entries),
+                current_version,
+                is_first_sync,
+            )
+            return SyncResult(
+                status=bootstrap_status,
+                version=current_version,
+                entries=len(entries),
+                reason=(
+                    "bootstrap_unsupported"
+                    if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
+                    else "bootstrap_unknown"
+                ),
+            )
 
-    try:
-        status = await cp.send_local_list(
+    send_local_list_raised = False
+    send_local_list_transport_error = False
+
+    async def _send_local_list_without_error_helper() -> str:
+        return await cp.send_local_list(
             list_version=new_version,
             update_type="Full",
             local_authorization_list=entries,
         )
-    except Exception as exc:
-        # FleetChargePoint.send_local_list catches its own exceptions, but
-        # a duck-typed fake might not — keep the orchestration safe.
-        logger.error(
-            "local_auth_sync station=%s send_local_list raised: %s",
-            station_id,
-            exc,
-        )
-        status = "Failed"
 
-    # Fallback caching: if the charger itself returned NotSupported (i.e. it
-    # wasn't our own 16-entry cap refusal inside send_local_list), record
-    # the firmware-scoped negative so the next reconnect short-circuits.
-    # The entry-count guard distinguishes a charger "NotSupported" from our
-    # local refusal — only the former is firmware-permanent. Skipped under
-    # legacy schema: the cache columns don't exist so we fall through to the
-    # plain ``local_list_last_status`` UPDATE.
-    if (
-        status == "NotSupported"
-        and not legacy_schema
-        and len(entries) <= _LOCAL_LIST_MAX_ENTRIES
-        and current_fw is not None
-    ):
+    method = _get_explicit_callable(cp, "send_local_list_with_error")
+    if method is not None:
+        try:
+            maybe_result = method(
+                list_version=new_version,
+                update_type="Full",
+                local_authorization_list=entries,
+            )
+            if inspect.isawaitable(maybe_result):
+                status, send_local_list_transport_error = await maybe_result
+            else:
+                logger.warning(
+                    "local_auth_sync station=%s send_local_list_with_error returned "
+                    "non-awaitable; falling back to send_local_list",
+                    station_id,
+                )
+                status = await _send_local_list_without_error_helper()
+        except Exception as exc:
+            logger.error(
+                "local_auth_sync station=%s send_local_list_with_error raised: %s",
+                station_id,
+                exc,
+            )
+            send_local_list_raised = True
+            status = "Failed"
+    else:
+        try:
+            status = await _send_local_list_without_error_helper()
+        except Exception as exc:
+            logger.error(
+                "local_auth_sync station=%s send_local_list raised: %s",
+                station_id,
+                exc,
+            )
+            send_local_list_raised = True
+            status = "Failed"
+
+    # Fallback caching: record a firmware-scoped negative when the charger
+    # itself reports the feature as broken so the next reconnect
+    # short-circuits via the probe cache. Two distinct gating rules:
+    #
+    # * ``NotSupported`` — definitive per OCPP 1.6 §5.16. Cache whenever the
+    #   refusal came from the charger (entries ≤ cap; the over-cap case is
+    #   our own local refusal in ``FleetChargePoint.send_local_list`` and
+    #   has nothing to do with firmware capability).
+    #
+    # * ``Failed`` — ambiguous in spec, but firmware-permanent in practice
+    #   on ABB Terra AC V1.8.x where the ChangeConfiguration bootstrap was
+    #   accepted but ``SendLocalList`` returned ``Failed`` rather than the
+    #   spec-mandated ``NotSupported``. Cache ONLY for charger-returned
+    #   ``Failed`` statuses (not transport/timeout exceptions) when we
+    #   don't already have positive evidence of support
+    #   (``probe_positive`` is False —
+    #   probe returned False/None or no probe outcome ever recorded
+    #   positive). This protects chargers that genuinely support the
+    #   feature but returned ``Failed`` once due to a transient internal
+    #   error: they keep their NULL cache and retry on the next reconnect.
+    #
+    # Skipped under legacy schema: the cache columns don't exist so we
+    # fall through to the plain ``local_list_last_status`` UPDATE.
+    cache_negative = False
+    if not legacy_schema and current_fw is not None and len(entries) <= _LOCAL_LIST_MAX_ENTRIES:
+        if status == "NotSupported":
+            cache_negative = True
+        elif (
+            status == "Failed"
+            and bootstrap_outcome is not BootstrapOutcome.UNKNOWN
+            and not probe_positive
+            and not send_local_list_raised
+            and not send_local_list_transport_error
+        ):
+            cache_negative = True
+    if cache_negative:
         await _record_probe_outcome(
             db,
             station_row["id"],
