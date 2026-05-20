@@ -2767,6 +2767,39 @@ class TimescaleClient:
             self.logger.warning("resolve_bidding_zone failed for site %s: %s", site_id, exc)
             return None
 
+    async def _resolve_site_id_for_station(self, station_id: Optional[str]) -> Optional[uuid.UUID]:
+        """Cross-pool helper: OCPP ``station_id`` → ``sites.id`` (Supabase).
+
+        ``insert_open_session`` writes the OCPP station_id but not
+        ``site_id`` (it has no Supabase round-trip on the StartTransaction
+        hot path), so live ``charging_sessions`` rows close with
+        ``site_id IS NULL``. The cost calculator short-circuits to
+        ``'no_depot'`` for those rows — meaning every live session would
+        skip pricing entirely. This helper backfills the join from
+        Supabase's ``charging_stations`` so the cost task gets a real
+        depot identifier without bloating the close-path commit.
+
+        Returns ``None`` when the static pool isn't configured (legacy
+        single-pool tests) or when the station_id doesn't match any row.
+        """
+        if not station_id:
+            return None
+        static_pool = self._static_pool()
+        if static_pool is None:
+            return None
+        try:
+            async with static_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT site_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                    station_id,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "site_id lookup failed for station %s: %s", station_id, exc
+            )
+            return None
+        return row["site_id"] if row else None
+
     def _schedule_session_cost(self, session_id: uuid.UUID) -> None:
         """Schedule the post-commit cost calculation for one session.
 
@@ -2826,6 +2859,15 @@ class TimescaleClient:
             # static (Supabase) pool. The calculator never crosses pools
             # itself; the WS handler owns the join.
             row_dict = dict(row)
+            # Live sessions land with site_id=NULL because insert_open_session
+            # doesn't write it (no Supabase round-trip on the StartTransaction
+            # hot path). Backfill from station_id via Supabase so the cost
+            # calculator can resolve a bidding zone and avoid the
+            # ``'no_depot'`` short-circuit for every live row.
+            if row_dict.get("site_id") is None:
+                row_dict["site_id"] = await self._resolve_site_id_for_station(
+                    row_dict.get("station_id")
+                )
             row_dict["bidding_zone"] = await self._resolve_bidding_zone(row_dict.get("site_id"))
 
             result = await compute_session_cost(self.pg_pool, row_dict)
