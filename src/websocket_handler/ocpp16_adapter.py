@@ -231,7 +231,7 @@ class OCPP16Session:
             tx_id_provider=self._next_transaction_id,
         )
 
-    async def _on_message_received(self) -> None:
+    async def _on_message_received(self, message_size: int = 0) -> None:
         """Refresh the connection-manager liveness clock on every OCPP frame
         and broadcast a rate-limited liveness signal to API replicas.
 
@@ -246,6 +246,12 @@ class OCPP16Session:
         get a "last interaction" event per ~10s of frames per charger.
         Fire-and-forget — a slow notify must not backpressure OCPP
         message processing.
+
+        ``message_size`` is the raw frame length in bytes; it feeds the
+        ``connection_stats.messages_received`` / ``bytes_received`` counters
+        so the ``Unregistered connection ... Messages: X/Y`` log line shows
+        real traffic instead of always ``0/0`` (previously the OCPP 1.6
+        path never called ``record_message_received``).
         """
         # Used by ``_force_boot_notification`` to skip the synthetic
         # TriggerMessage(BootNotification) when the charger is clearly alive
@@ -258,6 +264,12 @@ class OCPP16Session:
                 await self._connection_manager.update_heartbeat(self._station_id)
             except Exception:
                 logger.exception("update_heartbeat failed for station=%s", self._station_id)
+            try:
+                await self._connection_manager.record_message_received(
+                    self._station_id, message_size
+                )
+            except Exception:
+                logger.exception("record_message_received failed for station=%s", self._station_id)
 
         if self._liveness_notifier is not None:
             org_id = (self._tenant_context or {}).get("organization_id")

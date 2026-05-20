@@ -314,9 +314,58 @@ class TestOCPP16SessionForceBootNotification:
             message_handler=mock_message_handler,
         )
         assert s._inbound_frame_count == 0
-        await s._on_message_received()
-        await s._on_message_received()
+        await s._on_message_received(42)
+        await s._on_message_received(17)
         assert s._inbound_frame_count == 2
+
+    @pytest.mark.asyncio
+    async def test_on_message_received_records_message_in_connection_manager(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """``_on_message_received`` must forward the frame to the
+        ConnectionManager so the per-connection ``messages_received`` /
+        ``bytes_received`` stats reflect real OCPP 1.6 traffic instead of
+        always logging ``Messages: 0/0`` at unregister time.
+        """
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        connection_manager = MagicMock()
+        connection_manager.update_heartbeat = AsyncMock()
+        connection_manager.record_message_received = AsyncMock()
+
+        s = OCPP16Session(
+            station_id="msg_count_001",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            connection_manager=connection_manager,
+        )
+        await s._on_message_received(128)
+        connection_manager.record_message_received.assert_awaited_once_with("msg_count_001", 128)
+
+    @pytest.mark.asyncio
+    async def test_on_message_received_swallows_record_failure(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """A flaky ConnectionManager must not break OCPP message processing."""
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        connection_manager = MagicMock()
+        connection_manager.update_heartbeat = AsyncMock()
+        connection_manager.record_message_received = AsyncMock(
+            side_effect=RuntimeError("stats backend down")
+        )
+
+        s = OCPP16Session(
+            station_id="msg_count_002",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            connection_manager=connection_manager,
+        )
+        # Must not raise — the frame counter still increments.
+        await s._on_message_received(64)
+        assert s._inbound_frame_count == 1
 
 
 class TestOCPP16SessionMeteringConfigCache:
@@ -1644,13 +1693,13 @@ class TestOCPP16SessionRecovery:
         # contains "missing" only implicitly via the operator's mental model
         # but not literally; defensive anyway).
         missing_only = [
-            m for m in warnings
-            if "missing_meter_start" in m
-            and "deferred_meter_start_never_backfilled" not in m
+            m
+            for m in warnings
+            if "missing_meter_start" in m and "deferred_meter_start_never_backfilled" not in m
         ]
-        assert missing_only, (
-            f"Expected missing_meter_start WARN (with last_meter_wh present); got: {warnings}"
-        )
+        assert (
+            missing_only
+        ), f"Expected missing_meter_start WARN (with last_meter_wh present); got: {warnings}"
 
     @pytest.mark.asyncio
     async def test_on_transaction_stop_warns_deferred_never_backfilled(

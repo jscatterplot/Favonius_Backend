@@ -1,6 +1,18 @@
 """Adapter to use Starlette/FastAPI WebSocket as OCPP connection (same port as REST).
 
 Reference: Railway plan Option A - mount OCPP on same port as FastAPI.
+
+WebSocket ping/pong note
+------------------------
+When ``OCPP_USE_SAME_PORT=true`` is enabled, uvicorn (not this module)
+governs WebSocket ping/pong. ABB Terra AC v1.8.x and similar OCPP 1.6
+chargers tear the socket down when their internal keepalive timer
+(~25-30s) expires without inbound traffic, so the uvicorn flags
+``--ws-ping-interval`` (default 20s) and ``--ws-ping-timeout`` (default
+20s) must be kept low enough to refresh that timer. The legacy WS
+handler (``src/websocket_handler/server.py``) defaults to
+``WEBSOCKET_PING_INTERVAL=15`` / ``WEBSOCKET_PING_TIMEOUT=20`` — keep
+this path consistent with those values when serving OCPP via ASGI.
 """
 
 from __future__ import annotations
