@@ -458,3 +458,76 @@ async def test_backfill_terminates_when_all_candidates_are_terminal(
             [session_id_a, session_id_b],
         )
     assert {r["cost_total_source"] for r in rows} == {"unpriceable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_backfill_continues_past_unpriceable_chunk_to_priceable_rows(
+    pool, cleanup, monkeypatch,
+):
+    """Regression: an earlier draft broke the chunk loop when
+    ``chunk_priced == 0``, which meant a batch full of ``unpriceable``
+    rows ended the run before the cursor reached higher-UUID
+    candidates. With ``batch_size=1`` and a low-UUID unpriceable row
+    seeded before a high-UUID priceable one, the loop must keep
+    going — the cursor has advanced past the unpriceable row, so the
+    next chunk fetches the priceable one and prices it.
+
+    Forces deterministic UUID ordering with ``UUID(int=...)`` so the
+    unpriceable row is guaranteed to sort first.
+    """
+    site_id = uuid4()
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+
+    # Low session_id, no price in DB → 'unpriceable'
+    unpriceable_id = UUID(int=1)
+    # High session_id, price seeded → 'fallback_average'
+    priceable_id = UUID(int=2**64)
+    cleanup["sessions"].extend([unpriceable_id, priceable_id])
+
+    await _seed_session(
+        pool, session_id=unpriceable_id, site_id=site_id,
+        start=_utc(2026, 6, 1, 8), end=_utc(2026, 6, 1, 9),
+        energy_kwh=10.0, cost_total=0, cost_total_source=None,
+    )
+    # Seed price for the priceable row's window so it lands non-terminal.
+    await _seed_price(pool, _utc(2026, 6, 1, 12), 0.50)
+    await _seed_session(
+        pool, session_id=priceable_id, site_id=site_id,
+        start=_utc(2026, 6, 1, 12), end=_utc(2026, 6, 1, 13),
+        energy_kwh=20.0, cost_total=0, cost_total_source=None,
+    )
+
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL",
+                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL",
+                  "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    # batch_size=1 puts each session in its own chunk; if the loop
+    # stops after the unpriceable chunk, the priceable row stays at
+    # cost_total=0 / source=NULL and the assertion below fails.
+    import asyncio as _asyncio
+    await _asyncio.wait_for(
+        bf._run(_args(
+            depot_id=site_id,
+            session_ids=[unpriceable_id, priceable_id],
+            batch_size=1,
+        )),
+        timeout=15.0,
+    )
+
+    async with pool.acquire() as conn:
+        priced = await conn.fetchrow(
+            "SELECT cost_total, cost_total_source FROM charging_sessions "
+            "WHERE session_id = $1",
+            priceable_id,
+        )
+    assert priced["cost_total_source"] == "fallback_average"
+    assert priced["cost_total"] == Decimal("10.0000")  # 20 kWh × €0.50

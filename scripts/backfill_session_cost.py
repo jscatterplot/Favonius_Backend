@@ -301,7 +301,6 @@ async def _run(args: argparse.Namespace) -> int:
                 # loop: rows that landed terminal are now both behind
                 # the cursor and filtered out of subsequent chunks.
                 cursor_id = rows[-1]["session_id"]
-                chunk_priced = 0
 
                 for row in rows:
                     row_dict = dict(row)
@@ -312,8 +311,6 @@ async def _run(args: argparse.Namespace) -> int:
                         price_lookup=price_cache,
                     )
                     counts[result.source] += 1
-                    if result.source in ("granular", "fallback_average"):
-                        chunk_priced += 1
                     if args.dry_run:
                         logger.info(
                             "DRY session=%s source=%s cost=%s",
@@ -341,11 +338,15 @@ async def _run(args: argparse.Namespace) -> int:
                 # would match the same chunk forever.
                 if args.dry_run:
                     break
-                # Apply mode: stop when this chunk could not price any row.
-                # Unpriceable rows stay eligible across runs (prices may
-                # arrive later) but must not spin on the same batch.
-                if chunk_priced == 0:
-                    break
+                # Loop continues until ``not rows`` (no candidates above
+                # the cursor). An earlier draft also broke on
+                # ``chunk_priced == 0`` so the loop would terminate even
+                # if every row in a batch was unpriceable — but that
+                # was wrong: the cursor has already advanced past those
+                # rows, so the next chunk fetches a different (higher
+                # session_id) candidate set that may well contain
+                # priceable rows. Stopping early left those later rows
+                # stranded across runs.
 
         logger.info(
             "Backfill complete — processed=%d sources=%s",
