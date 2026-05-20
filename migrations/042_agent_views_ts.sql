@@ -94,40 +94,18 @@ $$;
 REVOKE ALL    ON FUNCTION agent_views.sessions(uuid[]) FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION agent_views.sessions(uuid[]) TO agent_reader_ts;
 
--- telemetry_hourly ───────────────────────────────────────────────────────
--- Rolled-up to hourly buckets to keep the LLM-facing surface tractable and
--- avoid exposing the raw 1-Hz hypertable scan path. The validator REQUIRES
--- a time predicate on this view; that's enforced in src/api/agent/sql_validator.py.
-DROP FUNCTION IF EXISTS agent_views.telemetry_hourly(uuid[]);
-CREATE OR REPLACE FUNCTION agent_views.telemetry_hourly(p_depot_ids uuid[])
-RETURNS TABLE (
-    vehicle_id        uuid,
-    charger_id        uuid,
-    depot_id          uuid,
-    hour              timestamptz,
-    avg_soc           double precision,
-    peak_charging_kw  double precision,
-    charging_minutes  double precision
-)
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, public
-AS $$
-    SELECT t.vehicle_id,
-           t.charger_id,
-           s.site_id,
-           time_bucket('1 hour', t.time) AS hour,
-           AVG(t.soc)                    AS avg_soc,
-           MAX(t.charging_kw)            AS peak_charging_kw,
-           SUM(CASE WHEN t.charging_kw > 0 THEN 1 ELSE 0 END)::double precision
-                                         AS charging_minutes
-    FROM public.telemetry t
-    JOIN public.charging_sessions s ON s.session_id = t.session_id
-    WHERE s.site_id = ANY(p_depot_ids)
-    GROUP BY t.vehicle_id, t.charger_id, s.site_id, time_bucket('1 hour', t.time)
-$$;
-
-REVOKE ALL    ON FUNCTION agent_views.telemetry_hourly(uuid[]) FROM PUBLIC;
-GRANT  EXECUTE ON FUNCTION agent_views.telemetry_hourly(uuid[]) TO agent_reader_ts;
+-- telemetry_hourly: intentionally NOT exposed in V1.
+--
+-- `telemetry` is depot-blind at the table level (charger_id was a FK to
+-- `public.chargers` which migration 029 dropped from TimescaleDB; the
+-- canonical charger roster lives in Supabase now). Without a clean
+-- depot-keyed source on the TS side we cannot enforce tenant scoping
+-- with a static SECURITY DEFINER function. Re-introducing this view
+-- requires either (a) a depot_id column on telemetry, (b) a snapshot
+-- cache of station_id → depot_id in TS, or (c) cross-DB read via
+-- postgres_fdw. None are done; tracked as follow-up. Until then the
+-- agent answers peak-power / SoC questions via the per-session
+-- aggregates already exposed in `agent_views.sessions`.
 
 -- optimization_runs ───────────────────────────────────────────────────────
 DROP FUNCTION IF EXISTS agent_views.optimization_runs(uuid[]);
@@ -190,61 +168,39 @@ END
 $outer$;
 
 -- prices_hourly ──────────────────────────────────────────────────────────
--- Bridges the two price tables that have shipped at different times.
--- Uses electricity_prices if present (migration 034 + PR #214's 041),
--- otherwise prices (migration 001).
-DO $outer$
-BEGIN
-    EXECUTE 'DROP FUNCTION IF EXISTS agent_views.prices_hourly(uuid[])';
-    IF EXISTS (
-        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relname = 'electricity_prices' AND n.nspname = 'public' AND c.relkind = 'r'
-    ) THEN
-        EXECUTE $body$
-            CREATE OR REPLACE FUNCTION agent_views.prices_hourly(p_depot_ids uuid[])
-            RETURNS TABLE (
-                depot_id        uuid,
-                hour            timestamptz,
-                price_per_kwh   numeric,
-                currency        text,
-                market_type     text
-            )
-            LANGUAGE sql STABLE SECURITY DEFINER
-            SET search_path = pg_catalog, public
-            AS 'SELECT NULL::uuid AS depot_id,
-                       time_bucket(''1 hour''::interval, ep.time) AS hour,
-                       AVG(ep.lmp_price_mwh / 1000.0)::numeric AS price_per_kwh,
-                       MAX(ep.price_unit)::text AS currency,
-                       MAX(ep.market_type) AS market_type
-                FROM public.electricity_prices ep
-                GROUP BY time_bucket(''1 hour''::interval, ep.time)'
-        $body$;
-    ELSE
-        EXECUTE $body$
-            CREATE OR REPLACE FUNCTION agent_views.prices_hourly(p_depot_ids uuid[])
-            RETURNS TABLE (
-                depot_id        uuid,
-                hour            timestamptz,
-                price_per_kwh   numeric,
-                currency        text,
-                market_type     text
-            )
-            LANGUAGE sql STABLE SECURITY DEFINER
-            SET search_path = pg_catalog, public
-            AS 'SELECT p.depot_id,
-                       time_bucket(''1 hour''::interval, p.time) AS hour,
-                       AVG(p.price_per_kwh)::numeric AS price_per_kwh,
-                       MAX(p.currency) AS currency,
-                       NULL::text AS market_type
-                FROM public.prices p
-                WHERE p.depot_id = ANY(p_depot_ids)
-                GROUP BY p.depot_id, time_bucket(''1 hour''::interval, p.time)'
-        $body$;
-    END IF;
-    EXECUTE 'REVOKE ALL    ON FUNCTION agent_views.prices_hourly(uuid[]) FROM PUBLIC';
-    EXECUTE 'GRANT  EXECUTE ON FUNCTION agent_views.prices_hourly(uuid[]) TO agent_reader_ts';
-END
-$outer$;
+-- ENTSO-E's electricity_prices is keyed by bidding zone (node_id), not
+-- depot — joining caller's depot_ids to those zones requires reading
+-- sites.tariff_config from Supabase, which the TS-side function cannot
+-- do (no cross-DB joins). To avoid a tenant leak (the original draft
+-- of this function returned the entire electricity_prices feed to any
+-- caller), V1 only exposes the legacy per-depot `prices` table; rows
+-- are NULL on the current ENTSO-E-only deployment, and that is the
+-- honest answer. Zone-aware pricing for the agent is tracked as a
+-- follow-up alongside the cross-DB strategy.
+DROP FUNCTION IF EXISTS agent_views.prices_hourly(uuid[]);
+CREATE OR REPLACE FUNCTION agent_views.prices_hourly(p_depot_ids uuid[])
+RETURNS TABLE (
+    depot_id        uuid,
+    hour            timestamptz,
+    price_per_kwh   numeric,
+    currency        text,
+    market_type     text
+)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+    SELECT p.depot_id,
+           time_bucket('1 hour'::interval, p.time) AS hour,
+           AVG(p.price_per_kwh)::numeric AS price_per_kwh,
+           MAX(p.currency) AS currency,
+           NULL::text AS market_type
+    FROM public.prices p
+    WHERE p.depot_id = ANY(p_depot_ids)
+    GROUP BY p.depot_id, time_bucket('1 hour'::interval, p.time)
+$$;
+
+REVOKE ALL    ON FUNCTION agent_views.prices_hourly(uuid[]) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION agent_views.prices_hourly(uuid[]) TO agent_reader_ts;
 
 -- building_load_hourly ───────────────────────────────────────────────────
 DROP FUNCTION IF EXISTS agent_views.building_load_hourly(uuid[]);
@@ -273,42 +229,37 @@ GRANT  EXECUTE ON FUNCTION agent_views.building_load_hourly(uuid[]) TO agent_rea
 -- connector_status_latest ────────────────────────────────────────────────
 -- Latest-row-per-(station,connector). connector_status is append-only;
 -- DISTINCT ON gives us "the current state" for each (station, connector).
-DO $outer$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relname = 'connector_status' AND n.nspname = 'public' AND c.relkind = 'r'
-    ) THEN
-        EXECUTE 'DROP FUNCTION IF EXISTS agent_views.connector_status_latest(uuid[])';
-        EXECUTE $body$
-            CREATE OR REPLACE FUNCTION agent_views.connector_status_latest(p_depot_ids uuid[])
-            RETURNS TABLE (
-                station_id        varchar,
-                connector_id      integer,
-                depot_id          uuid,
-                status            varchar,
-                error_code        varchar,
-                last_changed_at   timestamptz
-            )
-            LANGUAGE sql STABLE SECURITY DEFINER
-            SET search_path = pg_catalog, public
-            AS 'SELECT DISTINCT ON (cs.station_id, cs.connector_id)
-                       cs.station_id,
-                       cs.connector_id,
-                       s.site_id,
-                       cs.status,
-                       cs.error_code,
-                       cs.timestamp AS last_changed_at
-                FROM public.connector_status cs
-                JOIN public.charging_sessions s ON s.station_id = cs.station_id
-                WHERE s.site_id = ANY(p_depot_ids)
-                ORDER BY cs.station_id, cs.connector_id, cs.timestamp DESC'
-        $body$;
-        EXECUTE 'REVOKE ALL    ON FUNCTION agent_views.connector_status_latest(uuid[]) FROM PUBLIC';
-        EXECUTE 'GRANT  EXECUTE ON FUNCTION agent_views.connector_status_latest(uuid[]) TO agent_reader_ts';
-    END IF;
-END
-$outer$;
+-- Migration 029 added `depot_id` directly to connector_status so we no
+-- longer need to JOIN against the chargers shadow table (which 029
+-- dropped). Legacy rows where depot_id is NULL are excluded — they have
+-- no tenant context to attribute to.
+DROP FUNCTION IF EXISTS agent_views.connector_status_latest(uuid[]);
+CREATE OR REPLACE FUNCTION agent_views.connector_status_latest(p_depot_ids uuid[])
+RETURNS TABLE (
+    station_id        varchar,
+    connector_id      integer,
+    depot_id          uuid,
+    status            varchar,
+    error_code        varchar,
+    last_changed_at   timestamptz
+)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+    SELECT DISTINCT ON (cs.station_id, cs.connector_id)
+           cs.station_id,
+           cs.connector_id,
+           cs.depot_id,
+           cs.status,
+           cs.error_code,
+           cs.timestamp AS last_changed_at
+    FROM public.connector_status cs
+    WHERE cs.depot_id = ANY(p_depot_ids)
+    ORDER BY cs.station_id, cs.connector_id, cs.timestamp DESC
+$$;
+
+REVOKE ALL    ON FUNCTION agent_views.connector_status_latest(uuid[]) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION agent_views.connector_status_latest(uuid[]) TO agent_reader_ts;
 
 -- ── Append-only trigger on agent_runs (S3) ───────────────────────────────
 -- Mirrors the decisions_append_only_guard pattern from migration 037.

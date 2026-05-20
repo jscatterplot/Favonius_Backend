@@ -78,29 +78,6 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
         ),
     ),
     FunctionSpec(
-        name="telemetry_hourly",
-        purpose=(
-            "Hourly rollup of vehicle telemetry. Use this for peak-power or "
-            "SoC trend questions. REQUIRES a time predicate on `hour`."
-        ),
-        columns=(
-            ColumnSpec("vehicle_id", "uuid"),
-            ColumnSpec("charger_id", "uuid", "Nullable — vehicle may not be plugged."),
-            ColumnSpec("depot_id", "uuid"),
-            ColumnSpec("hour", "timestamptz", "Hour-bucket start (UTC)."),
-            ColumnSpec("avg_soc", "double precision", "Average SoC for the hour (0.0–1.0)."),
-            ColumnSpec("peak_charging_kw", "double precision", "Max instantaneous charging power for the hour."),
-            ColumnSpec("charging_minutes", "double precision", "Approx minutes the vehicle was actively charging."),
-        ),
-        examples=(
-            "SELECT hour, MAX(peak_charging_kw) AS site_peak_kw "
-            "FROM agent_views.telemetry_hourly($1) "
-            "WHERE hour >= now() - interval '7 days' "
-            "GROUP BY hour ORDER BY site_peak_kw DESC LIMIT 5",
-        ),
-        requires_time_predicate=True,
-    ),
-    FunctionSpec(
         name="optimization_runs",
         purpose="One row per MILP solver invocation per depot.",
         columns=(
@@ -139,16 +116,18 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
     FunctionSpec(
         name="prices_hourly",
         purpose=(
-            "Hourly day-ahead electricity prices. depot_id may be NULL when "
-            "the price source is a bidding-zone feeder rather than a per-depot "
-            "tariff. REQUIRES a time predicate on `hour`."
+            "Hourly per-depot tariff prices from the legacy `prices` table. "
+            "NOTE: on ENTSO-E deployments this table is empty — zone-keyed "
+            "prices live in `electricity_prices` and are not yet exposed to "
+            "the agent (cross-DB zone lookup is a follow-up). REQUIRES a "
+            "time predicate on `hour`."
         ),
         columns=(
-            ColumnSpec("depot_id", "uuid", "May be NULL when sourced from bidding-zone feeder."),
+            ColumnSpec("depot_id", "uuid"),
             ColumnSpec("hour", "timestamptz"),
             ColumnSpec("price_per_kwh", "numeric"),
             ColumnSpec("currency", "text"),
-            ColumnSpec("market_type", "text", "Free-form, e.g. 'DAM' for day-ahead market."),
+            ColumnSpec("market_type", "text", "NULL on legacy-prices deployments."),
         ),
         examples=(
             "SELECT hour, AVG(price_per_kwh) FROM agent_views.prices_hourly($1) "

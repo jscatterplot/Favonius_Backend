@@ -14,6 +14,7 @@ across the 1-2s LLM round-trip).
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -100,27 +101,44 @@ def build_sql_agent_tool_registry(
     )
 
     # ── sample_values ───────────────────────────────────────────────────
+    # Identifier regex used to scrub LLM-supplied table/column names. Plain
+    # SQL identifiers only — alphanumerics + underscore, must start with a
+    # letter, capped at 63 chars (Postgres's default NAMEDATALEN limit minus
+    # the NUL). The validator catches malicious *values* in WHERE clauses
+    # via sqlglot; here we are interpolating into the SELECT-list and the
+    # FROM clause as raw text, so we need a stricter belt before reaching
+    # the validator.
+    _IDENT_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,62}$")
+
     async def _sample_values(*, table: str, column: str, n: int = 5, **_: Any) -> dict:
         """Return up to n DISTINCT values from a column. Built on top of
         the same validate→execute path so the safety properties hold.
 
         Implementation: synthesise ``SELECT DISTINCT <col> FROM
         agent_views.<table>($1) WHERE … LIMIT n``. The validator rejects
-        if <table> isn't allowed; the executor enforces scope."""
+        if <table> isn't allowed; the executor enforces scope. ``column``
+        and ``table`` are pre-validated as plain identifiers BEFORE reaching
+        the SQL builder so a malicious value cannot escape the projection
+        and reach the validator with a payload that already changed shape.
+        """
         if n < 1 or n > 10:
             return {"error": "n must be in [1, 10]"}
-        table = table.strip().lower()
-        if table.startswith("agent_views."):
-            table = table.split(".", 1)[1]
-        if "(" in table:
-            table = table.split("(", 1)[0]
+        table_in = (table or "").strip().lower()
+        if table_in.startswith("agent_views."):
+            table_in = table_in.split(".", 1)[1]
+        if "(" in table_in:
+            table_in = table_in.split("(", 1)[0]
+        if not _IDENT_RE.fullmatch(table_in):
+            return {"error": f"table must be a plain identifier; got {table!r}"}
+        if not _IDENT_RE.fullmatch(column or ""):
+            return {"error": f"column must be a plain identifier; got {column!r}"}
 
         # Decide which pool by allowlist membership.
-        if table in AGENT_VIEWS_FUNCTIONS_TS:
+        if table_in in AGENT_VIEWS_FUNCTIONS_TS:
             pool, allowed, role, label = (
                 ts_pool, AGENT_VIEWS_FUNCTIONS_TS, "agent_reader_ts", "ts",
             )
-        elif table in AGENT_VIEWS_FUNCTIONS_STATIC:
+        elif table_in in AGENT_VIEWS_FUNCTIONS_STATIC:
             pool, allowed, role, label = (
                 static_pool, AGENT_VIEWS_FUNCTIONS_STATIC, "agent_reader_static", "static",
             )
@@ -130,11 +148,11 @@ def build_sql_agent_tool_registry(
         # Hypertable functions need a time predicate; default to last 30d.
         time_clause = ""
         from src.api.agent.sql_validator import HYPERTABLE_FUNCTIONS
-        if table in HYPERTABLE_FUNCTIONS:
+        if table_in in HYPERTABLE_FUNCTIONS:
             time_clause = " WHERE hour >= now() - interval '30 days'"
 
         sql = (
-            f"SELECT DISTINCT {column} FROM agent_views.{table}($1){time_clause} "
+            f"SELECT DISTINCT {column} FROM agent_views.{table_in}($1){time_clause} "
             f"LIMIT {n}"
         )
         v = validate_sql(sql, allowed_functions=allowed, row_limit=n)

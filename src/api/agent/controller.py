@@ -446,7 +446,7 @@ async def _run_sql_general_turn(
     from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
 
     client = agent_llm._get_client()
-    config = agent_llm.get_config()
+    config = agent_llm.CONFIG
 
     registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
 
@@ -496,6 +496,23 @@ async def _run_sql_general_turn(
         return reply
 
     AGENT_SQL_TOOL_TURNS.observe(qa.iterations)
+
+    # Server-computed audit numbers: rely on the tool-call trace, not the
+    # LLM-supplied `row_evidence` (the model can hallucinate that value).
+    sql_executions = 0
+    server_row_total = 0
+    for tc in qa.tool_calls:
+        if tc.name not in ("run_select_ts", "run_select_static"):
+            continue
+        if not tc.ok:
+            continue
+        sql_executions += 1
+        result = tc.result if isinstance(tc.result, dict) else {}
+        try:
+            server_row_total += int(result.get("row_count", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+
     await agent_runs_step(
         ts_pool,
         run_id,
@@ -503,25 +520,29 @@ async def _run_sql_general_turn(
         {
             "iterations": qa.iterations,
             "tool_call_count": len(qa.tool_calls),
-            "row_evidence": qa.row_evidence,
+            "sql_executions": sql_executions,
+            "server_row_total": server_row_total,
+            "model_row_evidence": qa.row_evidence,
             "status": qa.status,
         },
     )
 
-    if qa.status == "success" and qa.text:
-        # Count SQL executions in the trace for audit metadata.
-        sql_executions = sum(
-            1 for tc in qa.tool_calls if tc.name in ("run_select_ts", "run_select_static")
+    # Mirror to admin audit feed for EVERY turn that executed at least one
+    # SQL tool — observability gaps on non-success runs were called out in
+    # review. The audit row uses the server-counted total, not the LLM's
+    # claimed `row_evidence`.
+    if sql_executions > 0:
+        await write_agent_query_audit(
+            ts_pool, auth, run_id, "sql_general", server_row_total
         )
-        await write_agent_query_audit(ts_pool, auth, run_id, "sql_general", qa.row_evidence)
+
+    if qa.status == "success" and qa.text:
         reply = AgentReply.success(run_id=run_id, intent="sql_general", text=qa.text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
         if sse is not None:
             await sse.emit("answer", reply.model_dump(mode="json"))
-        _ = sql_executions  # currently unused beyond the count; left for future audit metadata
         return reply
 
-    # Non-success outcomes: terminator missing, max iterations hit, etc.
     text = qa.text.strip() if qa.text else ""
     if not text:
         text = (

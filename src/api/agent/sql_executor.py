@@ -136,52 +136,68 @@ async def run_select(
         raise SqlExecutorError(f"Unknown agent role: {role!r}")
 
     started = time.monotonic()
-    async with pool.acquire() as conn:  # P2: per-tool acquire/release
-        # NB: we must NOT use prepared statements here — Supavisor
-        # transaction-mode rejects them. asyncpg defaults to prepared
-        # via the pool's `statement_cache_size`, which the DB pool sets
-        # to 0. Each statement runs as a simple query.
-        async with conn.transaction(readonly=True):
-            try:
-                await conn.execute(f"SET LOCAL ROLE {role};")
-            except Exception as e:
-                raise SqlExecutorRoleError(
-                    f"Could not SET LOCAL ROLE {role}: {e}. The application's "
-                    f"connection user must be granted this role."
-                ) from e
+    outcome = "success"
+    try:
+        async with pool.acquire() as conn:  # P2: per-tool acquire/release
+            # NB: we must NOT use prepared statements here — Supavisor
+            # transaction-mode rejects them. asyncpg defaults to prepared
+            # via the pool's `statement_cache_size`, which the DB pool sets
+            # to 0. Each statement runs as a simple query.
+            async with conn.transaction(readonly=True):
+                try:
+                    await conn.execute(f"SET LOCAL ROLE {role};")
+                except Exception as e:
+                    raise SqlExecutorRoleError(
+                        f"Could not SET LOCAL ROLE {role}: {e}. The application's "
+                        f"connection user must be granted this role."
+                    ) from e
 
-            # S2: assert current_user matches.
-            current = await conn.fetchval("SELECT current_user;")
-            if str(current).lower() != role.lower():
-                raise SqlExecutorRoleError(
-                    f"Post-swap current_user is {current!r}, expected {role!r}. "
-                    f"Aborting turn (fail closed)."
-                )
+                # S2: assert current_user matches.
+                current = await conn.fetchval("SELECT current_user;")
+                if str(current).lower() != role.lower():
+                    raise SqlExecutorRoleError(
+                        f"Post-swap current_user is {current!r}, expected {role!r}. "
+                        f"Aborting turn (fail closed)."
+                    )
 
-            await conn.execute(f"SET LOCAL statement_timeout = '{statement_timeout}';")
-            await conn.execute("SET LOCAL transaction_read_only = on;")
+                await conn.execute(f"SET LOCAL statement_timeout = '{statement_timeout}';")
+                await conn.execute("SET LOCAL transaction_read_only = on;")
 
-            # S4: EXPLAIN (FORMAT TEXT) — never ANALYZE.
-            try:
-                explain_rows = await conn.fetch(
-                    f"EXPLAIN (FORMAT TEXT) {sql}",
-                    depot_ids,
-                )
-                explain_text = "\n".join(str(r[0]) for r in explain_rows)
-            except asyncpg.PostgresError as e:
-                # Most commonly: column does not exist / function signature
-                # mismatch. Surface as a planner error so the LLM retries.
-                raise SqlExecutorPlanError(f"EXPLAIN rejected SQL: {e}") from e
+                # S4: EXPLAIN (FORMAT TEXT) — never ANALYZE.
+                try:
+                    explain_rows = await conn.fetch(
+                        f"EXPLAIN (FORMAT TEXT) {sql}",
+                        depot_ids,
+                    )
+                    explain_text = "\n".join(str(r[0]) for r in explain_rows)
+                except asyncpg.PostgresError as e:
+                    raise SqlExecutorPlanError(f"EXPLAIN rejected SQL: {e}") from e
 
-            # Actual fetch.
-            try:
-                rows = await conn.fetch(sql, depot_ids)
-            except asyncpg.QueryCanceledError as e:
-                raise SqlExecutorTimeoutError(
-                    f"statement_timeout ({statement_timeout}) fired."
-                ) from e
-            except asyncpg.PostgresError as e:
-                raise SqlExecutorError(f"SQL execution failed: {e}") from e
+                try:
+                    rows = await conn.fetch(sql, depot_ids)
+                except asyncpg.QueryCanceledError as e:
+                    raise SqlExecutorTimeoutError(
+                        f"statement_timeout ({statement_timeout}) fired."
+                    ) from e
+                except asyncpg.PostgresError as e:
+                    raise SqlExecutorError(f"SQL execution failed: {e}") from e
+
+    except SqlExecutorRoleError:
+        outcome = "role_error"
+        AGENT_SQL_EXECUTIONS.labels(outcome=outcome, pool=pool_label).inc()
+        raise
+    except SqlExecutorPlanError:
+        outcome = "plan_error"
+        AGENT_SQL_EXECUTIONS.labels(outcome=outcome, pool=pool_label).inc()
+        raise
+    except SqlExecutorTimeoutError:
+        outcome = "timeout"
+        AGENT_SQL_EXECUTIONS.labels(outcome=outcome, pool=pool_label).inc()
+        raise
+    except SqlExecutorError:
+        outcome = "error"
+        AGENT_SQL_EXECUTIONS.labels(outcome=outcome, pool=pool_label).inc()
+        raise
 
     duration_ms = int((time.monotonic() - started) * 1000)
     truncated = False

@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 # All names case-insensitive — Postgres folds unquoted identifiers to lower.
 AGENT_VIEWS_FUNCTIONS_TS: frozenset[str] = frozenset({
     "sessions",
-    "telemetry_hourly",
     "optimization_runs",
     "alerts",
     "prices_hourly",
@@ -61,7 +60,6 @@ AGENT_VIEWS_FUNCTIONS_STATIC: frozenset[str] = frozenset({
 # through a year of telemetry rolling-up before LIMIT applies. The
 # validator looks for ANY comparison referencing one of these columns:
 HYPERTABLE_FUNCTIONS: frozenset[str] = frozenset({
-    "telemetry_hourly",
     "prices_hourly",
     "building_load_hourly",
 })
@@ -290,25 +288,28 @@ def validate_sql(
     # This is a defence-in-depth list; the main protection is the role
     # swap + grants.
 
-    # 6. Hypertable-backed functions need a time predicate.
-    branch_wheres = _collect_branch_wheres(tree)
-    for fn in functions_used:
-        if fn not in HYPERTABLE_FUNCTIONS:
-            continue
-        if not branch_wheres or any(w is None for w in branch_wheres):
-            return _reject(
-                "missing_time_filter",
-                f"agent_views.{fn} requires a time predicate (e.g. "
-                f"WHERE hour >= now() - interval '7 days'). Without one, "
-                f"the scan is unbounded.",
-            )
-        if not all(_has_time_predicate(where) for where in branch_wheres):
-            return _reject(
-                "missing_time_filter",
-                f"agent_views.{fn} requires a time predicate over one of "
-                f"{sorted(HYPERTABLE_TIME_COLUMNS)}. Add e.g. "
-                f"WHERE hour >= now() - interval '7 days'.",
-            )
+    # 6. Hypertable-backed functions need a time predicate. Apply per
+    # SELECT-branch — a UNION with one bounded and one unbounded branch
+    # would otherwise pass with the unbounded scan intact.
+    if functions_used and any(fn in HYPERTABLE_FUNCTIONS for fn in functions_used):
+        for select_node in _iter_selects(tree):
+            if not _select_touches_hypertable(select_node):
+                continue
+            where = select_node.args.get("where")
+            if where is None or not _has_bounding_time_predicate(where):
+                fn_name = next(
+                    (fn for fn in functions_used if fn in HYPERTABLE_FUNCTIONS),
+                    "hypertable",
+                )
+                return _reject(
+                    "missing_time_filter",
+                    f"agent_views.{fn_name} requires a bounding time predicate "
+                    f"on one of {sorted(HYPERTABLE_TIME_COLUMNS)} in EVERY "
+                    f"SELECT branch that references it (e.g. "
+                    f"WHERE hour >= now() - interval '7 days'). Comparisons "
+                    f"where both sides are columns (like `hour = hour`) do "
+                    f"NOT count.",
+                )
 
     # 7. LIMIT injection / cap.
     limit_node = tree.args.get("limit")
@@ -349,54 +350,65 @@ def validate_sql(
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-def _has_time_predicate(where: exp.Where) -> bool:
-    """True iff the WHERE has a *bounding* time predicate.
+def _iter_selects(tree: exp.Expression) -> "list[exp.Select]":
+    """Yield every Select node in a tree, including those nested inside
+    set-operations (Union / Intersect / Except). Top-down."""
+    out: list[exp.Select] = []
+    for node in tree.walk():
+        if isinstance(node, exp.Select):
+            out.append(node)
+    return out
 
-    We reject tautologies like `hour = hour` by requiring a time-column
-    side to be compared against a non-identical expression.
-    """
-    comparisons = (
-        exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ, exp.Between, exp.In
-    )
-    for node in where.walk():
-        if not isinstance(node, comparisons):
+
+def _select_touches_hypertable(select: exp.Select) -> bool:
+    """True iff this Select directly references a hypertable function in
+    its FROM/JOIN chain (not via a sub-SELECT — those carry their own
+    SELECT node and get checked separately)."""
+    for tbl in select.find_all(exp.Table):
+        if (tbl.db or "").lower() != "agent_views":
             continue
-        for col in node.find_all(exp.Column):
-            if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
-                continue
-            if _is_nontrivial_time_comparison(node, col):
-                return True
+        anon = tbl.find(exp.Anonymous)
+        if anon and anon.name.lower() in HYPERTABLE_FUNCTIONS:
+            return True
     return False
 
 
-def _collect_branch_wheres(tree: exp.Expression) -> list[Optional[exp.Where]]:
-    if isinstance(tree, exp.Select):
-        where = tree.args.get("where")
-        return [where] if isinstance(where, exp.Where) else [None]
-    if isinstance(tree, exp.SetOperation):
-        return _collect_branch_wheres(tree.this) + _collect_branch_wheres(tree.expression)
-    return []
+def _has_bounding_time_predicate(where: exp.Where) -> bool:
+    """True iff the WHERE contains a comparison that bounds one of
+    HYPERTABLE_TIME_COLUMNS against a non-column expression.
+
+    Tautologies like ``hour = hour`` are rejected: BOTH sides must
+    NOT be the same Column reference for the comparison to count.
+    BETWEEN and IN counts as bounding even if the children include
+    column refs — those still constrain the range to a finite set.
+    """
+    for col in where.find_all(exp.Column):
+        if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
+            continue
+        comparison = _ancestor_comparison(col)
+        if comparison is None:
+            continue
+        if isinstance(comparison, (exp.Between, exp.In)):
+            return True
+        # Binary comparison: at least one side must not be a Column.
+        left = comparison.this
+        right = comparison.args.get("expression")
+        if left is None or right is None:
+            continue
+        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+            continue  # `hour = hour` style tautology — does not bound
+        return True
+    return False
 
 
-def _is_nontrivial_time_comparison(node: exp.Expression, col: exp.Column) -> bool:
-    if isinstance(node, exp.Between):
-        low = node.args.get("low")
-        high = node.args.get("high")
-        return (low is not None and low.sql(dialect="postgres") != col.sql(dialect="postgres")
-                and high is not None and high.sql(dialect="postgres") != col.sql(dialect="postgres"))
-    if isinstance(node, exp.In):
-        values = node.args.get("expressions") or []
-        return any(v.sql(dialect="postgres") != col.sql(dialect="postgres") for v in values)
-
-    left = node.args.get("this")
-    right = node.args.get("expression")
-    if left is None or right is None:
-        return False
-
-    left_sql = left.sql(dialect="postgres")
-    right_sql = right.sql(dialect="postgres")
-    if left_sql == right_sql:
-        return False
-    left_cols = list(left.find_all(exp.Column))
-    right_cols = list(right.find_all(exp.Column))
-    return col in left_cols or col in right_cols
+def _ancestor_comparison(node: exp.Expression) -> exp.Expression | None:
+    """Walk parents up to the nearest comparison-like node (or None)."""
+    cur = node.parent
+    while cur is not None and not isinstance(cur, exp.Where):
+        if isinstance(
+            cur,
+            (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ, exp.Between, exp.In),
+        ):
+            return cur
+        cur = cur.parent
+    return None

@@ -67,10 +67,10 @@ class TestHappyPaths:
 
     def test_hypertable_with_time_predicate(self):
         r = _ok(
-            "SELECT * FROM agent_views.telemetry_hourly($1) "
+            "SELECT * FROM agent_views.prices_hourly($1) "
             "WHERE hour >= now() - interval '7 days'"
         )
-        assert r.functions_used == ("telemetry_hourly",)
+        assert r.functions_used == ("prices_hourly",)
 
     def test_join_two_agent_views_functions(self):
         # Self-join on the same pool is allowed.
@@ -297,21 +297,21 @@ class TestDangerousFunctions:
 
 
 class TestTimePredicate:
-    def test_telemetry_without_where_rejected(self):
-        _rej(
-            "SELECT * FROM agent_views.telemetry_hourly($1)",
-            kind="missing_time_filter",
-        )
-
-    def test_telemetry_with_unrelated_where_rejected(self):
-        _rej(
-            "SELECT * FROM agent_views.telemetry_hourly($1) WHERE depot_id IS NOT NULL",
-            kind="missing_time_filter",
-        )
-
-    def test_prices_hourly_without_time_rejected(self):
+    def test_prices_without_where_rejected(self):
         _rej(
             "SELECT * FROM agent_views.prices_hourly($1)",
+            kind="missing_time_filter",
+        )
+
+    def test_prices_with_unrelated_where_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) WHERE depot_id IS NOT NULL",
+            kind="missing_time_filter",
+        )
+
+    def test_building_load_without_time_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.building_load_hourly($1)",
             kind="missing_time_filter",
         )
 
@@ -321,15 +321,43 @@ class TestTimePredicate:
             "WHERE hour BETWEEN now() - interval '1 day' AND now()"
         )
 
-    def test_telemetry_with_hour_gte_accepted(self):
+    def test_prices_with_hour_gte_accepted(self):
         _ok(
-            "SELECT * FROM agent_views.telemetry_hourly($1) "
+            "SELECT * FROM agent_views.prices_hourly($1) "
             "WHERE hour >= now() - interval '7 days'"
         )
 
     def test_sessions_does_not_require_time(self):
         # sessions is not in HYPERTABLE_FUNCTIONS
         _ok("SELECT * FROM agent_views.sessions($1)")
+
+    def test_tautology_hour_eq_hour_rejected(self):
+        # `WHERE hour = hour` is a column-column comparison; it does not
+        # bound the time range.
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) WHERE hour = hour",
+            kind="missing_time_filter",
+        )
+
+    def test_union_unbounded_branch_rejected(self):
+        # Bounded first branch + unbounded second branch over a hypertable
+        # MUST be rejected — each branch is checked independently.
+        _rej(
+            "SELECT hour FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' "
+            "UNION "
+            "SELECT hour FROM agent_views.prices_hourly($1)",
+            kind="missing_time_filter",
+        )
+
+    def test_union_both_bounded_accepted(self):
+        _ok(
+            "SELECT hour FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '1 day' "
+            "UNION "
+            "SELECT hour FROM agent_views.prices_hourly($1) "
+            "WHERE hour < now() - interval '7 days'"
+        )
 
 
 # ── LIMIT injection / cap ────────────────────────────────────────────────
@@ -390,7 +418,7 @@ class TestCanonicalOutput:
 
     def test_canonical_for_hypertable_keeps_predicate(self):
         r = _ok(
-            "SELECT * FROM agent_views.telemetry_hourly($1) WHERE hour >= now()"
+            "SELECT * FROM agent_views.prices_hourly($1) WHERE hour >= now()"
         )
         assert "hour" in r.sql.lower()
         assert "$1" in r.sql
