@@ -265,18 +265,28 @@ _GRANULAR_TELEMETRY_SQL = """
                 -- (instead of last-first span, which let two sparse
                 -- boundary samples masquerade as full coverage).
                 COALESCE(
-                    SUM(EXTRACT(EPOCH FROM (next_time - time)))
-                        FILTER (WHERE next_time IS NOT NULL),
+                    SUM(
+                        EXTRACT(
+                            EPOCH FROM (
+                                LEAST(next_time, ${time_end}::timestamptz) - time
+                            )
+                        )
+                    ) FILTER (WHERE next_time IS NOT NULL),
                     0
                 ) AS observed_seconds,
                 -- Trapezoidal integration: average the two endpoints
                 -- of each interval before multiplying by Δt. Earlier
                 -- draft used left-Riemann (kw_i × Δt) which mis-prices
-                -- ramping/tapering sessions.
+                -- ramping/tapering sessions. Clip each segment at
+                -- end_time so LEAD past the session window is not billed.
                 COALESCE(
                     SUM(
                         (charging_kw + COALESCE(next_kw, charging_kw)) / 2.0
-                        * EXTRACT(EPOCH FROM (next_time - time)) / 3600.0
+                        * EXTRACT(
+                            EPOCH FROM (
+                                LEAST(next_time, ${time_end}::timestamptz) - time
+                            )
+                        ) / 3600.0
                     ) FILTER (WHERE next_time IS NOT NULL),
                     0
                 ) AS energy_kwh
