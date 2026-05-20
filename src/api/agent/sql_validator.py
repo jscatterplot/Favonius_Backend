@@ -382,13 +382,33 @@ def _select_touches_hypertable(select: exp.Select) -> bool:
     """True iff this Select directly references a hypertable function in
     its FROM/JOIN chain (not via a sub-SELECT — those carry their own
     SELECT node and get checked separately)."""
-    for tbl in select.find_all(exp.Table):
+    for tbl in _iter_select_from_tables(select):
         if (tbl.db or "").lower() != "agent_views":
             continue
         anon = tbl.find(exp.Anonymous)
         if anon and anon.name.lower() in HYPERTABLE_FUNCTIONS:
             return True
     return False
+
+
+def _iter_select_from_tables(select: exp.Select):
+    """Yield Table nodes in this SELECT's top-level FROM/JOIN only."""
+    from_clause = select.args.get("from_")
+    if from_clause is not None:
+        yield from _iter_from_join_tables(from_clause)
+    for join in select.args.get("joins") or []:
+        yield from _iter_from_join_tables(join)
+
+
+def _iter_from_join_tables(node: exp.Expression):
+    """Walk a FROM/JOIN fragment; do not descend into nested SELECTs."""
+    if isinstance(node, (exp.Subquery, exp.Select)):
+        return
+    if isinstance(node, exp.Table):
+        yield node
+        return
+    for child in node.iter_expressions():
+        yield from _iter_from_join_tables(child)
 
 
 def _has_bounding_time_predicate(where: exp.Where) -> bool:
@@ -399,8 +419,11 @@ def _has_bounding_time_predicate(where: exp.Where) -> bool:
     NOT be the same Column reference for the comparison to count.
     BETWEEN and IN counts as bounding even if the children include
     column refs — those still constrain the range to a finite set.
+
+    Predicates inside EXISTS/subquery branches are ignored — they
+    bound a nested scan, not this SELECT's hypertable FROM target.
     """
-    for col in where.find_all(exp.Column):
+    for col in _iter_where_columns(where.this):
         if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
             continue
         comparison = _ancestor_comparison(col)
@@ -417,6 +440,18 @@ def _has_bounding_time_predicate(where: exp.Where) -> bool:
             continue  # `hour = hour` style tautology — does not bound
         return True
     return False
+
+
+def _iter_where_columns(node: exp.Expression | None):
+    """Yield Column nodes in a WHERE predicate, excluding subqueries."""
+    if node is None:
+        return
+    if isinstance(node, (exp.Subquery, exp.Select, exp.Exists)):
+        return
+    if isinstance(node, exp.Column):
+        yield node
+    for child in node.iter_expressions():
+        yield from _iter_where_columns(child)
 
 
 def _ancestor_comparison(node: exp.Expression) -> exp.Expression | None:

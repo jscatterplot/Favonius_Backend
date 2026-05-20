@@ -860,11 +860,11 @@ async def run_qa_turn(
                 }
             )
 
-        if terminated:
-            break
-
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
+
+        if terminated:
+            break
 
         stop_reason = getattr(response, "stop_reason", None)
         if stop_reason == "end_turn":
