@@ -146,11 +146,24 @@ class SolverPool:
             old = self._executor
             self._executor = self._make_executor()
         if old is not None:
-            # Best-effort: the old executor is already busted or has a runaway
-            # worker. Don't await — children get reaped by the OS.
+            await asyncio.to_thread(self._shutdown_executor, old)
+
+    def _shutdown_executor(self, executor: ProcessPoolExecutor) -> None:
+        """Stop queued work, then hard-stop live worker processes."""
+        processes = list(getattr(executor, "_processes", {}).values())
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # pragma: no cover — defensive
+            return
+
+        # ``shutdown(wait=False)`` does not stop running calls. Force-terminate
+        # worker processes so timeouts don't accumulate orphaned CPU/memory use.
+        for process in processes:
+            if process is None or process.exitcode is not None:
+                continue
             try:
-                old.shutdown(wait=False, cancel_futures=True)
-            except Exception:  # pragma: no cover — defensive
+                process.terminate()
+            except Exception:  # pragma: no cover — best effort
                 pass
 
     async def solve(

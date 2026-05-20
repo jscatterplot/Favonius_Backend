@@ -187,6 +187,36 @@ def test_module_level_singleton_get_set():
 
 
 @pytest.mark.unit
+def test_shutdown_executor_terminates_live_processes():
+    pool = SolverPool(max_workers=1, worker_fn=echo_worker, worker_init_fn=_noop_init)
+
+    class _FakeProcess:
+        def __init__(self, exitcode):
+            self.exitcode = exitcode
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    class _FakeExecutor:
+        def __init__(self):
+            self.shutdown_calls = []
+            self._processes = {
+                1: _FakeProcess(exitcode=None),
+                2: _FakeProcess(exitcode=0),
+            }
+
+        def shutdown(self, wait, cancel_futures):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    fake_executor = _FakeExecutor()
+    pool._shutdown_executor(fake_executor)  # type: ignore[arg-type]
+
+    assert fake_executor.shutdown_calls == [(False, True)]
+    assert fake_executor._processes[1].terminated is True
+    assert fake_executor._processes[2].terminated is False
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_controller_uses_pool_when_set(monkeypatch):
     """``controller.run_optimization`` routes through ``SolverPool`` when one is installed."""
