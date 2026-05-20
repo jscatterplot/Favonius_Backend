@@ -392,6 +392,80 @@ async def test_backfill_dry_run_does_not_write(
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_backfill_dry_run_iterates_all_chunks(
+    db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls, caplog,
+):
+    """Regression: ``--dry-run`` used to break out of the chunk loop after
+    the first batch, an artifact of a pre-cursor design where dry-run
+    couldn't terminate (the candidate predicate only flipped on writes).
+    With the ``session_id > $cursor`` advance now in place, dry-run
+    must cover the full population so operators can preview
+    ``--max-rows 5000 --batch-size 500`` correctly across all ten
+    chunks instead of seeing only 500."""
+    import logging
+
+    _require_seedable_sites(db_pools)
+    site_id = uuid4()
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(db_pools.static_pool, site_id)
+    await _seed_price(pool, _utc(2026, 5, 4, 14), 0.20)
+
+    # Seed 5 candidate sessions; batch_size=2 forces ≥ 3 chunks.
+    seeded_ids: list[UUID] = []
+    for i in range(5):
+        sid = uuid4()
+        seeded_ids.append(sid)
+        cleanup["sessions"].append(sid)
+        await _seed_session(
+            pool,
+            session_id=sid,
+            site_id=site_id,
+            start=_utc(2026, 5, 4, 14) + timedelta(minutes=i),
+            end=_utc(2026, 5, 4, 15) + timedelta(minutes=i),
+            energy_kwh=30.0,
+            cost_total=0,
+        )
+
+    ts_url, static_url = integration_db_urls
+    monkeypatch.setenv("DATABASE_URL", ts_url)
+    monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
+
+    caplog.set_level(logging.INFO, logger="backfill_session_cost")
+    await bf._run(
+        _args(
+            depot_id=site_id,
+            dry_run=True,
+            session_ids=seeded_ids,
+            batch_size=2,
+            database_url=ts_url,
+            static_database_url=static_url,
+        ),
+    )
+
+    # Each candidate must show up in the dry-run log line. Earlier
+    # behavior would have logged only the first chunk's 2 sessions.
+    dry_lines = [r.getMessage() for r in caplog.records if "DRY session=" in r.getMessage()]
+    seen = {line.split("session=")[1].split(" ")[0] for line in dry_lines}
+    assert {str(sid) for sid in seeded_ids} <= seen, (
+        f"dry-run only previewed {len(seen)}/{len(seeded_ids)} sessions — "
+        f"loop broke after first chunk. Got: {seen}"
+    )
+
+    # And the rows are still unchanged.
+    async with pool.acquire() as conn:
+        after = await conn.fetch(
+            "SELECT cost_total, cost_total_source FROM charging_sessions "
+            "WHERE session_id = ANY($1)",
+            seeded_ids,
+        )
+    for row in after:
+        assert row["cost_total"] == Decimal("0")
+        assert row["cost_total_source"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_backfill_resweeps_unpriceable_when_prices_arrive(
     db_pools: IntegrationPools, pool, cleanup, monkeypatch, integration_db_urls,
 ):

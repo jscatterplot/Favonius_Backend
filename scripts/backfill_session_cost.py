@@ -409,10 +409,16 @@ async def _run(args: argparse.Namespace) -> int:
                 processed,
                 ", ".join(f"{k}={v}" for k, v in counts.most_common()),
             )
-            # Dry-run never mutates rows; the candidate predicate
-            # would match the same chunk forever without the cursor.
-            if args.dry_run:
-                break
+            # No dry-run shortcut here — the cursor at line ~368
+            # advances past every row in this chunk, so the next
+            # iteration's WHERE predicate (``session_id > $cursor``)
+            # naturally selects the next 500 candidates. An earlier
+            # draft broke out of the loop after one chunk to avoid
+            # spinning on the same candidate set forever (pre-cursor
+            # design — only writes moved rows out of the predicate,
+            # and dry-run wrote nothing). With the cursor in place,
+            # ``--dry-run --max-rows 5000 --batch-size 500`` correctly
+            # iterates ten chunks instead of stopping at the first.
 
         logger.info(
             "Backfill complete — processed=%d sources=%s",
