@@ -287,6 +287,15 @@ async def fetch_prices_by_zone(
     start_time = _as_utc_aware(start_time)
     end_time = _as_utc_aware(end_time)
 
+    # Read from one full ``forward_fill_window`` before the *floored*
+    # start hour, not before ``start_time`` itself. A session at 13:59
+    # with a 1h fill window needs the 12:00 price as a valid
+    # predecessor for the floored 13:00 bucket — that price is 1h59m
+    # before start_time but only 1h before the bucket the fill loop
+    # actually consults. Using ``start_time - 1h = 12:59`` excludes
+    # the 12:00 row even though it would be a valid fill source.
+    fetch_lower = _hour_floor_utc(start_time) - forward_fill_window
+
     rows = await db.fetch(
         """
         SELECT time, lmp_price_mwh
@@ -297,7 +306,7 @@ async def fetch_prices_by_zone(
         ORDER BY time
         """,
         bidding_zone,
-        start_time - forward_fill_window,
+        fetch_lower,
         end_time,
     )
 
@@ -410,8 +419,11 @@ async def fetch_or_pull_prices_by_zone(
     # Lazy import — keep src/db/ free of an adapters/ dep at import time.
     from ..adapters.entsoe.prices import ENTSOEAdapter
 
+    # The adapter owns an ``httpx.AsyncClient`` (with a connection pool)
+    # that must be explicitly closed; otherwise repeated cache misses
+    # leak open sockets over the process lifetime.
+    adapter = ENTSOEAdapter()
     try:
-        adapter = ENTSOEAdapter()
         # Fetch a window aligned to the missing hours. ENTSO-E charges
         # rate-limit budget per request, not per hour, so one call for
         # the whole window is cheaper than per-hour calls.
@@ -425,6 +437,8 @@ async def fetch_or_pull_prices_by_zone(
             bidding_zone, start_aware, end_aware, exc,
         )
         return cached
+    finally:
+        await adapter.close()
 
     if not fetched:
         return cached

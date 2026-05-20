@@ -98,7 +98,6 @@ _CANDIDATE_SQL = """
        AND session_id > $3::uuid
      ORDER BY session_id
      LIMIT $2
-       FOR UPDATE SKIP LOCKED
 """
 
 _CANDIDATE_BY_SESSION_SQL = """
@@ -114,7 +113,6 @@ _CANDIDATE_BY_SESSION_SQL = """
        AND session_id > $4::uuid
      ORDER BY session_id
      LIMIT $2
-       FOR UPDATE SKIP LOCKED
 """
 
 # All-zeros UUID — strictly less than every legitimate ``gen_random_uuid()``
@@ -272,7 +270,19 @@ async def _run(args: argparse.Namespace) -> int:
 
             session_ids = getattr(args, "session_ids", None) or []
 
-            async with ts_pool.acquire() as conn, conn.transaction():
+            # Read-only chunk SELECT in its own short-lived
+            # connection. Earlier draft wrapped the chunk in a
+            # transaction with ``FOR UPDATE`` so SKIP LOCKED would
+            # de-duplicate concurrent backfills, but that held row
+            # locks while ``compute_session_cost`` did heavy work —
+            # ENTSO-E API calls, telemetry SQL, optional pool
+            # connections — making live OCPP closes on the same rows
+            # block for seconds. The new shape: pull candidates with
+            # NO lock, compute outside any transaction, and let
+            # ``write_session_cost``'s WHERE predicate handle the
+            # rare lost-race case (another writer set the cost
+            # between our SELECT and our UPDATE).
+            async with ts_pool.acquire() as conn:
                 if session_ids:
                     rows = await conn.fetch(
                         _CANDIDATE_BY_SESSION_SQL,
@@ -288,62 +298,61 @@ async def _run(args: argparse.Namespace) -> int:
                         chunk_limit,
                         cursor_id,
                     )
-                if not rows:
-                    break
+            if not rows:
+                break
 
-                # Advance the cursor before processing, so even if the
-                # write path raises mid-chunk we don't re-pick the
-                # already-locked rows. Combined with the source-exclusion
-                # filter in _CANDIDATE_SQL this fully terminates the
-                # loop: rows that landed terminal are now both behind
-                # the cursor and filtered out of subsequent chunks.
-                cursor_id = rows[-1]["session_id"]
+            # Advance the cursor before processing rows. The cursor
+            # advances past every row we picked this iteration, even
+            # if a write returned False — those False cases mean the
+            # row's state has transitioned to ineligible (another
+            # writer set cost_total, or cost_total_source became
+            # 'manual'), so skipping them is correct, not a bug. The
+            # candidate predicate would exclude them on a fresh run
+            # anyway (cost_total IS NULL OR cost_total = 0 stays
+            # false now). Combined with the source-exclusion filter
+            # in _CANDIDATE_SQL this fully terminates the loop:
+            # rows that landed terminal are now both behind the
+            # cursor and filtered out of subsequent chunks.
+            cursor_id = rows[-1]["session_id"]
 
-                for row in rows:
-                    row_dict = dict(row)
-                    row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))
-                    result = await compute_session_cost(
-                        ts_pool,
-                        row_dict,
-                        price_lookup=price_cache,
-                    )
-                    counts[result.source] += 1
-                    if args.dry_run:
-                        logger.info(
-                            "DRY session=%s source=%s cost=%s",
-                            row["session_id"],
-                            result.source,
-                            result.cost,
-                        )
-                    else:
-                        wrote = await write_session_cost(
-                            ts_pool,
-                            row["session_id"],
-                            result,
-                            conn=conn,
-                        )
-                        if not wrote:
-                            counts["__write_lost_race"] += 1
-
-                processed += len(rows)
-                logger.info(
-                    "chunk done — total processed=%d (%s)",
-                    processed,
-                    ", ".join(f"{k}={v}" for k, v in counts.most_common()),
+            for row in rows:
+                row_dict = dict(row)
+                row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))
+                result = await compute_session_cost(
+                    ts_pool,
+                    row_dict,
+                    price_lookup=price_cache,
                 )
-                # Dry-run never mutates rows; the candidate predicate
-                # would match the same chunk forever.
+                counts[result.source] += 1
                 if args.dry_run:
-                    break
-                # Loop continues until ``not rows`` (no candidates above
-                # the cursor). An earlier draft also broke on
-                # ``chunk_priced == 0`` so the loop would terminate even
-                # if every row in a batch was unpriceable — but that
-                # was wrong: the cursor has already advanced past those
-                # rows, so the next chunk fetches a different (higher
-                # session_id) candidate set that may well contain
-                # priceable rows. Stopping early left those later rows
-                # stranded across runs.
+                    logger.info(
+                        "DRY session=%s source=%s cost=%s",
+                        row["session_id"],
+                        result.source,
+                        result.cost,
+                    )
+                else:
+                    # No ``conn=`` — let write_session_cost grab its
+                    # own connection and commit immediately, keeping
+                    # the row's UPDATE lock to single-digit ms.
+                    wrote = await write_session_cost(
+                        ts_pool,
+                        row["session_id"],
+                        result,
+                    )
+                    if not wrote:
+                        counts["__write_lost_race"] += 1
+
+            processed += len(rows)
+            logger.info(
+                "chunk done — total processed=%d (%s)",
+                processed,
+                ", ".join(f"{k}={v}" for k, v in counts.most_common()),
+            )
+            # Dry-run never mutates rows; the candidate predicate
+            # would match the same chunk forever without the cursor.
+            if args.dry_run:
+                break
 
         logger.info(
             "Backfill complete — processed=%d sources=%s",
