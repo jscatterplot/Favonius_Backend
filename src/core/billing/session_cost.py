@@ -356,6 +356,9 @@ async def _fetch_granular_telemetry_rows(
         return []
 
     if transaction_id is not None:
+        # First try the strict tx-scoped path. Telemetry rows from
+        # earlier or later transactions on the same connector are
+        # excluded — that's the whole point of carrying transaction_id.
         sql = _GRANULAR_TELEMETRY_SQL.format(
             where_clause=(
                 "t.station_id = $1 AND t.connector_id = $2 "
@@ -369,9 +372,30 @@ async def _fetch_granular_telemetry_rows(
         )
         if rows:
             return rows
-        # Fall through: telemetry may have NULL transaction_id but
-        # still be the correct samples for this (station, connector).
+        # Fall-through: catch the "MeterValues arrived before
+        # StartTransaction tagged them" / reconnect-without-tx-id
+        # case by also accepting samples whose transaction_id is NULL.
+        # Critically, we still exclude samples whose transaction_id
+        # is a *different* non-NULL value (a back-to-back or
+        # overlapping session on the same connector) — otherwise
+        # cross-session telemetry would bleed into one cost.
+        sql = _GRANULAR_TELEMETRY_SQL.format(
+            where_clause=(
+                "t.station_id = $1 AND t.connector_id = $2 "
+                "AND (t.transaction_id IS NULL OR t.transaction_id = $3)"
+            ),
+            time_start=4,
+            time_end=5,
+        )
+        return await conn.fetch(
+            sql, station_id, connector_id, transaction_id, start_time, end_time,
+        )
 
+    # Session has no transaction_id (typically imported pre-migration-035
+    # rows). The unscoped station+connector path is the only granular
+    # option for these; the time window provides the only safety net
+    # against cross-session bleed. Acceptable for imported rows since
+    # there's no transaction_id to compare against anyway.
     sql = _GRANULAR_TELEMETRY_SQL.format(
         where_clause="t.station_id = $1 AND t.connector_id = $2",
         time_start=3,

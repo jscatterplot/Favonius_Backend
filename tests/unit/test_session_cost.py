@@ -707,14 +707,17 @@ class _RouterConn:
     """Connection whose ``fetch`` returns different rows per WHERE shape.
 
     Used to exercise the ``_fetch_granular_telemetry_rows`` cascade:
-    vehicle_id → (station_id, connector_id, transaction_id) →
-    (station_id, connector_id). Each test seeds which WHERE-clause
-    substring should return which canned row set.
+    vehicle_id → strict (station, connector, transaction_id)
+                → relaxed (station, connector, transaction_id IS NULL OR = $)
+                → unscoped (station, connector) for sessions without
+                  any transaction_id.
+    Each test seeds which route returns which canned row set.
     """
 
     def __init__(self, route_map: dict[str, list[dict]]) -> None:
-        # Keys are substrings to look for in the SQL; values are the
-        # rows to return when that substring matches.
+        # Keys are routing tags ("transaction_id_strict",
+        # "transaction_id_or_null", "station_connector", "vehicle_id");
+        # values are the rows to return when that tag matches.
         self._routes = route_map
         self.query_log: list[str] = []
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
@@ -725,10 +728,11 @@ class _RouterConn:
         # Pick the most-specific route that matches.
         if "time_bucket" not in query or "telemetry" not in query:
             return []
-        # Order matters: transaction_id is more specific than
-        # station/connector alone.
+        # Order matters: most specific first.
+        if "transaction_id IS NULL OR t.transaction_id" in query:
+            return list(self._routes.get("transaction_id_or_null", []))
         if "transaction_id = $" in query:
-            return list(self._routes.get("transaction_id", []))
+            return list(self._routes.get("transaction_id_strict", []))
         if "station_id = $" in query and "connector_id = $" in query:
             return list(self._routes.get("station_connector", []))
         if "vehicle_id = $" in query:
@@ -748,9 +752,12 @@ async def test_granular_falls_through_transaction_id_to_station_connector() -> N
     """Regression: a session with ``transaction_id`` should not be
     stranded when telemetry rows have NULL ``transaction_id`` but
     matching ``station_id`` + ``connector_id``. The cascade must try
-    transaction-id first, then fall through to station+connector when
-    the first query returns no rows."""
-    # Telemetry exists only under the station+connector keys.
+    the strict tx-id filter first, then fall through to a *relaxed*
+    filter that accepts rows with the matching tx_id OR NULL — but
+    NOT rows with a *different* tx_id (a back-to-back session on
+    the same connector). See
+    ``test_granular_fallback_excludes_other_transactions`` for the
+    isolation guarantee."""
     bucketed_row = {
         "hour": _utc(2026, 5, 19, 13, 0),
         "first_time": _utc(2026, 5, 19, 13, 0),
@@ -760,49 +767,13 @@ async def test_granular_falls_through_transaction_id_to_station_connector() -> N
         "energy_kwh": 50.0,
     }
     conn = _RouterConn({
-        "transaction_id": [],           # telemetry has no rows tagged with this tx
-        "station_connector": [bucketed_row],
-        "vehicle_id": [],               # no vehicle on this session
-    })
-    pool = _FakePool(conn)
-    lookup = _make_lookup({_utc(2026, 5, 19, 13, 0): 0.20})
-
-    row = _session_row(
-        vehicle_id=None,
-        station_id="cp-it",
-        connector_id=1,
-        transaction_id=99999,
-    )
-    result = await compute_session_cost(pool, row, price_lookup=lookup)
-
-    assert result.source == "granular"
-    assert result.cost == Decimal("10.0000")
-    # And we did try the transaction-id filter first.
-    assert any("transaction_id = $" in q for q in conn.query_log)
-    # AND fell through to station+connector.
-    assert any(
-        "station_id = $" in q and "connector_id = $" in q and "transaction_id = $" not in q
-        for q in conn.query_log
-    )
-
-
-@pytest.mark.asyncio
-async def test_granular_skips_station_query_when_transaction_id_returns_rows() -> None:
-    """The cascade should stop at the first non-empty result. When
-    transaction_id matches telemetry, the station-only query is not
-    issued at all (avoids accidentally counting cross-transaction
-    samples on the same charger)."""
-    bucketed_row = {
-        "hour": _utc(2026, 5, 19, 13, 0),
-        "first_time": _utc(2026, 5, 19, 13, 0),
-        "last_time": _utc(2026, 5, 19, 13, 59),
-        "sample_count": 60,
-        "observed_seconds": 3540.0,
-        "energy_kwh": 50.0,
-    }
-    conn = _RouterConn({
-        "transaction_id": [bucketed_row],
-        "station_connector": [],
+        # Strict tx-id query returns nothing — simulates the
+        # "MeterValues arrived before StartTransaction tagged them"
+        # case.
+        "transaction_id_strict": [],
+        # The relaxed query (tx_id IS NULL OR = $) finds the
+        # un-tagged telemetry rows.
+        "transaction_id_or_null": [bucketed_row],
         "vehicle_id": [],
     })
     pool = _FakePool(conn)
@@ -817,7 +788,97 @@ async def test_granular_skips_station_query_when_transaction_id_returns_rows() -
     result = await compute_session_cost(pool, row, price_lookup=lookup)
 
     assert result.source == "granular"
-    # Exactly one telemetry query was issued (the transaction-id one).
+    assert result.cost == Decimal("10.0000")
+    # Both queries were issued in the right order.
+    telem_queries = [q for q in conn.query_log if "time_bucket" in q]
+    assert len(telem_queries) == 2
+    assert "transaction_id IS NULL OR" not in telem_queries[0]  # strict first
+    assert "transaction_id IS NULL OR" in telem_queries[1]      # relaxed second
+
+
+@pytest.mark.asyncio
+async def test_granular_fallback_excludes_other_transactions() -> None:
+    """Regression: when the strict tx-id query is empty, the
+    fallback must NOT return telemetry from a different transaction
+    on the same connector. The relaxed query restricts to
+    ``transaction_id IS NULL OR transaction_id = $session_tx``, so
+    back-to-back sessions on one charger can't bleed into each
+    other's cost.
+
+    Verified by checking the SQL text the fallback emits — the
+    actual row-level isolation is exercised by the integration
+    suite with seeded telemetry."""
+    conn = _RouterConn({
+        "transaction_id_strict": [],
+        "transaction_id_or_null": [],  # nothing matches; result lands fallback_average
+        "vehicle_id": [],
+    })
+    pool = _FakePool(conn)
+    lookup = _make_lookup({_utc(2026, 5, 19, 13, 0): 0.20})
+
+    row = _session_row(
+        vehicle_id=None,
+        station_id="cp-it",
+        connector_id=1,
+        transaction_id=99999,
+        energy_delivered_kwh=Decimal("50.0"),
+    )
+    result = await compute_session_cost(pool, row, price_lookup=lookup)
+
+    # No telemetry matched either query → fell through to fallback_average.
+    # Cost = 50 kWh × €0.20 = €10.00.
+    assert result.source == "fallback_average"
+    assert result.cost == Decimal("10.0000")
+
+    # The cascade NEVER issued an unscoped (station, connector) query
+    # — that path is reserved for sessions with no transaction_id.
+    # The unscoped query is identifiable as having neither
+    # ``transaction_id = $`` nor ``transaction_id IS NULL OR`` in the
+    # WHERE clause.
+    telem_queries = [q for q in conn.query_log if "time_bucket" in q]
+    assert all(
+        ("transaction_id = $" in q) or ("transaction_id IS NULL OR" in q)
+        for q in telem_queries
+    ), (
+        "fallback issued an unscoped (station, connector) query — "
+        "other transactions on the same connector would bleed into "
+        "this session's cost"
+    )
+
+
+@pytest.mark.asyncio
+async def test_granular_skips_station_query_when_transaction_id_returns_rows() -> None:
+    """The cascade stops at the first non-empty result. When the
+    strict tx-id query matches telemetry, the relaxed-fallback query
+    is not issued (avoids any chance of pulling in NULL-tagged rows
+    from a coincidentally-overlapping foreign transaction)."""
+    bucketed_row = {
+        "hour": _utc(2026, 5, 19, 13, 0),
+        "first_time": _utc(2026, 5, 19, 13, 0),
+        "last_time": _utc(2026, 5, 19, 13, 59),
+        "sample_count": 60,
+        "observed_seconds": 3540.0,
+        "energy_kwh": 50.0,
+    }
+    conn = _RouterConn({
+        "transaction_id_strict": [bucketed_row],
+        "transaction_id_or_null": [],
+        "vehicle_id": [],
+    })
+    pool = _FakePool(conn)
+    lookup = _make_lookup({_utc(2026, 5, 19, 13, 0): 0.20})
+
+    row = _session_row(
+        vehicle_id=None,
+        station_id="cp-it",
+        connector_id=1,
+        transaction_id=99999,
+    )
+    result = await compute_session_cost(pool, row, price_lookup=lookup)
+
+    assert result.source == "granular"
+    # Exactly one telemetry query was issued (the strict transaction-id one).
     telem_queries = [q for q in conn.query_log if "time_bucket" in q]
     assert len(telem_queries) == 1
     assert "transaction_id = $" in telem_queries[0]
+    assert "transaction_id IS NULL OR" not in telem_queries[0]
