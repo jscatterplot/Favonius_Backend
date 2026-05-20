@@ -154,7 +154,7 @@ class SolverPool:
         try:
             executor.shutdown(wait=False, cancel_futures=True)
         except Exception:  # pragma: no cover — defensive
-            return
+            pass
 
         # ``shutdown(wait=False)`` does not stop running calls. Force-terminate
         # worker processes so timeouts don't accumulate orphaned CPU/memory use.
