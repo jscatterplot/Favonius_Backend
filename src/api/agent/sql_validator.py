@@ -291,23 +291,18 @@ def validate_sql(
     # swap + grants.
 
     # 6. Hypertable-backed functions need a time predicate.
+    branch_wheres = _collect_branch_wheres(tree)
     for fn in functions_used:
         if fn not in HYPERTABLE_FUNCTIONS:
             continue
-        where = tree.args.get("where")
-        if where is None and isinstance(tree, exp.Union):
-            # Set ops: check each branch's where; conservative -> require
-            # at least the first to carry a time predicate.
-            inner = tree.this
-            where = inner.args.get("where") if isinstance(inner, exp.Select) else None
-        if where is None:
+        if not branch_wheres:
             return _reject(
                 "missing_time_filter",
                 f"agent_views.{fn} requires a time predicate (e.g. "
                 f"WHERE hour >= now() - interval '7 days'). Without one, "
                 f"the scan is unbounded.",
             )
-        if not _has_time_predicate(where):
+        if not all(_has_time_predicate(where) for where in branch_wheres):
             return _reject(
                 "missing_time_filter",
                 f"agent_views.{fn} requires a time predicate over one of "
@@ -355,21 +350,53 @@ def validate_sql(
 
 
 def _has_time_predicate(where: exp.Where) -> bool:
-    """True iff the WHERE references one of HYPERTABLE_TIME_COLUMNS in a
-    comparison node."""
-    for col in where.find_all(exp.Column):
-        if (col.name or "").lower() in HYPERTABLE_TIME_COLUMNS:
-            # Make sure it's part of a comparison (>, <, BETWEEN, etc.),
-            # not just a SELECT-list projection passing through.
-            parent = col.parent
-            while parent is not None and not isinstance(parent, exp.Where):
-                if isinstance(
-                    parent,
-                    (
-                        exp.GT, exp.GTE, exp.LT, exp.LTE,
-                        exp.EQ, exp.NEQ, exp.Between, exp.In,
-                    ),
-                ):
-                    return True
-                parent = parent.parent
+    """True iff the WHERE has a *bounding* time predicate.
+
+    We reject tautologies like `hour = hour` by requiring a time-column
+    side to be compared against a non-identical expression.
+    """
+    comparisons = (
+        exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ, exp.Between, exp.In
+    )
+    for node in where.walk():
+        if not isinstance(node, comparisons):
+            continue
+        for col in node.find_all(exp.Column):
+            if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
+                continue
+            if _is_nontrivial_time_comparison(node, col):
+                return True
     return False
+
+
+def _collect_branch_wheres(tree: exp.Expression) -> list[exp.Where]:
+    if isinstance(tree, exp.Select):
+        where = tree.args.get("where")
+        return [where] if isinstance(where, exp.Where) else []
+    if isinstance(tree, exp.SetOperation):
+        return _collect_branch_wheres(tree.this) + _collect_branch_wheres(tree.expression)
+    return []
+
+
+def _is_nontrivial_time_comparison(node: exp.Expression, col: exp.Column) -> bool:
+    if isinstance(node, exp.Between):
+        low = node.args.get("low")
+        high = node.args.get("high")
+        return (low is not None and low.sql(dialect="postgres") != col.sql(dialect="postgres")
+                and high is not None and high.sql(dialect="postgres") != col.sql(dialect="postgres"))
+    if isinstance(node, exp.In):
+        values = node.args.get("expressions") or []
+        return any(v.sql(dialect="postgres") != col.sql(dialect="postgres") for v in values)
+
+    left = node.args.get("this")
+    right = node.args.get("expression")
+    if left is None or right is None:
+        return False
+
+    left_sql = left.sql(dialect="postgres")
+    right_sql = right.sql(dialect="postgres")
+    if left_sql == right_sql:
+        return False
+    left_cols = list(left.find_all(exp.Column))
+    right_cols = list(right.find_all(exp.Column))
+    return col in left_cols or col in right_cols

@@ -114,16 +114,16 @@ SET search_path = pg_catalog, public
 AS $$
     SELECT t.vehicle_id,
            t.charger_id,
-           c.depot_id,
+           s.depot_id,
            time_bucket('1 hour', t.time) AS hour,
            AVG(t.soc)                    AS avg_soc,
            MAX(t.charging_kw)            AS peak_charging_kw,
            SUM(CASE WHEN t.charging_kw > 0 THEN 1 ELSE 0 END)::double precision
                                          AS charging_minutes
     FROM public.telemetry t
-    LEFT JOIN public.chargers c ON c.charger_id = t.charger_id
-    WHERE c.depot_id = ANY(p_depot_ids)
-    GROUP BY t.vehicle_id, t.charger_id, c.depot_id, time_bucket('1 hour', t.time)
+    JOIN public.charging_sessions s ON s.session_id = t.session_id
+    WHERE s.depot_id = ANY(p_depot_ids)
+    GROUP BY t.vehicle_id, t.charger_id, s.depot_id, time_bucket('1 hour', t.time)
 $$;
 
 REVOKE ALL    ON FUNCTION agent_views.telemetry_hourly(uuid[]) FROM PUBLIC;
@@ -213,8 +213,8 @@ BEGIN
             SET search_path = pg_catalog, public
             AS 'SELECT NULL::uuid AS depot_id,
                        time_bucket(''1 hour''::interval, ep.time) AS hour,
-                       AVG(ep.price)::numeric AS price_per_kwh,
-                       MAX(ep.currency) AS currency,
+                       AVG(ep.lmp_price_mwh / 1000.0)::numeric AS price_per_kwh,
+                       MAX(ep.price_unit)::text AS currency,
                        MAX(ep.market_type) AS market_type
                 FROM public.electricity_prices ep
                 GROUP BY time_bucket(''1 hour''::interval, ep.time)'
@@ -295,13 +295,13 @@ BEGIN
             AS 'SELECT DISTINCT ON (cs.station_id, cs.connector_id)
                        cs.station_id,
                        cs.connector_id,
-                       c.depot_id,
+                       s.depot_id,
                        cs.status,
                        cs.error_code,
                        cs.timestamp AS last_changed_at
                 FROM public.connector_status cs
-                LEFT JOIN public.chargers c ON c.ocpp_id = cs.station_id
-                WHERE c.depot_id = ANY(p_depot_ids)
+                JOIN public.charging_sessions s ON s.station_id = cs.station_id
+                WHERE s.depot_id = ANY(p_depot_ids)
                 ORDER BY cs.station_id, cs.connector_id, cs.timestamp DESC'
         $body$;
         EXECUTE 'REVOKE ALL    ON FUNCTION agent_views.connector_status_latest(uuid[]) FROM PUBLIC';
