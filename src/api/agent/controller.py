@@ -62,7 +62,7 @@ from src.api.agent.sql_tools import (
     build_sql_agent_tool_registry,
 )
 from src.api.agent.stream import SSEEventStream
-from src.api.agent_workflows.runtime import run_qa_turn
+from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.monitoring.metrics import (
     AGENT_RESOLVER_MISSES,
@@ -487,8 +487,8 @@ async def _run_sql_general_turn(
             temperature=0.0,
             on_step=_on_step,
         )
-    except ToolNotRegisteredError as exc:
-        logger.error("SQL agent ToolNotRegisteredError: %s", exc)
+    except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
+        logger.error("SQL agent tool error: %s", exc)
         reply = AgentReply.error(run_id=run_id)
         await agent_runs_close(ts_pool, run_id, "error", reply)
         if sse is not None:
@@ -551,7 +551,9 @@ async def _run_sql_general_turn(
         )
     reply = AgentReply(
         run_id=run_id,
-        status="not_found" if qa.status in ("no_terminator", "max_iterations") else "error",
+        status="not_found"
+        if qa.status in ("no_terminator", "max_iterations", "success")
+        else "error",
         text=text,
         intent="sql_general",
     )
