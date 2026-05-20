@@ -387,6 +387,35 @@ async def test_fetch_prices_by_zone_forward_fills(pool, cleanup_ids):
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_fetch_prices_by_zone_includes_floored_start_hour(pool, cleanup_ids):
+    """Regression: a 13:30 → 14:30 session needs the 13:00 hour bucket,
+    not just 14:00. The helper must floor ``start_time`` to the hour
+    rather than rounding up — _expected_hour_buckets in the calculator
+    and time_bucket() in the granular SQL both floor."""
+    cleanup_ids["zones"].append(TEST_ZONE)
+    await _seed_prices(
+        pool, TEST_ZONE,
+        {
+            _utc(2026, 5, 19, 13, 0): 0.10,
+            _utc(2026, 5, 19, 14, 0): 0.20,
+        },
+    )
+
+    async with pool.acquire() as conn:
+        filled = await fetch_prices_by_zone(
+            conn, TEST_ZONE,
+            _utc(2026, 5, 19, 13, 30),  # mid-hour start
+            _utc(2026, 5, 19, 14, 30),
+        )
+
+    assert _utc(2026, 5, 19, 13, 0) in filled, "13:00 hour bucket must be returned"
+    assert _utc(2026, 5, 19, 14, 0) in filled
+    assert filled[_utc(2026, 5, 19, 13, 0)] == pytest.approx(0.10)
+    assert filled[_utc(2026, 5, 19, 14, 0)] == pytest.approx(0.20)
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_fetch_prices_by_zone_ignores_legacy_market_rows(pool, cleanup_ids):
     """Only ENTSOE_DAM rows are returned — legacy CAISO LMP rows in the
     same table must be skipped by the helper's market_type filter."""

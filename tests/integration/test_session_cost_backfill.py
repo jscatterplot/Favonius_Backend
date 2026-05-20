@@ -348,3 +348,49 @@ async def test_backfill_dry_run_does_not_write(pool, cleanup, monkeypatch):
     # Row unchanged.
     assert after["cost_total"] == Decimal("0")
     assert after["cost_total_source"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_backfill_resweeps_unpriceable_when_prices_arrive(pool, cleanup, monkeypatch):
+    """Regression: rows the live close path tagged ``unpriceable``
+    (ENTSO-E hadn't published yet) must be picked up again once prices
+    land. The candidate predicate ``cost_total_source IS DISTINCT FROM
+    'manual'`` includes 'unpriceable' / 'no_energy' / 'no_depot' rows
+    so the backfill can heal them."""
+    site_id = uuid4()
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+    # Prices arrive AFTER the live close already wrote 'unpriceable'.
+    await _seed_price(pool, _utc(2026, 5, 5, 8), 0.50)
+    session_id = uuid4()
+    cleanup["sessions"].append(session_id)
+    await _seed_session(
+        pool,
+        session_id=session_id,
+        site_id=site_id,
+        start=_utc(2026, 5, 5, 8),
+        end=_utc(2026, 5, 5, 9),
+        energy_kwh=20.0,
+        cost_total=None,
+        cost_total_source="unpriceable",  # live close path's verdict
+    )
+
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
+    await bf._run(_args(depot_id=site_id, session_ids=[session_id]))
+
+    async with pool.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT cost_total, cost_total_source FROM charging_sessions WHERE session_id = $1",
+            session_id,
+        )
+    assert after["cost_total"] == Decimal("10.0000")  # 20 kWh × €0.50
+    assert after["cost_total_source"] == "fallback_average"

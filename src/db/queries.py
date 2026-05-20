@@ -290,6 +290,12 @@ async def fetch_prices_by_zone(
         return {}
 
     filled: dict[datetime, float] = {}
+    # Always include the hour bucket containing ``start_time`` — a 13:30
+    # session needs the 13:00 price. The granular path's telemetry rows
+    # bucket into that hour via time_bucket('1 hour', …), and
+    # _expected_hour_buckets in the calculator floors start the same way.
+    # Skipping the floored hour here was the off-by-one that left
+    # mid-hour sessions ``unpriceable`` despite DAM prices existing.
     cursor = start_time.replace(minute=0, second=0, microsecond=0)
     while cursor < end_time:
         candidate = None
