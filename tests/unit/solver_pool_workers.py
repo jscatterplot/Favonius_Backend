@@ -1,8 +1,7 @@
 """Trivial worker functions used only by SolverPool unit tests.
 
-Living under ``src/`` keeps them importable by ``spawn``ed child processes
-regardless of how pytest sets up the test package path. They are *not* used
-by production code; the real worker is ``pool._worker_solve``.
+Kept importable as ``tests.unit.solver_pool_workers`` so ``spawn``ed child
+processes can unpickle the worker callables. Not used by production code.
 """
 
 from __future__ import annotations

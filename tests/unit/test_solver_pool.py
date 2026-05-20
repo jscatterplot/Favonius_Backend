@@ -2,7 +2,7 @@
 
 The real ``_worker_solve`` pulls in Pyomo/Gurobi at first call, which would
 defeat the unit-test scope. These tests inject trivial worker functions
-from ``src.core.optimizer._test_workers`` so the pool's lifecycle, recovery,
+from ``tests.unit.solver_pool_workers`` so the pool's lifecycle, recovery,
 and timeout behaviour are exercised in isolation.
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.core.optimizer._test_workers import (
+from tests.unit.solver_pool_workers import (
     crash_worker,
     echo_worker,
     slow_worker,
