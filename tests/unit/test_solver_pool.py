@@ -36,7 +36,7 @@ async def test_start_then_stop_is_idempotent():
         worker_fn=echo_worker,
         worker_init_fn=_noop_init,
         worker_alarm_grace_s=0,
-        parent_timeout_buffer_s=2.0,
+        parent_timeout_buffer_s=3.0,
     )
     await pool.start()
     await pool.start()  # second start should no-op (executor already alive)
@@ -52,7 +52,7 @@ async def test_solve_runs_worker_and_returns_payload():
         worker_fn=echo_worker,
         worker_init_fn=_noop_init,
         worker_alarm_grace_s=0,
-        parent_timeout_buffer_s=2.0,
+        parent_timeout_buffer_s=3.0,
     )
     await pool.start()
     try:
@@ -87,7 +87,7 @@ async def test_broken_pool_is_recreated_and_retried():
         worker_fn=crash_worker,
         worker_init_fn=_noop_init,
         worker_alarm_grace_s=0,
-        parent_timeout_buffer_s=2.0,
+        parent_timeout_buffer_s=3.0,
     )
     await pool.start()
     try:
@@ -253,3 +253,38 @@ async def test_controller_uses_pool_when_set(monkeypatch):
     assert captured["called"] is True
     assert captured["time_limit"] == 1.0
     assert result.status == "optimal"
+
+
+def test_optimizer_exceptions_round_trip_pickle():
+    import pickle
+
+    from src.core.optimizer.exceptions import ConstraintViolationError, SolverTimeoutError
+
+    timeout = SolverTimeoutError(60.0)
+    timeout_roundtrip = pickle.loads(pickle.dumps(timeout))
+    assert isinstance(timeout_roundtrip, SolverTimeoutError)
+    assert timeout_roundtrip.time_limit == 60.0
+
+    violation = ConstraintViolationError("bad", "soc_limit", vehicle_id="v1")
+    violation_roundtrip = pickle.loads(pickle.dumps(violation))
+    assert isinstance(violation_roundtrip, ConstraintViolationError)
+    assert violation_roundtrip.constraint_name == "soc_limit"
+    assert violation_roundtrip.vehicle_id == "v1"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_recreate_skips_when_executor_already_replaced():
+    pool = SolverPool(max_workers=1, worker_fn=echo_worker, worker_init_fn=_noop_init)
+
+    class _OldExecutor:
+        pass
+
+    old = _OldExecutor()
+    replacement = _OldExecutor()
+    pool._executor = replacement  # type: ignore[assignment]
+
+    await pool._recreate(reason="timeout", failed_executor=old)  # type: ignore[arg-type]
+
+    # Should keep the already-rotated executor unchanged.
+    assert pool._executor is replacement

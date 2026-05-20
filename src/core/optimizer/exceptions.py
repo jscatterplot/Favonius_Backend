@@ -30,6 +30,9 @@ class SolverTimeoutError(OptimizationError):
         self.time_limit = time_limit
         self.message = message
 
+    def __reduce__(self):
+        return (self.__class__, (self.time_limit, self.message))
+
 
 class SolverError(OptimizationError):
     """Raised when solver encounters an error."""
@@ -70,3 +73,6 @@ class ConstraintViolationError(OptimizationError):
         self.message = message
         self.constraint_name = constraint_name
         self.vehicle_id = vehicle_id
+
+    def __reduce__(self):
+        return (self.__class__, (self.message, self.constraint_name, self.vehicle_id))

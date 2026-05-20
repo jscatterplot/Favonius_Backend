@@ -140,9 +140,12 @@ class SolverPool:
             await asyncio.to_thread(executor.shutdown, True, cancel_futures=True)
             logger.info("SolverPool stopped")
 
-    async def _recreate(self, reason: str) -> None:
+    async def _recreate(self, reason: str, failed_executor: Optional[ProcessPoolExecutor] = None) -> None:
         SOLVER_POOL_BROKEN.labels(reason=reason).inc()
         async with self._lock:
+            # If another task already rotated the pool, do not replace it again.
+            if failed_executor is not None and self._executor is not failed_executor:
+                return
             old = self._executor
             self._executor = self._make_executor()
         if old is not None:
@@ -179,13 +182,14 @@ class SolverPool:
 
         last_exc: Optional[BaseException] = None
         for attempt in (1, 2):
-            if self._executor is None:
+            executor = self._executor
+            if executor is None:
                 raise RuntimeError("SolverPool is not started")
             loop = asyncio.get_event_loop()
             SOLVER_POOL_INFLIGHT.inc()
             try:
                 future = loop.run_in_executor(
-                    self._executor,
+                    executor,
                     self._worker_fn,
                     state,
                     config,
@@ -202,7 +206,7 @@ class SolverPool:
                     attempt,
                     exc_info=True,
                 )
-                await self._recreate(reason="broken_pool")
+                await self._recreate(reason="broken_pool", failed_executor=executor)
             except asyncio.TimeoutError as exc:
                 last_exc = exc
                 logger.error(
@@ -213,7 +217,7 @@ class SolverPool:
                 # The runaway worker may still be holding a slot. Burn the
                 # executor so the OS reaps the orphan and the next call starts
                 # clean.
-                await self._recreate(reason="timeout")
+                await self._recreate(reason="timeout", failed_executor=executor)
                 if attempt == 2:
                     raise SolverTimeoutError(time_limit) from exc
             finally:
