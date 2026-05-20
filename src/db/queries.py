@@ -275,6 +275,17 @@ async def fetch_prices_by_zone(
         ``[start_time, end_time)`` whose value is the €/kWh price for
         that hour. Hours absent from the dict have no usable price.
     """
+    # ``electricity_prices.time`` is TIMESTAMPTZ — asyncpg always
+    # returns timezone-aware datetimes. Naive callers (e.g.
+    # StateAssembler._get_prices using datetime.utcnow()) would compare
+    # naive vs aware below and either raise TypeError or silently miss
+    # the price map entirely. Normalize the inputs to UTC-aware here so
+    # the helper accepts either flavor from any caller; the row-side
+    # normalization below covers the symmetric case where the database
+    # client returns naive datetimes (some test fakes do this).
+    start_time = _as_utc_aware(start_time)
+    end_time = _as_utc_aware(end_time)
+
     rows = await db.fetch(
         """
         SELECT time, lmp_price_mwh
@@ -292,8 +303,6 @@ async def fetch_prices_by_zone(
     if not rows:
         return {}
 
-    start_time = _as_utc_aware(start_time)
-    end_time = _as_utc_aware(end_time)
 
     known: list[tuple[datetime, float]] = []
     for row in rows:

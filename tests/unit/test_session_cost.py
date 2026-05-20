@@ -207,6 +207,11 @@ async def test_granular_varying_kw() -> None:
             "first_time": _utc(2026, 5, 19, 13, 0),
             "last_time": _utc(2026, 5, 19, 13, 30),
             "sample_count": 4,
+            # observed_seconds mirrors the granular SQL: SUM of all
+            # consecutive-sample Δt within the bucket, including the
+            # cross-bucket interval to the first sample in hour 14
+            # (LEAD is no longer partitioned by hour).
+            "observed_seconds": 3600.0,  # 13:00 → 14:00 = 1h continuous coverage
             "energy_kwh": 10.0,  # ramp-up
         },
         {
@@ -214,6 +219,7 @@ async def test_granular_varying_kw() -> None:
             "first_time": _utc(2026, 5, 19, 14, 0),
             "last_time": _utc(2026, 5, 19, 14, 50),
             "sample_count": 4,
+            "observed_seconds": 3000.0,  # 14:00 → 14:50
             "energy_kwh": 40.0,  # steady at peak
         },
     ]
@@ -610,3 +616,85 @@ async def test_write_session_cost_query_filters_manual_and_priced() -> None:
     query, _args = conn.execute_calls[0]
     assert "cost_total IS NULL OR cost_total = 0" in query
     assert "cost_total_source IS DISTINCT FROM 'manual'" in query
+
+
+@pytest.mark.asyncio
+async def test_write_session_cost_writes_null_not_zero_for_unpriceable() -> None:
+    """Regression: the UPDATE must SET cost_total = $2 directly, not
+    COALESCE($2, cost_total). For an 'unpriceable' result $2 is NULL,
+    and we want the column to land as NULL — historical imports landed
+    cost_total=0, and COALESCE would have left them at 0 (looking like
+    a free session) instead of normalizing to NULL."""
+    conn = _FakeConn()
+    pool = _FakePool(conn)
+    result = SessionCostResult(cost=None, source="unpriceable")
+
+    await write_session_cost(pool, SESSION, result)
+    query, args = conn.execute_calls[0]
+    assert "COALESCE" not in query.upper().replace("CORRELATION", "")
+    assert "SET cost_total        = $2" in query or "SET cost_total = $2" in query
+    # $2 must be NULL for the unpriceable case.
+    assert args[1] is None
+
+
+@pytest.mark.asyncio
+async def test_granular_unpriced_bucket_falls_back_not_short_circuits() -> None:
+    """Regression: when granular's per-bucket loop hits an unpriced
+    hour, the dispatcher must continue to ``_fallback_average`` rather
+    than short-circuit to ``'unpriceable'``. _try_granular signals
+    'try fallback' with ``None``; the dispatcher owns the final verdict.
+
+    Scenario: telemetry covers a single hour (priced); session window
+    extends one extra hour into an UNpriced region. Granular sees an
+    unpriced bucket, so it bails. Fallback also can't price the full
+    window (gap > 1h in expected_hour_buckets) → 'unpriceable'.
+    The contract here is *the path taken*, not the final source.
+    """
+    # Two hours of telemetry: 13:00 bucket fully priced, 14:00 absent
+    # from price_map → granular finds an unpriced bucket and must
+    # fall through to fallback (not emit unpriceable directly).
+    telem = [
+        {
+            "hour": _utc(2026, 5, 19, 13, 0),
+            "first_time": _utc(2026, 5, 19, 13, 0),
+            "last_time": _utc(2026, 5, 19, 13, 59),
+            "sample_count": 60,
+            "observed_seconds": 3540.0,
+            "energy_kwh": 25.0,
+        },
+        {
+            "hour": _utc(2026, 5, 19, 14, 0),
+            "first_time": _utc(2026, 5, 19, 14, 0),
+            "last_time": _utc(2026, 5, 19, 14, 50),
+            "sample_count": 50,
+            "observed_seconds": 3000.0,
+            "energy_kwh": 25.0,
+        },
+    ]
+    pool = _FakePool(_FakeConn(telem))
+    # Only hour 13 priced; hour 14 deliberately missing.
+    lookup = _make_lookup({_utc(2026, 5, 19, 13, 0): 0.20})
+
+    row = _session_row(
+        start_time=_utc(2026, 5, 19, 13, 0),
+        end_time=_utc(2026, 5, 19, 15, 0),
+        energy_delivered_kwh=Decimal("50.0"),
+    )
+    result = await compute_session_cost(pool, row, price_lookup=lookup)
+    # Fallback couldn't price hour 14 either → unpriceable. The
+    # important thing is we *reached* fallback (which sets source
+    # to 'unpriceable' via the missing-hour path, not granular).
+    assert result.source == "unpriceable"
+    # Telemetry diagnostics are absent when fallback emits — granular
+    # didn't emit a result. The earlier short-circuit version included
+    # granular's diagnostics in the unpriceable result.
+    assert result.energy_kwh_from_telemetry is None
+    assert result.telemetry_coverage is None
+
+
+# The naive/aware regression target is the optimizer +
+# fetch_prices_by_zone combination; tests/unit/test_state_assembler.py
+# already exercises that with datetime.utcnow() (naive) → aware-keyed
+# price map. A standalone test here would have to use a fake lookup
+# that bypasses the real helper's normalization, which would defeat
+# the purpose.

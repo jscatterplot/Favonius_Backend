@@ -237,12 +237,16 @@ async def compute_session_cost(
 _GRANULAR_TELEMETRY_SQL = """
             WITH bucketed AS (
                 SELECT
-                    time_bucket('1 hour', t.time) AS hour,
                     t.time,
                     t.charging_kw,
-                    LEAD(t.time) OVER (
-                        PARTITION BY time_bucket('1 hour', t.time) ORDER BY t.time
-                    ) AS next_time
+                    -- LEAD across the whole vehicle/charger timeline, not
+                    -- partitioned by hour. Partitioning would set
+                    -- next_time = NULL for the last sample in each hour
+                    -- bucket, dropping the cross-hour interval — a
+                    -- systematic undercount for typical telemetry
+                    -- cadences that don't align to :00.
+                    LEAD(t.time) OVER (ORDER BY t.time) AS next_time,
+                    LEAD(t.charging_kw) OVER (ORDER BY t.time) AS next_kw
                 FROM telemetry t
                 WHERE {where_clause}
                   AND t.time >= ${time_start}
@@ -251,19 +255,33 @@ _GRANULAR_TELEMETRY_SQL = """
                   AND t.charging_kw > 0
             )
             SELECT
-                hour,
+                time_bucket('1 hour', time) AS hour,
                 MIN(time) AS first_time,
                 MAX(time) AS last_time,
                 COUNT(*) AS sample_count,
+                -- observed_seconds is the SUM of every interval's
+                -- duration. With LEAD un-partitioned, this captures
+                -- cross-hour intervals too. Used by the coverage gate
+                -- (instead of last-first span, which let two sparse
+                -- boundary samples masquerade as full coverage).
+                COALESCE(
+                    SUM(EXTRACT(EPOCH FROM (next_time - time)))
+                        FILTER (WHERE next_time IS NOT NULL),
+                    0
+                ) AS observed_seconds,
+                -- Trapezoidal integration: average the two endpoints
+                -- of each interval before multiplying by Δt. Earlier
+                -- draft used left-Riemann (kw_i × Δt) which mis-prices
+                -- ramping/tapering sessions.
                 COALESCE(
                     SUM(
-                        charging_kw
+                        (charging_kw + COALESCE(next_kw, charging_kw)) / 2.0
                         * EXTRACT(EPOCH FROM (next_time - time)) / 3600.0
                     ) FILTER (WHERE next_time IS NOT NULL),
                     0
                 ) AS energy_kwh
             FROM bucketed
-            GROUP BY hour
+            GROUP BY time_bucket('1 hour', time)
             ORDER BY hour
             """
 
@@ -349,11 +367,25 @@ async def _try_granular(
     if telem_energy <= 0:
         return None
 
-    # Coverage gate: telemetry timestamps span what fraction of the session?
-    first = min(r["first_time"] for r in rows)
-    last = max(r["last_time"] for r in rows)
+    # Coverage gate: fraction of the session window that telemetry
+    # actually observed. observed_seconds is the SUM of every per-
+    # interval Δt produced by the granular SQL — the honest measure.
+    # The earlier draft used (last_sample - first_sample) /
+    # session_duration, which let two sparse samples at the window's
+    # edges fake near-full coverage while a big gap in between went
+    # unnoticed. Fall back to last-first when the row doesn't carry
+    # observed_seconds (legacy callers / test fakes that pre-date the
+    # SQL change) so this stays backward-compatible.
+    observed_seconds = sum(
+        float(
+            r["observed_seconds"]
+            if "observed_seconds" in r
+            else (r["last_time"] - r["first_time"]).total_seconds()
+        )
+        for r in rows
+    )
     session_seconds = (end_time - start_time).total_seconds()
-    coverage = (last - first).total_seconds() / session_seconds if session_seconds > 0 else 0.0
+    coverage = observed_seconds / session_seconds if session_seconds > 0 else 0.0
 
     # Energy reconciliation gate.
     if energy_delivered_kwh and energy_delivered_kwh > 0:
@@ -487,9 +519,15 @@ async def write_session_cost(
 
     cost_value = result.cost if result.source in ("granular", "fallback_average") else None
 
+    # Write ``cost_total`` directly — no COALESCE. Historical imports
+    # land ``cost_total = 0``; when the calculator returns
+    # ``'unpriceable'`` / ``'no_energy'`` / ``'no_depot'`` we want the
+    # column to land as NULL (the module contract) so readers can tell
+    # "billing couldn't price this" apart from "session was actually
+    # free". COALESCE preserved the zero, contradicting the contract.
     update_sql = """
             UPDATE charging_sessions
-               SET cost_total        = COALESCE($2, cost_total),
+               SET cost_total        = $2,
                    cost_total_source = $3,
                    updated_at        = NOW()
              WHERE session_id = $1

@@ -6,7 +6,7 @@ Reference: Development plan Step 4.1, PRD.md#5-system-architecture
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -377,6 +377,14 @@ class StateAssembler:
             List of prices in $/kWh, one per timestep
 
         Note:
+            Normalizes ``start`` / ``end`` to aware UTC before calling
+            the price helper. asyncpg returns ``electricity_prices.time``
+            as aware TIMESTAMPTZ, and the helper now returns a dict
+            keyed by aware datetimes; controllers built around naive
+            ``datetime.utcnow()`` would otherwise look up aware keys
+            with naive ones and miss every match.
+
+        Note:
             Resolves the depot's ENTSO-E bidding zone via
             :func:`src.db.queries.resolve_bidding_zone` (cached on the
             assembler instance), then delegates to
@@ -396,6 +404,13 @@ class StateAssembler:
             fetch_prices_by_zone,
             resolve_bidding_zone,
         )
+
+        # Normalize to aware UTC so dict lookups against the helper's
+        # aware-keyed map line up regardless of caller-side flavor.
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
 
         # Cache the zone on the instance — sites.tariff_config / sites.timezone
         # don't change inside a controller's lifetime, and this avoids a
@@ -446,7 +461,15 @@ class StateAssembler:
         default_price_kwh = 0.15
         delta_t = timedelta(hours=self.config.delta_t)
         prices: list[float] = []
-
+        # Per-step lookup: each timestep maps to its hour-floor and is
+        # priced from price_map at that hour. Earlier draft carried a
+        # ``last_price`` cursor that survived across hour gaps, so a
+        # multi-hour price gap silently extended the most recent priced
+        # hour's value across all later timesteps instead of reverting
+        # to default. fetch_prices_by_zone already forward-fills within
+        # 1h before the dict reaches us; if the hour is still missing
+        # we hunt for the closest known hour within 1h (defense in
+        # depth) and finally fall back to ``default_price_kwh``.
         for t in range(n_steps):
             step_time = start_utc + t * delta_t
             hour_floor = _hour_floor_utc(step_time)
