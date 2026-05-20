@@ -60,10 +60,10 @@ async def test_fetch_entsoe_prices_passes_resolved_zone_to_adapter():
     service.entsoe_adapter.get_prices_for_depot.assert_awaited_once()
     kwargs = service.entsoe_adapter.get_prices_for_depot.await_args.kwargs
     assert kwargs["bidding_zone"] == override_zone
-    # Storage must use the same zone — read and write paths agree.
-    service.entsoe_adapter.store_prices_to_db.assert_awaited_once()
-    store_args = service.entsoe_adapter.store_prices_to_db.await_args.args
-    assert override_zone in store_args
+    # The adapter handles storage internally now; ingestion no longer
+    # double-writes. Read and write paths agree because both reuse the
+    # same resolved zone the ingestion service injected.
+    service.entsoe_adapter.store_prices_to_db.assert_not_awaited()
 
 
 @pytest.mark.asyncio

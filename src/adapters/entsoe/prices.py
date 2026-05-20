@@ -234,32 +234,36 @@ class ENTSOEAdapter:
         # match on ``market_type = 'ENTSOE_DAM'``.
         _ = source
 
-        rows = [
-            (price.timestamp, bidding_zone, price.price_eur_mwh)
-            for price in prices
-        ]
+        # UNNEST-based bulk insert with RETURNING so we can count
+        # actually-inserted rows. ``executemany`` discards per-row
+        # results, and ON CONFLICT DO NOTHING makes ``execute`` report
+        # 'INSERT 0 N' where N counts the *attempts*, not the inserts.
+        # Reporting the attempted count over-stated success when the
+        # feeder ran on its 15-minute cadence against an already-warm
+        # table; almost every row was a no-op and we logged it as a
+        # win. ``RETURNING 1`` yields one row per inserted record only.
+        times = [price.timestamp for price in prices]
+        amounts = [price.price_eur_mwh for price in prices]
 
         query = """
         INSERT INTO electricity_prices (time, node_id, market_type, lmp_price_mwh)
-        VALUES ($1, $2, 'ENTSOE_DAM', $3)
+        SELECT t.time, $2, 'ENTSOE_DAM', t.price
+        FROM UNNEST($1::timestamptz[], $3::float8[]) AS t(time, price)
         ON CONFLICT (time, node_id, market_type) DO NOTHING
+        RETURNING 1
         """
 
         try:
             async with self.pool.acquire() as conn:
-                # ``executemany`` doesn't report per-row affected
-                # counts for ON CONFLICT DO NOTHING. Run the inserts
-                # in a single transaction and report the requested
-                # row count — actual inserts may be fewer if the WS
-                # feeder beat us to some hours.
                 async with conn.transaction():
-                    await conn.executemany(query, rows)
+                    inserted = await conn.fetch(query, times, bidding_zone, amounts)
+            stored = len(inserted)
 
             logger.info(
-                "Stored %d ENTSO-E prices for zone %s (source: %s)",
-                len(rows), bidding_zone, source,
+                "Stored %d/%d ENTSO-E prices for zone %s (source: %s)",
+                stored, len(prices), bidding_zone, source,
             )
-            return len(rows)
+            return stored
 
         except asyncpg.PostgresError as e:
             logger.error("Database error storing ENTSO-E prices: %s", e)

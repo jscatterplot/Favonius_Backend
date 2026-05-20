@@ -208,6 +208,14 @@ class PriceIngestionService:
             )
             return 0
 
+        # ``get_prices_for_depot`` already calls ``store_prices_to_db``
+        # internally when it fetches fresh data (see entsoe/prices.py).
+        # Earlier draft also called ``store_prices_to_db`` here on the
+        # returned list — with ON CONFLICT DO NOTHING that second pass
+        # was harmless but ran a full insert batch inside a transaction
+        # every ingestion tick for zero effect. Drop the duplicate and
+        # rely on the adapter's storage path; the returned list is the
+        # fetch count, which we report directly.
         prices = await self.entsoe_adapter.get_prices_for_depot(
             depot_id=depot_id,
             start_date=start_date,
@@ -219,16 +227,13 @@ class PriceIngestionService:
         )
 
         if prices:
-            stored = await self.entsoe_adapter.store_prices_to_db(
-                prices, zone, source="entsoe_dam"
-            )
             logger.info(
-                f"Stored {stored} ENTSO-E prices for zone {zone} "
+                f"Fetched {len(prices)} ENTSO-E prices for zone {zone} "
                 f"(depot={depot_id}, timezone={depot_timezone})"
             )
             if fetched_zones is not None:
                 fetched_zones.add(zone)
-            return stored
+            return len(prices)
         else:
             logger.warning(
                 f"No ENTSO-E prices fetched for depot {depot_id} (timezone: {depot_timezone})"
