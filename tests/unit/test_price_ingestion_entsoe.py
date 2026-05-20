@@ -68,9 +68,14 @@ async def test_fetch_entsoe_prices_passes_resolved_zone_to_adapter():
 
 @pytest.mark.asyncio
 async def test_fetch_entsoe_prices_dedups_within_fetched_zones_set():
-    """Second depot in the same zone must read from cache (use_cache=True),
-    not punch the ENTSO-E API again. ``fetched_zones`` is the per-run
-    coordination set populated by the first depot's fetch."""
+    """Second depot in the same zone must short-circuit before any adapter
+    call. Earlier draft used ``use_cache=True`` for depots 2..N, but
+    ``_get_cached_prices`` accepts any non-empty slice — including stale
+    rows from a prior day's ingestion — and the second depot would
+    silently inherit incomplete coverage. The first depot's fresh fetch
+    is the canonical source for the run; the table is already populated
+    for every consumer (calculator + optimizer) when the second depot's
+    turn comes around."""
     service = _service_with_mocked_adapters()
     zone = "10YLT-1001A0008Q"  # Lithuania
     fetched_zones: set[str] = set()
@@ -79,7 +84,7 @@ async def test_fetch_entsoe_prices_dedups_within_fetched_zones_set():
         "src.db.queries.resolve_bidding_zone",
         new=AsyncMock(return_value=zone),
     ):
-        # First depot — uncached, populates the set.
+        # First depot — fetches and stores.
         await service._fetch_entsoe_prices(
             str(uuid4()),
             datetime(2026, 5, 20, 10, 0),
@@ -90,8 +95,9 @@ async def test_fetch_entsoe_prices_dedups_within_fetched_zones_set():
         first_call = service.entsoe_adapter.get_prices_for_depot.await_args.kwargs
         assert first_call["use_cache"] is False
         assert zone in fetched_zones
+        assert service.entsoe_adapter.get_prices_for_depot.await_count == 1
 
-        # Second depot in the same zone — cached.
+        # Second depot in the same zone — no adapter call at all.
         await service._fetch_entsoe_prices(
             str(uuid4()),
             datetime(2026, 5, 20, 10, 0),
@@ -99,8 +105,9 @@ async def test_fetch_entsoe_prices_dedups_within_fetched_zones_set():
             depot_timezone="Europe/Vilnius",
             fetched_zones=fetched_zones,
         )
-        second_call = service.entsoe_adapter.get_prices_for_depot.await_args.kwargs
-        assert second_call["use_cache"] is True
+        assert service.entsoe_adapter.get_prices_for_depot.await_count == 1, (
+            "second depot must not call the adapter — the table is already populated"
+        )
 
 
 @pytest.mark.asyncio
@@ -156,9 +163,10 @@ async def test_fetch_prices_for_all_depots_shares_one_set_per_run():
     ):
         await service.fetch_prices_for_all_depots()
 
-    # Two calls to the adapter total — one per depot. The second one
-    # must have read from cache.
+    # Exactly one adapter call across both depots — the first one
+    # fetches and stores; the second is short-circuited because the
+    # zone is already in ``fetched_zones`` and ``electricity_prices``
+    # already holds the data the second depot would have read.
     calls = service.entsoe_adapter.get_prices_for_depot.await_args_list
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0].kwargs["use_cache"] is False
-    assert calls[1].kwargs["use_cache"] is True

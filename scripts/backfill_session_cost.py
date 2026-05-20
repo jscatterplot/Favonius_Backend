@@ -212,6 +212,43 @@ class ZoneResolver:
         return zone
 
 
+class SiteResolver:
+    """Caches ``station_id → site_id`` for the duration of the backfill.
+
+    Live ``charging_sessions`` rows close with ``site_id = NULL`` because
+    ``insert_open_session`` doesn't write it (no Supabase round-trip on
+    the StartTransaction hot path). The WS-handler post-close cost task
+    backfills site_id in memory, but if that task never wrote a cost
+    (process killed before await, ENTSO-E timeout, etc.) the row sits
+    in the DB with ``site_id = NULL`` and ``cost_total = NULL`` —
+    exactly the case the documented safety net is supposed to handle.
+    Without this resolver the backfill would re-discover the
+    ``'no_depot'`` short-circuit for every live row and never price them.
+
+    Supabase's ``charging_stations`` table maps OCPP ``station_id`` →
+    ``site_id``. Stations rarely move between depots; one cached
+    lookup per station covers thousands of sessions.
+    """
+
+    def __init__(self, static_pool: asyncpg.Pool) -> None:
+        self._pool = static_pool
+        self._cache: dict[str, Optional[UUID]] = {}
+
+    async def __call__(self, station_id: Optional[str]) -> Optional[UUID]:
+        if not station_id:
+            return None
+        if station_id in self._cache:
+            return self._cache[station_id]
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT site_id FROM charging_stations WHERE station_id = $1 LIMIT 1",
+                station_id,
+            )
+        site_id = row["site_id"] if row else None
+        self._cache[station_id] = site_id
+        return site_id
+
+
 def _resolve_ts_url() -> str:
     url = os.getenv("DATABASE_URL") or os.getenv("TIMESCALE_SERVICE_URL")
     if not url:
@@ -267,6 +304,7 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         price_cache = LRUPriceLookup(ts_pool)
         zone_resolver = ZoneResolver(static_pool)
+        site_resolver = SiteResolver(static_pool)
         counts: Counter[str] = Counter()
         processed = 0
         # Within-run cursor advances past every session we already
@@ -331,6 +369,14 @@ async def _run(args: argparse.Namespace) -> int:
 
             for row in rows:
                 row_dict = dict(row)
+                # Live sessions land with site_id=NULL because
+                # insert_open_session skips the Supabase round-trip on
+                # the StartTransaction hot path. Without this backfill,
+                # those rows would short-circuit to 'no_depot' on every
+                # safety-net sweep — the exact case the backfill exists
+                # to rescue. Cached one round-trip per station_id.
+                if row_dict.get("site_id") is None:
+                    row_dict["site_id"] = await site_resolver(row_dict.get("station_id"))
                 row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))
                 result = await compute_session_cost(
                     ts_pool,

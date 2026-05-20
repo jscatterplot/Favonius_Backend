@@ -190,11 +190,23 @@ class PriceIngestionService:
             )
             return 0
 
-        # If this zone was already pulled by another depot in this
-        # run, prefer the freshly-populated cache. ``electricity_prices``
-        # is keyed by zone, so two depots sharing a zone share the
-        # exact same row set.
-        use_cache = fetched_zones is not None and zone in fetched_zones
+        # ``electricity_prices`` is keyed by zone, so once one depot
+        # in this run has fetched + stored, every other depot in the
+        # same zone is reading the same hypertable rows. Earlier draft
+        # toggled ``use_cache=True`` for depots 2..N, but that read
+        # back any non-empty slice from the table — including stale
+        # rows left by a prior day's ingestion — and called it done.
+        # Short-circuiting here keeps depots 2..N from hitting the
+        # cache (or the API) at all: the first depot did the only
+        # ingestion work the zone needs, and the calculator / optimizer
+        # will read the freshly-stored rows directly when they next
+        # consult ``electricity_prices``.
+        if fetched_zones is not None and zone in fetched_zones:
+            logger.debug(
+                "Zone %s already ingested this run (depot=%s); skipping",
+                zone, depot_id,
+            )
+            return 0
 
         prices = await self.entsoe_adapter.get_prices_for_depot(
             depot_id=depot_id,
@@ -202,7 +214,7 @@ class PriceIngestionService:
             end_date=end_date,
             depot_timezone=depot_timezone,
             bidding_zone=zone,
-            use_cache=use_cache,
+            use_cache=False,
             source="entsoe_dam",
         )
 
