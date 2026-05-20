@@ -114,7 +114,7 @@ SET search_path = pg_catalog, public
 AS $$
     SELECT t.vehicle_id,
            t.charger_id,
-           s.depot_id,
+           s.site_id,
            time_bucket('1 hour', t.time) AS hour,
            AVG(t.soc)                    AS avg_soc,
            MAX(t.charging_kw)            AS peak_charging_kw,
@@ -122,8 +122,8 @@ AS $$
                                          AS charging_minutes
     FROM public.telemetry t
     JOIN public.charging_sessions s ON s.session_id = t.session_id
-    WHERE s.depot_id = ANY(p_depot_ids)
-    GROUP BY t.vehicle_id, t.charger_id, s.depot_id, time_bucket('1 hour', t.time)
+    WHERE s.site_id = ANY(p_depot_ids)
+    GROUP BY t.vehicle_id, t.charger_id, s.site_id, time_bucket('1 hour', t.time)
 $$;
 
 REVOKE ALL    ON FUNCTION agent_views.telemetry_hourly(uuid[]) FROM PUBLIC;
@@ -295,13 +295,13 @@ BEGIN
             AS 'SELECT DISTINCT ON (cs.station_id, cs.connector_id)
                        cs.station_id,
                        cs.connector_id,
-                       s.depot_id,
+                       s.site_id,
                        cs.status,
                        cs.error_code,
                        cs.timestamp AS last_changed_at
                 FROM public.connector_status cs
                 JOIN public.charging_sessions s ON s.station_id = cs.station_id
-                WHERE s.depot_id = ANY(p_depot_ids)
+                WHERE s.site_id = ANY(p_depot_ids)
                 ORDER BY cs.station_id, cs.connector_id, cs.timestamp DESC'
         $body$;
         EXECUTE 'REVOKE ALL    ON FUNCTION agent_views.connector_status_latest(uuid[]) FROM PUBLIC';
