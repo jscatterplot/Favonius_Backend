@@ -53,7 +53,7 @@ _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
 # back to sql_general (e.g. "which charger consumed the most" is a
 # ranking question, not a per-user consumption question).
 _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bwhich (depot|charger|vehicle|driver)\b"),
+    re.compile(r"\bwhich (depots?|chargers?|vehicles?|drivers?)\b"),
     re.compile(r"\bcompare\b"),
     re.compile(r"\bunderutil"),
     re.compile(r"\bfault"),

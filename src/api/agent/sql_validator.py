@@ -333,33 +333,16 @@ def validate_sql(
                     f"NOT count.",
                 )
 
-    # 7. LIMIT injection / cap.
-    limit_node = tree.args.get("limit")
-    if isinstance(tree, exp.Union):
-        # Union-level limit: walk to the outermost. sqlglot puts LIMIT on
-        # the Union when it's a trailing top-level limit.
-        pass
-
-    if limit_node is None:
-        tree.set("limit", exp.Limit(expression=exp.Literal.number(row_limit)))
-    else:
-        # Cap user-supplied LIMIT to row_limit.
-        expr = limit_node.expression
-        if isinstance(expr, exp.Literal) and not expr.is_string:
-            try:
-                user_n = int(str(expr.name))
-            except ValueError:
-                user_n = row_limit
-            if user_n > row_limit or user_n < 1:
-                limit_node.set("expression", exp.Literal.number(row_limit))
-        else:
-            # Non-literal LIMIT (e.g. a parameter) is rejected — keeps the
-            # cap deterministic.
-            return _reject(
-                "non_literal_limit",
-                "LIMIT must be a non-negative integer literal "
-                f"(≤ {row_limit}).",
-            )
+    # 7. LIMIT injection / cap — every SELECT branch and the root.
+    # Per-branch LIMITs on UNION/INTERSECT/EXCEPT run before the outer
+    # LIMIT; uncapped branches can scan huge row sets within the timeout.
+    for select_node in _iter_selects(tree):
+        rej = _apply_row_limit_on_node(select_node, row_limit)
+        if rej is not None:
+            return rej
+    rej = _apply_row_limit_on_node(tree, row_limit)
+    if rej is not None:
+        return rej
 
     canonical = tree.sql(dialect="postgres")
     return ValidationResult(
@@ -370,6 +353,31 @@ def validate_sql(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _apply_row_limit_on_node(
+    node: exp.Expression,
+    row_limit: int,
+) -> Optional[ValidationResult]:
+    """Inject or cap LIMIT on one AST node (Select, Union, etc.)."""
+    limit_node = node.args.get("limit")
+    if limit_node is None:
+        node.set("limit", exp.Limit(expression=exp.Literal.number(row_limit)))
+        return None
+    expr = limit_node.expression
+    if isinstance(expr, exp.Literal) and not expr.is_string:
+        try:
+            user_n = int(str(expr.name))
+        except ValueError:
+            user_n = row_limit
+        if user_n > row_limit or user_n < 1:
+            limit_node.set("expression", exp.Literal.number(row_limit))
+        return None
+    return _reject(
+        "non_literal_limit",
+        "LIMIT must be a non-negative integer literal "
+        f"(≤ {row_limit}).",
+    )
 
 
 def _iter_selects(tree: exp.Expression) -> "list[exp.Select]":
