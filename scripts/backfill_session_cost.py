@@ -84,6 +84,8 @@ _CANDIDATE_SQL = """
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
        AND cost_total_source IS DISTINCT FROM 'manual'
+       AND cost_total_source IS DISTINCT FROM 'no_energy'
+       AND cost_total_source IS DISTINCT FROM 'no_depot'
        AND ($1::uuid IS NULL OR site_id = $1)
      ORDER BY end_time
      LIMIT $2
@@ -98,6 +100,8 @@ _CANDIDATE_BY_SESSION_SQL = """
      WHERE end_time IS NOT NULL
        AND (cost_total IS NULL OR cost_total = 0)
        AND cost_total_source IS DISTINCT FROM 'manual'
+       AND cost_total_source IS DISTINCT FROM 'no_energy'
+       AND cost_total_source IS DISTINCT FROM 'no_depot'
        AND ($1::uuid IS NULL OR site_id = $1)
        AND session_id = ANY($3::uuid[])
      ORDER BY end_time
@@ -268,6 +272,7 @@ async def _run(args: argparse.Namespace) -> int:
                 if not rows:
                     break
 
+                chunk_priced = 0
                 for row in rows:
                     row_dict = dict(row)
                     row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))
@@ -277,6 +282,8 @@ async def _run(args: argparse.Namespace) -> int:
                         price_lookup=price_cache,
                     )
                     counts[result.source] += 1
+                    if result.source in ("granular", "fallback_average"):
+                        chunk_priced += 1
                     if args.dry_run:
                         logger.info(
                             "DRY session=%s source=%s cost=%s",
@@ -303,6 +310,11 @@ async def _run(args: argparse.Namespace) -> int:
                 # Dry-run never mutates rows; the candidate predicate
                 # would match the same chunk forever.
                 if args.dry_run:
+                    break
+                # Apply mode: stop when this chunk could not price any row.
+                # Unpriceable rows stay eligible across runs (prices may
+                # arrive later) but must not spin on the same batch.
+                if chunk_priced == 0:
                     break
 
         logger.info(

@@ -2792,8 +2792,9 @@ class TimescaleClient:
             row_dict["bidding_zone"] = await self._resolve_bidding_zone(row_dict.get("site_id"))
 
             result = await compute_session_cost(self.pg_pool, row_dict)
-            await write_session_cost(self.pg_pool, session_id, result)
-            SESSION_COST_COMPUTED.labels(source=result.source).inc()
+            wrote = await write_session_cost(self.pg_pool, session_id, result)
+            if wrote:
+                SESSION_COST_COMPUTED.labels(source=result.source).inc()
         except asyncpg.PostgresError as exc:
             self.logger.exception("DB error computing cost for session %s: %s", session_id, exc)
             SESSION_COST_COMPUTE_FAILURES.labels(reason="db_error").inc()
