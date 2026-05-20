@@ -373,6 +373,7 @@ async def lifespan(app: FastAPI):
     from ..core.optimizer.pool import SolverPool, set_solver_pool
 
     if os.getenv("SOLVER_PROCESS_POOL_DISABLED", "false").lower() == "true":
+        set_solver_pool(None)
         logger.warning(
             "SolverPool disabled by env; MILP solves will run in a thread "
             "inside the API process (loop unblock OK, no OOM isolation)."
@@ -394,6 +395,7 @@ async def lifespan(app: FastAPI):
                 worker_as_limit_mb,
             )
         except Exception as e:
+            set_solver_pool(None)
             logger.critical(
                 "SolverPool failed to start: %s. Solves will run in a thread "
                 "in the API process and may block the event loop briefly.",
