@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal, Mapping, Optional, Protocol
 from uuid import UUID
@@ -186,10 +186,33 @@ async def compute_session_cost(
     else:
         price_map = await price_lookup(bidding_zone, start_time, end_time)
 
+    station_id = session_row.get("station_id")
+    connector_id_raw = session_row.get("connector_id")
+    connector_id: Optional[int]
+    if connector_id_raw is None:
+        connector_id = None
+    else:
+        try:
+            connector_id = int(connector_id_raw)
+        except (TypeError, ValueError):
+            connector_id = None
+    transaction_id_raw = session_row.get("transaction_id")
+    transaction_id: Optional[int]
+    if transaction_id_raw is None:
+        transaction_id = None
+    else:
+        try:
+            transaction_id = int(transaction_id_raw)
+        except (TypeError, ValueError):
+            transaction_id = None
+
     # 1. Try granular (telemetry-driven).
     granular = await _try_granular(
         ts_pool,
         vehicle_id=vehicle_id,
+        station_id=station_id if isinstance(station_id, str) else None,
+        connector_id=connector_id,
+        transaction_id=transaction_id,
         start_time=start_time,
         end_time=end_time,
         energy_delivered_kwh=_as_float(energy_delivered_kwh),
@@ -211,22 +234,7 @@ async def compute_session_cost(
     )
 
 
-async def _try_granular(
-    ts_pool: asyncpg.Pool,
-    *,
-    vehicle_id: Optional[UUID],
-    start_time: datetime,
-    end_time: datetime,
-    energy_delivered_kwh: Optional[float],
-    price_map: dict[datetime, float],
-) -> Optional[SessionCostResult]:
-    """Granular-strategy attempt. Returns None to signal 'use fallback'."""
-    if vehicle_id is None:
-        return None
-
-    async with ts_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
+_GRANULAR_TELEMETRY_SQL = """
             WITH bucketed AS (
                 SELECT
                     time_bucket('1 hour', t.time) AS hour,
@@ -236,8 +244,9 @@ async def _try_granular(
                         PARTITION BY time_bucket('1 hour', t.time) ORDER BY t.time
                     ) AS next_time
                 FROM telemetry t
-                WHERE t.vehicle_id = $1
-                  AND t.time >= $2 AND t.time < $3
+                WHERE {where_clause}
+                  AND t.time >= ${time_start}
+                  AND t.time < ${time_end}
                   AND t.charging_kw IS NOT NULL
                   AND t.charging_kw > 0
             )
@@ -256,10 +265,84 @@ async def _try_granular(
             FROM bucketed
             GROUP BY hour
             ORDER BY hour
-            """,
-            vehicle_id,
-            start_time,
-            end_time,
+            """
+
+
+async def _fetch_granular_telemetry_rows(
+    conn: asyncpg.Connection,
+    *,
+    vehicle_id: Optional[UUID],
+    station_id: Optional[str],
+    connector_id: Optional[int],
+    transaction_id: Optional[int],
+    start_time: datetime,
+    end_time: datetime,
+) -> list[asyncpg.Record]:
+    """Load bucketed telemetry for granular billing.
+
+    Prefer ``vehicle_id`` when present; otherwise use charger keys from the
+    session row (migration 035 primary key). When ``transaction_id`` is set,
+    scope charger telemetry to that OCPP transaction.
+    """
+    time_start = 2
+    time_end = 3
+
+    if vehicle_id is not None:
+        sql = _GRANULAR_TELEMETRY_SQL.format(
+            where_clause="t.vehicle_id = $1",
+            time_start=time_start,
+            time_end=time_end,
+        )
+        rows = await conn.fetch(sql, vehicle_id, start_time, end_time)
+        if rows:
+            return rows
+
+    if station_id is None or connector_id is None:
+        return []
+
+    if transaction_id is not None:
+        sql = _GRANULAR_TELEMETRY_SQL.format(
+            where_clause=(
+                "t.station_id = $1 AND t.connector_id = $2 "
+                "AND t.transaction_id = $3"
+            ),
+            time_start=4,
+            time_end=5,
+        )
+        return await conn.fetch(
+            sql, station_id, connector_id, transaction_id, start_time, end_time
+        )
+
+    sql = _GRANULAR_TELEMETRY_SQL.format(
+        where_clause="t.station_id = $1 AND t.connector_id = $2",
+        time_start=3,
+        time_end=4,
+    )
+    return await conn.fetch(sql, station_id, connector_id, start_time, end_time)
+
+
+async def _try_granular(
+    ts_pool: asyncpg.Pool,
+    *,
+    vehicle_id: Optional[UUID],
+    station_id: Optional[str],
+    connector_id: Optional[int],
+    transaction_id: Optional[int],
+    start_time: datetime,
+    end_time: datetime,
+    energy_delivered_kwh: Optional[float],
+    price_map: dict[datetime, float],
+) -> Optional[SessionCostResult]:
+    """Granular-strategy attempt. Returns None to signal 'use fallback'."""
+    async with ts_pool.acquire() as conn:
+        rows = await _fetch_granular_telemetry_rows(
+            conn,
+            vehicle_id=vehicle_id,
+            station_id=station_id,
+            connector_id=connector_id,
+            transaction_id=transaction_id,
+            start_time=start_time,
+            end_time=end_time,
         )
 
     if not rows:
@@ -294,19 +377,14 @@ async def _try_granular(
         )
         return None
 
-    # Compute cost. Every bucket must have a price.
+    # Compute cost. Every bucket must have a price; missing bucket price
+    # means granular cannot run honestly — fall back to session average.
     total_cost = Decimal(0)
     for r in rows:
         hour = r["hour"]
-        price = price_map.get(hour)
+        price = _price_for_hour(price_map, hour)
         if price is None:
-            # Partial pricing — refuse rather than fabricate.
-            return SessionCostResult(
-                cost=None,
-                source="unpriceable",
-                energy_kwh_from_telemetry=telem_energy,
-                telemetry_coverage=coverage,
-            )
+            return None
         total_cost += Decimal(str(float(r["energy_kwh"]) * price))
 
     avg_price = (
@@ -330,20 +408,43 @@ def _fallback_average(
 ) -> SessionCostResult:
     """Fallback strategy: total energy × average price across the window."""
     expected_hours = _expected_hour_buckets(start_time, end_time)
-    covered = [h for h in expected_hours if h in price_map]
+    covered = [h for h in expected_hours if _price_for_hour(price_map, h) is not None]
     if not expected_hours or len(covered) < len(expected_hours):
         return SessionCostResult(
             cost=None,
             source="unpriceable",
         )
 
-    avg_price = sum(price_map[h] for h in covered) / len(covered)
+    bucket_prices = [_price_for_hour(price_map, h) for h in covered]
+    avg_price = sum(p for p in bucket_prices if p is not None) / len(covered)
     cost = Decimal(str(delivered_kwh * avg_price)).quantize(Decimal("0.0001"))
     return SessionCostResult(
         cost=cost,
         source="fallback_average",
         avg_price_used=avg_price,
     )
+
+
+def _normalize_hour(dt: datetime) -> datetime:
+    """Floor to UTC hour start for price-map lookups."""
+    floored = dt.replace(minute=0, second=0, microsecond=0)
+    if floored.tzinfo is None:
+        return floored.replace(tzinfo=timezone.utc)
+    return floored.astimezone(timezone.utc)
+
+
+def _price_for_hour(price_map: dict[datetime, float], hour: datetime) -> Optional[float]:
+    """Match a telemetry bucket hour to a price-map key."""
+    key = _normalize_hour(hour)
+    if key in price_map:
+        return price_map[key]
+    naive = key.replace(tzinfo=None)
+    if naive in price_map:
+        return price_map[naive]
+    aware = naive.replace(tzinfo=timezone.utc)
+    if aware in price_map:
+        return price_map[aware]
+    return None
 
 
 def _expected_hour_buckets(start: datetime, end: datetime) -> list[datetime]:

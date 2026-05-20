@@ -2771,7 +2771,8 @@ class TimescaleClient:
             async with self.pg_pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT session_id, site_id, vehicle_id, start_time, end_time,
+                    SELECT session_id, site_id, vehicle_id, station_id, connector_id,
+                           transaction_id, start_time, end_time,
                            energy_delivered_kwh, cost_total, cost_total_source
                       FROM charging_sessions
                      WHERE session_id = $1

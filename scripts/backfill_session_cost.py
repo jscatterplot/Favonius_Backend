@@ -66,6 +66,7 @@ if str(REPO_ROOT) not in sys.path:
 
 # Imports below intentionally after sys.path tweak (repo root → src.* packages).
 from src.core.billing.session_cost import (  # noqa: E402
+    _expected_hour_buckets,
     compute_session_cost,
     write_session_cost,
 )
@@ -76,7 +77,8 @@ logger = logging.getLogger("backfill_session_cost")
 
 
 _CANDIDATE_SQL = """
-    SELECT session_id, site_id, vehicle_id, start_time, end_time,
+    SELECT session_id, site_id, vehicle_id, station_id, connector_id,
+           transaction_id, start_time, end_time,
            energy_delivered_kwh, cost_total, cost_total_source
       FROM charging_sessions
      WHERE end_time IS NOT NULL
@@ -89,7 +91,8 @@ _CANDIDATE_SQL = """
 """
 
 _CANDIDATE_BY_SESSION_SQL = """
-    SELECT session_id, site_id, vehicle_id, start_time, end_time,
+    SELECT session_id, site_id, vehicle_id, station_id, connector_id,
+           transaction_id, start_time, end_time,
            energy_delivered_kwh, cost_total, cost_total_source
       FROM charging_sessions
      WHERE end_time IS NOT NULL
@@ -124,11 +127,30 @@ class LRUPriceLookup:
         start: datetime,
         end: datetime,
     ) -> dict[datetime, float]:
+        needed = _expected_hour_buckets(start, end)
+        if not needed:
+            async with self._pool.acquire() as conn:
+                return await fetch_prices_by_zone(conn, bidding_zone, start, end)
+
+        result: dict[datetime, float] = {}
+        for hour in needed:
+            key = (bidding_zone, hour)
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                result[hour] = self._cache[key]
+
+        if len(result) == len(needed):
+            return result
+
         async with self._pool.acquire() as conn:
             fresh = await fetch_prices_by_zone(conn, bidding_zone, start, end)
         for hour, price in fresh.items():
             self._put(bidding_zone, hour, price)
-        return dict(fresh)
+        for hour in needed:
+            key = (bidding_zone, hour)
+            if key in self._cache:
+                result[hour] = self._cache[key]
+        return result
 
     def _put(self, bidding_zone: str, hour: datetime, price: float) -> None:
         key = (bidding_zone, hour)
