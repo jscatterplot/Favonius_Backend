@@ -103,12 +103,14 @@ def _normalize_firmware(firmware: Optional[str]) -> Optional[str]:
     Some ABB Terra AC firmwares occasionally pad the ``firmware_version``
     field with trailing whitespace; without this normalisation the cache
     miss/hit cycle churns: ``"V1.8.36"`` written this boot ≠ ``"V1.8.36 "``
-    read next boot → re-probe → re-write. ``None`` is returned unchanged so
-    upstream callers can short-circuit on a missing firmware string.
+    read next boot → re-probe → re-write. ``None`` is returned unchanged, and
+    whitespace-only strings are treated as missing so we never cache a
+    firmware-scoped negative under an empty key.
     """
     if firmware is None:
         return None
-    return firmware.strip()
+    stripped = firmware.strip()
+    return stripped if stripped else None
 
 
 # Local-cap enforced inside ``FleetChargePoint.send_local_list``. Mirrored
@@ -481,7 +483,13 @@ async def _disable_freevend_best_effort(cp: _ChargePointProto, station_id: str) 
         )
         return
     except asyncio.CancelledError:
-        raise
+        logger.warning(
+            "local_auth_bootstrap_config station=%s key=%s cancelled — "
+            "best-effort abort",
+            station_id,
+            key,
+        )
+        return
     except Exception as exc:
         logger.warning(
             "local_auth_bootstrap_config station=%s key=%s error=%s",
@@ -710,12 +718,14 @@ async def sync_charger(
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
         # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
         if bootstrap_outcome in {BootstrapOutcome.UNSUPPORTED, BootstrapOutcome.UNKNOWN}:
-            await _disable_freevend_best_effort(cp, station_id)
             bootstrap_status = (
                 "UnsupportedFromBootstrap"
                 if bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
                 else "UnknownFromBootstrap"
             )
+            # Persist before best-effort Freevend disable so reconnect churn
+            # cannot drop the negative cache if the sync task is cancelled
+            # mid-RPC (HRX Vilnius ABB Terra AC reconnect cadence).
             if (
                 bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
                 and not probe_positive
@@ -749,6 +759,7 @@ async def sync_charger(
                         station_id,
                         exc,
                     )
+            await _disable_freevend_best_effort(cp, station_id)
             logger.info(
                 "local_auth_sync station=%s status=%s "
                 "entries=%d version=%d first_sync=%s reason=bootstrap_unsupported",

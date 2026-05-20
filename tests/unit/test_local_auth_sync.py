@@ -647,6 +647,68 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
         assert update_call.args[1] == "UnsupportedFromBootstrap"
 
     @pytest.mark.asyncio
+    async def test_bootstrap_unsupported_with_blank_firmware_skips_negative_cache(
+        self, monkeypatch
+    ) -> None:
+        """Whitespace-only firmware must not persist a permanent empty-key cache."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(
+            firmware_version="   ",
+            get_configuration_response={"configuration_key": [], "unknown_key": []},
+        )
+        cp.change_configuration = AsyncMock(return_value="NotSupported")
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "UnsupportedFromBootstrap"
+        cp.send_local_list.assert_not_awaited()
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported" not in update_call.args[0]
+        assert "local_list_last_status" in update_call.args[0]
+        assert update_call.args[1] == "UnsupportedFromBootstrap"
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_unsupported_persists_cache_when_freevend_cancelled(
+        self, monkeypatch
+    ) -> None:
+        """Fail-fast state must survive cancellation during best-effort Freevend."""
+        monkeypatch.delenv("OCPP_DISABLE_LOCAL_AUTH_LIST", raising=False)
+        db = _make_db(
+            station_row={
+                "id": "uuid-1",
+                "local_list_version": 0,
+                "local_list_supported": None,
+                "local_list_probed_firmware": None,
+            },
+            id_tag_rows=[{"id_tag": "VEH-1", "source": "vehicle"}],
+        )
+        cp = _make_cp(
+            firmware_version="V1.8.36",
+            get_configuration_response={"configuration_key": [], "unknown_key": []},
+        )
+        cp.change_configuration = AsyncMock(
+            side_effect=["NotSupported", asyncio.CancelledError()]
+        )
+
+        result = await sync_charger(cp, db, "station-001")
+
+        assert result.status == "UnsupportedFromBootstrap"
+        cp.send_local_list.assert_not_awaited()
+        update_call = db.execute.await_args_list[-1]
+        assert "local_list_supported = $1" in update_call.args[0]
+        assert update_call.args[1] is False
+        assert update_call.args[2] == "V1.8.36"
+
+    @pytest.mark.asyncio
     async def test_bootstrap_success_still_calls_send_local_list(self, monkeypatch) -> None:
         """Sanity: the happy path is unchanged. If the critical key is
         accepted, SendLocalList runs and the version bumps."""
@@ -916,6 +978,10 @@ class TestNormalizeFirmware:
 
     def test_no_change_for_already_clean_string(self) -> None:
         assert _normalize_firmware("V1.8.36") == "V1.8.36"
+
+    def test_whitespace_only_returns_none(self) -> None:
+        assert _normalize_firmware("   ") is None
+        assert _normalize_firmware("") is None
 
     @pytest.mark.asyncio
     async def test_cache_hit_when_firmware_has_extra_whitespace(self, monkeypatch) -> None:
