@@ -359,6 +359,20 @@ class TestTimePredicate:
             "WHERE hour < now() - interval '7 days'"
         )
 
+    def test_or_true_bypass_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' OR 1=1",
+            kind="missing_time_filter",
+        )
+
+    def test_or_boolean_true_bypass_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.building_load_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' OR TRUE",
+            kind="missing_time_filter",
+        )
+
 
 # ── LIMIT injection / cap ────────────────────────────────────────────────
 

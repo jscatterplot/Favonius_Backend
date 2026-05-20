@@ -314,7 +314,11 @@ def validate_sql(
             if not _select_touches_hypertable(select_node):
                 continue
             where = select_node.args.get("where")
-            if where is None or not _has_bounding_time_predicate(where):
+            if (
+                where is None
+                or not _has_bounding_time_predicate(where)
+                or _has_or_true_bypass(where)
+            ):
                 fn_name = next(
                     (fn for fn in functions_used if fn in HYPERTABLE_FUNCTIONS),
                     "hypertable",
@@ -430,3 +434,37 @@ def _ancestor_comparison(node: exp.Expression) -> exp.Expression | None:
             return cur
         cur = cur.parent
     return None
+
+
+def _has_or_true_bypass(where: exp.Where) -> bool:
+    """Detect OR branches that neutralize safety predicates.
+
+    Examples: ``... OR 1=1`` and ``... OR TRUE``.
+    """
+    for node in where.find_all(exp.Or):
+        if _is_unconditional_true(node.this) or _is_unconditional_true(node.expression):
+            return True
+    return False
+
+
+def _is_unconditional_true(node: exp.Expression | None) -> bool:
+    """Best-effort check for SQL expressions that are always TRUE."""
+    if node is None:
+        return False
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        return str(node.name) == "1"
+    if isinstance(node, exp.EQ):
+        left = node.this
+        right = node.expression
+        if left is None or right is None:
+            return False
+        if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
+            return left.name == right.name
+        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+            return (
+                left.sql(dialect="postgres").lower()
+                == right.sql(dialect="postgres").lower()
+            )
+    return False

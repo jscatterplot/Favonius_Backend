@@ -35,6 +35,16 @@ EXCEPTION
         NULL;  -- already exists; reapply grants below
 END $$;
 
+-- Runtime role membership: app login role must be able to SET ROLE.
+-- In this repo the runtime DB role is `favonius` (created by compose/staging
+-- bootstrap). Guard existence so local/special envs don't fail migration.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'favonius') THEN
+        GRANT agent_reader_ts TO favonius;
+    END IF;
+END $$;
+
 -- Defence in depth: explicitly REVOKE everything before granting back.
 REVOKE ALL ON SCHEMA public            FROM agent_reader_ts;
 REVOKE ALL ON SCHEMA pg_catalog        FROM agent_reader_ts;

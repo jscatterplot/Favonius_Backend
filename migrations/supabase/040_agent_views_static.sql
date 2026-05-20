@@ -25,6 +25,14 @@ EXCEPTION
         NULL;
 END $$;
 
+-- Runtime role membership: app login role must be able to SET ROLE.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'favonius') THEN
+        GRANT agent_reader_static TO favonius;
+    END IF;
+END $$;
+
 REVOKE ALL ON SCHEMA public            FROM agent_reader_static;
 REVOKE ALL ON SCHEMA pg_catalog        FROM agent_reader_static;
 REVOKE ALL ON SCHEMA information_schema FROM agent_reader_static;
