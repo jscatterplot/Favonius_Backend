@@ -61,8 +61,16 @@ def depot_id():
 
 @pytest.fixture
 def assembler(mock_db_pools, depot_id, depot_config):
-    """StateAssembler instance for testing."""
-    return StateAssembler(mock_db_pools, depot_id, depot_config)
+    """StateAssembler instance for testing.
+
+    The bidding-zone cache is pre-seeded so ``_get_prices`` doesn't try
+    to resolve a zone via the (mocked) static pool — these tests focus
+    on the price-interpolation behaviour, not the zone lookup.
+    ``test_session_cost.py`` covers the resolver explicitly.
+    """
+    a = StateAssembler(mock_db_pools, depot_id, depot_config)
+    a._bidding_zone_cache = "test-zone"
+    return a
 
 
 class TestStateAssemblerInitialization:
@@ -161,7 +169,7 @@ class TestGetPrices:
         rows = []
         base_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
         for i in range(6):
-            row_data = {"time": base_time + timedelta(hours=i), "energy_kwh": 0.10 + i * 0.01}
+            row_data = {"time": base_time + timedelta(hours=i), "lmp_price_mwh": (0.10 + i * 0.01) * 1000}
             row = MagicMock()
             row.__getitem__ = lambda self, k, d=row_data: d[k]
             rows.append(row)
@@ -204,8 +212,8 @@ class TestGetPrices:
         base_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
 
         # Create proper mock rows
-        row1_data = {"time": base_time, "energy_kwh": 0.10}
-        row2_data = {"time": base_time + timedelta(hours=1), "energy_kwh": 0.20}
+        row1_data = {"time": base_time, "lmp_price_mwh": 100.0}
+        row2_data = {"time": base_time + timedelta(hours=1), "lmp_price_mwh": 200.0}
 
         row1 = MagicMock()
         row1.__getitem__ = lambda self, k, d=row1_data: d[k]
@@ -237,7 +245,7 @@ class TestGetPrices:
                 **{
                     "__getitem__.side_effect": lambda k, t=base_time, p=0.10: {
                         "time": t,
-                        "energy_kwh": p,
+                        "lmp_price_mwh": p * 1000,
                     }[k]
                 }
             ),
@@ -791,7 +799,7 @@ class TestGetCurrentState:
                         **{
                             "__getitem__.side_effect": lambda k, t=datetime.utcnow(), p=0.10: {
                                 "time": t,
-                                "energy_kwh": p,
+                                "lmp_price_mwh": p * 1000,
                             }[k]
                         }
                     ),
@@ -867,7 +875,7 @@ class TestGetCurrentState:
                         **{
                             "__getitem__.side_effect": lambda k, t=datetime.utcnow(), p=0.10: {
                                 "time": t,
-                                "energy_kwh": p,
+                                "lmp_price_mwh": p * 1000,
                             }[k]
                         }
                     ),
@@ -1131,7 +1139,7 @@ class TestPriceHandling:
                 hours=i
             ), p=0.10 + i * 0.01: {
                 "time": t,
-                "energy_kwh": p,
+                "lmp_price_mwh": p * 1000,
             }[
                 k
             ]
@@ -1182,7 +1190,7 @@ class TestPriceHandling:
             mock_row = MagicMock()
             mock_row.__getitem__ = lambda self, k, time=t: {
                 "time": time,
-                "energy_kwh": 0.12,
+                "lmp_price_mwh": 120.0,
             }[k]
             price_rows.append(mock_row)
 

@@ -21,6 +21,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for the lazy bidding-zone cache on StateAssembler instances:
+# ``None`` is a valid resolved value meaning "this depot has no zone";
+# we need a distinct marker to distinguish "not yet resolved" from
+# "resolved to nothing".
+_SENTINEL = object()
+
 
 class StateAssembler:
     """Assembles current depot state for optimization.
@@ -371,34 +377,63 @@ class StateAssembler:
             List of prices in $/kWh, one per timestep
 
         Note:
-            Delegates the DB read + 1-hour forward-fill to the canonical
-            ``src.db.queries.fetch_prices_with_fill``. Hours that helper
-            can't fill (no known price within 1h) get the optimizer's
-            $0.15/kWh default — this default is a solver-input concern
-            and lives here, not in the helper, because billing code in
-            ``src/core/billing/`` must NOT fabricate prices the same way.
+            Resolves the depot's ENTSO-E bidding zone via
+            :func:`src.db.queries.resolve_bidding_zone` (cached on the
+            assembler instance), then delegates to
+            :func:`src.db.queries.fetch_prices_by_zone`. Hours that
+            helper can't fill (no known price within 1h) get the
+            optimizer's $0.15/kWh default — this default is a
+            solver-input concern and lives here, not in the helper,
+            because billing code in ``src/core/billing/`` must NOT
+            fabricate prices the same way.
 
         Raises:
             asyncpg.PostgresError: If database query fails
         """
-        from ...db.queries import fetch_prices_with_fill
+        from ...db.queries import fetch_prices_by_zone, resolve_bidding_zone
+
+        # Cache the zone on the instance — sites.tariff_config / sites.timezone
+        # don't change inside a controller's lifetime, and this avoids a
+        # static-pool round-trip on every solve.
+        zone = getattr(self, "_bidding_zone_cache", _SENTINEL)
+        if zone is _SENTINEL:
+            try:
+                async with self.pools.static.acquire() as static_conn:
+                    zone = await resolve_bidding_zone(static_conn, self.depot_id)
+            except asyncpg.PostgresError as e:
+                logger.error(
+                    f"Failed to resolve bidding zone for depot {self.depot_id}: {e}. "
+                    "Using default prices."
+                )
+                self._bidding_zone_cache = None
+                return [0.15] * n_steps
+            self._bidding_zone_cache = zone
+
+        if not zone:
+            logger.warning(
+                f"No bidding zone configured for depot {self.depot_id} "
+                "(set sites.tariff_config.entsoe_zone or sites.timezone); "
+                "using default $0.15/kWh."
+            )
+            return [0.15] * n_steps
 
         try:
             async with self.pools.ts.acquire() as conn:
-                price_map = await fetch_prices_with_fill(
-                    conn, self.depot_id, start, end
+                price_map = await fetch_prices_by_zone(
+                    conn, zone, start, end
                 )
         except asyncpg.PostgresError as e:
             logger.error(
-                f"Database error fetching prices for depot {self.depot_id}: {e}. "
-                "Using default prices."
+                f"Database error fetching prices for depot {self.depot_id} "
+                f"(zone {zone}): {e}. Using default prices."
             )
             return [0.15] * n_steps
 
         if not price_map:
             logger.warning(
                 f"No price data found for depot {self.depot_id} "
-                f"between {start} and {end}, using default $0.15/kWh"
+                f"(zone {zone}) between {start} and {end}, "
+                "using default $0.15/kWh"
             )
             return [0.15] * n_steps
 

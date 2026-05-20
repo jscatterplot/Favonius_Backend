@@ -32,14 +32,12 @@ ALTER TABLE charging_sessions
 COMMENT ON COLUMN charging_sessions.cost_total_source IS
     'Provenance of cost_total. One of: granular | fallback_average | unpriceable | no_energy | no_depot | manual. Set by src/core/billing/session_cost.py.';
 
--- Index for depot+time price lookups. Used by:
---   * src/core/billing/session_cost.py (fetch_prices_with_fill)
---   * src/db/queries.py::fetch_prices_with_fill
---   * src/core/state/assembler.py::_get_prices (after DRY refactor)
--- The prices PK is (time, depot_id) which gives chunk-pruning but a full
--- scan inside each chunk; this btree turns it into a point lookup per row.
-CREATE INDEX IF NOT EXISTS idx_prices_depot_time
-    ON prices (depot_id, time DESC);
+-- (Earlier drafts of this migration also added idx_prices_depot_time on the
+-- legacy ``prices`` table. The new architecture reads from
+-- ``electricity_prices`` keyed by ENTSO-E ``node_id`` instead — see
+-- src/db/queries.py::fetch_prices_by_zone and the existing
+-- idx_electricity_prices_node_time created in migration 034. No new
+-- index is needed here.)
 
 -- Partial index supporting the backfill candidate scan.
 -- The WHERE clause matches the predicate in scripts/backfill_session_cost.py

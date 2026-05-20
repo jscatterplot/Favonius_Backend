@@ -219,49 +219,59 @@ async def insert_price(
     await db.execute(query, timestamp, depot_id, energy_kwh, demand_kw, source)
 
 
-async def fetch_prices_with_fill(
+async def fetch_prices_by_zone(
     db,
-    depot_id: UUID,
+    bidding_zone: str,
     start_time: datetime,
     end_time: datetime,
     forward_fill_window: timedelta = timedelta(hours=1),
 ) -> dict[datetime, float]:
-    """Return a {hour_floor_utc: $/kWh} map for [start_time, end_time).
+    """Return a ``{hour_floor_utc: €/kWh}`` map for ``[start_time, end_time)``.
 
-    Reads the ``prices`` hypertable for ``depot_id`` and forward-fills any
-    missing hour from the most recent known price within
-    ``forward_fill_window``. Hours with no known price within the window
-    are absent from the returned dict — the caller decides whether that
-    counts as 'unpriceable'.
+    Reads the ``electricity_prices`` hypertable (written by the WS handler
+    price feeder from ENTSO-E day-ahead data) for a single ENTSO-E EIC
+    bidding zone, and forward-fills missing hours from the most recent
+    known price within ``forward_fill_window``. Hours with no usable
+    price are absent from the returned dict — the caller decides
+    whether that counts as ``unpriceable``.
 
-    This is the canonical price lookup shared by the optimizer's
-    ``_get_prices`` (which adds a $0.15/kWh solver-input fallback on top)
-    and the cost calculator in ``src/core/billing/session_cost.py``
-    (which treats missing hours as 'unpriceable' rather than fabricating).
+    The legacy ``prices`` table (per-depot tariff) was the original
+    source for this lookup. In every current deployment it is empty:
+    the ENTSO-E feeder writes only to ``electricity_prices`` keyed by
+    bidding zone, never per-depot. Callers resolve the zone from
+    ``sites`` via :func:`resolve_bidding_zone` and pass it in.
+
+    Unit conversion: ``electricity_prices.lmp_price_mwh`` is stored as
+    €/MWh; this helper divides by 1000 before returning, so callers
+    always see €/kWh.
+
+    Filters ``market_type = 'ENTSOE_DAM'`` so legacy CAISO LMP rows in
+    the same table are ignored.
 
     Args:
-        db: Database connection or pool.
-        depot_id: Depot UUID.
-        start_time: Inclusive start (any timezone-aware datetime; the
-            ``prices`` table stores UTC).
-        end_time: Exclusive end.
+        db: Database connection or pool (TimescaleDB).
+        bidding_zone: ENTSO-E EIC area code (e.g. ``10YLT-1001A0008Q``).
+        start_time: Inclusive start (UTC).
+        end_time: Exclusive end (UTC).
         forward_fill_window: Maximum age of the last known price that
             can be used to fill a missing hour. Defaults to 1 hour to
             match the optimizer's behavior.
 
     Returns:
-        Dict keyed by the start-of-hour timestamp (UTC) covered by
-        ``[start_time, end_time)`` whose value is the $/kWh price for
+        Dict keyed by the start-of-hour timestamp covered by
+        ``[start_time, end_time)`` whose value is the €/kWh price for
         that hour. Hours absent from the dict have no usable price.
     """
     rows = await db.fetch(
         """
-        SELECT time, energy_kwh
-        FROM prices
-        WHERE depot_id = $1 AND time >= $2 AND time < $3
+        SELECT time, lmp_price_mwh
+        FROM electricity_prices
+        WHERE node_id = $1
+          AND market_type = 'ENTSOE_DAM'
+          AND time >= $2 AND time < $3
         ORDER BY time
         """,
-        depot_id,
+        bidding_zone,
         start_time - forward_fill_window,
         end_time,
     )
@@ -269,9 +279,15 @@ async def fetch_prices_with_fill(
     if not rows:
         return {}
 
-    known: list[tuple[datetime, float]] = [
-        (row["time"], float(row["energy_kwh"])) for row in rows
-    ]
+    known: list[tuple[datetime, float]] = []
+    for row in rows:
+        raw = row["lmp_price_mwh"]
+        if raw is None:
+            continue
+        known.append((row["time"], float(raw) / 1000.0))
+
+    if not known:
+        return {}
 
     filled: dict[datetime, float] = {}
     first_hour = start_time.replace(minute=0, second=0, microsecond=0)
@@ -290,6 +306,54 @@ async def fetch_prices_with_fill(
         cursor += timedelta(hours=1)
 
     return filled
+
+
+async def resolve_bidding_zone(static_db, site_id: UUID) -> Optional[str]:
+    """Resolve the ENTSO-E EIC bidding zone for a depot.
+
+    Cascade:
+
+    1. ``sites.tariff_config['entsoe_zone']`` (explicit operator override).
+    2. ``get_bidding_zone(sites.timezone)`` — single-zone country lookup
+       via the static map in ``src/adapters/entsoe/mappings.py``.
+    3. ``None`` — the calculator's caller treats this as ``unpriceable``;
+       the optimizer falls back to its $0.15/kWh solver-input default.
+
+    Args:
+        static_db: Connection / pool to the static Supabase schema.
+        site_id: ``sites.id`` UUID.
+
+    Returns:
+        Bidding zone EIC code (e.g. ``10YLT-1001A0008Q``) or ``None``.
+    """
+    row = await static_db.fetchrow(
+        """
+        SELECT timezone, tariff_config
+          FROM sites
+         WHERE id = $1
+        """,
+        site_id,
+    )
+    if row is None:
+        return None
+
+    tariff = row["tariff_config"]
+    if isinstance(tariff, str):
+        try:
+            tariff = json.loads(tariff)
+        except json.JSONDecodeError:
+            tariff = None
+    if isinstance(tariff, dict):
+        explicit = tariff.get("entsoe_zone")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+
+    tz = row["timezone"]
+    if not tz:
+        return None
+    # Local import keeps src/db/ free of an adapters/ dep at import time.
+    from ..adapters.entsoe.mappings import get_bidding_zone
+    return get_bidding_zone(tz)
 
 
 # ============ SCHEDULE QUERIES ============

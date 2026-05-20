@@ -46,7 +46,7 @@ from uuid import UUID
 
 import asyncpg
 
-from ...db.queries import fetch_prices_with_fill
+from ...db.queries import fetch_prices_by_zone
 
 logger = logging.getLogger(__name__)
 
@@ -87,16 +87,17 @@ class SessionCostResult:
 class PriceLookup(Protocol):
     """Caller-injectable cache for the backfill script.
 
-    The default implementation hits ``prices`` for every call; the
-    backfill script wraps this with an LRU keyed by ``(depot_id,
-    hour_floor_utc)`` so repeated depots within a chunk don't re-query.
-    The protocol shape matches ``fetch_prices_with_fill`` so a None
-    default in :func:`compute_session_cost` just calls the helper.
+    The default implementation hits ``electricity_prices`` for every
+    call; the backfill script wraps this with an LRU keyed by
+    ``(bidding_zone, hour_floor_utc)`` so repeat zones within a chunk
+    don't re-query. The protocol shape matches
+    ``fetch_prices_by_zone`` so a None default in
+    :func:`compute_session_cost` just calls the helper.
     """
 
     async def __call__(
         self,
-        depot_id: UUID,
+        bidding_zone: str,
         start: datetime,
         end: datetime,
     ) -> dict[datetime, float]:
@@ -113,13 +114,17 @@ async def compute_session_cost(
 
     Args:
         ts_pool: TimescaleDB connection pool.
-        session_row: Row from ``charging_sessions``. Must include
-            ``session_id``, ``site_id``, ``vehicle_id``, ``start_time``,
-            ``end_time``, ``energy_delivered_kwh``, ``cost_total``,
-            ``cost_total_source``. Extra keys are ignored.
+        session_row: Row from ``charging_sessions`` augmented by the
+            caller with a ``bidding_zone`` key (resolved via
+            :func:`src.db.queries.resolve_bidding_zone`). Must also
+            include ``session_id``, ``site_id``, ``vehicle_id``,
+            ``start_time``, ``end_time``, ``energy_delivered_kwh``,
+            ``cost_total``, ``cost_total_source``. Extra keys are ignored.
+            A missing or ``None`` ``bidding_zone`` short-circuits to
+            ``unpriceable``.
         price_lookup: Optional injected price lookup (used by the
             backfill script to share a cache across rows). Defaults to
-            a fresh ``fetch_prices_with_fill`` call.
+            a fresh ``fetch_prices_by_zone`` call.
 
     Returns:
         :class:`SessionCostResult`. Never raises on data shape — every
@@ -161,24 +166,30 @@ async def compute_session_cost(
         except (ValueError, TypeError):
             vehicle_id = None
 
+    # The caller resolves the bidding zone (Supabase ``sites`` row →
+    # ENTSO-E EIC code) and stuffs it into the row dict before calling.
+    # No zone → no priceable map → ``unpriceable``.
+    bidding_zone = session_row.get("bidding_zone")
+    if not isinstance(bidding_zone, str) or not bidding_zone:
+        return SessionCostResult(cost=None, source="unpriceable")
+
     # Fetch prices once for the whole window. Both strategies read this map.
     if price_lookup is None:
         async with ts_pool.acquire() as conn:
-            price_map = await fetch_prices_with_fill(
+            price_map = await fetch_prices_by_zone(
                 conn,
-                site_id,
+                bidding_zone,
                 start_time,
                 end_time,
                 forward_fill_window=MAX_PRICE_GAP,
             )
     else:
-        price_map = await price_lookup(site_id, start_time, end_time)
+        price_map = await price_lookup(bidding_zone, start_time, end_time)
 
     # 1. Try granular (telemetry-driven).
     granular = await _try_granular(
         ts_pool,
         vehicle_id=vehicle_id,
-        depot_id=site_id,
         start_time=start_time,
         end_time=end_time,
         energy_delivered_kwh=_as_float(energy_delivered_kwh),
@@ -204,7 +215,6 @@ async def _try_granular(
     ts_pool: asyncpg.Pool,
     *,
     vehicle_id: Optional[UUID],
-    depot_id: UUID,
     start_time: datetime,
     end_time: datetime,
     energy_delivered_kwh: Optional[float],

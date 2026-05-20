@@ -46,6 +46,12 @@ bf = _load_backfill_module()
 from tests.integration.conftest import create_integration_pool
 
 
+# Single fixed zone for backfill tests. We seed a sites row with this
+# zone via tariff_config so resolve_bidding_zone returns it
+# deterministically — independent of the row's timezone column.
+TEST_ZONE = "10YLT-1001A0008Q"
+
+
 def _utc(year: int, month: int, day: int, hour: int = 0) -> datetime:
     return datetime(year, month, day, hour, tzinfo=timezone.utc)
 
@@ -59,20 +65,71 @@ async def pool():
 
 @pytest_asyncio.fixture
 async def cleanup(pool):
+    """Track IDs to delete on teardown.
+
+    Backfill tests seed ``sites`` (so the resolver finds a zone),
+    ``electricity_prices`` (by zone), and ``charging_sessions``.
+    """
     sessions: list[UUID] = []
-    depots: list[UUID] = []
-    yield {"sessions": sessions, "depots": depots}
+    sites: list[UUID] = []
+    zones: list[str] = []
+    yield {"sessions": sessions, "sites": sites, "zones": zones}
     async with pool.acquire() as conn:
         if sessions:
             await conn.execute(
                 "DELETE FROM charging_sessions WHERE session_id = ANY($1::uuid[])",
                 sessions,
             )
-        if depots:
+        if sites:
             await conn.execute(
-                "DELETE FROM prices WHERE depot_id = ANY($1::uuid[])",
-                depots,
+                "DELETE FROM sites WHERE id = ANY($1::uuid[])", sites,
             )
+        if zones:
+            await conn.execute(
+                "DELETE FROM electricity_prices WHERE node_id = ANY($1::text[])",
+                zones,
+            )
+
+
+async def _seed_site_with_zone(
+    pool: asyncpg.Pool,
+    site_id: UUID,
+    zone: str = TEST_ZONE,
+) -> None:
+    """Insert a sites row whose ``tariff_config.entsoe_zone`` is ``zone``.
+
+    This is the canonical signal the resolver looks at first; the
+    timezone fallback isn't exercised here — the resolver helper is
+    tested directly in ``test_session_cost_integration.py``.
+    """
+    import json as _json
+    payload = _json.dumps({"entsoe_zone": zone})
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO sites (id, tariff_config)
+            VALUES ($1, $2::jsonb)
+            ON CONFLICT (id) DO UPDATE SET tariff_config = EXCLUDED.tariff_config
+            """,
+            site_id, payload,
+        )
+
+
+async def _seed_price(
+    pool: asyncpg.Pool,
+    when: datetime,
+    eur_per_kwh: float,
+    zone: str = TEST_ZONE,
+) -> None:
+    """Insert one ENTSOE_DAM hour into electricity_prices (€/kWh → €/MWh)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO electricity_prices (time, node_id, market_type, lmp_price_mwh)
+            VALUES ($1, $2, 'ENTSOE_DAM', $3)
+            """,
+            when, zone, eur_per_kwh * 1000.0,
+        )
 
 
 async def _seed_session(
@@ -107,6 +164,13 @@ def _args(**overrides):
         "max_rows": None,
         "log_level": "INFO",
         "session_ids": [],
+        # Both pools point at the same test DB. The backfill script
+        # opens two pools at startup so the static-schema reads (sites)
+        # and TimescaleDB reads (charging_sessions, electricity_prices)
+        # can target different deployments; in this single-pg test
+        # environment they share a URL.
+        "database_url": None,
+        "static_database_url": None,
     }
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -118,12 +182,10 @@ async def test_backfill_processes_zero_cost_imports(pool, cleanup, monkeypatch):
     """Imported rows with cost_total=0 are the canonical population the
     backfill targets. Verify they're processed and updated."""
     site_id = uuid4()
-    cleanup["depots"].append(site_id)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO prices (time, depot_id, energy_kwh, source) VALUES ($1, $2, $3, 'test')",
-            _utc(2026, 5, 1, 10), site_id, 0.25,
-        )
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+    await _seed_price(pool, _utc(2026, 5, 1, 10), 0.25)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
     await _seed_session(
@@ -137,6 +199,10 @@ async def test_backfill_processes_zero_cost_imports(pool, cleanup, monkeypatch):
         cost_total_source=None,
     )
 
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
     monkeypatch.setenv(
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
@@ -159,12 +225,10 @@ async def test_backfill_processes_zero_cost_imports(pool, cleanup, monkeypatch):
 @pytest.mark.integration
 async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch):
     site_id = uuid4()
-    cleanup["depots"].append(site_id)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO prices (time, depot_id, energy_kwh, source) VALUES ($1, $2, $3, 'test')",
-            _utc(2026, 5, 2, 12), site_id, 0.30,
-        )
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+    await _seed_price(pool, _utc(2026, 5, 2, 12), 0.30)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
     await _seed_session(
@@ -177,6 +241,10 @@ async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch
         cost_total=None,
     )
 
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
     monkeypatch.setenv(
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
@@ -206,12 +274,10 @@ async def test_backfill_idempotent_second_run_is_noop(pool, cleanup, monkeypatch
 @pytest.mark.integration
 async def test_backfill_skips_manual_rows(pool, cleanup, monkeypatch):
     site_id = uuid4()
-    cleanup["depots"].append(site_id)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO prices (time, depot_id, energy_kwh, source) VALUES ($1, $2, $3, 'test')",
-            _utc(2026, 5, 3, 9), site_id, 0.40,
-        )
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+    await _seed_price(pool, _utc(2026, 5, 3, 9), 0.40)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
     await _seed_session(
@@ -225,6 +291,10 @@ async def test_backfill_skips_manual_rows(pool, cleanup, monkeypatch):
         cost_total_source="manual",
     )
 
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
     monkeypatch.setenv(
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
@@ -244,12 +314,10 @@ async def test_backfill_skips_manual_rows(pool, cleanup, monkeypatch):
 @pytest.mark.integration
 async def test_backfill_dry_run_does_not_write(pool, cleanup, monkeypatch):
     site_id = uuid4()
-    cleanup["depots"].append(site_id)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO prices (time, depot_id, energy_kwh, source) VALUES ($1, $2, $3, 'test')",
-            _utc(2026, 5, 4, 14), site_id, 0.20,
-        )
+    cleanup["sites"].append(site_id)
+    cleanup["zones"].append(TEST_ZONE)
+    await _seed_site_with_zone(pool, site_id)
+    await _seed_price(pool, _utc(2026, 5, 4, 14), 0.20)
     session_id = uuid4()
     cleanup["sessions"].append(session_id)
     await _seed_session(
@@ -262,6 +330,10 @@ async def test_backfill_dry_run_does_not_write(pool, cleanup, monkeypatch):
         cost_total=0,
     )
 
+    monkeypatch.setenv(
+        "STATIC_DATABASE_URL",
+        os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),
+    )
     monkeypatch.setenv(
         "DATABASE_URL",
         os.getenv("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/favonius_test"),

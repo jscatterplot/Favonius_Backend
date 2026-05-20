@@ -51,6 +51,9 @@ def _utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> dat
     return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
 
 
+DEFAULT_ZONE = "10YLT-1001A0008Q"
+
+
 def _session_row(**overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "session_id": SESSION,
@@ -61,6 +64,7 @@ def _session_row(**overrides: Any) -> dict[str, Any]:
         "energy_delivered_kwh": Decimal("50.0"),
         "cost_total": None,
         "cost_total_source": None,
+        "bidding_zone": DEFAULT_ZONE,
     }
     base.update(overrides)
     return base
@@ -107,8 +111,8 @@ class _FakePool:
 
 
 def _make_lookup(price_map: dict[datetime, float]):
-    async def _lookup(depot_id: UUID, start: datetime, end: datetime) -> dict[datetime, float]:
-        # Mirror fetch_prices_with_fill: return any hour bucket whose
+    async def _lookup(bidding_zone: str, start: datetime, end: datetime) -> dict[datetime, float]:
+        # Mirror fetch_prices_by_zone: return any hour bucket whose
         # [h, h+1h) overlaps [start, end). A session 13:30→14:30 needs
         # hours 13:00 AND 14:00.
         result: dict[datetime, float] = {}
@@ -313,6 +317,29 @@ async def test_no_prices_returns_unpriceable() -> None:
     result = await compute_session_cost(pool, _session_row(), price_lookup=lookup)
     assert result.source == "unpriceable"
     assert result.cost is None
+
+
+@pytest.mark.asyncio
+async def test_missing_bidding_zone_returns_unpriceable() -> None:
+    """When the caller can't resolve a zone (sites row missing tz +
+    tariff_config), the calculator short-circuits to unpriceable."""
+    pool = _FakePool(_FakeConn([]))
+    lookup = _make_lookup({_utc(2026, 5, 19, 13, 0): 0.20})
+    row = _session_row(bidding_zone=None)
+
+    result = await compute_session_cost(pool, row, price_lookup=lookup)
+    assert result.source == "unpriceable"
+    assert result.cost is None
+
+
+@pytest.mark.asyncio
+async def test_empty_bidding_zone_string_returns_unpriceable() -> None:
+    pool = _FakePool(_FakeConn([]))
+    lookup = _make_lookup({_utc(2026, 5, 19, 13, 0): 0.20})
+    row = _session_row(bidding_zone="")
+
+    result = await compute_session_cost(pool, row, price_lookup=lookup)
+    assert result.source == "unpriceable"
 
 
 # ─── 8. Forward-fill within 1h ───────────────────────────────────────

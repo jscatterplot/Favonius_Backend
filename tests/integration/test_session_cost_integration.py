@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Optional
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -27,8 +28,14 @@ from src.core.billing.session_cost import (
     compute_session_cost,
     write_session_cost,
 )
-from src.db.queries import fetch_prices_with_fill
+from src.db.queries import fetch_prices_by_zone, resolve_bidding_zone
 from tests.integration.conftest import create_integration_pool
+
+
+# A real ENTSO-E EIC code (Lithuania, the HRX pilot zone). The bidding
+# zone is opaque from the calculator's perspective — any string suffices
+# for tests — but using a real one keeps the data plausible.
+TEST_ZONE = "10YLT-1001A0008Q"
 
 
 def _utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> datetime:
@@ -44,21 +51,34 @@ async def pool():
 
 @pytest_asyncio.fixture
 async def cleanup_ids(pool):
-    """Track UUIDs to delete in test cleanup. Avoids leaving rows around."""
+    """Track IDs to delete in test cleanup. Avoids leaving rows around.
+
+    ``zones`` is the list of bidding-zone strings whose
+    ``electricity_prices`` rows the test inserted; ``depots`` is now
+    only retained for symmetry — the new architecture writes to
+    ``electricity_prices`` keyed by zone, not to ``prices`` keyed by
+    depot.
+    """
     sessions: list[UUID] = []
     depots: list[UUID] = []
     vehicles: list[UUID] = []
-    yield {"sessions": sessions, "depots": depots, "vehicles": vehicles}
+    zones: list[str] = []
+    yield {
+        "sessions": sessions,
+        "depots": depots,
+        "vehicles": vehicles,
+        "zones": zones,
+    }
     async with pool.acquire() as conn:
         if sessions:
             await conn.execute(
                 "DELETE FROM charging_sessions WHERE session_id = ANY($1::uuid[])",
                 sessions,
             )
-        if depots:
+        if zones:
             await conn.execute(
-                "DELETE FROM prices WHERE depot_id = ANY($1::uuid[])",
-                depots,
+                "DELETE FROM electricity_prices WHERE node_id = ANY($1::text[])",
+                zones,
             )
         if vehicles:
             await conn.execute(
@@ -97,15 +117,30 @@ async def _seed_session(
         )
 
 
-async def _seed_prices(pool: asyncpg.Pool, depot_id: UUID, hours: dict[datetime, float]) -> None:
+async def _seed_prices(
+    pool: asyncpg.Pool,
+    bidding_zone: str,
+    hours: dict[datetime, float],
+) -> None:
+    """Insert ENTSO-E DAM prices into electricity_prices.
+
+    Test inputs are in €/kWh (caller-friendly); the table stores €/MWh,
+    so we multiply by 1000 at the boundary.
+    """
     async with pool.acquire() as conn:
         await conn.executemany(
             """
-            INSERT INTO prices (time, depot_id, energy_kwh, source)
-            VALUES ($1, $2, $3, 'test')
-            ON CONFLICT (time, depot_id) DO UPDATE SET energy_kwh = EXCLUDED.energy_kwh
+            INSERT INTO electricity_prices (time, node_id, market_type, lmp_price_mwh)
+            VALUES ($1, $2, 'ENTSOE_DAM', $3)
             """,
-            [(h, depot_id, p) for h, p in hours.items()],
+            [(h, bidding_zone, p * 1000.0) for h, p in hours.items()],
+        )
+
+
+async def _cleanup_prices(pool: asyncpg.Pool, bidding_zone: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM electricity_prices WHERE node_id = $1", bidding_zone,
         )
 
 
@@ -127,13 +162,13 @@ async def test_granular_end_to_end(pool, cleanup_ids):
     site_id = uuid4()
     vehicle_id = uuid4()
     cleanup_ids["sessions"].append(session_id)
-    cleanup_ids["depots"].append(site_id)
+    cleanup_ids["zones"].append(TEST_ZONE)
     cleanup_ids["vehicles"].append(vehicle_id)
 
     start = _utc(2026, 5, 19, 13, 0)
     end = _utc(2026, 5, 19, 14, 0)
 
-    await _seed_prices(pool, site_id, {start: 0.20})
+    await _seed_prices(pool, TEST_ZONE, {start: 0.20})
     # Six samples 10 min apart, all 50 kW → ~50 kWh.
     await _seed_telemetry(
         pool, vehicle_id,
@@ -156,6 +191,7 @@ async def test_granular_end_to_end(pool, cleanup_ids):
     # Coerce vehicle_id text → UUID for the calculator.
     row_dict = dict(row)
     row_dict["vehicle_id"] = UUID(row_dict["vehicle_id"])
+    row_dict["bidding_zone"] = TEST_ZONE
 
     result = await compute_session_cost(pool, row_dict)
     assert result.source == "granular"
@@ -181,11 +217,11 @@ async def test_fallback_average_end_to_end(pool, cleanup_ids):
     site_id = uuid4()
     vehicle_id = uuid4()
     cleanup_ids["sessions"].append(session_id)
-    cleanup_ids["depots"].append(site_id)
+    cleanup_ids["zones"].append(TEST_ZONE)
 
     start = _utc(2026, 5, 19, 10, 0)
     end = _utc(2026, 5, 19, 12, 0)
-    await _seed_prices(pool, site_id, {start: 0.10, start + timedelta(hours=1): 0.30})
+    await _seed_prices(pool, TEST_ZONE, {start: 0.10, start + timedelta(hours=1): 0.30})
     await _seed_session(
         pool,
         session_id=session_id,
@@ -201,6 +237,7 @@ async def test_fallback_average_end_to_end(pool, cleanup_ids):
             "SELECT * FROM charging_sessions WHERE session_id = $1", session_id,
         ))
     row["vehicle_id"] = UUID(row["vehicle_id"])
+    row["bidding_zone"] = TEST_ZONE
 
     result = await compute_session_cost(pool, row)
     assert result.source == "fallback_average"
@@ -216,11 +253,11 @@ async def test_write_skips_manual_rows(pool, cleanup_ids):
     site_id = uuid4()
     vehicle_id = uuid4()
     cleanup_ids["sessions"].append(session_id)
-    cleanup_ids["depots"].append(site_id)
+    cleanup_ids["zones"].append(TEST_ZONE)
 
     start = _utc(2026, 5, 19, 13, 0)
     end = _utc(2026, 5, 19, 14, 0)
-    await _seed_prices(pool, site_id, {start: 0.20})
+    await _seed_prices(pool, TEST_ZONE, {start: 0.20})
     await _seed_session(
         pool,
         session_id=session_id,
@@ -238,6 +275,7 @@ async def test_write_skips_manual_rows(pool, cleanup_ids):
             "SELECT * FROM charging_sessions WHERE session_id = $1", session_id,
         ))
     row["vehicle_id"] = UUID(row["vehicle_id"])
+    row["bidding_zone"] = TEST_ZONE
 
     result = await compute_session_cost(pool, row)
     assert result.source == "manual"
@@ -253,23 +291,123 @@ async def test_write_skips_manual_rows(pool, cleanup_ids):
     assert after["cost_total_source"] == "manual"
 
 
+@pytest_asyncio.fixture
+async def cleanup_sites(pool):
+    """Track sites.id rows the test seeded and remove on teardown."""
+    site_ids: list[UUID] = []
+    yield site_ids
+    if site_ids:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM sites WHERE id = ANY($1::uuid[])", site_ids,
+            )
+
+
+async def _seed_site(
+    pool: asyncpg.Pool,
+    site_id: UUID,
+    *,
+    timezone_name: Optional[str] = None,
+    tariff_config: Optional[dict] = None,
+) -> None:
+    """Insert a sites row with the bits resolve_bidding_zone reads."""
+    import json as _json
+    payload = _json.dumps(tariff_config) if tariff_config is not None else None
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO sites (id, timezone, tariff_config)
+            VALUES ($1, $2, $3::jsonb)
+            ON CONFLICT (id) DO UPDATE
+              SET timezone      = EXCLUDED.timezone,
+                  tariff_config = EXCLUDED.tariff_config
+            """,
+            site_id, timezone_name, payload,
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_fetch_prices_with_fill_forward_fills(pool, cleanup_ids):
-    """Prices at 13:00 only; the helper should forward-fill 14:00 within the 1h window."""
+async def test_resolve_bidding_zone_uses_tariff_config_first(pool, cleanup_sites):
     site_id = uuid4()
-    cleanup_ids["depots"].append(site_id)
-    await _seed_prices(pool, site_id, {_utc(2026, 5, 19, 13, 0): 0.20})
+    cleanup_sites.append(site_id)
+    # Tariff config wins over timezone fallback.
+    await _seed_site(
+        pool, site_id,
+        timezone_name="Europe/Vilnius",
+        tariff_config={"entsoe_zone": "10YDE-RWENET---I"},
+    )
+    async with pool.acquire() as conn:
+        zone = await resolve_bidding_zone(conn, site_id)
+    assert zone == "10YDE-RWENET---I"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_resolve_bidding_zone_falls_back_to_timezone(pool, cleanup_sites):
+    site_id = uuid4()
+    cleanup_sites.append(site_id)
+    await _seed_site(pool, site_id, timezone_name="Europe/Vilnius", tariff_config=None)
+    async with pool.acquire() as conn:
+        zone = await resolve_bidding_zone(conn, site_id)
+    assert zone == "10YLT-1001A0008Q"  # Lithuania
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_resolve_bidding_zone_unknown_returns_none(pool, cleanup_sites):
+    site_id = uuid4()
+    cleanup_sites.append(site_id)
+    await _seed_site(pool, site_id, timezone_name="America/Los_Angeles", tariff_config=None)
+    async with pool.acquire() as conn:
+        zone = await resolve_bidding_zone(conn, site_id)
+    assert zone is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_fetch_prices_by_zone_forward_fills(pool, cleanup_ids):
+    """Prices at 13:00 only; the helper should forward-fill 14:00 within
+    the 1h window. Also asserts the EUR/MWh → EUR/kWh conversion."""
+    cleanup_ids["zones"].append(TEST_ZONE)
+    # _seed_prices already does the kWh → MWh conversion at the boundary.
+    await _seed_prices(pool, TEST_ZONE, {_utc(2026, 5, 19, 13, 0): 0.20})
 
     async with pool.acquire() as conn:
-        filled = await fetch_prices_with_fill(
-            conn, site_id, _utc(2026, 5, 19, 13, 0), _utc(2026, 5, 19, 15, 0),
+        filled = await fetch_prices_by_zone(
+            conn, TEST_ZONE, _utc(2026, 5, 19, 13, 0), _utc(2026, 5, 19, 15, 0),
         )
 
     # 13:00 known. 14:00 within 1h of 13:00 → filled. 15:00 is excluded by < end.
     assert _utc(2026, 5, 19, 13, 0) in filled
     assert _utc(2026, 5, 19, 14, 0) in filled
-    assert filled[_utc(2026, 5, 19, 14, 0)] == 0.20
+    assert filled[_utc(2026, 5, 19, 14, 0)] == pytest.approx(0.20)
+    assert filled[_utc(2026, 5, 19, 13, 0)] == pytest.approx(0.20)
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_fetch_prices_by_zone_ignores_legacy_market_rows(pool, cleanup_ids):
+    """Only ENTSOE_DAM rows are returned — legacy CAISO LMP rows in the
+    same table must be skipped by the helper's market_type filter."""
+    cleanup_ids["zones"].append(TEST_ZONE)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO electricity_prices (time, node_id, market_type, lmp_price_mwh) "
+            "VALUES ($1, $2, 'ENTSOE_DAM', $3)",
+            _utc(2026, 5, 19, 13, 0), TEST_ZONE, 100.0,  # €0.10/kWh
+        )
+        await conn.execute(
+            "INSERT INTO electricity_prices (time, node_id, market_type, lmp_price_mwh) "
+            "VALUES ($1, $2, 'RTM', $3)",
+            _utc(2026, 5, 19, 13, 0), TEST_ZONE, 999.0,  # would leak as €0.999/kWh
+        )
+
+    async with pool.acquire() as conn:
+        filled = await fetch_prices_by_zone(
+            conn, TEST_ZONE, _utc(2026, 5, 19, 13, 0), _utc(2026, 5, 19, 14, 0),
+        )
+    assert filled[_utc(2026, 5, 19, 13, 0)] == pytest.approx(0.10)
 
 
 @pytest.mark.asyncio
@@ -280,11 +418,11 @@ async def test_idempotent_write(pool, cleanup_ids):
     site_id = uuid4()
     vehicle_id = uuid4()
     cleanup_ids["sessions"].append(session_id)
-    cleanup_ids["depots"].append(site_id)
+    cleanup_ids["zones"].append(TEST_ZONE)
 
     start = _utc(2026, 5, 19, 13, 0)
     end = _utc(2026, 5, 19, 14, 0)
-    await _seed_prices(pool, site_id, {start: 0.20})
+    await _seed_prices(pool, TEST_ZONE, {start: 0.20})
     await _seed_session(
         pool,
         session_id=session_id,
@@ -311,6 +449,7 @@ async def test_idempotent_write(pool, cleanup_ids):
             "SELECT * FROM charging_sessions WHERE session_id = $1", session_id,
         ))
     row2["vehicle_id"] = UUID(row2["vehicle_id"])
+    row2["bidding_zone"] = TEST_ZONE
 
     result_two = await compute_session_cost(pool, row2)
     # The pre-existing non-zero cost is now respected as 'manual' sentinel

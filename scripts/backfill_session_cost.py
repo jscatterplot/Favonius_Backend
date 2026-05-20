@@ -15,13 +15,30 @@ The script is **idempotent and re-runnable**:
     the live path's cost task failed.
   * Rows where ``cost_total_source = 'manual'`` are never touched.
 
+The backfill needs **two** pools: one to the TimescaleDB instance that
+holds ``charging_sessions`` + ``electricity_prices``, and a separate
+one to the Supabase static schema that holds ``sites`` (the source of
+each depot's ENTSO-E bidding zone). When the two databases share a
+single URL (local dev, single-pg deployments), point both flags at the
+same URL.
+
 Usage::
 
-    python scripts/backfill_session_cost.py                # process all
-    python scripts/backfill_session_cost.py --dry-run      # print decisions only
-    python scripts/backfill_session_cost.py --depot-id <uuid>  # one depot
-    python scripts/backfill_session_cost.py --max-rows 1000    # cap the run
-    python scripts/backfill_session_cost.py --batch-size 200   # smaller chunks
+    # Two-pool deployment (production / TigerCloud + Supabase):
+    python scripts/backfill_session_cost.py \\
+        --database-url postgresql://.../timescale \\
+        --static-database-url postgresql://.../supabase
+
+    # Single-pool deployment (defaults from env):
+    DATABASE_URL=postgresql://... \\
+        STATIC_DATABASE_URL=postgresql://... \\
+        python scripts/backfill_session_cost.py
+
+    # Other flags:
+    --dry-run                    # print decisions, no writes
+    --depot-id <uuid>            # one depot
+    --max-rows N                 # stop after N rows total
+    --batch-size N               # rows per transaction (default 500)
 
 Exit codes:
     0 — completed successfully (dry-run or apply)
@@ -36,9 +53,9 @@ import logging
 import os
 import sys
 from collections import Counter, OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 from uuid import UUID
 
 import asyncpg
@@ -53,7 +70,7 @@ from src.core.billing.session_cost import (  # noqa: E402
     write_session_cost,
 )
 from src.db.postgres_url import prepare_asyncpg_url_and_ssl  # noqa: E402
-from src.db.queries import fetch_prices_with_fill  # noqa: E402
+from src.db.queries import fetch_prices_by_zone, resolve_bidding_zone  # noqa: E402
 
 logger = logging.getLogger("backfill_session_cost")
 
@@ -89,33 +106,32 @@ _CANDIDATE_BY_SESSION_SQL = """
 class LRUPriceLookup:
     """Bounded in-process price cache for the backfill run.
 
-    Keys are ``(depot_id, hour_floor_utc)``. The cache is populated as
-    needed by delegating uncovered ranges to ``fetch_prices_with_fill``
-    and merging the result. Repeat depots within a chunk skip the DB
-    round-trip — the win that motivates the cache.
+    Keys are ``(bidding_zone, hour_floor_utc)``. The cache is populated
+    as needed by delegating uncovered ranges to
+    :func:`fetch_prices_by_zone` and merging the result. Repeat zones
+    within a chunk skip the DB round-trip — the win that motivates the
+    cache.
     """
 
-    def __init__(self, pool: asyncpg.Pool, *, max_entries: int = 10_000) -> None:
-        self._pool = pool
+    def __init__(self, ts_pool: asyncpg.Pool, *, max_entries: int = 10_000) -> None:
+        self._pool = ts_pool
         self._max = max_entries
-        self._cache: OrderedDict[tuple[UUID, datetime], float] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, datetime], float] = OrderedDict()
 
     async def __call__(
         self,
-        depot_id: UUID,
+        bidding_zone: str,
         start: datetime,
         end: datetime,
     ) -> dict[datetime, float]:
         async with self._pool.acquire() as conn:
-            fresh = await fetch_prices_with_fill(conn, depot_id, start, end)
+            fresh = await fetch_prices_by_zone(conn, bidding_zone, start, end)
         for hour, price in fresh.items():
-            self._put(depot_id, hour, price)
-        return {
-            hour: price for hour, price in fresh.items()
-        }
+            self._put(bidding_zone, hour, price)
+        return dict(fresh)
 
-    def _put(self, depot_id: UUID, hour: datetime, price: float) -> None:
-        key = (depot_id, hour)
+    def _put(self, bidding_zone: str, hour: datetime, price: float) -> None:
+        key = (bidding_zone, hour)
         if key in self._cache:
             self._cache.move_to_end(key)
         self._cache[key] = price
@@ -123,11 +139,31 @@ class LRUPriceLookup:
             self._cache.popitem(last=False)
 
 
-def _resolve_database_url() -> str:
-    url = (
-        os.getenv("DATABASE_URL")
-        or os.getenv("TIMESCALE_SERVICE_URL")
-    )
+class ZoneResolver:
+    """Caches ``site_id → bidding_zone`` for the duration of the backfill.
+
+    sites.tariff_config / sites.timezone don't change during a backfill
+    run, so one round-trip per depot is enough — even with thousands
+    of sessions per depot.
+    """
+
+    def __init__(self, static_pool: asyncpg.Pool) -> None:
+        self._pool = static_pool
+        self._cache: dict[UUID, Optional[str]] = {}
+
+    async def __call__(self, site_id: Optional[UUID]) -> Optional[str]:
+        if site_id is None:
+            return None
+        if site_id in self._cache:
+            return self._cache[site_id]
+        async with self._pool.acquire() as conn:
+            zone = await resolve_bidding_zone(conn, site_id)
+        self._cache[site_id] = zone
+        return zone
+
+
+def _resolve_ts_url() -> str:
+    url = os.getenv("DATABASE_URL") or os.getenv("TIMESCALE_SERVICE_URL")
     if not url:
         raise RuntimeError(
             "Set DATABASE_URL or TIMESCALE_SERVICE_URL to point at the "
@@ -136,19 +172,50 @@ def _resolve_database_url() -> str:
     return url
 
 
+def _resolve_static_url() -> str:
+    """Static-schema URL: SUPABASE_DB_URL / STATIC_DATABASE_URL / DATABASE_URL."""
+    url = (
+        os.getenv("STATIC_DATABASE_URL")
+        or os.getenv("SUPABASE_DB_URL")
+        or os.getenv("DATABASE_URL")
+    )
+    if not url:
+        raise RuntimeError(
+            "Set STATIC_DATABASE_URL (or SUPABASE_DB_URL, or DATABASE_URL) "
+            "to point at the Supabase static schema. Bidding-zone "
+            "resolution requires reading sites.tariff_config / "
+            "sites.timezone."
+        )
+    return url
+
+
+async def _open_pool(url: str, *, label: str) -> asyncpg.Pool:
+    clean_url, ssl_config = prepare_asyncpg_url_and_ssl(url)
+    connect_kw: dict = {}
+    if ssl_config is not None:
+        connect_kw["ssl"] = ssl_config
+    logger.info("Opening %s pool", label)
+    return await asyncpg.create_pool(
+        clean_url, min_size=1, max_size=10, **connect_kw
+    )
+
+
 async def _run(args: argparse.Namespace) -> int:
-    url = _resolve_database_url()
+    ts_url = args.database_url or _resolve_ts_url()
+    static_url = args.static_database_url or _resolve_static_url()
     logger.info(
         "Backfill starting — dry_run=%s depot=%s batch_size=%s max_rows=%s",
         args.dry_run, args.depot_id, args.batch_size, args.max_rows,
     )
-    database_url, ssl_config = prepare_asyncpg_url_and_ssl(url)
-    connect_kw: dict = {}
-    if ssl_config is not None:
-        connect_kw["ssl"] = ssl_config
-    pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10, **connect_kw)
+
+    ts_pool = await _open_pool(ts_url, label="timescaledb")
+    # If both URLs resolve to the same DSN we still open a second pool —
+    # cleaner than sharing connections, and the cost is negligible for a
+    # one-shot script.
+    static_pool = await _open_pool(static_url, label="static")
     try:
-        price_cache = LRUPriceLookup(pool)
+        price_cache = LRUPriceLookup(ts_pool)
+        zone_resolver = ZoneResolver(static_pool)
         counts: Counter[str] = Counter()
         processed = 0
 
@@ -161,7 +228,7 @@ async def _run(args: argparse.Namespace) -> int:
 
             session_ids = getattr(args, "session_ids", None) or []
 
-            async with pool.acquire() as conn, conn.transaction():
+            async with ts_pool.acquire() as conn, conn.transaction():
                 if session_ids:
                     rows = await conn.fetch(
                         _CANDIDATE_BY_SESSION_SQL,
@@ -179,8 +246,12 @@ async def _run(args: argparse.Namespace) -> int:
                     break
 
                 for row in rows:
+                    row_dict = dict(row)
+                    row_dict["bidding_zone"] = await zone_resolver(
+                        row_dict.get("site_id")
+                    )
                     result = await compute_session_cost(
-                        pool, dict(row), price_lookup=price_cache,
+                        ts_pool, row_dict, price_lookup=price_cache,
                     )
                     counts[result.source] += 1
                     if args.dry_run:
@@ -190,7 +261,7 @@ async def _run(args: argparse.Namespace) -> int:
                         )
                     else:
                         wrote = await write_session_cost(
-                            pool, row["session_id"], result, conn=conn,
+                            ts_pool, row["session_id"], result, conn=conn,
                         )
                         if not wrote:
                             counts["__write_lost_race"] += 1
@@ -201,8 +272,8 @@ async def _run(args: argparse.Namespace) -> int:
                     processed,
                     ", ".join(f"{k}={v}" for k, v in counts.most_common()),
                 )
-                # Dry-run never mutates rows; the candidate predicate would match
-                # the same chunk forever.
+                # Dry-run never mutates rows; the candidate predicate
+                # would match the same chunk forever.
                 if args.dry_run:
                     break
 
@@ -213,7 +284,8 @@ async def _run(args: argparse.Namespace) -> int:
         )
         return 0
     finally:
-        await pool.close()
+        await ts_pool.close()
+        await static_pool.close()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -228,6 +300,11 @@ def _parse_args() -> argparse.Namespace:
                    help="Stop after processing N rows total (default: no limit).")
     p.add_argument("--log-level", type=str, default="INFO",
                    help="Python logging level (default: INFO).")
+    p.add_argument("--database-url", type=str, default=None,
+                   help="TimescaleDB URL. Overrides DATABASE_URL / TIMESCALE_SERVICE_URL.")
+    p.add_argument("--static-database-url", type=str, default=None,
+                   help="Supabase static-schema URL. Overrides "
+                        "STATIC_DATABASE_URL / SUPABASE_DB_URL / DATABASE_URL.")
     args = p.parse_args()
     if args.depot_id is not None:
         try:
