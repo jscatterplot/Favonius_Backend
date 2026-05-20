@@ -272,11 +272,11 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
 GLOSSARY: tuple[str, ...] = (
     "consumption = SUM(energy_kwh) in agent_views.sessions over the window of interest.",
     "cost / spend = SUM(cost_total) in agent_views.sessions; rows where cost_total IS NULL are 'unpriceable' and should be excluded from the headline number. Use cost_total_source = 'granular' for the most accurate subset.",
-    "peak demand = MAX(peak_charging_kw + peak_kw) when combining telemetry_hourly and building_load_hourly on the same depot+hour. If only one is needed, use that one directly.",
+    "peak demand = MAX(peak_demand_kw) from agent_views.optimization_runs($1) for solver-reported depot peaks, or MAX(peak_kw) from agent_views.building_load_hourly($1) for non-EV building load. telemetry_hourly is not exposed in V1 — do not reference it.",
     "depot-local day boundaries: use `start_time AT TIME ZONE (SELECT timezone FROM agent_views.depots($1) WHERE depot_id = …)`.",
     "current driver of an RFID card: NOT in agent_views directly; use the lookup_entity tool with kind='rfid'.",
     "an 'open' session has end_time IS NULL.",
-    "the cross-DB boundary: vehicles/drivers/chargers/depots/schedules_recent live on the static pool; sessions/telemetry/prices/alerts/optimization_runs live on the TS pool. You cannot JOIN across; resolve IDs via one pool, then query the other.",
+    "the cross-DB boundary: vehicles/drivers/chargers/depots/schedules_recent live on the static pool; sessions/optimization_runs/alerts/prices_hourly/building_load_hourly/connector_status_latest live on the TS pool. You cannot JOIN across; resolve IDs via one pool, then query the other.",
     "the LLM must NEVER include the org id / depot ids as a literal — the server binds those automatically via $1.",
 )
 

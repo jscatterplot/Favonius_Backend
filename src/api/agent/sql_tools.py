@@ -170,7 +170,7 @@ def build_sql_agent_tool_registry(
         except (SqlExecutorPlanError, SqlExecutorError) as e:
             return {"error": str(e)}
         return {
-            "table": f"agent_views.{table}",
+            "table": f"agent_views.{table_in}",
             "column": column,
             "values": [list(row.values())[0] if row else None for row in r.rows],
         }

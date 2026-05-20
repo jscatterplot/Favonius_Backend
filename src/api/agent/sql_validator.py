@@ -83,6 +83,12 @@ FORBIDDEN_SCHEMAS: frozenset[str] = frozenset({
 # Functions that must never be callable from agent SQL, even outside a
 # FROM clause. Each is either a known data-exfiltration vector, a
 # server-state mutator, or a way to defeat the statement_timeout cap.
+# sqlglot typed Func nodes (e.g. version() → CurrentVersion) use keys that
+# differ from the SQL function name; map key → name for the denylist check.
+TYPED_FUNC_KEYS: dict[str, str] = {
+    "currentversion": "version",
+}
+
 DANGEROUS_FUNCTIONS: frozenset[str] = frozenset({
     "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file",
     "lo_import", "lo_export",
@@ -283,10 +289,22 @@ def validate_sql(
 
     # Also walk built-in funcs sqlglot resolved (Func subclasses) to be
     # paranoid. Most dangerous functions parse as Anonymous because they
-    # are postgres-specific, but a few (e.g. CURRENT_USER) are typed.
-    # CURRENT_USER itself is informational — allow — but flag the rest.
+    # are postgres-specific, but a few (e.g. version() → CurrentVersion)
+    # are typed. CURRENT_USER is informational — allow — but flag the rest.
     # This is a defence-in-depth list; the main protection is the role
     # swap + grants.
+    for node in tree.find_all(exp.Func):
+        if isinstance(node, exp.Anonymous):
+            continue
+        parent = node.parent
+        if isinstance(parent, exp.Table):
+            continue
+        fn_name = TYPED_FUNC_KEYS.get((node.key or "").lower(), (node.key or "").lower())
+        if fn_name in DANGEROUS_FUNCTIONS:
+            return _reject(
+                "dangerous_fn",
+                f"Function {fn_name!r} not permitted.",
+            )
 
     # 6. Hypertable-backed functions need a time predicate. Apply per
     # SELECT-branch — a UNION with one bounded and one unbounded branch
