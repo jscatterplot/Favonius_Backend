@@ -29,8 +29,15 @@ def mock_pool():
     conn.__aenter__ = AsyncMock(return_value=conn)
     conn.__aexit__ = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
+    conn.executemany = AsyncMock()
     conn.fetch = AsyncMock(return_value=[])
     conn.fetchrow = AsyncMock(return_value=None)
+    # ``store_prices_to_db`` now batches inserts inside an explicit
+    # transaction so a half-applied batch on error rolls back.
+    txn = MagicMock()
+    txn.__aenter__ = AsyncMock(return_value=None)
+    txn.__aexit__ = AsyncMock(return_value=None)
+    conn.transaction = MagicMock(return_value=txn)
     return pool
 
 
@@ -422,28 +429,41 @@ async def test_get_day_ahead_prices_rate_limit(entsoe_adapter):
 
 @pytest.mark.asyncio
 async def test_store_prices_to_db(entsoe_adapter, mock_pool):
-    """Test storing ENTSO-E prices to database."""
-    depot_id = uuid4()
+    """Test storing ENTSO-E prices to the canonical electricity_prices table.
+
+    The adapter now keys by ENTSO-E bidding zone (``node_id``) so the
+    backend has one canonical price hypertable rather than per-depot
+    duplicates. The write batches all rows inside a single
+    transaction via ``executemany`` instead of N ``execute`` calls.
+    """
+    bidding_zone = "10Y1001A1001A82H"  # DE-LU
     prices = [
         ENTSOEPrice(
             timestamp=datetime(2026, 2, 10, h, 0, tzinfo=timezone.utc),
             price_eur_mwh=50.0 + h,
-            bidding_zone="10Y1001A1001A82H",
+            bidding_zone=bidding_zone,
         )
         for h in range(5)
     ]
 
-    stored = await entsoe_adapter.store_prices_to_db(prices, depot_id)
+    stored = await entsoe_adapter.store_prices_to_db(prices, bidding_zone)
 
     assert stored == 5
-    assert mock_pool.acquire.return_value.execute.call_count == 5
+    # One executemany call carrying all five rows — not five execute calls.
+    conn = mock_pool.acquire.return_value
+    conn.executemany.assert_awaited_once()
+    sql, rows = conn.executemany.await_args.args
+    assert "INSERT INTO electricity_prices" in sql
+    assert "ON CONFLICT (time, node_id, market_type) DO NOTHING" in sql
+    assert len(rows) == 5
+    # Every row carries the bidding zone, not the depot UUID.
+    assert all(row[1] == bidding_zone for row in rows)
 
 
 @pytest.mark.asyncio
 async def test_store_prices_to_db_no_pool():
     """Test storing without pool raises error."""
     adapter = ENTSOEAdapter(security_token="test-token")
-    depot_id = uuid4()
     prices = [
         ENTSOEPrice(
             timestamp=datetime(2026, 2, 10, 0, 0, tzinfo=timezone.utc),
@@ -453,7 +473,7 @@ async def test_store_prices_to_db_no_pool():
     ]
 
     with pytest.raises(RuntimeError, match="Database pool not configured"):
-        await adapter.store_prices_to_db(prices, depot_id)
+        await adapter.store_prices_to_db(prices, "10Y1001A1001A82H")
 
 
 @pytest.mark.asyncio

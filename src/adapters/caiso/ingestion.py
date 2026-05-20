@@ -120,7 +120,24 @@ class PriceIngestionService:
         end_date: datetime,
         depot_timezone: str,
     ) -> int:
-        """Fetch and store ENTSO-E prices for a European depot."""
+        """Fetch and store ENTSO-E prices for a European depot.
+
+        Prices are persisted to ``electricity_prices`` keyed by ENTSO-E
+        bidding zone — the same hypertable the WS-handler feeder and
+        the read-through cache in ``src/db/queries.py`` use. The
+        ``depot_id`` is retained as a log key and for the adapter's
+        per-depot timezone resolution but is no longer a storage key.
+        """
+        from ..entsoe.mappings import get_bidding_zone
+
+        zone = get_bidding_zone(depot_timezone)
+        if zone is None:
+            logger.warning(
+                f"No ENTSO-E bidding zone for depot {depot_id} "
+                f"(timezone: {depot_timezone}); skipping"
+            )
+            return 0
+
         prices = await self.entsoe_adapter.get_prices_for_depot(
             depot_id=depot_id,
             start_date=start_date,
@@ -132,16 +149,16 @@ class PriceIngestionService:
 
         if prices:
             stored = await self.entsoe_adapter.store_prices_to_db(
-                prices, depot_id, source="entsoe_dam"
+                prices, zone, source="entsoe_dam"
             )
             logger.info(
-                f"Stored {stored} ENTSO-E prices for depot {depot_id} "
-                f"(timezone: {depot_timezone})"
+                f"Stored {stored} ENTSO-E prices for zone {zone} "
+                f"(depot={depot_id}, timezone={depot_timezone})"
             )
             return stored
         else:
             logger.warning(
-                f"No ENTSO-E prices fetched for depot {depot_id} " f"(timezone: {depot_timezone})"
+                f"No ENTSO-E prices fetched for depot {depot_id} (timezone: {depot_timezone})"
             )
             return 0
 
