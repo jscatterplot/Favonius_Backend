@@ -164,6 +164,26 @@ WORKFLOW_LLM_TOKENS = Counter(
     ["workflow", "model", "direction"],  # direction: input | output
 )
 
+# Per-session electricity cost calculator (src/core/billing/session_cost.py).
+# Migration 040 added cost_total_source; these counters mirror its value space.
+SESSION_COST_COMPUTED = Counter(
+    "favonius_session_cost_computed_total",
+    "Charging-session cost calculations by source / outcome",
+    ["source"],  # granular | fallback_average | unpriceable | no_energy | no_depot | manual | pending_close
+)
+
+SESSION_COST_COMPUTE_FAILURES = Counter(
+    "favonius_session_cost_compute_failures_total",
+    "Exceptions thrown in the post-commit cost task (fire-and-forget)",
+    ["reason"],  # db_error | unexpected
+)
+
+SESSION_COST_DURATION = Histogram(
+    "favonius_session_cost_duration_seconds",
+    "Wall-clock time to compute one session's cost",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+)
+
 # Control loop metrics
 # Per PRD Section 10.2: System availability ≥ 99.5%
 CONTROL_LOOP_UPTIME = Gauge(

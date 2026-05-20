@@ -569,9 +569,23 @@ class TestTimescaleClient:
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_store_electricity_prices_writes_to_table(self, timescale_client):
-        """Happy path: ENTSO-E points are bulk-loaded into ``electricity_prices``."""
+        """Happy path: ENTSO-E points are upserted into ``electricity_prices``.
+
+        Migration 041 added a unique index on ``(time, node_id,
+        market_type)`` so the feeder must use ``INSERT … ON CONFLICT
+        DO NOTHING`` instead of the previous ``copy_records_to_table``
+        bulk-load — every 15-minute feeder tick re-ingests the same
+        day-ahead window, and COPY has no conflict-resolution
+        semantics.
+        """
         mock_conn = AsyncMock()
-        mock_conn.copy_records_to_table = AsyncMock()
+        mock_conn.executemany = AsyncMock()
+        # ``async with conn.transaction()`` is used so the batch
+        # is atomic.
+        txn = MagicMock()
+        txn.__aenter__ = AsyncMock(return_value=None)
+        txn.__aexit__ = AsyncMock(return_value=None)
+        mock_conn.transaction = MagicMock(return_value=txn)
         mock_pool = MagicMock()
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
         mock_pool.acquire.return_value.__aexit__.return_value = None
@@ -594,9 +608,13 @@ class TestTimescaleClient:
                 }
             ]
         )
-        mock_conn.copy_records_to_table.assert_awaited_once()
-        # First positional arg is the destination table name.
-        assert mock_conn.copy_records_to_table.await_args.args[0] == "electricity_prices"
+        mock_conn.executemany.assert_awaited_once()
+        sql, rows = mock_conn.executemany.await_args.args
+        assert "INSERT INTO electricity_prices" in sql
+        assert "ON CONFLICT (time, node_id, market_type) DO NOTHING" in sql
+        assert len(rows) == 1
+        assert rows[0][1] == "10YLT-1001A0008Q"
+        assert rows[0][2] == "ENTSOE_DAM"
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)

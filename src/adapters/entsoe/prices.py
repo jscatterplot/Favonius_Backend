@@ -193,23 +193,36 @@ class ENTSOEAdapter:
     async def store_prices_to_db(
         self,
         prices: list[ENTSOEPrice],
-        depot_id: str | UUID,
+        bidding_zone: str,
         source: str = "entsoe_dam",
-        demand_charge_per_kw: Optional[float] = None,
     ) -> int:
-        """Store fetched prices to database.
+        """Store fetched prices into ``electricity_prices``.
 
-        Converts EUR/MWh to EUR/kWh and stores in the prices table
-        using the same schema as CAISO prices.
+        Writes are keyed by ENTSO-E EIC bidding zone (``node_id``),
+        matching the canonical storage shape used by the WS handler's
+        price feeder and read by ``src/db/queries.py::fetch_prices_by_zone``.
+        Earlier draft wrote to the per-depot ``prices`` table — that
+        caused duplicate copies of the same hour across depots in the
+        same zone and was incompatible with the new single-source
+        billing path. The two tables are now consolidated.
+
+        Uses ``ON CONFLICT (time, node_id, market_type) DO NOTHING``
+        against the ``uq_electricity_prices_node_time_market`` index
+        from migration 041, so concurrent ingestion (this adapter +
+        the WS-handler feeder + the read-through cache in
+        ``fetch_or_pull_prices_by_zone``) can't race-insert duplicates.
 
         Args:
-            prices: List of ENTSOEPrice objects
-            depot_id: Depot identifier
-            source: Price source identifier
-            demand_charge_per_kw: Optional demand charge rate
+            prices: List of ``ENTSOEPrice`` objects to store.
+            bidding_zone: ENTSO-E EIC area code (e.g. ``10YLT-1001A0008Q``).
+            source: Source identifier. Honoured for backward
+                compatibility but the row's ``market_type`` is
+                normalised to ``'ENTSOE_DAM'`` regardless — that's
+                the only value the readers expect.
 
         Returns:
-            Number of prices stored
+            Number of price rows actually inserted (excludes rows the
+            uniqueness constraint rejected).
         """
         if not self.pool:
             raise RuntimeError("Database pool not configured for ENTSOEAdapter")
@@ -217,38 +230,40 @@ class ENTSOEAdapter:
         if not prices:
             return 0
 
-        depot_id_str = str(depot_id)
+        # Source kept for log/audit purposes only; downstream readers
+        # match on ``market_type = 'ENTSOE_DAM'``.
+        _ = source
+
+        # UNNEST-based bulk insert with RETURNING so we can count
+        # actually-inserted rows. ``executemany`` discards per-row
+        # results, and ON CONFLICT DO NOTHING makes ``execute`` report
+        # 'INSERT 0 N' where N counts the *attempts*, not the inserts.
+        # Reporting the attempted count over-stated success when the
+        # feeder ran on its 15-minute cadence against an already-warm
+        # table; almost every row was a no-op and we logged it as a
+        # win. ``RETURNING 1`` yields one row per inserted record only.
+        times = [price.timestamp for price in prices]
+        amounts = [price.price_eur_mwh for price in prices]
+
         query = """
-        INSERT INTO prices (time, depot_id, energy_kwh, demand_kw, source)
-        VALUES ($1, $2::uuid, $3, $4, $5)
-        ON CONFLICT (time, depot_id) DO UPDATE
-        SET energy_kwh = EXCLUDED.energy_kwh,
-            demand_kw = EXCLUDED.demand_kw,
-            source = EXCLUDED.source
+        INSERT INTO electricity_prices (time, node_id, market_type, lmp_price_mwh)
+        SELECT t.time, $2, 'ENTSOE_DAM', t.price
+        FROM UNNEST($1::timestamptz[], $3::float8[]) AS t(time, price)
+        ON CONFLICT (time, node_id, market_type) DO NOTHING
+        RETURNING 1
         """
 
-        stored_count = 0
         try:
             async with self.pool.acquire() as conn:
-                for price in prices:
-                    energy_kwh = price.price_per_kwh
-                    await conn.execute(
-                        query,
-                        price.timestamp,
-                        depot_id_str,
-                        energy_kwh,
-                        demand_charge_per_kw,
-                        source,
-                    )
-                    stored_count += 1
+                async with conn.transaction():
+                    inserted = await conn.fetch(query, times, bidding_zone, amounts)
+            stored = len(inserted)
 
             logger.info(
-                "Stored %d ENTSO-E prices for depot %s (source: %s)",
-                stored_count,
-                depot_id_str,
-                source,
+                "Stored %d/%d ENTSO-E prices for zone %s (source: %s)",
+                stored, len(prices), bidding_zone, source,
             )
-            return stored_count
+            return stored
 
         except asyncpg.PostgresError as e:
             logger.error("Database error storing ENTSO-E prices: %s", e)
@@ -282,12 +297,20 @@ class ENTSOEAdapter:
             List of ENTSOEPrice objects
         """
         zone = bidding_zone or (get_bidding_zone(depot_timezone) if depot_timezone else None)
+        if zone is None:
+            raise ValueError(
+                f"Cannot determine bidding zone. Provide bidding_zone or a "
+                f"European depot_timezone (got timezone={depot_timezone!r})"
+            )
+
+        # ``depot_id`` is retained in the signature for callers that
+        # log per-depot but no longer used as a storage key — the
+        # canonical table is ``electricity_prices`` keyed by zone.
+        _ = depot_id
 
         if use_cache and self.pool:
             try:
-                cached = await self._get_cached_prices(
-                    depot_id, start_date, end_date, zone or "unknown"
-                )
+                cached = await self._get_cached_prices(zone, start_date, end_date)
                 if cached:
                     return cached
             except Exception as e:
@@ -302,7 +325,7 @@ class ENTSOEAdapter:
 
         if self.pool and prices:
             try:
-                await self.store_prices_to_db(prices, depot_id, source=source)
+                await self.store_prices_to_db(prices, zone, source=source)
             except Exception as e:
                 logger.warning("Error storing ENTSO-E prices to database: %s", e)
 
@@ -310,47 +333,53 @@ class ENTSOEAdapter:
 
     async def _get_cached_prices(
         self,
-        depot_id: str | UUID,
+        bidding_zone: str,
         start_time: datetime,
         end_time: datetime,
-        bidding_zone: str,
     ) -> list[ENTSOEPrice]:
-        """Get cached prices from database."""
+        """Read cached prices from ``electricity_prices`` for one zone.
+
+        Reads the same canonical hypertable that
+        ``src/db/queries.py::fetch_prices_by_zone`` consults, so
+        operators ingesting via this adapter or via the WS-handler
+        feeder both populate one table that the billing and optimizer
+        paths read from uniformly.
+        """
         if not self.pool:
             return []
 
-        depot_id_str = str(depot_id)
         query = """
-        SELECT time, energy_kwh, source
-        FROM prices
-        WHERE depot_id = $1::uuid
+        SELECT time, lmp_price_mwh
+        FROM electricity_prices
+        WHERE node_id = $1
+          AND market_type = 'ENTSOE_DAM'
           AND time >= $2
           AND time < $3
-          AND source = 'entsoe_dam'
         ORDER BY time
         """
 
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(query, depot_id_str, start_time, end_time)
+            rows = await conn.fetch(query, bidding_zone, start_time, end_time)
 
         if not rows:
             return []
 
         prices = []
         for row in rows:
-            price_mwh = row["energy_kwh"] * 1000.0
+            raw = row["lmp_price_mwh"]
+            if raw is None:
+                continue
             prices.append(
                 ENTSOEPrice(
                     timestamp=row["time"],
-                    price_eur_mwh=price_mwh,
+                    price_eur_mwh=float(raw),
                     bidding_zone=bidding_zone,
                 )
             )
 
         logger.debug(
-            "Using %d cached ENTSO-E prices for depot %s",
-            len(prices),
-            depot_id_str,
+            "Using %d cached ENTSO-E prices for zone %s",
+            len(prices), bidding_zone,
         )
         return prices
 

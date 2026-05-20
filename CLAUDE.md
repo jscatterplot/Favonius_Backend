@@ -272,6 +272,14 @@ Sprint 4 ships the five tools the daily-readiness workflow needs (PRD §6.1) on 
 
 Tools registered: `get_scheduled_departures(depot_id, window_start, window_end)`, `get_vehicle_state(vehicle_id)`, `get_charger_state(charger_id)`, `get_charging_plan(vehicle_id)`, `get_driver_assignment(route_id)`. The data plumbing this depends on: Supabase migration 013 (`schedules.driver_id`) and migration 014 (`routes` view aliasing `schedules` to the PRD §5.1 `Route` shape).
 
+### Per-session billing (`src/core/billing/session_cost.py`)
+
+`compute_session_cost(ts_pool, session_row)` returns a `SessionCostResult` (`cost`, `source`, diagnostics). Two strategies, automatic selection: **granular** integrates `charging_kw × Δt × price(t)` via TimescaleDB `time_bucket('1 hour', telemetry.time)` (trapezoidal between consecutive samples) joined to `electricity_prices`, **fallback_average** uses `energy_delivered_kwh × avg(price over [start,end])`. The granular path is gated: telemetry timestamps must cover ≥80% of the session AND telemetry-implied energy must reconcile to within ±10% of `energy_delivered_kwh`. The chosen strategy is written to `charging_sessions.cost_total_source` (migration 040). Missing prices → `'unpriceable'`, `cost_total` stays NULL; billing never fabricates a price.
+
+Price lookup goes through `src/db/queries.py::fetch_or_pull_prices_by_zone` — a read-through cache around `electricity_prices` (keyed by ENTSO-E `node_id`, EUR/MWh stored, EUR/kWh returned). On cache miss the helper calls `ENTSOEAdapter.get_day_ahead_prices(zone, start, end)` directly against the Transparency Platform API, persists the result back to `electricity_prices`, and re-reads through the standard forward-fill path. This is what keeps billing working when the WS handler's price feeder is misconfigured or hasn't populated the table yet. Requires `EUROPEAN_ELECTRICITY_API`; without it the helper returns whatever the cache has (possibly empty) and the calculator lands `'unpriceable'`. Each call site resolves the bidding zone for a depot via `src/db/queries.py::resolve_bidding_zone(static_pool, site_id)` once, with a cascade: `sites.tariff_config['entsoe_zone']` → `get_bidding_zone(sites.timezone)` → `None`. Callers (cost calculator + `StateAssembler._get_prices`) inject the resolved zone; the calculator returns `'unpriceable'` and the optimizer falls back to $0.15/kWh when no zone resolves. The legacy `prices` table (per-depot tariff) is unused on the current ENTSO-E deployment — `ENTSOEAdapter.store_prices_to_db` and `_get_cached_prices` write/read `electricity_prices` keyed by bidding zone too, so all ENTSO-E ingestion paths (this adapter + the WS-handler feeder + the read-through cache) land in one canonical hypertable.
+
+The OCPP close path (`TimescaleClient.close_open_session`, `recover_orphaned_sessions`) schedules the calc as a post-commit `asyncio.create_task`; if it fails, the row stays NULL and `scripts/backfill_session_cost.py` sweeps it on the next run (predicate `WHERE cost_total IS NULL OR cost_total = 0`). The backfill script takes two URLs (`--database-url` for TimescaleDB, `--static-database-url` for Supabase; fall through to `DATABASE_URL` / `STATIC_DATABASE_URL` / `SUPABASE_DB_URL` env). It builds a `{site_id → zone}` cache at startup so the resolver hits Supabase once per depot, not per row. Chunked (default 500 rows) with `SELECT FOR UPDATE SKIP LOCKED` and is safely re-runnable. Metrics: `favonius_session_cost_computed_total{source}`, `favonius_session_cost_compute_failures_total{reason}`, `favonius_session_cost_duration_seconds`.
+
 ### Optimization Control Loop
 
 ```
@@ -405,6 +413,7 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 - `optimization_runs.status` values: `'optimal'` | `'feasible'` | `'degraded'` | `'infeasible'` | `'timeout'`
 - `charging_command_queue.status` values: `'pending'` | `'sent'` | `'acked'` | `'failed'` | `'expired'`
 - `ocpp_transaction_id` / `ocpp_charging_profile_id` sequences (migration 012) provide restart-safe OCPP 1.6 integer IDs
+- `charging_sessions.cost_total_source` values (migration 040): `'granular'` | `'fallback_average'` | `'unpriceable'` | `'no_energy'` | `'no_depot'` | `'manual'`. Written by `src/core/billing/session_cost.py`; the calculator never overwrites `'manual'` or any non-zero externally-sourced cost.
 
 ### Migrations
 Migrations in `migrations/` run automatically on `docker-compose up` (mounted to `/docker-entrypoint-initdb.d`). To run manually: `python scripts/run_migrations.py`.

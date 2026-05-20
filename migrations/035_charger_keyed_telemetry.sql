@@ -25,14 +25,18 @@ ALTER TABLE telemetry
     ALTER COLUMN station_id SET NOT NULL,
     ALTER COLUMN connector_id SET NOT NULL;
 
--- Vehicle is now optional enrichment, not the primary identity.
-ALTER TABLE telemetry
-    ALTER COLUMN vehicle_id DROP NOT NULL;
-
 -- Replace old PK and indexes.
+-- The PK swap must run BEFORE the vehicle_id NOT NULL drop — PostgreSQL
+-- refuses ALTER COLUMN ... DROP NOT NULL on a column that's part of an
+-- active primary key. With the old (time, vehicle_id) PK dropped first
+-- the column is free to lose its NOT NULL.
 ALTER TABLE telemetry DROP CONSTRAINT IF EXISTS telemetry_pkey;
 ALTER TABLE telemetry
     ADD CONSTRAINT telemetry_pkey PRIMARY KEY (time, station_id, connector_id);
+
+-- Vehicle is now optional enrichment, not the primary identity.
+ALTER TABLE telemetry
+    ALTER COLUMN vehicle_id DROP NOT NULL;
 
 DROP INDEX IF EXISTS idx_telemetry_vehicle;
 CREATE INDEX IF NOT EXISTS idx_telemetry_vehicle ON telemetry (vehicle_id, time DESC);

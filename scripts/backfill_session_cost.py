@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""One-shot backfill for charging_sessions.cost_total.
+
+Computes electricity cost for every closed charging_sessions row whose
+``cost_total`` is NULL or 0 (and whose ``cost_total_source`` is not
+``'manual'``). Reuses ``src/core/billing/session_cost.py`` so the math
+is identical to the live close path.
+
+The script is **idempotent and re-runnable**:
+
+  * Candidate predicate ``WHERE cost_total IS NULL OR cost_total = 0`` is
+    re-checked on every chunk. Already-priced rows are skipped.
+  * ``FOR UPDATE SKIP LOCKED`` lets a concurrent live close take its
+    own row without us blocking on it; we'll process it next sweep if
+    the live path's cost task failed.
+  * Rows where ``cost_total_source = 'manual'`` are never touched.
+
+The backfill needs **two** pools: one to the TimescaleDB instance that
+holds ``charging_sessions`` + ``electricity_prices``, and a separate
+one to the Supabase static schema that holds ``sites`` (the source of
+each depot's ENTSO-E bidding zone). When the two databases share a
+single URL (local dev, single-pg deployments), point both flags at the
+same URL.
+
+Usage::
+
+    # Two-pool deployment (production / TigerCloud + Supabase):
+    python scripts/backfill_session_cost.py \\
+        --database-url postgresql://.../timescale \\
+        --static-database-url postgresql://.../supabase
+
+    # Single-pool deployment (defaults from env):
+    DATABASE_URL=postgresql://... \\
+        STATIC_DATABASE_URL=postgresql://... \\
+        python scripts/backfill_session_cost.py
+
+    # Other flags:
+    --dry-run                    # print decisions, no writes
+    --depot-id <uuid>            # one depot
+    --max-rows N                 # stop after N rows total
+    --batch-size N               # rows per transaction (default 500)
+
+Exit codes:
+    0 — completed successfully (dry-run or apply)
+    1 — connection / fatal error
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import sys
+from collections import Counter, OrderedDict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from uuid import UUID
+
+import asyncpg
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Imports below intentionally after sys.path tweak (repo root → src.* packages).
+from src.core.billing.session_cost import (  # noqa: E402
+    _expected_hour_buckets,
+    compute_session_cost,
+    write_session_cost,
+)
+from src.db.postgres_url import prepare_asyncpg_url_and_ssl  # noqa: E402
+from src.db.queries import (  # noqa: E402
+    _as_utc_aware,
+    fetch_or_pull_prices_by_zone,
+    resolve_bidding_zone,
+)
+
+logger = logging.getLogger("backfill_session_cost")
+
+
+# Only ``'manual'`` is sacrosanct (operator-supplied cost) — the calculator
+# never overwrites those. Beyond that we want to preserve self-healing:
+# a re-import that fixes ``energy_delivered_kwh`` or an admin populating
+# ``site_id`` on a legacy row should let the next backfill re-evaluate.
+# But unconditionally resweeping every terminal row across runs amplifies
+# the backfill cost on fleets with thousands of permanently-stranded
+# imports — rows where the underlying data hasn't changed will land the
+# same terminal source forever. The two predicates below are conservative
+# filters that skip rows whose data is still in the *exact* state that
+# produced the terminal label:
+#
+#   * ``'no_energy'`` rows whose ``energy_delivered_kwh`` is still NULL/≤0
+#     will land ``'no_energy'`` again — nothing changed.
+#   * ``'no_depot'`` rows whose ``site_id`` is still NULL AND ``station_id``
+#     is also NULL have no recovery path (the SiteResolver needs a
+#     station_id to look up). When either becomes non-NULL the predicate
+#     stops matching and the row re-enters the candidate set.
+#
+# ``'unpriceable'`` always resweeps — prices in ``electricity_prices``
+# can arrive later (ENTSO-E publication lag) and we can't cheaply join
+# at the SQL level to detect that.
+# Depot scoping admits NULL-site rows with a station_id so the
+# SiteResolver path can recover them. Without this, ``--depot-id <X>``
+# runs would skip every live/imported row whose ``site_id`` is still
+# NULL even when the station_id maps to depot X — exactly the rows
+# operators most often need to backfill (failed post-close cost task,
+# pre-site_id-backfill imports). The Python loop filters by the
+# resolved depot after ``SiteResolver`` runs.
+_CANDIDATE_SQL = """
+    SELECT session_id, site_id, vehicle_id, station_id, connector_id,
+           transaction_id, start_time, end_time,
+           energy_delivered_kwh, cost_total, cost_total_source
+      FROM charging_sessions
+     WHERE end_time IS NOT NULL
+       AND (cost_total IS NULL OR cost_total = 0)
+       AND cost_total_source IS DISTINCT FROM 'manual'
+       AND NOT (
+           cost_total_source = 'no_energy'
+           AND (energy_delivered_kwh IS NULL OR energy_delivered_kwh <= 0)
+       )
+       AND NOT (
+           cost_total_source = 'no_depot'
+           AND site_id IS NULL
+           AND station_id IS NULL
+       )
+       AND (
+           $1::uuid IS NULL
+           OR site_id = $1
+           OR (site_id IS NULL AND station_id IS NOT NULL)
+       )
+       AND session_id > $3::uuid
+     ORDER BY session_id
+     LIMIT $2
+"""
+
+_CANDIDATE_BY_SESSION_SQL = """
+    SELECT session_id, site_id, vehicle_id, station_id, connector_id,
+           transaction_id, start_time, end_time,
+           energy_delivered_kwh, cost_total, cost_total_source
+      FROM charging_sessions
+     WHERE end_time IS NOT NULL
+       AND (cost_total IS NULL OR cost_total = 0)
+       AND cost_total_source IS DISTINCT FROM 'manual'
+       AND NOT (
+           cost_total_source = 'no_energy'
+           AND (energy_delivered_kwh IS NULL OR energy_delivered_kwh <= 0)
+       )
+       AND NOT (
+           cost_total_source = 'no_depot'
+           AND site_id IS NULL
+           AND station_id IS NULL
+       )
+       AND (
+           $1::uuid IS NULL
+           OR site_id = $1
+           OR (site_id IS NULL AND station_id IS NOT NULL)
+       )
+       AND session_id = ANY($3::uuid[])
+       AND session_id > $4::uuid
+     ORDER BY session_id
+     LIMIT $2
+"""
+
+# All-zeros UUID — strictly less than every legitimate ``gen_random_uuid()``
+# value, so the first chunk uses it as a lower-bound that admits all rows.
+_UUID_FLOOR = UUID("00000000-0000-0000-0000-000000000000")
+
+
+class LRUPriceLookup:
+    """Bounded in-process price cache for the backfill run.
+
+    Keys are ``(bidding_zone, hour_floor_utc)``. The cache is populated
+    as needed by delegating uncovered ranges to
+    :func:`fetch_or_pull_prices_by_zone` and merging the result. Repeat zones
+    within a chunk skip the DB round-trip — the win that motivates the
+    cache.
+    """
+
+    def __init__(self, ts_pool: asyncpg.Pool, *, max_entries: int = 10_000) -> None:
+        self._pool = ts_pool
+        self._max = max_entries
+        self._cache: OrderedDict[tuple[str, datetime], float] = OrderedDict()
+
+    async def __call__(
+        self,
+        bidding_zone: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[datetime, float]:
+        # Cache keys are aware-UTC datetimes (that's what
+        # ``fetch_or_pull_prices_by_zone`` stores via ``self._put``).
+        # Naive callers — possible when ``charging_sessions.start_time``
+        # comes back as naive from a test fake or a misconfigured
+        # asyncpg type codec — would otherwise build naive expected
+        # hour keys and miss the cache on every lookup, defeating the
+        # whole point of the LRU. Normalize so the lookups match the
+        # store keys exactly.
+        start = _as_utc_aware(start)
+        end = _as_utc_aware(end)
+        needed = _expected_hour_buckets(start, end)
+        if not needed:
+            async with self._pool.acquire() as conn:
+                return await fetch_or_pull_prices_by_zone(conn, bidding_zone, start, end)
+
+        result: dict[datetime, float] = {}
+        for hour in needed:
+            key = (bidding_zone, hour)
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                result[hour] = self._cache[key]
+
+        if len(result) == len(needed):
+            return result
+
+        async with self._pool.acquire() as conn:
+            fresh = await fetch_or_pull_prices_by_zone(conn, bidding_zone, start, end)
+        for hour, price in fresh.items():
+            self._put(bidding_zone, hour, price)
+        for hour in needed:
+            key = (bidding_zone, hour)
+            if key in self._cache:
+                result[hour] = self._cache[key]
+        return result
+
+    def _put(self, bidding_zone: str, hour: datetime, price: float) -> None:
+        key = (bidding_zone, hour)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = price
+        while len(self._cache) > self._max:
+            self._cache.popitem(last=False)
+
+
+class ZoneResolver:
+    """Caches ``site_id → bidding_zone`` for the duration of the backfill.
+
+    sites.tariff_config / sites.timezone don't change during a backfill
+    run, so one round-trip per depot is enough — even with thousands
+    of sessions per depot.
+    """
+
+    def __init__(self, static_pool: asyncpg.Pool) -> None:
+        self._pool = static_pool
+        self._cache: dict[UUID, Optional[str]] = {}
+
+    async def __call__(self, site_id: Optional[UUID]) -> Optional[str]:
+        if site_id is None:
+            return None
+        if site_id in self._cache:
+            return self._cache[site_id]
+        async with self._pool.acquire() as conn:
+            zone = await resolve_bidding_zone(conn, site_id)
+        self._cache[site_id] = zone
+        return zone
+
+
+class SiteResolver:
+    """Caches ``station_id → site_id`` for the duration of the backfill.
+
+    Live ``charging_sessions`` rows close with ``site_id = NULL`` because
+    ``insert_open_session`` doesn't write it (no Supabase round-trip on
+    the StartTransaction hot path). The WS-handler post-close cost task
+    backfills site_id in memory, but if that task never wrote a cost
+    (process killed before await, ENTSO-E timeout, etc.) the row sits
+    in the DB with ``site_id = NULL`` and ``cost_total = NULL`` —
+    exactly the case the documented safety net is supposed to handle.
+    Without this resolver the backfill would re-discover the
+    ``'no_depot'`` short-circuit for every live row and never price them.
+
+    Supabase's ``charging_stations`` table maps OCPP ``station_id`` →
+    ``site_id``. Stations rarely move between depots; one cached
+    lookup per station covers thousands of sessions.
+
+    ``ORDER BY id`` makes the lookup deterministic across runs:
+    ``charging_stations.station_id`` is only indexed (not unique) at
+    the Supabase layer, so duplicate ``station_id`` values can return
+    arbitrary rows depending on plan/order. Resolving the wrong
+    ``site_id`` writes incorrect costs for every affected session.
+    Ordering by the row UUID picks the same depot every time.
+    """
+
+    def __init__(self, static_pool: asyncpg.Pool) -> None:
+        self._pool = static_pool
+        self._cache: dict[str, Optional[UUID]] = {}
+
+    async def __call__(self, station_id: Optional[str]) -> Optional[UUID]:
+        if not station_id:
+            return None
+        if station_id in self._cache:
+            return self._cache[station_id]
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT site_id FROM charging_stations "
+                "WHERE station_id = $1 ORDER BY id LIMIT 1",
+                station_id,
+            )
+        site_id = row["site_id"] if row else None
+        self._cache[station_id] = site_id
+        return site_id
+
+
+def _resolve_ts_url() -> str:
+    url = os.getenv("DATABASE_URL") or os.getenv("TIMESCALE_SERVICE_URL")
+    if not url:
+        raise RuntimeError(
+            "Set DATABASE_URL or TIMESCALE_SERVICE_URL to point at the "
+            "TimescaleDB instance to backfill."
+        )
+    return url
+
+
+def _resolve_static_url() -> str:
+    """Static-schema URL: SUPABASE_DB_URL / STATIC_DATABASE_URL / DATABASE_URL."""
+    url = (
+        os.getenv("STATIC_DATABASE_URL")
+        or os.getenv("SUPABASE_DB_URL")
+        or os.getenv("DATABASE_URL")
+    )
+    if not url:
+        raise RuntimeError(
+            "Set STATIC_DATABASE_URL (or SUPABASE_DB_URL, or DATABASE_URL) "
+            "to point at the Supabase static schema. Bidding-zone "
+            "resolution requires reading sites.tariff_config / "
+            "sites.timezone."
+        )
+    return url
+
+
+async def _open_pool(url: str, *, label: str) -> asyncpg.Pool:
+    clean_url, ssl_config = prepare_asyncpg_url_and_ssl(url)
+    connect_kw: dict = {}
+    if ssl_config is not None:
+        connect_kw["ssl"] = ssl_config
+    logger.info("Opening %s pool", label)
+    return await asyncpg.create_pool(clean_url, min_size=1, max_size=10, **connect_kw)
+
+
+async def _run(args: argparse.Namespace) -> int:
+    ts_url = args.database_url or _resolve_ts_url()
+    static_url = args.static_database_url or _resolve_static_url()
+    logger.info(
+        "Backfill starting — dry_run=%s depot=%s batch_size=%s max_rows=%s",
+        args.dry_run,
+        args.depot_id,
+        args.batch_size,
+        args.max_rows,
+    )
+
+    ts_pool = await _open_pool(ts_url, label="timescaledb")
+    # If both URLs resolve to the same DSN we still open a second pool —
+    # cleaner than sharing connections, and the cost is negligible for a
+    # one-shot script.
+    static_pool = await _open_pool(static_url, label="static")
+    try:
+        price_cache = LRUPriceLookup(ts_pool)
+        zone_resolver = ZoneResolver(static_pool)
+        site_resolver = SiteResolver(static_pool)
+        counts: Counter[str] = Counter()
+        processed = 0
+        # Within-run cursor advances past every session we already
+        # touched — prevents terminal rows (``'unpriceable'`` /
+        # ``'no_energy'`` / ``'no_depot'`` whose cost_total stays NULL)
+        # from looping infinitely.
+        cursor_id: UUID = _UUID_FLOOR
+
+        while True:
+            if args.max_rows is not None and processed >= args.max_rows:
+                break
+            chunk_limit = args.batch_size
+            if args.max_rows is not None:
+                chunk_limit = min(chunk_limit, args.max_rows - processed)
+
+            session_ids = getattr(args, "session_ids", None) or []
+
+            # Read-only chunk SELECT in its own short-lived
+            # connection. Earlier draft wrapped the chunk in a
+            # transaction with ``FOR UPDATE`` so SKIP LOCKED would
+            # de-duplicate concurrent backfills, but that held row
+            # locks while ``compute_session_cost`` did heavy work —
+            # ENTSO-E API calls, telemetry SQL, optional pool
+            # connections — making live OCPP closes on the same rows
+            # block for seconds. The new shape: pull candidates with
+            # NO lock, compute outside any transaction, and let
+            # ``write_session_cost``'s WHERE predicate handle the
+            # rare lost-race case (another writer set the cost
+            # between our SELECT and our UPDATE).
+            async with ts_pool.acquire() as conn:
+                if session_ids:
+                    rows = await conn.fetch(
+                        _CANDIDATE_BY_SESSION_SQL,
+                        args.depot_id,
+                        chunk_limit,
+                        session_ids,
+                        cursor_id,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        _CANDIDATE_SQL,
+                        args.depot_id,
+                        chunk_limit,
+                        cursor_id,
+                    )
+            if not rows:
+                break
+
+            # Advance the cursor before processing rows. The cursor
+            # advances past every row we picked this iteration, even
+            # if a write returned False — those False cases mean the
+            # row's state has transitioned to ineligible (another
+            # writer set cost_total, or cost_total_source became
+            # 'manual'), so skipping them is correct, not a bug. The
+            # candidate predicate would exclude them on a fresh run
+            # anyway (cost_total IS NULL OR cost_total = 0 stays
+            # false now). Combined with the source-exclusion filter
+            # in _CANDIDATE_SQL this fully terminates the loop:
+            # rows that landed terminal are now both behind the
+            # cursor and filtered out of subsequent chunks.
+            cursor_id = rows[-1]["session_id"]
+
+            for row in rows:
+                row_dict = dict(row)
+                # Live sessions land with site_id=NULL because
+                # insert_open_session skips the Supabase round-trip on
+                # the StartTransaction hot path. Without this backfill,
+                # those rows would short-circuit to 'no_depot' on every
+                # safety-net sweep — the exact case the backfill exists
+                # to rescue. Cached one round-trip per station_id.
+                if row_dict.get("site_id") is None:
+                    row_dict["site_id"] = await site_resolver(row_dict.get("station_id"))
+                # Depot-scoped runs admit NULL-site candidates at the SQL
+                # level so SiteResolver can recover them. After resolution,
+                # skip any row whose resolved site doesn't match the
+                # requested depot — otherwise ``--depot-id X`` would price
+                # rows belonging to other depots that happen to share a
+                # station_id with X (rare but possible at integration time).
+                if args.depot_id is not None and row_dict.get("site_id") != args.depot_id:
+                    counts["__skipped_other_depot"] += 1
+                    continue
+                row_dict["bidding_zone"] = await zone_resolver(row_dict.get("site_id"))
+                result = await compute_session_cost(
+                    ts_pool,
+                    row_dict,
+                    price_lookup=price_cache,
+                )
+                counts[result.source] += 1
+                if args.dry_run:
+                    logger.info(
+                        "DRY session=%s source=%s cost=%s",
+                        row["session_id"],
+                        result.source,
+                        result.cost,
+                    )
+                else:
+                    # No ``conn=`` — let write_session_cost grab its
+                    # own connection and commit immediately, keeping
+                    # the row's UPDATE lock to single-digit ms.
+                    wrote = await write_session_cost(
+                        ts_pool,
+                        row["session_id"],
+                        result,
+                    )
+                    if not wrote:
+                        counts["__write_lost_race"] += 1
+
+            processed += len(rows)
+            logger.info(
+                "chunk done — total processed=%d (%s)",
+                processed,
+                ", ".join(f"{k}={v}" for k, v in counts.most_common()),
+            )
+            # No dry-run shortcut here — the cursor at line ~368
+            # advances past every row in this chunk, so the next
+            # iteration's WHERE predicate (``session_id > $cursor``)
+            # naturally selects the next 500 candidates. An earlier
+            # draft broke out of the loop after one chunk to avoid
+            # spinning on the same candidate set forever (pre-cursor
+            # design — only writes moved rows out of the predicate,
+            # and dry-run wrote nothing). With the cursor in place,
+            # ``--dry-run --max-rows 5000 --batch-size 500`` correctly
+            # iterates ten chunks instead of stopping at the first.
+
+        logger.info(
+            "Backfill complete — processed=%d sources=%s",
+            processed,
+            dict(counts),
+        )
+        return 0
+    finally:
+        await ts_pool.close()
+        await static_pool.close()
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument(
+        "--dry-run", action="store_true", help="Compute but do not write. Logs every decision."
+    )
+    p.add_argument(
+        "--depot-id", type=str, default=None, help="Restrict backfill to one depot UUID."
+    )
+    p.add_argument(
+        "--batch-size", type=int, default=500, help="Rows per transaction (default: 500)."
+    )
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Stop after processing N rows total (default: no limit).",
+    )
+    p.add_argument(
+        "--log-level", type=str, default="INFO", help="Python logging level (default: INFO)."
+    )
+    p.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        help="TimescaleDB URL. Overrides DATABASE_URL / TIMESCALE_SERVICE_URL.",
+    )
+    p.add_argument(
+        "--static-database-url",
+        type=str,
+        default=None,
+        help="Supabase static-schema URL. Overrides "
+        "STATIC_DATABASE_URL / SUPABASE_DB_URL / DATABASE_URL.",
+    )
+    args = p.parse_args()
+    if args.depot_id is not None:
+        try:
+            args.depot_id = UUID(args.depot_id)
+        except ValueError:
+            p.error(f"--depot-id must be a UUID, got {args.depot_id!r}")
+    return args
+
+
+def main() -> int:
+    args = _parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    try:
+        return asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        logger.warning("Interrupted")
+        return 130
+    except Exception:
+        logger.exception("Fatal error during backfill")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

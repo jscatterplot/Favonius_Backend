@@ -544,6 +544,184 @@ class TestRotateCredentialsRBAC:
         audit.assert_not_awaited()
 
 
+# ── POST /admin/depots/{depot_id}/chargers/{charger_id}/local_auth/reset ───
+
+
+class TestResetLocalAuthCacheRBAC:
+    """POST .../local_auth/reset — favonius_admin or matching customer_admin.
+
+    Mirrors ``TestRotateCredentialsRBAC`` because the auth contract is the
+    same: cross-org reads are 403 (not 404), customer_operator/viewer are
+    403, the success path writes a ``charger.local_auth.cache_reset``
+    audit row.
+    """
+
+    URL = f"/admin/depots/{DEPOT_ID}/chargers/{CHARGER_ID}/local_auth/reset"
+
+    def _hit(self, client):
+        return client.post(self.URL, headers=AUTH_HDR)
+
+    def _reset_row(self, **overrides) -> dict:
+        row = {
+            "ocpp_id": "acme-berlin-001",
+            "previous_supported": False,
+            "previous_probed_firmware": "TAC3Z9119006710273::V1.8.36",
+            "legacy_schema": False,
+        }
+        row.update(overrides)
+        return row
+
+    def test_favonius_admin_200_clears_cache_and_audits(self, client, mock_pool):
+        pool, _ = mock_pool
+        _override_user(_user("favonius_admin"))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.reset_local_auth_cache",
+                new_callable=AsyncMock,
+                return_value=self._reset_row(),
+            ) as reset_mock,
+            patch(
+                "src.api.main.write_admin_audit_row", new_callable=AsyncMock
+            ) as audit,
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert body["previous_supported"] is False
+        assert body["previous_probed_firmware"] == "TAC3Z9119006710273::V1.8.36"
+        assert body["ocpp_id"] == "acme-berlin-001"
+        assert body["reset_at"]
+        reset_mock.assert_awaited_once()
+        # Audit row carries the previous cache state for ops forensics.
+        audit.assert_awaited_once()
+        row = audit.await_args.args[1]
+        assert row.action == "charger.local_auth.cache_reset"
+        assert row.actor_role == "favonius_admin"
+        assert row.metadata["previous_supported"] is False
+        assert row.metadata["previous_probed_firmware"] == "TAC3Z9119006710273::V1.8.36"
+
+    def test_customer_admin_own_org_200(self, client, mock_pool):
+        pool, _ = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.reset_local_auth_cache",
+                new_callable=AsyncMock,
+                return_value=self._reset_row(),
+            ),
+            patch(
+                "src.api.main.write_admin_audit_row", new_callable=AsyncMock
+            ) as audit,
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_200_OK
+        audit.assert_awaited_once()
+        row = audit.await_args.args[1]
+        assert row.action == "charger.local_auth.cache_reset"
+        assert row.actor_role == "customer_admin"
+
+    def test_customer_admin_other_org_403_not_404(self, client, mock_pool):
+        """A customer_admin querying a depot in a different org must get
+        403, not 404 — same posture as rotate_credentials so we never leak
+        depot existence across tenants."""
+        pool, _ = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+
+    def test_customer_operator_403(self, client, mock_pool):
+        pool, _ = mock_pool
+        _override_user(_user("customer_operator", organization_id=ORG_ID))
+        with patch("src.api.main.db_pools", pool):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+        assert response.json()["detail"]["error_code"] == "FORBIDDEN_ROLE"
+
+    def test_viewer_403(self, client, mock_pool):
+        pool, _ = mock_pool
+        _override_user(_user("viewer"))
+        with patch("src.api.main.db_pools", pool):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+        assert response.json()["detail"]["error_code"] == "FORBIDDEN_ROLE"
+
+    def test_charger_not_found_404(self, client, mock_pool):
+        """Unknown (depot, charger) pair → 404 and no audit row."""
+        pool, _ = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.reset_local_auth_cache",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "src.api.main.write_admin_audit_row", new_callable=AsyncMock
+            ) as audit,
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_404_NOT_FOUND
+        audit.assert_not_awaited()
+
+    def test_legacy_schema_still_returns_200(self, client, mock_pool):
+        """When migration 012 is absent, the reset still succeeds (probe
+        columns being NULL is the same as freshly cleared). The response
+        records the legacy_schema fact for ops visibility."""
+        pool, _ = mock_pool
+        _override_user(_user("favonius_admin"))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.reset_local_auth_cache",
+                new_callable=AsyncMock,
+                return_value=self._reset_row(
+                    previous_supported=None,
+                    previous_probed_firmware=None,
+                    legacy_schema=True,
+                ),
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert body["previous_supported"] is None
+        audit.assert_awaited_once()
+        row = audit.await_args.args[1]
+        assert row.metadata["legacy_schema"] is True
+
+
 # ── POST /admin/depots/{depot_id}/chargers/{charger_id}/manual_authorize ───
 
 

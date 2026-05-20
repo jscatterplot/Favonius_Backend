@@ -10,11 +10,25 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
+
+
+def _as_utc_aware(dt: datetime) -> datetime:
+    """Normalize naive UTC or aware datetimes to timezone-aware UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _hour_floor_utc(dt: datetime) -> datetime:
+    """Floor to start of hour in UTC (for price-map keys and lookups)."""
+    aware = _as_utc_aware(dt)
+    return aware.replace(minute=0, second=0, microsecond=0)
 
 
 def _coerce_jsonb_dict(value: Any) -> dict[str, Any]:
@@ -217,6 +231,319 @@ async def insert_price(
             source = EXCLUDED.source
     """
     await db.execute(query, timestamp, depot_id, energy_kwh, demand_kw, source)
+
+
+async def fetch_prices_by_zone(
+    db,
+    bidding_zone: str,
+    start_time: datetime,
+    end_time: datetime,
+    forward_fill_window: timedelta = timedelta(hours=1),
+) -> dict[datetime, float]:
+    """Return a ``{hour_floor_utc: €/kWh}`` map for ``[start_time, end_time)``.
+
+    Reads the ``electricity_prices`` hypertable (written by the WS handler
+    price feeder from ENTSO-E day-ahead data) for a single ENTSO-E EIC
+    bidding zone, and forward-fills missing hours from the most recent
+    known price within ``forward_fill_window``. Hours with no usable
+    price are absent from the returned dict — the caller decides
+    whether that counts as ``unpriceable``.
+
+    The legacy ``prices`` table (per-depot tariff) was the original
+    source for this lookup. In every current deployment it is empty:
+    the ENTSO-E feeder writes only to ``electricity_prices`` keyed by
+    bidding zone, never per-depot. Callers resolve the zone from
+    ``sites`` via :func:`resolve_bidding_zone` and pass it in.
+
+    Unit conversion: ``electricity_prices.lmp_price_mwh`` is stored as
+    €/MWh; this helper divides by 1000 before returning, so callers
+    always see €/kWh.
+
+    Filters ``market_type = 'ENTSOE_DAM'`` so legacy CAISO LMP rows in
+    the same table are ignored.
+
+    Args:
+        db: Database connection or pool (TimescaleDB).
+        bidding_zone: ENTSO-E EIC area code (e.g. ``10YLT-1001A0008Q``).
+        start_time: Inclusive start (UTC).
+        end_time: Exclusive end (UTC).
+        forward_fill_window: Maximum age of the last known price that
+            can be used to fill a missing hour. Defaults to 1 hour to
+            match the optimizer's behavior.
+
+    Returns:
+        Dict keyed by the start-of-hour timestamp covered by
+        ``[start_time, end_time)`` whose value is the €/kWh price for
+        that hour. Hours absent from the dict have no usable price.
+    """
+    # ``electricity_prices.time`` is TIMESTAMPTZ — asyncpg always
+    # returns timezone-aware datetimes. Naive callers (e.g.
+    # StateAssembler._get_prices using datetime.utcnow()) would compare
+    # naive vs aware below and either raise TypeError or silently miss
+    # the price map entirely. Normalize the inputs to UTC-aware here so
+    # the helper accepts either flavor from any caller; the row-side
+    # normalization below covers the symmetric case where the database
+    # client returns naive datetimes (some test fakes do this).
+    start_time = _as_utc_aware(start_time)
+    end_time = _as_utc_aware(end_time)
+
+    # Read from one full ``forward_fill_window`` before the *floored*
+    # start hour, not before ``start_time`` itself. A session at 13:59
+    # with a 1h fill window needs the 12:00 price as a valid
+    # predecessor for the floored 13:00 bucket — that price is 1h59m
+    # before start_time but only 1h before the bucket the fill loop
+    # actually consults. Using ``start_time - 1h = 12:59`` excludes
+    # the 12:00 row even though it would be a valid fill source.
+    fetch_lower = _hour_floor_utc(start_time) - forward_fill_window
+
+    rows = await db.fetch(
+        """
+        SELECT time, lmp_price_mwh
+        FROM electricity_prices
+        WHERE node_id = $1
+          AND market_type = 'ENTSOE_DAM'
+          AND time >= $2 AND time < $3
+        ORDER BY time
+        """,
+        bidding_zone,
+        fetch_lower,
+        end_time,
+    )
+
+    if not rows:
+        return {}
+
+
+    known: list[tuple[datetime, float]] = []
+    for row in rows:
+        raw = row["lmp_price_mwh"]
+        if raw is None:
+            continue
+        known.append((_as_utc_aware(row["time"]), float(raw) / 1000.0))
+
+    if not known:
+        return {}
+
+    filled: dict[datetime, float] = {}
+    # Always include the hour bucket containing ``start_time`` — a 13:30
+    # session needs the 13:00 price. The granular path's telemetry rows
+    # bucket into that hour via time_bucket('1 hour', …), and
+    # _expected_hour_buckets in the calculator floors start the same way.
+    # Skipping the floored hour here was the off-by-one that left
+    # mid-hour sessions ``unpriceable`` despite DAM prices existing.
+    cursor = _hour_floor_utc(start_time)
+    while cursor < end_time:
+        candidate = None
+        for ts, price in known:
+            if ts <= cursor and (cursor - ts) <= forward_fill_window:
+                candidate = price
+            elif ts > cursor:
+                break
+        if candidate is not None:
+            filled[cursor] = candidate
+        cursor += timedelta(hours=1)
+
+    return filled
+
+
+async def fetch_or_pull_prices_by_zone(
+    ts_db,
+    bidding_zone: str,
+    start_time: datetime,
+    end_time: datetime,
+    forward_fill_window: timedelta = timedelta(hours=1),
+) -> dict[datetime, float]:
+    """Same shape as :func:`fetch_prices_by_zone`, but with a read-through
+    cache to the ENTSO-E Transparency Platform API.
+
+    The ``electricity_prices`` table is populated by the WS handler's
+    price feeder (see ``src/websocket_handler/price_feeder.py``). In
+    deployments where that feeder isn't running, isn't configured for
+    the right zone, or is writing to a different DB, the table is
+    empty and every cost calculation lands ``'unpriceable'`` despite
+    real ENTSO-E DAM data being available.
+
+    This helper closes the gap. On cache miss it calls
+    :class:`~src.adapters.entsoe.prices.ENTSOEAdapter` directly,
+    persists the hourly result to ``electricity_prices`` (skipping
+    hours that already exist so a concurrent feeder write doesn't
+    duplicate), and re-reads through the standard forward-fill path
+    so callers get a uniformly shaped dict.
+
+    Requires the ``EUROPEAN_ELECTRICITY_API`` env var (same token the
+    price feeder uses). Without it, the API call is skipped and the
+    function falls back to whatever ``electricity_prices`` already
+    contains.
+
+    Args:
+        ts_db: TimescaleDB connection / pool — used for both reads and
+            the persist step. Must accept ``.fetch`` and ``.execute``
+            / ``.executemany`` (asyncpg.Pool, asyncpg.Connection, or
+            a context wrapping one).
+        bidding_zone: ENTSO-E EIC area code.
+        start_time, end_time: UTC window; naive datetimes are accepted
+            and normalized.
+        forward_fill_window: same semantics as :func:`fetch_prices_by_zone`.
+
+    Returns:
+        ``{hour_floor_utc: €/kWh}`` dict, same as
+        ``fetch_prices_by_zone``. The dict may still be incomplete
+        when the ENTSO-E API has no data for the window (e.g. far-past
+        archive that the API doesn't serve, or an API outage).
+    """
+    cached = await fetch_prices_by_zone(
+        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+    )
+
+    start_aware = _as_utc_aware(start_time)
+    end_aware = _as_utc_aware(end_time)
+    expected_hours: list[datetime] = []
+    cursor = _hour_floor_utc(start_aware)
+    while cursor < end_aware:
+        expected_hours.append(cursor)
+        cursor += timedelta(hours=1)
+
+    missing_hours = [h for h in expected_hours if h not in cached]
+    if not missing_hours:
+        return cached
+
+    if not os.environ.get("EUROPEAN_ELECTRICITY_API"):
+        logger.warning(
+            "fetch_or_pull_prices_by_zone: cache miss for zone=%s "
+            "[%s, %s) missing=%d hours; EUROPEAN_ELECTRICITY_API "
+            "unset — returning partial cache",
+            bidding_zone, start_aware, end_aware, len(missing_hours),
+        )
+        return cached
+
+    # Lazy import — keep src/db/ free of an adapters/ dep at import time.
+    from ..adapters.entsoe.prices import ENTSOEAdapter
+
+    # The adapter owns an ``httpx.AsyncClient`` (with a connection pool)
+    # that must be explicitly closed; otherwise repeated cache misses
+    # leak open sockets over the process lifetime.
+    adapter = ENTSOEAdapter()
+    try:
+        # Fetch a window aligned to the missing hours. ENTSO-E charges
+        # rate-limit budget per request, not per hour, so one call for
+        # the whole window is cheaper than per-hour calls.
+        fetched = await adapter.get_day_ahead_prices(
+            start_aware, end_aware, bidding_zone=bidding_zone,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_or_pull_prices_by_zone: ENTSO-E API call failed "
+            "for zone=%s [%s, %s): %s — returning partial cache",
+            bidding_zone, start_aware, end_aware, exc,
+        )
+        return cached
+    finally:
+        await adapter.close()
+
+    if not fetched:
+        return cached
+
+    # Persist only hours that aren't already in the table. The schema
+    # has no unique constraint on ``(time, node_id, market_type)`` so
+    # we can't rely on ON CONFLICT — do the existence check ourselves.
+    existing_rows = await ts_db.fetch(
+        """
+        SELECT time
+          FROM electricity_prices
+         WHERE node_id     = $1
+           AND market_type = 'ENTSOE_DAM'
+           AND time       >= $2
+           AND time        < $3
+        """,
+        bidding_zone, start_aware, end_aware,
+    )
+    existing_times = {_as_utc_aware(r["time"]) for r in existing_rows}
+
+    new_rows = [
+        (_as_utc_aware(p.timestamp), bidding_zone, p.price_per_kwh * 1000.0)
+        for p in fetched
+        if _as_utc_aware(p.timestamp) not in existing_times
+    ]
+    if new_rows:
+        # ``ON CONFLICT DO NOTHING`` against the
+        # ``uq_electricity_prices_node_time_market`` unique index
+        # (migration 041) makes the insert race-proof. Two concurrent
+        # cache-miss callers (or the WS-handler feeder running in
+        # parallel) both observing the row as absent and both INSERTing
+        # would otherwise produce duplicates that the helper's
+        # ``ORDER BY time`` cannot deterministically resolve. The
+        # SELECT-based existence check above is still worth keeping —
+        # it eliminates most candidates without a conflict round-trip
+        # and keeps the audit log clean.
+        await ts_db.executemany(
+            """
+            INSERT INTO electricity_prices
+                (time, node_id, market_type, lmp_price_mwh)
+            VALUES ($1, $2, 'ENTSOE_DAM', $3)
+            ON CONFLICT (time, node_id, market_type) DO NOTHING
+            """,
+            new_rows,
+        )
+        logger.info(
+            "fetch_or_pull_prices_by_zone: pulled %d hours from "
+            "ENTSO-E into electricity_prices (zone=%s)",
+            len(new_rows), bidding_zone,
+        )
+
+    # Re-read with forward-fill so the returned dict matches the cache
+    # path's shape and semantics exactly.
+    return await fetch_prices_by_zone(
+        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+    )
+
+
+async def resolve_bidding_zone(static_db, site_id: UUID) -> Optional[str]:
+    """Resolve the ENTSO-E EIC bidding zone for a depot.
+
+    Cascade:
+
+    1. ``sites.tariff_config['entsoe_zone']`` (explicit operator override).
+    2. ``get_bidding_zone(sites.timezone)`` — single-zone country lookup
+       via the static map in ``src/adapters/entsoe/mappings.py``.
+    3. ``None`` — the calculator's caller treats this as ``unpriceable``;
+       the optimizer falls back to its $0.15/kWh solver-input default.
+
+    Args:
+        static_db: Connection / pool to the static Supabase schema.
+        site_id: ``sites.id`` UUID.
+
+    Returns:
+        Bidding zone EIC code (e.g. ``10YLT-1001A0008Q``) or ``None``.
+    """
+    row = await static_db.fetchrow(
+        """
+        SELECT timezone, tariff_config
+          FROM sites
+         WHERE id = $1
+        """,
+        site_id,
+    )
+    if row is None:
+        return None
+
+    tariff = row["tariff_config"]
+    if isinstance(tariff, str):
+        try:
+            tariff = json.loads(tariff)
+        except json.JSONDecodeError:
+            tariff = None
+    if isinstance(tariff, dict):
+        explicit = tariff.get("entsoe_zone")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+
+    tz = row["timezone"]
+    if not tz:
+        return None
+    # Local import keeps src/db/ free of an adapters/ dep at import time.
+    from ..adapters.entsoe.mappings import get_bidding_zone
+
+    return get_bidding_zone(tz)
 
 
 # ============ SCHEDULE QUERIES ============
@@ -2235,6 +2562,110 @@ async def rotate_charger_credentials(
     }
 
 
+async def reset_local_auth_cache(
+    db, *, depot_id: str, charger_id: str
+) -> Optional[dict]:
+    """Clear the cached LocalAuthorizationList support outcome for a charger.
+
+    Sets ``local_list_supported``, ``local_list_probed_firmware``,
+    ``local_list_probed_at`` and ``local_list_last_status`` back to NULL so
+    the next BootNotification re-runs the probe + bootstrap path.
+
+    Use case: a charger was cached as ``supported=False`` (e.g. because the
+    firmware was known-bad), then ops upgraded the firmware to a version
+    that DOES support LocalAuthListManagement. Without an explicit reset,
+    the per-firmware cache invalidates automatically when the firmware
+    string changes — but if ops wants to retest BEFORE upgrading (or the
+    cache was poisoned by a transient bug), this endpoint forces a re-probe
+    on the next reconnect.
+
+    Returns ``{"ocpp_id": ..., "previous_supported": True|False|None,
+    "previous_probed_firmware": ...}`` so the caller can audit what state
+    was cleared. Returns ``None`` if the (depot, charger) pair doesn't
+    exist (caller distinguishes 403 vs 404).
+
+    Schema: relies on migration 012 columns. Callers should not invoke
+    this endpoint against a deployment that hasn't applied 012 — the
+    UPDATE will succeed (no error) but the columns it nulls out don't
+    exist yet, so the runtime path was never reading them anyway. The
+    fetch step uses ``.get()`` defensively to tolerate that case.
+    """
+    fetch_query = """
+        SELECT id,
+               station_id AS ocpp_id,
+               local_list_supported,
+               local_list_probed_firmware
+        FROM charging_stations
+        WHERE id = $1::uuid AND site_id = $2::uuid
+    """
+    try:
+        row = await db.fetchrow(fetch_query, charger_id, depot_id)
+    except Exception as exc:
+        # 42703 == undefined_column when migration 012 not applied. Fall
+        # back to the minimal shape so the endpoint still resolves 404 vs
+        # 200 correctly even on a legacy DB.
+        if getattr(exc, "sqlstate", None) == "42703":
+            legacy_fetch = """
+                SELECT id, station_id AS ocpp_id
+                FROM charging_stations
+                WHERE id = $1::uuid AND site_id = $2::uuid
+            """
+            row = await db.fetchrow(legacy_fetch, charger_id, depot_id)
+            if row is None:
+                return None
+            # 011-only schema: probe columns (012) are absent, but version and
+            # last_status exist — reset them so the next sync uses first-sync.
+            await db.execute(
+                """
+                UPDATE charging_stations
+                SET local_list_last_status = NULL,
+                    local_list_version     = 0
+                WHERE id = $1::uuid AND site_id = $2::uuid
+                """,
+                charger_id,
+                depot_id,
+            )
+            return {
+                "ocpp_id": row["ocpp_id"],
+                "previous_supported": None,
+                "previous_probed_firmware": None,
+                "legacy_schema": True,
+            }
+        raise
+
+    if row is None:
+        return None
+
+    previous_supported = row.get("local_list_supported") if hasattr(row, "get") else (
+        row["local_list_supported"] if "local_list_supported" in row.keys() else None
+    )
+    previous_probed_firmware = row.get("local_list_probed_firmware") if hasattr(row, "get") else (
+        row["local_list_probed_firmware"]
+        if "local_list_probed_firmware" in row.keys()
+        else None
+    )
+
+    await db.execute(
+        """
+        UPDATE charging_stations
+        SET local_list_supported       = NULL,
+            local_list_probed_firmware = NULL,
+            local_list_probed_at       = NULL,
+            local_list_last_status     = NULL,
+            local_list_version         = 0
+        WHERE id = $1::uuid AND site_id = $2::uuid
+        """,
+        charger_id,
+        depot_id,
+    )
+    return {
+        "ocpp_id": row["ocpp_id"],
+        "previous_supported": previous_supported,
+        "previous_probed_firmware": previous_probed_firmware,
+        "legacy_schema": False,
+    }
+
+
 # ============ Fleet List Helpers (GET /depots/{id}/chargers, /vehicles) ============
 
 
@@ -2536,9 +2967,7 @@ async def charger_id_by_ocpp_id(db, *, depot_id: str) -> dict[str, str]:
     return {row["ocpp_id"]: row["charger_id"] for row in rows}
 
 
-async def list_active_sessions_for_depot(
-    db, *, station_ids: list[str]
-) -> list[dict]:
+async def list_active_sessions_for_depot(db, *, station_ids: list[str]) -> list[dict]:
     """Open live charging sessions across a set of OCPP station ids.
 
     Backs ``GET /depots/{id}/sessions/active``. Reads from TimescaleDB only;
@@ -2614,9 +3043,7 @@ async def list_completed_sessions_for_depot(
         params.append(cursor_ts)
         params.append(cursor_session_id)
         # Keyset: strictly older than the cursor by (end_time, session_id).
-        clauses.append(
-            f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)"
-        )
+        clauses.append(f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)")
 
     params.append(limit)
     where_sql = " AND ".join(clauses)
@@ -2643,9 +3070,7 @@ async def list_completed_sessions_for_depot(
     return [dict(r) for r in rows]
 
 
-async def latest_telemetry_for_depot_vehicles(
-    db, *, vehicle_ids: list[str]
-) -> list[dict]:
+async def latest_telemetry_for_depot_vehicles(db, *, vehicle_ids: list[str]) -> list[dict]:
     """Lightweight per-vehicle real-time state for a depot.
 
     Distinct from :func:`latest_telemetry_by_vehicles` (which keys by
