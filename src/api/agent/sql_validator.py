@@ -817,9 +817,20 @@ def _predicate_allows_unbounded_time(node: exp.Expression) -> bool:
         if inner is None:
             return True
         if _is_unconditional_false(inner):
+            # NOT(FALSE) ≡ TRUE — bypass.
             return True
         if _is_unconditional_true(inner):
+            # NOT(TRUE) ≡ FALSE — the row is unreachable, so the NOT
+            # branch cannot be satisfied. No bypass via this branch.
             return False
+        # NOT(anything else) — the negation of an arbitrary leaf predicate
+        # is still a non-time-bound predicate that can be TRUE for many
+        # rows (`NOT(depot_id IS NOT NULL)` ≡ `depot_id IS NULL`,
+        # `NOT(status = 'x')` ≡ `status != 'x'` etc.). Conservatively
+        # treat it as "allows unbounded time"; that's what a bypass means
+        # here. Returning False here would let
+        # `WHERE hour >= … OR NOT(depot_id IS NOT NULL)` pass the guard
+        # while leaving the OR branch fully unbounded.
         return True
     if _is_unconditional_true(node):
         return True
@@ -857,6 +868,14 @@ def _is_unconditional_true(node: exp.Expression | None) -> bool:
     """
     if node is None:
         return False
+    # Unwrap parentheses — `(TRUE)`, `((1=1))`, etc. should be equivalent
+    # to the inner expression. sqlglot keeps Paren in the tree, so the
+    # NOT case in _predicate_allows_unbounded_time wouldn't recognise
+    # `NOT(TRUE)` as `NOT TRUE` without this.
+    while isinstance(node, exp.Paren):
+        node = node.this
+        if node is None:
+            return False
     if isinstance(node, exp.Boolean):
         return bool(node.this)
     if isinstance(node, exp.Literal) and not node.is_string:
@@ -889,6 +908,10 @@ def _is_unconditional_false(node: exp.Expression | None) -> bool:
     """Best-effort check for SQL expressions that are always FALSE."""
     if node is None:
         return False
+    while isinstance(node, exp.Paren):
+        node = node.this
+        if node is None:
+            return False
     if isinstance(node, exp.Boolean):
         return not bool(node.this)
     if isinstance(node, exp.Literal) and not node.is_string:

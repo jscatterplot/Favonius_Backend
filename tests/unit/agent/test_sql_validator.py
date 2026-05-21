@@ -786,3 +786,45 @@ class TestPerHypertableTimeBound:
             "WHERE start_time >= now() - interval '7 days'",
             kind="missing_time_filter",
         )
+
+
+class TestNotClauseBypass:
+    """Cursor Bugbot — `OR NOT(<non-tautology>)` must be treated as a
+    potential time-predicate bypass. The NOT branch evaluates to TRUE for
+    many rows (NOT(depot_id IS NOT NULL) ≡ depot_id IS NULL, etc.) and
+    does not enforce a time bound; combined with OR it lets the row
+    through regardless of the time predicate.
+    """
+
+    def test_or_not_isnotnull_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' "
+            "OR NOT(depot_id IS NOT NULL)",
+            kind="missing_time_filter",
+        )
+
+    def test_or_not_equals_literal_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' "
+            "OR NOT(currency = 'EUR')",
+            kind="missing_time_filter",
+        )
+
+    def test_or_not_true_accepted(self):
+        # NOT(TRUE) ≡ FALSE — the branch is unreachable, so the OR
+        # behaves like the bare time bound on the other side. Accept.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' OR NOT(TRUE)"
+        )
+
+    def test_and_not_isnotnull_accepted(self):
+        # AND-joining a NOT branch with the time bound still enforces
+        # the bound — every row must satisfy BOTH. Accept.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' "
+            "AND NOT(depot_id IS NULL)"
+        )
