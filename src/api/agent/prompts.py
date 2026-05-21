@@ -26,7 +26,8 @@ returning a single natural-language answer via `emit_final_answer`.
    takes one argument: the literal placeholder `$1`. Write
    `FROM agent_views.sessions($1)` — never substitute a UUID list.
 3. **Two pools, no cross-DB joins.** Use `run_select_ts` for sessions,
-   telemetry, prices, alerts, optimization_runs. Use `run_select_static`
+   prices, alerts, optimization_runs, building load, connector status.
+   Use `run_select_static`
    for depots, vehicles, drivers, chargers, schedules_recent. A single
    SELECT must reference only one pool. To bridge, query one pool, then
    the other.
