@@ -105,6 +105,12 @@ async def receive_upload(
         decoded = verify_token(token)
     except UploadTokenError as exc:
         raise UploadRejected(401, f"invalid token: {exc}") from exc
+    except RuntimeError as exc:
+        # ``verify_token`` raises RuntimeError when the signing key is
+        # unset — a server-side misconfiguration, not a bad client.
+        # Surface it as 503 so the operator gets a clear signal instead
+        # of an opaque 500.
+        raise UploadRejected(503, f"upload misconfigured: {exc}") from exc
 
     expected_hash = decoded.sha256_hex
     content_sha256 = hashlib.sha256(body).hexdigest()
@@ -317,7 +323,13 @@ async def reconcile_and_finalize(
 
     Returns the :class:`ReconciliationResult`. When the import has no
     associated ``session_id`` (depot-wide pull, future), returns
-    ``None`` and leaves status at ``'parsed'``.
+    ``None``.
+
+    Failed imports (``status='failed'``) still produce a reconciliation
+    row with ``source='parse_failed'`` so the read endpoint can render
+    a non-empty comparison payload — operators need explicit failure
+    visibility, not a missing block. The import row is left in
+    ``'failed'`` (never advanced to ``'reconciled'``).
     """
     async with ts_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -328,7 +340,9 @@ async def reconcile_and_finalize(
             """,
             import_id,
         )
-    if row is None or row["status"] != "parsed":
+    if row is None:
+        return None
+    if row["status"] not in ("parsed", "failed"):
         return None
     if row["session_id"] is None:
         return None
@@ -345,19 +359,24 @@ async def reconcile_and_finalize(
         result=result,
     )
 
-    async with ts_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE charger_log_imports
-               SET status         = 'reconciled',
-                   reconciled_at  = NOW()
-             WHERE id = $1
-               AND status = 'parsed'
-            """,
-            import_id,
-        )
-
-    CHARGER_LOG_IMPORTS.labels(vendor=row["vendor"] or "unknown", status="reconciled").inc()
+    if row["status"] == "parsed":
+        # Only advance to 'reconciled' when the parse succeeded.
+        # 'failed' is terminal — the row already shows operators why
+        # the import didn't yield entries.
+        async with ts_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE charger_log_imports
+                   SET status         = 'reconciled',
+                       reconciled_at  = NOW()
+                 WHERE id = $1
+                   AND status = 'parsed'
+                """,
+                import_id,
+            )
+        CHARGER_LOG_IMPORTS.labels(
+            vendor=row["vendor"] or "unknown", status="reconciled"
+        ).inc()
     CHARGER_LOG_RECONCILIATIONS.labels(source=result.source).inc()
     return result
 

@@ -107,6 +107,34 @@ class TestUploadEndpoint:
         assert response.status_code == 404
         assert response.json()["detail"]["error_code"] == "CHARGER_LOG_UPLOAD_REJECTED"
 
+    def test_streaming_rejects_body_when_chunked_exceeds_cap(self, client, monkeypatch):
+        """Regression for Codex P1: a client that uses chunked transfer
+        encoding (no Content-Length) used to be able to force unbounded
+        buffering via ``await request.body()``. The endpoint now
+        streams chunks and rejects with 413 the moment the running
+        total exceeds the per-endpoint cap.
+        """
+        monkeypatch.setenv("CHARGER_LOG_UPLOAD_MAX_BYTES", "1024")  # 1 KiB cap
+
+        from src.api import main as main_module
+
+        token = mint_token(uuid4())
+        # Use a generator so httpx sends as chunked transfer-encoding
+        # (no Content-Length). The MaxBodySizeMiddleware can only act
+        # on Content-Length, so the in-handler streaming cap is the
+        # only defence.
+        def _chunked():
+            yield b"x" * 600
+            yield b"y" * 600  # crosses the 1024-byte cap
+
+        with patch.object(main_module, "db_pools", _StubPools(object())):
+            response = client.post(
+                f"/internal/charger_logs/upload?token={token}",
+                content=_chunked(),
+            )
+        assert response.status_code == 413
+        assert response.json()["detail"]["error_code"] == "CHARGER_LOG_UPLOAD_REJECTED"
+
 
 class _StubPools:
     """Quick replacement for ``DatabasePools`` that's truthy in the

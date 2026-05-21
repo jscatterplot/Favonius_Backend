@@ -8422,7 +8422,41 @@ async def upload_charger_log_endpoint(
         )
 
     start = time.perf_counter()
-    body = await request.body()
+
+    # Stream the body with a hard byte ceiling so a missing /
+    # understated ``Content-Length`` can't force unbounded buffering.
+    # ``MaxBodySizeMiddleware`` already checks the header up-front, but
+    # only when the client sends one — Starlette's ``request.body()``
+    # otherwise concatenates chunked-transfer payloads of any size.
+    from ..adapters.chargers.upload_token import get_max_upload_bytes
+
+    max_bytes = get_max_upload_bytes()
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            if len(body) + len(chunk) > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error_code": "CHARGER_LOG_UPLOAD_REJECTED",
+                        "message": "upload exceeds max size",
+                    },
+                )
+            body.extend(chunk)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Network drop mid-upload — treat as a client error rather than 500.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "CHARGER_LOG_UPLOAD_REJECTED",
+                "message": f"upload stream error: {exc}",
+            },
+        ) from exc
+    body_bytes = bytes(body)
 
     file_name = (
         request.headers.get("X-File-Name")
@@ -8434,7 +8468,7 @@ async def upload_charger_log_endpoint(
         result = await receive_upload(
             db_pools.ts,
             token=token,
-            body=body,
+            body=body_bytes,
             file_name=file_name,
         )
     except UploadRejected as exc:
@@ -9250,6 +9284,13 @@ async def fetch_charger_session_logs_endpoint(
             if session_row["connector_id"] is not None
             else None,
             vendor=charger_row["vendor"],
+            # Bound the diagnostic dump to the session window so
+            # chargers return only the relevant slice instead of a
+            # full-disk export. ABB Terra AC honours these OCPP fields
+            # when present; ignoring them risks oversized uploads that
+            # blow CHARGER_LOG_UPLOAD_MAX_BYTES.
+            start_time=session_row["start_time"],
+            stop_time=session_row["end_time"],
             idempotency_key=idempotency_key,
         )
     except RuntimeError as exc:
@@ -9275,6 +9316,32 @@ async def fetch_charger_session_logs_endpoint(
                 idempotency_key,
             )
         if existing is not None:
+            # Still write the audit row so privileged retries inside
+            # the dedupe window leave a trail. Compliance reviews care
+            # about "who tried" as much as "what changed".
+            await _record_admin_action(
+                user=user,
+                action="charger.logs.fetched",
+                depot_id=depot_id,
+                organization_id_override=(
+                    str(depot_row.get("organization_id"))
+                    if depot_row.get("organization_id")
+                    else None
+                ),
+                target_type="charger_log_import",
+                target_id=str(existing["id"]),
+                metadata={
+                    "endpoint": (
+                        "POST /admin/depots/{depot_id}/chargers/{charger_id}/sessions/{session_id}/fetch_logs"
+                    ),
+                    "charger_id": charger_id,
+                    "session_id": session_id,
+                    "ocpp_id": charger_row["ocpp_id"],
+                    "vendor": charger_row["vendor"],
+                    "deduplicated": True,
+                    "existing_status": existing["status"],
+                },
+            )
             return {
                 "import_id": str(existing["id"]),
                 "status": existing["status"],

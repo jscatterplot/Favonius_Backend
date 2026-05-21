@@ -7,6 +7,25 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from uuid import UUID
+
+
+def _coerce_uuid(value: Any) -> Optional[UUID]:
+    """Parse a UUID from a payload value, returning ``None`` on any failure.
+
+    The OCPP command queue stores ``import_id`` in JSONB as a string
+    (``str(import_id)`` at enqueue time). asyncpg binds Python ``UUID``
+    instances to ``uuid``-typed columns, not raw strings — passing a
+    string would silently fail the UPDATE and leave the row stuck.
+    """
+    if value is None:
+        return None
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 from .cache_manager import CacheManager
 from .connection_pool import open_dedicated_connection
@@ -1061,6 +1080,29 @@ class ChargingCommandQueueConsumer:
                             self.logger.info("Expired %d overdue queue row(s)", n)
                     except Exception as exc:
                         self.logger.warning("expire_overdue_commands failed: %s", exc)
+                    # Same loop expires stale charger_log_imports rows so
+                    # the comparison endpoint surfaces a terminal state
+                    # instead of an indefinite "pending". Best-effort —
+                    # the upload endpoint can still complete a row that
+                    # races this expirer, gated by the per-status WHERE
+                    # in receive_upload's UPDATE.
+                    try:
+                        expire_fn = getattr(
+                            self.timescale_client,
+                            "expire_overdue_charger_log_imports",
+                            None,
+                        )
+                        if expire_fn is not None:
+                            n_imports = await expire_fn()
+                            if n_imports:
+                                self.logger.info(
+                                    "Expired %d overdue charger_log_imports row(s)",
+                                    n_imports,
+                                )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "expire_overdue_charger_log_imports failed: %s", exc
+                        )
                     last_expiry_scan = now
 
                 # Wait for either a NOTIFY wakeup or the polling timeout.
@@ -1470,8 +1512,8 @@ class ChargingCommandQueueConsumer:
         state (the queue row is already ``sent``). The upload endpoint
         will still flip status to ``received`` when the file arrives.
         """
-        import_id = (payload or {}).get("import_id")
-        if not import_id:
+        import_id = _coerce_uuid((payload or {}).get("import_id"))
+        if import_id is None:
             return
         pool = getattr(self.timescale_client, "_pool", None) or getattr(
             self.timescale_client, "pool", None
@@ -1500,8 +1542,8 @@ class ChargingCommandQueueConsumer:
 
     async def _mark_import_failed(self, payload: Dict[str, Any], reason: str) -> None:
         """Flip ``charger_log_imports`` row to ``failed``. Best-effort."""
-        import_id = (payload or {}).get("import_id")
-        if not import_id:
+        import_id = _coerce_uuid((payload or {}).get("import_id"))
+        if import_id is None:
             return
         pool = getattr(self.timescale_client, "_pool", None) or getattr(
             self.timescale_client, "pool", None

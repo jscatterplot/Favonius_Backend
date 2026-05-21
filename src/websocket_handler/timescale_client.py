@@ -3304,6 +3304,41 @@ class TimescaleClient:
             except (ValueError, IndexError):
                 return 0
 
+    async def expire_overdue_charger_log_imports(self, ttl_seconds: int = 3600) -> int:
+        """Move stale ``requested`` / ``uploading`` log imports to ``expired``.
+
+        Without this the read endpoint (``GET .../log_comparison``) would
+        keep showing an in-flight state forever when:
+
+          * the queue row expires before any charger came online, or
+          * the charger ack'd GetDiagnostics but never POSTed the file.
+
+        The TTL anchors on ``requested_at`` and matches
+        ``CHARGER_LOG_UPLOAD_TOKEN_TTL_S`` (default 3600 s). Once that
+        window has passed, the signed upload URL is itself unusable, so
+        any pending row has no chance of completing.
+
+        Returns the rowcount.
+        """
+        async with self.pg_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE charger_log_imports
+                   SET status        = 'expired',
+                       error_message = COALESCE(
+                           error_message,
+                           'upload window elapsed without receiving file'
+                       )
+                 WHERE status IN ('requested', 'uploading')
+                   AND requested_at <= NOW() - ($1 || ' seconds')::interval
+                """,
+                str(int(ttl_seconds)),
+            )
+            try:
+                return int(result.split()[-1])
+            except (ValueError, IndexError):
+                return 0
+
     async def queue_depth_by_status(self) -> Dict[str, int]:
         """Sample ``charging_command_queue`` depth grouped by status.
 

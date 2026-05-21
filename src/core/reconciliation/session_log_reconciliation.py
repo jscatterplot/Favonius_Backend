@@ -204,7 +204,12 @@ _CHARGER_AGGREGATE_SQL = """
       FROM charger_session_log_entries
      WHERE log_import_id = $1
        AND ($2::text IS NULL OR station_id = $2)
-       AND ($3::bigint IS NULL OR transaction_id = $3 OR transaction_id IS NULL)
+       -- When a concrete transaction_id is known, scope strictly to it
+       -- so multi-session diagnostic dumps can't bleed rows from other
+       -- transactions into this session's aggregate. When transaction_id
+       -- is unknown (legacy imports), fall back to "anything in the
+       -- import for this station".
+       AND ($3::bigint IS NULL OR transaction_id = $3)
 """
 
 

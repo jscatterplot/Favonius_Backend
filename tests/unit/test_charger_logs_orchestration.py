@@ -218,6 +218,26 @@ async def test_receive_upload_rejects_token_hash_mismatch():
     assert excinfo.value.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_receive_upload_maps_missing_signing_key_to_503(monkeypatch):
+    """Regression for Codex P2: ``verify_token`` raises ``RuntimeError``
+    when ``CHARGER_LOG_UPLOAD_SIGNING_KEY`` is unset *after* format
+    checks pass. Without explicit handling the endpoint returned 500.
+    ``receive_upload`` now maps it to a 503 ``UploadRejected`` so the
+    operator sees a config signal instead of an opaque server error.
+    """
+    # Mint a well-formed token with the key set, then drop the key so
+    # ``verify_token`` reaches the HMAC step and raises RuntimeError
+    # (not UploadTokenError "malformed token").
+    token = mint_token(uuid4())
+    monkeypatch.delenv("CHARGER_LOG_UPLOAD_SIGNING_KEY", raising=False)
+    conn = _FakeConn({})
+    with pytest.raises(UploadRejected) as excinfo:
+        await receive_upload(_FakePool(conn), token=token, body=b"payload")
+    assert excinfo.value.status_code == 503
+    assert "misconfigured" in excinfo.value.reason
+
+
 # ---------------------------------------------------------------------------
 # parse_and_persist_entries — parser dispatch + status transitions
 # ---------------------------------------------------------------------------
@@ -347,3 +367,46 @@ async def test_reconcile_skips_when_session_id_is_null():
     conn = _FakeConn({"FROM charger_log_imports": row})
     result = await reconcile_and_finalize(_FakePool(conn), import_id=import_id)
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_runs_for_failed_imports():
+    """Regression for Codex P2: a parse failure used to skip the
+    reconciler, leaving the read endpoint with no source enum to
+    display. ``reconcile_and_finalize`` now runs even when the import
+    row is in ``status='failed'`` so a ``source='parse_failed'``
+    row appears in ``session_log_reconciliations``. The import row
+    itself stays in ``failed`` — only ``parsed`` advances to
+    ``reconciled``.
+    """
+    import_id = uuid4()
+    session_id = uuid4()
+    # First fetchrow returns the import (status='failed'), second
+    # returns the session (so reconcile_session_log can resolve it),
+    # third returns the import_row inside reconcile_session_log,
+    # fourth returns the charger aggregate.
+    import_row_failed = {
+        "id": import_id,
+        "session_id": session_id,
+        "vendor": "ABB",
+        "status": "failed",
+        "error_message": "tar corrupt",
+    }
+    # Sequence the two fetches against ``FROM charger_log_imports``:
+    # outer reconcile_and_finalize lookup first, then the lookup
+    # inside reconcile_session_log.
+    conn = _FakeConn(
+        {
+            "FROM charger_log_imports": [import_row_failed, import_row_failed],
+            "FROM charging_sessions": None,  # no session → source='no_session'
+        }
+    )
+    result = await reconcile_and_finalize(_FakePool(conn), import_id=import_id)
+    assert result is not None
+    # Even with no session/no entries, the reconciler emits a row —
+    # the source enum tells the UI what happened.
+    assert result.source in {"no_session", "parse_failed"}
+    # No status flip — 'failed' is terminal.
+    assert not any(
+        "SET status         = 'reconciled'" in sql for sql, _ in conn.executed
+    )

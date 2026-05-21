@@ -206,6 +206,30 @@ async def test_reconciled_when_both_sides_present():
 
 
 @pytest.mark.asyncio
+async def test_charger_aggregate_drops_null_tx_when_concrete_tx_supplied():
+    """Regression for Codex P2: when reconciling a specific transaction,
+    rows with NULL ``transaction_id`` from other sessions in the same
+    diagnostic dump used to bleed into the aggregate via an
+    ``OR transaction_id IS NULL`` fallback. The fix tightens the
+    aggregate to a strict equality match when a concrete tx_id is
+    supplied. This test asserts the SQL no longer contains the OR-NULL
+    clause.
+    """
+    from src.core.reconciliation.session_log_reconciliation import (
+        _CHARGER_AGGREGATE_SQL,
+    )
+
+    # Concrete sanity check: when tx_id is bound, the SQL must NOT
+    # accept rows where it IS NULL. The text-level assertion is
+    # readable and brittle in the right way: any future relaxation of
+    # the filter will fail this test.
+    assert "transaction_id IS NULL" not in _CHARGER_AGGREGATE_SQL
+    # The strict-equality branch ("transaction_id = $3") must still be
+    # present so the filter actually applies.
+    assert "transaction_id = $3" in _CHARGER_AGGREGATE_SQL
+
+
+@pytest.mark.asyncio
 async def test_partial_when_our_energy_is_missing():
     """No telemetry → ``partial`` (charger side has data, ours doesn't)."""
     session = _make_session_row()
