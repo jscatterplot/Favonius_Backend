@@ -314,10 +314,24 @@ def validate_sql(
         # FROM/JOIN targets we already validated above.
         if isinstance(parent, exp.Table):
             continue
-        if node.name.lower() in DANGEROUS_FUNCTIONS:
+        fname = (node.name or "").lower()
+        if fname in DANGEROUS_FUNCTIONS:
             return _reject(
                 "dangerous_fn",
                 f"Function {node.name!r} not permitted.",
+            )
+        # Blanket-reject any unqualified pg_* call. The named denylist
+        # above only catches a handful (pg_read_file, pg_ls_dir, pg_sleep,
+        # …) — pg_relation_size, pg_total_relation_size, pg_database_size,
+        # pg_stat_get_*, pg_advisory_lock and many more are not on it but
+        # all violate the agent's "no system catalog access" contract.
+        # Honest exception: nothing in agent_views.* uses pg_* prefixes,
+        # so an LLM-emitted pg_X() call is always wrong.
+        if fname.startswith("pg_"):
+            return _reject(
+                "dangerous_fn",
+                f"Function {node.name!r} not permitted "
+                f"(pg_* helpers are reserved for system catalog access).",
             )
 
     # Also walk built-in funcs sqlglot resolved (Func subclasses) to be
@@ -341,30 +355,36 @@ def validate_sql(
 
     # 6. Hypertable-backed functions need a time predicate. Apply per
     # SELECT-branch — a UNION with one bounded and one unbounded branch
-    # would otherwise pass with the unbounded scan intact.
+    # would otherwise pass with the unbounded scan intact. AND apply per
+    # hypertable: a query joining `prices_hourly` with `sessions` must
+    # bound the time column attached to `prices_hourly`, not just any
+    # column in HYPERTABLE_TIME_COLUMNS (the LLM could leak `prices_hourly`
+    # by only bounding `sessions.start_time`).
     if functions_used and any(fn in HYPERTABLE_FUNCTIONS for fn in functions_used):
         for select_node in _iter_selects(tree):
-            if not _select_touches_hypertable(select_node):
+            htable_refs = list(_hypertable_refs_in_select(select_node))
+            if not htable_refs:
                 continue
             where = select_node.args.get("where")
-            if (
-                where is None
-                or not _has_bounding_time_predicate(where)
-                or _has_or_true_bypass(where)
-            ):
-                fn_name = next(
-                    (fn for fn in functions_used if fn in HYPERTABLE_FUNCTIONS),
-                    "hypertable",
-                )
-                return _reject(
-                    "missing_time_filter",
-                    f"agent_views.{fn_name} requires a bounding time predicate "
-                    f"on one of {sorted(HYPERTABLE_TIME_COLUMNS)} in EVERY "
-                    f"SELECT branch that references it (e.g. "
-                    f"WHERE hour >= now() - interval '7 days'). Comparisons "
-                    f"where both sides are columns (like `hour = hour`) do "
-                    f"NOT count.",
-                )
+            all_aliases = list(_all_source_aliases(select_node))
+            for alias, fname in htable_refs:
+                if (
+                    where is None
+                    or not _has_bounding_time_predicate_for(where, alias, all_aliases)
+                    or _has_or_true_bypass(where)
+                ):
+                    return _reject(
+                        "missing_time_filter",
+                        f"agent_views.{fname} requires a bounding time predicate "
+                        f"on its own time column (one of "
+                        f"{sorted(HYPERTABLE_TIME_COLUMNS)}) in EVERY SELECT "
+                        f"branch that references it. Bound the predicate to the "
+                        f"hypertable's alias (e.g. `WHERE {alias}.hour >= "
+                        f"now() - interval '7 days'`); bounds on a joined "
+                        f"sibling table do NOT count, and comparisons where "
+                        f"both sides are columns (like `hour = hour`) do NOT "
+                        f"count either.",
+                    )
 
     # 7. OFFSET reject + LIMIT injection / cap on every SELECT branch + root.
     #
@@ -469,10 +489,19 @@ def _iter_top_level_branches(tree: exp.Expression) -> "list[exp.Select]":
     output (e.g. ``WHERE x IN (SELECT y FROM …)`` becoming an arbitrary
     500-row IN-list).
     """
+    # Collect all set-op classes available in the installed sqlglot (the
+    # public API stabilised on Union but older/newer versions also expose
+    # Intersect/Except/SetOperation). Without this, INTERSECT/EXCEPT
+    # branches escape the LIMIT cap entirely.
+    set_op_types: tuple[type, ...] = (exp.Union,)
+    for cls_name in ("Intersect", "Except", "SetOperation"):
+        if hasattr(exp, cls_name):
+            set_op_types = set_op_types + (getattr(exp, cls_name),)
+
     out: list[exp.Select] = []
 
     def _visit(node: exp.Expression) -> None:
-        if isinstance(node, exp.Union):
+        if isinstance(node, set_op_types):
             left = node.args.get("this")
             right = node.args.get("expression")
             if left is not None:
@@ -487,17 +516,41 @@ def _iter_top_level_branches(tree: exp.Expression) -> "list[exp.Select]":
     return out
 
 
-def _select_touches_hypertable(select: exp.Select) -> bool:
-    """True iff this Select directly references a hypertable function in
-    its FROM/JOIN chain (not via a sub-SELECT — those carry their own
-    SELECT node and get checked separately)."""
+def _hypertable_refs_in_select(
+    select: exp.Select,
+) -> "list[tuple[str, str]]":
+    """Yield (alias_or_fname, fname) for each hypertable function in
+    this Select's top-level FROM/JOIN. The alias falls back to the
+    function name when none is declared — that's what the LLM has to
+    reference in WHERE for the time bound to count.
+    """
+    out: list[tuple[str, str]] = []
     for tbl in _iter_select_from_tables(select):
         if (tbl.db or "").lower() != "agent_views":
             continue
         anon = tbl.find(exp.Anonymous)
-        if anon and anon.name.lower() in HYPERTABLE_FUNCTIONS:
-            return True
-    return False
+        if anon is None:
+            continue
+        fname = (anon.name or "").lower()
+        if fname not in HYPERTABLE_FUNCTIONS:
+            continue
+        alias = (tbl.alias or fname).lower()
+        out.append((alias, fname))
+    return out
+
+
+def _all_source_aliases(select: exp.Select) -> "list[str]":
+    """Yield aliases (or function names) for every FROM/JOIN source.
+    Used to decide whether an UNQUALIFIED column reference is ambiguous
+    in WHERE: if there's exactly one source, ``WHERE hour >= X`` can
+    only refer to that source's column.
+    """
+    out: list[str] = []
+    for tbl in _iter_select_from_tables(select):
+        anon = tbl.find(exp.Anonymous)
+        fname = (anon.name or "").lower() if anon else ""
+        out.append((tbl.alias or fname or (tbl.name or "")).lower())
+    return out
 
 
 def _iter_select_from_tables(select: exp.Select):
@@ -520,30 +573,42 @@ def _iter_from_join_tables(node: exp.Expression):
         yield from _iter_from_join_tables(child)
 
 
-def _has_bounding_time_predicate(where: exp.Where) -> bool:
-    """True iff the WHERE contains a bounding time-column comparison
-    that's NOT neutralised by being inside an OR with a non-bounding
-    branch and isn't a self-referential tautology.
+def _has_bounding_time_predicate_for(
+    where: exp.Where,
+    target_alias: str,
+    all_aliases: "list[str]",
+) -> bool:
+    """True iff the WHERE contains a bounding time-column predicate
+    attributable to ``target_alias`` (the alias/name of the hypertable
+    function being guarded).
 
-    Defeats handled:
+    A predicate counts when:
+      * its time column belongs to HYPERTABLE_TIME_COLUMNS, AND
+      * the column reference is qualified by ``target_alias``, OR
+        unqualified AND ``target_alias`` is the only source in the
+        SELECT's FROM/JOIN chain (so the reference is unambiguous), AND
+      * the comparison is a genuine bound (not a self-reference,
+        EXTRACT-wrapper, etc.), AND
+      * the predicate is not inside an EXISTS/subquery branch.
 
-    * ``WHERE hour = hour`` — both sides are the same column. The
-      ``_is_genuine_bound`` check below catches this.
-    * ``WHERE hour >= hour - interval '1 day'`` — the time column
-      appears on BOTH sides via an arithmetic expression. Same check.
-    * ``WHERE date_trunc('day', hour) = hour`` — same column on both
-      sides via a function wrap. Same check.
-
-    Predicates inside EXISTS/subquery branches are ignored — they
-    bound a nested scan, not this SELECT's hypertable FROM target.
-    OR-TRUE bypass (``... OR 1=1`` / ``... OR TRUE``) is detected
-    separately by ``_has_or_true_bypass`` in the main validate flow.
-    Legitimate OR-of-bounds queries (``hour > X OR hour < Y``) still
-    pass; we don't reject every OR ancestor.
+    OR-TRUE bypass is detected separately by ``_has_or_true_bypass``.
     """
+    only_source = len(all_aliases) == 1 and all_aliases[0] == target_alias
     for col in _iter_where_columns(where.this):
         if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
             continue
+        col_alias = (col.table or "").lower()
+        if col_alias:
+            if col_alias != target_alias:
+                # Column belongs to a sibling table (e.g. sessions.start_time
+                # when we're guarding prices_hourly) — does NOT bound us.
+                continue
+        else:
+            # Unqualified column reference. Only counts if there's a single
+            # source and it's the hypertable we're guarding — otherwise
+            # the LLM hasn't disambiguated which table the bound applies to.
+            if not only_source:
+                continue
         comparison = _ancestor_comparison(col)
         if comparison is None:
             continue
@@ -626,7 +691,58 @@ def _is_genuine_bound(comparison: exp.Expression, time_col: exp.Column) -> bool:
         # Neither side references the time column (shouldn't reach here
         # via _ancestor_comparison, but defensive).
         return False
+    # The time-referencing side must be either the bare Column or
+    # `date_trunc(_, hour)` (order-preserving). Anything else —
+    # `EXTRACT(EPOCH FROM hour) > 0`, `date_part('hour', hour) >= 0`,
+    # `MOD(EXTRACT(…), 24) = 5`, etc. — does NOT bound the time range
+    # of the scan even though the column technically appears on one side.
+    time_side = left if left_time_cols else right
+    if not _side_is_order_preserving(time_side, target_name):
+        return False
     return True
+
+
+def _side_is_order_preserving(node: exp.Expression, time_col_name: str) -> bool:
+    """True if ``node`` is the time column directly, or wrapped in a
+    monotonic / order-preserving function that still lets a literal on
+    the OTHER side actually bound the scan window.
+
+    Accepts:
+      * bare Column reference to the time column
+      * ``date_trunc(<unit>, <time_col>)`` — truncates but preserves order
+        (sqlglot may parse this as TimestampTrunc / DateTrunc / DatetimeTrunc
+        depending on dialect / version; handle them all)
+      * ``time_bucket(<interval>, <time_col>)`` — TimescaleDB analogue
+
+    Rejects everything else (``EXTRACT``, ``date_part``, ``MOD``,
+    arithmetic against the column, etc.). When in doubt, reject — the
+    LLM can rewrite to the bare-column form.
+    """
+    if isinstance(node, exp.Column) and (node.name or "").lower() == time_col_name:
+        return True
+    # date_trunc parses differently across sqlglot versions / dialects:
+    # TimestampTrunc, DateTrunc, DatetimeTrunc are all possible nodes.
+    trunc_types: tuple[type, ...] = ()
+    for cls_name in ("TimestampTrunc", "DateTrunc", "DatetimeTrunc"):
+        if hasattr(exp, cls_name):
+            trunc_types = trunc_types + (getattr(exp, cls_name),)
+    if trunc_types and isinstance(node, trunc_types):
+        inner = node.args.get("this")
+        if isinstance(inner, exp.Column) and (inner.name or "").lower() == time_col_name:
+            return True
+        return False
+    # time_bucket() typically parses as Anonymous with the column as last arg
+    if isinstance(node, exp.Anonymous) and (node.name or "").lower() == "time_bucket":
+        exprs = node.args.get("expressions") or []
+        if exprs:
+            last = exprs[-1]
+            if (
+                isinstance(last, exp.Column)
+                and (last.name or "").lower() == time_col_name
+            ):
+                return True
+        return False
+    return False
 
 
 def _columns_matching(node: exp.Expression, name: str) -> list[exp.Column]:

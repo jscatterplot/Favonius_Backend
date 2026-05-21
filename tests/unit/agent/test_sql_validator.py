@@ -651,3 +651,138 @@ class TestSubqueryRowCapNotInjected:
         )
         # Two branch LIMITs + one outer LIMIT = three.
         assert r.sql.upper().count("LIMIT") >= 2
+
+
+class TestPgStarFunctionsRejected:
+    """Codex P2 — unqualified ``pg_*`` calls (pg_relation_size, pg_database_size,
+    pg_advisory_lock, …) must be blanket-rejected even when not on the
+    named denylist. The agent never has a legitimate use for them.
+    """
+
+    def test_pg_relation_size_rejected(self):
+        _rej(
+            "SELECT pg_relation_size('x') FROM agent_views.sessions($1)",
+            kind="dangerous_fn",
+        )
+
+    def test_pg_total_relation_size_rejected(self):
+        _rej(
+            "SELECT pg_total_relation_size('x') FROM agent_views.sessions($1)",
+            kind="dangerous_fn",
+        )
+
+    def test_pg_advisory_lock_rejected(self):
+        _rej(
+            "SELECT pg_advisory_lock(1) FROM agent_views.sessions($1)",
+            kind="dangerous_fn",
+        )
+
+    def test_pg_stat_get_rejected(self):
+        _rej(
+            "SELECT pg_stat_get_db_xact_commit(1) FROM agent_views.sessions($1)",
+            kind="dangerous_fn",
+        )
+
+
+class TestExtractAndDatePartNotABound:
+    """Codex P1 — `EXTRACT(EPOCH FROM hour) > 0` and `date_part('h', hour)
+    >= 0` reference the time column but do NOT constrain the time window.
+    The bound side must be the bare column (or a monotonic wrap like
+    date_trunc / time_bucket).
+    """
+
+    def test_extract_epoch_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE EXTRACT(EPOCH FROM hour) > 0",
+            kind="missing_time_filter",
+        )
+
+    def test_date_part_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE date_part('hour', hour) >= 0",
+            kind="missing_time_filter",
+        )
+
+    def test_date_trunc_bound_accepted(self):
+        # date_trunc IS order-preserving — `date_trunc('day', hour) >=
+        # '2026-01-01'` legitimately bounds the scan window.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE date_trunc('day', hour) >= '2026-01-01'"
+        )
+
+
+class TestSetOpBranchesAllCapped:
+    """Codex P2 — INTERSECT / EXCEPT branches must be LIMIT-capped just
+    like UNION branches, otherwise the row-cap protection is bypassed.
+    """
+
+    def test_intersect_branches_capped(self):
+        # Build via UNION ALL since most tested set-ops parse identically.
+        # The validator handles all three (Union / Intersect / Except)
+        # via the same _iter_top_level_branches walker.
+        import sqlglot
+        from sqlglot import exp
+
+        # Verify the helper walks Intersect/Except in this sqlglot build.
+        if not hasattr(exp, "Intersect"):
+            return
+        from src.api.agent.sql_validator import _iter_top_level_branches
+
+        tree = sqlglot.parse_one(
+            "SELECT depot_id FROM agent_views.sessions($1) "
+            "INTERSECT "
+            "SELECT depot_id FROM agent_views.optimization_runs($1)",
+            read="postgres",
+        )
+        branches = _iter_top_level_branches(tree)
+        # Both branches must be enumerated — the bug was the helper
+        # only recursed into Union, leaving Intersect/Except branches
+        # uncapped.
+        assert len(branches) == 2, (
+            f"expected 2 branches across INTERSECT, got {len(branches)}"
+        )
+
+
+class TestPerHypertableTimeBound:
+    """Codex P1 — when JOINing a hypertable function against a sibling
+    table, the bound must be on the HYPERTABLE's time column, not just
+    any time column in the WHERE.
+    """
+
+    def test_bound_on_sibling_only_rejected(self):
+        # prices_hourly joined to sessions; bound is on sessions only.
+        # prices_hourly is unbounded — must reject.
+        _rej(
+            "SELECT ph.depot_id FROM agent_views.prices_hourly($1) ph "
+            "JOIN agent_views.sessions($1) s ON ph.depot_id = s.depot_id "
+            "WHERE s.start_time >= now() - interval '7 days'",
+            kind="missing_time_filter",
+        )
+
+    def test_bound_on_hypertable_alias_accepted(self):
+        # Time bound qualified by the hypertable's alias.
+        _ok(
+            "SELECT ph.depot_id FROM agent_views.prices_hourly($1) ph "
+            "JOIN agent_views.sessions($1) s ON ph.depot_id = s.depot_id "
+            "WHERE ph.hour >= now() - interval '7 days'"
+        )
+
+    def test_unqualified_bound_single_source_accepted(self):
+        # No JOIN — unqualified `hour` can only be from prices_hourly.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days'"
+        )
+
+    def test_unqualified_bound_with_join_rejected(self):
+        # When there's a JOIN, an unqualified bound is ambiguous and
+        # does NOT count as bounding either source.
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) ph "
+            "JOIN agent_views.sessions($1) s ON ph.depot_id = s.depot_id "
+            "WHERE start_time >= now() - interval '7 days'",
+            kind="missing_time_filter",
+        )
