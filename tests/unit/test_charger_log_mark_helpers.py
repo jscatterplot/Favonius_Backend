@@ -40,7 +40,7 @@ class _FakePool:
 
 class _FakeTimescaleClient:
     def __init__(self):
-        self._pool = _FakePool()
+        self.pg_pool = _FakePool()
 
 
 class TestCoerceUuid:
@@ -71,8 +71,8 @@ class TestMarkImportHelpers:
         import_id = uuid4()
         payload = {"import_id": str(import_id), "location": "https://x"}
         await consumer._mark_import_uploading(payload, "diagnostics.tar.gz")
-        assert len(client._pool.conn.execute_calls) == 1
-        _, args = client._pool.conn.execute_calls[0]
+        assert len(client.pg_pool.conn.execute_calls) == 1
+        _, args = client.pg_pool.conn.execute_calls[0]
         # First arg to the UPDATE must be a UUID instance — binding a
         # str to a uuid column is what triggered the silent failure.
         assert isinstance(args[0], UUID)
@@ -87,8 +87,8 @@ class TestMarkImportHelpers:
         import_id = uuid4()
         payload = {"import_id": str(import_id)}
         await consumer._mark_import_failed(payload, "boom")
-        assert len(client._pool.conn.execute_calls) == 1
-        _, args = client._pool.conn.execute_calls[0]
+        assert len(client.pg_pool.conn.execute_calls) == 1
+        _, args = client.pg_pool.conn.execute_calls[0]
         assert isinstance(args[0], UUID)
         assert args[0] == import_id
 
@@ -104,7 +104,7 @@ class TestMarkImportHelpers:
         await consumer._mark_import_uploading(
             {"import_id": "not-a-uuid"}, "x.tar.gz"
         )
-        assert client._pool.conn.execute_calls == []
+        assert client.pg_pool.conn.execute_calls == []
 
     @pytest.mark.asyncio
     async def test_mark_failed_skips_when_import_id_missing(self):
@@ -113,4 +113,4 @@ class TestMarkImportHelpers:
             client, cp_lookup=lambda _cp: None
         )
         await consumer._mark_import_failed({}, "boom")
-        assert client._pool.conn.execute_calls == []
+        assert client.pg_pool.conn.execute_calls == []

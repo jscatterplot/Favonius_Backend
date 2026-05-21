@@ -1527,9 +1527,7 @@ class ChargingCommandQueueConsumer:
         import_id = _coerce_uuid((payload or {}).get("import_id"))
         if import_id is None:
             return
-        pool = getattr(self.timescale_client, "_pool", None) or getattr(
-            self.timescale_client, "pool", None
-        )
+        pool = getattr(self.timescale_client, "pg_pool", None)
         if pool is None:
             return
         try:
@@ -1557,9 +1555,7 @@ class ChargingCommandQueueConsumer:
         import_id = _coerce_uuid((payload or {}).get("import_id"))
         if import_id is None:
             return
-        pool = getattr(self.timescale_client, "_pool", None) or getattr(
-            self.timescale_client, "pool", None
-        )
+        pool = getattr(self.timescale_client, "pg_pool", None)
         if pool is None:
             return
         try:
