@@ -3304,7 +3304,9 @@ class TimescaleClient:
             except (ValueError, IndexError):
                 return 0
 
-    async def expire_overdue_charger_log_imports(self, ttl_seconds: int = 3600) -> int:
+    async def expire_overdue_charger_log_imports(
+        self, ttl_seconds: int | None = None
+    ) -> int:
         """Move stale ``requested`` / ``uploading`` log imports to ``expired``.
 
         Without this the read endpoint (``GET .../log_comparison``) would
@@ -3320,6 +3322,10 @@ class TimescaleClient:
 
         Returns the rowcount.
         """
+        if ttl_seconds is None:
+            from src.adapters.chargers.upload_token import get_token_ttl_seconds
+
+            ttl_seconds = get_token_ttl_seconds()
         async with self.pg_pool.acquire() as conn:
             result = await conn.execute(
                 """

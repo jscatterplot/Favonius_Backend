@@ -36,6 +36,20 @@ logger = logging.getLogger(__name__)
 
 _SESSION_LOG_NAME_HINTS = ("session", "charging_session", "transaction")
 
+# Canonical header keys mapped by ``_canon``; every alias the reader
+# helpers accept must appear here or that column duplicates into
+# ``raw_fields``.
+_KNOWN_CANON_KEYS = frozenset({
+    "timestamp", "time", "datetime",
+    "transactionid",
+    "connectorid",
+    "soc", "socpercent", "stateofcharge",
+    "energykwh", "energydeliveredkwh",
+    "energywh", "energyactiveimportregister",
+    "powerkw", "chargingkw",
+    "powerw", "poweractiveimport",
+})
+
 
 def parse_abb_diagnostics(blob: bytes) -> Iterable[ChargerLogEntry]:
     """Extract normalized session-log entries from an ABB diagnostics blob.
@@ -151,6 +165,8 @@ def _parse_csv_text(text: str) -> Iterator[ChargerLogEntry]:
         # Not a session-log shape — nothing to extract.
         return
 
+    excluded_row_keys = {headers.get(k) for k in _KNOWN_CANON_KEYS}
+
     for row in reader:
         ts = _pick(row, headers, "timestamp", "time", "datetime")
         if ts is None:
@@ -164,26 +180,10 @@ def _parse_csv_text(text: str) -> Iterator[ChargerLogEntry]:
         energy_kwh = _read_energy_kwh(row, headers)
         power_kw = _read_power_kw(row, headers)
         soc = _read_soc(row, headers)
-        # ``headers`` is keyed by ``_canon(header)`` (alphanumerics
-        # only), so the exclusion set must list canonical forms too —
-        # any underscored variant here would silently be dead code.
-        # Every alias the reader helpers below accept must appear in
-        # this set, or that column ends up both in the normalized
-        # field AND duplicated into raw_fields.
-        _KNOWN_CANON_KEYS = {
-            "timestamp", "time", "datetime",
-            "transactionid",
-            "connectorid",
-            "soc", "socpercent", "stateofcharge",
-            "energykwh", "energydeliveredkwh",
-            "energywh", "energyactiveimportregister",
-            "powerkw", "chargingkw",
-            "powerw", "poweractiveimport",
-        }
         raw = {
             row_key: row[row_key]
             for row_key in row
-            if row_key not in {headers.get(k) for k in _KNOWN_CANON_KEYS}
+            if row_key not in excluded_row_keys
         }
         yield ChargerLogEntry(
             time=parsed_ts,
