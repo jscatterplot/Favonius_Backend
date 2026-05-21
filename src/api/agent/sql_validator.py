@@ -69,6 +69,16 @@ HYPERTABLE_FUNCTIONS: frozenset[str] = frozenset(
         "building_load_hourly",
     }
 )
+# The two hypertable functions (prices_hourly, building_load_hourly)
+# both expose exactly one time column: ``hour``. Older drafts of this
+# set included ``start_time``/``end_time``/``time`` to match
+# table-level columns, but those names exist on the non-hypertable
+# functions (sessions has start_time/end_time; raw telemetry has
+# time) — accepting them as bounds let an LLM-written query satisfy
+# the missing_time_filter guard with a predicate on a column that
+# doesn't actually exist on the bounded function. The query then
+# failed at EXPLAIN time, wasting an iteration. Narrowed to the
+# actual column the validator is guarding.
 HYPERTABLE_TIME_COLUMNS: frozenset[str] = frozenset({"hour"})
 
 # Forbidden schemas — anything resolving here is an instant reject.

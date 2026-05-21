@@ -588,7 +588,6 @@ async def _run_sql_general_turn(
             on_step=_on_step,
         )
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
-        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
         logger.error("SQL agent tool error: %s", exc)
         # Codex P2: if a disallowed tool aborted the loop AFTER one or
         # more SQL tools had already executed, we still owe those rows
