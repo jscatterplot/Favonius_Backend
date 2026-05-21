@@ -3341,7 +3341,7 @@ class TimescaleClient:
                    )
                 """,
                 str(int(ttl_seconds)),
-                str(max(int(ttl_seconds), int(ttl_seconds) * 2)),
+                str(int(ttl_seconds) * 2),
             )
             try:
                 return int(result.split()[-1])
