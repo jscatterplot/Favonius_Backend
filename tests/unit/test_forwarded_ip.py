@@ -52,7 +52,12 @@ class TestLegacyBehaviour:
 
 
 class TestImplicitPrivateTrust:
-    """``trust_implicit_private=True`` skips CGNAT / private / loopback hops."""
+    """``trust_implicit_private=True`` implicitly trusts only RFC 6598 CGNAT.
+
+    Private / loopback / link-local IPs may be real client addresses on
+    on-prem or container networks and are NOT auto-skipped — those
+    deployments must declare their proxy CIDR via ``trusted_networks``.
+    """
 
     def test_skips_cgnat_proxy_returns_real_client(self):
         """Railway shape: edge IP is 100.64.x.x; XFF holds the real client."""
@@ -62,33 +67,48 @@ class TestImplicitPrivateTrust:
             == "18.196.90.141"
         )
 
-    def test_skips_private_proxy_returns_real_client(self):
+    def test_does_not_implicitly_skip_private(self):
+        """Private clients (on-prem / VPN) are returned, not skipped as proxies."""
         headers = _Headers({"X-Forwarded-For": "18.196.90.141, 10.0.0.5"})
+        # Right-to-left: 10.0.0.5 is private but NOT CGNAT — it is the client.
         assert (
             extract_forwarded_ip(headers, trust_implicit_private=True)
-            == "18.196.90.141"
+            == "10.0.0.5"
         )
 
-    def test_skips_loopback_proxy(self):
+    def test_does_not_implicitly_skip_loopback(self):
         headers = _Headers({"X-Forwarded-For": "18.196.90.141, 127.0.0.1"})
         assert (
             extract_forwarded_ip(headers, trust_implicit_private=True)
-            == "18.196.90.141"
+            == "127.0.0.1"
         )
 
-    def test_skips_link_local_proxy(self):
+    def test_does_not_implicitly_skip_link_local(self):
         headers = _Headers({"X-Forwarded-For": "18.196.90.141, fe80::1"})
         assert (
             extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "fe80::1"
+        )
+
+    def test_skips_explicitly_trusted_private(self):
+        """Private LB declared in ``trusted_networks`` IS skipped."""
+        headers = _Headers({"X-Forwarded-For": "18.196.90.141, 10.0.0.5"})
+        assert (
+            extract_forwarded_ip(
+                headers,
+                trusted_networks=(_net("10.0.0.0/8"),),
+                trust_implicit_private=True,
+            )
             == "18.196.90.141"
         )
 
     def test_falls_back_to_leftmost_when_all_trusted(self):
-        """Internal-only chain: nothing public to return — preserve the claim."""
-        headers = _Headers({"X-Forwarded-For": "10.0.0.1, 10.0.0.2"})
+        """Internal-only chain: nothing non-trusted to return — preserve the claim."""
+        headers = _Headers({"X-Forwarded-For": "100.64.0.1, 100.64.0.2"})
+        # Both CGNAT → both implicitly trusted → fall back to leftmost.
         assert (
             extract_forwarded_ip(headers, trust_implicit_private=True)
-            == "10.0.0.1"
+            == "100.64.0.1"
         )
 
 
@@ -152,14 +172,30 @@ class TestSpoofResistance:
             == "8.8.8.8"
         )
 
-    def test_spoofed_private_ip_skipped(self):
-        """Attacker tries to spoof an internal IP — still gets skipped as 'proxy'."""
+    def test_spoofed_leading_entries_unreached(self):
+        """Right-to-left walk stops at the first non-trusted entry — spoofs at left are ignored."""
         headers = _Headers(
             {"X-Forwarded-For": "10.0.0.99, 93.184.216.34, 100.64.0.2"}
         )
         assert (
             extract_forwarded_ip(headers, trust_implicit_private=True)
             == "93.184.216.34"
+        )
+
+    def test_private_client_behind_private_lb_is_not_spoofed(self):
+        """Codex P1: real client on private network, attacker spoofs public IP.
+
+        Scenario: on-prem deployment where clients live on 10.0.0.0/8 and
+        the LB also has a private IP. Attacker sends
+        ``X-Forwarded-For: 8.8.8.8`` and the LB appends ``10.1.2.3`` (real
+        client). Earlier behaviour: walker skipped 10.1.2.3 as a "private
+        proxy" and returned the spoofed 8.8.8.8. Fixed behaviour: 10.1.2.3
+        is treated as the client (not an implicit proxy), spoof rejected.
+        """
+        headers = _Headers({"X-Forwarded-For": "8.8.8.8, 10.1.2.3"})
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "10.1.2.3"
         )
 
 

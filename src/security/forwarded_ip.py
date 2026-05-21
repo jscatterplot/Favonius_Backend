@@ -30,6 +30,14 @@ from typing import Iterable, Optional, Union
 # Fly.io and other PaaS providers route between their edge and the
 # container over this range. Python's ``ipaddress`` does not classify it
 # as ``is_private`` so we check it explicitly.
+#
+# Note: RFC 1918 private, loopback, and link-local addresses are NOT
+# implicitly trusted as chain hops. On-prem deployments where the real
+# client lives behind a private-IP load balancer would otherwise let an
+# attacker spoof ``X-Forwarded-For: 8.8.8.8`` and have the LB-appended
+# private client IP get skipped as a "proxy" — surfacing the spoof. For
+# those topologies, declare the LB's CIDR explicitly in
+# ``GEO_BLOCK_TRUSTED_PROXY_RANGES`` / ``OCPP_TRUSTED_PROXY_RANGES``.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 _Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
@@ -54,15 +62,20 @@ def normalize_forwarded_ip(raw_ip: str) -> Optional[str]:
         return None
 
 
-def _is_implicitly_trusted(
+def _is_implicitly_trusted_chain_hop(
     ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
 ) -> bool:
-    """True for RFC 1918/4193 private, loopback, link-local, and RFC 6598 CGNAT."""
-    if ip.is_private or ip.is_loopback or ip.is_link_local:
-        return True
-    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK:
-        return True
-    return False
+    """True only for RFC 6598 CGNAT — the PaaS-edge-to-container address space.
+
+    RFC 1918 private, loopback, and link-local are deliberately excluded:
+    they can be legitimate *client* IPs in on-prem / VPN / Docker / K8s
+    deployments, and auto-skipping them as proxies would let an attacker
+    spoof their origin by prepending ``X-Forwarded-For: 8.8.8.8`` so the
+    LB-appended private client IP gets discarded as a "proxy hop".
+    Such deployments declare their proxy CIDR explicitly via
+    ``trusted_networks``.
+    """
+    return isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK
 
 
 def _is_trusted_proxy_entry(
@@ -75,7 +88,7 @@ def _is_trusted_proxy_entry(
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    if trust_implicit_private and _is_implicitly_trusted(ip):
+    if trust_implicit_private and _is_implicitly_trusted_chain_hop(ip):
         return True
     return any(ip.version == net.version and ip in net for net in trusted_networks)
 
@@ -147,10 +160,13 @@ def extract_forwarded_ip(
         trusted_networks: CIDRs that act as reverse proxies for this
             deployment. Entries in the chain whose IPs fall in any of these
             ranges are treated as intermediate hops, not the client.
-        trust_implicit_private: When True, RFC 1918 / RFC 4193 private,
-            loopback, link-local, and RFC 6598 CGNAT addresses are also
-            treated as intermediate proxies. Match this to the caller's
-            existing ``trust private proxy headers`` config.
+        trust_implicit_private: When True, RFC 6598 CGNAT addresses
+            (100.64.0.0/10) are treated as intermediate proxies — this
+            covers Railway, Render, Fly.io, and similar PaaS providers.
+            RFC 1918 private, loopback, and link-local addresses are
+            deliberately NOT implicitly trusted because they may be real
+            client IPs on on-prem / VPN / Docker / K8s networks; declare
+            those proxy CIDRs explicitly in ``trusted_networks``.
 
     Returns:
         The resolved client IP, or ``None`` when no valid header is present.
