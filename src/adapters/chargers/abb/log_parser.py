@@ -161,7 +161,7 @@ def _parse_csv_text(text: str) -> Iterator[ChargerLogEntry]:
     if reader.fieldnames is None:
         return
     headers = {_canon(h): h for h in reader.fieldnames}
-    if "timestamp" not in headers and "time" not in headers:
+    if "timestamp" not in headers and "time" not in headers and "datetime" not in headers:
         # Not a session-log shape — nothing to extract.
         return
 
