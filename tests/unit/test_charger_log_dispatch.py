@@ -142,6 +142,32 @@ async def test_dispatch_token_in_url_matches_persisted_hash():
 
 
 @pytest.mark.asyncio
+async def test_queue_expiry_aligned_with_token_ttl(monkeypatch):
+    """Regression for Codex P2: queue row expiry used to be a fixed
+    60 min, even when ``CHARGER_LOG_UPLOAD_TOKEN_TTL_S`` was shorter.
+    A charger reconnecting late could then be handed a command
+    whose embedded upload URL had already expired. Dispatch now caps
+    the queue expiry at the configured token TTL.
+    """
+    monkeypatch.setenv("CHARGER_LOG_UPLOAD_TOKEN_TTL_S", "600")  # 10 min
+
+    from src.adapters.ocpp.dispatch import dispatch_get_diagnostics
+
+    conn = _FakeConn()
+    pool = _FakePool(conn)
+    await dispatch_get_diagnostics(pool, station_id="OCPP-TTL")
+
+    # The fifth $4 arg to the queue INSERT carries the expiry interval
+    # in minutes (stringified). With a 600s TTL the queue must expire
+    # at most 10 min from now.
+    queue_args = conn.calls[1][2]
+    expires_str = queue_args[3]
+    assert int(expires_str) <= 10, (
+        f"expected queue expiry <= 10 min (token TTL 600s); got {expires_str}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_dispatch_forwards_optional_ocpp_params():
     from src.adapters.ocpp.dispatch import dispatch_get_diagnostics
 

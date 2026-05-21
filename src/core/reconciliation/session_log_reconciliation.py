@@ -363,7 +363,16 @@ async def _our_energy_kwh(
                 conn,
                 "AND (t.transaction_id IS NULL OR t.transaction_id = $3)",
             )
-        return await _query(conn, "")
+        # No transaction_id: still need to reference $3 in the SQL so
+        # asyncpg's prepared-statement binding sees an arity match
+        # against the 5 args we pass. ``($3::bigint IS NULL OR …)``
+        # makes the filter a no-op when $3 is NULL (our case here)
+        # without dropping the placeholder. Cursor Medium flagged the
+        # arity mismatch on the previous shape.
+        return await _query(
+            conn,
+            "AND ($3::bigint IS NULL OR t.transaction_id = $3)",
+        )
 
 
 def _duration_s(start: Optional[datetime], end: Optional[datetime]) -> Optional[int]:

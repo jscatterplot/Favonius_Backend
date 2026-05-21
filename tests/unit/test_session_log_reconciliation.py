@@ -216,6 +216,33 @@ async def test_reconciled_when_both_sides_present():
 
 
 @pytest.mark.asyncio
+async def test_our_energy_sql_references_dollar3_in_all_branches():
+    """Regression for Cursor Medium: when ``transaction_id`` is None
+    the function passed 5 args but the SQL referenced only $1/$2/$4/$5,
+    leaving $3 unbound and producing an asyncpg arity mismatch. All
+    three cascade branches must reference $3, even if as a no-op.
+    """
+    from src.core.reconciliation.session_log_reconciliation import (
+        _OUR_ENERGY_SQL,
+        _TAIL_EXTRAPOLATION_CAP_SECONDS,
+    )
+
+    branches = [
+        "AND t.transaction_id = $3",
+        "AND (t.transaction_id IS NULL OR t.transaction_id = $3)",
+        "AND ($3::bigint IS NULL OR t.transaction_id = $3)",
+    ]
+    for tx_filter in branches:
+        rendered = _OUR_ENERGY_SQL.format(
+            tx_filter=tx_filter,
+            tail_cap_s=_TAIL_EXTRAPOLATION_CAP_SECONDS,
+        )
+        assert "$3" in rendered, (
+            f"branch {tx_filter!r} dropped $3; would arity-mismatch on bind"
+        )
+
+
+@pytest.mark.asyncio
 async def test_our_energy_sql_caps_tail_extrapolation():
     """Regression for Cursor Medium: the tail term used to integrate
     the last sample's power all the way to ``end_time``. For a

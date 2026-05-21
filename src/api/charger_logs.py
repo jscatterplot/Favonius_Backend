@@ -32,6 +32,7 @@ import asyncpg
 
 from ..adapters.chargers import ChargerLogParseError, get_parser_for_vendor
 from ..adapters.chargers.upload_token import (
+    UploadToken,
     UploadTokenError,
     get_max_upload_bytes,
     verify_token,
@@ -81,6 +82,7 @@ async def receive_upload(
     token: str,
     body: bytes,
     file_name: Optional[str] = None,
+    decoded: Optional[UploadToken] = None,
 ) -> UploadReceiveResult:
     """Validate the token, persist the body, flip the row to ``'received'``.
 
@@ -89,6 +91,16 @@ async def receive_upload(
     BYTEA on the same TimescaleDB pool keeps the blob colocated with
     ``charging_sessions`` per the plan in
     ``/root/.claude/plans/i-want-to-add-tranquil-torvalds.md``.
+
+    When the endpoint has already called :func:`verify_token` before
+    streaming the body, it should pass the resulting
+    :class:`UploadToken` as ``decoded`` so this function doesn't
+    re-verify. Between the two checks (pre-check + here) the token's
+    expiry could elapse — the body would then be discarded after
+    minutes of streaming, which is what Cursor flagged as a race.
+    Re-using the prior verification result keeps the endpoint
+    consistent with itself; the per-row ``upload_token_hash`` check
+    below is the authoritative defence against replay.
 
     Raises:
         UploadRejected: token invalid / expired (401), import not found
@@ -101,24 +113,25 @@ async def receive_upload(
     if len(body) == 0:
         raise UploadRejected(400, "empty body")
 
-    try:
-        decoded = verify_token(token)
-    except UploadTokenError as exc:
-        # Defence-in-depth against timing/content side channels: the
-        # response body says only "invalid token" regardless of which
-        # specific check tripped (shape / signature / expiry). The
-        # detailed reason still lands in the server log via the
-        # exception chain for operator debugging.
-        logger.info("upload token rejected: %s", exc)
-        raise UploadRejected(401, "invalid token") from exc
-    except RuntimeError as exc:
-        # ``verify_token`` raises RuntimeError when the signing key is
-        # unset — a server-side misconfiguration, not a bad client.
-        # Surface it as 503 so the operator gets a clear signal
-        # instead of an opaque 500. The exception message names the
-        # missing env var and is safe to expose — it's not a client
-        # data leak, it's a deployment instruction.
-        raise UploadRejected(503, f"upload misconfigured: {exc}") from exc
+    if decoded is None:
+        try:
+            decoded = verify_token(token)
+        except UploadTokenError as exc:
+            # Defence-in-depth against timing/content side channels: the
+            # response body says only "invalid token" regardless of which
+            # specific check tripped (shape / signature / expiry). The
+            # detailed reason still lands in the server log via the
+            # exception chain for operator debugging.
+            logger.info("upload token rejected: %s", exc)
+            raise UploadRejected(401, "invalid token") from exc
+        except RuntimeError as exc:
+            # ``verify_token`` raises RuntimeError when the signing key is
+            # unset — a server-side misconfiguration, not a bad client.
+            # Surface it as 503 so the operator gets a clear signal
+            # instead of an opaque 500. The exception message names the
+            # missing env var and is safe to expose — it's not a client
+            # data leak, it's a deployment instruction.
+            raise UploadRejected(503, f"upload misconfigured: {exc}") from exc
 
     expected_hash = decoded.sha256_hex
     content_sha256 = hashlib.sha256(body).hexdigest()

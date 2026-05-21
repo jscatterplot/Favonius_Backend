@@ -250,7 +250,7 @@ async def dispatch_get_diagnostics(
     charger_id: Optional[UUID] = None,
     connector_id: Optional[int] = None,
     vendor: Optional[str] = None,
-    expires_in_min: int = 60,
+    expires_in_min: Optional[int] = None,
     retries: Optional[int] = None,
     retry_interval: Optional[int] = None,
     start_time: Optional[datetime] = None,
@@ -310,6 +310,19 @@ async def dispatch_get_diagnostics(
             "Charger log upload is not configured: set CHARGER_LOG_UPLOAD_BASE_URL "
             "(and CHARGER_LOG_UPLOAD_SIGNING_KEY)."
         )
+
+    # Anchor the queue row's expiry to the token TTL so a charger that
+    # only reconnects late won't be handed a command whose upload URL
+    # has already expired. ``get_token_ttl_seconds()`` enforces a 60 s
+    # floor; the queue ceiling is at least that, capped at the caller's
+    # explicit ``expires_in_min`` when one is supplied.
+    from ..chargers.upload_token import get_token_ttl_seconds
+
+    token_ttl_s = get_token_ttl_seconds()
+    if expires_in_min is None:
+        queue_expires_in_min = max(1, token_ttl_s // 60)
+    else:
+        queue_expires_in_min = min(expires_in_min, max(1, token_ttl_s // 60))
 
     import_id = uuid4()
     # Mint exactly once so the token embedded in the URL is the same
@@ -371,7 +384,7 @@ async def dispatch_get_diagnostics(
                 station_id,
                 connector_id if connector_id is not None else 0,
                 json.dumps(payload),
-                str(expires_in_min),
+                str(queue_expires_in_min),
             )
 
     logger.info(

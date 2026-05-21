@@ -165,6 +165,46 @@ async def test_receive_upload_rejects_invalid_token():
 
 
 @pytest.mark.asyncio
+async def test_receive_upload_skips_reverify_when_decoded_passed():
+    """Regression for Cursor HIGH: the upload endpoint verifies the
+    token, streams the body, then calls receive_upload which used to
+    verify *again*. Between the two calls the token's expiry could
+    elapse, rejecting an upload the pre-check accepted. receive_upload
+    now accepts a ``decoded`` ``UploadToken`` from the endpoint and
+    re-uses it, so both verdicts are consistent.
+    """
+    import hashlib
+
+    from src.adapters.chargers.upload_token import UploadToken
+
+    import_id = uuid4()
+    fake_token = f"{import_id}.99999999.deadbeef" + "00" * 28
+    expected_hash = hashlib.sha256(fake_token.encode()).hexdigest()
+    decoded = UploadToken(import_id=import_id, expiry_unix=99999999, raw=fake_token)
+
+    row = {
+        "id": import_id,
+        "session_id": uuid4(),
+        "station_id": "OCPP-01",
+        "vendor": "ABB",
+        "status": "requested",
+        "upload_token_hash": expected_hash,
+    }
+    conn = _FakeConn({"FROM charger_log_imports": row})
+
+    # Even with a syntactically invalid token (would fail verify_token),
+    # passing decoded= bypasses the second verify and proceeds to the
+    # DB write.
+    result = await receive_upload(
+        _FakePool(conn),
+        token=fake_token,
+        body=b"payload",
+        decoded=decoded,
+    )
+    assert result.import_id == import_id
+
+
+@pytest.mark.asyncio
 async def test_receive_upload_does_not_leak_token_reason():
     """Regression for Cursor LOW: the rejection reason used to embed
     the underlying ``UploadTokenError`` (``malformed`` /

@@ -8469,7 +8469,7 @@ async def upload_charger_log_endpoint(
     )
 
     try:
-        verify_token(token)
+        decoded_token = verify_token(token)
     except UploadTokenError as exc:
         # Don't leak the specific reason (malformed / bad signature /
         # expired) to the client — keeps timing-side channels narrow.
@@ -8527,11 +8527,17 @@ async def upload_charger_log_endpoint(
     file_name = _extract_upload_filename(request)
 
     try:
+        # Pass the already-decoded token so receive_upload doesn't
+        # re-verify and risk a different verdict than the pre-check.
+        # Between streaming and reaching the DB the token's expiry
+        # could elapse; a double verify would then reject a body we
+        # just spent bandwidth accepting.
         result = await receive_upload(
             db_pools.ts,
             token=token,
             body=body_bytes,
             file_name=file_name,
+            decoded=decoded_token,
         )
     except UploadRejected as exc:
         raise HTTPException(
