@@ -557,15 +557,43 @@ def _ancestor_comparison(node: exp.Expression) -> exp.Expression | None:
     return None
 
 
-def _has_or_true_bypass(where: exp.Where) -> bool:
-    """Detect OR branches that neutralize safety predicates.
-
-    Examples: ``... OR 1=1`` and ``... OR TRUE``.
-    Legitimate ``... OR hour < X OR hour > Y`` queries are not affected.
-    """
-    for node in where.find_all(exp.Or):
-        if _is_unconditional_true(node.this) or _is_unconditional_true(node.expression):
+def _is_under(expr: exp.Expression, ancestor: exp.Expression) -> bool:
+    """True if ``expr`` is ``ancestor`` or nested inside it."""
+    cur: exp.Expression | None = expr
+    while cur is not None:
+        if cur is ancestor:
             return True
+        cur = cur.parent
+    return False
+
+
+def _has_or_true_bypass(where: exp.Where) -> bool:
+    """Detect OR branches that neutralize a bounding time predicate.
+
+    Only OR-TRUE on the ancestry chain from a genuine time comparison
+    to the WHERE root is flagged (sibling OR branch is always true).
+    ``hour >= X AND (y OR 1=1)`` is not a bypass — the time bound is
+    independently enforced by the AND.
+    """
+    root = where.this
+    for col in _iter_where_columns(root):
+        if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
+            continue
+        comparison = _ancestor_comparison(col)
+        if comparison is None or not _is_genuine_bound(comparison, col):
+            continue
+        cur = comparison.parent
+        while cur is not None:
+            if isinstance(cur, exp.Or):
+                if _is_under(cur.this, comparison):
+                    sibling = cur.expression
+                else:
+                    sibling = cur.this
+                if _is_unconditional_true(sibling):
+                    return True
+            if cur is root:
+                break
+            cur = cur.parent
     return False
 
 

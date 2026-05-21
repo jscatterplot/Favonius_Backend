@@ -43,7 +43,7 @@ class PlannerDecision:
 # Phrases that strongly suggest the consumption fast path. All
 # lowercased; matched against a lowercased user message.
 _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bhow much (did|has) .+ (charged?|consumed?|used)\b"),
+    re.compile(r"\bhow much (did|has) .+ (charg(?:e|ed|ing)|consum(?:e|ed|ing)|used)\b"),
     re.compile(r"\bconsumption (of|for|by) \S+"),
     re.compile(r"\benergy (used|consumed) by \S+"),
     re.compile(r"\bhow many kwh did \S+ "),
