@@ -196,7 +196,9 @@ def _emit_decision_schema() -> dict[str, Any]:
                 },
                 "coverage": {
                     "type": "object",
-                    "description": ("Optional counts of depot entities reviewed during this turn."),
+                    "description": (
+                        "Optional counts of depot entities reviewed during this turn."
+                    ),
                     "additionalProperties": False,
                     "properties": {
                         "vehicles_checked": {"type": "integer", "minimum": 0},
@@ -341,7 +343,9 @@ class WorkflowAgent:
                 messages.append({"role": "assistant", "content": assistant_content})
 
                 tool_use_blocks = [
-                    b for b in assistant_content if getattr(b, "type", None) == "tool_use"
+                    b
+                    for b in assistant_content
+                    if getattr(b, "type", None) == "tool_use"
                 ]
 
                 if not tool_use_blocks:
@@ -368,7 +372,9 @@ class WorkflowAgent:
                     block_input = dict(getattr(block, "input", {}) or {})
 
                     if name == EMIT_DECISION_TOOL_NAME:
-                        decision_output, rule_applied = self._capture_terminator(block_input, guard)
+                        decision_output, rule_applied = self._capture_terminator(
+                            block_input, guard
+                        )
                         emit_called = True
                         # Terminator: do not append a tool_result; do not
                         # process further tool_use blocks in this response.
@@ -758,8 +764,7 @@ async def run_qa_turn(
     """
     if EMIT_FINAL_ANSWER_TOOL not in allowed_tools:
         raise WorkflowRuntimeError(
-            f"allowed_tools must include the terminator "
-            f"{EMIT_FINAL_ANSWER_TOOL!r}"
+            f"allowed_tools must include the terminator {EMIT_FINAL_ANSWER_TOOL!r}"
         )
 
     # Clamp to at least 1 — mirrors WorkflowAgent.__init__'s
@@ -924,7 +929,11 @@ async def run_qa_turn(
                     # actually happened. See PR #216 review thread.
                     if isinstance(result, dict) and "error" in result:
                         ok = False
-                        err = str(result.get("error_kind") or result.get("error") or "tool error")
+                        err = str(
+                            result.get("error_kind")
+                            or result.get("error")
+                            or "tool error"
+                        )
 
                 tc = ToolCall(
                     name=name,
@@ -976,9 +985,7 @@ async def run_qa_turn(
     )
 
 
-async def _dispatch_on_step(
-    cb: Callable[[ToolCall], Any], tc: ToolCall
-) -> None:
+async def _dispatch_on_step(cb: Callable[[ToolCall], Any], tc: ToolCall) -> None:
     """Dispatch the on_step callback, awaiting it if it returns a coroutine.
 
     Renamed from ``_safe_on_step`` after review: the "safe" suffix

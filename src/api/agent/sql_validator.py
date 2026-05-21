@@ -38,47 +38,60 @@ logger = logging.getLogger(__name__)
 # ── Allow / deny lists ────────────────────────────────────────────────────
 
 # All names case-insensitive — Postgres folds unquoted identifiers to lower.
-AGENT_VIEWS_FUNCTIONS_TS: frozenset[str] = frozenset({
-    "sessions",
-    "optimization_runs",
-    "alerts",
-    "prices_hourly",
-    "building_load_hourly",
-    "connector_status_latest",
-})
+AGENT_VIEWS_FUNCTIONS_TS: frozenset[str] = frozenset(
+    {
+        "sessions",
+        "optimization_runs",
+        "alerts",
+        "prices_hourly",
+        "building_load_hourly",
+        "connector_status_latest",
+    }
+)
 
-AGENT_VIEWS_FUNCTIONS_STATIC: frozenset[str] = frozenset({
-    "depots",
-    "vehicles",
-    "chargers",
-    "drivers",
-    "schedules_recent",
-})
+AGENT_VIEWS_FUNCTIONS_STATIC: frozenset[str] = frozenset(
+    {
+        "depots",
+        "vehicles",
+        "chargers",
+        "drivers",
+        "schedules_recent",
+    }
+)
 
 # Functions that REQUIRE a time predicate in the user's WHERE. These are
 # the hypertable-backed ones; without a bounded scan the query can chew
 # through a year of telemetry rolling-up before LIMIT applies. The
 # validator looks for ANY comparison referencing one of these columns:
-HYPERTABLE_FUNCTIONS: frozenset[str] = frozenset({
-    "prices_hourly",
-    "building_load_hourly",
-})
-HYPERTABLE_TIME_COLUMNS: frozenset[str] = frozenset({
-    "hour", "start_time", "end_time", "time",
-})
+HYPERTABLE_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "prices_hourly",
+        "building_load_hourly",
+    }
+)
+HYPERTABLE_TIME_COLUMNS: frozenset[str] = frozenset(
+    {
+        "hour",
+        "start_time",
+        "end_time",
+        "time",
+    }
+)
 
 # Forbidden schemas — anything resolving here is an instant reject.
-FORBIDDEN_SCHEMAS: frozenset[str] = frozenset({
-    "pg_catalog",
-    "pg_temp",
-    "pg_toast",
-    "information_schema",
-    "auth",        # Supabase auth schema
-    "storage",     # Supabase storage schema
-    "vault",       # Supabase vault schema
-    "supabase_functions",
-    "supabase_migrations",
-})
+FORBIDDEN_SCHEMAS: frozenset[str] = frozenset(
+    {
+        "pg_catalog",
+        "pg_temp",
+        "pg_toast",
+        "information_schema",
+        "auth",  # Supabase auth schema
+        "storage",  # Supabase storage schema
+        "vault",  # Supabase vault schema
+        "supabase_functions",
+        "supabase_migrations",
+    }
+)
 
 # Functions that must never be callable from agent SQL, even outside a
 # FROM clause. Each is either a known data-exfiltration vector, a
@@ -89,21 +102,36 @@ TYPED_FUNC_KEYS: dict[str, str] = {
     "currentversion": "version",
 }
 
-DANGEROUS_FUNCTIONS: frozenset[str] = frozenset({
-    "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file",
-    "lo_import", "lo_export",
-    "dblink", "dblink_exec", "dblink_connect", "dblink_disconnect",
-    "copy",
-    "current_setting", "set_config",
-    "pg_sleep", "pg_sleep_for", "pg_sleep_until",
-    "txid_current", "pg_current_xact_id",
-    "pg_terminate_backend", "pg_cancel_backend",
-    "pg_reload_conf",
-    "version",
-    "pg_backend_pid",
-    "pg_export_snapshot",
-    "pg_advisory_lock", "pg_advisory_xact_lock",
-})
+DANGEROUS_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+        "pg_stat_file",
+        "lo_import",
+        "lo_export",
+        "dblink",
+        "dblink_exec",
+        "dblink_connect",
+        "dblink_disconnect",
+        "copy",
+        "current_setting",
+        "set_config",
+        "pg_sleep",
+        "pg_sleep_for",
+        "pg_sleep_until",
+        "txid_current",
+        "pg_current_xact_id",
+        "pg_terminate_backend",
+        "pg_cancel_backend",
+        "pg_reload_conf",
+        "version",
+        "pg_backend_pid",
+        "pg_export_snapshot",
+        "pg_advisory_lock",
+        "pg_advisory_xact_lock",
+    }
+)
 
 # Positive allowlist of UNQUALIFIED function names that may appear in
 # LLM-emitted SQL outside the table-function FROM slot. The intent:
@@ -132,61 +160,63 @@ DANGEROUS_FUNCTIONS: frozenset[str] = frozenset({
 # rejection surfaces as `function_not_allowed` and an operator can
 # extend the set. NEVER add `pg_*` here — that whole namespace is
 # rejected wholesale by the `_unqualified pg_* call` check below.
-ALLOWED_ANONYMOUS_FUNCTIONS: frozenset[str] = frozenset({
-    # TimescaleDB time-series helpers
-    "time_bucket",
-    "time_bucket_gapfill",
-    "locf",
-    "interpolate",
-    "first",
-    "last",
-    # JSON helpers sqlglot sometimes leaves as Anonymous
-    "jsonb_object_keys",
-    "jsonb_each",
-    "jsonb_each_text",
-    "jsonb_array_elements",
-    "jsonb_array_elements_text",
-    # Set-returning helpers commonly needed for time-range generation
-    "generate_series",
-    # Conditional / coalesce-like
-    "greatest",
-    "least",
-    "nullif",
-    "coalesce",
-    # Common numeric
-    "abs",
-    "sign",
-    "mod",
-    "round",
-    "ceil",
-    "ceiling",
-    "floor",
-    "trunc",
-    # Common string utilities (most are typed, but some dialect-specific
-    # ones land as Anonymous in older sqlglot builds)
-    "length",
-    "char_length",
-    "lower",
-    "upper",
-    "initcap",
-    "trim",
-    "btrim",
-    "ltrim",
-    "rtrim",
-    "replace",
-    "regexp_replace",
-    "substring",
-    "substr",
-    "left",
-    "right",
-    "concat",
-    "concat_ws",
-    "format",
-    "to_char",
-    "to_number",
-    "to_date",
-    "to_timestamp",
-})
+ALLOWED_ANONYMOUS_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        # TimescaleDB time-series helpers
+        "time_bucket",
+        "time_bucket_gapfill",
+        "locf",
+        "interpolate",
+        "first",
+        "last",
+        # JSON helpers sqlglot sometimes leaves as Anonymous
+        "jsonb_object_keys",
+        "jsonb_each",
+        "jsonb_each_text",
+        "jsonb_array_elements",
+        "jsonb_array_elements_text",
+        # Set-returning helpers commonly needed for time-range generation
+        "generate_series",
+        # Conditional / coalesce-like
+        "greatest",
+        "least",
+        "nullif",
+        "coalesce",
+        # Common numeric
+        "abs",
+        "sign",
+        "mod",
+        "round",
+        "ceil",
+        "ceiling",
+        "floor",
+        "trunc",
+        # Common string utilities (most are typed, but some dialect-specific
+        # ones land as Anonymous in older sqlglot builds)
+        "length",
+        "char_length",
+        "lower",
+        "upper",
+        "initcap",
+        "trim",
+        "btrim",
+        "ltrim",
+        "rtrim",
+        "replace",
+        "regexp_replace",
+        "substring",
+        "substr",
+        "left",
+        "right",
+        "concat",
+        "concat_ws",
+        "format",
+        "to_char",
+        "to_number",
+        "to_date",
+        "to_timestamp",
+    }
+)
 
 DEFAULT_ROW_LIMIT = 500
 MAX_ROW_LIMIT = 500  # absolute ceiling — user-supplied LIMIT is capped to this
@@ -281,9 +311,20 @@ def validate_sql(
     # retry from, instead of burning a SQL-agent iteration on a runtime
     # error (P2 codex).
     for node in tree.walk():
-        if isinstance(node, (exp.Delete, exp.Insert, exp.Update, exp.Merge,
-                             exp.Drop, exp.Create, exp.Alter,
-                             exp.TruncateTable, exp.Command)):
+        if isinstance(
+            node,
+            (
+                exp.Delete,
+                exp.Insert,
+                exp.Update,
+                exp.Merge,
+                exp.Drop,
+                exp.Create,
+                exp.Alter,
+                exp.TruncateTable,
+                exp.Command,
+            ),
+        ):
             return _reject(
                 "non_select",
                 f"DML/DDL not allowed (found {type(node).__name__}).",
@@ -360,9 +401,11 @@ def validate_sql(
                 f"got {len(args)}.",
             )
         arg = args[0]
-        if not (isinstance(arg, exp.Parameter)
-                and isinstance(arg.this, exp.Literal)
-                and str(arg.this.name) == "1"):
+        if not (
+            isinstance(arg, exp.Parameter)
+            and isinstance(arg.this, exp.Literal)
+            and str(arg.this.name) == "1"
+        ):
             return _reject(
                 "bad_function_argument",
                 f"agent_views.{fn_name} argument must be the placeholder $1, "
@@ -492,7 +535,9 @@ def validate_sql(
         parent = node.parent
         if isinstance(parent, exp.Table):
             continue
-        fn_name = TYPED_FUNC_KEYS.get((node.key or "").lower(), (node.key or "").lower())
+        fn_name = TYPED_FUNC_KEYS.get(
+            (node.key or "").lower(), (node.key or "").lower()
+        )
         if fn_name in DANGEROUS_FUNCTIONS:
             return _reject(
                 "dangerous_fn",
@@ -583,9 +628,7 @@ def validate_sql(
 def _is_zero_literal(expr: exp.Expression | None) -> bool:
     """True iff ``expr`` is the integer literal 0 (used for OFFSET 0)."""
     return (
-        isinstance(expr, exp.Literal)
-        and not expr.is_string
-        and str(expr.name) == "0"
+        isinstance(expr, exp.Literal) and not expr.is_string and str(expr.name) == "0"
     )
 
 
@@ -609,8 +652,7 @@ def _apply_row_limit_on_node(
         return None
     return _reject(
         "non_literal_limit",
-        "LIMIT must be a non-negative integer literal "
-        f"(≤ {row_limit}).",
+        f"LIMIT must be a non-negative integer literal (≤ {row_limit}).",
     )
 
 
@@ -874,7 +916,10 @@ def _side_is_order_preserving(node: exp.Expression, time_col_name: str) -> bool:
             trunc_types = trunc_types + (getattr(exp, cls_name),)
     if trunc_types and isinstance(node, trunc_types):
         inner = node.args.get("this")
-        if isinstance(inner, exp.Column) and (inner.name or "").lower() == time_col_name:
+        if (
+            isinstance(inner, exp.Column)
+            and (inner.name or "").lower() == time_col_name
+        ):
             return True
         return False
     # time_bucket() typically parses as Anonymous with the column as last arg
@@ -959,18 +1004,16 @@ def _predicate_allows_unbounded_time(
         left, right = node.this, node.expression
         if left is None or right is None:
             return True
-        return (
-            _predicate_allows_unbounded_time(left, target_alias, all_aliases)
-            and _predicate_allows_unbounded_time(right, target_alias, all_aliases)
-        )
+        return _predicate_allows_unbounded_time(
+            left, target_alias, all_aliases
+        ) and _predicate_allows_unbounded_time(right, target_alias, all_aliases)
     if isinstance(node, exp.Or):
         left, right = node.this, node.expression
         if left is None or right is None:
             return True
-        return (
-            _predicate_allows_unbounded_time(left, target_alias, all_aliases)
-            or _predicate_allows_unbounded_time(right, target_alias, all_aliases)
-        )
+        return _predicate_allows_unbounded_time(
+            left, target_alias, all_aliases
+        ) or _predicate_allows_unbounded_time(right, target_alias, all_aliases)
     if isinstance(node, exp.Not):
         inner = node.this
         if inner is None:

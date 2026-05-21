@@ -199,7 +199,13 @@ class AgentReply(BaseModel):
             "in your depots. Double-check the spelling, or try the person's "
             "employee ID or a vehicle's license plate."
         )
-        return cls(run_id=run_id, status="not_found", text=text, intent=intent, not_found=labels)
+        return cls(
+            run_id=run_id,
+            status="not_found",
+            text=text,
+            intent=intent,
+            not_found=labels,
+        )
 
     @classmethod
     def error(cls, *, run_id: UUID, message: Optional[str] = None) -> "AgentReply":
@@ -274,7 +280,8 @@ async def _emit_answer_safe(
         logger.exception(
             "Failed to emit SSE answer for run %s; agent_runs row "
             "already closed with status %r — leaving it as-is.",
-            run_id, reply.status,
+            run_id,
+            reply.status,
         )
 
 
@@ -316,9 +323,7 @@ async def run_turn(
 
     try:
         # 0. Planner — pick consumption fast path, sql_general, or refuse.
-        decision = planner_classify(
-            message, organization_id=auth.organization_id
-        )
+        decision = planner_classify(message, organization_id=auth.organization_id)
         await agent_runs_step(
             ts_pool,
             run_id,
@@ -328,9 +333,7 @@ async def run_turn(
         await _emit_step("planner_decision", f"{decision.route} ({decision.reason})")
 
         if decision.route == "refuse":
-            reply_text = (
-                "Please enter a question about depot charging or analytics."
-            )
+            reply_text = "Please enter a question about depot charging or analytics."
             reply = AgentReply(
                 run_id=run_id,
                 status="not_found",
@@ -372,7 +375,9 @@ async def run_turn(
         if ambiguous:
             for _entity in ambiguous:
                 AGENT_RESOLVER_MISSES.labels(kind="ambiguous").inc()
-            reply = AgentReply.disambiguation(run_id=run_id, intent=plan.intent, ambiguous=ambiguous)
+            reply = AgentReply.disambiguation(
+                run_id=run_id, intent=plan.intent, ambiguous=ambiguous
+            )
             await agent_runs_close(ts_pool, run_id, "disambiguation", reply)
             await _emit_answer_safe(sse, reply, run_id)
             return reply
@@ -382,7 +387,9 @@ async def run_turn(
         if missing:
             for _entity in missing:
                 AGENT_RESOLVER_MISSES.labels(kind="not_found").inc()
-            reply = AgentReply.not_found_reply(run_id=run_id, intent=plan.intent, missing=missing)
+            reply = AgentReply.not_found_reply(
+                run_id=run_id, intent=plan.intent, missing=missing
+            )
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
             await _emit_answer_safe(sse, reply, run_id)
             return reply
