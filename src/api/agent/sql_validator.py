@@ -69,14 +69,7 @@ HYPERTABLE_FUNCTIONS: frozenset[str] = frozenset(
         "building_load_hourly",
     }
 )
-HYPERTABLE_TIME_COLUMNS: frozenset[str] = frozenset(
-    {
-        "hour",
-        "start_time",
-        "end_time",
-        "time",
-    }
-)
+HYPERTABLE_TIME_COLUMNS: frozenset[str] = frozenset({"hour"})
 
 # Forbidden schemas — anything resolving here is an instant reject.
 FORBIDDEN_SCHEMAS: frozenset[str] = frozenset(

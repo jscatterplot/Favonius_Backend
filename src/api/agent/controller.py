@@ -599,7 +599,6 @@ async def _run_sql_general_turn(
         # before any tool dispatch in this turn) — falls through with
         # an empty list.
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
-        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
         # Bugbot M-sev: wrap the audit mirror in try/except. If the DB
         # write raises (append-only trigger rejection, asyncpg conn
         # error, etc.), the unhandled exception would mask the original
