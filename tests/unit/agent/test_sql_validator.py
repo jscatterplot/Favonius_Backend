@@ -436,8 +436,10 @@ class TestLimitHandling:
         assert " LIMIT 10" in r.sql.upper()
 
     def test_non_literal_limit_rejected(self):
+        # LIMIT must be a numeric literal. Use a column-ref form to dodge
+        # the bad_placeholder rule (which now also rejects extra $1).
         _rej(
-            "SELECT * FROM agent_views.sessions($1) LIMIT $1",
+            "SELECT * FROM agent_views.sessions($1) LIMIT depot_id",
             kind="non_literal_limit",
         )
 
@@ -483,7 +485,13 @@ class TestCanonicalOutput:
 
 
 class TestBindPlaceholderEnforcement:
-    """Only $1 is bound by the executor; any $N for N != 1 must reject."""
+    """Only $1 is bound by the executor; any $N for N != 1 must reject.
+
+    Additionally, extra `$1` placeholders OUTSIDE the function-arg slot
+    are rejected — the executor binds $1 as ``uuid[]`` for depot scope,
+    so reusing it in a predicate (``WHERE depot_id = $1``) causes a
+    parameter-type mismatch at execute time.
+    """
 
     def test_dollar_two_in_where_rejected(self):
         _rej(
@@ -495,6 +503,20 @@ class TestBindPlaceholderEnforcement:
         _rej(
             "SELECT * FROM agent_views.sessions($1) "
             "WHERE start_time >= $3::timestamptz",
+            kind="bad_placeholder",
+        )
+
+    def test_extra_dollar_one_in_where_rejected(self):
+        # $1 reused in a predicate — the bind is uuid[] depot scope; the
+        # LLM expected a scalar uuid. Reject at validate time.
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) WHERE depot_id = $1",
+            kind="bad_placeholder",
+        )
+
+    def test_extra_dollar_one_in_select_list_rejected(self):
+        _rej(
+            "SELECT $1, depot_id FROM agent_views.sessions($1)",
             kind="bad_placeholder",
         )
 

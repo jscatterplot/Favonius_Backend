@@ -87,6 +87,12 @@ class WorkflowRuntimeError(RuntimeError):
 class ToolNotAllowedError(WorkflowRuntimeError):
     """The LLM tried to dispatch a tool outside the workflow's allow-list.
 
+    Carries the partial ``tool_calls`` trace as ``self.tool_calls`` so
+    the controller can mirror any executed SQL to the admin audit feed
+    BEFORE returning the error reply — without this, a policy violation
+    that lands AFTER a successful ``run_select_*`` would drop the
+    audit trail for the part that did execute (P2 codex finding).
+
     This is a policy violation, not a programming error. It happens if
     the upstream service hands the runtime a workflow whose
     ``allowed_tools`` does not match the tools array the LLM was given —
@@ -94,6 +100,13 @@ class ToolNotAllowedError(WorkflowRuntimeError):
     and the metric carries ``status='tool_not_allowed'``; the exception
     propagates to the caller.
     """
+
+    def __init__(self, *args: Any, tool_calls: "Optional[list[ToolCall]]" = None) -> None:
+        super().__init__(*args)
+        # Partial trace up to the disallowed call. Empty list (not None)
+        # when no tool dispatch had completed yet, so callers don't need
+        # a None-check before iterating.
+        self.tool_calls: list[ToolCall] = list(tool_calls or [])
 
 
 class AnthropicClient(Protocol):
@@ -862,7 +875,8 @@ async def run_qa_turn(
             if name not in allowed_tools:
                 status = "tool_not_allowed"
                 raise ToolNotAllowedError(
-                    f"SQL agent attempted to call disallowed tool {name!r}"
+                    f"SQL agent attempted to call disallowed tool {name!r}",
+                    tool_calls=tool_calls,
                 )
 
             try:
@@ -933,13 +947,20 @@ async def run_qa_turn(
 async def _safe_on_step(
     cb: Callable[[ToolCall], Any], tc: ToolCall
 ) -> None:
-    """Run the on_step callback; swallow its errors to protect the loop."""
-    try:
-        result = cb(tc)
-        if hasattr(result, "__await__"):
-            await result
-    except Exception:  # noqa: BLE001
-        logger.exception("on_step callback raised; continuing")
+    """Run the on_step callback, awaiting it if it returns a coroutine.
+
+    Exceptions PROPAGATE. The SQL controller's on_step persists each
+    tool call to ``agent_runs.steps_json`` and emits step events; if
+    either side effect fails (DB write error, trigger rejection, SSE
+    failure), continuing as if logging succeeded would silently violate
+    the append-only audit trace guarantee. The runtime lets the
+    exception bubble up — the caller's outer except handler will close
+    the run with ``status='error'`` so the audit trail still reflects
+    that something went wrong, even if the per-step row is incomplete.
+    """
+    result = cb(tc)
+    if hasattr(result, "__await__"):
+        await result
 
 
 __all__ = [

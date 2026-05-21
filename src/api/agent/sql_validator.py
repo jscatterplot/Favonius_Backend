@@ -202,6 +202,7 @@ def validate_sql(
 
     # 4. Schema allowlist + table-function allowlist.
     functions_used: list[str] = []
+    allowed_placeholder_ids: set[int] = set()
     for node in tree.find_all(exp.Table):
         # The Table node represents either a plain table (e.g. public.x)
         # or a table-function call (e.g. agent_views.sessions($1)).
@@ -263,6 +264,10 @@ def validate_sql(
                 f"got {arg.sql(dialect='postgres')!r}. The server binds the "
                 f"caller's visible depots — never write a literal UUID list.",
             )
+        # Record the legitimate $1 by identity so the broader Parameter
+        # walk below can distinguish "the function arg slot" from "a
+        # stray $1 elsewhere in the query".
+        allowed_placeholder_ids.add(id(arg))
 
         functions_used.append(fn_name)
 
@@ -274,12 +279,23 @@ def validate_sql(
             f"{', '.join(sorted(allowed_functions))}.",
         )
 
-    # 4b. Reject any bind placeholder other than $1. The executor binds
-    # exactly one argument (the caller's visible_depot_ids); any $N where
-    # N != 1 — or even an extra $1 outside the agent_views.<fn>($1) call
-    # — would fail at execution with a parameter-count/type error, wasting
-    # a loop iteration that should have been blocked earlier.
+    # 4b. Reject any bind placeholder other than the single legitimate $1
+    # used inside an agent_views.<fn>($1) call slot.
+    #
+    # The executor binds exactly one argument (the caller's
+    # visible_depot_ids of type `uuid[]`). Two failure modes both end in
+    # runtime parameter errors that waste loop iterations:
+    #
+    #   * `... WHERE foo = $2` — wrong index, no second bind value
+    #   * `... WHERE depot_id = $1` (reusing $1 in a predicate) — the
+    #     bind type is uuid[] but the LLM expected uuid, and even when
+    #     the operator coerces the row leaks across tenants
+    #
+    # Both are rejected here so the LLM gets a tool_result(is_error=True)
+    # at validate time instead of an asyncpg error at execute time.
     for param in tree.find_all(exp.Parameter):
+        if id(param) in allowed_placeholder_ids:
+            continue
         if not (isinstance(param.this, exp.Literal) and str(param.this.name) == "1"):
             return _reject(
                 "bad_placeholder",
@@ -287,6 +303,14 @@ def validate_sql(
                 f"depot list); got {param.sql(dialect='postgres')!r}. Use a "
                 f"literal value or move the predicate into agent_views.<fn>($1).",
             )
+        return _reject(
+            "bad_placeholder",
+            f"Extra $1 placeholder at {param.sql(dialect='postgres')!r}: "
+            f"$1 is only valid as the first (and only) argument to "
+            f"agent_views.<fn>($1). The server binds it to a uuid[] depot "
+            f"list; reusing it elsewhere causes a parameter-type mismatch "
+            f"at execute time.",
+        )
 
     # 5. Schema-qualified function calls (Dot wrapping Anonymous) — reject
     # any prefix in FORBIDDEN_SCHEMAS. The Table-node check at step 4

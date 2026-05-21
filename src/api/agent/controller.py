@@ -534,6 +534,43 @@ async def _run_sql_general_turn(
         )
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
         logger.error("SQL agent tool error: %s", exc)
+        # Codex P2: if a disallowed tool aborted the loop AFTER one or
+        # more SQL tools had already executed, we still owe those rows
+        # an entry in the admin audit feed — otherwise the audit gap
+        # lands exactly on policy-violation turns where the trail
+        # matters most. ToolNotAllowedError carries the partial trace
+        # as `exc.tool_calls`; ToolNotRegisteredError doesn't (it raises
+        # before any tool dispatch in this turn) — falls through with
+        # an empty list.
+        partial_calls = list(getattr(exc, "tool_calls", []) or [])
+        sql_attempts = 0
+        server_row_total = 0
+        for tc in partial_calls:
+            if tc.name not in ("run_select_ts", "run_select_static"):
+                continue
+            sql_attempts += 1
+            if not tc.ok:
+                continue
+            result = tc.result if isinstance(tc.result, dict) else {}
+            try:
+                server_row_total += int(result.get("row_count", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        if sql_attempts > 0:
+            await agent_runs_step(
+                ts_pool,
+                run_id,
+                "sql_loop_aborted",
+                {
+                    "tool_call_count": len(partial_calls),
+                    "sql_attempts": sql_attempts,
+                    "server_row_total": server_row_total,
+                    "abort_reason": type(exc).__name__,
+                },
+            )
+            await write_agent_query_audit(
+                ts_pool, auth, run_id, "sql_general", server_row_total
+            )
         reply = AgentReply.error(run_id=run_id)
         await agent_runs_close(ts_pool, run_id, "error", reply)
         await _emit_answer_safe(sse, reply, run_id)

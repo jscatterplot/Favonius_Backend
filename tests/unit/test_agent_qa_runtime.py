@@ -253,6 +253,50 @@ async def test_tool_not_allowed_raises():
 
 
 @pytest.mark.asyncio
+async def test_tool_not_allowed_preserves_partial_trace():
+    """Codex P2: when a disallowed tool aborts the loop mid-response,
+    successful prior tool calls in the SAME response (or earlier turns)
+    must be reachable on the exception so the caller can mirror them to
+    the admin audit feed. Without this, policy-violation turns lose
+    audit evidence for the calls that DID execute.
+    """
+    reg, _ = _registry()
+    async def _secret(**_):
+        return {"ok": True}
+    reg.register(
+        "secret_admin_tool",
+        description="x",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        fn=_secret,
+    )
+
+    # Response 1 dispatches an allowed run_select_ts successfully.
+    # Response 2 calls a disallowed secret tool → aborts the loop.
+    script = [
+        _FakeResponse([_tool_use("run_select_ts", "b1", {"sql": "SELECT 1"})]),
+        _FakeResponse([_tool_use("secret_admin_tool", "b2", {})]),
+    ]
+    client = _FakeClient(script)
+
+    with pytest.raises(ToolNotAllowedError) as ei:
+        await run_qa_turn(
+            anthropic_client=client,
+            model="claude-haiku-4-5",
+            system_prompt="sys",
+            user_message="q",
+            tool_registry=reg,
+            allowed_tools=_allowed_tools(),
+        )
+
+    # The successful run_select_ts call must still be on the exception
+    # so the controller can write it to the admin audit feed.
+    partial = list(getattr(ei.value, "tool_calls", []))
+    assert len(partial) == 1
+    assert partial[0].name == "run_select_ts"
+    assert partial[0].ok is True
+
+
+@pytest.mark.asyncio
 async def test_no_terminator_when_model_returns_text_only():
     reg, _ = _registry()
     script = [_FakeResponse(
