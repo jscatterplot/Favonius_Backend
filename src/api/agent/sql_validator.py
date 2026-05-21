@@ -820,7 +820,7 @@ def _predicate_allows_unbounded_time(node: exp.Expression) -> bool:
             return True
         if _is_unconditional_true(inner):
             return False
-        return False
+        return True
     if _is_unconditional_true(node):
         return True
     if _leaf_enforces_hypertable_time_bound(node):
