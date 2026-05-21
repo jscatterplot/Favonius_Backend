@@ -289,7 +289,6 @@ _OUR_ENERGY_SQL = """
                AND t.time >= $4::timestamptz - INTERVAL '15 minutes'
                AND t.time < $5::timestamptz
                AND t.charging_kw IS NOT NULL
-               AND t.charging_kw > 0
         )
         SELECT
             COALESCE(
