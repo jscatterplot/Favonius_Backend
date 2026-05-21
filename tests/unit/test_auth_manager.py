@@ -19,6 +19,17 @@ from src.websocket_handler.auth_manager import (
 from src.websocket_handler.config import SupabaseConfig
 
 
+# WS_AUTH_JWT_SIGNING_KEY is required by AuthManager.__init__ since the
+# service-key fallback was removed. Set a deterministic test value for every
+# test in this module so the construct-and-verify pattern keeps working.
+_TEST_WS_JWT_KEY = "test-ws-jwt-signing-key-not-the-service-key"
+
+
+@pytest.fixture(autouse=True)
+def _set_ws_jwt_signing_key(monkeypatch):
+    monkeypatch.setenv("WS_AUTH_JWT_SIGNING_KEY", _TEST_WS_JWT_KEY)
+
+
 class TestAuthManager:
     """Test the AuthManager class."""
 
@@ -76,11 +87,30 @@ class TestAuthManager:
 
         assert manager.config == config
         assert manager.supabase_client == mock_supabase_client
-        assert manager.jwt_secret == config.service_key
+        assert manager.jwt_secret == _TEST_WS_JWT_KEY
+        # The service key must never be used as the JWT signing key — that
+        # was the regression this fixture defends against.
+        assert manager.jwt_secret != config.service_key
         assert manager.jwt_algorithm == "HS256"
         assert manager.token_expiry == timedelta(minutes=15)
         assert manager.user_cache == {}
         assert manager.cache_ttl == timedelta(minutes=5)
+
+    def test_constructor_raises_when_signing_key_unset(
+        self, config, mock_supabase_client, monkeypatch
+    ):
+        """Without WS_AUTH_JWT_SIGNING_KEY the handler must refuse to start."""
+        monkeypatch.delenv("WS_AUTH_JWT_SIGNING_KEY", raising=False)
+        with pytest.raises(RuntimeError, match="WS_AUTH_JWT_SIGNING_KEY is required"):
+            AuthManager(config, mock_supabase_client)
+
+    def test_constructor_raises_when_signing_key_empty(
+        self, config, mock_supabase_client, monkeypatch
+    ):
+        """Empty string is treated the same as unset."""
+        monkeypatch.setenv("WS_AUTH_JWT_SIGNING_KEY", "")
+        with pytest.raises(RuntimeError, match="WS_AUTH_JWT_SIGNING_KEY is required"):
+            AuthManager(config, mock_supabase_client)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
