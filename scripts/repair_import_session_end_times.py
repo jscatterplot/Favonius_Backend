@@ -27,8 +27,8 @@ Safety
 * **Dry-run is the default.** Pass ``--apply`` to commit.
 * Only rows with ``source = 'import'`` are touched — never live OCPP
   sessions.
-* Selection predicate is the same one the API now rejects up front:
-  ``end_time > now + 1 day`` OR ``end_time - start_time > 7 days``.
+* Selection predicate matches the API's new rejection bounds:
+  ``end_time > now + 1 hour`` OR ``end_time - start_time > 7 days``.
 * ``cost_total_source = 'manual'`` rows are excluded — operator-supplied
   costs are sacrosanct.
 * Wraps the UPDATE in a transaction; failure leaves no partial state.
@@ -80,11 +80,11 @@ _AUDIT_SQL = """
     SELECT
       COUNT(*) FILTER (WHERE end_time IS NOT NULL)                                                AS with_end,
       COUNT(*)                                                                                    AS total_import,
-      COUNT(*) FILTER (WHERE end_time > NOW() + INTERVAL '1 day')                                 AS ends_in_future,
+      COUNT(*) FILTER (WHERE end_time > NOW() + INTERVAL '1 hour')                                 AS ends_in_future,
       COUNT(*) FILTER (WHERE end_time - start_time > INTERVAL '7 days')                           AS span_over_7d,
       COUNT(*) FILTER (
           WHERE end_time IS NOT NULL
-            AND (end_time > NOW() + INTERVAL '1 day'
+            AND (end_time > NOW() + INTERVAL '1 hour'
                  OR end_time - start_time > INTERVAL '7 days')
             AND COALESCE(cost_total_source, '') <> 'manual'
             AND cost_total IS NOT NULL
@@ -103,7 +103,7 @@ _SAMPLE_SQL = """
      WHERE source = 'import'
        AND end_time IS NOT NULL
        AND ($1::uuid IS NULL OR site_id = $1::uuid)
-       AND (end_time > NOW() + INTERVAL '1 day'
+       AND (end_time > NOW() + INTERVAL '1 hour'
             OR end_time - start_time > INTERVAL '7 days')
      ORDER BY end_time DESC
      LIMIT 20
@@ -111,7 +111,7 @@ _SAMPLE_SQL = """
 
 # IMPORTANT: this query is the unit of repair. Pre-sanitisation matches the
 # resolver bounds in src/api/main.py (_resolve_import_end_time):
-#   end_time > now + 1 day  OR  end_time - start_time > 7 days
+#   end_time > now + 1 hour  OR  end_time - start_time > 7 days
 # 'manual' cost rows are excluded — those are operator-supplied numbers.
 _REPAIR_SQL = """
     UPDATE charging_sessions
@@ -122,7 +122,7 @@ _REPAIR_SQL = """
        AND end_time IS NOT NULL
        AND ($1::uuid IS NULL OR site_id = $1::uuid)
        AND COALESCE(cost_total_source, '') <> 'manual'
-       AND (end_time > NOW() + INTERVAL '1 day'
+       AND (end_time > NOW() + INTERVAL '1 hour'
             OR end_time - start_time > INTERVAL '7 days')
 """
 

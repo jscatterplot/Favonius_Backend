@@ -1492,6 +1492,31 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
         assert response.json()["error_code"] == "VALIDATION_ERROR"
 
+    def test_huge_duration_rejected_by_pydantic_not_overflow(
+        self, client, mock_db_pool
+    ):
+        """Capped at 7d so `timedelta(seconds=10**15)` can never overflow.
+
+        Without the upper bound this used to bubble up as a 500
+        OverflowError from inside `_resolve_import_end_time`.
+        """
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, _ = mock_db_pool
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json={**_row_payload(), "session_duration_seconds": 10**15},
+            )
+
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert response.json()["error_code"] == "VALIDATION_ERROR"
+
     def test_platform_import_hash_uses_raw_file_end_not_resolved(
         self, client, mock_db_pool
     ):

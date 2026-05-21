@@ -2188,7 +2188,10 @@ class HistoricalSessionImport(_CamelOrSnakeModel):
     # supplied the server prefers `start + duration` over a bad file end.
     # Accepts seconds (int) because the FE parses HH:MM:SS / decimal hours and
     # normalises to a non-negative integer count of seconds before posting.
-    session_duration_seconds: Optional[int] = Field(default=None, ge=0)
+    # Upper bound matches `_IMPORT_MAX_SESSION_SPAN` (7 days) so an out-of-range
+    # value yields a clean 400 VALIDATION_ERROR instead of a 500 from
+    # `timedelta(seconds=10**15)` overflowing inside the resolver.
+    session_duration_seconds: Optional[int] = Field(default=None, ge=0, le=7 * 24 * 3600)
     energy_delivered_kwh: float = Field(..., ge=0)
     revenue: float = Field(default=0.0, ge=0)
     rfid_label: Optional[str] = Field(default=None, max_length=255)
