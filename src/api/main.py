@@ -3966,6 +3966,19 @@ def _resolve_import_end_time(
         computed_end.isoformat(),
         start_time_utc.isoformat(),
     )
+    if not _is_sane(computed_end):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                "detail": (
+                    "session_duration_seconds yields an end_time outside the "
+                    "accepted bounds (must be on/after start, within 1 hour of "
+                    "now, and ≤ 7 days from start)"
+                ),
+                "field": "session_duration_seconds",
+            },
+        )
     return computed_end
 
 
