@@ -101,12 +101,18 @@ class ToolNotAllowedError(WorkflowRuntimeError):
     propagates to the caller.
     """
 
-    def __init__(self, *args: Any, tool_calls: "Optional[list[ToolCall]]" = None) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        tool_calls: "Optional[list[ToolCall]]" = None,
+        iterations: int = 0,
+    ) -> None:
         super().__init__(*args)
         # Partial trace up to the disallowed call. Empty list (not None)
         # when no tool dispatch had completed yet, so callers don't need
         # a None-check before iterating.
         self.tool_calls: list[ToolCall] = list(tool_calls or [])
+        self.iterations: int = max(0, int(iterations))
 
 
 class AnthropicClient(Protocol):
@@ -877,6 +883,7 @@ async def run_qa_turn(
                 raise ToolNotAllowedError(
                     f"SQL agent attempted to call disallowed tool {name!r}",
                     tool_calls=tool_calls,
+                    iterations=iterations,
                 )
 
             try:

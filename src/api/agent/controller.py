@@ -460,7 +460,7 @@ def _sql_functions_accessed(tool_calls: Any) -> list[str]:
             raw = tc.result.get("functions_used")
             if isinstance(raw, list):
                 names = [str(n) for n in raw]
-        if not names and tc.ok and isinstance(tc.arguments, dict):
+        if not names and isinstance(tc.arguments, dict):
             sql = tc.arguments.get("sql") or ""
             names = _AGENT_VIEWS_FN_RE.findall(str(sql))
         for fn in names:
@@ -544,7 +544,7 @@ async def _run_sql_general_turn(
         # before any tool dispatch in this turn) — falls through with
         # an empty list.
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
-        sql_tool_turns = len(partial_calls)
+        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
         sql_attempts = 0
         server_row_total = 0
         for tc in partial_calls:
