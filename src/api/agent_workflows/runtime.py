@@ -39,6 +39,7 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from src.api.agent.auth_context import AuthContext
+from src.api.agent.sql_tools import EMIT_FINAL_ANSWER_TOOL
 from src.api.agent_workflows.constraints import (
     ConstraintViolation,
     DepotConstraints,
@@ -691,12 +692,6 @@ class QAResult:
         self.iterations = iterations
 
 
-# Reserved terminator name for the SQL agent. The runtime closes the
-# Q&A loop when the LLM calls this. Defined here (not imported from
-# sql_tools) to keep this module dep-free of the agent SQL package.
-QA_TERMINATOR_TOOL_NAME: str = "emit_final_answer"
-
-
 async def run_qa_turn(
     *,
     anthropic_client: _ClientFacade,
@@ -727,7 +722,7 @@ async def run_qa_turn(
         tool_registry: Registry containing the SQL agent tools and the
             ``emit_final_answer`` terminator.
         allowed_tools: Tool names from ``tool_registry`` the LLM may
-            call. Must include :data:`QA_TERMINATOR_TOOL_NAME`.
+            call. Must include :data:`~src.api.agent.sql_tools.EMIT_FINAL_ANSWER_TOOL`.
         max_iterations: Hard cap on tool-use turns. Default 8.
         max_tokens, temperature: Anthropic Messages API parameters.
         on_step: Optional async callback invoked after each tool call
@@ -742,10 +737,10 @@ async def run_qa_turn(
             ``allowed_tools`` and not the terminator.
         ToolNotRegisteredError: a registered name has no callable.
     """
-    if QA_TERMINATOR_TOOL_NAME not in allowed_tools:
+    if EMIT_FINAL_ANSWER_TOOL not in allowed_tools:
         raise WorkflowRuntimeError(
             f"allowed_tools must include the terminator "
-            f"{QA_TERMINATOR_TOOL_NAME!r}"
+            f"{EMIT_FINAL_ANSWER_TOOL!r}"
         )
 
     tools = tool_registry.anthropic_schemas(list(allowed_tools))
@@ -801,7 +796,7 @@ async def run_qa_turn(
             block_id = getattr(block, "id", "") or ""
             block_input = dict(getattr(block, "input", {}) or {})
 
-            if name == QA_TERMINATOR_TOOL_NAME:
+            if name == EMIT_FINAL_ANSWER_TOOL:
                 try:
                     result = await tool_registry.dispatch(name, block_input)
                     ok = True
@@ -941,7 +936,7 @@ async def _safe_on_step(
 __all__ = [
     "DEFAULT_PERMISSION_TIER",
     "EMIT_DECISION_TOOL_NAME",
-    "QA_TERMINATOR_TOOL_NAME",
+    "EMIT_FINAL_ANSWER_TOOL",
     "QAResult",
     "ToolNotAllowedError",
     "WorkflowAgent",

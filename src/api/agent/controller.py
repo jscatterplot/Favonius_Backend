@@ -29,6 +29,7 @@ never leaked back to the client per the security review.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional, Protocol
 from uuid import UUID
 
@@ -38,6 +39,7 @@ from src.api.agent.audit import (
     agent_runs_close,
     agent_runs_open,
     agent_runs_step,
+    sql_audit_target_type,
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import (
@@ -431,6 +433,31 @@ async def run_turn(
 
 # ── SQL-mode (general analytics) sub-orchestrator ──────────────────────────
 
+_AGENT_VIEWS_FN_RE = re.compile(r"agent_views\.(\w+)", re.IGNORECASE)
+
+
+def _sql_functions_accessed(tool_calls: Any) -> list[str]:
+    """Collect agent_views function names from SQL-mode run_select tool calls."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for tc in tool_calls:
+        if tc.name not in ("run_select_ts", "run_select_static"):
+            continue
+        names: list[str] = []
+        if tc.ok and isinstance(tc.result, dict):
+            raw = tc.result.get("functions_used")
+            if isinstance(raw, list):
+                names = [str(n) for n in raw]
+        elif isinstance(tc.arguments, dict):
+            sql = tc.arguments.get("sql") or ""
+            names = _AGENT_VIEWS_FN_RE.findall(str(sql))
+        for fn in names:
+            key = fn.lower()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(key)
+    return ordered
+
 
 async def _run_sql_general_turn(
     *,
@@ -545,8 +572,15 @@ async def _run_sql_general_turn(
     # attempts still leave a trail via agent_runs.steps_json + the run_id
     # back-reference in the audit metadata.
     if sql_attempts > 0:
+        functions_accessed = _sql_functions_accessed(qa.tool_calls)
         await write_agent_query_audit(
-            ts_pool, auth, run_id, "sql_general", server_row_total
+            ts_pool,
+            auth,
+            run_id,
+            "sql_general",
+            server_row_total,
+            target_type=sql_audit_target_type(functions_accessed),
+            functions_accessed=functions_accessed or None,
         )
 
     if qa.status == "success" and qa.text:

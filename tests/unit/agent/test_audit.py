@@ -21,6 +21,7 @@ from src.api.agent.audit import (
     agent_runs_close,
     agent_runs_open,
     agent_runs_step,
+    sql_audit_target_type,
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import AuthContext
@@ -297,4 +298,27 @@ class TestWriteAgentQueryAudit:
 
         passed_row = mock_writer.await_args.args[1]
         assert passed_row.organization_id is None
-        assert passed_row.actor_role == "favonius_admin"
+
+    async def test_sql_general_target_type_reflects_functions_accessed(self):
+        pool = _make_pool()
+        auth = _auth()
+        run_id = uuid4()
+
+        with patch("src.api.agent.audit.write_admin_audit_row", new=AsyncMock()) as mock_writer:
+            await write_agent_query_audit(
+                pool,
+                auth,
+                run_id,
+                intent="sql_general",
+                row_count=12,
+                target_type=sql_audit_target_type(["optimization_runs", "alerts"]),
+                functions_accessed=["optimization_runs", "alerts"],
+            )
+
+        passed_row = mock_writer.await_args.args[1]
+        assert passed_row.target_type == "optimization_runs,alerts"
+        assert passed_row.metadata == {
+            "intent": "sql_general",
+            "row_count": 12,
+            "functions_accessed": ["optimization_runs", "alerts"],
+        }

@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from src.api.agent_workflows.runtime import (
-    QA_TERMINATOR_TOOL_NAME,
+    EMIT_FINAL_ANSWER_TOOL,
     QAResult,
     ToolNotAllowedError,
     run_qa_turn,
@@ -80,7 +80,7 @@ def _registry() -> tuple[ToolRegistry, list[tuple[str, dict]]]:
         return {"rows": [{"depot_id": "d1", "n": 42}], "row_count": 1}
 
     async def _terminator(*, text: str, row_evidence: int = 0, **_):
-        log.append((QA_TERMINATOR_TOOL_NAME, {"text": text, "row_evidence": row_evidence}))
+        log.append((EMIT_FINAL_ANSWER_TOOL, {"text": text, "row_evidence": row_evidence}))
         return {"text": text, "row_evidence": row_evidence}
 
     reg.register(
@@ -100,7 +100,7 @@ def _registry() -> tuple[ToolRegistry, list[tuple[str, dict]]]:
         fn=_run_select,
     )
     reg.register(
-        QA_TERMINATOR_TOOL_NAME,
+        EMIT_FINAL_ANSWER_TOOL,
         description="terminator",
         input_schema={
             "type": "object",
@@ -116,7 +116,7 @@ def _registry() -> tuple[ToolRegistry, list[tuple[str, dict]]]:
 
 
 def _allowed_tools() -> list[str]:
-    return ["list_tables", "run_select_ts", QA_TERMINATOR_TOOL_NAME]
+    return ["list_tables", "run_select_ts", EMIT_FINAL_ANSWER_TOOL]
 
 
 # ── Tests ────────────────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ async def test_happy_path_explorer_then_select_then_terminator():
         ]),
         _FakeResponse([
             _tool_use(
-                QA_TERMINATOR_TOOL_NAME,
+                EMIT_FINAL_ANSWER_TOOL,
                 "b3",
                 {"text": "There were 42 sessions.", "row_evidence": 1},
             )
@@ -162,13 +162,13 @@ async def test_happy_path_explorer_then_select_then_terminator():
     assert [tc.name for tc in result.tool_calls] == [
         "list_tables",
         "run_select_ts",
-        QA_TERMINATOR_TOOL_NAME,
+        EMIT_FINAL_ANSWER_TOOL,
     ]
-    assert step_log == ["list_tables", "run_select_ts", QA_TERMINATOR_TOOL_NAME]
+    assert step_log == ["list_tables", "run_select_ts", EMIT_FINAL_ANSWER_TOOL]
     assert [name for name, _ in log] == [
         "list_tables",
         "run_select_ts",
-        QA_TERMINATOR_TOOL_NAME,
+        EMIT_FINAL_ANSWER_TOOL,
     ]
 
 
@@ -284,7 +284,7 @@ async def test_error_envelope_return_marks_tool_call_as_failure():
         fn=_envelope_failer,
     )
     reg.register(
-        QA_TERMINATOR_TOOL_NAME,
+        EMIT_FINAL_ANSWER_TOOL,
         description="terminator",
         input_schema={
             "type": "object",
@@ -298,7 +298,7 @@ async def test_error_envelope_return_marks_tool_call_as_failure():
         _FakeResponse([_tool_use("run_select_ts", "b1", {"sql": "SELECT * FROM public.x"})]),
         _FakeResponse([
             _tool_use(
-                QA_TERMINATOR_TOOL_NAME, "b2",
+                EMIT_FINAL_ANSWER_TOOL, "b2",
                 {"text": "I cannot answer because the validator rejected my SQL."}
             )
         ]),
@@ -311,7 +311,7 @@ async def test_error_envelope_return_marks_tool_call_as_failure():
         system_prompt="sys",
         user_message="q",
         tool_registry=reg,
-        allowed_tools=["run_select_ts", QA_TERMINATOR_TOOL_NAME],
+        allowed_tools=["run_select_ts", EMIT_FINAL_ANSWER_TOOL],
     )
 
     failed = next(tc for tc in result.tool_calls if tc.name == "run_select_ts")
@@ -339,7 +339,7 @@ async def test_tool_dispatch_error_is_returned_to_model():
         fn=_broken_tool,
     )
     reg.register(
-        QA_TERMINATOR_TOOL_NAME,
+        EMIT_FINAL_ANSWER_TOOL,
         description="",
         input_schema={
             "type": "object",
@@ -353,7 +353,7 @@ async def test_tool_dispatch_error_is_returned_to_model():
         _FakeResponse([_tool_use("list_tables", "b1", {})]),
         _FakeResponse([
             _tool_use(
-                QA_TERMINATOR_TOOL_NAME, "b2",
+                EMIT_FINAL_ANSWER_TOOL, "b2",
                 {"text": "tool failed, here is what I can say"}
             )
         ]),
@@ -366,7 +366,7 @@ async def test_tool_dispatch_error_is_returned_to_model():
         system_prompt="sys",
         user_message="q",
         tool_registry=reg,
-        allowed_tools=["list_tables", QA_TERMINATOR_TOOL_NAME],
+        allowed_tools=["list_tables", EMIT_FINAL_ANSWER_TOOL],
     )
 
     assert result.status == "success"
