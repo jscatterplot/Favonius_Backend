@@ -29,7 +29,11 @@ class TestMetricsAuth:
         with patch("src.api.main._METRICS_TOKEN", ""):
             response = _client().get("/metrics")
         assert response.status_code == 503
-        assert response.json()["error_code"] == "SERVICE_UNAVAILABLE"
+        payload = response.json()
+        assert payload["error_code"] == "SERVICE_UNAVAILABLE"
+        # Regression guard: secret-bearing details must never leak through
+        # 5xx responses, even when the underlying exception mentions the env var.
+        assert "METRICS_TOKEN" not in payload.get("detail", "")
 
     def test_401_when_authorization_missing(self):
         with patch("src.api.main._METRICS_TOKEN", "test-token"):
