@@ -122,6 +122,7 @@ db_pools: Optional[DatabasePools] = None
 controller_manager: Optional[ControllerManager] = None
 ocpp_server: Optional[object] = None  # OCPPServer type
 liveness_hub: Optional[Any] = None  # api.liveness_hub.LivenessHub
+solver_pool: Optional[Any] = None  # core.optimizer.pool.SolverPool
 
 # Depot config cache (to reduce database queries)
 _depot_config_cache: dict[str, tuple[DepotConfig, float]] = {}  # depot_id -> (config, timestamp)
@@ -259,7 +260,7 @@ async def _heartbeat_loop(ts_pool: asyncpg.Pool) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global db_pools, controller_manager, ocpp_server
+    global db_pools, controller_manager, ocpp_server, solver_pool
 
     # ── Database pools ────────────────────────────────────────────────────────
     # Supabase (static/reference data): DATABASE_URL required.
@@ -363,6 +364,46 @@ async def lifespan(app: FastAPI):
             logger.error(f"Failed to start OCPP server: {e}", exc_info=True)
             ocpp_server = None
 
+    # ── Solver process pool ──────────────────────────────────────────────────
+    # MILP solves are CPU-bound and would block the asyncio loop (60 s freeze
+    # of /health, OCPP traffic, scrapes) if run in-process. Dispatch each
+    # solve to a child process. On failure we fall back to running solves in
+    # a thread, which is correct but blocks the loop — log CRITICAL so it's
+    # not silent.
+    from ..core.optimizer.pool import SolverPool, set_solver_pool
+
+    if os.getenv("SOLVER_PROCESS_POOL_DISABLED", "false").lower() == "true":
+        set_solver_pool(None)
+        logger.warning(
+            "SolverPool disabled by env; MILP solves will run in a thread "
+            "inside the API process (loop unblock OK, no OOM isolation)."
+        )
+        solver_pool = None
+    else:
+        try:
+            solver_pool_size = int(os.getenv("SOLVER_PROCESS_POOL_SIZE", "2"))
+            worker_as_limit_mb = int(os.getenv("SOLVER_WORKER_AS_LIMIT_MB", "1500"))
+            solver_pool = SolverPool(
+                max_workers=solver_pool_size,
+                worker_as_limit_bytes=worker_as_limit_mb * 1024 * 1024,
+            )
+            await solver_pool.start()
+            set_solver_pool(solver_pool)
+            logger.info(
+                "SolverPool started (workers=%d, AS limit=%d MiB)",
+                solver_pool_size,
+                worker_as_limit_mb,
+            )
+        except Exception as e:
+            set_solver_pool(None)
+            logger.critical(
+                "SolverPool failed to start: %s. Solves will run in a thread "
+                "in the API process and may block the event loop briefly.",
+                e,
+                exc_info=True,
+            )
+            solver_pool = None
+
     # ── Controller manager ────────────────────────────────────────────────────
     try:
         controller_manager = ControllerManager(
@@ -436,6 +477,14 @@ async def lifespan(app: FastAPI):
             logger.info("All controllers stopped")
         except Exception as e:
             logger.error(f"Error stopping controllers: {e}", exc_info=True)
+
+    if solver_pool is not None:
+        try:
+            set_solver_pool(None)
+            await solver_pool.stop()
+            logger.info("Solver pool stopped")
+        except Exception as e:
+            logger.error(f"Error stopping solver pool: {e}", exc_info=True)
 
     if ocpp_server:
         try:
