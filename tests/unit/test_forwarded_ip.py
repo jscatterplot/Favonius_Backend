@@ -170,6 +170,7 @@ class TestSpoofResistance:
 
     def test_spoofed_leading_entries_unreached(self):
         """Right-to-left walk stops at the first non-trusted entry — spoofs at left are ignored."""
+        proxies = (_net("100.64.0.0/10"),)
         headers = _Headers(
             {"X-Forwarded-For": "10.0.0.99, 93.184.216.34, 100.64.0.2"}
         )

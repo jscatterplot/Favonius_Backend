@@ -98,7 +98,6 @@ def _is_trusted_proxy_entry(
     # in VPN/on-prem deployments and must remain eligible as the resolved
     # origin IP. Implicit trust is retained only for legacy "no CIDRs"
     # deployments where the caller intentionally opts in.
-    if trust_implicit_private and _is_implicitly_trusted(ip):
     if trust_implicit_private and _is_implicitly_trusted_chain_hop(ip):
         return True
     return False
