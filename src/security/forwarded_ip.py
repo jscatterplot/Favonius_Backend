@@ -88,9 +88,20 @@ def _is_trusted_proxy_entry(
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
+    explicitly_trusted = any(
+        ip.version == net.version and ip in net for net in trusted_networks
+    )
+    if explicitly_trusted:
+        return True
+    # Do not blanket-trust private/loopback/link-local chain entries when
+    # explicit proxy CIDRs are configured: private-network clients are common
+    # in VPN/on-prem deployments and must remain eligible as the resolved
+    # origin IP. Implicit trust is retained only for legacy "no CIDRs"
+    # deployments where the caller intentionally opts in.
+    if trust_implicit_private and _is_implicitly_trusted(ip):
     if trust_implicit_private and _is_implicitly_trusted_chain_hop(ip):
         return True
-    return any(ip.version == net.version and ip in net for net in trusted_networks)
+    return False
 
 
 def _select_client_ip(

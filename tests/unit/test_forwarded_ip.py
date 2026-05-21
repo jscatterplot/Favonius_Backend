@@ -59,13 +59,9 @@ class TestImplicitPrivateTrust:
     deployments must declare their proxy CIDR via ``trusted_networks``.
     """
 
-    def test_skips_cgnat_proxy_returns_real_client(self):
-        """Railway shape: edge IP is 100.64.x.x; XFF holds the real client."""
+    def test_cgnat_is_implicitly_skipped(self):
         headers = _Headers({"X-Forwarded-For": "18.196.90.141, 100.64.0.2"})
-        assert (
-            extract_forwarded_ip(headers, trust_implicit_private=True)
-            == "18.196.90.141"
-        )
+        assert extract_forwarded_ip(headers, trust_implicit_private=True) == "18.196.90.141"
 
     def test_does_not_implicitly_skip_private(self):
         """Private clients (on-prem / VPN) are returned, not skipped as proxies."""
@@ -178,7 +174,11 @@ class TestSpoofResistance:
             {"X-Forwarded-For": "10.0.0.99, 93.184.216.34, 100.64.0.2"}
         )
         assert (
-            extract_forwarded_ip(headers, trust_implicit_private=True)
+            extract_forwarded_ip(
+                headers,
+                trusted_networks=proxies,
+                trust_implicit_private=True,
+            )
             == "93.184.216.34"
         )
 
