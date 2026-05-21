@@ -115,6 +115,33 @@ async def test_dispatch_writes_import_row_and_queue_row():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_token_in_url_matches_persisted_hash():
+    """Regression for Bugbot HIGH: dispatch used to mint the token
+    twice (once for the hash, once inside ``build_upload_url``). When
+    ``time.time()`` straddled a second boundary the two tokens
+    differed and uploads were rejected with 401. The token embedded
+    in the URL must hash to the value persisted in
+    ``upload_token_hash``.
+    """
+    import hashlib
+    from urllib.parse import parse_qs, urlparse
+
+    from src.adapters.ocpp.dispatch import dispatch_get_diagnostics
+
+    conn = _FakeConn()
+    pool = _FakePool(conn)
+
+    await dispatch_get_diagnostics(pool, station_id="OCPP-MATCH")
+
+    persisted_hash = conn.calls[0][2][6]  # upload_token_hash arg
+    payload = json.loads(conn.calls[1][2][2])
+    location = payload["location"]
+    token_in_url = parse_qs(urlparse(location).query)["token"][0]
+
+    assert hashlib.sha256(token_in_url.encode()).hexdigest() == persisted_hash
+
+
+@pytest.mark.asyncio
 async def test_dispatch_forwards_optional_ocpp_params():
     from src.adapters.ocpp.dispatch import dispatch_get_diagnostics
 

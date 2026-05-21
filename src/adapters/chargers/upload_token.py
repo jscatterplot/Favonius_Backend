@@ -146,8 +146,19 @@ def verify_token(token: str, *, now: Optional[float] = None) -> UploadToken:
     return UploadToken(import_id=import_id, expiry_unix=expiry, raw=token)
 
 
-def build_upload_url(import_id: UUID, *, base_url: Optional[str] = None) -> str:
+def build_upload_url(
+    import_id: UUID,
+    *,
+    base_url: Optional[str] = None,
+    token: Optional[str] = None,
+) -> str:
     """Build the ``location=`` value passed to ``GetDiagnostics``.
+
+    Pass ``token`` when the caller has already minted one (the dispatch
+    path needs the token bytes to also store
+    ``upload_token_hash`` — minting a fresh token here would be a
+    second :func:`time.time` sample and could land in a different
+    second, producing a hash mismatch and a 401 on upload).
 
     Returns ``""`` only when the base URL is unset — callers check
     this before enqueuing the OCPP command.
@@ -158,8 +169,8 @@ def build_upload_url(import_id: UUID, *, base_url: Optional[str] = None) -> str:
             "CHARGER_LOG_UPLOAD_BASE_URL is unset; cannot build a usable "
             "GetDiagnostics location URL."
         )
-    token = mint_token(import_id)
-    query = urlencode({"token": token, "import_id": str(import_id)})
+    token_value = token if token is not None else mint_token(import_id)
+    query = urlencode({"token": token_value, "import_id": str(import_id)})
     return f"{base}?{query}"
 
 

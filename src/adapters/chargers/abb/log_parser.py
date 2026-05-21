@@ -164,17 +164,26 @@ def _parse_csv_text(text: str) -> Iterator[ChargerLogEntry]:
         energy_kwh = _read_energy_kwh(row, headers)
         power_kw = _read_power_kw(row, headers)
         soc = _read_soc(row, headers)
+        # ``headers`` is keyed by ``_canon(header)`` (alphanumerics
+        # only), so the exclusion set must list canonical forms too —
+        # any underscored variant here would silently be dead code.
+        # Every alias the reader helpers below accept must appear in
+        # this set, or that column ends up both in the normalized
+        # field AND duplicated into raw_fields.
+        _KNOWN_CANON_KEYS = {
+            "timestamp", "time", "datetime",
+            "transactionid",
+            "connectorid",
+            "soc", "socpercent", "stateofcharge",
+            "energykwh", "energydeliveredkwh",
+            "energywh", "energyactiveimportregister",
+            "powerkw", "chargingkw",
+            "powerw", "poweractiveimport",
+        }
         raw = {
             row_key: row[row_key]
             for row_key in row
-            if row_key not in {headers.get(k) for k in {
-                "timestamp", "time", "datetime",
-                "transactionid", "transaction_id",
-                "connectorid", "connector_id",
-                "energywh", "energy_wh", "energykwh", "energy_kwh",
-                "powerw", "power_w", "powerkw", "power_kw",
-                "soc", "socpercent", "soc_percent",
-            }}
+            if row_key not in {headers.get(k) for k in _KNOWN_CANON_KEYS}
         }
         yield ChargerLogEntry(
             time=parsed_ts,

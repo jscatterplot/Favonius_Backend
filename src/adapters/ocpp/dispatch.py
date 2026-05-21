@@ -312,9 +312,14 @@ async def dispatch_get_diagnostics(
         )
 
     import_id = uuid4()
+    # Mint exactly once so the token embedded in the URL is the same
+    # one whose sha256 we persist in ``upload_token_hash``. A second
+    # mint inside build_upload_url would re-sample ``time.time()`` and
+    # could straddle a second boundary, producing a different signature
+    # and a 401 "token mismatch" on upload.
     token = mint_token(import_id)
     token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    location = build_upload_url(import_id)
+    location = build_upload_url(import_id, token=token)
 
     payload: dict[str, Any] = {
         "location": location,

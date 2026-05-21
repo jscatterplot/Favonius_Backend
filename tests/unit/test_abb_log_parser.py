@@ -111,6 +111,38 @@ class TestParseAbbDiagnostics:
         assert "timestamp" not in entries[0].raw_fields
         assert "soc_percent" not in entries[0].raw_fields
 
+    def test_alternate_aliases_do_not_duplicate_into_raw_fields(self):
+        """Regression for Bugbot LOW: the raw_fields exclusion set used
+        to miss ``state_of_charge`` / ``energy_kwh`` / ``charging_kw`` /
+        ``poweractiveimport`` / ``energyactiveimportregister``, so a
+        CSV using one of those names produced both the normalized
+        field AND a duplicate entry in raw_fields.
+        """
+        csv = b"""timestamp,transaction_id,connector_id,state_of_charge,charging_kw,energy_kwh
+2024-01-15T14:00:00Z,1,1,0.4,11.0,3.5
+"""
+        entries = list(parse_abb_diagnostics(csv))
+        assert len(entries) == 1
+        e = entries[0]
+        # Values landed in the normalized fields...
+        assert e.soc == pytest.approx(0.4)
+        assert e.charging_kw == pytest.approx(11.0)
+        assert e.energy_kwh == pytest.approx(3.5)
+        # ...and did NOT also leak into raw_fields.
+        assert e.raw_fields == {}
+
+    def test_active_import_register_alias_not_duplicated(self):
+        csv = b"""timestamp,transaction_id,energy_active_import_register,power_active_import
+2024-01-15T14:00:00Z,1,5500,11000
+"""
+        entries = list(parse_abb_diagnostics(csv))
+        assert len(entries) == 1
+        e = entries[0]
+        # Wh / W input → kWh / kW normalized fields
+        assert e.energy_kwh == pytest.approx(5.5)
+        assert e.charging_kw == pytest.approx(11.0)
+        assert e.raw_fields == {}
+
     def test_skips_rows_with_missing_timestamp(self):
         csv = b"""timestamp,transaction_id,soc_percent,power_w,energy_wh
 ,1,50.0,5000,0
