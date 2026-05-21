@@ -894,6 +894,25 @@ async def run_qa_turn(
                         except (TypeError, ValueError):
                             row_evidence = 0
                         terminated = True
+                        # Append the terminator's tool_result BEFORE
+                        # breaking so the message list stays internally
+                        # consistent. Today we break the outer loop right
+                        # after this and never send messages back to the
+                        # API, so the missing entry was latent — but if
+                        # a future code change replays/persists messages
+                        # or removes the outer break, the assistant
+                        # tool_use block would have no matching
+                        # tool_result and the next API call would error
+                        # with "unmatched tool_use_id". Bugbot flagged
+                        # the latent risk; this closes it.
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block_id,
+                                "content": json.dumps(result, default=str),
+                                "is_error": False,
+                            }
+                        )
                         break
                     tool_results.append(
                         {

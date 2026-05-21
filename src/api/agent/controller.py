@@ -588,6 +588,16 @@ async def _run_sql_general_turn(
             on_step=_on_step,
         )
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
+        # Set sql_tool_turns from exc.iterations BEFORE the early return
+        # so the AGENT_SQL_TOOL_TURNS histogram in the finally block
+        # records the actual round-trip count, not 0. Both exception
+        # types carry `iterations` (ToolNotAllowedError via its ctor;
+        # ToolNotRegisteredError via the attribute attached at the
+        # re-raise site in run_qa_turn). Without this, every policy-
+        # violation turn flat-lined the metric at 0, biasing the
+        # distribution toward zero on the runs we care most about
+        # monitoring.
+        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
         logger.error("SQL agent tool error: %s", exc)
         # Codex P2: if a disallowed tool aborted the loop AFTER one or
         # more SQL tools had already executed, we still owe those rows

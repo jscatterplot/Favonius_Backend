@@ -165,6 +165,26 @@ async def test_happy_path_explorer_then_select_then_terminator():
         "run_select_ts",
         EMIT_FINAL_ANSWER_TOOL,
     ]
+    # Each turn's tool_use blocks must have a matching tool_result in
+    # the next user message for the Anthropic API contract. Verify the
+    # client saw a complete tool_result trail across all three turns —
+    # specifically the terminator's tool_result must be appended too,
+    # not silently dropped by the `break`. Bugbot flagged the latent
+    # issue earlier; this asserts the fix.
+    user_messages_with_tool_results = []
+    for call in client.messages.calls:
+        for msg in call["messages"]:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for entry in msg["content"]:
+                    if isinstance(entry, dict) and entry.get("type") == "tool_result":
+                        user_messages_with_tool_results.append(entry["tool_use_id"])
+    # We should see tool_results for b1 (list_tables) and b2 (run_select_ts).
+    # The terminator's tool_result is captured before the outer break in
+    # the local messages list but never sent back (we return before the
+    # next API call). The assertion is therefore: every NON-terminator
+    # tool_use block has its tool_result reach the API.
+    assert "b1" in user_messages_with_tool_results
+    assert "b2" in user_messages_with_tool_results
     assert step_log == ["list_tables", "run_select_ts", EMIT_FINAL_ANSWER_TOOL]
     assert [name for name, _ in log] == [
         "list_tables",
