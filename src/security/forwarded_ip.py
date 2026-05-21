@@ -26,10 +26,8 @@ import logging
 from typing import Iterable, Optional, Union
 
 # RFC 6598 carrier-grade NAT shared address space. Treated as implicitly
-# trusted when callers opt into private-proxy trust — Railway, Render,
-# Fly.io and other PaaS providers route between their edge and the
-# container over this range. Python's ``ipaddress`` does not classify it
-# as ``is_private`` so we check it explicitly.
+# trusted when callers opt in; this is commonly used for internal
+# edge->container hops by PaaS providers.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 _Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
@@ -54,15 +52,9 @@ def normalize_forwarded_ip(raw_ip: str) -> Optional[str]:
         return None
 
 
-def _is_implicitly_trusted(
-    ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
-) -> bool:
-    """True for RFC 1918/4193 private, loopback, link-local, and RFC 6598 CGNAT."""
-    if ip.is_private or ip.is_loopback or ip.is_link_local:
-        return True
-    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK:
-        return True
-    return False
+def _is_implicitly_trusted(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
+    """True for RFC 6598 CGNAT only."""
+    return isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK
 
 
 def _is_trusted_proxy_entry(
@@ -75,9 +67,19 @@ def _is_trusted_proxy_entry(
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
+    explicitly_trusted = any(
+        ip.version == net.version and ip in net for net in trusted_networks
+    )
+    if explicitly_trusted:
+        return True
+    # Do not blanket-trust private/loopback/link-local chain entries when
+    # explicit proxy CIDRs are configured: private-network clients are common
+    # in VPN/on-prem deployments and must remain eligible as the resolved
+    # origin IP. Implicit trust is retained only for legacy "no CIDRs"
+    # deployments where the caller intentionally opts in.
     if trust_implicit_private and _is_implicitly_trusted(ip):
         return True
-    return any(ip.version == net.version and ip in net for net in trusted_networks)
+    return False
 
 
 def _select_client_ip(
@@ -147,10 +149,8 @@ def extract_forwarded_ip(
         trusted_networks: CIDRs that act as reverse proxies for this
             deployment. Entries in the chain whose IPs fall in any of these
             ranges are treated as intermediate hops, not the client.
-        trust_implicit_private: When True, RFC 1918 / RFC 4193 private,
-            loopback, link-local, and RFC 6598 CGNAT addresses are also
-            treated as intermediate proxies. Match this to the caller's
-            existing ``trust private proxy headers`` config.
+        trust_implicit_private: When True, RFC 6598 CGNAT addresses are
+            treated as intermediate proxies.
 
     Returns:
         The resolved client IP, or ``None`` when no valid header is present.
