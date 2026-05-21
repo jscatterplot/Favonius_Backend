@@ -460,7 +460,7 @@ def _sql_functions_accessed(tool_calls: Any) -> list[str]:
             raw = tc.result.get("functions_used")
             if isinstance(raw, list):
                 names = [str(n) for n in raw]
-        elif isinstance(tc.arguments, dict):
+        if not names and isinstance(tc.arguments, dict):
             sql = tc.arguments.get("sql") or ""
             names = _AGENT_VIEWS_FN_RE.findall(str(sql))
         for fn in names:
@@ -519,6 +519,7 @@ async def _run_sql_general_turn(
         summary = f"{name}: {'ok' if tool_call.ok else 'error'}"
         await emit_step("tool_call", summary)
 
+    sql_tool_turns = 0
     try:
         qa = await run_qa_turn(
             anthropic_client=client,
@@ -543,6 +544,7 @@ async def _run_sql_general_turn(
         # before any tool dispatch in this turn) — falls through with
         # an empty list.
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
+        sql_tool_turns = len(partial_calls) or 1
         sql_attempts = 0
         server_row_total = 0
         for tc in partial_calls:
@@ -588,8 +590,10 @@ async def _run_sql_general_turn(
         await agent_runs_close(ts_pool, run_id, "error", reply)
         await _emit_answer_safe(sse, reply, run_id)
         return reply
-
-    AGENT_SQL_TOOL_TURNS.observe(qa.iterations)
+    else:
+        sql_tool_turns = qa.iterations
+    finally:
+        AGENT_SQL_TOOL_TURNS.observe(sql_tool_turns)
 
     # Server-computed audit numbers: rely on the tool-call trace, not the
     # LLM-supplied `row_evidence` (the model can hallucinate that value).
