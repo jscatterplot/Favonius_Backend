@@ -802,9 +802,10 @@ async def run_qa_turn(
             block_input = dict(getattr(block, "input", {}) or {})
 
             if name == QA_TERMINATOR_TOOL_NAME:
-                final_text = str(block_input.get("text", "")).strip()
+                result = await tool_registry.dispatch(name, block_input)
+                final_text = str(result.get("text", "")).strip()
                 try:
-                    row_evidence = int(block_input.get("row_evidence", 0) or 0)
+                    row_evidence = int(result.get("row_evidence", 0) or 0)
                 except (TypeError, ValueError):
                     row_evidence = 0
                 terminated = True
@@ -813,7 +814,7 @@ async def run_qa_turn(
                 tc = ToolCall(
                     name=name,
                     arguments=block_input,
-                    result={"text": final_text, "row_evidence": row_evidence},
+                    result=result,
                     ok=True,
                     error=None,
                 )

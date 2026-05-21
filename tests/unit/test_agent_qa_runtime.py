@@ -165,10 +165,11 @@ async def test_happy_path_explorer_then_select_then_terminator():
         QA_TERMINATOR_TOOL_NAME,
     ]
     assert step_log == ["list_tables", "run_select_ts", QA_TERMINATOR_TOOL_NAME]
-    # Real tool dispatch happens for non-terminator calls; the terminator
-    # is captured directly from its input without round-tripping through
-    # the registry (its output is fully determined by the LLM's input).
-    assert [name for name, _ in log] == ["list_tables", "run_select_ts"]
+    assert [name for name, _ in log] == [
+        "list_tables",
+        "run_select_ts",
+        QA_TERMINATOR_TOOL_NAME,
+    ]
 
 
 @pytest.mark.asyncio
