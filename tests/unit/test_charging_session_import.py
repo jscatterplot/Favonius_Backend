@@ -1517,6 +1517,83 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
         assert response.json()["error_code"] == "VALIDATION_ERROR"
 
+    def test_platform_import_hash_stable_when_only_duration_added(
+        self, client, mock_db_pool
+    ):
+        """Adding/removing `session_duration_seconds` MUST NOT change the
+        platform-initiated hash. Pinned because Codex P1 caught a regression
+        where the hash branched on file-end presence and silently picked
+        the resolver's output in the no-file-end path.
+
+        Re-import scenario: customer first imports without duration (older FE),
+        then re-imports the same logical row with the new FE that ships
+        duration. The hash must be identical so the UPSERT merges, not
+        duplicates.
+        """
+        from datetime import datetime, timezone
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id_a = str(uuid4())
+        session_id_b = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        # Same payload twice; only the duration field differs (absent vs 5400s).
+        # Both rounds: no `end_time_local`, platform-initiated (no id_tag/label).
+        base_payload = _row_payload(id_tag=None, rfid_label=None)
+        base_payload["end_time_local"] = None
+        payload_a = {**base_payload}  # no duration
+        payload_b = {**base_payload, "session_duration_seconds": 5400}
+
+        # Round 1 — no duration. Capture hash BEFORE the next round mutates
+        # the shared conn's await_args_list (the mock_db_pool fixture reuses
+        # the same conn across requests).
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            identity_fetchrows=[],
+            session_id=session_id_a,
+            org_id=org_id,
+        )
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload_a,
+            )
+        hash_a = _upsert_bind(conn)[11]
+
+        # Reset module-level caches so round 2 re-runs the sites lookup.
+        from src.api import main as api_main
+
+        api_main._site_metadata_cache.clear()
+        api_main._site_metadata_locks.clear()
+
+        # Round 2 — same row, duration added. _setup re-primes side_effect.
+        self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            identity_fetchrows=[],
+            session_id=session_id_b,
+            org_id=org_id,
+        )
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload_b,
+            )
+        hash_b = _upsert_bind(conn)[11]
+
+        assert hash_a == hash_b, (
+            "Platform hash must be stable across re-uploads of the same row "
+            "when the only difference is the new duration field."
+        )
+
     def test_platform_import_hash_uses_raw_file_end_not_resolved(
         self, client, mock_db_pool
     ):

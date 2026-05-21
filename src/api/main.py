@@ -4271,20 +4271,24 @@ async def import_historical_charging_session(
     # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
     # When both identifiers are absent, classify as platform-initiated import.
     id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
-    # Platform-initiated dedup hashing MUST use the raw file end_time, not
-    # the resolver's output. The hash is the customer's stable identity for
-    # the row across re-uploads, and the resolver may produce different
-    # values for the same file as `session_duration_seconds` is added /
-    # corrected. Using `file_end_time_utc` also preserves backward-compat
-    # with rows persisted pre-resolver: their stored end_time was the raw
-    # file value, and migration 036's backfill used it as such.
+    # Platform-initiated dedup hashing MUST always use the raw file end_time,
+    # never the resolver's output. The hash is the customer's stable identity
+    # for the row across re-uploads — the XLSX is the source of truth, and
+    # any value derived from `session_duration_seconds` would mutate when the
+    # FE starts/stops sending the field or ships a corrected duration in a
+    # later upload, breaking ON CONFLICT merge. Using the raw file value also
+    # preserves backward-compat with rows persisted pre-resolver and with
+    # migration 036's backfill, which keys off the persisted `end_time`
+    # (== the raw file value for pre-resolver rows).
+    #
+    # Trade-off: when an XLSX has no end_time column at all (file end == None)
+    # and two distinct platform-initiated sessions share start_time + status +
+    # user_full_name + station_owner_full_name, they collide on hash. That
+    # risk already existed pre-PR — there is no extra discriminator we can
+    # add here without making the hash depend on the resolver, which would
+    # break the more common re-import idempotency case above.
     hash_id_token = (
-        _platform_import_hash_token(
-            request,
-            end_time_utc=(
-                file_end_time_utc if request.end_time_local else end_time_utc
-            ),
-        )
+        _platform_import_hash_token(request, end_time_utc=file_end_time_utc)
         if is_platform_initiated
         else id_token
     )
