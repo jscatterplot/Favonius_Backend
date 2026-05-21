@@ -388,7 +388,9 @@ class WorkflowAgent:
                         status = "tool_not_allowed"
                         raise ToolNotAllowedError(
                             f"workflow {workflow.name!r} attempted to call "
-                            f"disallowed tool {name!r}"
+                            f"disallowed tool {name!r}",
+                            tool_calls=tool_calls,
+                            iterations=_iteration + 1,
                         )
 
                     # Pre-dispatch hard-constraint guard.

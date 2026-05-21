@@ -231,6 +231,10 @@ async def run_select(
         outcome = "error"
         AGENT_SQL_EXECUTIONS.labels(outcome=outcome, pool=pool_label).inc()
         raise
+    except Exception:
+        outcome = "error"
+        AGENT_SQL_EXECUTIONS.labels(outcome=outcome, pool=pool_label).inc()
+        raise
 
     duration_ms = int((time.monotonic() - started) * 1000)
     truncated = False
