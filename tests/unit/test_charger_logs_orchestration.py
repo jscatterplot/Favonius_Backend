@@ -165,6 +165,31 @@ async def test_receive_upload_rejects_invalid_token():
 
 
 @pytest.mark.asyncio
+async def test_receive_upload_does_not_leak_token_reason():
+    """Regression for Cursor LOW: the rejection reason used to embed
+    the underlying ``UploadTokenError`` (``malformed`` /
+    ``bad signature`` / ``expired``) into the response body, which
+    is a content side channel. The reason now reads simply
+    ``invalid token`` regardless of which sub-check tripped.
+    """
+    conn = _FakeConn({})
+    # Malformed (wrong segment count) — different from expired
+    # versus bad-signature, yet all must produce the same client-
+    # visible message.
+    with pytest.raises(UploadRejected) as excinfo_malformed:
+        await receive_upload(_FakePool(conn), token="too.few", body=b"payload")
+    assert excinfo_malformed.value.reason == "invalid token"
+    # Well-formed shape, wrong signature: same generic message.
+    with pytest.raises(UploadRejected) as excinfo_badsig:
+        await receive_upload(
+            _FakePool(conn),
+            token=f"{uuid4()}.0.deadbeef" + "00" * 28,
+            body=b"payload",
+        )
+    assert excinfo_badsig.value.reason == "invalid token"
+
+
+@pytest.mark.asyncio
 async def test_receive_upload_returns_404_when_row_missing():
     import_id = uuid4()
     token = mint_token(import_id)

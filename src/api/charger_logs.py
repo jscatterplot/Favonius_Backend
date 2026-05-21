@@ -104,12 +104,20 @@ async def receive_upload(
     try:
         decoded = verify_token(token)
     except UploadTokenError as exc:
-        raise UploadRejected(401, f"invalid token: {exc}") from exc
+        # Defence-in-depth against timing/content side channels: the
+        # response body says only "invalid token" regardless of which
+        # specific check tripped (shape / signature / expiry). The
+        # detailed reason still lands in the server log via the
+        # exception chain for operator debugging.
+        logger.info("upload token rejected: %s", exc)
+        raise UploadRejected(401, "invalid token") from exc
     except RuntimeError as exc:
         # ``verify_token`` raises RuntimeError when the signing key is
         # unset — a server-side misconfiguration, not a bad client.
-        # Surface it as 503 so the operator gets a clear signal instead
-        # of an opaque 500.
+        # Surface it as 503 so the operator gets a clear signal
+        # instead of an opaque 500. The exception message names the
+        # missing env var and is safe to expose — it's not a client
+        # data leak, it's a deployment instruction.
         raise UploadRejected(503, f"upload misconfigured: {exc}") from exc
 
     expected_hash = decoded.sha256_hex

@@ -275,7 +275,15 @@ def _parse_csv_text(text: str) -> Iterator[ChargerLogEntry]:
         # Not a session-log shape — nothing to extract.
         return
 
-    excluded_row_keys = {headers.get(k) for k in _KNOWN_CANON_KEYS}
+    # Filter out None: ``headers.get(k)`` returns None for every
+    # canonical key that isn't present in the CSV, and
+    # ``csv.DictReader`` stores overflow columns (when a row has more
+    # fields than the header) under the key ``None``. Without the
+    # filter, ``None`` always lands in the exclusion set and overflow
+    # data is silently dropped instead of preserved in raw_fields.
+    excluded_row_keys = {
+        h for h in (headers.get(k) for k in _KNOWN_CANON_KEYS) if h is not None
+    }
 
     for row in reader:
         ts = _pick(row, headers, "timestamp", "time", "datetime")

@@ -222,21 +222,47 @@ def _charger_total_kwh(
 
     ABB Terra AC and other OCPP-compliant chargers report
     ``energy_kwh`` as the cumulative meter reading at each sample, so
-    the session total is ``max - min``. When the parser only yielded
-    one sample (no min/max spread) or the meter resets to 0 at session
-    start, ``max - min`` collapses to ``max``, which is still right.
+    the session total is ``max - min``. The two ambiguous cases:
+
+      * **All samples report the same cumulative meter value.**
+        The vehicle was plugged in but idle. Returning ``max`` here
+        would conflate that with "5000 kWh delivered" when the meter
+        sat at 5000 kWh the whole time — clearly wrong. Return ``0.0``.
+      * **Only one sample present** (no min/max spread). We can't
+        integrate over the session window from a single point; the
+        honest answer is also ``0.0`` — the reconciler will surface
+        ``source='partial'`` against any non-zero telemetry side.
+
+    Returns:
+        ``None`` when the parser yielded no usable energy data at all
+        (max is None or non-positive).
+        ``0.0`` when ``max - min`` is non-positive (idle / single-sample).
+        ``max - min`` otherwise.
     """
     if max_energy_kwh is None or max_energy_kwh <= 0:
         return None
     if min_energy_kwh is None:
+        # Some parsers (e.g. delta-style emitters; future-only path)
+        # don't populate ``min_energy_kwh`` because each sample is
+        # already a per-interval delta. ``max`` is the appropriate
+        # total in that case.
         return max_energy_kwh
     delta = max_energy_kwh - min_energy_kwh
     if delta <= 0:
-        # Single-sample or non-monotonic — fall back to MAX so we
-        # still surface *some* number rather than dropping to
-        # ``no_log_entries`` for a misbehaving meter.
-        return max_energy_kwh
+        return 0.0
     return delta
+
+
+# How far forward the final MeterValues sample is allowed to be
+# extrapolated when integrating power × time. OCPP's
+# ``MeterValueSampleInterval`` is typically 30-60 s; capping at 5
+# minutes admits one stalled sample per session without letting a
+# stale final reading dominate the integral when the charger drops
+# its socket long before the StopTransaction message lands. Matches
+# the spirit of ``MAX_TELEMETRY_AGE`` (15 min) used elsewhere as the
+# staleness threshold, scaled down to a single sample's worth of
+# tail.
+_TAIL_EXTRAPOLATION_CAP_SECONDS = 300
 
 
 _OUR_ENERGY_SQL = """
@@ -263,8 +289,22 @@ _OUR_ENERGY_SQL = """
                 0
             ) + COALESCE(
                 SUM(
+                    -- Tail term: extrapolate the last observed power
+                    -- forward to ``end_time``, but cap the tail at
+                    -- ``_TAIL_EXTRAPOLATION_CAP_S`` seconds so a stale
+                    -- final sample doesn't get integrated across the
+                    -- whole rest of the session window. Cursor Medium
+                    -- flagged this as a double-count risk for sessions
+                    -- whose last MeterValues arrived long before
+                    -- StopTransaction — a real concern for
+                    -- chargers that drop their socket toward
+                    -- session end. The cap matches typical OCPP
+                    -- MeterValueSampleInterval bounds.
                     charging_kw
-                    * EXTRACT(EPOCH FROM ($5::timestamptz - GREATEST(raw_time, $4::timestamptz))) / 3600.0
+                    * LEAST(
+                        EXTRACT(EPOCH FROM ($5::timestamptz - GREATEST(raw_time, $4::timestamptz))),
+                        {tail_cap_s}
+                      ) / 3600.0
                 ) FILTER (WHERE next_time IS NULL),
                 0
             ) AS energy_kwh
@@ -297,7 +337,10 @@ async def _our_energy_kwh(
 
     async def _query(conn: asyncpg.Connection, tx_filter: str) -> Optional[float]:
         row = await conn.fetchrow(
-            _OUR_ENERGY_SQL.format(tx_filter=tx_filter),
+            _OUR_ENERGY_SQL.format(
+                tx_filter=tx_filter,
+                tail_cap_s=_TAIL_EXTRAPOLATION_CAP_SECONDS,
+            ),
             station_id,
             connector_id,
             transaction_id,

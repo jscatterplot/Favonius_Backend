@@ -8471,11 +8471,15 @@ async def upload_charger_log_endpoint(
     try:
         verify_token(token)
     except UploadTokenError as exc:
+        # Don't leak the specific reason (malformed / bad signature /
+        # expired) to the client — keeps timing-side channels narrow.
+        # Server log carries the detail.
+        logger.info("upload token rejected: %s", exc)
         raise HTTPException(
             status_code=401,
             detail={
                 "error_code": "CHARGER_LOG_UPLOAD_REJECTED",
-                "message": f"invalid token: {exc}",
+                "message": "invalid token",
             },
         ) from exc
     except RuntimeError as exc:

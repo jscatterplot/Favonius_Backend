@@ -124,11 +124,21 @@ class TestChargerTotalKwh:
     def test_returns_none_when_max_is_zero(self):
         assert _charger_total_kwh(max_energy_kwh=0.0, min_energy_kwh=0.0) is None
 
-    def test_falls_back_to_max_when_delta_non_positive(self):
-        # Single-sample case: max == min, delta = 0, fall back to max.
-        assert _charger_total_kwh(max_energy_kwh=5.0, min_energy_kwh=5.0) == 5.0
-        # Non-monotonic case (meter glitch): max < min, fall back to max.
-        assert _charger_total_kwh(max_energy_kwh=4.0, min_energy_kwh=6.0) == 4.0
+    def test_zero_delta_returns_zero_not_cumulative(self):
+        """Regression for Cursor Medium: a session where the vehicle
+        was plugged in but idle reports identical cumulative meter
+        readings on every sample. The old code returned ``max`` as
+        the session total — turning an idle session at meter=5000
+        kWh into "5000 kWh delivered". The function now returns 0.0,
+        the only honest answer.
+        """
+        # Idle session: meter reads 5000 kWh on every sample.
+        assert _charger_total_kwh(max_energy_kwh=5000.0, min_energy_kwh=5000.0) == 0.0
+        # Single-sample case (max == min): also returns 0 since we
+        # have no integration window.
+        assert _charger_total_kwh(max_energy_kwh=5.0, min_energy_kwh=5.0) == 0.0
+        # Non-monotonic case (meter glitch): also 0 — refuse to fabricate.
+        assert _charger_total_kwh(max_energy_kwh=4.0, min_energy_kwh=6.0) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +213,31 @@ async def test_reconciled_when_both_sides_present():
     assert result.our_duration_s == 3600
     assert result.charger_duration_s == 3600
     assert result.notes["charger_entries"] == 4
+
+
+@pytest.mark.asyncio
+async def test_our_energy_sql_caps_tail_extrapolation():
+    """Regression for Cursor Medium: the tail term used to integrate
+    the last sample's power all the way to ``end_time``. For a
+    session whose last MeterValues arrived long before
+    StopTransaction (charger lost socket near session end), this
+    over-attributed energy across the entire silent window. The SQL
+    now ``LEAST(...)``-caps the tail extrapolation at
+    ``_TAIL_EXTRAPOLATION_CAP_SECONDS``.
+    """
+    from src.core.reconciliation.session_log_reconciliation import (
+        _OUR_ENERGY_SQL,
+        _TAIL_EXTRAPOLATION_CAP_SECONDS,
+    )
+
+    rendered = _OUR_ENERGY_SQL.format(
+        tx_filter="t.transaction_id = $3",
+        tail_cap_s=_TAIL_EXTRAPOLATION_CAP_SECONDS,
+    )
+    # The cap must appear in the rendered SQL, and it must be inside
+    # a LEAST(...) so it bounds the integration window.
+    assert f"LEAST(" in rendered
+    assert str(_TAIL_EXTRAPOLATION_CAP_SECONDS) in rendered
 
 
 @pytest.mark.asyncio

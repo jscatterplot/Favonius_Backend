@@ -213,6 +213,28 @@ class TestParseAbbDiagnostics:
         assert e.charging_kw == pytest.approx(11.0)
         assert e.raw_fields == {}
 
+    def test_overflow_columns_land_in_raw_fields_not_lost(self):
+        """Regression for Cursor LOW: ``csv.DictReader`` stores extra
+        columns (when a row has more fields than the header) under
+        the key ``None``. The exclusion set used to include ``None``
+        because ``headers.get(missing_key)`` returned None — so
+        overflow data was silently dropped. The exclusion-set
+        builder now filters None out.
+        """
+        # Header lists 3 columns; rows carry a 4th value → overflow
+        # is keyed under None by csv.DictReader.
+        csv = (
+            b"timestamp,transaction_id,soc_percent\n"
+            b"2024-01-15T14:00:00Z,1,50.0,bonus_value\n"
+        )
+        entries = list(parse_abb_diagnostics(csv))
+        assert len(entries) == 1
+        # The "bonus_value" overflow must be preserved in raw_fields
+        # under key None (the csv.DictReader convention). If the bug
+        # were still present, raw_fields would be empty.
+        assert None in entries[0].raw_fields
+        assert entries[0].raw_fields[None] == ["bonus_value"]
+
     def test_skips_rows_with_missing_timestamp(self):
         csv = b"""timestamp,transaction_id,soc_percent,power_w,energy_wh
 ,1,50.0,5000,0
