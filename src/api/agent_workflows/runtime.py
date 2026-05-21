@@ -57,6 +57,7 @@ from src.api.agent_workflows.tools import (
     ToolRegistry,
 )
 from src.monitoring.metrics import (
+    AGENT_LLM_TOKENS,
     WORKFLOW_LLM_TOKENS,
     WORKFLOW_TURN_DURATION,
     WORKFLOW_TURNS,
@@ -804,6 +805,17 @@ async def run_qa_turn(
                 tools=tools,
                 messages=messages,
             )
+            # Record token usage on EVERY round-trip. Bugbot M-sev: a
+            # SQL-mode turn can make up to `max_iterations` (default 8)
+            # Anthropic API calls — by far the most expensive execution
+            # path the agent has — and without this hook the cost was
+            # entirely invisible in Prometheus. Mirrors the
+            # `_record_usage` pattern in `src/api/agent/llm.py` (the
+            # consumption fast path) and the `_record_tokens` pattern on
+            # WorkflowAgent, but lands the count in the same
+            # `AGENT_LLM_TOKENS` metric the consumption path uses so a
+            # single dashboard covers both agent paths.
+            _record_qa_tokens(response, model)
 
             assistant_content = list(response.content)
             messages.append({"role": "assistant", "content": assistant_content})
@@ -1006,6 +1018,27 @@ async def run_qa_turn(
         row_evidence=row_evidence,
         iterations=iterations,
     )
+
+
+def _record_qa_tokens(response: Any, model: str) -> None:
+    """Increment AGENT_LLM_TOKENS from an Anthropic response's usage block.
+
+    Used by ``run_qa_turn`` after every API round-trip in the SQL-mode
+    tool-use loop. Lands counts in the same metric the consumption
+    fast path uses (`src/api/agent/llm.py:_record_usage`) so a single
+    dashboard panel covers both agent paths. WorkflowAgent uses a
+    DIFFERENT metric (`WORKFLOW_LLM_TOKENS`) because workflows are a
+    distinct product surface.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    in_tokens = getattr(usage, "input_tokens", 0) or 0
+    out_tokens = getattr(usage, "output_tokens", 0) or 0
+    if in_tokens:
+        AGENT_LLM_TOKENS.labels(model=model, direction="input").inc(in_tokens)
+    if out_tokens:
+        AGENT_LLM_TOKENS.labels(model=model, direction="output").inc(out_tokens)
 
 
 async def _dispatch_on_step(cb: Callable[[ToolCall], Any], tc: ToolCall) -> None:

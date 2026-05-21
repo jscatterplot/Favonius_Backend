@@ -371,11 +371,19 @@ def describe_function(name: str) -> dict | None:
 
 
 def list_functions_summary() -> list[dict]:
-    """Return a compact list-of-objects for the ``list_tables`` tool."""
+    """Return a compact list-of-objects for the ``list_tables`` tool.
+
+    Pool label uses an explicit name-keyed map rather than the previous
+    ``if f in TS_FUNCTIONS`` identity check (Bugbot Low-sev: that check
+    works today only because each ``FunctionSpec`` instance lives in
+    exactly one tuple; if specs were ever shared or rebuilt the label
+    would silently flip).
+    """
+    ts_names = {f.name for f in TS_FUNCTIONS}
     return [
         {
             "name": f"agent_views.{f.name}",
-            "pool": "ts" if f in TS_FUNCTIONS else "static",
+            "pool": "ts" if f.name in ts_names else "static",
             "purpose": f.purpose.splitlines()[0],
             "requires_time_predicate": f.requires_time_predicate,
         }

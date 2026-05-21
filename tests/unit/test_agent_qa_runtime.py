@@ -193,6 +193,100 @@ async def test_happy_path_explorer_then_select_then_terminator():
     ]
 
 
+class _FakeUsage:
+    """Mimic the Anthropic SDK's response.usage object shape."""
+
+    def __init__(self, input_tokens: int, output_tokens: int) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+@pytest.mark.asyncio
+async def test_run_qa_turn_records_token_usage_per_round_trip():
+    """Bugbot M-sev: `run_qa_turn` was making up to `max_iterations`
+    Anthropic API calls per turn but never recording token usage to
+    Prometheus. The SQL-mode path is the most expensive execution path
+    the agent has — leaving it unobserved means cost monitoring is
+    blind to this entire feature. Verify the metric is hit on every
+    round-trip.
+    """
+    from src.monitoring.metrics import AGENT_LLM_TOKENS
+
+    reg, _ = _registry()
+
+    # Three round-trips: explorer → select → terminator.
+    script = [
+        _FakeResponse([_tool_use("list_tables", "b1", {})]),
+        _FakeResponse([_tool_use("run_select_ts", "b2", {"sql": "SELECT 1"})]),
+        _FakeResponse([
+            _tool_use(
+                EMIT_FINAL_ANSWER_TOOL,
+                "b3",
+                {"text": "ok", "row_evidence": 1},
+            )
+        ]),
+    ]
+    # Attach distinct usage to each so we can verify aggregation.
+    script[0].usage = _FakeUsage(input_tokens=100, output_tokens=20)
+    script[1].usage = _FakeUsage(input_tokens=150, output_tokens=30)
+    script[2].usage = _FakeUsage(input_tokens=200, output_tokens=10)
+    client = _FakeClient(script)
+
+    # Snapshot counters BEFORE the run so we can diff (other tests may
+    # leave residue depending on order).
+    model = "claude-haiku-4-5"
+    before_in = AGENT_LLM_TOKENS.labels(model=model, direction="input")._value.get()
+    before_out = AGENT_LLM_TOKENS.labels(model=model, direction="output")._value.get()
+
+    await run_qa_turn(
+        anthropic_client=client,
+        model=model,
+        system_prompt="sys",
+        user_message="q",
+        tool_registry=reg,
+        allowed_tools=_allowed_tools(),
+    )
+
+    after_in = AGENT_LLM_TOKENS.labels(model=model, direction="input")._value.get()
+    after_out = AGENT_LLM_TOKENS.labels(model=model, direction="output")._value.get()
+
+    # Sum across all three round-trips: 100+150+200 input, 20+30+10 output.
+    assert after_in - before_in == 450
+    assert after_out - before_out == 60
+
+
+@pytest.mark.asyncio
+async def test_run_qa_turn_no_token_recording_when_usage_missing():
+    """The Anthropic API occasionally returns a response without a
+    ``usage`` block (e.g. on tool-use turns in some SDK versions). The
+    recorder must be a no-op in that case rather than throwing
+    AttributeError mid-loop."""
+    from src.monitoring.metrics import AGENT_LLM_TOKENS
+
+    reg, _ = _registry()
+    script = [
+        _FakeResponse([_tool_use(EMIT_FINAL_ANSWER_TOOL, "b1", {"text": "ok"})]),
+    ]
+    # script[0].usage is already None (default) — fall through.
+    client = _FakeClient(script)
+
+    model = "claude-haiku-4-5"
+    before_in = AGENT_LLM_TOKENS.labels(model=model, direction="input")._value.get()
+
+    # Should NOT raise.
+    await run_qa_turn(
+        anthropic_client=client,
+        model=model,
+        system_prompt="sys",
+        user_message="q",
+        tool_registry=reg,
+        allowed_tools=_allowed_tools(),
+    )
+
+    after_in = AGENT_LLM_TOKENS.labels(model=model, direction="input")._value.get()
+    assert after_in == before_in  # unchanged
+
+
 @pytest.mark.asyncio
 async def test_max_iterations_without_terminator():
     reg, _ = _registry()
