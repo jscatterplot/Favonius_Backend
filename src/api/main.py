@@ -4276,7 +4276,12 @@ async def import_historical_charging_session(
     # with rows persisted pre-resolver: their stored end_time was the raw
     # file value, and migration 036's backfill used it as such.
     hash_id_token = (
-        _platform_import_hash_token(request, end_time_utc=file_end_time_utc)
+        _platform_import_hash_token(
+            request,
+            end_time_utc=(
+                file_end_time_utc if request.end_time_local else end_time_utc
+            ),
+        )
         if is_platform_initiated
         else id_token
     )
