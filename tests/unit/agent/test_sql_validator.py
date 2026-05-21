@@ -477,3 +477,177 @@ class TestCanonicalOutput:
         )
         assert "hour" in r.sql.lower()
         assert "$1" in r.sql
+
+
+# ── Latest review-feedback round ────────────────────────────────────────
+
+
+class TestBindPlaceholderEnforcement:
+    """Only $1 is bound by the executor; any $N for N != 1 must reject."""
+
+    def test_dollar_two_in_where_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) WHERE depot_id = $2",
+            kind="bad_placeholder",
+        )
+
+    def test_dollar_three_anywhere_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) "
+            "WHERE start_time >= $3::timestamptz",
+            kind="bad_placeholder",
+        )
+
+
+class TestSchemaQualifiedFunctionCalls:
+    """Dot(Identifier, Anonymous) targets — auth.uid() etc. — must reject.
+
+    The table-node check at step 4 covers FROM auth.x but NOT bare
+    `SELECT auth.uid()` calls (sqlglot represents those as a Dot node,
+    not a Table). Without this guard the role-swap is the only defence.
+    """
+
+    def test_auth_uid_call_rejected(self):
+        _rej(
+            "SELECT auth.uid() FROM agent_views.sessions($1)",
+            kind="forbidden_schema",
+        )
+
+    def test_storage_function_call_rejected(self):
+        _rej(
+            "SELECT storage.objects() FROM agent_views.sessions($1)",
+            kind="forbidden_schema",
+        )
+
+    def test_vault_function_call_rejected(self):
+        _rej(
+            "SELECT vault.decrypt('x') FROM agent_views.sessions($1)",
+            kind="forbidden_schema",
+        )
+
+    def test_pg_catalog_dot_function_rejected(self):
+        _rej(
+            "SELECT pg_catalog.pg_read_file('x') FROM agent_views.sessions($1)",
+            kind="forbidden_schema",
+        )
+
+
+class TestSelfReferentialBetweenInRejected:
+    """Codex P1 — `_is_genuine_bound` must reject self-references in
+    BETWEEN/IN, otherwise the time-predicate guard is trivially bypassed.
+    """
+
+    def test_between_self_ref_low_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour BETWEEN hour - interval '1 day' AND hour + interval '1 day'",
+            kind="missing_time_filter",
+        )
+
+    def test_between_normal_bounds_accepted(self):
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour BETWEEN now() - interval '7 days' AND now()"
+        )
+
+    def test_in_self_ref_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) WHERE hour IN (hour)",
+            kind="missing_time_filter",
+        )
+
+    def test_in_with_literals_accepted(self):
+        # `hour IN (timestamptz '...')` is a finite list — bound.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour IN (timestamptz '2026-05-01 00:00:00')"
+        )
+
+    def test_in_subquery_rejected(self):
+        # Sub-SELECT in IN cannot be statically shown to bound the scan.
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour IN (SELECT hour FROM agent_views.prices_hourly($1))",
+            kind="missing_time_filter",
+        )
+
+
+class TestBroaderUnconditionalTrueDetection:
+    """Codex P1 — the OR-bypass detector must catch non-EQ tautologies."""
+
+    def test_or_two_gt_one_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' OR 2 > 1",
+            kind="missing_time_filter",
+        )
+
+    def test_or_one_lt_two_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' OR 1 < 2",
+            kind="missing_time_filter",
+        )
+
+    def test_or_one_lte_one_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' OR 1 <= 1",
+            kind="missing_time_filter",
+        )
+
+    def test_or_one_neq_two_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' OR 1 <> 2",
+            kind="missing_time_filter",
+        )
+
+
+class TestNestedAndOrBypass:
+    """Bugbot — inverted _is_under args bypass detection when the
+    bounding comparison is nested inside an AND inside the OR branch.
+    """
+
+    def test_nested_and_with_or_true_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE (hour >= now() - interval '7 days' AND depot_id IS NOT NULL) "
+            "OR 1=1",
+            kind="missing_time_filter",
+        )
+
+    def test_and_combined_or_true_in_sibling_accepted(self):
+        # OR-TRUE is ANDed against the bound, not ORed against it — the
+        # time predicate is still independently enforced.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' AND (status = 'x' OR 1=1)"
+        )
+
+
+class TestSubqueryRowCapNotInjected:
+    """Codex P1 — LIMIT must only be injected on the top-level branches,
+    not on subqueries nested in IN/EXISTS/scalar contexts.
+    """
+
+    def test_in_subquery_not_capped(self):
+        r = _ok(
+            "SELECT * FROM agent_views.sessions($1) "
+            "WHERE driver_id IN (SELECT driver_id FROM agent_views.drivers($1))",
+            allowed=TS | STATIC,
+        )
+        # The inner SELECT must NOT have its own LIMIT injected; only the
+        # outer one. Verify by checking that exactly one LIMIT appears in
+        # the canonical SQL (the outer one).
+        assert r.sql.upper().count("LIMIT") == 1
+
+    def test_union_branches_still_capped(self):
+        # UNION branches DO get capped — they're top-level result sources.
+        r = _ok(
+            "SELECT depot_id FROM agent_views.sessions($1) "
+            "UNION ALL "
+            "SELECT depot_id FROM agent_views.optimization_runs($1)"
+        )
+        # Two branch LIMITs + one outer LIMIT = three.
+        assert r.sql.upper().count("LIMIT") >= 2

@@ -274,7 +274,40 @@ def validate_sql(
             f"{', '.join(sorted(allowed_functions))}.",
         )
 
-    # 5. Dangerous functions called outside table-context.
+    # 4b. Reject any bind placeholder other than $1. The executor binds
+    # exactly one argument (the caller's visible_depot_ids); any $N where
+    # N != 1 — or even an extra $1 outside the agent_views.<fn>($1) call
+    # — would fail at execution with a parameter-count/type error, wasting
+    # a loop iteration that should have been blocked earlier.
+    for param in tree.find_all(exp.Parameter):
+        if not (isinstance(param.this, exp.Literal) and str(param.this.name) == "1"):
+            return _reject(
+                "bad_placeholder",
+                f"Only the placeholder $1 is supported (bound to the caller's "
+                f"depot list); got {param.sql(dialect='postgres')!r}. Use a "
+                f"literal value or move the predicate into agent_views.<fn>($1).",
+            )
+
+    # 5. Schema-qualified function calls (Dot wrapping Anonymous) — reject
+    # any prefix in FORBIDDEN_SCHEMAS. The Table-node check at step 4
+    # blocks `FROM auth.x`, but it does NOT catch `SELECT auth.uid()`
+    # because sqlglot represents that as Dot(Identifier, Anonymous), not
+    # as a Table. Run BEFORE the dangerous_fn check so the rejection
+    # surfaces the (broader, more specific) schema reason rather than
+    # leaking which individual functions are on the denylist.
+    for dot in tree.find_all(exp.Dot):
+        left = dot.this
+        if not isinstance(left, exp.Identifier):
+            continue
+        schema = (left.name or "").lower()
+        if schema in FORBIDDEN_SCHEMAS:
+            return _reject(
+                "forbidden_schema",
+                f"Schema-qualified function call to {schema}.* is not "
+                f"permitted: {dot.sql(dialect='postgres')!r}.",
+            )
+
+    # 5b. Dangerous functions called outside table-context.
     for node in tree.find_all(exp.Anonymous):
         parent = node.parent
         # Skip the table-function nodes — those are the legitimate
@@ -358,9 +391,12 @@ def validate_sql(
 
     # Per-branch LIMITs on UNION/INTERSECT/EXCEPT run before the outer
     # LIMIT; uncapped branches can scan huge row sets within the timeout.
-    # Cap each branch AND the root.
-    for select_node in _iter_selects(tree):
-        rej = _apply_row_limit_on_node(select_node, row_limit)
+    # Cap each top-level branch AND the root — but DO NOT cap nested
+    # subqueries (e.g. `WHERE x IN (SELECT y FROM …)`), since an injected
+    # LIMIT there changes the query's semantics rather than just truncating
+    # the user-visible output.
+    for branch in _iter_top_level_branches(tree):
+        rej = _apply_row_limit_on_node(branch, row_limit)
         if rej is not None:
             return rej
     rej = _apply_row_limit_on_node(tree, row_limit)
@@ -419,6 +455,35 @@ def _iter_selects(tree: exp.Expression) -> "list[exp.Select]":
     for node in tree.walk():
         if isinstance(node, exp.Select):
             out.append(node)
+    return out
+
+
+def _iter_top_level_branches(tree: exp.Expression) -> "list[exp.Select]":
+    """Yield the SELECT branches at the *user-visible* surface of a query.
+
+    Walks set-operation (Union / Intersect / Except) nodes recursively to
+    collect their direct SELECT operands, but does NOT recurse into
+    Subquery / Exists / scalar-subquery contexts. Caller uses this for
+    LIMIT injection — a LIMIT on a nested subquery would change the
+    query's semantics rather than just truncating the user-visible
+    output (e.g. ``WHERE x IN (SELECT y FROM …)`` becoming an arbitrary
+    500-row IN-list).
+    """
+    out: list[exp.Select] = []
+
+    def _visit(node: exp.Expression) -> None:
+        if isinstance(node, exp.Union):
+            left = node.args.get("this")
+            right = node.args.get("expression")
+            if left is not None:
+                _visit(left)
+            if right is not None:
+                _visit(right)
+            return
+        if isinstance(node, exp.Select):
+            out.append(node)
+
+    _visit(tree)
     return out
 
 
@@ -506,20 +571,51 @@ def _is_genuine_bound(comparison: exp.Expression, time_col: exp.Column) -> bool:
 
     Rules:
 
-    * ``BETWEEN`` / ``IN`` count as bounds — they constrain to a finite
-      set regardless of nested expressions.
     * Binary comparison (``>=`` etc.): the time column must appear on
       EXACTLY ONE side; the OTHER side must not contain a Column ref
       to the SAME time column (catches ``hour >= hour - interval '…'``
       and ``date_trunc('day', hour) = hour``).
+    * ``BETWEEN``: the time column must appear on the subject side only.
+      If EITHER bound also references the time column the predicate is
+      self-referential (e.g. ``hour BETWEEN hour - interval '1d' AND
+      hour + interval '1d'``) and does NOT bound the scan window.
+    * ``IN``: the time column must be the subject side only — if any
+      value in the IN-list also references the time column, the
+      predicate degenerates (e.g. ``hour IN (hour)``).
     """
-    if isinstance(comparison, (exp.Between, exp.In)):
-        return True
+    target_name = (time_col.name or "").lower()
+
+    if isinstance(comparison, exp.Between):
+        subject = comparison.args.get("this")
+        low = comparison.args.get("low")
+        high = comparison.args.get("high")
+        if subject is None or low is None or high is None:
+            return False
+        subj_has = bool(_columns_matching(subject, target_name))
+        low_has = bool(_columns_matching(low, target_name))
+        high_has = bool(_columns_matching(high, target_name))
+        return subj_has and not (low_has or high_has)
+
+    if isinstance(comparison, exp.In):
+        subject = comparison.args.get("this")
+        if subject is None:
+            return False
+        subj_has = bool(_columns_matching(subject, target_name))
+        expressions = comparison.args.get("expressions") or []
+        for v in expressions:
+            if _columns_matching(v, target_name):
+                return False
+        # An IN against a subquery cannot be statically proven to bound the
+        # window, but the subquery is opaque to the validator — treat as
+        # bound only if there's no subquery branch.
+        if comparison.args.get("query") is not None:
+            return False
+        return subj_has and bool(expressions)
+
     left = comparison.args.get("this")
     right = comparison.args.get("expression")
     if left is None or right is None:
         return False
-    target_name = (time_col.name or "").lower()
     left_time_cols = _columns_matching(left, target_name)
     right_time_cols = _columns_matching(right, target_name)
     if left_time_cols and right_time_cols:
@@ -585,7 +681,12 @@ def _has_or_true_bypass(where: exp.Where) -> bool:
         cur = comparison.parent
         while cur is not None:
             if isinstance(cur, exp.Or):
-                if _is_under(cur.this, comparison):
+                # Identify which OR branch CONTAINS the comparison: that
+                # branch is the bound side, the OTHER branch is its sibling.
+                # _is_under(expr, ancestor) returns True if `expr` is or is
+                # nested inside `ancestor` — so we ask whether `comparison`
+                # lives under `cur.this` (the LEFT operand) vs. `cur.expression`.
+                if _is_under(comparison, cur.this):
                     sibling = cur.expression
                 else:
                     sibling = cur.this
@@ -598,23 +699,77 @@ def _has_or_true_bypass(where: exp.Where) -> bool:
 
 
 def _is_unconditional_true(node: exp.Expression | None) -> bool:
-    """Best-effort check for SQL expressions that are always TRUE."""
+    """Best-effort check for SQL expressions that are always TRUE.
+
+    Catches a small grammar of literal tautologies:
+
+    * ``TRUE`` / non-zero integer literal
+    * Self-equality on columns: ``hour = hour``
+    * Literal-vs-literal binary comparisons evaluated at parse time:
+      ``1 = 1``, ``2 > 1``, ``1 < 2``, ``1 <> 0``, ``1 >= 1``, etc.
+
+    Does not attempt arbitrary expression evaluation — anything more
+    complex falls through to ``False`` (validator will accept; defence
+    relies on role-swap + statement_timeout as backstop).
+    """
     if node is None:
         return False
     if isinstance(node, exp.Boolean):
         return bool(node.this)
     if isinstance(node, exp.Literal) and not node.is_string:
-        return str(node.name) == "1"
-    if isinstance(node, exp.EQ):
+        # `WHERE 1` style — non-zero numeric literal alone is truthy.
+        try:
+            return float(node.name) != 0
+        except ValueError:
+            return False
+    if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         left = node.this
         right = node.expression
         if left is None or right is None:
             return False
-        if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
-            return left.name == right.name
-        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+        # column = same column
+        if (
+            isinstance(node, exp.EQ)
+            and isinstance(left, exp.Column)
+            and isinstance(right, exp.Column)
+        ):
             return (
                 left.sql(dialect="postgres").lower()
                 == right.sql(dialect="postgres").lower()
             )
+        if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
+            return _literal_comparison_holds(node, left, right)
+    return False
+
+
+def _literal_comparison_holds(
+    op: exp.Expression, left: exp.Literal, right: exp.Literal
+) -> bool:
+    """Evaluate a comparison between two literals at parse time.
+
+    Both literals are coerced to floats when both are numeric strings;
+    otherwise falls back to string comparison. Returns False on any
+    coercion failure (we'd rather miss a tautology than wrongly reject).
+    """
+    try:
+        if not left.is_string and not right.is_string:
+            lv: float | str = float(left.name)
+            rv: float | str = float(right.name)
+        else:
+            lv = str(left.name)
+            rv = str(right.name)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(op, exp.EQ):
+        return lv == rv
+    if isinstance(op, exp.NEQ):
+        return lv != rv
+    if isinstance(op, exp.GT):
+        return lv > rv  # type: ignore[operator]
+    if isinstance(op, exp.GTE):
+        return lv >= rv  # type: ignore[operator]
+    if isinstance(op, exp.LT):
+        return lv < rv  # type: ignore[operator]
+    if isinstance(op, exp.LTE):
+        return lv <= rv  # type: ignore[operator]
     return False

@@ -499,11 +499,16 @@ async def _run_sql_general_turn(
 
     # Server-computed audit numbers: rely on the tool-call trace, not the
     # LLM-supplied `row_evidence` (the model can hallucinate that value).
+    # Count BOTH successful and failed SQL attempts so the admin audit row
+    # is written on problematic turns too — closing the observability gap
+    # called out in review (P2 codex thread).
+    sql_attempts = 0
     sql_executions = 0
     server_row_total = 0
     for tc in qa.tool_calls:
         if tc.name not in ("run_select_ts", "run_select_static"):
             continue
+        sql_attempts += 1
         if not tc.ok:
             continue
         sql_executions += 1
@@ -520,6 +525,7 @@ async def _run_sql_general_turn(
         {
             "iterations": qa.iterations,
             "tool_call_count": len(qa.tool_calls),
+            "sql_attempts": sql_attempts,
             "sql_executions": sql_executions,
             "server_row_total": server_row_total,
             "model_row_evidence": qa.row_evidence,
@@ -527,11 +533,12 @@ async def _run_sql_general_turn(
         },
     )
 
-    # Mirror to admin audit feed for EVERY turn that executed at least one
-    # SQL tool — observability gaps on non-success runs were called out in
-    # review. The audit row uses the server-counted total, not the LLM's
-    # claimed `row_evidence`.
-    if sql_executions > 0:
+    # Mirror to admin audit feed for EVERY turn that ATTEMPTED at least one
+    # SQL tool — observability gaps on failure-only runs were called out in
+    # review (P2). The row records server-counted successful rows; failed
+    # attempts still leave a trail via agent_runs.steps_json + the run_id
+    # back-reference in the audit metadata.
+    if sql_attempts > 0:
         await write_agent_query_audit(
             ts_pool, auth, run_id, "sql_general", server_row_total
         )

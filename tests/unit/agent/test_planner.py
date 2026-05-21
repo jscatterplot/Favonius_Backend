@@ -39,11 +39,17 @@ def test_general_question_routes_to_sql_general(monkeypatch):
     assert d.route == "sql_general"
 
 
-def test_general_question_refused_when_sql_mode_off(monkeypatch):
+def test_general_question_falls_back_to_consumption_when_sql_mode_off(monkeypatch):
+    # When SQL mode is off (the default during rollout), non-trigger
+    # messages fall back to the consumption_by_user fast path. The
+    # intent compiler's LLM extractor then refuses if the message
+    # is not a consumption question — preserving the legacy behaviour
+    # from before SQL mode existed and keeping all 50 golden
+    # consumption prompts on the fast path.
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "false")
     d = classify("Which depot consumed the most?", organization_id=ORG_A)
-    assert d.route == "refuse"
-    assert d.reason == "sql_mode_disabled"
+    assert d.route == "consumption_by_user"
+    assert d.reason == "consumption_fallback_no_sql_mode"
 
 
 def test_anti_pattern_pulls_consumption_to_sql_general(monkeypatch):
@@ -63,18 +69,21 @@ def test_allowlist_match_routes_sql_general(monkeypatch):
     assert d.route == "sql_general"
 
 
-def test_allowlist_miss_refuses(monkeypatch):
+def test_allowlist_miss_falls_back_to_consumption(monkeypatch):
+    # Allowlist miss is functionally equivalent to SQL mode off for
+    # this org — fall back to consumption_by_user, not refuse.
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
     monkeypatch.setenv("AGENT_SQL_ORG_ALLOWLIST", str(ORG_B))
     d = classify("Which chargers are faulted?", organization_id=ORG_A)
-    assert d.route == "refuse"
+    assert d.route == "consumption_by_user"
+    assert d.reason == "consumption_fallback_no_sql_mode"
 
 
-def test_allowlist_no_org_id_refuses(monkeypatch):
+def test_allowlist_no_org_id_falls_back(monkeypatch):
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
     monkeypatch.setenv("AGENT_SQL_ORG_ALLOWLIST", str(ORG_A))
     d = classify("Which chargers?", organization_id=None)
-    assert d.route == "refuse"
+    assert d.route == "consumption_by_user"
 
 
 def test_empty_message_refused(monkeypatch):

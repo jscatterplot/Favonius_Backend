@@ -123,12 +123,15 @@ def classify(
     if is_sql_mode_enabled() and is_org_in_sql_allowlist(organization_id):
         return PlannerDecision(route="sql_general", reason="sql_mode_route")
 
-    # SQL mode off → only consumption_by_user is reachable.
-    if consumption_match:
-        # Anti-pattern matched but no SQL mode — best effort fall back.
-        return PlannerDecision(
-            route="consumption_by_user",
-            reason="consumption_fallback_no_sql_mode",
-        )
-
-    return PlannerDecision(route="refuse", reason="sql_mode_disabled")
+    # SQL mode off → fall back to the consumption fast path. The intent
+    # compiler has its own extraction step that returns a refusal if it
+    # cannot recognise the question — keeping the legacy behaviour from
+    # before SQL mode existed. Without this fallback, ~half of the 50
+    # golden consumption prompts (any that don't match the narrow
+    # _CONSUMPTION_TRIGGERS regexes) regress to `refuse` during the
+    # default-off rollout period, e.g. "What did Lukas Jankauskas charge
+    # last month?", "Show energy for Smith this week", etc.
+    return PlannerDecision(
+        route="consumption_by_user",
+        reason="consumption_fallback_no_sql_mode",
+    )
