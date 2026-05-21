@@ -46,7 +46,7 @@ class TestMetricsAuth:
         assert response.status_code == 401
 
     def test_401_when_authorization_uses_basic_scheme(self):
-        """Constant-time compare against the full ``Bearer <token>`` string."""
+        """Scheme is matched case-insensitively but only ``bearer`` is accepted."""
         with patch("src.api.main._METRICS_TOKEN", "test-token"):
             response = _client().get(
                 "/metrics", headers={"Authorization": "Basic dGVzdC10b2tlbg=="}
@@ -62,6 +62,29 @@ class TestMetricsAuth:
         # Prometheus text exposition format. Body may be empty in a stripped
         # registry — content-type is the stable signal.
         assert response.headers["content-type"].startswith("text/plain")
+
+    def test_200_with_lowercase_bearer_scheme(self):
+        """RFC 7235: HTTP auth scheme is case-insensitive."""
+        with patch("src.api.main._METRICS_TOKEN", "test-token"):
+            response = _client().get(
+                "/metrics", headers={"Authorization": "bearer test-token"}
+            )
+        assert response.status_code == 200
+
+    def test_200_with_mixed_case_bearer_scheme(self):
+        with patch("src.api.main._METRICS_TOKEN", "test-token"):
+            response = _client().get(
+                "/metrics", headers={"Authorization": "BeArEr test-token"}
+            )
+        assert response.status_code == 200
+
+    def test_401_when_token_case_differs(self):
+        """The token itself (the secret) remains case-sensitive."""
+        with patch("src.api.main._METRICS_TOKEN", "test-token"):
+            response = _client().get(
+                "/metrics", headers={"Authorization": "Bearer Test-Token"}
+            )
+        assert response.status_code == 401
 
     def test_bearer_token_with_special_chars_does_not_match_substring(self):
         """Catch any future regression where a substring compare slips in."""
