@@ -225,7 +225,11 @@ async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
 # Security: INTERNAL_API_TOKEN required in production (M1).
 # When unset, /internal/ocpp-event refuses every request (C3 fail-closed).
 _INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
-_environment = os.getenv("ENVIRONMENT", "development")
+# Normalize so ``Production``, ``production ``, and ``PRODUCTION`` all
+# trigger the production-only safety guards downstream. A strict
+# case-sensitive compare would silently let a misconfigured deploy boot
+# without the required secrets.
+_environment = os.getenv("ENVIRONMENT", "development").strip().lower()
 if _environment == "production" and not _INTERNAL_API_TOKEN:
     raise RuntimeError(
         "INTERNAL_API_TOKEN must be set in production. "
@@ -235,6 +239,29 @@ if not _INTERNAL_API_TOKEN:
     logger.warning(
         "INTERNAL_API_TOKEN is not set; /internal/ocpp-event will refuse every "
         "request with 503 until the token is configured."
+    )
+
+# Security: METRICS_TOKEN gates /metrics. Prometheus output carries per-depot
+# labels, optimization counts, OCPP session counts, and agent token usage —
+# enough to fingerprint customer activity. Without a token the endpoint
+# refuses every request so the production deploy fails closed rather than
+# silently exposing operational data. Scrapers configure the token via
+# Prometheus' ``authorization.credentials_file``.
+#
+# ``strip()`` so a whitespace/newline-only value (mistakes from secrets
+# tooling, e.g. a trailing newline in a Kubernetes Secret) is treated the
+# same as unset — otherwise the production fail-fast would pass and every
+# scrape would then 401 with no obvious reason.
+_METRICS_TOKEN = os.getenv("METRICS_TOKEN", "").strip()
+if _environment == "production" and not _METRICS_TOKEN:
+    raise RuntimeError(
+        "METRICS_TOKEN must be set in production. "
+        "The /metrics endpoint exposes operational data without it."
+    )
+if not _METRICS_TOKEN:
+    logger.warning(
+        "METRICS_TOKEN is not set; /metrics will refuse every request "
+        "with 503 until the token is configured."
     )
 
 
@@ -8484,23 +8511,53 @@ async def health_check(response: Response):
     summary="Prometheus metrics endpoint",
     description="""
     Expose Prometheus metrics for monitoring and observability.
-    
+
     Returns metrics in Prometheus text format including:
     - Optimization run counts and durations
     - Vehicle SoC metrics
     - Grid power and peak demand
     - System performance metrics
     - Control loop metrics
-    
-    Reference: Development plan Step 7.2
+
+    **Authentication:** Requires ``Authorization: Bearer <METRICS_TOKEN>``.
+    Configure Prometheus via ``authorization.credentials_file`` so the
+    scrape config carries the token.
     """,
     include_in_schema=False,  # Hide from OpenAPI docs (internal endpoint)
 )
-async def metrics():
+async def metrics(request: Request):
     """Prometheus metrics endpoint.
 
-    Reference: Development plan Step 7.2
+    Refuses every request when ``METRICS_TOKEN`` is unset (503) so an
+    unconfigured deploy never leaks operational data. Otherwise parses
+    ``Authorization`` as a Bearer credential — RFC 7235 declares HTTP
+    auth schemes case-insensitive, so ``bearer`` and ``Bearer`` are
+    equivalent — and constant-time-compares the token against
+    ``METRICS_TOKEN``. Returns 401 on mismatch.
     """
+    if not _METRICS_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Metrics endpoint not configured (METRICS_TOKEN missing)",
+        )
+    auth_header = request.headers.get("Authorization", "")
+    # RFC 7235 BNF: ``credentials = auth-scheme 1*SP token68``. Partition at
+    # the first SP and ``lstrip`` any extras so a header like
+    # ``Bearer   <token>`` (multiple SPs from a permissive proxy) is still
+    # accepted. The token itself must remain a constant-time compare.
+    scheme, separator, rest = auth_header.partition(" ")
+    presented_token = rest.lstrip(" ")
+    if not separator or scheme.lower() != "bearer" or not presented_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    # ``compare_digest`` raises ``TypeError`` on non-ASCII ``str`` inputs, so
+    # a request carrying ``Authorization: Bearer <obs-text>`` would otherwise
+    # surface as a 500 instead of a clean 401. Encode both sides to bytes —
+    # constant-time semantics are preserved and any byte sequence compares
+    # cleanly without raising.
+    if not secrets.compare_digest(
+        presented_token.encode("utf-8"), _METRICS_TOKEN.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 

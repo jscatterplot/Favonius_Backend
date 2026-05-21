@@ -33,14 +33,25 @@ class AuthManager:
             max_size=1000, default_ttl=timedelta(seconds=300)
         )
 
-        # JWT settings
-        self.jwt_secret = os.getenv("WS_AUTH_JWT_SIGNING_KEY") or config.service_key
-        if not os.getenv("WS_AUTH_JWT_SIGNING_KEY"):
-            self.logger.warning(
-                "WS_AUTH_JWT_SIGNING_KEY is not set; falling back to Supabase service key. "
-                "Set WS_AUTH_JWT_SIGNING_KEY in production to enforce key separation."
+        # JWT settings. WS_AUTH_JWT_SIGNING_KEY is required: silent fallback to
+        # SUPABASE_SERVICE_KEY (the most privileged credential in the project)
+        # would mean every WebSocket JWT is signed with a key that grants full
+        # database access, so a single leaked WS token becomes a forgery oracle
+        # for arbitrary credentials. Fail fast at construction instead.
+        # ``strip()`` so a whitespace/newline-only value (a common copy-paste
+        # mishap from secrets tooling) is treated the same as unset.
+        raw_signing_key = os.environ.get("WS_AUTH_JWT_SIGNING_KEY", "")
+        self.jwt_secret = raw_signing_key.strip()
+        if not self.jwt_secret:
+            raise RuntimeError(
+                "WS_AUTH_JWT_SIGNING_KEY is required. Generate one with "
+                "`openssl rand -base64 48` and set it on the WebSocket Handler "
+                "service. Do NOT reuse SUPABASE_SERVICE_KEY — it has full "
+                "database access and must not sign end-user JWTs."
             )
-        self.jwt_previous_secret = os.getenv("WS_AUTH_JWT_SIGNING_KEY_PREVIOUS")
+        raw_previous_secret = os.getenv("WS_AUTH_JWT_SIGNING_KEY_PREVIOUS", "")
+        previous_secret = raw_previous_secret.strip()
+        self.jwt_previous_secret = previous_secret or None
         self.jwt_algorithm = "HS256"
         self.token_expiry = timedelta(minutes=15)
         self.jwt_issuer = os.getenv("WS_AUTH_JWT_ISSUER", "favonius-websocket-handler")

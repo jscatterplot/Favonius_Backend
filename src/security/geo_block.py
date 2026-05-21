@@ -559,14 +559,26 @@ def check_ip_blocked(ip_str: str) -> GeoBlockResult:
 # peers would let attackers spoof their origin country.
 
 
-def _extract_forwarded_ip(headers: object) -> Optional[str]:
+def _extract_forwarded_ip(
+    headers: object,
+    *,
+    trusted_networks: tuple = (),
+    trust_implicit_private: bool = False,
+) -> Optional[str]:
     """Extract the original client IP from common reverse-proxy headers.
 
     Order of precedence: RFC 7239 ``Forwarded`` > ``X-Forwarded-For`` >
-    ``X-Real-IP``. For ``X-Forwarded-For`` with multiple hops, the leftmost
-    valid IP is returned (that is the original client).
+    ``X-Real-IP``. With trust info, the chain is walked right-to-left
+    skipping trusted-proxy hops; the rightmost non-trusted entry wins so
+    a prepended ``X-Forwarded-For: <spoofed>`` cannot bypass geo-blocking.
+    Without trust info, falls back to legacy leftmost-wins for backwards
+    compatibility.
     """
-    return extract_forwarded_ip(headers)
+    return extract_forwarded_ip(
+        headers,
+        trusted_networks=trusted_networks,
+        trust_implicit_private=trust_implicit_private,
+    )
 
 
 def _parse_ip_networks(
@@ -650,13 +662,22 @@ class GeoBlockMiddleware(BaseHTTPMiddleware):
         )
 
     def _resolve_client_ip(self, request: Request) -> Optional[str]:
-        """Resolve the effective client IP, honouring trusted proxy headers."""
+        """Resolve the effective client IP, honouring trusted proxy headers.
+
+        The parser is given the same trust configuration this middleware
+        uses to vet the peer so it can skip intermediate-proxy entries
+        when walking ``X-Forwarded-For`` right-to-left.
+        """
         peer_ip = request.client.host if request.client else None
         if not peer_ip:
             return None
         if not self._is_trusted_proxy(peer_ip):
             return peer_ip
-        forwarded_ip = _extract_forwarded_ip(request.headers)
+        forwarded_ip = _extract_forwarded_ip(
+            request.headers,
+            trusted_networks=tuple(self._trusted_proxy_networks),
+            trust_implicit_private=self._trust_proxy_headers,
+        )
         return forwarded_ip or peer_ip
 
     async def dispatch(self, request: Request, call_next):
