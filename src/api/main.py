@@ -236,6 +236,24 @@ if not _INTERNAL_API_TOKEN:
         "request with 503 until the token is configured."
     )
 
+# Security: METRICS_TOKEN gates /metrics. Prometheus output carries per-depot
+# labels, optimization counts, OCPP session counts, and agent token usage —
+# enough to fingerprint customer activity. Without a token the endpoint
+# refuses every request so the production deploy fails closed rather than
+# silently exposing operational data. Scrapers configure the token via
+# Prometheus' ``authorization.credentials_file``.
+_METRICS_TOKEN = os.getenv("METRICS_TOKEN", "")
+if _environment == "production" and not _METRICS_TOKEN:
+    raise RuntimeError(
+        "METRICS_TOKEN must be set in production. "
+        "The /metrics endpoint exposes operational data without it."
+    )
+if not _METRICS_TOKEN:
+    logger.warning(
+        "METRICS_TOKEN is not set; /metrics will refuse every request "
+        "with 503 until the token is configured."
+    )
+
 
 async def _heartbeat_loop(ts_pool: asyncpg.Pool) -> None:
     """Write optimizer heartbeat to TimescaleDB every 30 s.
@@ -8283,23 +8301,37 @@ async def health_check(response: Response):
     summary="Prometheus metrics endpoint",
     description="""
     Expose Prometheus metrics for monitoring and observability.
-    
+
     Returns metrics in Prometheus text format including:
     - Optimization run counts and durations
     - Vehicle SoC metrics
     - Grid power and peak demand
     - System performance metrics
     - Control loop metrics
-    
-    Reference: Development plan Step 7.2
+
+    **Authentication:** Requires ``Authorization: Bearer <METRICS_TOKEN>``.
+    Configure Prometheus via ``authorization.credentials_file`` so the
+    scrape config carries the token.
     """,
     include_in_schema=False,  # Hide from OpenAPI docs (internal endpoint)
 )
-async def metrics():
+async def metrics(request: Request):
     """Prometheus metrics endpoint.
 
-    Reference: Development plan Step 7.2
+    Refuses every request when ``METRICS_TOKEN`` is unset (503) so an
+    unconfigured deploy never leaks operational data. Otherwise compares
+    the ``Authorization`` header in constant time against ``Bearer
+    {METRICS_TOKEN}`` and returns 401 on mismatch.
     """
+    if not _METRICS_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Metrics endpoint not configured (METRICS_TOKEN missing)",
+        )
+    auth_header = request.headers.get("Authorization", "")
+    expected = f"Bearer {_METRICS_TOKEN}"
+    if not secrets.compare_digest(auth_header, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
