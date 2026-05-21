@@ -131,6 +131,9 @@ async def reconcile_session_log(
             log_import_id,
             session["station_id"],
             session["transaction_id"],
+            session["connector_id"],
+            session["start_time"],
+            session["end_time"],
         )
 
     charger_entries = int(charger_row["sample_count"] or 0) if charger_row else 0
@@ -209,7 +212,15 @@ _CHARGER_AGGREGATE_SQL = """
        -- transactions into this session's aggregate. When transaction_id
        -- is unknown (legacy imports), fall back to "anything in the
        -- import for this station".
-       AND ($3::bigint IS NULL OR transaction_id = $3)
+       AND (
+            ($3::bigint IS NOT NULL AND transaction_id = $3)
+            OR (
+                $3::bigint IS NULL
+                AND ($4::int IS NULL OR connector_id = $4)
+                AND ($5::timestamptz IS NULL OR time >= $5)
+                AND ($6::timestamptz IS NULL OR time <= $6)
+            )
+       )
 """
 
 

@@ -320,9 +320,9 @@ async def dispatch_get_diagnostics(
 
     token_ttl_s = get_token_ttl_seconds()
     if expires_in_min is None:
-        queue_expires_in_min = max(1, token_ttl_s // 60)
+        queue_expires_in_min = max(1, (token_ttl_s + 59) // 60)
     else:
-        queue_expires_in_min = min(expires_in_min, max(1, token_ttl_s // 60))
+        queue_expires_in_min = min(expires_in_min, max(1, (token_ttl_s + 59) // 60))
 
     import_id = uuid4()
     # Mint exactly once so the token embedded in the URL is the same

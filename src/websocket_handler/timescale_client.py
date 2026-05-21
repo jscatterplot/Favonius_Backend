@@ -3335,10 +3335,13 @@ class TimescaleClient:
                            error_message,
                            'upload window elapsed without receiving file'
                        )
-                 WHERE status IN ('requested', 'uploading')
-                   AND requested_at <= NOW() - ($1 || ' seconds')::interval
+                 WHERE (
+                        (status = 'requested' AND requested_at <= NOW() - ($1 || ' seconds')::interval)
+                        OR (status = 'uploading' AND requested_at <= NOW() - ($2 || ' seconds')::interval)
+                   )
                 """,
                 str(int(ttl_seconds)),
+                str(max(int(ttl_seconds), int(ttl_seconds) * 2)),
             )
             try:
                 return int(result.split()[-1])
