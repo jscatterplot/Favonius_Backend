@@ -1071,7 +1071,7 @@ def _is_unconditional_true(node: exp.Expression | None) -> bool:
     Catches a small grammar of literal tautologies:
 
     * ``TRUE`` / non-zero integer literal
-    * Self-equality on columns: ``hour = hour``
+    * Self-comparison on columns: ``hour = hour``, ``hour >= hour``, etc.
     * Literal-vs-literal binary comparisons evaluated at parse time:
       ``1 = 1``, ``2 > 1``, ``1 < 2``, ``1 <> 0``, ``1 >= 1``, etc.
 
@@ -1102,9 +1102,9 @@ def _is_unconditional_true(node: exp.Expression | None) -> bool:
         right = node.expression
         if left is None or right is None:
             return False
-        # column = same column
+        # column compared to itself (EQ / GTE / LTE are tautologies)
         if (
-            isinstance(node, exp.EQ)
+            isinstance(node, (exp.EQ, exp.GTE, exp.LTE))
             and isinstance(left, exp.Column)
             and isinstance(right, exp.Column)
         ):

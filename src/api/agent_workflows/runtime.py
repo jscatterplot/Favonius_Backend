@@ -976,6 +976,8 @@ async def run_qa_turn(
     except Exception as exc:
         if not hasattr(exc, "iterations"):
             exc.iterations = iterations  # type: ignore[attr-defined]
+        if not hasattr(exc, "tool_calls"):
+            exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
         raise
 
     return QAResult(

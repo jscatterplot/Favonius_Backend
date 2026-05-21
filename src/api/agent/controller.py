@@ -478,6 +478,53 @@ def _sql_functions_accessed(tool_calls: Any) -> list[str]:
     return ordered
 
 
+async def _mirror_sql_general_audit_from_calls(
+    *,
+    ts_pool: Any,
+    auth: Any,
+    run_id: UUID,
+    partial_calls: list,
+    abort_reason: str,
+) -> None:
+    """Mirror admin audit when SQL tools ran before an abort (P2 observability)."""
+    sql_attempts = 0
+    server_row_total = 0
+    for tc in partial_calls:
+        if tc.name not in ("run_select_ts", "run_select_static"):
+            continue
+        sql_attempts += 1
+        if not tc.ok:
+            continue
+        result = tc.result if isinstance(tc.result, dict) else {}
+        try:
+            server_row_total += int(result.get("row_count", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    if sql_attempts <= 0:
+        return
+    await agent_runs_step(
+        ts_pool,
+        run_id,
+        "sql_loop_aborted",
+        {
+            "tool_call_count": len(partial_calls),
+            "sql_attempts": sql_attempts,
+            "server_row_total": server_row_total,
+            "abort_reason": abort_reason,
+        },
+    )
+    partial_functions_accessed = _sql_functions_accessed(partial_calls)
+    await write_agent_query_audit(
+        ts_pool,
+        auth,
+        run_id,
+        "sql_general",
+        server_row_total,
+        target_type=sql_audit_target_type(partial_functions_accessed),
+        functions_accessed=partial_functions_accessed or None,
+    )
+
+
 async def _run_sql_general_turn(
     *,
     run_id: UUID,
@@ -552,47 +599,13 @@ async def _run_sql_general_turn(
         # before any tool dispatch in this turn) — falls through with
         # an empty list.
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
-        sql_attempts = 0
-        server_row_total = 0
-        for tc in partial_calls:
-            if tc.name not in ("run_select_ts", "run_select_static"):
-                continue
-            sql_attempts += 1
-            if not tc.ok:
-                continue
-            result = tc.result if isinstance(tc.result, dict) else {}
-            try:
-                server_row_total += int(result.get("row_count", 0) or 0)
-            except (TypeError, ValueError):
-                pass
-        if sql_attempts > 0:
-            await agent_runs_step(
-                ts_pool,
-                run_id,
-                "sql_loop_aborted",
-                {
-                    "tool_call_count": len(partial_calls),
-                    "sql_attempts": sql_attempts,
-                    "server_row_total": server_row_total,
-                    "abort_reason": type(exc).__name__,
-                },
-            )
-            # Use the SQL-mode target_type / functions_accessed (same as
-            # the success path) so the audit row is filterable by the
-            # actual tables touched, not mislabelled as a consumption
-            # turn (P2 codex / M-sev bugbot: the default
-            # target_type='charging_sessions' is the consumption path's
-            # value and would silently mis-classify SQL-mode aborts).
-            partial_functions_accessed = _sql_functions_accessed(partial_calls)
-            await write_agent_query_audit(
-                ts_pool,
-                auth,
-                run_id,
-                "sql_general",
-                server_row_total,
-                target_type=sql_audit_target_type(partial_functions_accessed),
-                functions_accessed=partial_functions_accessed or None,
-            )
+        await _mirror_sql_general_audit_from_calls(
+            ts_pool=ts_pool,
+            auth=auth,
+            run_id=run_id,
+            partial_calls=partial_calls,
+            abort_reason=type(exc).__name__,
+        )
         reply = AgentReply.error(run_id=run_id)
         try:
             await agent_runs_close(ts_pool, run_id, "error", reply)
@@ -602,6 +615,14 @@ async def _run_sql_general_turn(
         return reply
     except Exception as exc:
         sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
+        partial_calls = list(getattr(exc, "tool_calls", []) or [])
+        await _mirror_sql_general_audit_from_calls(
+            ts_pool=ts_pool,
+            auth=auth,
+            run_id=run_id,
+            partial_calls=partial_calls,
+            abort_reason=type(exc).__name__,
+        )
         raise
     else:
         sql_tool_turns = qa.iterations
