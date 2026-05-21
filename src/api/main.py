@@ -224,7 +224,11 @@ async def _create_pool(url: str, url_source: str) -> asyncpg.Pool:
 # Security: INTERNAL_API_TOKEN required in production (M1).
 # When unset, /internal/ocpp-event refuses every request (C3 fail-closed).
 _INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
-_environment = os.getenv("ENVIRONMENT", "development")
+# Normalize so ``Production``, ``production ``, and ``PRODUCTION`` all
+# trigger the production-only safety guards downstream. A strict
+# case-sensitive compare would silently let a misconfigured deploy boot
+# without the required secrets.
+_environment = os.getenv("ENVIRONMENT", "development").strip().lower()
 if _environment == "production" and not _INTERNAL_API_TOKEN:
     raise RuntimeError(
         "INTERNAL_API_TOKEN must be set in production. "
@@ -8319,9 +8323,11 @@ async def metrics(request: Request):
     """Prometheus metrics endpoint.
 
     Refuses every request when ``METRICS_TOKEN`` is unset (503) so an
-    unconfigured deploy never leaks operational data. Otherwise compares
-    the ``Authorization`` header in constant time against ``Bearer
-    {METRICS_TOKEN}`` and returns 401 on mismatch.
+    unconfigured deploy never leaks operational data. Otherwise parses
+    ``Authorization`` as a Bearer credential — RFC 7235 declares HTTP
+    auth schemes case-insensitive, so ``bearer`` and ``Bearer`` are
+    equivalent — and constant-time-compares the token against
+    ``METRICS_TOKEN``. Returns 401 on mismatch.
     """
     if not _METRICS_TOKEN:
         raise HTTPException(
@@ -8329,8 +8335,10 @@ async def metrics(request: Request):
             detail="Metrics endpoint not configured (METRICS_TOKEN missing)",
         )
     auth_header = request.headers.get("Authorization", "")
-    expected = f"Bearer {_METRICS_TOKEN}"
-    if not secrets.compare_digest(auth_header, expected):
+    scheme, _, presented_token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not presented_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not secrets.compare_digest(presented_token, _METRICS_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
