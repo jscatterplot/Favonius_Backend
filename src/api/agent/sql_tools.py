@@ -157,7 +157,9 @@ def build_sql_agent_tool_registry(
         )
         v = validate_sql(sql, allowed_functions=allowed, row_limit=n)
         if not v.ok:
+            AGENT_SQL_VALIDATIONS.labels(verdict=f"rejected:{v.error_kind}").inc()
             return {"error": f"validator rejected sample query: {v.error_kind}: {v.error}"}
+        AGENT_SQL_VALIDATIONS.labels(verdict="accepted").inc()
         try:
             r = await run_select(
                 pool=pool,
@@ -167,8 +169,15 @@ def build_sql_agent_tool_registry(
                 pool_label=label,
                 row_cap=n,
             )
-        except (SqlExecutorPlanError, SqlExecutorError) as e:
-            return {"error": str(e)}
+        except SqlExecutorRoleError as e:
+            logger.error("agent role-swap failure pool=%s: %s", label, e)
+            return {"error": "Internal authorisation error.", "error_kind": "role_error"}
+        except SqlExecutorPlanError as e:
+            return {"error": str(e), "error_kind": "plan_error"}
+        except SqlExecutorTimeoutError as e:
+            return {"error": str(e), "error_kind": "timeout"}
+        except SqlExecutorError as e:
+            return {"error": str(e), "error_kind": "exec_error"}
         return {
             "table": f"agent_views.{table_in}",
             "column": column,
