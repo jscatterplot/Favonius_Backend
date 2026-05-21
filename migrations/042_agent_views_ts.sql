@@ -311,12 +311,21 @@ CREATE TRIGGER trg_agent_runs_append_only
 
 -- agent_runs.steps_json gets appended to via UPDATE during a turn (the
 -- existing audit.py writers do this). We allow UPDATE but only of the
--- specific columns the orchestrator writes: status, steps_json,
--- duration_ms, final_intent. Other column updates are rejected.
+-- specific columns the orchestrator writes (status, steps_json,
+-- duration_ms, final_intent), AND we enforce true append-only semantics
+-- on `steps_json` itself: the new JSONB array MUST contain the old
+-- array as a prefix. Pruning or rewriting prior step elements is
+-- rejected — that's the forensic-integrity contract called out by
+-- review (P1 codex, agent SQL S3). status/duration_ms/final_intent are
+-- left mutable because the application's error path may legitimately
+-- need to overwrite a terminal status if a post-close step fails.
 CREATE OR REPLACE FUNCTION agent_runs_restricted_update_guard()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    old_len int;
+    i int;
 BEGIN
     IF NEW.run_id          IS DISTINCT FROM OLD.run_id
     OR NEW.user_id         IS DISTINCT FROM OLD.user_id
@@ -331,6 +340,39 @@ BEGIN
             'status, steps_json, duration_ms, final_intent are mutable.'
         USING ERRCODE = 'check_violation';
     END IF;
+
+    -- steps_json: append-only. The new array must be at least as long
+    -- as the old array AND every old element must remain at the same
+    -- index. NULL old defaults to empty so first-write goes through.
+    IF NEW.steps_json IS DISTINCT FROM OLD.steps_json THEN
+        IF NEW.steps_json IS NULL
+        OR jsonb_typeof(NEW.steps_json) IS DISTINCT FROM 'array'
+        OR jsonb_typeof(COALESCE(OLD.steps_json, '[]'::jsonb)) IS DISTINCT FROM 'array'
+        THEN
+            RAISE EXCEPTION
+                'agent_runs.steps_json must be a JSONB array (got %).',
+                jsonb_typeof(NEW.steps_json)
+            USING ERRCODE = 'check_violation';
+        END IF;
+        old_len := jsonb_array_length(COALESCE(OLD.steps_json, '[]'::jsonb));
+        IF jsonb_array_length(NEW.steps_json) < old_len THEN
+            RAISE EXCEPTION
+                'agent_runs.steps_json is append-only: cannot shrink from % '
+                'to % elements.',
+                old_len, jsonb_array_length(NEW.steps_json)
+            USING ERRCODE = 'check_violation';
+        END IF;
+        FOR i IN 0 .. old_len - 1 LOOP
+            IF NEW.steps_json -> i IS DISTINCT FROM OLD.steps_json -> i THEN
+                RAISE EXCEPTION
+                    'agent_runs.steps_json is append-only: existing step at '
+                    'index % cannot be modified.',
+                    i
+                USING ERRCODE = 'check_violation';
+            END IF;
+        END LOOP;
+    END IF;
+
     RETURN NEW;
 END;
 $$;
