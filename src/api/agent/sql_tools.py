@@ -357,8 +357,19 @@ def build_sql_agent_tool_registry(
     )
 
     # ── emit_final_answer (terminator) ──────────────────────────────────
-    async def _emit_final_answer(*, text: str, row_evidence: int = 0, **_: Any) -> dict:
-        return {"text": text, "row_evidence": int(row_evidence)}
+    async def _emit_final_answer(*, text: str, row_evidence: Any = 0, **_: Any) -> dict:
+        # Defensively coerce row_evidence: the LLM occasionally passes
+        # a stringified count ("42 rows") or null instead of the integer
+        # the schema declares. A raw `int(row_evidence)` would raise
+        # ValueError/TypeError, the runtime would catch it as a generic
+        # tool failure, and the user would just see another retry — no
+        # cleanly classified failure. Clamp to a sane non-negative int
+        # so the terminator always returns a well-formed result.
+        try:
+            evidence = int(row_evidence)
+        except (TypeError, ValueError):
+            evidence = 0
+        return {"text": str(text or ""), "row_evidence": max(0, evidence)}
 
     registry.register(
         EMIT_FINAL_ANSWER_TOOL,
