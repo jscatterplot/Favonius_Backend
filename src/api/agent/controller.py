@@ -304,17 +304,9 @@ async def run_turn(
         await _emit_step("planner_decision", f"{decision.route} ({decision.reason})")
 
         if decision.route == "refuse":
-            if decision.reason == "empty_message":
-                reply_text = (
-                    "Please enter a question about depot charging or analytics."
-                )
-            else:
-                reply_text = (
-                    "I can only answer depot analytics questions, and right "
-                    "now my analytical mode is disabled for your organisation. "
-                    "Try a consumption question like 'how much did <driver> "
-                    "charge last month?'."
-                )
+            reply_text = (
+                "Please enter a question about depot charging or analytics."
+            )
             reply = AgentReply(
                 run_id=run_id,
                 status="not_found",

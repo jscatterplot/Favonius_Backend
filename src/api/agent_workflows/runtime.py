@@ -39,7 +39,6 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from src.api.agent.auth_context import AuthContext
-from src.api.agent.sql_tools import EMIT_FINAL_ANSWER_TOOL
 from src.api.agent_workflows.constraints import (
     ConstraintViolation,
     DepotConstraints,
@@ -72,6 +71,7 @@ logger = logging.getLogger(__name__)
 # schema-validated shape. Naming is part of the contract; do not rename
 # without a coordinated prompt change.
 EMIT_DECISION_TOOL_NAME: str = "emit_decision"
+EMIT_FINAL_ANSWER_TOOL: str = "emit_final_answer"
 
 
 # Sprint-1's launch default for a workflow without an explicit
@@ -722,7 +722,7 @@ async def run_qa_turn(
         tool_registry: Registry containing the SQL agent tools and the
             ``emit_final_answer`` terminator.
         allowed_tools: Tool names from ``tool_registry`` the LLM may
-            call. Must include :data:`~src.api.agent.sql_tools.EMIT_FINAL_ANSWER_TOOL`.
+            call. Must include :data:`~src.api.agent_workflows.runtime.EMIT_FINAL_ANSWER_TOOL`.
         max_iterations: Hard cap on tool-use turns. Default 8.
         max_tokens, temperature: Anthropic Messages API parameters.
         on_step: Optional async callback invoked after each tool call
