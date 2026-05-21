@@ -859,7 +859,7 @@ async def run_qa_turn(
                 )
                 tool_calls.append(tc)
                 if on_step is not None:
-                    await _safe_on_step(on_step, tc)
+                    await _dispatch_on_step(on_step, tc)
                 if ok:
                     final_text = str(result.get("text", "")).strip()
                     try:
@@ -918,7 +918,7 @@ async def run_qa_turn(
             )
             tool_calls.append(tc)
             if on_step is not None:
-                await _safe_on_step(on_step, tc)
+                await _dispatch_on_step(on_step, tc)
 
             tool_results.append(
                 {
@@ -935,10 +935,13 @@ async def run_qa_turn(
         if terminated:
             break
 
-        stop_reason = getattr(response, "stop_reason", None)
-        if stop_reason == "end_turn":
-            status = "no_terminator"
-            break
+        # No stop-reason early break needed here: the empty
+        # ``tool_use_blocks`` case is handled upstream (line ~801) where
+        # we treat a model that returns text only as ``no_terminator``
+        # and exit. When we get here, ``tool_use_blocks`` was non-empty
+        # which means the Anthropic API set ``stop_reason='tool_use'``
+        # — we always want to loop back so the model can see the
+        # ``tool_result`` payloads we just appended.
     else:
         status = "max_iterations"
 
@@ -951,19 +954,24 @@ async def run_qa_turn(
     )
 
 
-async def _safe_on_step(
+async def _dispatch_on_step(
     cb: Callable[[ToolCall], Any], tc: ToolCall
 ) -> None:
-    """Run the on_step callback, awaiting it if it returns a coroutine.
+    """Dispatch the on_step callback, awaiting it if it returns a coroutine.
 
-    Exceptions PROPAGATE. The SQL controller's on_step persists each
-    tool call to ``agent_runs.steps_json`` and emits step events; if
-    either side effect fails (DB write error, trigger rejection, SSE
-    failure), continuing as if logging succeeded would silently violate
-    the append-only audit trace guarantee. The runtime lets the
-    exception bubble up — the caller's outer except handler will close
-    the run with ``status='error'`` so the audit trail still reflects
-    that something went wrong, even if the per-step row is incomplete.
+    Renamed from ``_safe_on_step`` after review: the "safe" suffix
+    elsewhere in this codebase (cf. ``_emit_answer_safe`` in
+    ``src/api/agent/controller.py``) means "swallows exceptions". This
+    helper used to do that, but it now PROPAGATES — the SQL
+    controller's on_step persists each tool call to
+    ``agent_runs.steps_json`` (which the migration-042 trigger may
+    reject on structural violations) and emits SSE step events; if
+    either side effect fails, continuing as if logging succeeded would
+    silently violate the append-only audit trace guarantee. The
+    runtime lets the exception bubble up — the caller's outer except
+    handler will close the run with ``status='error'`` so the audit
+    trail still reflects that something went wrong, even if the
+    per-step row is incomplete.
     """
     result = cb(tc)
     if hasattr(result, "__await__"):

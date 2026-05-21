@@ -87,6 +87,19 @@ class ExecResult:
 _CELL_BYTE_CAP = 1024
 
 
+# Pre-baked role-swap statements. Defence in depth: the role parameter
+# is already validated against a hardcoded 2-item set below, but
+# building these statements server-side from f-strings keeps a future
+# allowlist relaxation from accidentally opening a SQL-injection
+# surface. PostgreSQL doesn't accept parameterised arguments to
+# `SET LOCAL ROLE` (it's a command-level identifier, not a value), so
+# a literal lookup is the safest option.
+_ROLE_SQL: dict[str, str] = {
+    "agent_reader_ts": "SET LOCAL ROLE agent_reader_ts;",
+    "agent_reader_static": "SET LOCAL ROLE agent_reader_static;",
+}
+
+
 def _truncate_cell(value: Any) -> Any:
     """Cap string-like cells to ``_CELL_BYTE_CAP`` bytes with a marker."""
     if value is None or isinstance(value, (int, float, bool, UUID)):
@@ -154,7 +167,10 @@ async def run_select(
             # to 0. Each statement runs as a simple query.
             async with conn.transaction(readonly=True):
                 try:
-                    await conn.execute(f"SET LOCAL ROLE {role};")
+                    # Look up the pre-baked statement instead of building
+                    # one from f-string interpolation. role is already
+                    # validated above; this is defence in depth.
+                    await conn.execute(_ROLE_SQL[role])
                 except Exception as e:
                     raise SqlExecutorRoleError(
                         f"Could not SET LOCAL ROLE {role}: {e}. The application's "
@@ -169,7 +185,15 @@ async def run_select(
                         f"Aborting turn (fail closed)."
                     )
 
-                await conn.execute(f"SET LOCAL statement_timeout = '{statement_timeout}';")
+                # SET LOCAL statement_timeout via set_config — fully
+                # parameterised path (set_config(name, value, is_local))
+                # so no f-string interpolation reaches the SQL. The
+                # statement_timeout value is already regex-validated
+                # above, but this removes the last interpolation site.
+                await conn.execute(
+                    "SELECT set_config('statement_timeout', $1, true);",
+                    statement_timeout,
+                )
                 await conn.execute("SET LOCAL transaction_read_only = on;")
 
                 # S4: EXPLAIN (FORMAT TEXT) — never ANALYZE.
