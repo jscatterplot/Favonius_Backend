@@ -4268,8 +4268,15 @@ async def import_historical_charging_session(
     # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
     # When both identifiers are absent, classify as platform-initiated import.
     id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
+    # Platform-initiated dedup hashing MUST use the raw file end_time, not
+    # the resolver's output. The hash is the customer's stable identity for
+    # the row across re-uploads, and the resolver may produce different
+    # values for the same file as `session_duration_seconds` is added /
+    # corrected. Using `file_end_time_utc` also preserves backward-compat
+    # with rows persisted pre-resolver: their stored end_time was the raw
+    # file value, and migration 036's backfill used it as such.
     hash_id_token = (
-        _platform_import_hash_token(request, end_time_utc=end_time_utc)
+        _platform_import_hash_token(request, end_time_utc=file_end_time_utc)
         if is_platform_initiated
         else id_token
     )

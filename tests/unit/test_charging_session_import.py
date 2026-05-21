@@ -1492,6 +1492,75 @@ class TestHistoricalChargingSessionImport:
         assert response.status_code == http_status.HTTP_400_BAD_REQUEST
         assert response.json()["error_code"] == "VALIDATION_ERROR"
 
+    def test_platform_import_hash_uses_raw_file_end_not_resolved(
+        self, client, mock_db_pool
+    ):
+        """Platform-initiated dedup hash MUST use the raw file end_time, not
+        the resolver's output. Otherwise re-imports of the same XLSX with a
+        new/corrected `session_duration_seconds` would change the hash and
+        insert a duplicate row instead of merging into the existing one.
+
+        Pins backward-compat with rows persisted pre-resolver, whose stored
+        end_time IS the raw file value (no resolver existed yet).
+        """
+        from datetime import datetime, timezone
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            identity_fetchrows=[],  # platform-initiated: no identity lookups
+            session_id=session_id,
+            org_id=org_id,
+        )
+
+        # File end is in the past and sane on its own (passes _is_sane), but
+        # the duration says something different — within 7d so the resolver
+        # discards the file end and uses start+duration. Hash must still
+        # match what you'd compute from the FILE end_time.
+        payload = _row_payload(
+            id_tag=None,
+            rfid_label=None,
+            start_time_local="2026-05-05 12:00",
+            end_time_local="2026-05-05 18:00",  # +6h file end (sane)
+        )
+        payload["session_duration_seconds"] = 30 * 60  # +30 min computed end
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        bind = _upsert_bind(conn)
+
+        # Resolved end_time is start + 30min = 09:30 UTC (Vilnius 12:30).
+        assert bind[6] == datetime(2026, 5, 5, 9, 30, tzinfo=timezone.utc)
+
+        # But the hash MUST be computed from the RAW file end_time
+        # (18:00 Vilnius = 15:00 UTC), not the resolved one.
+        from src.api.main import HistoricalSessionImport
+
+        request_for_hash = HistoricalSessionImport(**payload)
+        file_end_utc = datetime(2026, 5, 5, 15, 0, tzinfo=timezone.utc)
+        expected_token = _platform_import_hash_token(
+            request_for_hash, end_time_utc=file_end_utc
+        )
+        expected_hash = _compute_import_row_hash(
+            depot_id=depot_id,
+            start_time_utc=datetime(2026, 5, 5, 9, 0, tzinfo=timezone.utc),
+            id_tag=expected_token,
+        )
+        assert bind[11] == expected_hash
+
     def test_import_row_hash_unaffected_by_duration_field(self, client, mock_db_pool):
         """Adding `session_duration_seconds` MUST NOT change the dedup hash —
         otherwise re-imports of the same file would dual-write rows."""
