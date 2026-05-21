@@ -88,6 +88,16 @@ def _is_trusted_proxy_entry(
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
+    # Dual-stack proxies commonly emit IPv4 client addresses as
+    # IPv4-mapped IPv6 (``::ffff:100.64.0.2``, RFC 4291 §2.5.5.2).
+    # Strict ``ip.version == net.version`` matching plus an IPv4-only
+    # CGNAT predicate would otherwise leave the mapped form looking
+    # like an untrusted IPv6 hop, so the right-to-left walk would stop
+    # on the proxy and misattribute every request to it. Normalize to
+    # the underlying IPv4 before both the explicit-CIDR and implicit
+    # CGNAT checks so the walk continues past the proxy as intended.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
     explicitly_trusted = any(
         ip.version == net.version and ip in net for net in trusted_networks
     )

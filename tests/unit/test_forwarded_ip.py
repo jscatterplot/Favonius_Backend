@@ -320,6 +320,59 @@ class TestRepeatedHeaderLines:
         )
 
 
+class TestIpv4MappedIpv6Hops:
+    """Dual-stack proxies frequently emit IPv4 hops as IPv4-mapped IPv6.
+
+    Without normalising ``::ffff:a.b.c.d`` back to ``a.b.c.d`` the
+    strict ``ip.version == net.version`` comparison and the IPv4-only
+    CGNAT check both treat the proxy hop as an untrusted IPv6 entry,
+    the right-to-left walk halts on it, and every request is
+    misattributed to the proxy.
+    """
+
+    def test_cgnat_in_ipv4_mapped_ipv6_form_is_skipped(self):
+        headers = _Headers(
+            {"X-Forwarded-For": "93.184.216.34, ::ffff:100.64.0.2"}
+        )
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "93.184.216.34"
+        )
+
+    def test_spoof_chain_with_ipv4_mapped_proxy_hop(self):
+        """Attacker spoofs leftmost; CGNAT proxy hop is in mapped form."""
+        headers = _Headers(
+            {"X-Forwarded-For": "8.8.8.8, 93.184.216.34, ::ffff:100.64.0.2"}
+        )
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "93.184.216.34"
+        )
+
+    def test_explicit_v4_cidr_matches_ipv4_mapped_hop(self):
+        """An explicit IPv4 proxy CIDR matches its ``::ffff:`` form too."""
+        lb = (_net("198.51.100.0/24"),)
+        headers = _Headers(
+            {"X-Forwarded-For": "93.184.216.34, ::ffff:198.51.100.5"}
+        )
+        assert (
+            extract_forwarded_ip(
+                headers, trusted_networks=lb, trust_implicit_private=False
+            )
+            == "93.184.216.34"
+        )
+
+    def test_real_ipv6_client_not_normalized(self):
+        """Genuine IPv6 client (not a ``::ffff:`` mapping) is returned as-is."""
+        headers = _Headers(
+            {"X-Forwarded-For": "2001:db8::1, 100.64.0.2"}
+        )
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "2001:db8::1"
+        )
+
+
 class TestParseIpNetworks:
     def test_skips_invalid_entries(self):
         nets = parse_ip_networks(

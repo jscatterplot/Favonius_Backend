@@ -119,9 +119,15 @@ class TestMetricsAuth:
         carrying obs-text in the credential would surface as an
         unhandled exception (500) and create a noisy availability
         signal. The handler must treat it as plain unauthorised.
+
+        The Authorization header is shipped as ``bytes`` to bypass
+        httpx's client-side ASCII validation — wire format actually
+        carries arbitrary octets, and Starlette decodes them as
+        latin-1, so the handler sees a non-ASCII ``str`` exactly as
+        it would for a real obs-text request.
         """
         with patch("src.api.main._METRICS_TOKEN", "test-token"):
             response = _client().get(
-                "/metrics", headers={"Authorization": "Bearer wörld"}
+                "/metrics", headers={"Authorization": b"Bearer w\xc3\xb6rld"}
             )
         assert response.status_code == 401
