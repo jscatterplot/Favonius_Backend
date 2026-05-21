@@ -128,6 +128,36 @@ def _select_client_ip(
     return chain[0]
 
 
+def _collect_header_values(headers: object, name: str) -> str:
+    """Return every instance of ``name`` joined with ``, `` for chain parsing.
+
+    RFC 7230 §3.2.2 allows recipients to combine multiple header field
+    lines of the same name into one comma-separated value, OR to emit
+    them as separate lines — both shapes carry the same semantics for
+    list-style headers like ``X-Forwarded-For`` and ``Forwarded``. The
+    naive ``headers.get("X-Forwarded-For")`` only returns the first
+    instance, which lets an attacker supply a spoofed first line and
+    have the trusted proxy's appended line silently dropped. We collect
+    every instance via the canonical multi-value accessor exposed by
+    the underlying header container (Starlette ``Headers.getlist``,
+    ``websockets`` ``Headers.get_all``) and join them ourselves so the
+    downstream chain parser sees the full proxy hop list.
+    """
+    for accessor_name in ("getlist", "get_all"):
+        accessor = getattr(headers, accessor_name, None)
+        if callable(accessor):
+            try:
+                values = accessor(name)
+            except TypeError:
+                continue
+            joined = ", ".join(v for v in values if v)
+            if joined:
+                return joined
+            break
+    single = headers.get(name, "") or ""
+    return single
+
+
 def _parse_forwarded_header_chain(forwarded: str) -> list[str]:
     """Parse RFC 7239 ``Forwarded`` header into an ordered list of ``for=`` IPs."""
     result: list[str] = []
@@ -192,12 +222,12 @@ def extract_forwarded_ip(
 
     networks = tuple(trusted_networks)
 
-    forwarded_chain = _parse_forwarded_header_chain(headers.get("Forwarded", "") or "")
+    forwarded_chain = _parse_forwarded_header_chain(_collect_header_values(headers, "Forwarded"))
     chosen = _select_client_ip(forwarded_chain, networks, trust_implicit_private)
     if chosen:
         return chosen
 
-    xff_chain = _parse_xff_chain(headers.get("X-Forwarded-For", "") or "")
+    xff_chain = _parse_xff_chain(_collect_header_values(headers, "X-Forwarded-For"))
     chosen = _select_client_ip(xff_chain, networks, trust_implicit_private)
     if chosen:
         return chosen

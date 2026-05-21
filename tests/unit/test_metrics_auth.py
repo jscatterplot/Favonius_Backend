@@ -110,3 +110,18 @@ class TestMetricsAuth:
                 "/metrics", headers={"Authorization": "Bearer   test-token"}
             )
         assert response.status_code == 200
+
+    def test_401_when_bearer_contains_non_ascii(self):
+        """Non-ASCII bearer must return 401, not crash to 500.
+
+        ``secrets.compare_digest`` raises ``TypeError`` when given a
+        non-ASCII ``str``; without the byte-encoding fix, a request
+        carrying obs-text in the credential would surface as an
+        unhandled exception (500) and create a noisy availability
+        signal. The handler must treat it as plain unauthorised.
+        """
+        with patch("src.api.main._METRICS_TOKEN", "test-token"):
+            response = _client().get(
+                "/metrics", headers={"Authorization": "Bearer wörld"}
+            )
+        assert response.status_code == 401

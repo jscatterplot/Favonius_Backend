@@ -245,6 +245,81 @@ class TestInvalidEntries:
         )
 
 
+class TestRepeatedHeaderLines:
+    """RFC 7230 §3.2.2: repeated list-style headers are semantically merged.
+
+    If we read only the first ``X-Forwarded-For`` field via ``.get``, an
+    attacker can prepend their own header line with a spoofed value and
+    the trusted proxy's appended line is silently dropped. The chain
+    walker must see the full proxy hop sequence.
+    """
+
+    def test_starlette_repeated_xff_is_merged(self):
+        from starlette.datastructures import Headers
+
+        headers = Headers(
+            raw=[
+                (b"x-forwarded-for", b"8.8.8.8"),
+                (b"x-forwarded-for", b"93.184.216.34, 100.64.0.2"),
+            ]
+        )
+        # Walking right-to-left across the merged chain skips the CGNAT hop
+        # and returns the real client appended by the edge proxy. Without
+        # the merge fix, only the first header (the spoof) is seen.
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "93.184.216.34"
+        )
+
+    def test_starlette_repeated_forwarded_is_merged(self):
+        from starlette.datastructures import Headers
+
+        headers = Headers(
+            raw=[
+                (b"forwarded", b"for=8.8.8.8"),
+                (b"forwarded", b"for=93.184.216.34, for=100.64.0.2"),
+            ]
+        )
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "93.184.216.34"
+        )
+
+    def test_websockets_style_get_all_accessor(self):
+        """``websockets`` headers expose ``get_all`` rather than ``getlist``."""
+
+        class _WsHeaders:
+            def __init__(self, raw: list[tuple[str, str]]) -> None:
+                self._raw = raw
+
+            def get_all(self, name: str) -> list[str]:
+                lower = name.lower()
+                return [v for k, v in self._raw if k.lower() == lower]
+
+            def get(self, name: str, default: str = "") -> str:
+                values = self.get_all(name)
+                return values[0] if values else default
+
+        headers = _WsHeaders(
+            [
+                ("X-Forwarded-For", "8.8.8.8"),
+                ("X-Forwarded-For", "93.184.216.34, 100.64.0.2"),
+            ]
+        )
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "93.184.216.34"
+        )
+
+    def test_get_only_headers_still_work(self):
+        """Plain mapping-style headers (no multi-value accessor) keep working."""
+        headers = _Headers({"X-Forwarded-For": "8.8.8.8, 93.184.216.34, 100.64.0.2"})
+        assert (
+            extract_forwarded_ip(headers, trust_implicit_private=True)
+            == "93.184.216.34"
+        )
+
+
 class TestParseIpNetworks:
     def test_skips_invalid_entries(self):
         nets = parse_ip_networks(

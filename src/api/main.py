@@ -8348,7 +8348,14 @@ async def metrics(request: Request):
     presented_token = rest.lstrip(" ")
     if not separator or scheme.lower() != "bearer" or not presented_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if not secrets.compare_digest(presented_token, _METRICS_TOKEN):
+    # ``compare_digest`` raises ``TypeError`` on non-ASCII ``str`` inputs, so
+    # a request carrying ``Authorization: Bearer <obs-text>`` would otherwise
+    # surface as a 500 instead of a clean 401. Encode both sides to bytes —
+    # constant-time semantics are preserved and any byte sequence compares
+    # cleanly without raising.
+    if not secrets.compare_digest(
+        presented_token.encode("utf-8"), _METRICS_TOKEN.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
