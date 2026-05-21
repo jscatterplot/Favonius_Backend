@@ -204,6 +204,13 @@ $outer$;
 -- are NULL on the current ENTSO-E-only deployment, and that is the
 -- honest answer. Zone-aware pricing for the agent is tracked as a
 -- follow-up alongside the cross-DB strategy.
+--
+-- Note on column naming: the legacy `prices` table calls its $/kWh
+-- column `energy_kwh` (yes, the column name is misleading — see
+-- migrations/001_initial_schema.sql:104 where the comment clarifies
+-- "$/kWh"). The agent_views surface renames it to `price_per_kwh` so
+-- the LLM sees a self-describing identifier. `prices` has no currency
+-- column either; we surface NULL there and document via the catalogue.
 DROP FUNCTION IF EXISTS agent_views.prices_hourly(uuid[]);
 CREATE OR REPLACE FUNCTION agent_views.prices_hourly(p_depot_ids uuid[])
 RETURNS TABLE (
@@ -218,9 +225,9 @@ SET search_path = pg_catalog, public
 AS $$
     SELECT p.depot_id,
            time_bucket('1 hour'::interval, p.time) AS hour,
-           AVG(p.price_per_kwh)::numeric AS price_per_kwh,
-           MAX(p.currency) AS currency,
-           NULL::text AS market_type
+           AVG(p.energy_kwh)::numeric AS price_per_kwh,
+           NULL::text AS currency,
+           MAX(p.source)::text AS market_type
     FROM public.prices p
     WHERE p.depot_id = ANY(p_depot_ids)
     GROUP BY p.depot_id, time_bucket('1 hour'::interval, p.time)
