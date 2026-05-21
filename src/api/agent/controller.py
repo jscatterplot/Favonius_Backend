@@ -568,8 +568,21 @@ async def _run_sql_general_turn(
                     "abort_reason": type(exc).__name__,
                 },
             )
+            # Use the SQL-mode target_type / functions_accessed (same as
+            # the success path) so the audit row is filterable by the
+            # actual tables touched, not mislabelled as a consumption
+            # turn (P2 codex / M-sev bugbot: the default
+            # target_type='charging_sessions' is the consumption path's
+            # value and would silently mis-classify SQL-mode aborts).
+            partial_functions_accessed = _sql_functions_accessed(partial_calls)
             await write_agent_query_audit(
-                ts_pool, auth, run_id, "sql_general", server_row_total
+                ts_pool,
+                auth,
+                run_id,
+                "sql_general",
+                server_row_total,
+                target_type=sql_audit_target_type(partial_functions_accessed),
+                functions_accessed=partial_functions_accessed or None,
             )
         reply = AgentReply.error(run_id=run_id)
         await agent_runs_close(ts_pool, run_id, "error", reply)

@@ -850,3 +850,75 @@ class TestNotClauseBypass:
             "WHERE hour >= now() - interval '7 days' "
             "AND NOT(depot_id IS NULL)"
         )
+
+
+class TestLockClauseRejected:
+    """Codex P2 — SELECT ... FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE /
+    FOR KEY SHARE must reject at validate time, not at execute time. The
+    executor's read-only transaction would reject them anyway but a
+    deterministic validation rejection gives the LLM a clean retry."""
+
+    def test_for_update_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) FOR UPDATE",
+            kind="lock_clause_not_allowed",
+        )
+
+    def test_for_share_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) FOR SHARE",
+            kind="lock_clause_not_allowed",
+        )
+
+    def test_for_update_of_table_rejected(self):
+        _rej(
+            "SELECT * FROM agent_views.sessions($1) FOR UPDATE OF sessions",
+            kind="lock_clause_not_allowed",
+        )
+
+
+class TestAnonymousFunctionAllowlist:
+    """Codex P1 — non-table function calls that aren't typed builtins must
+    be on the positive allowlist. Defends against user-defined functions
+    the role-swap might happen to grant execute on."""
+
+    def test_random_user_function_rejected(self):
+        # An unqualified `my_internal_fn(…)` call has no allowlist entry
+        # and isn't a sqlglot-typed builtin, so it parses as Anonymous
+        # and must reject.
+        _rej(
+            "SELECT my_internal_fn(depot_id) FROM agent_views.sessions($1)",
+            kind="function_not_allowed",
+        )
+
+    def test_typed_builtins_pass(self):
+        # COUNT, SUM, AVG, NOW, COALESCE, EXTRACT all parse as typed
+        # exp.Func subclasses and bypass the Anonymous allowlist.
+        _ok(
+            "SELECT COUNT(*), SUM(energy_kwh), AVG(cost_total), "
+            "COALESCE(driver_id, vehicle_id) "
+            "FROM agent_views.sessions($1) "
+            "WHERE start_time >= NOW() - interval '7 days'"
+        )
+
+    def test_time_bucket_in_allowlist_accepted(self):
+        # TimescaleDB's time_bucket parses as Anonymous (it's a postgres
+        # extension, not a SQL standard fn). On the allowlist, so accept.
+        _ok(
+            "SELECT time_bucket('1 day', hour) AS day, AVG(price_per_kwh) "
+            "FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '30 days' "
+            "GROUP BY day"
+        )
+
+    def test_generate_series_accepted(self):
+        # generate_series is a common helper for time-range fills; on the
+        # allowlist so it can be used to align with sparse hypertable data.
+        _ok(
+            "SELECT * FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '7 days' "
+            "AND depot_id IN ("
+            "  SELECT depot_id FROM agent_views.depots($1)"
+            ")",
+            allowed=TS | STATIC,
+        )

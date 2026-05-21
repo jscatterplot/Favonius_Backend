@@ -105,6 +105,89 @@ DANGEROUS_FUNCTIONS: frozenset[str] = frozenset({
     "pg_advisory_lock", "pg_advisory_xact_lock",
 })
 
+# Positive allowlist of UNQUALIFIED function names that may appear in
+# LLM-emitted SQL outside the table-function FROM slot. The intent:
+# fail-closed for arbitrary user-defined functions (e.g.
+# `public.some_internal_fn(...)`) which the role-swap might still allow
+# execute permission on by accident, and which would expose data or
+# side-effects outside the curated agent_views surface.
+#
+# Most Postgres / SQL builtins (COUNT, SUM, AVG, NOW, COALESCE, EXTRACT,
+# date_trunc, …) sqlglot resolves to typed Func subclasses (exp.Count,
+# exp.Now, exp.Coalesce, exp.Extract, exp.TimestampTrunc, …), NOT to
+# exp.Anonymous — so they bypass this allowlist naturally. The
+# entries below are the dialect-specific / extension functions that
+# parse as Anonymous and that the LLM legitimately needs:
+#
+#  * `time_bucket` / `time_bucket_gapfill` — TimescaleDB time aggregation
+#    (the agent_views.*_hourly functions wrap one but the LLM can
+#    legitimately apply another to roll up further)
+#  * `locf` / `interpolate` — TimescaleDB gap-fill helpers
+#  * `first` / `last` — TimescaleDB ordered aggregates
+#
+# Plus a few common name-only aliases that sqlglot leaves as Anonymous
+# in some versions: jsonb_object_keys, generate_series, …
+#
+# If the LLM legitimately needs a function not on this list, the
+# rejection surfaces as `function_not_allowed` and an operator can
+# extend the set. NEVER add `pg_*` here — that whole namespace is
+# rejected wholesale by the `_unqualified pg_* call` check below.
+ALLOWED_ANONYMOUS_FUNCTIONS: frozenset[str] = frozenset({
+    # TimescaleDB time-series helpers
+    "time_bucket",
+    "time_bucket_gapfill",
+    "locf",
+    "interpolate",
+    "first",
+    "last",
+    # JSON helpers sqlglot sometimes leaves as Anonymous
+    "jsonb_object_keys",
+    "jsonb_each",
+    "jsonb_each_text",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    # Set-returning helpers commonly needed for time-range generation
+    "generate_series",
+    # Conditional / coalesce-like
+    "greatest",
+    "least",
+    "nullif",
+    "coalesce",
+    # Common numeric
+    "abs",
+    "sign",
+    "mod",
+    "round",
+    "ceil",
+    "ceiling",
+    "floor",
+    "trunc",
+    # Common string utilities (most are typed, but some dialect-specific
+    # ones land as Anonymous in older sqlglot builds)
+    "length",
+    "char_length",
+    "lower",
+    "upper",
+    "initcap",
+    "trim",
+    "btrim",
+    "ltrim",
+    "rtrim",
+    "replace",
+    "regexp_replace",
+    "substring",
+    "substr",
+    "left",
+    "right",
+    "concat",
+    "concat_ws",
+    "format",
+    "to_char",
+    "to_number",
+    "to_date",
+    "to_timestamp",
+})
+
 DEFAULT_ROW_LIMIT = 500
 MAX_ROW_LIMIT = 500  # absolute ceiling — user-supplied LIMIT is capped to this
 
@@ -191,6 +274,12 @@ def validate_sql(
         )
 
     # 3. Reject DML anywhere — covers `WITH x AS (DELETE …) SELECT …`.
+    # Also reject row-locking SELECT variants (FOR UPDATE / FOR SHARE /
+    # FOR NO KEY UPDATE / FOR KEY SHARE): the executor's read-only
+    # transaction would refuse them at execute time, but blocking up
+    # front gives the LLM a deterministic validation rejection it can
+    # retry from, instead of burning a SQL-agent iteration on a runtime
+    # error (P2 codex).
     for node in tree.walk():
         if isinstance(node, (exp.Delete, exp.Insert, exp.Update, exp.Merge,
                              exp.Drop, exp.Create, exp.Alter,
@@ -198,6 +287,15 @@ def validate_sql(
             return _reject(
                 "non_select",
                 f"DML/DDL not allowed (found {type(node).__name__}).",
+            )
+        if isinstance(node, exp.Lock):
+            return _reject(
+                "lock_clause_not_allowed",
+                f"Row-locking SELECT clauses (FOR UPDATE / FOR SHARE / "
+                f"FOR NO KEY UPDATE / FOR KEY SHARE) are not permitted: "
+                f"{node.sql(dialect='postgres')!r}. The agent runs in a "
+                f"read-only transaction so locks have no useful effect "
+                f"and the executor would reject them anyway.",
             )
 
     # 4. Schema allowlist + table-function allowlist.
@@ -331,7 +429,13 @@ def validate_sql(
                 f"permitted: {dot.sql(dialect='postgres')!r}.",
             )
 
-    # 5b. Dangerous functions called outside table-context.
+    # 5b. Unqualified function calls — allowlist + denylist combo.
+    # Most Postgres builtins parse as typed Func subclasses (exp.Count,
+    # exp.Now, etc.) and bypass this check entirely. Anonymous calls are
+    # dialect extensions or user-defined functions; we restrict them to
+    # the positive ALLOWED_ANONYMOUS_FUNCTIONS set so user-defined
+    # functions like `public.some_internal_fn()` cannot be reached even
+    # if the role-swap happens to grant execute (P1 codex finding).
     for node in tree.find_all(exp.Anonymous):
         parent = node.parent
         # Skip the table-function nodes — those are the legitimate
@@ -356,6 +460,17 @@ def validate_sql(
                 "dangerous_fn",
                 f"Function {node.name!r} not permitted "
                 f"(pg_* helpers are reserved for system catalog access).",
+            )
+        if fname not in ALLOWED_ANONYMOUS_FUNCTIONS:
+            return _reject(
+                "function_not_allowed",
+                f"Function {node.name!r} is not in the agent's allowlist "
+                f"of safe extensions. If the LLM needs a Postgres builtin, "
+                f"verify it parses as a typed expression (sqlglot resolves "
+                f"COUNT/SUM/NOW/EXTRACT/COALESCE/… as typed nodes that "
+                f"bypass this check). If a dialect extension is genuinely "
+                f"needed, add it to ALLOWED_ANONYMOUS_FUNCTIONS after "
+                f"reviewing the side effects.",
             )
 
     # Also walk built-in funcs sqlglot resolved (Func subclasses) to be
