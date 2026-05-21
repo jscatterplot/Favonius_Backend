@@ -829,7 +829,14 @@ async def run_qa_turn(
                     result = await tool_registry.dispatch(name, block_input)
                     ok = True
                     err = None
-                except ToolNotRegisteredError:
+                except ToolNotRegisteredError as exc:
+                    # Attach the partial trace so the controller can
+                    # audit any SQL that already executed in this turn.
+                    # ToolNotAllowedError carries the same fields via its
+                    # ctor; ToolNotRegisteredError is a stdlib KeyError
+                    # subclass so we set attributes after the fact.
+                    exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
+                    exc.iterations = iterations  # type: ignore[attr-defined]
                     raise
                 except Exception as exc:  # noqa: BLE001
                     logger.exception(
@@ -879,7 +886,11 @@ async def run_qa_turn(
                 continue
 
             if name not in allowed_tools:
-                status = "tool_not_allowed"
+                # status is intentionally not set here — the raise below
+                # propagates out of run_qa_turn entirely (this function
+                # has no `except ToolNotAllowedError` handler) so the
+                # QAResult below is unreachable. The caller reads the
+                # state off the exception instead.
                 raise ToolNotAllowedError(
                     f"SQL agent attempted to call disallowed tool {name!r}",
                     tool_calls=tool_calls,
@@ -890,7 +901,12 @@ async def run_qa_turn(
                 result = await tool_registry.dispatch(name, block_input)
                 ok = True
                 err = None
-            except ToolNotRegisteredError:
+            except ToolNotRegisteredError as exc:
+                # Attach the partial trace so the controller can audit
+                # any SQL that already executed in this turn (parallel
+                # to the ToolNotAllowedError path above).
+                exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
+                exc.iterations = iterations  # type: ignore[attr-defined]
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("SQL agent tool dispatch failed: %s", name)

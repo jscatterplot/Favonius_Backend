@@ -21,6 +21,7 @@ from src.api.agent_workflows.runtime import (
     ToolNotAllowedError,
     run_qa_turn,
 )
+from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.api.agent_workflows.tools import ToolRegistry
 
 
@@ -294,6 +295,59 @@ async def test_tool_not_allowed_preserves_partial_trace():
     assert len(partial) == 1
     assert partial[0].name == "run_select_ts"
     assert partial[0].ok is True
+
+
+@pytest.mark.asyncio
+async def test_tool_not_registered_preserves_partial_trace():
+    """Bugbot M-sev: `ToolNotRegisteredError` must also carry the
+    partial tool_calls trace, mirroring `ToolNotAllowedError`. Without
+    this, the controller's audit-mirror branch sees an empty trace and
+    skips `write_agent_query_audit` on these aborts.
+
+    Trigger: the model invokes a tool whose name IS in `allowed_tools`
+    (so the allow-list passes) but is missing a callable in the
+    registry — sqlite path where the registry-side error fires.
+    """
+    reg, _ = _registry()
+    # Simulate dispatch-time registration drift: a tool that passes the
+    # `anthropic_schemas(allowed)` check at function entry but raises
+    # ToolNotRegisteredError when actually invoked. (This models the
+    # real bug scenario — a tool that *was* registered when the
+    # workflow was loaded but whose callable subsequently disappeared
+    # by the time dispatch runs, or a registry-side bug where get()
+    # and dispatch() disagree.)
+    async def _explodes(**_):
+        raise ToolNotRegisteredError("ghost_tool")
+
+    reg.register(
+        "ghost_tool",
+        description="",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        fn=_explodes,
+    )
+    allowed = _allowed_tools() + ["ghost_tool"]
+    script = [
+        _FakeResponse([_tool_use("run_select_ts", "b1", {"sql": "SELECT 1"})]),
+        _FakeResponse([_tool_use("ghost_tool", "b2", {})]),
+    ]
+    client = _FakeClient(script)
+
+    with pytest.raises(ToolNotRegisteredError) as ei:
+        await run_qa_turn(
+            anthropic_client=client,
+            model="claude-haiku-4-5",
+            system_prompt="sys",
+            user_message="q",
+            tool_registry=reg,
+            allowed_tools=allowed,
+        )
+
+    partial = list(getattr(ei.value, "tool_calls", []))
+    assert len(partial) == 1
+    assert partial[0].name == "run_select_ts"
+    assert partial[0].ok is True
+    # iterations should reflect that 2 round-trips happened before abort.
+    assert getattr(ei.value, "iterations", 0) >= 1
 
 
 @pytest.mark.asyncio
