@@ -453,7 +453,6 @@ class TestUpsertSqlContract:
             "vehicle_id",
             "driver_id",
             "card_id",
-            "end_time",
             "import_user_full_name",
             "import_station_owner",
             "import_status",
@@ -465,6 +464,23 @@ class TestUpsertSqlContract:
             f"COALESCE(charging_sessions.{column}, EXCLUDED.{column})"
             in upsert_sql
         ), f"missing COALESCE for {column}"
+
+    def test_end_time_overwrites_on_non_null_excluded(self, upsert_sql):
+        """end_time uses overwrite-when-non-null, NOT COALESCE.
+
+        A re-import is the customer's signal that the previously stored end
+        was wrong (typically: bad XLSX end_time column, now corrected via
+        `session_duration_seconds`). The new resolver pre-sanitises the
+        incoming value, so any non-NULL EXCLUDED.end_time is more trustworthy
+        than what's already in the row.
+        """
+        # The COALESCE form for end_time MUST be gone — that would block fixes.
+        assert (
+            "COALESCE(charging_sessions.end_time, EXCLUDED.end_time)"
+            not in upsert_sql
+        )
+        # And the overwrite-on-non-null CASE WHEN must be present.
+        assert "WHEN EXCLUDED.end_time IS NOT NULL THEN EXCLUDED.end_time" in upsert_sql
 
     def test_energy_metering_column_refresh_rules(self, upsert_sql):
         assert "energy_delivered_kwh" in upsert_sql

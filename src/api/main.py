@@ -2182,6 +2182,16 @@ class HistoricalSessionImport(_CamelOrSnakeModel):
     import_batch_id: UUID
     start_time_local: str = Field(..., min_length=1, max_length=64)
     end_time_local: Optional[str] = Field(default=None, max_length=64)
+    # XLSX often carries a "Session duration" column whose value is the only
+    # trustworthy signal for end_time — the export's end_time column has been
+    # observed populated with absurd dates (Dec 2026, etc.). When duration is
+    # supplied the server prefers `start + duration` over a bad file end.
+    # Accepts seconds (int) because the FE parses HH:MM:SS / decimal hours and
+    # normalises to a non-negative integer count of seconds before posting.
+    # Upper bound matches `_IMPORT_MAX_SESSION_SPAN` (7 days) so an out-of-range
+    # value yields a clean 400 VALIDATION_ERROR instead of a 500 from
+    # `timedelta(seconds=10**15)` overflowing inside the resolver.
+    session_duration_seconds: Optional[int] = Field(default=None, ge=0, le=7 * 24 * 3600)
     energy_delivered_kwh: float = Field(..., ge=0)
     revenue: float = Field(default=0.0, ge=0)
     rfid_label: Optional[str] = Field(default=None, max_length=255)
@@ -3856,6 +3866,125 @@ async def update_rfid_card(
 _IMPORT_TS_FORMATS: tuple[str, ...] = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S")
 
 
+# Bounds used by `_resolve_import_end_time`. Defensive but generous: real
+# fleet sessions complete in hours, and the worst-bug XLSX we've seen had
+# `end_time` cells like "2026-12-31" while the duration column was correct.
+# Anything beyond MAX_SESSION_SPAN is almost certainly the spreadsheet's bad
+# end_time column; anything beyond now+FUTURE_SKEW is impossible by definition.
+_IMPORT_MAX_SESSION_SPAN = timedelta(days=7)
+_IMPORT_FUTURE_SKEW = timedelta(hours=1)
+_IMPORT_END_MISMATCH_TOLERANCE = timedelta(minutes=15)
+
+
+def _resolve_import_end_time(
+    *,
+    start_time_utc: datetime,
+    end_time_utc: Optional[datetime],
+    duration_seconds: Optional[int],
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Pick a trustworthy end_time for an imported charging session.
+
+    Decision table:
+
+    | file end        | duration | action                                |
+    |-----------------|----------|---------------------------------------|
+    | missing         | present  | use computed                          |
+    | sane, agrees    | present  | use file end                          |
+    | insane / drift  | present  | use computed (file end is bogus)      |
+    | sane            | missing  | use file end                          |
+    | insane          | missing  | raise 400 INVALID_TIMESTAMP           |
+    | missing         | missing  | None (ongoing / open session)         |
+
+    "Insane" means: end < start, end > now + 1h, or span > 7 days.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    computed_end: Optional[datetime] = None
+    if duration_seconds is not None and duration_seconds > 0:
+        computed_end = start_time_utc + timedelta(seconds=duration_seconds)
+
+    def _is_sane(end: datetime) -> bool:
+        if end < start_time_utc:
+            return False
+        if end > now + _IMPORT_FUTURE_SKEW:
+            return False
+        if end - start_time_utc > _IMPORT_MAX_SESSION_SPAN:
+            return False
+        return True
+
+    if end_time_utc is None and computed_end is None:
+        return None
+
+    if end_time_utc is None:
+        # Duration-only path — sanity-check against the same rules so a bogus
+        # duration (e.g. negative or > 7d) does not slip through.
+        if not _is_sane(computed_end):  # type: ignore[arg-type]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                    "detail": (
+                        "session_duration_seconds yields an end_time outside the "
+                        "accepted bounds (must be on/after start, within 1 hour of "
+                        "now, and ≤ 7 days from start)"
+                    ),
+                    "field": "session_duration_seconds",
+                },
+            )
+        return computed_end
+
+    if computed_end is None:
+        # File-end-only path — no duration to corroborate, so insane ends are
+        # rejected rather than silently stored. This is the bug the broken HRX
+        # XLSX import created in production.
+        if not _is_sane(end_time_utc):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                    "detail": (
+                        "end_time_local is outside the accepted bounds (must be "
+                        "on/after start, within 1 hour of now, and ≤ 7 days from "
+                        "start). Provide session_duration_seconds to derive a "
+                        "trusted end."
+                    ),
+                    "field": "end_time_local",
+                },
+            )
+        return end_time_utc
+
+    # Both present: trust the file end only when it is sane AND agrees with
+    # the duration-derived end within tolerance. Disagreement is a strong
+    # signal that the file end is the bad column (this is the HRX scenario).
+    if (
+        _is_sane(end_time_utc)
+        and abs(end_time_utc - computed_end) <= _IMPORT_END_MISMATCH_TOLERANCE
+    ):
+        return end_time_utc
+
+    logger.info(
+        "import_end_time_correction: file_end=%s computed_end=%s start=%s — using computed",
+        end_time_utc.isoformat(),
+        computed_end.isoformat(),
+        start_time_utc.isoformat(),
+    )
+    if not _is_sane(computed_end):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": ErrorCode.INVALID_TIMESTAMP.value,
+                "detail": (
+                    "session_duration_seconds yields an end_time outside the "
+                    "accepted bounds (must be on/after start, within 1 hour of "
+                    "now, and ≤ 7 days from start)"
+                ),
+                "field": "session_duration_seconds",
+            },
+        )
+    return computed_end
+
+
 def _parse_import_local_timestamp(value: str, tz: ZoneInfo, *, field: str) -> datetime:
     """Parse a depot-local timestamp string and return its UTC datetime."""
     text = (value or "").strip()
@@ -4116,21 +4245,19 @@ async def import_historical_charging_session(
     # The source export emits multiple terminal/non-terminal statuses (Finished,
     # ConnectedStoppedByEv, Charging, ...) and we let them all round-trip the
     # `end_time` cell when present. Status semantics live on `import_status`
-    # (free text); the only timestamp invariant we still enforce is monotonic
-    # ordering relative to start.
-    end_time_utc: Optional[datetime] = None
+    # (free text). Validity is delegated to `_resolve_import_end_time` which
+    # also reconciles the file's end_time column against the (more trustworthy)
+    # `session_duration_seconds` value when both are present.
+    file_end_time_utc: Optional[datetime] = None
     if request.end_time_local:
-        end_time_utc = _parse_import_local_timestamp(
+        file_end_time_utc = _parse_import_local_timestamp(
             request.end_time_local, tz, field="end_time_local"
         )
-        if end_time_utc < start_time_utc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error_code": ErrorCode.INVALID_TIMESTAMP.value,
-                    "detail": "end_time_local must be on or after start_time_local",
-                },
-            )
+    end_time_utc = _resolve_import_end_time(
+        start_time_utc=start_time_utc,
+        end_time_utc=file_end_time_utc,
+        duration_seconds=request.session_duration_seconds,
+    )
 
     if not math.isfinite(request.energy_delivered_kwh):
         raise HTTPException(
@@ -4144,8 +4271,24 @@ async def import_historical_charging_session(
     # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
     # When both identifiers are absent, classify as platform-initiated import.
     id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
+    # Platform-initiated dedup hashing MUST always use the raw file end_time,
+    # never the resolver's output. The hash is the customer's stable identity
+    # for the row across re-uploads — the XLSX is the source of truth, and
+    # any value derived from `session_duration_seconds` would mutate when the
+    # FE starts/stops sending the field or ships a corrected duration in a
+    # later upload, breaking ON CONFLICT merge. Using the raw file value also
+    # preserves backward-compat with rows persisted pre-resolver and with
+    # migration 036's backfill, which keys off the persisted `end_time`
+    # (== the raw file value for pre-resolver rows).
+    #
+    # Trade-off: when an XLSX has no end_time column at all (file end == None)
+    # and two distinct platform-initiated sessions share start_time + status +
+    # user_full_name + station_owner_full_name, they collide on hash. That
+    # risk already existed pre-PR — there is no extra discriminator we can
+    # add here without making the hash depend on the resolver, which would
+    # break the more common re-import idempotency case above.
     hash_id_token = (
-        _platform_import_hash_token(request, end_time_utc=end_time_utc)
+        _platform_import_hash_token(request, end_time_utc=file_end_time_utc)
         if is_platform_initiated
         else id_token
     )
@@ -4198,7 +4341,16 @@ async def import_historical_charging_session(
                     vehicle_id            = COALESCE(charging_sessions.vehicle_id, EXCLUDED.vehicle_id),
                     driver_id             = COALESCE(charging_sessions.driver_id, EXCLUDED.driver_id),
                     card_id               = COALESCE(charging_sessions.card_id, EXCLUDED.card_id),
-                    end_time              = COALESCE(charging_sessions.end_time, EXCLUDED.end_time),
+                    -- Overwrite end_time when the new payload provides one.
+                    -- A re-import is the customer's signal that the previously
+                    -- stored end was wrong (e.g. the broken HRX XLSX with bad
+                    -- end_time cells fixed by `session_duration_seconds`).
+                    -- The resolver already sanitised the incoming value, so a
+                    -- non-NULL EXCLUDED.end_time is always more trustworthy.
+                    end_time              = CASE
+                        WHEN EXCLUDED.end_time IS NOT NULL THEN EXCLUDED.end_time
+                        ELSE charging_sessions.end_time
+                    END,
                     import_user_full_name = COALESCE(charging_sessions.import_user_full_name, EXCLUDED.import_user_full_name),
                     import_station_owner  = COALESCE(charging_sessions.import_station_owner, EXCLUDED.import_station_owner),
                     import_status         = COALESCE(charging_sessions.import_status, EXCLUDED.import_status),
