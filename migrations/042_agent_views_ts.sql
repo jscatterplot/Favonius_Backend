@@ -35,16 +35,6 @@ EXCEPTION
         NULL;  -- already exists; reapply grants below
 END $$;
 
--- Runtime role membership: app login role must be able to SET ROLE.
--- In this repo the runtime DB role is `favonius` (created by compose/staging
--- bootstrap). Guard existence so local/special envs don't fail migration.
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'favonius') THEN
-        GRANT agent_reader_ts TO favonius;
-    END IF;
-END $$;
-
 -- Defence in depth: explicitly REVOKE everything before granting back.
 REVOKE ALL ON SCHEMA public            FROM agent_reader_ts;
 REVOKE ALL ON SCHEMA pg_catalog        FROM agent_reader_ts;
@@ -54,24 +44,30 @@ REVOKE ALL ON SCHEMA information_schema FROM agent_reader_ts;
 CREATE SCHEMA IF NOT EXISTS agent_views;
 GRANT  USAGE  ON SCHEMA agent_views TO agent_reader_ts;
 
--- Grant the runtime login role membership in agent_reader_ts so the
--- executor's `SET LOCAL ROLE agent_reader_ts` actually succeeds. We
--- grant to `current_user` (the role that's applying this migration)
--- on the assumption that migrations and the runtime share a DB user,
--- which is the case in Railway/Docker/Supabase pooler setups. If
--- migrations run as a different role than the application, an
--- operator must manually run `GRANT agent_reader_ts TO <app_user>`
--- — and the executor's `current_user` assertion (S2) surfaces the
--- mismatch as `role_error` at the first SQL turn. Idempotent.
+-- Grant runtime login-role(s) membership in agent_reader_ts so the
+-- executor's `SET LOCAL ROLE agent_reader_ts` succeeds regardless of
+-- whether DATABASE_URL points at a direct login user or a pooler user.
+-- We attempt both current_user and session_user (deduplicated), then warn
+-- if grants are blocked by privileges. Idempotent.
 DO $grant$
+DECLARE
+    grant_role text;
 BEGIN
-    EXECUTE format('GRANT agent_reader_ts TO %I', current_user);
-EXCEPTION
-    WHEN insufficient_privilege THEN
-        RAISE WARNING
-            'Could not GRANT agent_reader_ts TO %: '
-            'manual grant required for SQL agent mode to function.',
-            current_user;
+    FOR grant_role IN
+        SELECT DISTINCT rolname
+        FROM (VALUES (current_user), (session_user)) AS r(rolname)
+        WHERE rolname IS NOT NULL
+    LOOP
+        BEGIN
+            EXECUTE format('GRANT agent_reader_ts TO %I', grant_role);
+        EXCEPTION
+            WHEN insufficient_privilege THEN
+                RAISE WARNING
+                    'Could not GRANT agent_reader_ts TO %: '
+                    'manual grant required for SQL agent mode to function.',
+                    grant_role;
+        END;
+    END LOOP;
 END
 $grant$;
 

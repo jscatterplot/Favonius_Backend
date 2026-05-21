@@ -95,6 +95,10 @@ dev = [
     "pytest-asyncio>=0.23.2",
     "pytest-mock>=3.12.0",
     "pytest-cov>=4.1.0",
+    # Schema validation (used by the workflow eval harness; also in main deps
+    # but listed here to ensure it is always installed in dev environments
+    # regardless of pip resolver caching behaviour).
+    "jsonschema>=4.20.0",
     # Code quality
     "black>=23.12.0",
     "isort>=5.13.2",

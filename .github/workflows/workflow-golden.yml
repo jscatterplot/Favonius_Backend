@@ -94,6 +94,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+          # Belt-and-suspenders: jsonschema is in both main and dev deps but
+          # pip caching edge-cases on some runners leave it absent. Explicit
+          # install is idempotent and guarantees the workflow-eval harness can
+          # import Draft7Validator (used in load_scenario schema validation).
+          pip install "jsonschema>=4.20.0"
       - name: Apply migrations
         run: python scripts/run_migrations.py
         env:
