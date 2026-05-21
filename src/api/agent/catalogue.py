@@ -116,22 +116,41 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
     FunctionSpec(
         name="prices_hourly",
         purpose=(
-            "Hourly per-depot tariff prices from the legacy `prices` table. "
-            "NOTE: on ENTSO-E deployments this table is empty — zone-keyed "
-            "prices live in `electricity_prices` and are not yet exposed to "
-            "the agent (cross-DB zone lookup is a follow-up). REQUIRES a "
-            "time predicate on `hour`."
+            "Hourly day-ahead electricity prices from ENTSO-E, keyed by "
+            "BIDDING ZONE (e.g. `10YLT-1001A0008Q` for Lithuania) — NOT by "
+            "depot. ENTSO-E prices are public market data so this surface "
+            "isn't depot-scoped. To find the prices for a specific depot, "
+            "first call `agent_views.depots($1)` and read its `entsoe_zone` "
+            "column, then filter `prices_hourly` with "
+            "`WHERE bidding_zone = '<that zone>'`. REQUIRES a time "
+            "predicate on `hour`. Prices are in EUR/kWh."
         ),
         columns=(
-            ColumnSpec("depot_id", "uuid"),
+            ColumnSpec(
+                "bidding_zone",
+                "text",
+                "ENTSO-E EIC bidding-zone code. Cross-link via "
+                "`agent_views.depots($1).entsoe_zone`.",
+            ),
             ColumnSpec("hour", "timestamptz"),
-            ColumnSpec("price_per_kwh", "numeric"),
-            ColumnSpec("currency", "text"),
-            ColumnSpec("market_type", "text", "NULL on legacy-prices deployments."),
+            ColumnSpec(
+                "price_per_kwh",
+                "numeric",
+                "Average of the LMP component, EUR/kWh.",
+            ),
+            ColumnSpec("currency", "text", "Always 'EUR' for ENTSO-E."),
+            ColumnSpec(
+                "market_type",
+                "text",
+                "Feed identifier: 'ENTSOE_DAM' for ENTSO-E day-ahead.",
+            ),
         ),
         examples=(
-            "SELECT hour, AVG(price_per_kwh) FROM agent_views.prices_hourly($1) "
-            "WHERE hour >= now() - interval '24 hours' GROUP BY hour ORDER BY hour",
+            "SELECT bidding_zone, hour, price_per_kwh "
+            "FROM agent_views.prices_hourly($1) "
+            "WHERE hour >= now() - interval '24 hours' "
+            "AND bidding_zone = '10YLT-1001A0008Q' "
+            "ORDER BY hour",
         ),
         requires_time_predicate=True,
     ),
@@ -190,8 +209,17 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("address", "text"),
             ColumnSpec("latitude", "double precision"),
             ColumnSpec("longitude", "double precision"),
+            ColumnSpec(
+                "entsoe_zone",
+                "text",
+                "ENTSO-E EIC bidding zone (e.g. '10YLT-1001A0008Q'). "
+                "Cross-link this with `agent_views.prices_hourly($1)` to "
+                "filter by depot.",
+            ),
         ),
-        examples=("SELECT depot_id, name, timezone FROM agent_views.depots($1)",),
+        examples=(
+            "SELECT depot_id, name, timezone, entsoe_zone FROM agent_views.depots($1)",
+        ),
     ),
     FunctionSpec(
         name="vehicles",

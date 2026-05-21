@@ -63,6 +63,16 @@ $grant$;
 -- The Supabase table is `sites`; the backend vocabulary is "depot".
 -- The function returns the depot-vocabulary view so the LLM sees consistent
 -- terminology with the rest of the system prompt.
+--
+-- ``entsoe_zone`` is exposed so the LLM can cross-link this function with
+-- ``agent_views.prices_hourly($1)`` (TimescaleDB side, zone-keyed). The
+-- value comes from the explicit operator override at
+-- ``sites.tariff_config['entsoe_zone']``; we do NOT fall back to the
+-- timezone → zone derivation here (that lives in Python — see
+-- ``src/db/queries.py:resolve_bidding_zone``) so the LLM sees only what
+-- operators explicitly configured. The full timezone string is on the
+-- ``timezone`` column already; an LLM that needs the country can derive
+-- it.
 DROP FUNCTION IF EXISTS agent_views.depots(uuid[]);
 CREATE OR REPLACE FUNCTION agent_views.depots(p_depot_ids uuid[])
 RETURNS TABLE (
@@ -73,7 +83,8 @@ RETURNS TABLE (
     max_grid_kw     double precision,
     address         text,
     latitude        double precision,
-    longitude       double precision
+    longitude       double precision,
+    entsoe_zone     text
 )
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, public
@@ -85,7 +96,8 @@ AS $$
            s.max_grid_kw,
            s.address::text,
            s.latitude,
-           s.longitude
+           s.longitude,
+           NULLIF((s.tariff_config ->> 'entsoe_zone')::text, '') AS entsoe_zone
     FROM public.sites s
     WHERE s.id = ANY(p_depot_ids)
 $$;

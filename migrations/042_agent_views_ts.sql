@@ -195,26 +195,47 @@ END
 $outer$;
 
 -- prices_hourly ──────────────────────────────────────────────────────────
--- ENTSO-E's electricity_prices is keyed by bidding zone (node_id), not
--- depot — joining caller's depot_ids to those zones requires reading
--- sites.tariff_config from Supabase, which the TS-side function cannot
--- do (no cross-DB joins). To avoid a tenant leak (the original draft
--- of this function returned the entire electricity_prices feed to any
--- caller), V1 only exposes the legacy per-depot `prices` table; rows
--- are NULL on the current ENTSO-E-only deployment, and that is the
--- honest answer. Zone-aware pricing for the agent is tracked as a
--- follow-up alongside the cross-DB strategy.
+-- Returns day-ahead electricity prices from the ENTSO-E feed
+-- (``public.electricity_prices``), keyed by bidding zone (``node_id``) —
+-- NOT by depot. This is a deliberate departure from the
+-- per-depot scoping convention every other agent_views function follows.
 --
--- Note on column naming: the legacy `prices` table calls its $/kWh
--- column `energy_kwh` (yes, the column name is misleading — see
--- migrations/001_initial_schema.sql:104 where the comment clarifies
--- "$/kWh"). The agent_views surface renames it to `price_per_kwh` so
--- the LLM sees a self-describing identifier. `prices` has no currency
--- column either; we surface NULL there and document via the catalogue.
+-- Justification (security review):
+--   * ENTSO-E day-ahead prices are PUBLIC market data — they are published
+--     on the ENTSO-E Transparency Platform for anyone to consume. There is
+--     no tenant secret encoded in the price values.
+--   * Bidding-zone identifiers (e.g. ``10YLT-1001A0008Q`` for Lithuania,
+--     ``10Y1001A1001A82H`` for Germany-Luxembourg) are also public — each
+--     zone covers an entire country or region and is documented on the
+--     ENTSO-E site. Knowing zone X exists does not reveal which orgs operate
+--     there.
+--   * The depot → zone mapping that IS tenant-scoped lives on
+--     ``sites.tariff_config['entsoe_zone']`` in Supabase. We expose that
+--     via ``agent_views.depots()`` (Supabase migration 040), filtered by
+--     ``p_depot_ids`` like every other static function — that surface IS
+--     tenant-scoped.
+--
+-- Cross-link pattern: the LLM calls ``agent_views.depots($1)`` first to
+-- discover its visible depots' zones, then queries
+-- ``agent_views.prices_hourly($1) WHERE bidding_zone IN (…)`` to filter to
+-- the zones it cares about. The ``p_depot_ids`` parameter is required by
+-- the validator's $1-binding contract (every agent_views.<fn>($1) call
+-- must take exactly one arg) and is accepted here for signature
+-- consistency, but is intentionally NOT used inside the function body —
+-- there is no depot column on ``electricity_prices`` to filter on, and a
+-- fabricated join through Supabase isn't possible (no cross-DB joins,
+-- postgres_fdw is deliberately not adopted per CLAUDE.md). Hypertable
+-- time-predicate enforcement (validator) still requires the LLM to bound
+-- the scan via ``WHERE hour >= …``.
+--
+-- The legacy ``public.prices`` table (per-depot utility TOU) is unused on
+-- the current ENTSO-E deployment and not exposed here. If a future
+-- deployment populates ``public.prices``, a second function (e.g.
+-- ``utility_prices_hourly``) can surface it without changing this one.
 DROP FUNCTION IF EXISTS agent_views.prices_hourly(uuid[]);
 CREATE OR REPLACE FUNCTION agent_views.prices_hourly(p_depot_ids uuid[])
 RETURNS TABLE (
-    depot_id        uuid,
+    bidding_zone    text,
     hour            timestamptz,
     price_per_kwh   numeric,
     currency        text,
@@ -223,14 +244,16 @@ RETURNS TABLE (
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
-    SELECT p.depot_id,
-           time_bucket('1 hour'::interval, p.time) AS hour,
-           AVG(p.energy_kwh)::numeric AS price_per_kwh,
-           NULL::text AS currency,
-           MAX(p.source)::text AS market_type
-    FROM public.prices p
-    WHERE p.depot_id = ANY(p_depot_ids)
-    GROUP BY p.depot_id, time_bucket('1 hour'::interval, p.time)
+    -- p_depot_ids is intentionally unused — see function comment above.
+    -- Convert EUR/MWh → EUR/kWh by dividing by 1000.
+    SELECT ep.node_id::text                                AS bidding_zone,
+           time_bucket('1 hour'::interval, ep.time)        AS hour,
+           (AVG(ep.lmp_price_mwh) / 1000.0)::numeric       AS price_per_kwh,
+           'EUR'::text                                     AS currency,
+           MAX(ep.market_type)::text                       AS market_type
+    FROM public.electricity_prices ep
+    WHERE ep.lmp_price_mwh IS NOT NULL
+    GROUP BY ep.node_id, time_bucket('1 hour'::interval, ep.time)
 $$;
 
 REVOKE ALL    ON FUNCTION agent_views.prices_hourly(uuid[]) FROM PUBLIC;
