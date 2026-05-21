@@ -787,76 +787,145 @@ async def run_qa_turn(
     status: str = "success"
     iterations: int = 0
 
-    for iterations in range(1, max_iterations + 1):
-        response = await anthropic_client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system_blocks,
-            tools=tools,
-            messages=messages,
-        )
+    try:
+        for iterations in range(1, max_iterations + 1):
+            response = await anthropic_client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system_blocks,
+                tools=tools,
+                messages=messages,
+            )
 
-        assistant_content = list(response.content)
-        messages.append({"role": "assistant", "content": assistant_content})
+            assistant_content = list(response.content)
+            messages.append({"role": "assistant", "content": assistant_content})
 
-        tool_use_blocks = [
-            b for b in assistant_content if getattr(b, "type", None) == "tool_use"
-        ]
-
-        if not tool_use_blocks:
-            # No tool call — model returned text only. Treat as failure
-            # to terminate properly; we still surface whatever text the
-            # model produced as the answer.
-            text_blocks = [
-                getattr(b, "text", "")
-                for b in assistant_content
-                if getattr(b, "type", None) == "text"
+            tool_use_blocks = [
+                b for b in assistant_content if getattr(b, "type", None) == "tool_use"
             ]
-            final_text = "".join(text_blocks).strip()
-            status = "no_terminator"
-            break
 
-        tool_results: list[dict[str, Any]] = []
-        terminated = False
-        for block in tool_use_blocks:
-            name = getattr(block, "name", None) or ""
-            block_id = getattr(block, "id", "") or ""
-            block_input = dict(getattr(block, "input", {}) or {})
+            if not tool_use_blocks:
+                # No tool call — model returned text only. Treat as failure
+                # to terminate properly; we still surface whatever text the
+                # model produced as the answer.
+                text_blocks = [
+                    getattr(b, "text", "")
+                    for b in assistant_content
+                    if getattr(b, "type", None) == "text"
+                ]
+                final_text = "".join(text_blocks).strip()
+                status = "no_terminator"
+                break
 
-            if name == EMIT_FINAL_ANSWER_TOOL:
+            tool_results: list[dict[str, Any]] = []
+            terminated = False
+            for block in tool_use_blocks:
+                name = getattr(block, "name", None) or ""
+                block_id = getattr(block, "id", "") or ""
+                block_input = dict(getattr(block, "input", {}) or {})
+
+                if name not in allowed_tools:
+                    # status is intentionally not set here — the raise below
+                    # propagates out of run_qa_turn entirely (this function
+                    # has no `except ToolNotAllowedError` handler) so the
+                    # QAResult below is unreachable. The caller reads the
+                    # state off the exception instead.
+                    raise ToolNotAllowedError(
+                        f"SQL agent attempted to call disallowed tool {name!r}",
+                        tool_calls=tool_calls,
+                        iterations=iterations,
+                    )
+
+                if name == EMIT_FINAL_ANSWER_TOOL:
+                    try:
+                        result = await tool_registry.dispatch(name, block_input)
+                        ok = True
+                        err = None
+                    except ToolNotRegisteredError as exc:
+                        # Attach the partial trace so the controller can
+                        # audit any SQL that already executed in this turn.
+                        # ToolNotAllowedError carries the same fields via its
+                        # ctor; ToolNotRegisteredError is a stdlib KeyError
+                        # subclass so we set attributes after the fact.
+                        exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
+                        exc.iterations = iterations  # type: ignore[attr-defined]
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception(
+                            "SQL agent terminator dispatch failed: %s", name
+                        )
+                        result = {
+                            "error": "tool_failure",
+                            "tool": name,
+                            "detail": str(exc),
+                        }
+                        ok = False
+                        err = str(exc)
+                    else:
+                        if isinstance(result, dict) and "error" in result:
+                            ok = False
+                            err = str(
+                                result.get("error_kind")
+                                or result.get("error")
+                                or "tool error"
+                            )
+                    tc = ToolCall(
+                        name=name,
+                        arguments=block_input,
+                        result=result,
+                        ok=ok,
+                        error=err,
+                    )
+                    tool_calls.append(tc)
+                    if on_step is not None:
+                        await _dispatch_on_step(on_step, tc)
+                    if ok:
+                        final_text = str(result.get("text", "")).strip()
+                        try:
+                            row_evidence = int(result.get("row_evidence", 0) or 0)
+                        except (TypeError, ValueError):
+                            row_evidence = 0
+                        terminated = True
+                        break
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block_id,
+                            "content": json.dumps(result, default=str),
+                            "is_error": True,
+                        }
+                    )
+                    continue
+
                 try:
                     result = await tool_registry.dispatch(name, block_input)
                     ok = True
                     err = None
                 except ToolNotRegisteredError as exc:
-                    # Attach the partial trace so the controller can
-                    # audit any SQL that already executed in this turn.
-                    # ToolNotAllowedError carries the same fields via its
-                    # ctor; ToolNotRegisteredError is a stdlib KeyError
-                    # subclass so we set attributes after the fact.
+                    # Attach the partial trace so the controller can audit
+                    # any SQL that already executed in this turn (parallel
+                    # to the ToolNotAllowedError path above).
                     exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
                     exc.iterations = iterations  # type: ignore[attr-defined]
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception(
-                        "SQL agent terminator dispatch failed: %s", name
-                    )
-                    result = {
-                        "error": "tool_failure",
-                        "tool": name,
-                        "detail": str(exc),
-                    }
+                    logger.exception("SQL agent tool dispatch failed: %s", name)
+                    result = {"error": "tool_failure", "tool": name, "detail": str(exc)}
                     ok = False
                     err = str(exc)
                 else:
+                    # A tool may signal logical failure by returning an error
+                    # envelope (top-level "error" key) without raising —
+                    # e.g. the SQL agent's validator/executor wraps the
+                    # rejection reason for the LLM. Treat that as ok=False
+                    # so audit aggregation in the controller and the
+                    # tool_result is_error flag downstream both match what
+                    # actually happened. See PR #216 review thread.
                     if isinstance(result, dict) and "error" in result:
                         ok = False
-                        err = str(
-                            result.get("error_kind")
-                            or result.get("error")
-                            or "tool error"
-                        )
+                        err = str(result.get("error_kind") or result.get("error") or "tool error")
+
                 tc = ToolCall(
                     name=name,
                     arguments=block_input,
@@ -867,99 +936,36 @@ async def run_qa_turn(
                 tool_calls.append(tc)
                 if on_step is not None:
                     await _dispatch_on_step(on_step, tc)
-                if ok:
-                    final_text = str(result.get("text", "")).strip()
-                    try:
-                        row_evidence = int(result.get("row_evidence", 0) or 0)
-                    except (TypeError, ValueError):
-                        row_evidence = 0
-                    terminated = True
-                    break
+
                 tool_results.append(
                     {
                         "type": "tool_result",
                         "tool_use_id": block_id,
                         "content": json.dumps(result, default=str),
-                        "is_error": True,
+                        "is_error": not ok,
                     }
                 )
-                continue
 
-            if name not in allowed_tools:
-                # status is intentionally not set here — the raise below
-                # propagates out of run_qa_turn entirely (this function
-                # has no `except ToolNotAllowedError` handler) so the
-                # QAResult below is unreachable. The caller reads the
-                # state off the exception instead.
-                raise ToolNotAllowedError(
-                    f"SQL agent attempted to call disallowed tool {name!r}",
-                    tool_calls=tool_calls,
-                    iterations=iterations,
-                )
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
 
-            try:
-                result = await tool_registry.dispatch(name, block_input)
-                ok = True
-                err = None
-            except ToolNotRegisteredError as exc:
-                # Attach the partial trace so the controller can audit
-                # any SQL that already executed in this turn (parallel
-                # to the ToolNotAllowedError path above).
-                exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
-                exc.iterations = iterations  # type: ignore[attr-defined]
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("SQL agent tool dispatch failed: %s", name)
-                result = {"error": "tool_failure", "tool": name, "detail": str(exc)}
-                ok = False
-                err = str(exc)
-            else:
-                # A tool may signal logical failure by returning an error
-                # envelope (top-level "error" key) without raising —
-                # e.g. the SQL agent's validator/executor wraps the
-                # rejection reason for the LLM. Treat that as ok=False
-                # so audit aggregation in the controller and the
-                # tool_result is_error flag downstream both match what
-                # actually happened. See PR #216 review thread.
-                if isinstance(result, dict) and "error" in result:
-                    ok = False
-                    err = str(result.get("error_kind") or result.get("error") or "tool error")
+            if terminated:
+                break
 
-            tc = ToolCall(
-                name=name,
-                arguments=block_input,
-                result=result,
-                ok=ok,
-                error=err,
-            )
-            tool_calls.append(tc)
-            if on_step is not None:
-                await _dispatch_on_step(on_step, tc)
+            # No stop-reason early break needed here: the empty
+            # ``tool_use_blocks`` case is handled upstream (line ~801) where
+            # we treat a model that returns text only as ``no_terminator``
+            # and exit. When we get here, ``tool_use_blocks`` was non-empty
+            # which means the Anthropic API set ``stop_reason='tool_use'``
+            # — we always want to loop back so the model can see the
+            # ``tool_result`` payloads we just appended.
+        else:
+            status = "max_iterations"
 
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block_id,
-                    "content": json.dumps(result, default=str),
-                    "is_error": not ok,
-                }
-            )
-
-        if tool_results:
-            messages.append({"role": "user", "content": tool_results})
-
-        if terminated:
-            break
-
-        # No stop-reason early break needed here: the empty
-        # ``tool_use_blocks`` case is handled upstream (line ~801) where
-        # we treat a model that returns text only as ``no_terminator``
-        # and exit. When we get here, ``tool_use_blocks`` was non-empty
-        # which means the Anthropic API set ``stop_reason='tool_use'``
-        # — we always want to loop back so the model can see the
-        # ``tool_result`` payloads we just appended.
-    else:
-        status = "max_iterations"
+    except Exception as exc:
+        if not hasattr(exc, "iterations"):
+            exc.iterations = iterations  # type: ignore[attr-defined]
+        raise
 
     return QAResult(
         text=final_text,

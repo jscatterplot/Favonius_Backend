@@ -534,6 +534,7 @@ async def _run_sql_general_turn(
             on_step=_on_step,
         )
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
+        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
         logger.error("SQL agent tool error: %s", exc)
         # Codex P2: if a disallowed tool aborted the loop AFTER one or
         # more SQL tools had already executed, we still owe those rows
@@ -544,7 +545,6 @@ async def _run_sql_general_turn(
         # before any tool dispatch in this turn) — falls through with
         # an empty list.
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
-        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
         sql_attempts = 0
         server_row_total = 0
         for tc in partial_calls:
@@ -593,6 +593,9 @@ async def _run_sql_general_turn(
             logger.exception("Failed to close agent_run %s in error state", run_id)
         await _emit_answer_safe(sse, reply, run_id)
         return reply
+    except Exception as exc:
+        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
+        raise
     else:
         sql_tool_turns = qa.iterations
     finally:

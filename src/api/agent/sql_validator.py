@@ -309,10 +309,17 @@ def validate_sql(
         db = (node.db or "").lower()
         name = (node.name or "").lower()
 
-        if db in FORBIDDEN_SCHEMAS or name in FORBIDDEN_SCHEMAS:
+        if db in FORBIDDEN_SCHEMAS:
             return _reject(
                 "forbidden_schema",
-                f"Schema not allowed: {db or name}.",
+                f"Schema not allowed: {db}.",
+            )
+        # Table-function nodes often have empty `name` (function on Anonymous);
+        # only treat `name` as a schema token when it is set (e.g. FROM auth).
+        if name and name in FORBIDDEN_SCHEMAS:
+            return _reject(
+                "forbidden_schema",
+                f"Schema not allowed: {name}.",
             )
 
         if db != "agent_views":
@@ -945,8 +952,9 @@ def _predicate_allows_unbounded_time(
     """True iff this boolean subtree can be TRUE without a hypertable time bound."""
     if isinstance(node, exp.Paren):
         inner = node.this
-        if inner is not None:
-            return _predicate_allows_unbounded_time(inner, target_alias, all_aliases)
+        if inner is None:
+            return True
+        return _predicate_allows_unbounded_time(inner, target_alias, all_aliases)
     if isinstance(node, exp.And):
         left, right = node.this, node.expression
         if left is None or right is None:
