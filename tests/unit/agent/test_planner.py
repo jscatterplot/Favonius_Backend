@@ -6,8 +6,12 @@ from uuid import UUID
 
 import pytest
 
-from src.api.agent.planner import classify, PlannerDecision
-
+from src.api.agent.planner import (
+    _sql_org_allowlist_tokens,
+    classify,
+    is_sql_mode_enabled,
+    PlannerDecision,
+)
 
 ORG_A = UUID("11111111-1111-1111-1111-111111111111")
 ORG_B = UUID("22222222-2222-2222-2222-222222222222")
@@ -17,6 +21,8 @@ ORG_B = UUID("22222222-2222-2222-2222-222222222222")
 def _clean_env(monkeypatch):
     monkeypatch.delenv("AGENT_SQL_MODE_ENABLED", raising=False)
     monkeypatch.delenv("AGENT_SQL_ORG_ALLOWLIST", raising=False)
+    is_sql_mode_enabled.cache_clear()
+    _sql_org_allowlist_tokens.cache_clear()
 
 
 def test_consumption_question_routes_to_fast_path(monkeypatch):

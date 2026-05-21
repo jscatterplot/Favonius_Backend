@@ -25,6 +25,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal, Optional
 from uuid import UUID
 
@@ -62,8 +63,13 @@ _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+@lru_cache(maxsize=1)
 def is_sql_mode_enabled() -> bool:
-    """``AGENT_SQL_MODE_ENABLED`` env-var check (default False)."""
+    """``AGENT_SQL_MODE_ENABLED`` env-var check (default False).
+
+    Parsed once per process; tests must call ``cache_clear()`` after
+    monkeypatching the environment.
+    """
     return os.environ.get("AGENT_SQL_MODE_ENABLED", "false").lower() in (
         "1",
         "true",
@@ -72,18 +78,26 @@ def is_sql_mode_enabled() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def _sql_org_allowlist_tokens() -> Optional[frozenset[str]]:
+    """Parse ``AGENT_SQL_ORG_ALLOWLIST`` once; ``None`` means all orgs."""
+    raw = os.environ.get("AGENT_SQL_ORG_ALLOWLIST", "").strip()
+    if not raw:
+        return None
+    return frozenset(tok.strip().lower() for tok in raw.split(",") if tok.strip())
+
+
 def is_org_in_sql_allowlist(organization_id: Optional[UUID]) -> bool:
     """Check the per-org allowlist for SQL mode.
 
     Empty/unset allowlist means SQL mode is open to every org (paired
     with ``AGENT_SQL_MODE_ENABLED=true`` this is full rollout).
     """
-    raw = os.environ.get("AGENT_SQL_ORG_ALLOWLIST", "").strip()
-    if not raw:
+    allowed = _sql_org_allowlist_tokens()
+    if allowed is None:
         return True
     if organization_id is None:
         return False
-    allowed = {tok.strip().lower() for tok in raw.split(",") if tok.strip()}
     return str(organization_id).lower() in allowed
 
 

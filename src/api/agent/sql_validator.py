@@ -419,7 +419,8 @@ def validate_sql(
         # stray $1 elsewhere in the query".
         allowed_placeholder_ids.add(id(arg))
 
-        functions_used.append(fn_name)
+        if fn_name not in functions_used:
+            functions_used.append(fn_name)
 
     if not functions_used:
         return _reject(

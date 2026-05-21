@@ -133,6 +133,18 @@ class _ClientFacade(Protocol):
     messages: AnthropicClient
 
 
+def _messages_api(client: _ClientFacade | AnthropicClient) -> AnthropicClient:
+    """Return the Messages API sub-client.
+
+    Callers may pass either the top-level AsyncAnthropic façade (with a
+    ``.messages`` attribute) or the messages sub-client directly.
+    """
+    nested = getattr(client, "messages", None)
+    if nested is not None:
+        return nested
+    return client  # type: ignore[return-value]
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
@@ -197,9 +209,7 @@ def _emit_decision_schema() -> dict[str, Any]:
                 },
                 "coverage": {
                     "type": "object",
-                    "description": (
-                        "Optional counts of depot entities reviewed during this turn."
-                    ),
+                    "description": ("Optional counts of depot entities reviewed during this turn."),
                     "additionalProperties": False,
                     "properties": {
                         "vehicles_checked": {"type": "integer", "minimum": 0},
@@ -344,9 +354,7 @@ class WorkflowAgent:
                 messages.append({"role": "assistant", "content": assistant_content})
 
                 tool_use_blocks = [
-                    b
-                    for b in assistant_content
-                    if getattr(b, "type", None) == "tool_use"
+                    b for b in assistant_content if getattr(b, "type", None) == "tool_use"
                 ]
 
                 if not tool_use_blocks:
@@ -373,9 +381,7 @@ class WorkflowAgent:
                     block_input = dict(getattr(block, "input", {}) or {})
 
                     if name == EMIT_DECISION_TOOL_NAME:
-                        decision_output, rule_applied = self._capture_terminator(
-                            block_input, guard
-                        )
+                        decision_output, rule_applied = self._capture_terminator(block_input, guard)
                         emit_called = True
                         # Terminator: do not append a tool_result; do not
                         # process further tool_use blocks in this response.
@@ -797,7 +803,7 @@ async def run_qa_turn(
 
     try:
         for iterations in range(1, max_iterations + 1):
-            response = await anthropic_client.messages.create(
+            response = await _messages_api(anthropic_client).create(
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -871,9 +877,7 @@ async def run_qa_turn(
                         exc.iterations = iterations  # type: ignore[attr-defined]
                         raise
                     except Exception as exc:  # noqa: BLE001
-                        logger.exception(
-                            "SQL agent terminator dispatch failed: %s", name
-                        )
+                        logger.exception("SQL agent terminator dispatch failed: %s", name)
                         result = {
                             "error": "tool_failure",
                             "tool": name,
@@ -885,9 +889,7 @@ async def run_qa_turn(
                         if isinstance(result, dict) and "error" in result:
                             ok = False
                             err = str(
-                                result.get("error_kind")
-                                or result.get("error")
-                                or "tool error"
+                                result.get("error_kind") or result.get("error") or "tool error"
                             )
                     tc = ToolCall(
                         name=name,
@@ -968,11 +970,7 @@ async def run_qa_turn(
                     # actually happened. See PR #216 review thread.
                     if isinstance(result, dict) and "error" in result:
                         ok = False
-                        err = str(
-                            result.get("error_kind")
-                            or result.get("error")
-                            or "tool error"
-                        )
+                        err = str(result.get("error_kind") or result.get("error") or "tool error")
 
                 tc = ToolCall(
                     name=name,
