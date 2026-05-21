@@ -109,6 +109,7 @@ from .reports import (
     REPORT_GROUP_BY_VALUES,
     SessionRow,
     aggregate_energy_rows,
+    compute_energy_totals,
     stream_rows_as_csv,
 )
 
@@ -5548,20 +5549,41 @@ class EnergyReportRow(BaseModel):
     charger_id: Optional[str] = Field(None, description="Charger UUID or 'unassigned'")
     driver_id: Optional[str] = Field(None, description="Driver UUID or 'unassigned'")
     card_id: Optional[str] = Field(None, description="RFID card UUID or 'unassigned'")
+    card_label: Optional[str] = Field(
+        None,
+        description=(
+            "Human-readable RFID card label (or id_tag fallback). Set only "
+            "when grouping by card; multiple cards sharing a label are "
+            "merged into one row."
+        ),
+    )
     energy_kwh: float = Field(..., description="Total energy delivered in the bucket (kWh)")
     session_count: int = Field(..., description="Number of charging sessions in the bucket")
     avg_kw: float = Field(..., description="Average charging power across sessions (kWh / hours)")
     cost: EnergyReportCost = Field(..., description="Bucketed cost (sum or estimate)")
 
 
+class EnergyReportTotals(BaseModel):
+    """Cross-bucket totals returned alongside report rows."""
+
+    energy_kwh: float
+    session_count: int
+    avg_kw: float
+    cost: EnergyReportCost
+
+
 class EnergyReportResponse(BaseModel):
     """Response from /reports/depots/{depot_id}/energy/monthly."""
 
     depot_id: str
+    depot_name: Optional[str] = Field(None, description="Human-readable depot name")
     currency: str
     from_: str = Field(..., alias="from")
     to: str
     rows: list[EnergyReportRow]
+    totals: Optional[EnergyReportTotals] = Field(
+        None, description="Sum of energy / count / cost across all rows in the window"
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -5677,15 +5699,21 @@ def _optional_text(value: object) -> Optional[str]:
 
 async def _load_report_context(
     depot_id: str,
-) -> tuple[str, str, Optional[float], list[str], dict[str, str]]:
-    """Fetch depot reporting context and charger mappings from static DB."""
+) -> tuple[str, str, str, Optional[float], list[str], dict[str, str]]:
+    """Fetch depot reporting context and charger mappings from static DB.
+
+    Returns ``(depot_name, timezone_name, currency, under_cap_rate,
+    ocpp_ids, charger_id_by_ocpp_id)``. ``depot_name`` falls back to the
+    depot UUID when ``sites.name`` is NULL so the report always has
+    something to render in place of the raw ID.
+    """
     if not db_pools:
         raise DatabaseError("Database not available")
 
     async with db_pools.static.acquire() as conn:
         depot_row = await conn.fetchrow(
             """
-            SELECT timezone, currency, billing_metadata
+            SELECT name, timezone, currency, billing_metadata
             FROM sites
             WHERE id = $1::uuid
             """,
@@ -5699,6 +5727,7 @@ async def _load_report_context(
             depot_id,
         )
 
+    depot_name = depot_row["name"] or depot_id
     timezone_name = depot_row["timezone"] or "America/Los_Angeles"
     currency = depot_row["currency"] or "USD"
     billing_metadata = depot_row["billing_metadata"]
@@ -5711,7 +5740,7 @@ async def _load_report_context(
 
     ocpp_ids = [r["ocpp_id"] for r in charger_rows]
     charger_id_by_ocpp_id = {r["ocpp_id"]: r["charger_id"] for r in charger_rows}
-    return timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id
+    return depot_name, timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id
 
 
 async def _fetch_session_rows(
@@ -5723,7 +5752,12 @@ async def _fetch_session_rows(
     to_date: date,
     ts_conn: Optional[asyncpg.Connection] = None,
 ) -> list[SessionRow]:
-    """Fetch charging_sessions rows in [from, to] (inclusive) in depot TZ."""
+    """Fetch charging_sessions rows in [from, to] (inclusive) in depot TZ.
+
+    Card identity is enriched with ``label`` and ``id_tag`` from the
+    ``rfid_cards`` table so the aggregator can group same-label cards
+    together and the export carries human-readable names.
+    """
     if not db_pools or db_pools.ts is None:
         raise DatabaseError("Database not available")
 
@@ -5756,10 +5790,43 @@ async def _fetch_session_rows(
     else:
         records = await ts_conn.fetch(query, ocpp_ids, from_date, to_date, timezone_name, depot_id)
 
+    card_ids = {
+        _optional_text(r["card_id"])
+        for r in records
+        if _optional_text(r["card_id"]) is not None
+    }
+    card_info: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    if card_ids:
+        # Scope by site_id so a charging_sessions.card_id that points to a
+        # card from another depot (legacy / bad-import data) is NOT enriched
+        # — we'd otherwise leak the other tenant's label/id_tag and merge
+        # buckets under the wrong card name. Unenriched rows fall back to
+        # grouping by raw card_id UUID via aggregate_energy_rows.
+        async with db_pools.static.acquire() as conn:
+            card_rows = await conn.fetch(
+                """
+                SELECT id::text AS card_id, label, id_tag
+                FROM rfid_cards
+                WHERE id = ANY($1::uuid[])
+                  AND site_id = $2::uuid
+                """,
+                list(card_ids),
+                depot_id,
+            )
+        card_info = {
+            row["card_id"]: (
+                _optional_text(row["label"]),
+                _optional_text(row["id_tag"]),
+            )
+            for row in card_rows
+        }
+
     rows: list[SessionRow] = []
     for r in records:
         energy = r["energy_delivered_kwh"]
         cost = r["cost_total"]
+        card_id = _optional_text(r["card_id"])
+        card_label, card_id_tag = card_info.get(card_id, (None, None)) if card_id else (None, None)
         rows.append(
             SessionRow(
                 start_time=r["start_time"],
@@ -5769,7 +5836,9 @@ async def _fetch_session_rows(
                 vehicle_id=_optional_text(r["vehicle_id"]),
                 charger_id=charger_id_by_ocpp_id.get(r["charger_id"]),
                 driver_id=_optional_text(r["driver_id"]),
-                card_id=_optional_text(r["card_id"]),
+                card_id=card_id,
+                card_label=card_label,
+                card_id_tag=card_id_tag,
             )
         )
     return rows
@@ -5791,7 +5860,12 @@ async def _build_energy_report(
     *,
     search: Optional[str] = None,
 ) -> tuple[dict, list[dict], str]:
-    """Run the full report pipeline and return (metadata, rows, currency)."""
+    """Run the full report pipeline and return (metadata, rows, currency).
+
+    ``metadata`` carries ``depot_name`` and a ``totals`` block so the
+    monthly endpoint and downstream consumers (PDF, CSV) can render the
+    report header and a Total line without re-querying the data.
+    """
     from_date = _parse_report_date(from_str, "from")
     to_date = _parse_report_date(to_str, "to")
     if to_date < from_date:
@@ -5800,7 +5874,7 @@ async def _build_energy_report(
             detail="'to' must be on or after 'from'",
         )
 
-    timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
+    depot_name, timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
         await _load_report_context(depot_id)
     )
     sessions = await _fetch_session_rows(
@@ -5818,11 +5892,21 @@ async def _build_energy_report(
         from_date=from_date,
         to_date=to_date,
     )
+    totals = compute_energy_totals(
+        sessions,
+        timezone=timezone_name,
+        under_cap_rate=under_cap_rate,
+        currency=currency,
+        from_date=from_date,
+        to_date=to_date,
+    )
     metadata = {
         "depot_id": depot_id,
+        "depot_name": depot_name,
         "currency": currency,
         "from": from_str,
         "to": to_str,
+        "totals": totals,
     }
     return metadata, rows, currency
 
@@ -5971,7 +6055,7 @@ async def get_energy_report_monthly_csv(
     grouping = _validate_report_group_by(group_by)
 
     try:
-        _, rows, _ = await _build_energy_report(depot_id, from_, to, grouping, search=search)
+        metadata, rows, _ = await _build_energy_report(depot_id, from_, to, grouping, search=search)
     except DepotNotFoundError:
         raise
     except asyncpg.PostgresError as exc:
@@ -5988,9 +6072,12 @@ async def get_energy_report_monthly_csv(
 
     # Bind to a local so the generator captures a stable reference.
     rows_for_stream = rows
+    totals_for_stream = metadata.get("totals")
 
     def _generate() -> Iterator[str]:
-        yield from stream_rows_as_csv(rows_for_stream, group_by=grouping)
+        yield from stream_rows_as_csv(
+            rows_for_stream, group_by=grouping, totals=totals_for_stream
+        )
 
     return StreamingResponse(_generate(), media_type="text/csv", headers=headers)
 
@@ -6369,6 +6456,7 @@ async def get_energy_transactions(
 
     try:
         (
+            _depot_name,
             timezone_name,
             currency,
             under_cap_rate,
@@ -6665,6 +6753,7 @@ async def export_report(
 
     stored = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
     agg_rows: list[dict] = stored.get("rows", [])
+    totals: Optional[dict] = stored.get("totals")
     group_by: Optional[str] = row["group_by"]
 
     filename = f"report_{report_id}.csv"
@@ -6672,7 +6761,7 @@ async def export_report(
     rows_for_stream = agg_rows
 
     def _generate() -> Iterator[str]:
-        yield from stream_rows_as_csv(rows_for_stream, group_by=group_by)
+        yield from stream_rows_as_csv(rows_for_stream, group_by=group_by, totals=totals)
 
     return StreamingResponse(_generate(), media_type="text/csv", headers=headers_resp)
 
@@ -9775,7 +9864,7 @@ async def _handle_reports_generate(
         )
 
     # Load depot timezone to resolve defaults and for UTC conversion.
-    timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
+    depot_name, timezone_name, currency, under_cap_rate, ocpp_ids, charger_id_by_ocpp_id = (
         await _load_report_context(depot_id)
     )
     tz = ZoneInfo(timezone_name)
@@ -9850,8 +9939,22 @@ async def _handle_reports_generate(
             from_date=period_start_date,
             to_date=period_end_date,
         )
+        totals = compute_energy_totals(
+            sessions,
+            timezone=timezone_name,
+            under_cap_rate=under_cap_rate,
+            currency=currency,
+            from_date=period_start_date,
+            to_date=period_end_date,
+        )
         stored_data = json.dumps(
-            {"rows": agg_rows, "currency": currency, "group_by": group_by}
+            {
+                "rows": agg_rows,
+                "currency": currency,
+                "group_by": group_by,
+                "depot_name": depot_name,
+                "totals": totals,
+            }
         )
 
     async def _insert_report(conn: asyncpg.Connection) -> asyncpg.Record:

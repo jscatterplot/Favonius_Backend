@@ -201,6 +201,7 @@ def _build_shared_pool(
         if "FROM sites" in query:
             # Reports endpoint depot row.
             return {
+                "name": "Test Depot",
                 "timezone": timezone_name,
                 "currency": currency,
                 "billing_metadata": {"under_cap_rate": 0.20},
