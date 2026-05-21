@@ -802,26 +802,58 @@ async def run_qa_turn(
             block_input = dict(getattr(block, "input", {}) or {})
 
             if name == QA_TERMINATOR_TOOL_NAME:
-                result = await tool_registry.dispatch(name, block_input)
-                final_text = str(result.get("text", "")).strip()
                 try:
-                    row_evidence = int(result.get("row_evidence", 0) or 0)
-                except (TypeError, ValueError):
-                    row_evidence = 0
-                terminated = True
-                # Record the terminator call as a tool_call so the trace
-                # shows the closing step.
+                    result = await tool_registry.dispatch(name, block_input)
+                    ok = True
+                    err = None
+                except ToolNotRegisteredError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "SQL agent terminator dispatch failed: %s", name
+                    )
+                    result = {
+                        "error": "tool_failure",
+                        "tool": name,
+                        "detail": str(exc),
+                    }
+                    ok = False
+                    err = str(exc)
+                else:
+                    if isinstance(result, dict) and "error" in result:
+                        ok = False
+                        err = str(
+                            result.get("error_kind")
+                            or result.get("error")
+                            or "tool error"
+                        )
                 tc = ToolCall(
                     name=name,
                     arguments=block_input,
                     result=result,
-                    ok=True,
-                    error=None,
+                    ok=ok,
+                    error=err,
                 )
                 tool_calls.append(tc)
                 if on_step is not None:
                     await _safe_on_step(on_step, tc)
-                break
+                if ok:
+                    final_text = str(result.get("text", "")).strip()
+                    try:
+                        row_evidence = int(result.get("row_evidence", 0) or 0)
+                    except (TypeError, ValueError):
+                        row_evidence = 0
+                    terminated = True
+                    break
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block_id,
+                        "content": json.dumps(result, default=str),
+                        "is_error": True,
+                    }
+                )
+                continue
 
             if name not in allowed_tools:
                 status = "tool_not_allowed"

@@ -813,6 +813,13 @@ def _predicate_allows_unbounded_time(node: exp.Expression) -> bool:
             or _predicate_allows_unbounded_time(right)
         )
     if isinstance(node, exp.Not):
+        inner = node.this
+        if inner is None:
+            return True
+        if _is_unconditional_false(inner):
+            return True
+        if _is_unconditional_true(inner):
+            return False
         return False
     if _is_unconditional_true(node):
         return True
@@ -875,6 +882,27 @@ def _is_unconditional_true(node: exp.Expression | None) -> bool:
             )
         if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
             return _literal_comparison_holds(node, left, right)
+    return False
+
+
+def _is_unconditional_false(node: exp.Expression | None) -> bool:
+    """Best-effort check for SQL expressions that are always FALSE."""
+    if node is None:
+        return False
+    if isinstance(node, exp.Boolean):
+        return not bool(node.this)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            return float(node.name) == 0
+        except ValueError:
+            return False
+    if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        left = node.this
+        right = node.expression
+        if left is None or right is None:
+            return False
+        if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
+            return not _literal_comparison_holds(node, left, right)
     return False
 
 
