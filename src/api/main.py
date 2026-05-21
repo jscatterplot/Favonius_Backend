@@ -48,6 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic.alias_generators import to_camel
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from ..adapters.ocpp.dispatch import dispatch_get_diagnostics
 from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
 from ..core.optimizer.exceptions import (
@@ -99,6 +100,11 @@ from ..security.validators import (
     validate_vehicle_id,
 )
 from . import fleet_list as _fleet_list
+from .charger_logs import (
+    UploadRejected,
+    receive_upload,
+    schedule_post_upload_pipeline,
+)
 from .charging_import import (
     PriceSource,
     StaticPriceSource,
@@ -578,17 +584,35 @@ app = FastAPI(
 
 _MAX_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(1 * 1024 * 1024)))  # 1 MB default
 
+# Charger diagnostic archives can be tens of MB. The upload endpoint
+# applies its own cap (``CHARGER_LOG_UPLOAD_MAX_BYTES``) which the
+# middleware mirrors so a misconfigured global cap doesn't silently
+# block the endpoint while the per-endpoint cap suggests it would work.
+_CHARGER_LOG_UPLOAD_PATH = "/internal/charger_logs/upload"
+
+
+def _body_size_limit_for_path(path: str) -> int:
+    if path == _CHARGER_LOG_UPLOAD_PATH:
+        # Lazy import: the upload-token helper reads env at call time so
+        # tests can monkeypatch CHARGER_LOG_UPLOAD_MAX_BYTES.
+        from ..adapters.chargers.upload_token import get_max_upload_bytes
+
+        return get_max_upload_bytes()
+    return _MAX_BODY_SIZE
+
 
 class MaxBodySizeMiddleware(BaseHTTPMiddleware):
     """Reject requests whose Content-Length exceeds the configured maximum."""
 
     async def dispatch(self, request: Request, call_next):
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > _MAX_BODY_SIZE:
-            return JSONResponse(
-                status_code=413,
-                content={"detail": "Request body too large"},
-            )
+        if content_length:
+            limit = _body_size_limit_for_path(request.url.path)
+            if int(content_length) > limit:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large"},
+                )
         return await call_next(request)
 
 
@@ -8357,6 +8381,99 @@ async def receive_ocpp_event(
         return {"status": "error", "detail": str(e)}
 
 
+@app.post(
+    "/internal/charger_logs/upload",
+    include_in_schema=False,
+)
+async def upload_charger_log_endpoint(
+    request: Request,
+    token: str = Query(..., description="HMAC-signed upload token from GetDiagnostics location URL"),
+    import_id: Optional[str] = Query(None, description="Convenience param; the canonical id is encoded in token"),
+):
+    """Receive a charger-uploaded diagnostics archive.
+
+    Public endpoint (chargers don't carry Supabase JWTs). Auth is the
+    HMAC-signed ``token`` query param produced by
+    :func:`src.adapters.chargers.upload_token.mint_token` and embedded
+    in the ``location`` URL we sent in ``GetDiagnostics``. The token
+    encodes ``(import_id, expiry, hmac)``; the upload endpoint
+    recomputes the HMAC and rejects malformed / expired / mismatched
+    tokens with 401.
+
+    Size-cap: the body is read into memory up to
+    ``CHARGER_LOG_UPLOAD_MAX_BYTES`` (default 50 MiB). Bodies above
+    that limit return 413 — the legacy ``MaxBodySizeMiddleware`` may
+    already trip on this before we ever see it.
+
+    On success: stores ``raw_payload`` on the ``charger_log_imports``
+    row, flips status to ``'received'``, schedules
+    :func:`run_post_upload_pipeline` as a post-commit background task,
+    returns 202 ``{import_id, status_url}``.
+    """
+    _ = import_id  # accepted for charger compatibility; not authoritative
+
+    if db_pools is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error_code": "DATABASE_UNAVAILABLE",
+                "message": "Database not available",
+            },
+        )
+
+    start = time.perf_counter()
+    body = await request.body()
+
+    file_name = (
+        request.headers.get("X-File-Name")
+        or request.headers.get("Content-Disposition", "").split("filename=")[-1].strip('"; ')
+        or None
+    )
+
+    try:
+        result = await receive_upload(
+            db_pools.ts,
+            token=token,
+            body=body,
+            file_name=file_name,
+        )
+    except UploadRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "error_code": "CHARGER_LOG_UPLOAD_REJECTED",
+                "message": exc.reason,
+            },
+        ) from exc
+
+    # Record histogram before scheduling the background pipeline so a
+    # slow parse doesn't pollute the receive-latency metric.
+    from ..monitoring.metrics import CHARGER_LOG_UPLOAD_DURATION
+
+    CHARGER_LOG_UPLOAD_DURATION.observe(max(time.perf_counter() - start, 1e-6))
+
+    schedule_post_upload_pipeline(
+        db_pools.ts,
+        import_id=result.import_id,
+        background_tasks=_background_tasks,
+    )
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "import_id": str(result.import_id),
+            "status": "received",
+            "file_size_bytes": result.file_size_bytes,
+            "content_sha256": result.content_sha256,
+            "status_url": (
+                f"/admin/depots/<depot_id>/sessions/{result.session_id}/log_comparison"
+                if result.session_id
+                else None
+            ),
+        },
+    )
+
+
 # ── Health checks ─────────────────────────────────────────────────────────────
 
 
@@ -9013,6 +9130,375 @@ async def rotate_charger_credentials_endpoint(
         },
         "rotated_at": result["last_rotated_at"],
     }
+
+
+@app.post(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/sessions/{session_id}/fetch_logs",
+    tags=["admin"],
+    summary="Trigger a GetDiagnostics pull of charger-side session logs",
+)
+async def fetch_charger_session_logs_endpoint(
+    depot_id: str,
+    charger_id: str,
+    session_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Enqueue an OCPP ``GetDiagnostics`` to extract the charger's own log.
+
+    Flow:
+      1. Authorize favonius_admin / customer_admin and resolve the depot.
+      2. Look up the charger's OCPP id (``station_id``) + vendor from
+         ``charging_stations``. 404 if charger isn't in the depot.
+      3. Verify the session belongs to that station — defence against
+         someone fetching logs for a different depot's session by id
+         alone.
+      4. :func:`dispatch_get_diagnostics` writes a ``charger_log_imports``
+         row, mints a signed upload URL, and enqueues a
+         ``charging_command_queue`` row. The WS handler drains the
+         queue and pushes ``GetDiagnostics(location=<URL>)`` to the
+         live OCPP socket.
+      5. Audit row ``charger.logs.fetched`` is written before returning.
+
+    Returns ``{import_id, status, status_url}``. The operator polls
+    ``GET /admin/depots/.../sessions/.../log_comparison`` for the
+    parsed + reconciled result.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+    validate_uuid(session_id, "session_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin"):
+        raise _forbidden("FORBIDDEN_ROLE", "favonius_admin or customer_admin role required")
+
+    depot_row, _ = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name=(
+            "POST /admin/depots/{depot_id}/chargers/{charger_id}/sessions/{session_id}/fetch_logs"
+        ),
+    )
+
+    if db_pools is None:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.static.acquire() as conn:
+        charger_row = await conn.fetchrow(
+            """
+            SELECT id::text     AS charger_id,
+                   station_id   AS ocpp_id,
+                   vendor       AS vendor,
+                   connector_count
+              FROM charging_stations
+             WHERE id = $1::uuid AND site_id = $2::uuid
+            """,
+            charger_id,
+            depot_id,
+        )
+    if charger_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "CHARGER_NOT_FOUND", "message": "Charger not found"},
+        )
+
+    async with db_pools.ts.acquire() as conn:
+        session_row = await conn.fetchrow(
+            """
+            SELECT session_id, station_id, connector_id, transaction_id,
+                   start_time, end_time
+              FROM charging_sessions
+             WHERE session_id = $1::uuid
+               AND station_id = $2
+            """,
+            session_id,
+            charger_row["ocpp_id"],
+        )
+    if session_row is None:
+        # Either the session doesn't exist or it's on a different
+        # charger — return 404 without leaking which.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "SESSION_NOT_FOUND", "message": "Session not found"},
+        )
+
+    # One idempotency key per (session, source) so a double-click on
+    # the UI button doesn't queue two GetDiagnostics within the same
+    # second. Includes a coarse timestamp to allow a fresh attempt an
+    # hour later if the first one failed — using only session_id would
+    # make the row permanently un-re-fetchable.
+    hour_bucket = int(time.time() // 3600)
+    idempotency_key = f"get_diagnostics:{session_id}:{hour_bucket}"
+
+    try:
+        import_id = await dispatch_get_diagnostics(
+            db_pools.ts,
+            station_id=charger_row["ocpp_id"],
+            session_id=UUID(session_id),
+            charger_id=UUID(charger_id),
+            connector_id=int(session_row["connector_id"])
+            if session_row["connector_id"] is not None
+            else None,
+            vendor=charger_row["vendor"],
+            idempotency_key=idempotency_key,
+        )
+    except RuntimeError as exc:
+        # Missing env config — surface a 503 so operators see why the
+        # action did nothing instead of a generic 500.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error_code": "CHARGER_LOG_UPLOAD_NOT_CONFIGURED",
+                "message": str(exc),
+            },
+        ) from exc
+    except asyncpg.UniqueViolationError:
+        # Idempotency-key collision — another request in this hour
+        # bucket already queued a GetDiagnostics for this session.
+        async with db_pools.ts.acquire() as conn:
+            existing = await conn.fetchrow(
+                """
+                SELECT id, status
+                  FROM charger_log_imports
+                 WHERE idempotency_key = $1
+                """,
+                idempotency_key,
+            )
+        if existing is not None:
+            return {
+                "import_id": str(existing["id"]),
+                "status": existing["status"],
+                "deduplicated": True,
+            }
+        # Shouldn't reach here, but if we do the UniqueViolation is
+        # honest news for the caller.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "DUPLICATE_REQUEST",
+                "message": "Identical GetDiagnostics already queued",
+            },
+        )
+
+    await _record_admin_action(
+        user=user,
+        action="charger.logs.fetched",
+        depot_id=depot_id,
+        organization_id_override=(
+            str(depot_row.get("organization_id")) if depot_row.get("organization_id") else None
+        ),
+        target_type="charger_log_import",
+        target_id=str(import_id),
+        metadata={
+            "endpoint": (
+                "POST /admin/depots/{depot_id}/chargers/{charger_id}/sessions/{session_id}/fetch_logs"
+            ),
+            "charger_id": charger_id,
+            "session_id": session_id,
+            "ocpp_id": charger_row["ocpp_id"],
+            "vendor": charger_row["vendor"],
+        },
+    )
+
+    return {
+        "import_id": str(import_id),
+        "status": "requested",
+        "status_url": (
+            f"/admin/depots/{depot_id}/sessions/{session_id}/log_comparison"
+        ),
+    }
+
+
+@app.get(
+    "/admin/depots/{depot_id}/sessions/{session_id}/log_comparison",
+    tags=["admin"],
+    summary="Side-by-side comparison of our session record vs the charger's log",
+)
+async def get_session_log_comparison_endpoint(
+    depot_id: str,
+    session_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return ``{our_session, charger_entries, reconciliation, import}`` for the UI.
+
+    Loads the most recent ``charger_log_imports`` row for the session
+    (any source — GetDiagnostics, GetLog, or manual_upload), the parsed
+    entries from ``charger_session_log_entries``, the matching
+    ``session_log_reconciliations`` row, and the original
+    ``charging_sessions`` row.
+
+    Responses:
+      * 200 with full payload when the import has reached ``reconciled``.
+      * 200 with partial payload (no reconciliation block) when the
+        import is still ``requested`` / ``uploading`` / ``received`` /
+        ``parsed`` — the UI shows a "pending" state.
+      * 404 when no import exists yet for this session.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(session_id, "session_id")
+
+    _ = _require_admin_role(user)
+    depot_row, _ = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name="GET /admin/depots/{depot_id}/sessions/{session_id}/log_comparison",
+    )
+
+    if db_pools is None:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        session_row = await conn.fetchrow(
+            """
+            SELECT session_id, station_id, connector_id, transaction_id,
+                   vehicle_id, start_time, end_time, energy_delivered_kwh,
+                   cost_total, cost_total_source
+              FROM charging_sessions
+             WHERE session_id = $1::uuid
+            """,
+            session_id,
+        )
+        if session_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error_code": "SESSION_NOT_FOUND", "message": "Session not found"},
+            )
+
+        # Tenant fence: the session must belong to a charger in the
+        # caller's depot. favonius_admin bypasses (the resolve helper
+        # already audited the cross-org read).
+        if get_user_role(user) != "favonius_admin":
+            owner = await db_pools.static.fetchval(
+                """
+                SELECT site_id::text
+                  FROM charging_stations
+                 WHERE station_id = $1
+                """,
+                session_row["station_id"],
+            )
+            if owner != depot_id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={
+                        "error_code": "SESSION_NOT_FOUND",
+                        "message": "Session not found",
+                    },
+                )
+
+        import_row = await conn.fetchrow(
+            """
+            SELECT id, status, source, vendor, file_name, file_size_bytes,
+                   content_sha256, requested_at, received_at, parsed_at,
+                   reconciled_at, error_message
+              FROM charger_log_imports
+             WHERE session_id = $1::uuid
+             ORDER BY requested_at DESC
+             LIMIT 1
+            """,
+            session_id,
+        )
+        if import_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error_code": "NO_CHARGER_LOG_IMPORT",
+                    "message": "No charger log has been fetched for this session yet",
+                },
+            )
+
+        entries = await conn.fetch(
+            """
+            SELECT time, connector_id, transaction_id,
+                   soc, charging_kw, energy_kwh, raw_fields
+              FROM charger_session_log_entries
+             WHERE log_import_id = $1
+             ORDER BY time
+            """,
+            import_row["id"],
+        )
+
+        reconciliation = await conn.fetchrow(
+            """
+            SELECT computed_at, source,
+                   our_energy_kwh, charger_energy_kwh, energy_delta_pct,
+                   our_duration_s, charger_duration_s,
+                   our_start_time, charger_start_time,
+                   our_end_time, charger_end_time, notes
+              FROM session_log_reconciliations
+             WHERE session_id = $1::uuid AND log_import_id = $2
+            """,
+            session_id,
+            import_row["id"],
+        )
+
+    payload: dict[str, Any] = {
+        "session": {
+            "session_id": str(session_row["session_id"]),
+            "station_id": session_row["station_id"],
+            "connector_id": session_row["connector_id"],
+            "transaction_id": session_row["transaction_id"],
+            "vehicle_id": (
+                str(session_row["vehicle_id"])
+                if session_row["vehicle_id"] is not None
+                else None
+            ),
+            "start_time": session_row["start_time"],
+            "end_time": session_row["end_time"],
+            "energy_delivered_kwh": (
+                float(session_row["energy_delivered_kwh"])
+                if session_row["energy_delivered_kwh"] is not None
+                else None
+            ),
+            "cost_total": (
+                float(session_row["cost_total"]) if session_row["cost_total"] is not None else None
+            ),
+            "cost_total_source": session_row["cost_total_source"],
+        },
+        "import": {
+            "import_id": str(import_row["id"]),
+            "status": import_row["status"],
+            "source": import_row["source"],
+            "vendor": import_row["vendor"],
+            "file_name": import_row["file_name"],
+            "file_size_bytes": import_row["file_size_bytes"],
+            "content_sha256": import_row["content_sha256"],
+            "requested_at": import_row["requested_at"],
+            "received_at": import_row["received_at"],
+            "parsed_at": import_row["parsed_at"],
+            "reconciled_at": import_row["reconciled_at"],
+            "error_message": import_row["error_message"],
+        },
+        "charger_entries": [
+            {
+                "time": e["time"],
+                "connector_id": e["connector_id"],
+                "transaction_id": e["transaction_id"],
+                "soc": e["soc"],
+                "charging_kw": e["charging_kw"],
+                "energy_kwh": e["energy_kwh"],
+                "raw_fields": e["raw_fields"],
+            }
+            for e in entries
+        ],
+        "reconciliation": (
+            {
+                "computed_at": reconciliation["computed_at"],
+                "source": reconciliation["source"],
+                "our_energy_kwh": reconciliation["our_energy_kwh"],
+                "charger_energy_kwh": reconciliation["charger_energy_kwh"],
+                "energy_delta_pct": reconciliation["energy_delta_pct"],
+                "our_duration_s": reconciliation["our_duration_s"],
+                "charger_duration_s": reconciliation["charger_duration_s"],
+                "our_start_time": reconciliation["our_start_time"],
+                "charger_start_time": reconciliation["charger_start_time"],
+                "our_end_time": reconciliation["our_end_time"],
+                "charger_end_time": reconciliation["charger_end_time"],
+                "notes": reconciliation["notes"],
+            }
+            if reconciliation is not None
+            else None
+        ),
+    }
+    return payload
 
 
 @app.post(

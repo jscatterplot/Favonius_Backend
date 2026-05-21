@@ -18,17 +18,23 @@ Reference: PRD §9.1 (OCPP), §10.5 (observability), session 3 brief.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime
 from typing import Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
 from src.core.models import OptimizationResult
 
 from ...db.pools import DatabasePools
+from ..chargers.upload_token import (
+    build_upload_url,
+    get_upload_base_url,
+    mint_token,
+)
 from .charge_point import convert_schedule_to_ocpp_profile
 from .mapping import get_vehicle_to_charger_map
 
@@ -234,6 +240,142 @@ async def _enqueue(
                 str(expires_in_min),
             )
         )
+
+
+async def dispatch_get_diagnostics(
+    ts_pool: asyncpg.Pool,
+    *,
+    station_id: str,
+    session_id: Optional[UUID] = None,
+    charger_id: Optional[UUID] = None,
+    connector_id: Optional[int] = None,
+    vendor: Optional[str] = None,
+    expires_in_min: int = 60,
+    retries: Optional[int] = None,
+    retry_interval: Optional[int] = None,
+    start_time: Optional[datetime] = None,
+    stop_time: Optional[datetime] = None,
+    idempotency_key: Optional[str] = None,
+) -> UUID:
+    """Enqueue a ``GetDiagnostics`` command and create its import row.
+
+    The function:
+      1. Inserts a ``charger_log_imports`` row in status ``'requested'``.
+      2. Mints an HMAC-signed upload URL embedding the new row's id.
+      3. Hashes the token and stores it in ``upload_token_hash`` so
+         the upload endpoint can reject mismatched tokens.
+      4. Enqueues a ``charging_command_queue`` row with
+         ``command_type='get_diagnostics'`` and a payload carrying the
+         signed URL, retries/retryInterval, and optional time window.
+
+    The legacy WS handler's ``ChargingCommandQueueConsumer`` drains the
+    queue, calls ``FleetChargePoint.get_diagnostics(location=…)`` with
+    the signed URL, and the charger uploads to the upload endpoint.
+
+    Args:
+        ts_pool: TimescaleDB pool.
+        station_id: OCPP charge-point id (matches
+            ``charging_command_queue.charge_point_id`` /
+            ``charging_sessions.station_id``).
+        session_id: ``charging_sessions.session_id`` if pulling logs for
+            a specific session. Optional for future depot-wide pulls.
+        charger_id: Supabase UUID of the charger (for the imports row).
+        connector_id: 1-based connector id, if known.
+        vendor: Vendor string (drives parser dispatch at receive time).
+            When unset, the receive path looks it up from
+            ``charging_stations``.
+        expires_in_min: How long the queue row stays eligible for delivery.
+        retries / retry_interval: Forwarded to OCPP ``GetDiagnostics``.
+        start_time / stop_time: Optional OCPP window for the diagnostic
+            dump (passed through to the charger).
+        idempotency_key: When set, the row's ``UNIQUE`` constraint on
+            ``idempotency_key`` blocks a second request from creating
+            a duplicate row.
+
+    Returns:
+        The new ``charger_log_imports.id``.
+
+    Raises:
+        RuntimeError: When ``CHARGER_LOG_UPLOAD_BASE_URL`` /
+            ``CHARGER_LOG_UPLOAD_SIGNING_KEY`` are unset — the charger
+            could not reach a usable URL, so dispatch refuses up-front
+            rather than emit a broken request.
+        asyncpg.UniqueViolationError: When ``idempotency_key`` collides
+            with an existing row. Callers translate this to HTTP 409.
+    """
+    # Fail fast if the deployment isn't configured. Avoids minting a
+    # token the charger could never use.
+    if get_upload_base_url() is None:
+        raise RuntimeError(
+            "Charger log upload is not configured: set CHARGER_LOG_UPLOAD_BASE_URL "
+            "(and CHARGER_LOG_UPLOAD_SIGNING_KEY)."
+        )
+
+    import_id = uuid4()
+    token = mint_token(import_id)
+    token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    location = build_upload_url(import_id)
+
+    payload: dict[str, Any] = {
+        "location": location,
+        "import_id": str(import_id),
+    }
+    if retries is not None:
+        payload["retries"] = retries
+    if retry_interval is not None:
+        payload["retry_interval"] = retry_interval
+    if start_time is not None:
+        payload["start_time"] = start_time.isoformat()
+    if stop_time is not None:
+        payload["stop_time"] = stop_time.isoformat()
+
+    async with ts_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO charger_log_imports (
+                    id, station_id, charger_id, connector_id, session_id,
+                    vendor, source, status, requested_at,
+                    upload_token_hash, idempotency_key
+                ) VALUES (
+                    $1, $2, $3, $4, $5,
+                    $6, 'get_diagnostics', 'requested', NOW(),
+                    $7, $8
+                )
+                """,
+                import_id,
+                station_id,
+                charger_id,
+                connector_id,
+                session_id,
+                vendor,
+                token_sha256,
+                idempotency_key,
+            )
+            await conn.execute(
+                """
+                INSERT INTO charging_command_queue (
+                    charge_point_id, connector_id, command_type,
+                    payload, expires_at
+                ) VALUES (
+                    $1, $2, 'get_diagnostics',
+                    $3::jsonb,
+                    NOW() + ($4 || ' minutes')::interval
+                )
+                """,
+                station_id,
+                connector_id if connector_id is not None else 0,
+                json.dumps(payload),
+                str(expires_in_min),
+            )
+
+    logger.info(
+        "Enqueued GetDiagnostics import_id=%s station=%s session=%s",
+        import_id,
+        station_id,
+        session_id,
+    )
+    return import_id
 
 
 async def _store_charging_command(

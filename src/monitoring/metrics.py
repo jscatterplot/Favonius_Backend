@@ -151,6 +151,33 @@ SESSION_COST_DURATION = Histogram(
     buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
 )
 
+# Charger-side log import + reconciliation (migration 042 / charger_log_imports).
+# One counter per terminal state per vendor so dashboards can isolate
+# vendor-specific failure modes (e.g. ABB parse rate vs Wallbox).
+CHARGER_LOG_IMPORTS = Counter(
+    "favonius_charger_log_imports_total",
+    "Charger-side log import lifecycle transitions",
+    ["vendor", "status"],  # status: requested | received | parsed | reconciled | failed | expired
+)
+
+CHARGER_LOG_PARSE_FAILURES = Counter(
+    "favonius_charger_log_parse_failures_total",
+    "Parser exceptions or empty results by vendor and reason",
+    ["vendor", "reason"],  # reason: corrupt_archive | parse_exception | no_entries | unsupported_vendor
+)
+
+CHARGER_LOG_RECONCILIATIONS = Counter(
+    "favonius_charger_log_reconciliations_total",
+    "Reconciliations written, labelled by source enum",
+    ["source"],  # reconciled | partial | no_log_entries | no_session | parse_failed
+)
+
+CHARGER_LOG_UPLOAD_DURATION = Histogram(
+    "favonius_charger_log_upload_duration_seconds",
+    "Wall-clock time to receive and persist a charger log upload",
+    buckets=[0.05, 0.1, 0.5, 1, 5, 15, 60, 300],
+)
+
 # Control loop metrics
 # Per PRD Section 10.2: System availability ≥ 99.5%
 CONTROL_LOOP_UPTIME = Gauge(
