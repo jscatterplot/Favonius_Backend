@@ -28,6 +28,7 @@ from src.api.main import app
 from src.api.reports import (
     SessionRow,
     aggregate_energy_rows,
+    compute_energy_totals,
     csv_columns,
     stream_rows_as_csv,
 )
@@ -72,6 +73,8 @@ def _make_pool(static_records: dict[str, Any], ts_records: list[dict]):
     async def static_fetch(query: str, *args, **kwargs):
         if "FROM charging_stations" in query:
             return static_records.get("charger_rows", [])
+        if "FROM rfid_cards" in query:
+            return static_records.get("rfid_card_rows", [])
         return []
 
     static_conn.fetchrow.side_effect = static_fetchrow
@@ -100,6 +103,7 @@ def _make_pool(static_records: dict[str, Any], ts_records: list[dict]):
 
 def _depot_row(
     *,
+    name: str = "Test Depot",
     timezone: str = "America/Los_Angeles",
     currency: str = "USD",
     under_cap_rate: Optional[float] = 0.20,
@@ -108,6 +112,7 @@ def _depot_row(
     if under_cap_rate is not None:
         billing_metadata["under_cap_rate"] = under_cap_rate
     return {
+        "name": name,
         "timezone": timezone,
         "currency": currency,
         "billing_metadata": billing_metadata,
@@ -348,6 +353,244 @@ class TestAggregateEnergyRows:
                 to_date=date(2024, 1, 1),
             )
 
+    def test_group_by_card_merges_same_label_across_tags(self):
+        """Two cards sharing a label collapse into one row by merge key."""
+        tz = "America/Los_Angeles"
+        sessions = [
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 5, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 5, 11, 0), tz),
+                energy_kwh=50.0,
+                cost_total=10.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id="uuid-a",
+                card_label="Driver John",
+                card_id_tag="TAG_AAA",
+            ),
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 10, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 10, 11, 0), tz),
+                energy_kwh=30.0,
+                cost_total=6.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id="uuid-b",
+                card_label="Driver John",
+                card_id_tag="TAG_BBB",
+            ),
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 12, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 12, 11, 0), tz),
+                energy_kwh=20.0,
+                cost_total=4.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id="uuid-c",
+                card_label="Driver Jane",
+                card_id_tag="TAG_CCC",
+            ),
+        ]
+        rows = aggregate_energy_rows(
+            sessions,
+            timezone=tz,
+            group_by="card",
+            under_cap_rate=0.20,
+            currency="USD",
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 1, 31),
+        )
+        by_label = {r["card_label"]: r for r in rows}
+        assert set(by_label) == {"Driver John", "Driver Jane"}
+        assert by_label["Driver John"]["session_count"] == 2
+        assert by_label["Driver John"]["energy_kwh"] == pytest.approx(80.0)
+        assert by_label["Driver John"]["cost"]["amount"] == pytest.approx(16.0)
+        # card_id on the merged row is one of the underlying UUIDs.
+        assert by_label["Driver John"]["card_id"] in {"uuid-a", "uuid-b"}
+        # Different label → separate row.
+        assert by_label["Driver Jane"]["energy_kwh"] == pytest.approx(20.0)
+
+    def test_group_by_card_falls_back_to_id_tag_when_label_missing(self):
+        """No label → group by id_tag so two tag scans collapse anyway."""
+        tz = "America/Los_Angeles"
+        sessions = [
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 5, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 5, 11, 0), tz),
+                energy_kwh=40.0,
+                cost_total=8.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id="uuid-a",
+                card_label=None,
+                card_id_tag="TAG_SHARED",
+            ),
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 6, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 6, 11, 0), tz),
+                energy_kwh=10.0,
+                cost_total=2.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id="uuid-b",
+                card_label=None,
+                card_id_tag="TAG_SHARED",
+            ),
+        ]
+        rows = aggregate_energy_rows(
+            sessions,
+            timezone=tz,
+            group_by="card",
+            under_cap_rate=0.20,
+            currency="USD",
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 1, 31),
+        )
+        assert len(rows) == 1
+        assert rows[0]["energy_kwh"] == pytest.approx(50.0)
+        # Label falls back to the id_tag because no label is set.
+        assert rows[0]["card_label"] == "TAG_SHARED"
+
+    def test_group_by_card_unassigned_when_card_id_is_null(self):
+        """NULL card_id stays in the single 'unassigned' bucket."""
+        tz = "America/Los_Angeles"
+        sessions = [
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 5, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 5, 11, 0), tz),
+                energy_kwh=10.0,
+                cost_total=2.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id=None,
+            ),
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 6, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 6, 11, 0), tz),
+                energy_kwh=15.0,
+                cost_total=3.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id=None,
+            ),
+        ]
+        rows = aggregate_energy_rows(
+            sessions,
+            timezone=tz,
+            group_by="card",
+            under_cap_rate=0.20,
+            currency="USD",
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 1, 31),
+        )
+        assert len(rows) == 1
+        assert rows[0]["card_id"] == "unassigned"
+        assert rows[0]["card_label"] == "unassigned"
+        assert rows[0]["session_count"] == 2
+
+
+class TestComputeEnergyTotals:
+    """Tests for :func:`compute_energy_totals`."""
+
+    def test_totals_sum_energy_count_and_cost(self):
+        tz = "America/Los_Angeles"
+        sessions = [
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 5, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 5, 11, 0), tz),
+                energy_kwh=100.0,
+                cost_total=20.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id=None,
+            ),
+            SessionRow(
+                start_time=_utc(datetime(2024, 2, 5, 9, 0), tz),
+                end_time=_utc(datetime(2024, 2, 5, 11, 0), tz),
+                energy_kwh=50.0,
+                cost_total=None,  # forces estimate
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id=None,
+            ),
+        ]
+        totals = compute_energy_totals(
+            sessions,
+            timezone=tz,
+            under_cap_rate=0.20,
+            currency="USD",
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 2, 29),
+        )
+        assert totals["session_count"] == 2
+        assert totals["energy_kwh"] == pytest.approx(150.0)
+        # 20.0 + (50.0 × 0.20) = 30.0
+        assert totals["cost"]["amount"] == pytest.approx(30.0)
+        assert totals["cost"]["currency"] == "USD"
+        assert totals["cost"]["estimated"] is True
+        # avg_kw = 150 kWh / 4 hr = 37.5
+        assert totals["avg_kw"] == pytest.approx(37.5)
+
+    def test_totals_skip_sessions_outside_window(self):
+        tz = "America/Los_Angeles"
+        sessions = [
+            SessionRow(
+                start_time=_utc(datetime(2023, 12, 30, 9, 0), tz),
+                end_time=_utc(datetime(2023, 12, 30, 11, 0), tz),
+                energy_kwh=999.0,
+                cost_total=999.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id=None,
+            ),
+            SessionRow(
+                start_time=_utc(datetime(2024, 1, 5, 9, 0), tz),
+                end_time=_utc(datetime(2024, 1, 5, 11, 0), tz),
+                energy_kwh=10.0,
+                cost_total=2.0,
+                vehicle_id=None,
+                charger_id=None,
+                driver_id=None,
+                card_id=None,
+            ),
+        ]
+        totals = compute_energy_totals(
+            sessions,
+            timezone=tz,
+            under_cap_rate=None,
+            currency="USD",
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 1, 31),
+        )
+        assert totals["session_count"] == 1
+        assert totals["energy_kwh"] == pytest.approx(10.0)
+
+    def test_totals_empty_when_no_sessions(self):
+        totals = compute_energy_totals(
+            [],
+            timezone="UTC",
+            under_cap_rate=None,
+            currency="EUR",
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 1, 31),
+        )
+        assert totals == {
+            "energy_kwh": 0.0,
+            "session_count": 0,
+            "avg_kw": 0.0,
+            "cost": {"amount": 0.0, "currency": "EUR", "estimated": False},
+        }
+
 
 # ── CSV helper tests ────────────────────────────────────────────────────────
 
@@ -368,6 +611,61 @@ class TestCsvSerialization:
 
     def test_csv_columns_with_grouping(self):
         assert csv_columns("vehicle")[1] == "vehicle_id"
+
+    def test_csv_columns_card_grouping_includes_label(self):
+        cols = csv_columns("card")
+        assert cols[1] == "card_id"
+        assert cols[2] == "card_label"
+
+    def test_stream_rows_as_csv_with_totals_appends_total_row(self):
+        rows = [
+            {
+                "bucket": "2024-01",
+                "vehicle_id": "bus_1",
+                "energy_kwh": 100.0,
+                "session_count": 1,
+                "avg_kw": 50.0,
+                "cost": {"amount": 20.0, "currency": "USD", "estimated": False},
+            },
+        ]
+        totals = {
+            "energy_kwh": 100.0,
+            "session_count": 1,
+            "avg_kw": 50.0,
+            "cost": {"amount": 20.0, "currency": "USD", "estimated": False},
+        }
+        body = "".join(
+            stream_rows_as_csv(rows, group_by="vehicle", totals=totals)
+        )
+        reader = list(csv.reader(io.StringIO(body)))
+        assert len(reader) == 3  # header + 1 row + TOTAL
+        assert reader[-1][0] == "TOTAL"
+        assert reader[-1][1] == ""  # grouping cell blank on totals
+        assert float(reader[-1][2]) == 100.0
+        assert int(reader[-1][3]) == 1
+        assert reader[-1][4] == ""  # avg_kw blank on totals
+        assert float(reader[-1][5]) == 20.0
+        assert reader[-1][6] == "USD"
+
+    def test_stream_rows_as_csv_card_grouping_emits_label_column(self):
+        rows = [
+            {
+                "bucket": "2024-01",
+                "card_id": "uuid-a",
+                "card_label": "Driver John",
+                "energy_kwh": 100.0,
+                "session_count": 1,
+                "avg_kw": 50.0,
+                "cost": {"amount": 20.0, "currency": "USD", "estimated": False},
+            },
+        ]
+        body = "".join(stream_rows_as_csv(rows, group_by="card"))
+        reader = list(csv.reader(io.StringIO(body)))
+        # Header includes card_id + card_label.
+        assert reader[0][1] == "card_id"
+        assert reader[0][2] == "card_label"
+        assert reader[1][1] == "uuid-a"
+        assert reader[1][2] == "Driver John"
 
     def test_stream_rows_as_csv_matches_json_rows(self):
         rows = [
@@ -460,6 +758,94 @@ class TestEnergyReportMonthlyEndpoint:
         assert row["energy_kwh"] == pytest.approx(200.0)
         assert row["cost"]["estimated"] is True
         assert row["cost"]["amount"] == pytest.approx(40.0)
+        # Depot name and totals now flow through the response.
+        assert body["depot_name"] == "Test Depot"
+        assert body["totals"]["session_count"] == 2
+        assert body["totals"]["energy_kwh"] == pytest.approx(200.0)
+        assert body["totals"]["cost"]["amount"] == pytest.approx(40.0)
+
+    def test_group_by_card_returns_labels_and_merges_same_label_tags(self, client):
+        """Two physical tags with one label collapse into a single row."""
+        depot_id = str(uuid4())
+        ocpp_id = "ocpp_a"
+        charger_uuid = str(uuid4())
+        card_uuid_a = str(uuid4())
+        card_uuid_b = str(uuid4())
+        card_uuid_c = str(uuid4())
+        tz = "America/Los_Angeles"
+
+        ts_records = [
+            {
+                "start_time": _utc(datetime(2024, 1, 5, 9, 0), tz),
+                "end_time": _utc(datetime(2024, 1, 5, 11, 0), tz),
+                "energy_delivered_kwh": 50.0,
+                "cost_total": 10.0,
+                "vehicle_id": None,
+                "charger_id": ocpp_id,
+                "driver_id": None,
+                "card_id": card_uuid_a,
+            },
+            {
+                "start_time": _utc(datetime(2024, 1, 10, 9, 0), tz),
+                "end_time": _utc(datetime(2024, 1, 10, 11, 0), tz),
+                "energy_delivered_kwh": 30.0,
+                "cost_total": 6.0,
+                "vehicle_id": None,
+                "charger_id": ocpp_id,
+                "driver_id": None,
+                "card_id": card_uuid_b,
+            },
+            {
+                "start_time": _utc(datetime(2024, 1, 12, 9, 0), tz),
+                "end_time": _utc(datetime(2024, 1, 12, 11, 0), tz),
+                "energy_delivered_kwh": 20.0,
+                "cost_total": 4.0,
+                "vehicle_id": None,
+                "charger_id": ocpp_id,
+                "driver_id": None,
+                "card_id": card_uuid_c,
+            },
+        ]
+        pools = _make_pool(
+            static_records={
+                "depot_row": _depot_row(timezone=tz),
+                "charger_rows": [{"charger_id": charger_uuid, "ocpp_id": ocpp_id}],
+                "rfid_card_rows": [
+                    {"card_id": card_uuid_a, "label": "Driver John", "id_tag": "TAG_A"},
+                    {"card_id": card_uuid_b, "label": "Driver John", "id_tag": "TAG_B"},
+                    {"card_id": card_uuid_c, "label": "Driver Jane", "id_tag": "TAG_C"},
+                ],
+            },
+            ts_records=ts_records,
+        )
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/monthly",
+                params={
+                    "from": "2024-01-01",
+                    "to": "2024-01-31",
+                    "group_by": "card",
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        rows = response.json()["rows"]
+        by_label = {r["card_label"]: r for r in rows}
+        assert set(by_label) == {"Driver John", "Driver Jane"}
+        # John's two tags collapsed into one row totalling 80 kWh / $16.
+        assert by_label["Driver John"]["session_count"] == 2
+        assert by_label["Driver John"]["energy_kwh"] == pytest.approx(80.0)
+        assert by_label["Driver John"]["cost"]["amount"] == pytest.approx(16.0)
+        # Jane stays separate.
+        assert by_label["Driver Jane"]["session_count"] == 1
+        assert by_label["Driver Jane"]["energy_kwh"] == pytest.approx(20.0)
+        # Totals cross all buckets.
+        totals = response.json()["totals"]
+        assert totals["session_count"] == 3
+        assert totals["energy_kwh"] == pytest.approx(100.0)
+        assert totals["cost"]["amount"] == pytest.approx(20.0)
 
     def test_empty_data_returns_rows_array(self, client):
         depot_id = str(uuid4())
@@ -794,13 +1180,15 @@ class TestEnergyReportCsvEndpoint:
 
         assert csv_response.status_code == status.HTTP_200_OK
         assert csv_response.headers["content-type"].startswith("text/csv")
-        json_rows = json_response.json()["rows"]
+        json_body = json_response.json()
+        json_rows = json_body["rows"]
         csv_text = csv_response.text
         reader = list(csv.reader(io.StringIO(csv_text)))
-        assert len(reader) == 1 + len(json_rows)
+        # 1 header + N data rows + 1 TOTAL row.
+        assert len(reader) == 1 + len(json_rows) + 1
         # Walk every JSON row and confirm the corresponding CSV row matches
         # field-for-field.
-        for json_row, csv_row in zip(json_rows, reader[1:]):
+        for json_row, csv_row in zip(json_rows, reader[1:-1]):
             assert csv_row[0] == json_row["bucket"]
             assert float(csv_row[1]) == pytest.approx(json_row["energy_kwh"])
             assert int(csv_row[2]) == json_row["session_count"]
@@ -808,6 +1196,15 @@ class TestEnergyReportCsvEndpoint:
             assert float(csv_row[4]) == pytest.approx(json_row["cost"]["amount"])
             assert csv_row[5] == json_row["cost"]["currency"]
             assert (csv_row[6] == "true") == json_row["cost"]["estimated"]
+        # Final row carries cross-bucket totals matching the JSON ``totals`` block.
+        totals = json_body["totals"]
+        total_row = reader[-1]
+        assert total_row[0] == "TOTAL"
+        assert float(total_row[1]) == pytest.approx(totals["energy_kwh"])
+        assert int(total_row[2]) == totals["session_count"]
+        assert total_row[3] == ""  # avg_kw blank on totals
+        assert float(total_row[4]) == pytest.approx(totals["cost"]["amount"])
+        assert total_row[5] == totals["cost"]["currency"]
 
     def test_csv_cross_org_denial(self, client):
         depot_id = str(uuid4())
