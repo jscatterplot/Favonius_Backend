@@ -246,7 +246,12 @@ if not _INTERNAL_API_TOKEN:
 # refuses every request so the production deploy fails closed rather than
 # silently exposing operational data. Scrapers configure the token via
 # Prometheus' ``authorization.credentials_file``.
-_METRICS_TOKEN = os.getenv("METRICS_TOKEN", "")
+#
+# ``strip()`` so a whitespace/newline-only value (mistakes from secrets
+# tooling, e.g. a trailing newline in a Kubernetes Secret) is treated the
+# same as unset — otherwise the production fail-fast would pass and every
+# scrape would then 401 with no obvious reason.
+_METRICS_TOKEN = os.getenv("METRICS_TOKEN", "").strip()
 if _environment == "production" and not _METRICS_TOKEN:
     raise RuntimeError(
         "METRICS_TOKEN must be set in production. "
@@ -8335,8 +8340,13 @@ async def metrics(request: Request):
             detail="Metrics endpoint not configured (METRICS_TOKEN missing)",
         )
     auth_header = request.headers.get("Authorization", "")
-    scheme, _, presented_token = auth_header.partition(" ")
-    if scheme.lower() != "bearer" or not presented_token:
+    # RFC 7235 BNF: ``credentials = auth-scheme 1*SP token68``. Partition at
+    # the first SP and ``lstrip`` any extras so a header like
+    # ``Bearer   <token>`` (multiple SPs from a permissive proxy) is still
+    # accepted. The token itself must remain a constant-time compare.
+    scheme, separator, rest = auth_header.partition(" ")
+    presented_token = rest.lstrip(" ")
+    if not separator or scheme.lower() != "bearer" or not presented_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not secrets.compare_digest(presented_token, _METRICS_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")

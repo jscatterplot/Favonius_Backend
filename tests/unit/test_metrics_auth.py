@@ -20,11 +20,16 @@ def _client() -> TestClient:
 
 class TestMetricsAuth:
     def test_503_when_token_unset(self):
-        """Fail-closed: unconfigured deploy never leaks Prometheus data."""
+        """Fail-closed: unconfigured deploy never leaks Prometheus data.
+
+        The API's global ``http_exception_handler`` sanitises the detail
+        string for any 5xx response, so we assert on the stable
+        ``error_code`` envelope field rather than the detail content.
+        """
         with patch("src.api.main._METRICS_TOKEN", ""):
             response = _client().get("/metrics")
         assert response.status_code == 503
-        assert "METRICS_TOKEN" in response.json()["detail"]
+        assert response.json()["error_code"] == "SERVICE_UNAVAILABLE"
 
     def test_401_when_authorization_missing(self):
         with patch("src.api.main._METRICS_TOKEN", "test-token"):
@@ -93,3 +98,11 @@ class TestMetricsAuth:
                 "/metrics", headers={"Authorization": "Bearer abcd"}
             )
         assert response.status_code == 401
+
+    def test_200_with_multi_space_bearer(self):
+        """RFC 7235 allows ``1*SP`` between scheme and token."""
+        with patch("src.api.main._METRICS_TOKEN", "test-token"):
+            response = _client().get(
+                "/metrics", headers={"Authorization": "Bearer   test-token"}
+            )
+        assert response.status_code == 200

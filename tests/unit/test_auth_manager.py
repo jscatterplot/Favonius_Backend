@@ -112,6 +112,22 @@ class TestAuthManager:
         with pytest.raises(RuntimeError, match="WS_AUTH_JWT_SIGNING_KEY is required"):
             AuthManager(config, mock_supabase_client)
 
+    def test_constructor_raises_when_signing_key_whitespace_only(
+        self, config, mock_supabase_client, monkeypatch
+    ):
+        """A whitespace/newline-only value is a common copy-paste mishap; reject it."""
+        monkeypatch.setenv("WS_AUTH_JWT_SIGNING_KEY", "   \n\t ")
+        with pytest.raises(RuntimeError, match="WS_AUTH_JWT_SIGNING_KEY is required"):
+            AuthManager(config, mock_supabase_client)
+
+    def test_constructor_strips_signing_key_whitespace(
+        self, config, mock_supabase_client, monkeypatch
+    ):
+        """Surrounding whitespace is stripped so trailing newlines from secrets tooling work."""
+        monkeypatch.setenv("WS_AUTH_JWT_SIGNING_KEY", "  real-key-value\n")
+        manager = AuthManager(config, mock_supabase_client)
+        assert manager.jwt_secret == "real-key-value"
+
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_authenticate_user_valid_token(self, auth_manager):
