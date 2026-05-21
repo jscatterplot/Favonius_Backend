@@ -197,6 +197,35 @@ async def test_max_iterations_without_terminator():
 
 
 @pytest.mark.asyncio
+async def test_max_iterations_zero_clamped_to_one():
+    """``max_iterations=0`` is clamped to 1 (matching WorkflowAgent.__init__).
+
+    Without the clamp the loop would never execute and the returned
+    ``QAResult.iterations`` would be 0 — nonsensical: the caller asked
+    for "zero turns" but the runtime still returned a result. Clamping
+    to 1 means the model gets at least one turn even when the caller
+    passes a degenerate value, and ``iterations`` reflects what the
+    runtime actually did.
+    """
+    reg, _ = _registry()
+    script = [_FakeResponse([_tool_use("list_tables", "b1", {})])]
+    client = _FakeClient(script)
+
+    result = await run_qa_turn(
+        anthropic_client=client,
+        model="claude-haiku-4-5",
+        system_prompt="sys",
+        user_message="user q",
+        tool_registry=reg,
+        allowed_tools=_allowed_tools(),
+        max_iterations=0,
+    )
+
+    assert result.iterations == 1
+    assert result.status == "max_iterations"
+
+
+@pytest.mark.asyncio
 async def test_tool_not_allowed_raises():
     reg, _ = _registry()
     # Add a "secret" tool to the registry but NOT to allowed_tools.

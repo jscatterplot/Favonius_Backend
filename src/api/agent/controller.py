@@ -254,6 +254,30 @@ def _describe_params(params: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
+async def _emit_answer_safe(
+    sse: Optional[SSEEventStream], reply: "AgentReply", run_id: UUID
+) -> None:
+    """Emit the final SSE ``answer`` event without letting failures propagate.
+
+    The ``agent_runs`` row is already closed by the caller at this point,
+    so an SSE write error must NOT trigger the outer-exception path that
+    would overwrite the terminal status with ``"error"`` — the run actually
+    succeeded, only the post-close side-effect failed. Pre-close SSE
+    ``step`` events are not wrapped because their failure SHOULD abort the
+    turn (no audit row has been closed yet).
+    """
+    if sse is None:
+        return
+    try:
+        await sse.emit("answer", reply.model_dump(mode="json"))
+    except Exception:  # noqa: BLE001 — best-effort post-close
+        logger.exception(
+            "Failed to emit SSE answer for run %s; agent_runs row "
+            "already closed with status %r — leaving it as-is.",
+            run_id, reply.status,
+        )
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 
@@ -314,8 +338,7 @@ async def run_turn(
                 intent="refuse",
             )
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
-            if sse is not None:
-                await sse.emit("answer", reply.model_dump(mode="json"))
+            await _emit_answer_safe(sse, reply, run_id)
             return reply
 
         if decision.route == "sql_general":
@@ -351,8 +374,7 @@ async def run_turn(
                 AGENT_RESOLVER_MISSES.labels(kind="ambiguous").inc()
             reply = AgentReply.disambiguation(run_id=run_id, intent=plan.intent, ambiguous=ambiguous)
             await agent_runs_close(ts_pool, run_id, "disambiguation", reply)
-            if sse is not None:
-                await sse.emit("answer", reply.model_dump(mode="json"))
+            await _emit_answer_safe(sse, reply, run_id)
             return reply
 
         # 3b. Not-found short-circuit.
@@ -362,8 +384,7 @@ async def run_turn(
                 AGENT_RESOLVER_MISSES.labels(kind="not_found").inc()
             reply = AgentReply.not_found_reply(run_id=run_id, intent=plan.intent, missing=missing)
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
-            if sse is not None:
-                await sse.emit("answer", reply.model_dump(mode="json"))
+            await _emit_answer_safe(sse, reply, run_id)
             return reply
 
         # 4. Resolve time window in the depot timezone.
@@ -405,8 +426,7 @@ async def run_turn(
         )
         reply = AgentReply.success(run_id=run_id, intent=plan.intent, text=text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
-        if sse is not None:
-            await sse.emit("answer", reply.model_dump(mode="json"))
+        await _emit_answer_safe(sse, reply, run_id)
         return reply
 
     except Exception:
@@ -516,8 +536,7 @@ async def _run_sql_general_turn(
         logger.error("SQL agent tool error: %s", exc)
         reply = AgentReply.error(run_id=run_id)
         await agent_runs_close(ts_pool, run_id, "error", reply)
-        if sse is not None:
-            await sse.emit("answer", reply.model_dump(mode="json"))
+        await _emit_answer_safe(sse, reply, run_id)
         return reply
 
     AGENT_SQL_TOOL_TURNS.observe(qa.iterations)
@@ -578,8 +597,7 @@ async def _run_sql_general_turn(
     if qa.status == "success" and qa.text:
         reply = AgentReply.success(run_id=run_id, intent="sql_general", text=qa.text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
-        if sse is not None:
-            await sse.emit("answer", reply.model_dump(mode="json"))
+        await _emit_answer_safe(sse, reply, run_id)
         return reply
 
     text = qa.text.strip() if qa.text else ""
@@ -597,6 +615,5 @@ async def _run_sql_general_turn(
         intent="sql_general",
     )
     await agent_runs_close(ts_pool, run_id, reply.status, reply)
-    if sse is not None:
-        await sse.emit("answer", reply.model_dump(mode="json"))
+    await _emit_answer_safe(sse, reply, run_id)
     return reply

@@ -40,14 +40,18 @@ from src.api.agent.sql_validator import (
     AGENT_VIEWS_FUNCTIONS_TS,
     validate_sql,
 )
+from src.api.agent_workflows.runtime import EMIT_FINAL_ANSWER_TOOL as _RUNTIME_TERMINATOR
 from src.api.agent_workflows.tools import ToolRegistry
 from src.monitoring.metrics import AGENT_SQL_VALIDATIONS
 
 logger = logging.getLogger(__name__)
 
 
-# Terminator tool name — runtime closes the loop on this call.
-EMIT_FINAL_ANSWER_TOOL = "emit_final_answer"
+# Terminator tool name — runtime closes the loop on this call. Aliased to
+# the runtime's canonical constant (imported at module top) so a future
+# rename in one place doesn't silently desync the registration vs the
+# loop's terminator detection.
+EMIT_FINAL_ANSWER_TOOL = _RUNTIME_TERMINATOR
 
 
 def build_sql_agent_tool_registry(

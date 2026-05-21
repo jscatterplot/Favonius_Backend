@@ -743,6 +743,15 @@ async def run_qa_turn(
             f"{EMIT_FINAL_ANSWER_TOOL!r}"
         )
 
+    # Clamp to at least 1 — mirrors WorkflowAgent.__init__'s
+    # `max(1, int(max_iterations))`. Without this, max_iterations=0
+    # skips the loop entirely and returns iterations=0 with
+    # status="max_iterations", which is nonsensical (the loop never ran).
+    try:
+        max_iterations = max(1, int(max_iterations))
+    except (TypeError, ValueError):
+        max_iterations = 1
+
     tools = tool_registry.anthropic_schemas(list(allowed_tools))
     system_blocks: list[dict[str, Any]] = [
         {
