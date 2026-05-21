@@ -305,8 +305,8 @@ def _parse_csv_text(text: str) -> Iterator[ChargerLogEntry]:
         }
         yield ChargerLogEntry(
             time=parsed_ts,
-            transaction_id=_read_int(row, headers, "transactionid", "transaction_id"),
-            connector_id=_read_int(row, headers, "connectorid", "connector_id"),
+            transaction_id=_read_int(row, headers, "transactionid"),
+            connector_id=_read_int(row, headers, "connectorid"),
             soc=soc,
             charging_kw=power_kw,
             energy_kwh=energy_kwh,
@@ -351,20 +351,20 @@ def _read_float(row: dict, headers: dict, *keys: str) -> Optional[float]:
 
 def _read_energy_kwh(row: dict, headers: dict) -> Optional[float]:
     """Return cumulative energy in kWh regardless of source unit."""
-    kwh = _read_float(row, headers, "energykwh", "energy_kwh", "energydeliveredkwh")
+    kwh = _read_float(row, headers, "energykwh", "energydeliveredkwh")
     if kwh is not None:
         return kwh
-    wh = _read_float(row, headers, "energywh", "energy_wh", "energyactiveimportregister")
+    wh = _read_float(row, headers, "energywh", "energyactiveimportregister")
     if wh is not None:
         return wh / 1000.0
     return None
 
 
 def _read_power_kw(row: dict, headers: dict) -> Optional[float]:
-    kw = _read_float(row, headers, "powerkw", "power_kw", "chargingkw")
+    kw = _read_float(row, headers, "powerkw", "chargingkw")
     if kw is not None:
         return kw
-    w = _read_float(row, headers, "powerw", "power_w", "poweractiveimport")
+    w = _read_float(row, headers, "powerw", "poweractiveimport")
     if w is not None:
         return w / 1000.0
     return None
@@ -372,7 +372,7 @@ def _read_power_kw(row: dict, headers: dict) -> Optional[float]:
 
 def _read_soc(row: dict, headers: dict) -> Optional[float]:
     """Return SoC as a fraction in [0, 1] regardless of source unit."""
-    soc = _read_float(row, headers, "socpercent", "soc_percent")
+    soc = _read_float(row, headers, "socpercent")
     if soc is not None:
         return soc / 100.0
     soc = _read_float(row, headers, "soc", "stateofcharge")

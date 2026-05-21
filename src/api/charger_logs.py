@@ -472,7 +472,7 @@ async def _mark_import_failed(
                SET status        = 'failed',
                    error_message = $2
              WHERE id = $1
-               AND status NOT IN ('reconciled', 'expired')
+               AND status NOT IN ('reconciled', 'expired', 'failed')
             """,
             import_id,
             reason[:500],
