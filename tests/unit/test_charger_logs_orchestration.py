@@ -370,6 +370,44 @@ async def test_reconcile_skips_when_session_id_is_null():
 
 
 @pytest.mark.asyncio
+async def test_run_post_upload_pipeline_marks_failed_on_unexpected_exception():
+    """Regression for Codex P2: previously a DB error mid-pipeline left
+    the import in ``received`` / ``parsed`` forever because
+    ``run_post_upload_pipeline`` only logged. The pipeline now flips
+    the row to ``failed`` on any uncaught exception so operators see
+    a terminal state.
+    """
+    from src.api.charger_logs import run_post_upload_pipeline
+
+    import_id = uuid4()
+    executed_sqls: list[str] = []
+
+    class _Conn:
+        async def fetchrow(self, *a, **k):
+            # Boom — simulate a transient DB / network failure that
+            # neither parse nor reconcile already handles.
+            raise RuntimeError("connection reset")
+
+        async def execute(self, sql, *a, **k):
+            executed_sqls.append(sql)
+            return "UPDATE 1"
+
+    class _Pool:
+        conn = _Conn()
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield self.conn
+
+    await run_post_upload_pipeline(_Pool(), import_id=import_id)
+    # The pipeline's catch-all must have flipped the row to 'failed' via
+    # _mark_import_failed. Match on the canonical UPDATE shape.
+    assert any(
+        "SET status        = 'failed'" in sql for sql in executed_sqls
+    ), f"no failure UPDATE issued; executed: {executed_sqls}"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_runs_for_failed_imports():
     """Regression for Codex P2: a parse failure used to skip the
     reconciler, leaving the read endpoint with no source enum to

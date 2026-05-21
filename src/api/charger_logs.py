@@ -401,6 +401,25 @@ async def run_post_upload_pipeline(
         logger.exception(
             "Post-upload pipeline failed for import=%s: %s", import_id, exc
         )
+        # The parse/reconcile stages each handle their own expected
+        # failure modes (ChargerLogParseError, parser exception, etc.)
+        # and write ``status='failed'`` themselves. An exception
+        # reaching here is unexpected — a DB write failed mid-flight,
+        # an asyncpg connection dropped, etc. Without an explicit
+        # terminal transition the row sits in ``received`` /
+        # ``parsed`` forever and the comparison endpoint never resolves.
+        # Best-effort flip to ``failed`` so operators see the row
+        # land somewhere terminal.
+        try:
+            await _mark_import_failed(
+                ts_pool, import_id, f"post_upload_pipeline: {exc!r}"
+            )
+        except Exception as mark_exc:  # noqa: BLE001
+            logger.warning(
+                "Could not mark import=%s failed after pipeline error: %s",
+                import_id,
+                mark_exc,
+            )
 
 
 def schedule_post_upload_pipeline(

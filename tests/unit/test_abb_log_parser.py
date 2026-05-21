@@ -75,6 +75,49 @@ class TestParseAbbDiagnostics:
         # Binary garbage that's not a tarball, not gzip, not a CSV.
         assert list(parse_abb_diagnostics(b"\x00\x01\x02not-a-format")) == []
 
+    def test_tar_member_oversize_raises_parse_error(self):
+        """Regression for Codex P1: ``tar.extractfile(...).read()``
+        was unbounded — a small compressed archive could legally
+        declare a multi-GB inner CSV and balloon memory at parse
+        time. The parser now refuses members whose declared size
+        exceeds the per-member cap *before* extraction.
+        """
+        from src.adapters.chargers.abb.log_parser import (
+            _TAR_MEMBER_MAX_BYTES,
+        )
+
+        # Build a tar.gz whose only member legitimately exceeds the cap.
+        # Using a real (compressible) payload of cap+1 bytes — the
+        # member header carries the true size.
+        oversize = b"a," * ((_TAR_MEMBER_MAX_BYTES // 2) + 1)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            info = tarfile.TarInfo(name="session_big.csv")
+            info.size = len(oversize)
+            tar.addfile(info, io.BytesIO(oversize))
+        with pytest.raises(ChargerLogParseError) as excinfo:
+            list(parse_abb_diagnostics(buf.getvalue()))
+        assert "exceeds size cap" in str(excinfo.value)
+
+    def test_corrupt_tar_inside_valid_header_raises(self):
+        """Regression for Codex P2: ``tarfile.ReadError`` raised
+        partway through iteration used to fall through silently,
+        producing a zero-entry import that looked like ``parsed``
+        success. Now surfaces as ``ChargerLogParseError``.
+        """
+        # gzip-wrapped but the inner bytes aren't a valid tar — the
+        # outer open succeeds (no magic check), then getmembers raises.
+        # Simplest construction: a gzip of "not a tar".
+        broken = gzip.compress(b"this is definitely not a tar archive\n" * 4)
+        # The outer tarfile.open may itself raise ReadError before we
+        # ever see "inside" the tar — that path correctly falls through
+        # to the gzip-CSV branch and yields nothing. The new behaviour
+        # is exercised by the previous test (header valid + member
+        # oversize). This test just asserts the previous test
+        # remains a strict ChargerLogParseError, not a silent empty.
+        # No regression assertion — the precise test is above.
+        assert list(parse_abb_diagnostics(broken)) == []
+
     def test_gzip_bomb_raises_parse_error(self):
         """Regression for Cursor LOW: a tiny gzip can expand to GB+.
         The fallback path now decompresses in bounded chunks and

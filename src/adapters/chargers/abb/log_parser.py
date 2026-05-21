@@ -27,7 +27,7 @@ import io
 import logging
 import tarfile
 from datetime import datetime, timezone
-from typing import Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from ..types import ChargerLogEntry, ChargerLogParseError
 
@@ -54,10 +54,39 @@ _KNOWN_CANON_KEYS = frozenset({
 # malformed blob (~1 KB of zeros expands to ~1 GB) cannot exhaust
 # memory. 50 MiB matches ``CHARGER_LOG_UPLOAD_MAX_BYTES`` default —
 # anything bigger than the upload ceiling can't legitimately be a
-# session log anyway. The tar.gz path uses ``tarfile`` streaming and
-# is bounded by per-member ``size`` headers, which tarfile already
-# validates against the underlying stream.
+# session log anyway.
 _GUNZIP_MAX_BYTES = 50 * 1024 * 1024
+
+# Same cap applied to individual tar members. ``tarfile`` itself trusts
+# the header's ``size`` field at extract time, so a crafted archive
+# declaring a multi-GB member would otherwise drive an unbounded read
+# into memory. The cap is enforced *before* extraction (via the header
+# size) and *during* extraction (via ``_read_capped``).
+_TAR_MEMBER_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _read_capped(stream: Any, max_bytes: int, name: str) -> bytes:
+    """Read up to ``max_bytes`` from a stream; raise if more arrives.
+
+    ``tarfile.ExtFile.read()`` with no argument is unbounded — bounded
+    chunked reads with a running total are the only way to refuse a
+    member that mis-declared its size or runs longer than the header
+    claimed.
+    """
+    chunks: list[bytes] = []
+    seen = 0
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        seen += len(chunk)
+        if seen > max_bytes:
+            raise ChargerLogParseError(
+                f"tar member {name!r} exceeds size cap during extraction "
+                f"(>{max_bytes} bytes)"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 class _GzipTooLarge(Exception):
@@ -136,9 +165,16 @@ def parse_abb_diagnostics(blob: bytes) -> Iterable[ChargerLogEntry]:
 def _iter_csv_streams(blob: bytes) -> Iterator[tuple[str, str]]:
     """Yield (name, text) for every plausible session-log file in the blob."""
     # 1. tar.gz: the dominant ABB GetDiagnostics shape.
+    # ``tarfile.ReadError`` is what gets raised when the archive header
+    # doesn't look like a tar — we use that to fall through to the
+    # plain-gzip / raw-CSV paths. Once we're INSIDE a valid tar (the
+    # except below this try block), corruption or oversize members
+    # are real errors and must surface as ``ChargerLogParseError``.
+    looks_like_tar = False
     try:
         buf = io.BytesIO(blob)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            looks_like_tar = True
             for member in tar.getmembers():
                 if not member.isfile():
                     continue
@@ -147,14 +183,39 @@ def _iter_csv_streams(blob: bytes) -> Iterator[tuple[str, str]]:
                     continue
                 if not any(hint in name_lower for hint in _SESSION_LOG_NAME_HINTS):
                     continue
+                # Reject members the header says are too big BEFORE
+                # extracting. A crafted tar can compress to <50 MiB
+                # while declaring a multi-GB member — refusing here
+                # short-circuits the unbounded read.
+                if member.size > _TAR_MEMBER_MAX_BYTES:
+                    raise ChargerLogParseError(
+                        f"tar member {member.name!r} exceeds size cap "
+                        f"({member.size} > {_TAR_MEMBER_MAX_BYTES} bytes)"
+                    )
                 f = tar.extractfile(member)
                 if f is None:
                     continue
-                data = f.read()
+                # Even with a clean header, read in bounded chunks so a
+                # mis-declared / sparse member can't balloon at extract
+                # time. The cap mirrors the upload ceiling — anything
+                # larger than the whole upload can't legitimately be a
+                # single log file inside it.
+                data = _read_capped(f, _TAR_MEMBER_MAX_BYTES, member.name)
                 yield member.name, _decode(data)
         return
+    except ChargerLogParseError:
+        # Either the per-member size guard or the bounded read tripped.
+        # Propagate so the import row is marked 'failed' with an
+        # explicit reason instead of silently producing zero entries.
+        raise
     except tarfile.ReadError:
-        pass
+        # Header didn't parse as tar — fall through to the gzip / raw
+        # CSV branches. A real tar that failed mid-stream sets
+        # ``looks_like_tar`` and lands in the EOFError/OSError branch.
+        if looks_like_tar:
+            raise ChargerLogParseError(
+                "ABB tar.gz header parsed but stream is truncated/corrupt"
+            )
     except (EOFError, OSError) as exc:
         raise ChargerLogParseError(f"Corrupt ABB tar.gz: {exc}") from exc
 

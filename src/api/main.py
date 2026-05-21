@@ -9404,6 +9404,14 @@ async def fetch_charger_session_logs_endpoint(
                 "import_id": str(existing["id"]),
                 "status": existing["status"],
                 "deduplicated": True,
+                # Clients that drive subsequent polls off ``status_url``
+                # must see the same key on every response path,
+                # including the dedupe short-circuit. Otherwise an
+                # idempotent retry leaves them unable to follow the
+                # comparison endpoint without rebuilding the URL.
+                "status_url": (
+                    f"/admin/depots/{depot_id}/sessions/{session_id}/log_comparison"
+                ),
             }
         # Shouldn't reach here, but if we do the UniqueViolation is
         # honest news for the caller.
