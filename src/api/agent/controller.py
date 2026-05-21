@@ -599,13 +599,29 @@ async def _run_sql_general_turn(
         # before any tool dispatch in this turn) — falls through with
         # an empty list.
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
-        await _mirror_sql_general_audit_from_calls(
-            ts_pool=ts_pool,
-            auth=auth,
-            run_id=run_id,
-            partial_calls=partial_calls,
-            abort_reason=type(exc).__name__,
-        )
+        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
+        # Bugbot M-sev: wrap the audit mirror in try/except. If the DB
+        # write raises (append-only trigger rejection, asyncpg conn
+        # error, etc.), the unhandled exception would mask the original
+        # ToolNotAllowedError / ToolNotRegisteredError context AND skip
+        # the agent_runs_close + SSE emit + return below, leaving the
+        # run row in 'running' state and the client with a raw 502
+        # instead of the graceful error reply. Log and continue — the
+        # outer-handler in run_turn is the audit safety net.
+        try:
+            await _mirror_sql_general_audit_from_calls(
+                ts_pool=ts_pool,
+                auth=auth,
+                run_id=run_id,
+                partial_calls=partial_calls,
+                abort_reason=type(exc).__name__,
+            )
+        except Exception:  # noqa: BLE001 - best-effort error-path audit
+            logger.exception(
+                "Failed to mirror partial SQL audit for aborted run %s "
+                "(original abort: %s); continuing with graceful error close.",
+                run_id, type(exc).__name__,
+            )
         reply = AgentReply.error(run_id=run_id)
         try:
             await agent_runs_close(ts_pool, run_id, "error", reply)
@@ -616,13 +632,26 @@ async def _run_sql_general_turn(
     except Exception as exc:
         sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
-        await _mirror_sql_general_audit_from_calls(
-            ts_pool=ts_pool,
-            auth=auth,
-            run_id=run_id,
-            partial_calls=partial_calls,
-            abort_reason=type(exc).__name__,
-        )
+        # Wrap in try/except (Bugbot M-sev): if the audit write fails
+        # here it would mask the original exception, swallowing the
+        # actual cause of the SQL-mode failure that the outer
+        # ``run_turn`` exception handler needs to log / convert to a
+        # 502. Log the audit-side failure and re-raise the ORIGINAL
+        # exception below.
+        try:
+            await _mirror_sql_general_audit_from_calls(
+                ts_pool=ts_pool,
+                auth=auth,
+                run_id=run_id,
+                partial_calls=partial_calls,
+                abort_reason=type(exc).__name__,
+            )
+        except Exception:  # noqa: BLE001 - best-effort, never mask `exc`
+            logger.exception(
+                "Failed to mirror partial SQL audit on unhandled SQL-mode "
+                "exception for run %s (original exception will still raise).",
+                run_id,
+            )
         raise
     else:
         sql_tool_turns = qa.iterations
