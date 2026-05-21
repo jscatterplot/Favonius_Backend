@@ -104,6 +104,88 @@ def _apply_group_id(
             row_payload["card_label"] = _UNASSIGNED if value is None else value
 
 
+def _window_utc_bounds(
+    timezone: str, from_date: date, to_date: date
+) -> tuple[datetime, datetime]:
+    """Compute the half-open UTC window for the depot-local calendar range."""
+    tz = ZoneInfo(timezone)
+    window_start_local = datetime.combine(from_date, datetime.min.time())
+    window_end_local = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
+    return (
+        window_start_local.replace(tzinfo=tz).astimezone(ZoneInfo("UTC")),
+        window_end_local.replace(tzinfo=tz).astimezone(ZoneInfo("UTC")),
+    )
+
+
+def _session_in_window(
+    row: SessionRow, start_utc: datetime, end_utc: datetime
+) -> bool:
+    """Return True when ``row.start_time`` is inside the half-open UTC window."""
+    start = row.start_time
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=ZoneInfo("UTC"))
+    return start_utc <= start < end_utc
+
+
+def _new_agg() -> dict[str, float]:
+    """Return a zeroed accumulator dict for energy/cost stats."""
+    return {
+        "energy_kwh": 0.0,
+        "energy_kwh_with_duration": 0.0,
+        "session_count": 0,
+        "duration_hours": 0.0,
+        "cost_total_sum": 0.0,
+        "cost_missing_count": 0,
+        "energy_kwh_missing_cost": 0.0,
+    }
+
+
+def _accumulate(agg: dict[str, float], row: SessionRow) -> None:
+    """Add ``row`` into the accumulator in-place."""
+    energy = float(row.energy_kwh) if row.energy_kwh is not None else 0.0
+    agg["energy_kwh"] += energy
+    agg["session_count"] += 1
+    if row.end_time is not None:
+        duration_h = max((row.end_time - row.start_time).total_seconds() / 3600.0, 0.0)
+        agg["duration_hours"] += duration_h
+        agg["energy_kwh_with_duration"] += energy
+    if row.cost_total is None:
+        agg["cost_missing_count"] += 1
+        agg["energy_kwh_missing_cost"] += energy
+    else:
+        agg["cost_total_sum"] += float(row.cost_total)
+
+
+def _finalize_agg(
+    agg: dict[str, float], under_cap_rate: Optional[float], currency: str
+) -> dict:
+    """Project an accumulator into the report payload (excluding ``bucket``)."""
+    estimated = agg["cost_missing_count"] > 0
+    if estimated:
+        cost_amount = agg["cost_total_sum"] + (
+            agg["energy_kwh_missing_cost"] * under_cap_rate
+            if under_cap_rate is not None
+            else 0.0
+        )
+    else:
+        cost_amount = agg["cost_total_sum"]
+    avg_kw = (
+        agg["energy_kwh_with_duration"] / agg["duration_hours"]
+        if agg["duration_hours"] > 0
+        else 0.0
+    )
+    return {
+        "energy_kwh": round(agg["energy_kwh"], 6),
+        "session_count": int(agg["session_count"]),
+        "avg_kw": round(avg_kw, 6),
+        "cost": {
+            "amount": round(cost_amount, 6),
+            "currency": currency,
+            "estimated": estimated,
+        },
+    }
+
+
 def aggregate_energy_rows(
     sessions: Iterable[SessionRow],
     *,
@@ -135,85 +217,29 @@ def aggregate_energy_rows(
         raise ValueError(f"Unsupported group_by: {group_by!r}")
 
     tz = ZoneInfo(timezone)
-    window_start_local = datetime.combine(from_date, datetime.min.time())
-    window_end_local = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
-    window_start_utc = window_start_local.replace(tzinfo=tz).astimezone(ZoneInfo("UTC"))
-    window_end_utc = window_end_local.replace(tzinfo=tz).astimezone(ZoneInfo("UTC"))
+    window_start_utc, window_end_utc = _window_utc_bounds(timezone, from_date, to_date)
 
     buckets: dict[tuple[str, Optional[str]], dict[str, float]] = {}
     representatives: dict[tuple[str, Optional[str]], SessionRow] = {}
 
     for row in sessions:
-        start = row.start_time
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=ZoneInfo("UTC"))
-        if start < window_start_utc or start >= window_end_utc:
+        if not _session_in_window(row, window_start_utc, window_end_utc):
             continue
 
-        bucket = _bucket_for(start, tz)
+        bucket = _bucket_for(row.start_time, tz)
         group_val = _group_value(row, group_by)
         key = (bucket, group_val)
-        agg = buckets.setdefault(
-            key,
-            {
-                "energy_kwh": 0.0,
-                "energy_kwh_with_duration": 0.0,
-                "session_count": 0,
-                "duration_hours": 0.0,
-                "cost_total_sum": 0.0,
-                "cost_missing_count": 0,
-                "energy_kwh_missing_cost": 0.0,
-            },
-        )
+        agg = buckets.setdefault(key, _new_agg())
         if group_by == "card" and key not in representatives and row.card_id is not None:
             representatives[key] = row
-
-        energy = float(row.energy_kwh) if row.energy_kwh is not None else 0.0
-        agg["energy_kwh"] += energy
-        agg["session_count"] += 1
-        if row.end_time is not None:
-            duration_h = max((row.end_time - row.start_time).total_seconds() / 3600.0, 0.0)
-            agg["duration_hours"] += duration_h
-            agg["energy_kwh_with_duration"] += energy
-        if row.cost_total is None:
-            agg["cost_missing_count"] += 1
-            agg["energy_kwh_missing_cost"] += energy
-        else:
-            agg["cost_total_sum"] += float(row.cost_total)
+        _accumulate(agg, row)
 
     rows: list[dict] = []
     for (bucket, group_val), agg in sorted(
         buckets.items(),
         key=lambda kv: (kv[0][0], kv[0][1] is None, kv[0][1] or ""),
     ):
-        estimated = agg["cost_missing_count"] > 0
-        if estimated:
-            estimate = (
-                agg["energy_kwh_missing_cost"] * under_cap_rate
-                if under_cap_rate is not None
-                else 0.0
-            )
-            cost_amount = agg["cost_total_sum"] + estimate
-        else:
-            cost_amount = agg["cost_total_sum"]
-
-        avg_kw = (
-            agg["energy_kwh_with_duration"] / agg["duration_hours"]
-            if agg["duration_hours"] > 0
-            else 0.0
-        )
-
-        row_payload: dict = {
-            "bucket": bucket,
-            "energy_kwh": round(agg["energy_kwh"], 6),
-            "session_count": int(agg["session_count"]),
-            "avg_kw": round(avg_kw, 6),
-            "cost": {
-                "amount": round(cost_amount, 6),
-                "currency": currency,
-                "estimated": estimated,
-            },
-        }
+        row_payload: dict = {"bucket": bucket, **_finalize_agg(agg, under_cap_rate, currency)}
         _apply_group_id(
             row_payload,
             group_by,
@@ -235,64 +261,16 @@ def compute_energy_totals(
 ) -> dict:
     """Aggregate all sessions in the window into a single totals row.
 
-    The same cost-estimation rule as :func:`aggregate_energy_rows` applies:
-    any session missing ``cost_total`` flips the row's ``estimated`` flag
-    and contributes ``energy_kwh × under_cap_rate`` to the cost when a
-    rate is configured.
+    Shares the same per-session accumulator and cost-estimation rule as
+    :func:`aggregate_energy_rows` so the two stay in lockstep.
     """
-    tz = ZoneInfo(timezone)
-    window_start_local = datetime.combine(from_date, datetime.min.time())
-    window_end_local = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
-    window_start_utc = window_start_local.replace(tzinfo=tz).astimezone(ZoneInfo("UTC"))
-    window_end_utc = window_end_local.replace(tzinfo=tz).astimezone(ZoneInfo("UTC"))
-
-    energy_kwh = 0.0
-    energy_kwh_with_duration = 0.0
-    session_count = 0
-    duration_hours = 0.0
-    cost_total_sum = 0.0
-    cost_missing_count = 0
-    energy_kwh_missing_cost = 0.0
-
+    window_start_utc, window_end_utc = _window_utc_bounds(timezone, from_date, to_date)
+    agg = _new_agg()
     for row in sessions:
-        start = row.start_time
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=ZoneInfo("UTC"))
-        if start < window_start_utc or start >= window_end_utc:
+        if not _session_in_window(row, window_start_utc, window_end_utc):
             continue
-
-        energy = float(row.energy_kwh) if row.energy_kwh is not None else 0.0
-        energy_kwh += energy
-        session_count += 1
-        if row.end_time is not None:
-            duration_h = max((row.end_time - row.start_time).total_seconds() / 3600.0, 0.0)
-            duration_hours += duration_h
-            energy_kwh_with_duration += energy
-        if row.cost_total is None:
-            cost_missing_count += 1
-            energy_kwh_missing_cost += energy
-        else:
-            cost_total_sum += float(row.cost_total)
-
-    estimated = cost_missing_count > 0
-    if estimated:
-        cost_amount = cost_total_sum + (
-            energy_kwh_missing_cost * under_cap_rate if under_cap_rate is not None else 0.0
-        )
-    else:
-        cost_amount = cost_total_sum
-    avg_kw = energy_kwh_with_duration / duration_hours if duration_hours > 0 else 0.0
-
-    return {
-        "energy_kwh": round(energy_kwh, 6),
-        "session_count": int(session_count),
-        "avg_kw": round(avg_kw, 6),
-        "cost": {
-            "amount": round(cost_amount, 6),
-            "currency": currency,
-            "estimated": estimated,
-        },
-    }
+        _accumulate(agg, row)
+    return _finalize_agg(agg, under_cap_rate, currency)
 
 
 _CSV_BASE_COLUMNS = (

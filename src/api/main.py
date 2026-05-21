@@ -5797,14 +5797,21 @@ async def _fetch_session_rows(
     }
     card_info: dict[str, tuple[Optional[str], Optional[str]]] = {}
     if card_ids:
+        # Scope by site_id so a charging_sessions.card_id that points to a
+        # card from another depot (legacy / bad-import data) is NOT enriched
+        # — we'd otherwise leak the other tenant's label/id_tag and merge
+        # buckets under the wrong card name. Unenriched rows fall back to
+        # grouping by raw card_id UUID via aggregate_energy_rows.
         async with db_pools.static.acquire() as conn:
             card_rows = await conn.fetch(
                 """
                 SELECT id::text AS card_id, label, id_tag
                 FROM rfid_cards
                 WHERE id = ANY($1::uuid[])
+                  AND site_id = $2::uuid
                 """,
                 list(card_ids),
+                depot_id,
             )
         card_info = {
             row["card_id"]: (

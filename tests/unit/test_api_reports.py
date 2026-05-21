@@ -74,7 +74,24 @@ def _make_pool(static_records: dict[str, Any], ts_records: list[dict]):
         if "FROM charging_stations" in query:
             return static_records.get("charger_rows", [])
         if "FROM rfid_cards" in query:
-            return static_records.get("rfid_card_rows", [])
+            rows = static_records.get("rfid_card_rows", [])
+            # Mirror the production WHERE clause: scope to the requested
+            # depot when site_id is present in the query and a depot arg
+            # was passed in. Cards are keyed by ``card_id``; the depot
+            # filter uses an optional ``site_id`` field on the fixture
+            # row (rows missing site_id are treated as in-scope).
+            requested_card_ids = set(args[0]) if args else set()
+            requested_site_id = args[1] if "site_id" in query and len(args) > 1 else None
+            filtered = []
+            for row in rows:
+                if requested_card_ids and row["card_id"] not in requested_card_ids:
+                    continue
+                if requested_site_id is not None:
+                    row_site = row.get("site_id")
+                    if row_site is not None and row_site != requested_site_id:
+                        continue
+                filtered.append(row)
+            return filtered
         return []
 
     static_conn.fetchrow.side_effect = static_fetchrow
@@ -846,6 +863,89 @@ class TestEnergyReportMonthlyEndpoint:
         assert totals["session_count"] == 3
         assert totals["energy_kwh"] == pytest.approx(100.0)
         assert totals["cost"]["amount"] == pytest.approx(20.0)
+
+    def test_card_from_other_depot_does_not_leak_label(self, client):
+        """Card UUID belonging to another depot is NOT enriched.
+
+        Models a legacy/imported charging_sessions row whose ``card_id``
+        points at an ``rfid_cards`` row owned by a different ``site_id``.
+        The lookup must be depot-scoped so the other tenant's ``label``
+        never appears in this depot's report.
+        """
+        depot_id = str(uuid4())
+        other_depot_id = str(uuid4())
+        ocpp_id = "ocpp_a"
+        charger_uuid = str(uuid4())
+        leaked_card_uuid = str(uuid4())
+        local_card_uuid = str(uuid4())
+        tz = "America/Los_Angeles"
+
+        ts_records = [
+            {
+                "start_time": _utc(datetime(2024, 1, 5, 9, 0), tz),
+                "end_time": _utc(datetime(2024, 1, 5, 11, 0), tz),
+                "energy_delivered_kwh": 40.0,
+                "cost_total": 8.0,
+                "vehicle_id": None,
+                "charger_id": ocpp_id,
+                "driver_id": None,
+                "card_id": leaked_card_uuid,
+            },
+            {
+                "start_time": _utc(datetime(2024, 1, 6, 9, 0), tz),
+                "end_time": _utc(datetime(2024, 1, 6, 11, 0), tz),
+                "energy_delivered_kwh": 25.0,
+                "cost_total": 5.0,
+                "vehicle_id": None,
+                "charger_id": ocpp_id,
+                "driver_id": None,
+                "card_id": local_card_uuid,
+            },
+        ]
+        pools = _make_pool(
+            static_records={
+                "depot_row": _depot_row(timezone=tz),
+                "charger_rows": [{"charger_id": charger_uuid, "ocpp_id": ocpp_id}],
+                "rfid_card_rows": [
+                    # Owned by another depot — must NOT leak through.
+                    {
+                        "card_id": leaked_card_uuid,
+                        "label": "Other Tenant Driver",
+                        "id_tag": "TAG_OTHER",
+                        "site_id": other_depot_id,
+                    },
+                    {
+                        "card_id": local_card_uuid,
+                        "label": "Local Driver",
+                        "id_tag": "TAG_LOCAL",
+                        "site_id": depot_id,
+                    },
+                ],
+            },
+            ts_records=ts_records,
+        )
+        with patch("src.api.main.db_pools", pools), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.get(
+                f"/reports/depots/{depot_id}/energy/monthly",
+                params={
+                    "from": "2024-01-01",
+                    "to": "2024-01-31",
+                    "group_by": "card",
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        rows = response.json()["rows"]
+        labels = {r["card_label"] for r in rows}
+        assert "Other Tenant Driver" not in labels
+        assert "TAG_OTHER" not in labels
+        # The local card is enriched normally; the leaked-card row falls
+        # back to grouping by raw UUID (so card_label == card_id UUID).
+        assert "Local Driver" in labels
+        leaked_row = next(r for r in rows if r["card_id"] == leaked_card_uuid)
+        assert leaked_row["card_label"] == leaked_card_uuid
 
     def test_empty_data_returns_rows_array(self, client):
         depot_id = str(uuid4())
