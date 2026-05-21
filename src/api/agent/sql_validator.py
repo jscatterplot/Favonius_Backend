@@ -780,37 +780,57 @@ def _is_under(expr: exp.Expression, ancestor: exp.Expression) -> bool:
 
 
 def _has_or_true_bypass(where: exp.Where) -> bool:
-    """Detect OR branches that neutralize a bounding time predicate.
+    """Detect when the WHERE can be satisfied without an effective time bound.
 
-    Only OR-TRUE on the ancestry chain from a genuine time comparison
-    to the WHERE root is flagged (sibling OR branch is always true).
-    ``hour >= X AND (y OR 1=1)`` is not a bypass — the time bound is
-    independently enforced by the AND.
+    OR-TRUE only neutralizes a bound when an OR branch can be taken without
+    satisfying another AND-joined effective bound. ``WHERE (hour >= X OR 1=1)
+    AND hour >= Y`` is not a bypass; ``WHERE hour >= Y OR (hour >= X OR 1=1)``
+    still is.
     """
-    root = where.this
-    for col in _iter_where_columns(root):
+    return _predicate_allows_unbounded_time(where.this)
+
+
+def _predicate_allows_unbounded_time(node: exp.Expression) -> bool:
+    """True iff this boolean subtree can be TRUE without a hypertable time bound."""
+    if isinstance(node, exp.Paren):
+        inner = node.this
+        if inner is not None:
+            return _predicate_allows_unbounded_time(inner)
+    if isinstance(node, exp.And):
+        left, right = node.this, node.expression
+        if left is None or right is None:
+            return True
+        return (
+            _predicate_allows_unbounded_time(left)
+            and _predicate_allows_unbounded_time(right)
+        )
+    if isinstance(node, exp.Or):
+        left, right = node.this, node.expression
+        if left is None or right is None:
+            return True
+        return (
+            _predicate_allows_unbounded_time(left)
+            or _predicate_allows_unbounded_time(right)
+        )
+    if isinstance(node, exp.Not):
+        return False
+    if _is_unconditional_true(node):
+        return True
+    if _leaf_enforces_hypertable_time_bound(node):
+        return False
+    return True
+
+
+def _leaf_enforces_hypertable_time_bound(node: exp.Expression) -> bool:
+    """True iff this leaf predicate is a genuine bound on a hypertable time column."""
+    for col in _iter_where_columns(node):
         if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
             continue
         comparison = _ancestor_comparison(col)
         if comparison is None or not _is_genuine_bound(comparison, col):
             continue
-        cur = comparison.parent
-        while cur is not None:
-            if isinstance(cur, exp.Or):
-                # Identify which OR branch CONTAINS the comparison: that
-                # branch is the bound side, the OTHER branch is its sibling.
-                # _is_under(expr, ancestor) returns True if `expr` is or is
-                # nested inside `ancestor` — so we ask whether `comparison`
-                # lives under `cur.this` (the LEFT operand) vs. `cur.expression`.
-                if _is_under(comparison, cur.this):
-                    sibling = cur.expression
-                else:
-                    sibling = cur.this
-                if _is_unconditional_true(sibling):
-                    return True
-            if cur is root:
-                break
-            cur = cur.parent
+        if _is_under(comparison, node):
+            return True
     return False
 
 
