@@ -371,7 +371,7 @@ def validate_sql(
                 if (
                     where is None
                     or not _has_bounding_time_predicate_for(where, alias, all_aliases)
-                    or _has_or_true_bypass(where)
+                    or _has_or_true_bypass(where, alias, all_aliases)
                 ):
                     return _reject(
                         "missing_time_filter",
@@ -779,38 +779,50 @@ def _is_under(expr: exp.Expression, ancestor: exp.Expression) -> bool:
     return False
 
 
-def _has_or_true_bypass(where: exp.Where) -> bool:
+def _has_or_true_bypass(
+    where: exp.Where,
+    target_alias: str,
+    all_aliases: "list[str]",
+) -> bool:
     """Detect when the WHERE can be satisfied without an effective time bound.
 
     OR-TRUE only neutralizes a bound when an OR branch can be taken without
     satisfying another AND-joined effective bound. ``WHERE (hour >= X OR 1=1)
     AND hour >= Y`` is not a bypass; ``WHERE hour >= Y OR (hour >= X OR 1=1)``
     still is.
+
+    Scoped to ``target_alias``: a sibling hypertable's time bound (e.g.
+    ``bl.hour >= Y`` when guarding ``ph``) does not count as enforcing the
+    target scan.
     """
-    return _predicate_allows_unbounded_time(where.this)
+    return _predicate_allows_unbounded_time(where.this, target_alias, all_aliases)
 
 
-def _predicate_allows_unbounded_time(node: exp.Expression) -> bool:
+def _predicate_allows_unbounded_time(
+    node: exp.Expression,
+    target_alias: str,
+    all_aliases: "list[str]",
+) -> bool:
     """True iff this boolean subtree can be TRUE without a hypertable time bound."""
     if isinstance(node, exp.Paren):
         inner = node.this
         if inner is not None:
-            return _predicate_allows_unbounded_time(inner)
+            return _predicate_allows_unbounded_time(inner, target_alias, all_aliases)
     if isinstance(node, exp.And):
         left, right = node.this, node.expression
         if left is None or right is None:
             return True
         return (
-            _predicate_allows_unbounded_time(left)
-            and _predicate_allows_unbounded_time(right)
+            _predicate_allows_unbounded_time(left, target_alias, all_aliases)
+            and _predicate_allows_unbounded_time(right, target_alias, all_aliases)
         )
     if isinstance(node, exp.Or):
         left, right = node.this, node.expression
         if left is None or right is None:
             return True
         return (
-            _predicate_allows_unbounded_time(left)
-            or _predicate_allows_unbounded_time(right)
+            _predicate_allows_unbounded_time(left, target_alias, all_aliases)
+            or _predicate_allows_unbounded_time(right, target_alias, all_aliases)
         )
     if isinstance(node, exp.Not):
         inner = node.this
@@ -834,15 +846,26 @@ def _predicate_allows_unbounded_time(node: exp.Expression) -> bool:
         return True
     if _is_unconditional_true(node):
         return True
-    if _leaf_enforces_hypertable_time_bound(node):
+    if _leaf_enforces_hypertable_time_bound(node, target_alias, all_aliases):
         return False
     return True
 
 
-def _leaf_enforces_hypertable_time_bound(node: exp.Expression) -> bool:
-    """True iff this leaf predicate is a genuine bound on a hypertable time column."""
+def _leaf_enforces_hypertable_time_bound(
+    node: exp.Expression,
+    target_alias: str,
+    all_aliases: "list[str]",
+) -> bool:
+    """True iff this leaf predicate genuinely bounds the target hypertable's time column."""
+    only_source = len(all_aliases) == 1 and all_aliases[0] == target_alias
     for col in _iter_where_columns(node):
         if (col.name or "").lower() not in HYPERTABLE_TIME_COLUMNS:
+            continue
+        col_alias = (col.table or "").lower()
+        if col_alias:
+            if col_alias != target_alias:
+                continue
+        elif not only_source:
             continue
         comparison = _ancestor_comparison(col)
         if comparison is None or not _is_genuine_bound(comparison, col):
