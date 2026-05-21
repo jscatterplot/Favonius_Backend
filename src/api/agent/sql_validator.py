@@ -400,8 +400,7 @@ def validate_sql(
         if len(args) != 1:
             return _reject(
                 "bad_function_argument",
-                f"agent_views.{fn_name} must take exactly one argument ($1); "
-                f"got {len(args)}.",
+                f"agent_views.{fn_name} must take exactly one argument ($1); " f"got {len(args)}.",
             )
         arg = args[0]
         if not (
@@ -538,9 +537,7 @@ def validate_sql(
         parent = node.parent
         if isinstance(parent, exp.Table):
             continue
-        fn_name = TYPED_FUNC_KEYS.get(
-            (node.key or "").lower(), (node.key or "").lower()
-        )
+        fn_name = TYPED_FUNC_KEYS.get((node.key or "").lower(), (node.key or "").lower())
         if fn_name in DANGEROUS_FUNCTIONS:
             return _reject(
                 "dangerous_fn",
@@ -613,9 +610,12 @@ def validate_sql(
         rej = _apply_row_limit_on_node(branch, row_limit)
         if rej is not None:
             return rej
-    rej = _apply_row_limit_on_node(tree, row_limit)
-    if rej is not None:
-        return rej
+    # Plain SELECTs are already capped via the branch loop; only set-op
+    # roots need an outer LIMIT (UNION/INTERSECT/EXCEPT).
+    if not isinstance(tree, exp.Select):
+        rej = _apply_row_limit_on_node(tree, row_limit)
+        if rej is not None:
+            return rej
 
     canonical = tree.sql(dialect="postgres")
     return ValidationResult(
@@ -630,9 +630,7 @@ def validate_sql(
 
 def _is_zero_literal(expr: exp.Expression | None) -> bool:
     """True iff ``expr`` is the integer literal 0 (used for OFFSET 0)."""
-    return (
-        isinstance(expr, exp.Literal) and not expr.is_string and str(expr.name) == "0"
-    )
+    return isinstance(expr, exp.Literal) and not expr.is_string and str(expr.name) == "0"
 
 
 def _apply_row_limit_on_node(
@@ -919,10 +917,7 @@ def _side_is_order_preserving(node: exp.Expression, time_col_name: str) -> bool:
             trunc_types = trunc_types + (getattr(exp, cls_name),)
     if trunc_types and isinstance(node, trunc_types):
         inner = node.args.get("this")
-        if (
-            isinstance(inner, exp.Column)
-            and (inner.name or "").lower() == time_col_name
-        ):
+        if isinstance(inner, exp.Column) and (inner.name or "").lower() == time_col_name:
             return True
         return False
     # time_bucket() typically parses as Anonymous with the column as last arg
@@ -930,10 +925,7 @@ def _side_is_order_preserving(node: exp.Expression, time_col_name: str) -> bool:
         exprs = node.args.get("expressions") or []
         if exprs:
             last = exprs[-1]
-            if (
-                isinstance(last, exp.Column)
-                and (last.name or "").lower() == time_col_name
-            ):
+            if isinstance(last, exp.Column) and (last.name or "").lower() == time_col_name:
                 return True
         return False
     return False
@@ -1111,10 +1103,7 @@ def _is_unconditional_true(node: exp.Expression | None) -> bool:
             and isinstance(left, exp.Column)
             and isinstance(right, exp.Column)
         ):
-            return (
-                left.sql(dialect="postgres").lower()
-                == right.sql(dialect="postgres").lower()
-            )
+            return left.sql(dialect="postgres").lower() == right.sql(dialect="postgres").lower()
         if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
             return _literal_comparison_holds(node, left, right)
     return False
@@ -1145,9 +1134,7 @@ def _is_unconditional_false(node: exp.Expression | None) -> bool:
     return False
 
 
-def _literal_comparison_holds(
-    op: exp.Expression, left: exp.Literal, right: exp.Literal
-) -> bool:
+def _literal_comparison_holds(op: exp.Expression, left: exp.Literal, right: exp.Literal) -> bool:
     """Evaluate a comparison between two literals at parse time.
 
     Both literals are coerced to floats when both are numeric strings;

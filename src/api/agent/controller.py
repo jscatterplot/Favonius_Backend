@@ -387,9 +387,7 @@ async def run_turn(
         if missing:
             for _entity in missing:
                 AGENT_RESOLVER_MISSES.labels(kind="not_found").inc()
-            reply = AgentReply.not_found_reply(
-                run_id=run_id, intent=plan.intent, missing=missing
-            )
+            reply = AgentReply.not_found_reply(run_id=run_id, intent=plan.intent, missing=missing)
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
             await _emit_answer_safe(sse, reply, run_id)
             return reply
@@ -646,7 +644,8 @@ async def _run_sql_general_turn(
             logger.exception(
                 "Failed to mirror partial SQL audit for aborted run %s "
                 "(original abort: %s); continuing with graceful error close.",
-                run_id, type(exc).__name__,
+                run_id,
+                type(exc).__name__,
             )
         reply = AgentReply.error(run_id=run_id)
         try:
@@ -703,20 +702,30 @@ async def _run_sql_general_turn(
         except (TypeError, ValueError):
             pass
 
-    await agent_runs_step(
-        ts_pool,
-        run_id,
-        "sql_loop_complete",
-        {
-            "iterations": qa.iterations,
-            "tool_call_count": len(qa.tool_calls),
-            "sql_attempts": sql_attempts,
-            "sql_executions": sql_executions,
-            "server_row_total": server_row_total,
-            "model_row_evidence": qa.row_evidence,
-            "status": qa.status,
-        },
-    )
+    # Bugbot M-sev: wrap success-path audit writes in try/except (same
+    # rationale as the error-path mirrors above). A transient DB failure
+    # here must not skip agent_runs_close + SSE emit + return below.
+    try:
+        await agent_runs_step(
+            ts_pool,
+            run_id,
+            "sql_loop_complete",
+            {
+                "iterations": qa.iterations,
+                "tool_call_count": len(qa.tool_calls),
+                "sql_attempts": sql_attempts,
+                "sql_executions": sql_executions,
+                "server_row_total": server_row_total,
+                "model_row_evidence": qa.row_evidence,
+                "status": qa.status,
+            },
+        )
+    except Exception:  # noqa: BLE001 - best-effort success-path audit
+        logger.exception(
+            "Failed to record sql_loop_complete step for run %s; "
+            "continuing with answer delivery.",
+            run_id,
+        )
 
     # Mirror to admin audit feed for EVERY turn that ATTEMPTED at least one
     # SQL tool — observability gaps on failure-only runs were called out in
@@ -725,15 +734,21 @@ async def _run_sql_general_turn(
     # back-reference in the audit metadata.
     if sql_attempts > 0:
         functions_accessed = _sql_functions_accessed(qa.tool_calls)
-        await write_agent_query_audit(
-            ts_pool,
-            auth,
-            run_id,
-            "sql_general",
-            server_row_total,
-            target_type=sql_audit_target_type(functions_accessed),
-            functions_accessed=functions_accessed or None,
-        )
+        try:
+            await write_agent_query_audit(
+                ts_pool,
+                auth,
+                run_id,
+                "sql_general",
+                server_row_total,
+                target_type=sql_audit_target_type(functions_accessed),
+                functions_accessed=functions_accessed or None,
+            )
+        except Exception:  # noqa: BLE001 - best-effort success-path audit
+            logger.exception(
+                "Failed to write SQL general audit for run %s; " "continuing with answer delivery.",
+                run_id,
+            )
 
     if qa.status == "success" and qa.text:
         reply = AgentReply.success(run_id=run_id, intent="sql_general", text=qa.text)
@@ -753,9 +768,9 @@ async def _run_sql_general_turn(
     # didn't give us an answer in time" buckets that map to not_found.
     reply = AgentReply(
         run_id=run_id,
-        status="not_found"
-        if qa.status in ("no_terminator", "max_iterations", "success")
-        else "error",
+        status=(
+            "not_found" if qa.status in ("no_terminator", "max_iterations", "success") else "error"
+        ),
         text=text,
         intent="sql_general",
     )
