@@ -899,42 +899,48 @@ async def run_qa_turn(
                     tool_calls.append(tc)
                     if on_step is not None:
                         await _dispatch_on_step(on_step, tc)
+
+                    # The terminator is TERMINAL regardless of success or
+                    # failure (Bugbot M-sev): on failure we used to
+                    # ``continue`` and process the remaining tool_use
+                    # blocks in the same response, which (a) wasted work
+                    # and tokens on a turn the model has already declared
+                    # over, and (b) violated the semantic contract — the
+                    # model asked to stop. WorkflowAgent's ``emit_decision``
+                    # path (line 382 above) breaks unconditionally; this
+                    # path now matches. Subsequent blocks in the same
+                    # response are intentionally skipped without
+                    # appending tool_results because ``terminated = True``
+                    # causes the outer loop to break before any further
+                    # API call, so the messages-list inconsistency is
+                    # never observed by Anthropic.
+                    terminated = True
                     if ok:
                         final_text = str(result.get("text", "")).strip()
                         try:
                             row_evidence = int(result.get("row_evidence", 0) or 0)
                         except (TypeError, ValueError):
                             row_evidence = 0
-                        terminated = True
-                        # Append the terminator's tool_result BEFORE
-                        # breaking so the message list stays internally
-                        # consistent. Today we break the outer loop right
-                        # after this and never send messages back to the
-                        # API, so the missing entry was latent — but if
-                        # a future code change replays/persists messages
-                        # or removes the outer break, the assistant
-                        # tool_use block would have no matching
-                        # tool_result and the next API call would error
-                        # with "unmatched tool_use_id". Bugbot flagged
-                        # the latent risk; this closes it.
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block_id,
-                                "content": json.dumps(result, default=str),
-                                "is_error": False,
-                            }
-                        )
-                        break
+                    else:
+                        # final_text stays "" — the controller maps this to
+                        # the generic "I wasn't able to compose…" reply.
+                        status = "terminator_failed"
+                    # Append the terminator's tool_result so the in-memory
+                    # messages list stays consistent with the assistant
+                    # turn that produced it. We break the outer loop right
+                    # after, so this entry is never sent to the API — but
+                    # if a future change persists or replays messages, the
+                    # tool_use block having no matching tool_result would
+                    # surface as "unmatched tool_use_id" on the next call.
                     tool_results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": block_id,
                             "content": json.dumps(result, default=str),
-                            "is_error": True,
+                            "is_error": not ok,
                         }
                     )
-                    continue
+                    break
 
                 try:
                     result = await tool_registry.dispatch(name, block_input)

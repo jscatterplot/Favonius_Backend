@@ -201,6 +201,129 @@ class _FakeUsage:
         self.output_tokens = output_tokens
 
 
+def _registry_with_raising_terminator() -> tuple[ToolRegistry, list[tuple[str, dict]]]:
+    """Same as ``_registry`` but the terminator ALWAYS raises a generic
+    exception. Used to test the terminator-failure-is-terminal path."""
+    reg = ToolRegistry()
+    log: list[tuple[str, dict]] = []
+
+    async def _run_select(*, sql: str, **_):
+        log.append(("run_select_ts", {"sql": sql}))
+        return {"rows": [{"depot_id": "d1", "n": 42}], "row_count": 1}
+
+    async def _broken_terminator(**kwargs):
+        log.append((EMIT_FINAL_ANSWER_TOOL, kwargs))
+        raise RuntimeError("simulated terminator dispatch failure")
+
+    reg.register(
+        "run_select_ts",
+        description="select",
+        input_schema={
+            "type": "object",
+            "properties": {"sql": {"type": "string"}},
+            "required": ["sql"],
+        },
+        fn=_run_select,
+    )
+    reg.register(
+        EMIT_FINAL_ANSWER_TOOL,
+        description="terminator",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "row_evidence": {"type": "integer", "default": 0},
+            },
+            "required": ["text"],
+        },
+        fn=_broken_terminator,
+    )
+    return reg, log
+
+
+@pytest.mark.asyncio
+async def test_terminator_failure_skips_remaining_tool_use_blocks_in_same_response():
+    """Bugbot M-sev: when emit_final_answer dispatch raises, the prior
+    code did ``continue`` and would dispatch any tool_use blocks that
+    followed the terminator IN THE SAME response. The terminator should
+    be terminal regardless of success or failure — matching
+    WorkflowAgent's emit_decision behaviour.
+
+    This test scripts a single response containing
+    ``[run_select_ts, emit_final_answer, run_select_ts]`` and verifies
+    the third block is NOT dispatched after the terminator fails.
+    """
+    reg, log = _registry_with_raising_terminator()
+    # ONE response containing three blocks; the second (terminator) raises.
+    multi_block_response = _FakeResponse(
+        [
+            _tool_use("run_select_ts", "b1", {"sql": "SELECT 1"}),
+            _tool_use(EMIT_FINAL_ANSWER_TOOL, "b2", {"text": "ok", "row_evidence": 1}),
+            _tool_use("run_select_ts", "b3", {"sql": "SELECT 2"}),
+        ]
+    )
+    client = _FakeClient([multi_block_response])
+
+    result = await run_qa_turn(
+        anthropic_client=client,
+        model="claude-haiku-4-5",
+        system_prompt="sys",
+        user_message="q",
+        tool_registry=reg,
+        allowed_tools=["run_select_ts", EMIT_FINAL_ANSWER_TOOL],
+    )
+
+    # Block 1 dispatched. Block 2 (terminator) attempted-and-failed.
+    # Block 3 SKIPPED because terminator is terminal.
+    names_called = [name for name, _ in log]
+    assert names_called == [
+        "run_select_ts",
+        EMIT_FINAL_ANSWER_TOOL,
+    ], f"expected b3 to be skipped after terminator failure; got {names_called}"
+
+    # The QAResult exposes the failure via status="terminator_failed"
+    # so the controller can map it to an error reply rather than a
+    # not_found / success.
+    assert result.status == "terminator_failed"
+    assert result.text == ""
+    # iterations == 1 (one API round-trip — we broke without looping).
+    assert result.iterations == 1
+    # Exactly one round-trip — we did NOT loop back to the API after
+    # the terminator failed.
+    assert len(client.messages.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminator_failure_does_not_loop_back_to_api():
+    """A simpler regression: even with a single-block response where the
+    terminator fails, we must NOT make a second API call (which would
+    let the LLM retry). The prior `continue` path would do so. The
+    new break-and-set-terminated path exits immediately."""
+    reg, _ = _registry_with_raising_terminator()
+    single_block_response = _FakeResponse(
+        [_tool_use(EMIT_FINAL_ANSWER_TOOL, "b1", {"text": "ok"})]
+    )
+    # If the loop incorrectly continued, it would hit the second
+    # response and call the (working) select. With the fix, the second
+    # response is never used because we break the outer loop.
+    second_response = _FakeResponse(
+        [_tool_use("run_select_ts", "b2", {"sql": "SELECT 3"})]
+    )
+    client = _FakeClient([single_block_response, second_response])
+
+    result = await run_qa_turn(
+        anthropic_client=client,
+        model="claude-haiku-4-5",
+        system_prompt="sys",
+        user_message="q",
+        tool_registry=reg,
+        allowed_tools=["run_select_ts", EMIT_FINAL_ANSWER_TOOL],
+    )
+
+    assert result.status == "terminator_failed"
+    assert len(client.messages.calls) == 1  # never made the 2nd call
+
+
 @pytest.mark.asyncio
 async def test_run_qa_turn_records_token_usage_per_round_trip():
     """Bugbot M-sev: `run_qa_turn` was making up to `max_iterations`

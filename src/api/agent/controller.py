@@ -478,6 +478,18 @@ def _sql_functions_accessed(tool_calls: Any) -> list[str]:
     return ordered
 
 
+def _extract_iterations(exc: BaseException) -> int:
+    """Pull the ``iterations`` count off an exception raised by run_qa_turn.
+
+    Both ``ToolNotAllowedError`` (via ctor) and the generic
+    ``Exception`` path (via the ``runtime.py`` outer handler that
+    attaches ``exc.iterations``) carry the integer. Defensive cast +
+    None guard keep this safe for any future exception subclass that
+    forgets to set the attribute.
+    """
+    return int(getattr(exc, "iterations", 0) or 0)
+
+
 async def _mirror_sql_general_audit_from_calls(
     *,
     ts_pool: Any,
@@ -573,7 +585,16 @@ async def _run_sql_general_turn(
         summary = f"{name}: {'ok' if tool_call.ok else 'error'}"
         await emit_step("tool_call", summary)
 
-    sql_tool_turns = 0
+    # Bugbot L-sev: previous shape was ``sql_tool_turns = 0`` +
+    # try/except/else/finally with the variable reassigned in three
+    # branches and a single ``finally: AGENT_SQL_TOOL_TURNS.observe(…)``.
+    # The triple-assignment was correct today but fragile: any future
+    # refactor that changed an except handler to fall through (instead
+    # of return/raise) would silently observe a stale value from the
+    # other branch. We now observe the metric LOCALLY in each branch,
+    # with the value derived from the in-scope source (qa.iterations or
+    # exc.iterations) right next to where the path is decided. One
+    # observation per path; no shared mutable state.
     try:
         qa = await run_qa_turn(
             anthropic_client=client,
@@ -588,16 +609,13 @@ async def _run_sql_general_turn(
             on_step=_on_step,
         )
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
-        # Set sql_tool_turns from exc.iterations BEFORE the early return
-        # so the AGENT_SQL_TOOL_TURNS histogram in the finally block
-        # records the actual round-trip count, not 0. Both exception
-        # types carry `iterations` (ToolNotAllowedError via its ctor;
-        # ToolNotRegisteredError via the attribute attached at the
-        # re-raise site in run_qa_turn). Without this, every policy-
-        # violation turn flat-lined the metric at 0, biasing the
-        # distribution toward zero on the runs we care most about
-        # monitoring.
-        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
+        # Both exception types carry ``iterations``: ToolNotAllowedError
+        # via its ctor; ToolNotRegisteredError via the attribute
+        # attached at the re-raise site in run_qa_turn. Without
+        # observing here, every policy-violation turn would flat-line
+        # the histogram at 0, biasing the distribution toward zero on
+        # the runs we most need to monitor.
+        AGENT_SQL_TOOL_TURNS.observe(_extract_iterations(exc))
         logger.error("SQL agent tool error: %s", exc)
         # Codex P2: if a disallowed tool aborted the loop AFTER one or
         # more SQL tools had already executed, we still owe those rows
@@ -638,7 +656,7 @@ async def _run_sql_general_turn(
         await _emit_answer_safe(sse, reply, run_id)
         return reply
     except Exception as exc:
-        sql_tool_turns = int(getattr(exc, "iterations", 0) or 0)
+        AGENT_SQL_TOOL_TURNS.observe(_extract_iterations(exc))
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
         # Wrap in try/except (Bugbot M-sev): if the audit write fails
         # here it would mask the original exception, swallowing the
@@ -662,9 +680,7 @@ async def _run_sql_general_turn(
             )
         raise
     else:
-        sql_tool_turns = qa.iterations
-    finally:
-        AGENT_SQL_TOOL_TURNS.observe(sql_tool_turns)
+        AGENT_SQL_TOOL_TURNS.observe(qa.iterations)
 
     # Server-computed audit numbers: rely on the tool-call trace, not the
     # LLM-supplied `row_evidence` (the model can hallucinate that value).
@@ -731,6 +747,10 @@ async def _run_sql_general_turn(
             "I wasn't able to compose a complete answer to that question. "
             "Try rephrasing, or break it into smaller questions."
         )
+    # ``terminator_failed`` (runtime.py: emit_final_answer dispatch raised)
+    # is routed to ``error`` — it's a genuine system fault, not a
+    # not-found. ``no_terminator`` / ``max_iterations`` are the "model
+    # didn't give us an answer in time" buckets that map to not_found.
     reply = AgentReply(
         run_id=run_id,
         status="not_found"
