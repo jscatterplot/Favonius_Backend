@@ -404,14 +404,23 @@ class OCPPWebSocketServer:
         return any(ip_addr in network for network in self._trusted_proxy_networks)
 
     def _get_client_ip(self, websocket: WebSocketServerProtocol) -> str:
-        """Resolve the effective client IP for geo-blocking, auth logs, and limits."""
+        """Resolve the effective client IP for geo-blocking, auth logs, and limits.
+
+        The parser is given the same trust configuration this server uses to
+        vet the peer, so it can walk ``X-Forwarded-For`` right-to-left and
+        skip intermediate-proxy hops instead of trusting a prepended spoof.
+        """
         peer_ip = self._get_peer_ip(websocket)
         if peer_ip == "unknown" or not self._is_trusted_proxy_ip(peer_ip):
             return peer_ip
 
         request = getattr(websocket, "request", None)
         headers = getattr(request, "headers", {}) if request is not None else {}
-        forwarded_ip = extract_forwarded_ip(headers)
+        forwarded_ip = extract_forwarded_ip(
+            headers,
+            trusted_networks=tuple(self._trusted_proxy_networks),
+            trust_implicit_private=self._trust_private_proxy_headers,
+        )
         if forwarded_ip:
             self.logger.info(
                 "Using forwarded OCPP client IP %s from trusted proxy %s",

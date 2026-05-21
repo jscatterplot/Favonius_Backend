@@ -1,10 +1,38 @@
-"""Shared helpers for parsing forwarded client IP headers."""
+"""Shared helpers for parsing forwarded client IP headers.
+
+When the API or WebSocket handler runs behind a reverse proxy (Railway edge,
+Cloudflare, on-prem nginx, the Lithuanian DSO firewall), the immediate TCP
+peer is the proxy, not the real client. Geo-blocking decisions and audit
+logs must use the real client IP, which the proxy advertises via the
+``X-Forwarded-For`` / ``Forwarded`` / ``X-Real-IP`` headers.
+
+The naive "leftmost X-Forwarded-For wins" pattern is unsafe: when the proxy
+*appends* its view (the common nginx and most-PaaS default), an attacker
+can prepend `X-Forwarded-For: 8.8.8.8` and the leftmost lookup returns the
+spoofed value. :func:`extract_forwarded_ip` walks the chain right-to-left
+instead, skipping entries that are themselves trusted proxies, and returns
+the rightmost non-trusted entry — that is the real origin client.
+
+Callers must first verify the immediate TCP peer is a trusted proxy before
+passing headers to this function. The trust gate stays in the caller; the
+parser only consults trust info to decide which chain entries are
+intermediate proxies and which is the real client.
+"""
 
 from __future__ import annotations
 
 import ipaddress
 import logging
-from typing import Optional
+from typing import Iterable, Optional, Union
+
+# RFC 6598 carrier-grade NAT shared address space. Treated as implicitly
+# trusted when callers opt into private-proxy trust — Railway, Render,
+# Fly.io and other PaaS providers route between their edge and the
+# container over this range. Python's ``ipaddress`` does not classify it
+# as ``is_private`` so we check it explicitly.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+_Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 
 def normalize_forwarded_ip(raw_ip: str) -> Optional[str]:
@@ -26,25 +54,127 @@ def normalize_forwarded_ip(raw_ip: str) -> Optional[str]:
         return None
 
 
-def extract_forwarded_ip(headers: object) -> Optional[str]:
-    """Extract the original client IP from common reverse-proxy headers."""
-    if not hasattr(headers, "get"):
-        return None
+def _is_implicitly_trusted(
+    ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
+) -> bool:
+    """True for RFC 1918/4193 private, loopback, link-local, and RFC 6598 CGNAT."""
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        return True
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK:
+        return True
+    return False
 
-    forwarded = headers.get("Forwarded", "") or ""
+
+def _is_trusted_proxy_entry(
+    ip_str: str,
+    trusted_networks: tuple[_Network, ...],
+    trust_implicit_private: bool,
+) -> bool:
+    """True when this chain entry represents a known intermediate proxy."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if trust_implicit_private and _is_implicitly_trusted(ip):
+        return True
+    return any(ip.version == net.version and ip in net for net in trusted_networks)
+
+
+def _select_client_ip(
+    chain: list[str],
+    trusted_networks: tuple[_Network, ...],
+    trust_implicit_private: bool,
+) -> Optional[str]:
+    """Return the rightmost non-trusted IP in a forwarded chain.
+
+    Callers without trust info (``trusted_networks=()`` and
+    ``trust_implicit_private=False``) get the legacy leftmost-wins behaviour
+    so older call sites do not silently change semantics. With trust info,
+    the chain is walked right-to-left and the first non-trusted entry is
+    returned. When every entry is a known proxy we fall back to the
+    leftmost entry — purely internal traffic still surfaces "the claimed
+    origin" rather than nothing.
+    """
+    if not chain:
+        return None
+    if not (trusted_networks or trust_implicit_private):
+        return chain[0]
+    for candidate in reversed(chain):
+        if not _is_trusted_proxy_entry(candidate, trusted_networks, trust_implicit_private):
+            return candidate
+    return chain[0]
+
+
+def _parse_forwarded_header_chain(forwarded: str) -> list[str]:
+    """Parse RFC 7239 ``Forwarded`` header into an ordered list of ``for=`` IPs."""
+    result: list[str] = []
     for proxy_hop in forwarded.split(","):
         for item in proxy_hop.split(";"):
             key, separator, value = item.strip().partition("=")
             if separator and key.lower() == "for":
                 parsed = normalize_forwarded_ip(value)
                 if parsed:
-                    return parsed
+                    result.append(parsed)
+                break
+    return result
 
-    x_forwarded_for = headers.get("X-Forwarded-For", "") or ""
-    for candidate in x_forwarded_for.split(","):
+
+def _parse_xff_chain(xff: str) -> list[str]:
+    """Parse ``X-Forwarded-For`` into an ordered list of valid IPs."""
+    result: list[str] = []
+    for candidate in xff.split(","):
         parsed = normalize_forwarded_ip(candidate)
         if parsed:
-            return parsed
+            result.append(parsed)
+    return result
+
+
+def extract_forwarded_ip(
+    headers: object,
+    *,
+    trusted_networks: Iterable[_Network] = (),
+    trust_implicit_private: bool = False,
+) -> Optional[str]:
+    """Extract the original client IP from forwarded-header chains.
+
+    Walks ``X-Forwarded-For`` (and RFC 7239 ``Forwarded``) right-to-left,
+    skipping entries that are themselves trusted proxies, and returns the
+    rightmost non-trusted entry — the original client. Falls back to
+    ``X-Real-IP`` when neither chain header is present.
+
+    Args:
+        headers: A mapping-like object exposing case-insensitive ``.get(name)``.
+        trusted_networks: CIDRs that act as reverse proxies for this
+            deployment. Entries in the chain whose IPs fall in any of these
+            ranges are treated as intermediate hops, not the client.
+        trust_implicit_private: When True, RFC 1918 / RFC 4193 private,
+            loopback, link-local, and RFC 6598 CGNAT addresses are also
+            treated as intermediate proxies. Match this to the caller's
+            existing ``trust private proxy headers`` config.
+
+    Returns:
+        The resolved client IP, or ``None`` when no valid header is present.
+
+    Safety:
+        Callers MUST first verify the immediate TCP peer is a trusted proxy
+        before invoking this function. Otherwise an arbitrary internet peer
+        can supply any value as the "client" and bypass geo-blocking or
+        allowlists.
+    """
+    if not hasattr(headers, "get"):
+        return None
+
+    networks = tuple(trusted_networks)
+
+    forwarded_chain = _parse_forwarded_header_chain(headers.get("Forwarded", "") or "")
+    chosen = _select_client_ip(forwarded_chain, networks, trust_implicit_private)
+    if chosen:
+        return chosen
+
+    xff_chain = _parse_xff_chain(headers.get("X-Forwarded-For", "") or "")
+    chosen = _select_client_ip(xff_chain, networks, trust_implicit_private)
+    if chosen:
+        return chosen
 
     x_real_ip = headers.get("X-Real-IP", "") or ""
     return normalize_forwarded_ip(x_real_ip) if x_real_ip else None
@@ -55,9 +185,9 @@ def parse_ip_networks(
     *,
     logger: logging.Logger,
     env_var_name: str,
-) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+) -> list[_Network]:
     """Parse a comma-separated list of CIDR ranges, ignoring invalid entries."""
-    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    networks: list[_Network] = []
     for raw_range in ranges.split(","):
         raw_range = raw_range.strip()
         if not raw_range:
