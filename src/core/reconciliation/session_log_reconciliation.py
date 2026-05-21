@@ -239,28 +239,7 @@ def _charger_total_kwh(
     return delta
 
 
-async def _our_energy_kwh(
-    ts_pool: asyncpg.Pool,
-    *,
-    station_id: Optional[str],
-    connector_id: Optional[int],
-    transaction_id: Optional[int],
-    start_time: Optional[datetime],
-    end_time: Optional[datetime],
-) -> Optional[float]:
-    """Trapezoidal integration of telemetry.charging_kw across the window.
-
-    Falls back to the strict tx-scoped query first; if that yields no
-    rows (legacy telemetry without ``transaction_id``), retries with
-    ``(station_id, connector_id)`` only. Same cascade philosophy as
-    :func:`src.core.billing.session_cost._fetch_granular_telemetry_rows`.
-    """
-    if start_time is None or end_time is None:
-        return None
-    if station_id is None or connector_id is None:
-        return None
-
-    sql_tx = """
+_OUR_ENERGY_SQL = """
         WITH samples AS (
             SELECT t.time AS raw_time,
                    t.charging_kw,
@@ -269,7 +248,7 @@ async def _our_energy_kwh(
               FROM telemetry t
              WHERE t.station_id = $1
                AND t.connector_id = $2
-               AND ($3::bigint IS NULL OR t.transaction_id = $3 OR t.transaction_id IS NULL)
+               {tx_filter}
                AND t.time >= $4::timestamptz - INTERVAL '15 minutes'
                AND t.time < $5::timestamptz
                AND t.charging_kw IS NOT NULL
@@ -291,22 +270,57 @@ async def _our_energy_kwh(
             ) AS energy_kwh
         FROM samples
         WHERE next_time IS NULL OR next_time > $4::timestamptz
+"""
+
+
+async def _our_energy_kwh(
+    ts_pool: asyncpg.Pool,
+    *,
+    station_id: Optional[str],
+    connector_id: Optional[int],
+    transaction_id: Optional[int],
+    start_time: Optional[datetime],
+    end_time: Optional[datetime],
+) -> Optional[float]:
+    """Trapezoidal integration of telemetry.charging_kw across the window.
+
+    Cascade when ``transaction_id`` is set: strict ``transaction_id = $3``
+    first; if that yields no positive energy, retry with
+    ``transaction_id IS NULL OR transaction_id = $3`` so legacy untagged
+    samples still count without mixing in other sessions' rows. Same
+    philosophy as :func:`src.core.billing.session_cost._fetch_granular_telemetry_rows`.
     """
-    async with ts_pool.acquire() as conn:
+    if start_time is None or end_time is None:
+        return None
+    if station_id is None or connector_id is None:
+        return None
+
+    async def _query(conn: asyncpg.Connection, tx_filter: str) -> Optional[float]:
         row = await conn.fetchrow(
-            sql_tx,
+            _OUR_ENERGY_SQL.format(tx_filter=tx_filter),
             station_id,
             connector_id,
             transaction_id,
             start_time,
             end_time,
         )
-    if row is None:
-        return None
-    value = _as_float(row["energy_kwh"])
-    if value is None or value <= 0:
-        return None
-    return value
+        if row is None:
+            return None
+        value = _as_float(row["energy_kwh"])
+        if value is None or value <= 0:
+            return None
+        return value
+
+    async with ts_pool.acquire() as conn:
+        if transaction_id is not None:
+            value = await _query(conn, "AND t.transaction_id = $3")
+            if value is not None:
+                return value
+            return await _query(
+                conn,
+                "AND (t.transaction_id IS NULL OR t.transaction_id = $3)",
+            )
+        return await _query(conn, "")
 
 
 def _duration_s(start: Optional[datetime], end: Optional[datetime]) -> Optional[int]:

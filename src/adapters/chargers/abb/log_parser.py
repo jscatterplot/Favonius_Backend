@@ -254,11 +254,13 @@ def _read_power_kw(row: dict, headers: dict) -> Optional[float]:
 
 def _read_soc(row: dict, headers: dict) -> Optional[float]:
     """Return SoC as a fraction in [0, 1] regardless of source unit."""
-    soc = _read_float(row, headers, "soc", "socpercent", "soc_percent", "stateofcharge")
+    soc = _read_float(row, headers, "socpercent", "soc_percent")
+    if soc is not None:
+        return soc / 100.0
+    soc = _read_float(row, headers, "soc", "stateofcharge")
     if soc is None:
         return None
-    # Both 0.85 and 85.0 are plausible inputs; the >1 branch covers
-    # percentage encodings, which is the dominant ABB convention.
+    # Fraction inputs (0.85) and percentage inputs (85.0) on generic columns.
     return soc / 100.0 if soc > 1.0 else soc
 
 
