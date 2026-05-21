@@ -688,6 +688,63 @@ class OCPP16Session:
         logger.debug("clear_der_control called on OCPP 1.6 session — skipping")
         return False
 
+    async def get_diagnostics(
+        self,
+        location: str,
+        *,
+        retries: Optional[int] = None,
+        retry_interval: Optional[int] = None,
+        start_time: Any = None,
+        stop_time: Any = None,
+    ) -> Optional[str]:
+        """Send OCPP 1.6 ``GetDiagnostics`` to the connected charger.
+
+        The queue consumer dispatches charger-log fetches by calling
+        ``cp.get_diagnostics(location=…)`` on whatever the in-memory
+        session exposes. Without this wrapper, the ``getattr`` lookup
+        on an ``OCPP16Session`` returned ``None`` and the row was
+        terminally marked failed — GetDiagnostics never reached the
+        charger. Delegates to ``FleetChargePoint.get_diagnostics`` and
+        returns the upload filename the charger reported (``None`` on
+        any failure — the underlying call swallows exceptions).
+
+        ``start_time`` / ``stop_time`` are accepted as datetime or
+        ISO-8601 strings; they're forwarded as ISO-8601 strings because
+        the underlying ``call.GetDiagnostics`` expects that shape.
+        """
+        if not self._is_connection_open():
+            logger.info(
+                "get_diagnostics requested for station=%s while offline — skipping push",
+                self._station_id,
+            )
+            return None
+
+        def _coerce(ts: Any) -> Optional[str]:
+            if ts is None or ts == "":
+                return None
+            if isinstance(ts, str):
+                return ts
+            try:
+                return ts.isoformat()
+            except AttributeError:
+                return str(ts)
+
+        try:
+            return await self._cp.get_diagnostics(
+                location=location,
+                start_time=_coerce(start_time),
+                stop_time=_coerce(stop_time),
+                retries=retries,
+                retry_interval=retry_interval,
+            )
+        except Exception as exc:
+            logger.warning(
+                "send_get_diagnostics failed for station=%s: %s",
+                self._station_id,
+                exc,
+            )
+            return None
+
     # ------------------------------------------------------------------
     # FleetChargePoint callbacks
     # ------------------------------------------------------------------

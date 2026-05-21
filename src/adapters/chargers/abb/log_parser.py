@@ -50,6 +50,48 @@ _KNOWN_CANON_KEYS = frozenset({
     "powerw", "poweractiveimport",
 })
 
+# Cap the decompressed size of the plain-gzip fallback so a hostile or
+# malformed blob (~1 KB of zeros expands to ~1 GB) cannot exhaust
+# memory. 50 MiB matches ``CHARGER_LOG_UPLOAD_MAX_BYTES`` default —
+# anything bigger than the upload ceiling can't legitimately be a
+# session log anyway. The tar.gz path uses ``tarfile`` streaming and
+# is bounded by per-member ``size`` headers, which tarfile already
+# validates against the underlying stream.
+_GUNZIP_MAX_BYTES = 50 * 1024 * 1024
+
+
+class _GzipTooLarge(Exception):
+    """Internal signal — gzip payload would exceed the decompression cap."""
+
+    def __init__(self, bytes_seen: int) -> None:
+        super().__init__(f"gzip payload exceeded cap after {bytes_seen} bytes")
+        self.bytes_seen = bytes_seen
+
+
+def _gunzip_capped(blob: bytes, max_bytes: int) -> bytes:
+    """Decompress gzip in 64 KiB chunks, aborting if total exceeds cap.
+
+    Using ``gzip.GzipFile`` over the raw blob lets us read in bounded
+    increments and bail before the inflated output blows past the
+    ceiling. ``gzip.decompress(blob)`` would have already materialised
+    the whole expansion before we could check its size.
+    """
+    import gzip as _gzip
+    import io as _io
+
+    chunks: list[bytes] = []
+    seen = 0
+    with _gzip.GzipFile(fileobj=_io.BytesIO(blob), mode="rb") as gz:
+        while True:
+            chunk = gz.read(65536)
+            if not chunk:
+                break
+            seen += len(chunk)
+            if seen > max_bytes:
+                raise _GzipTooLarge(seen)
+            chunks.append(chunk)
+    return b"".join(chunks)
+
 
 def parse_abb_diagnostics(blob: bytes) -> Iterable[ChargerLogEntry]:
     """Extract normalized session-log entries from an ABB diagnostics blob.
@@ -125,9 +167,16 @@ def _iter_csv_streams(blob: bytes) -> Iterator[tuple[str, str]]:
     import zlib
 
     try:
-        text = gzip.decompress(blob).decode("utf-8", errors="replace")
+        text = _gunzip_capped(blob, _GUNZIP_MAX_BYTES).decode("utf-8", errors="replace")
         yield "diagnostics.csv.gz", text
         return
+    except _GzipTooLarge as exc:
+        # Explicit ChargerLogParseError so the reconciler surfaces a
+        # ``parse_failed`` rather than silently dropping a hostile blob.
+        raise ChargerLogParseError(
+            f"gzip payload exceeds {_GUNZIP_MAX_BYTES} bytes "
+            f"(decompressed at least {exc.bytes_seen} bytes); refusing to expand"
+        ) from exc
     except (OSError, EOFError, zlib.error):
         pass
 

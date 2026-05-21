@@ -1085,7 +1085,10 @@ class ChargingCommandQueueConsumer:
                     # instead of an indefinite "pending". Best-effort —
                     # the upload endpoint can still complete a row that
                     # races this expirer, gated by the per-status WHERE
-                    # in receive_upload's UPDATE.
+                    # in receive_upload's UPDATE. TTL comes from
+                    # ``CHARGER_LOG_UPLOAD_TOKEN_TTL_S`` so the expirer
+                    # tracks operator-configured token lifetime instead
+                    # of a hard-coded constant.
                     try:
                         expire_fn = getattr(
                             self.timescale_client,
@@ -1093,7 +1096,16 @@ class ChargingCommandQueueConsumer:
                             None,
                         )
                         if expire_fn is not None:
-                            n_imports = await expire_fn()
+                            # Lazy import: keep this module independent
+                            # of src.adapters at module-load time.
+                            from src.adapters.chargers.upload_token import (
+                                get_token_ttl_seconds,
+                            )
+                            try:
+                                ttl = get_token_ttl_seconds()
+                            except Exception:
+                                ttl = 3600
+                            n_imports = await expire_fn(ttl)
                             if n_imports:
                                 self.logger.info(
                                     "Expired %d overdue charger_log_imports row(s)",

@@ -107,6 +107,30 @@ class TestUploadEndpoint:
         assert response.status_code == 404
         assert response.json()["detail"]["error_code"] == "CHARGER_LOG_UPLOAD_REJECTED"
 
+    def test_bad_token_rejected_before_streaming_body(self, client):
+        """Regression for Codex P2: the endpoint used to stream the
+        body before validating the token, letting an attacker waste
+        bandwidth with a bad token. The token shape/HMAC is now
+        checked first and a 401 returns without reading any chunks.
+        """
+        from src.api import main as main_module
+
+        called = {"received": False}
+
+        async def _should_not_be_called(*a, **k):
+            called["received"] = True
+            raise AssertionError("receive_upload reached with invalid token")
+
+        with patch.object(main_module, "db_pools", _StubPools(object())), patch(
+            "src.api.main.receive_upload", side_effect=_should_not_be_called
+        ):
+            response = client.post(
+                "/internal/charger_logs/upload?token=garbage.token.value",
+                content=b"x" * 1024,
+            )
+        assert response.status_code == 401
+        assert called["received"] is False
+
     def test_streaming_rejects_body_when_chunked_exceeds_cap(self, client, monkeypatch):
         """Regression for Codex P1: a client that uses chunked transfer
         encoding (no Content-Length) used to be able to force unbounded

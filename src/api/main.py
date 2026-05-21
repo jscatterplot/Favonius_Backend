@@ -8381,6 +8381,39 @@ async def receive_ocpp_event(
         return {"status": "error", "detail": str(e)}
 
 
+_CONTENT_DISPOSITION_FILENAME_RE = re.compile(
+    r'filename\s*=\s*"?(?P<name>[^";\r\n]+?)"?\s*(?:;|$)',
+    re.IGNORECASE,
+)
+
+
+def _extract_upload_filename(request: Request) -> Optional[str]:
+    """Return a sanitized client-supplied filename, or ``None``.
+
+    Prefers the explicit ``X-File-Name`` header; falls back to a
+    Content-Disposition ``filename=`` parameter only when one is
+    actually present. The previous implementation used
+    ``split("filename=")[-1]``, which returned the whole header value
+    when the parameter was absent — producing junk file names like
+    ``"attachment"`` that were stored verbatim in the DB.
+    """
+    raw = request.headers.get("X-File-Name")
+    if raw:
+        candidate = raw.strip()
+    else:
+        cd = request.headers.get("Content-Disposition", "")
+        match = _CONTENT_DISPOSITION_FILENAME_RE.search(cd) if cd else None
+        candidate = match.group("name").strip() if match else ""
+    if not candidate:
+        return None
+    # Strip directory parts and other noise; the DB column is plain text
+    # but operators read it, so keep it short and printable.
+    candidate = candidate.replace("\\", "/").split("/")[-1]
+    candidate = "".join(ch for ch in candidate if ch.isprintable() and ch not in '"\r\n\t')
+    candidate = candidate.strip(" \"';")
+    return candidate[:255] or None
+
+
 @app.post(
     "/internal/charger_logs/upload",
     include_in_schema=False,
@@ -8423,13 +8456,42 @@ async def upload_charger_log_endpoint(
 
     start = time.perf_counter()
 
+    # Validate the token *before* reading a single byte of the body so
+    # an attacker with a bad / expired token can't waste server
+    # bandwidth or memory streaming a payload that will be rejected
+    # anyway. The full token-hash check against
+    # ``charger_log_imports.upload_token_hash`` still runs inside
+    # ``receive_upload``; this is just the cheap pre-check.
+    from ..adapters.chargers.upload_token import (
+        UploadTokenError,
+        get_max_upload_bytes,
+        verify_token,
+    )
+
+    try:
+        verify_token(token)
+    except UploadTokenError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error_code": "CHARGER_LOG_UPLOAD_REJECTED",
+                "message": f"invalid token: {exc}",
+            },
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "CHARGER_LOG_UPLOAD_REJECTED",
+                "message": f"upload misconfigured: {exc}",
+            },
+        ) from exc
+
     # Stream the body with a hard byte ceiling so a missing /
     # understated ``Content-Length`` can't force unbounded buffering.
     # ``MaxBodySizeMiddleware`` already checks the header up-front, but
     # only when the client sends one — Starlette's ``request.body()``
     # otherwise concatenates chunked-transfer payloads of any size.
-    from ..adapters.chargers.upload_token import get_max_upload_bytes
-
     max_bytes = get_max_upload_bytes()
     body = bytearray()
     try:
@@ -8458,11 +8520,7 @@ async def upload_charger_log_endpoint(
         ) from exc
     body_bytes = bytes(body)
 
-    file_name = (
-        request.headers.get("X-File-Name")
-        or request.headers.get("Content-Disposition", "").split("filename=")[-1].strip('"; ')
-        or None
-    )
+    file_name = _extract_upload_filename(request)
 
     try:
         result = await receive_upload(
