@@ -8458,6 +8458,21 @@ async def upload_charger_log_endpoint(
         background_tasks=_background_tasks,
     )
 
+    status_url = None
+    if result.session_id is not None:
+        session_depot = await db_pools.ts.fetchval(
+            """
+            SELECT site_id::text
+              FROM charging_sessions
+             WHERE session_id = $1::uuid
+            """,
+            result.session_id,
+        )
+        if session_depot:
+            status_url = (
+                f"/admin/depots/{session_depot}/sessions/{result.session_id}/log_comparison"
+            )
+
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={
@@ -8465,11 +8480,7 @@ async def upload_charger_log_endpoint(
             "status": "received",
             "file_size_bytes": result.file_size_bytes,
             "content_sha256": result.content_sha256,
-            "status_url": (
-                f"/admin/depots/<depot_id>/sessions/{result.session_id}/log_comparison"
-                if result.session_id
-                else None
-            ),
+            "status_url": status_url,
         },
     )
 
@@ -9351,7 +9362,7 @@ async def get_session_log_comparison_endpoint(
             """
             SELECT session_id, station_id, connector_id, transaction_id,
                    vehicle_id, start_time, end_time, energy_delivered_kwh,
-                   cost_total, cost_total_source
+                   cost_total, cost_total_source, site_id
               FROM charging_sessions
              WHERE session_id = $1::uuid
             """,
@@ -9363,19 +9374,22 @@ async def get_session_log_comparison_endpoint(
                 detail={"error_code": "SESSION_NOT_FOUND", "message": "Session not found"},
             )
 
-        # Tenant fence: the session must belong to a charger in the
-        # caller's depot. favonius_admin bypasses (the resolve helper
-        # already audited the cross-org read).
+        # Tenant fence: the session must belong to the caller's depot.
+        # Prefer charging_sessions.site_id so decommissioned chargers
+        # (dropped from Supabase) don't deny access to retained history.
+        # favonius_admin bypasses (the resolve helper already audited).
         if get_user_role(user) != "favonius_admin":
-            owner = await db_pools.static.fetchval(
-                """
-                SELECT site_id::text
-                  FROM charging_stations
-                 WHERE station_id = $1
-                """,
-                session_row["station_id"],
-            )
-            if owner != depot_id:
+            owner = session_row["site_id"]
+            if owner is None:
+                owner = await db_pools.static.fetchval(
+                    """
+                    SELECT site_id::text
+                      FROM charging_stations
+                     WHERE station_id = $1
+                    """,
+                    session_row["station_id"],
+                )
+            if owner is None or str(owner) != depot_id:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={
