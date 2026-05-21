@@ -460,7 +460,7 @@ def _sql_functions_accessed(tool_calls: Any) -> list[str]:
             raw = tc.result.get("functions_used")
             if isinstance(raw, list):
                 names = [str(n) for n in raw]
-        if not names and isinstance(tc.arguments, dict):
+        if not names and tc.ok and isinstance(tc.arguments, dict):
             sql = tc.arguments.get("sql") or ""
             names = _AGENT_VIEWS_FN_RE.findall(str(sql))
         for fn in names:
@@ -544,7 +544,7 @@ async def _run_sql_general_turn(
         # before any tool dispatch in this turn) — falls through with
         # an empty list.
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
-        sql_tool_turns = len(partial_calls) or 1
+        sql_tool_turns = len(partial_calls)
         sql_attempts = 0
         server_row_total = 0
         for tc in partial_calls:
@@ -587,7 +587,10 @@ async def _run_sql_general_turn(
                 functions_accessed=partial_functions_accessed or None,
             )
         reply = AgentReply.error(run_id=run_id)
-        await agent_runs_close(ts_pool, run_id, "error", reply)
+        try:
+            await agent_runs_close(ts_pool, run_id, "error", reply)
+        except Exception:  # pragma: no cover - audit close is best-effort
+            logger.exception("Failed to close agent_run %s in error state", run_id)
         await _emit_answer_safe(sse, reply, run_id)
         return reply
     else:
