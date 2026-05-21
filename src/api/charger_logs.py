@@ -214,14 +214,18 @@ async def parse_and_persist_entries(
         entries = list(parser(bytes(row["raw_payload"])))
     except ChargerLogParseError as exc:
         await _mark_import_failed(ts_pool, import_id, f"parse_failed: {exc}")
-        CHARGER_LOG_IMPORTS.labels(vendor=row["vendor"], status="failed").inc()
+        CHARGER_LOG_IMPORTS.labels(
+            vendor=row["vendor"] or "unknown", status="failed"
+        ).inc()
         CHARGER_LOG_PARSE_FAILURES.labels(
             vendor=row["vendor"] or "unknown", reason="corrupt_archive"
         ).inc()
         return 0
     except Exception as exc:  # noqa: BLE001
         await _mark_import_failed(ts_pool, import_id, f"parser exception: {exc}")
-        CHARGER_LOG_IMPORTS.labels(vendor=row["vendor"], status="failed").inc()
+        CHARGER_LOG_IMPORTS.labels(
+            vendor=row["vendor"] or "unknown", status="failed"
+        ).inc()
         CHARGER_LOG_PARSE_FAILURES.labels(
             vendor=row["vendor"] or "unknown", reason="parse_exception"
         ).inc()
@@ -242,7 +246,9 @@ async def parse_and_persist_entries(
                 """,
                 import_id,
             )
-        CHARGER_LOG_IMPORTS.labels(vendor=row["vendor"], status="parsed").inc()
+        CHARGER_LOG_IMPORTS.labels(
+            vendor=row["vendor"] or "unknown", status="parsed"
+        ).inc()
         CHARGER_LOG_PARSE_FAILURES.labels(
             vendor=row["vendor"] or "unknown", reason="no_entries"
         ).inc()
@@ -292,7 +298,7 @@ async def parse_and_persist_entries(
                 import_id,
             )
 
-    CHARGER_LOG_IMPORTS.labels(vendor=row["vendor"], status="parsed").inc()
+    CHARGER_LOG_IMPORTS.labels(vendor=row["vendor"] or "unknown", status="parsed").inc()
     logger.info(
         "Parsed %d entries for import=%s vendor=%s",
         len(entries),

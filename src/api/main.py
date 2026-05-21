@@ -9455,8 +9455,8 @@ async def get_session_log_comparison_endpoint(
                 if session_row["vehicle_id"] is not None
                 else None
             ),
-            "start_time": session_row["start_time"],
-            "end_time": session_row["end_time"],
+            "start_time": _isoformat(session_row["start_time"]),
+            "end_time": _isoformat(session_row["end_time"]),
             "energy_delivered_kwh": (
                 float(session_row["energy_delivered_kwh"])
                 if session_row["energy_delivered_kwh"] is not None
@@ -9475,15 +9475,15 @@ async def get_session_log_comparison_endpoint(
             "file_name": import_row["file_name"],
             "file_size_bytes": import_row["file_size_bytes"],
             "content_sha256": import_row["content_sha256"],
-            "requested_at": import_row["requested_at"],
-            "received_at": import_row["received_at"],
-            "parsed_at": import_row["parsed_at"],
-            "reconciled_at": import_row["reconciled_at"],
+            "requested_at": _isoformat(import_row["requested_at"]),
+            "received_at": _isoformat(import_row["received_at"]),
+            "parsed_at": _isoformat(import_row["parsed_at"]),
+            "reconciled_at": _isoformat(import_row["reconciled_at"]),
             "error_message": import_row["error_message"],
         },
         "charger_entries": [
             {
-                "time": e["time"],
+                "time": _isoformat(e["time"]),
                 "connector_id": e["connector_id"],
                 "transaction_id": e["transaction_id"],
                 "soc": e["soc"],
@@ -9495,17 +9495,17 @@ async def get_session_log_comparison_endpoint(
         ],
         "reconciliation": (
             {
-                "computed_at": reconciliation["computed_at"],
+                "computed_at": _isoformat(reconciliation["computed_at"]),
                 "source": reconciliation["source"],
                 "our_energy_kwh": reconciliation["our_energy_kwh"],
                 "charger_energy_kwh": reconciliation["charger_energy_kwh"],
                 "energy_delta_pct": reconciliation["energy_delta_pct"],
                 "our_duration_s": reconciliation["our_duration_s"],
                 "charger_duration_s": reconciliation["charger_duration_s"],
-                "our_start_time": reconciliation["our_start_time"],
-                "charger_start_time": reconciliation["charger_start_time"],
-                "our_end_time": reconciliation["our_end_time"],
-                "charger_end_time": reconciliation["charger_end_time"],
+                "our_start_time": _isoformat(reconciliation["our_start_time"]),
+                "charger_start_time": _isoformat(reconciliation["charger_start_time"]),
+                "our_end_time": _isoformat(reconciliation["our_end_time"]),
+                "charger_end_time": _isoformat(reconciliation["charger_end_time"]),
                 "notes": reconciliation["notes"],
             }
             if reconciliation is not None
