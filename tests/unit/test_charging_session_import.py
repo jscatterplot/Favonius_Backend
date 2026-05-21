@@ -21,6 +21,7 @@ from src.api.main import (
     _compute_import_row_hash,
     _platform_import_hash_token,
     _parse_import_local_timestamp,
+    _resolve_import_end_time,
     HistoricalSessionImport,
     app,
     get_price_source,
@@ -313,6 +314,189 @@ class TestPureHelpers:
         token_a = _platform_import_hash_token(request_a, end_time_utc=end_time)
         token_b = _platform_import_hash_token(request_b, end_time_utc=end_time)
         assert token_a != token_b
+
+
+# --------------------------------------------------------------------------- #
+# _resolve_import_end_time — duration-aware end picker
+# --------------------------------------------------------------------------- #
+
+
+class TestResolveImportEndTime:
+    """Pin the decision table from `_resolve_import_end_time`.
+
+    Motivated by the HRX bug: the XLSX `end_time` column held absurd values
+    (Dec 2026 etc.) while the duration column was trustworthy. The resolver
+    prefers `start + duration` whenever the two disagree or the file end is
+    insane, and refuses to silently persist far-future / multi-week ends.
+    """
+
+    from datetime import datetime, timedelta, timezone  # noqa: E402
+
+    def _utc(self, *args, **kwargs):
+        from datetime import datetime, timezone
+
+        return datetime(*args, tzinfo=timezone.utc, **kwargs)
+
+    def test_returns_none_when_both_missing(self):
+        start = self._utc(2026, 5, 5, 12, 0)
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=None,
+            duration_seconds=None,
+            now=self._utc(2026, 5, 21, 0, 0),
+        )
+        assert result is None
+
+    def test_duration_only_returns_computed_end(self):
+        start = self._utc(2026, 5, 5, 12, 0)
+        # 2 hours = 7200s
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=None,
+            duration_seconds=7200,
+            now=self._utc(2026, 5, 21, 0, 0),
+        )
+        assert result == self._utc(2026, 5, 5, 14, 0)
+
+    def test_vilnius_session_with_duration_only(self):
+        """Duration of 90 minutes on a 12:56 Vilnius start yields 14:26 local
+        (11:26 UTC). This is the path the new FE field exercises."""
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        start_utc = _parse_import_local_timestamp(
+            "2026-05-05 12:56", ZoneInfo("Europe/Vilnius"), field="start_time_local"
+        )
+        result = _resolve_import_end_time(
+            start_time_utc=start_utc,
+            end_time_utc=None,
+            duration_seconds=90 * 60,
+            now=datetime(2026, 5, 21, tzinfo=timezone.utc),
+        )
+        # 12:56 + 1:30 = 14:26 Vilnius (UTC+3 in May DST) -> 11:26 UTC.
+        assert result == datetime(2026, 5, 5, 11, 26, tzinfo=timezone.utc)
+
+    def test_file_end_only_sane_passes_through(self):
+        start = self._utc(2026, 5, 5, 12, 0)
+        sane_end = self._utc(2026, 5, 5, 14, 0)
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=sane_end,
+            duration_seconds=None,
+            now=self._utc(2026, 5, 21, 0, 0),
+        )
+        assert result == sane_end
+
+    def test_file_end_only_far_future_rejected(self):
+        start = self._utc(2026, 5, 5, 12, 0)
+        bad_end = self._utc(2026, 12, 31, 12, 0)  # 7 months later
+        with pytest.raises(HTTPException) as exc:
+            _resolve_import_end_time(
+                start_time_utc=start,
+                end_time_utc=bad_end,
+                duration_seconds=None,
+                now=self._utc(2026, 5, 21, 0, 0),
+            )
+        assert exc.value.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert exc.value.detail["error_code"] == "INVALID_TIMESTAMP"
+        assert exc.value.detail["field"] == "end_time_local"
+
+    def test_file_end_only_before_start_rejected(self):
+        start = self._utc(2026, 5, 5, 12, 0)
+        with pytest.raises(HTTPException) as exc:
+            _resolve_import_end_time(
+                start_time_utc=start,
+                end_time_utc=self._utc(2026, 5, 5, 9, 0),
+                duration_seconds=None,
+                now=self._utc(2026, 5, 21, 0, 0),
+            )
+        assert exc.value.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert exc.value.detail["error_code"] == "INVALID_TIMESTAMP"
+
+    def test_file_end_only_span_over_seven_days_rejected(self):
+        start = self._utc(2026, 5, 5, 12, 0)
+        bad_end = self._utc(2026, 5, 13, 13, 0)  # 8 days
+        with pytest.raises(HTTPException):
+            _resolve_import_end_time(
+                start_time_utc=start,
+                end_time_utc=bad_end,
+                duration_seconds=None,
+                now=self._utc(2026, 5, 21, 0, 0),
+            )
+
+    def test_bad_file_end_with_good_duration_uses_computed(self):
+        """The HRX scenario: file end is Dec 2026 but duration is 90 minutes."""
+        start = self._utc(2026, 5, 5, 12, 0)
+        bad_end = self._utc(2026, 12, 31, 12, 0)
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=bad_end,
+            duration_seconds=90 * 60,
+            now=self._utc(2026, 5, 21, 0, 0),
+        )
+        assert result == self._utc(2026, 5, 5, 13, 30)
+
+    def test_file_end_and_duration_agree_within_tolerance_uses_file(self):
+        """Both sane and consistent — file end wins (it's what the user typed)."""
+        start = self._utc(2026, 5, 5, 12, 0)
+        file_end = self._utc(2026, 5, 5, 14, 5)
+        # duration says 14:00 → drift = 5 min, within 15-min tolerance.
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=file_end,
+            duration_seconds=2 * 3600,
+            now=self._utc(2026, 5, 21, 0, 0),
+        )
+        assert result == file_end
+
+    def test_file_end_and_duration_disagree_beyond_tolerance_uses_computed(self):
+        """File end sane, duration sane, but they disagree by hours — duration wins."""
+        start = self._utc(2026, 5, 5, 12, 0)
+        file_end = self._utc(2026, 5, 5, 20, 0)  # +8h
+        duration = 30 * 60  # +30 min
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=file_end,
+            duration_seconds=duration,
+            now=self._utc(2026, 5, 21, 0, 0),
+        )
+        assert result == self._utc(2026, 5, 5, 12, 30)
+
+    def test_zero_duration_treated_as_missing(self):
+        """0 seconds is meaningless — fall back to file end / NULL path."""
+        start = self._utc(2026, 5, 5, 12, 0)
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=None,
+            duration_seconds=0,
+            now=self._utc(2026, 5, 21, 0, 0),
+        )
+        assert result is None
+
+    def test_duration_only_far_future_rejected(self):
+        """Even with no file end, an absurd duration is rejected."""
+        start = self._utc(2026, 5, 5, 12, 0)
+        with pytest.raises(HTTPException) as exc:
+            _resolve_import_end_time(
+                start_time_utc=start,
+                end_time_utc=None,
+                duration_seconds=30 * 86400,  # 30 days
+                now=self._utc(2026, 5, 21, 0, 0),
+            )
+        assert exc.value.detail["field"] == "session_duration_seconds"
+
+    def test_file_end_inside_future_skew_accepted(self):
+        """A 30-min clock skew between server now and customer file is tolerated."""
+        start = self._utc(2026, 5, 21, 11, 30)
+        end_slightly_future = self._utc(2026, 5, 21, 12, 30)
+        now = self._utc(2026, 5, 21, 12, 0)
+        result = _resolve_import_end_time(
+            start_time_utc=start,
+            end_time_utc=end_slightly_future,
+            duration_seconds=None,
+            now=now,
+        )
+        assert result == end_slightly_future
 
 
 # --------------------------------------------------------------------------- #
@@ -1175,3 +1359,173 @@ class TestHistoricalChargingSessionImport:
             id_tag="platform-start",
         )
         assert bind[11] == expected_hash
+
+    # ---------------------------------------------------------------------- #
+    # session_duration_seconds — XLSX duration column path
+    # ---------------------------------------------------------------------- #
+
+    def test_duration_only_row_inserts_with_computed_end(self, client, mock_db_pool):
+        """No end_time_local + duration → end_time = start + duration (UTC)."""
+        from datetime import datetime, timezone
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+            session_id=session_id,
+            org_id=org_id,
+        )
+
+        payload = _row_payload()
+        payload["end_time_local"] = None
+        payload["session_duration_seconds"] = 90 * 60  # 1h30m
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        bind = _upsert_bind(conn)
+        # 12:56 Vilnius (UTC+3 DST) -> 09:56 UTC; +90 min -> 11:26 UTC.
+        assert bind[6] == datetime(2026, 5, 5, 11, 26, tzinfo=timezone.utc)
+
+    def test_bad_file_end_with_duration_uses_computed_end(self, client, mock_db_pool):
+        """The HRX bug: file end is Dec 2026 but duration is 90 min.
+
+        Pre-fix this row landed with end_time = Dec 2026; cost backfill then
+        tried to pull 7 months of ENTSO-E prices and gave up. After the fix
+        the resolver discards the file end and uses start + duration.
+        """
+        from datetime import datetime, timezone
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+            session_id=session_id,
+            org_id=org_id,
+        )
+
+        payload = _row_payload(
+            start_time_local="2026-05-05 12:56",
+            end_time_local="2026-12-31 23:59",  # broken column
+        )
+        payload["session_duration_seconds"] = 90 * 60
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=payload,
+            )
+
+        assert response.status_code == http_status.HTTP_201_CREATED
+        bind = _upsert_bind(conn)
+        # The bad file end was rejected in favour of start+duration.
+        assert bind[6] == datetime(2026, 5, 5, 11, 26, tzinfo=timezone.utc)
+
+    def test_bad_file_end_without_duration_returns_400(self, client, mock_db_pool):
+        """Without duration the bad file end has no corroborating source — reject."""
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+            org_id=org_id,
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json=_row_payload(
+                    start_time_local="2026-05-05 12:56",
+                    end_time_local="2026-12-31 23:59",
+                ),
+            )
+
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        body = response.json()
+        assert body["error_code"] == "INVALID_TIMESTAMP"
+        assert not _upsert_was_called(conn)
+
+    def test_negative_duration_rejected_by_pydantic(self, client, mock_db_pool):
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+        pool, _ = mock_db_pool
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            response = client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json={**_row_payload(), "session_duration_seconds": -1},
+            )
+
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+        assert response.json()["error_code"] == "VALIDATION_ERROR"
+
+    def test_import_row_hash_unaffected_by_duration_field(self, client, mock_db_pool):
+        """Adding `session_duration_seconds` MUST NOT change the dedup hash —
+        otherwise re-imports of the same file would dual-write rows."""
+        from datetime import datetime, timezone
+
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        session_id = str(uuid4())
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        pool, conn = self._setup(
+            mock_db_pool,
+            depot_row=_depot_row("Europe/Vilnius"),
+            vehicle_row=None,
+            card_row=None,
+            session_id=session_id,
+            org_id=org_id,
+        )
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main.verify_depot_access", new_callable=AsyncMock
+        ):
+            client.post(
+                f"/admin/depots/{depot_id}/charging-sessions/import",
+                headers=AUTH_HDR,
+                json={**_row_payload(), "session_duration_seconds": 7200},
+            )
+
+        bind = _upsert_bind(conn)
+        # bind[11] is the import_row_hash. It must match the canonical hash
+        # built from (depot, start_time_utc, id_tag) ONLY — never duration.
+        expected = _compute_import_row_hash(
+            depot_id=depot_id,
+            start_time_utc=datetime(2026, 5, 5, 9, 56, tzinfo=timezone.utc),
+            id_tag="ED8503",
+        )
+        assert bind[11] == expected
