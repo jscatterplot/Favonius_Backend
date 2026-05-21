@@ -25,14 +25,6 @@ EXCEPTION
         NULL;
 END $$;
 
--- Runtime role membership: app login role must be able to SET ROLE.
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'favonius') THEN
-        GRANT agent_reader_static TO favonius;
-    END IF;
-END $$;
-
 REVOKE ALL ON SCHEMA public            FROM agent_reader_static;
 REVOKE ALL ON SCHEMA pg_catalog        FROM agent_reader_static;
 REVOKE ALL ON SCHEMA information_schema FROM agent_reader_static;
@@ -40,18 +32,30 @@ REVOKE ALL ON SCHEMA information_schema FROM agent_reader_static;
 CREATE SCHEMA IF NOT EXISTS agent_views;
 GRANT  USAGE  ON SCHEMA agent_views TO agent_reader_static;
 
--- Grant the runtime login role membership in agent_reader_static so
--- the executor's `SET LOCAL ROLE agent_reader_static` succeeds. See
--- migrations/042_agent_views_ts.sql for the full rationale. Idempotent.
+-- Grant runtime login-role(s) membership in agent_reader_static so
+-- executor `SET LOCAL ROLE agent_reader_static` succeeds regardless of
+-- whether DATABASE_URL points at a direct login user or a pooler user.
+-- We attempt both current_user and session_user (deduplicated), then warn
+-- if grants are blocked by privileges. Idempotent.
 DO $grant$
+DECLARE
+    grant_role text;
 BEGIN
-    EXECUTE format('GRANT agent_reader_static TO %I', current_user);
-EXCEPTION
-    WHEN insufficient_privilege THEN
-        RAISE WARNING
-            'Could not GRANT agent_reader_static TO %: '
-            'manual grant required for SQL agent mode to function.',
-            current_user;
+    FOR grant_role IN
+        SELECT DISTINCT rolname
+        FROM (VALUES (current_user), (session_user)) AS r(rolname)
+        WHERE rolname IS NOT NULL
+    LOOP
+        BEGIN
+            EXECUTE format('GRANT agent_reader_static TO %I', grant_role);
+        EXCEPTION
+            WHEN insufficient_privilege THEN
+                RAISE WARNING
+                    'Could not GRANT agent_reader_static TO %: '
+                    'manual grant required for SQL agent mode to function.',
+                    grant_role;
+        END;
+    END LOOP;
 END
 $grant$;
 
