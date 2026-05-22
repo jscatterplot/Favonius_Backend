@@ -45,6 +45,12 @@ class PlannerDecision:
 # lowercased; matched against a lowercased user message.
 _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bhow much (did|has) .+ (charg(?:e|ed|ing)|consum(?:e|ed|ing)|used)\b"),
+    # Same shape with a quantity word between `how much` and `did/has`,
+    # e.g. "how much energy did vehicle X consume last month".
+    re.compile(
+        r"\bhow much (?:energy|electricity|power|kwh|kilowatt-?hours?) "
+        r"(?:did|has) .+ (?:charg(?:e|ed|ing)|consum(?:e|ed|ing)|used)\b"
+    ),
     re.compile(r"\bconsumption (of|for|by) \S+"),
     re.compile(r"\benergy (used|consumed) by \S+"),
     re.compile(r"\bhow many kwh did \S+ "),

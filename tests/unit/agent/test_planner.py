@@ -7,10 +7,10 @@ from uuid import UUID
 import pytest
 
 from src.api.agent.planner import (
+    PlannerDecision,
     _sql_org_allowlist_tokens,
     classify,
     is_sql_mode_enabled,
-    PlannerDecision,
 )
 
 ORG_A = UUID("11111111-1111-1111-1111-111111111111")
@@ -117,3 +117,72 @@ def test_planner_decision_is_frozen():
     d = PlannerDecision(route="sql_general", reason="x")
     with pytest.raises(Exception):
         d.route = "refuse"  # type: ignore[misc]
+
+
+# ── S1 routing gate for the 20-question SQL-mode eval suite ──────────────
+#
+# Source: PLAN.md §"The 20 questions". One assertion per question, so
+# any future change to _CONSUMPTION_TRIGGERS / _CONSUMPTION_ANTIPATTERNS
+# that re-routes one of these surfaces immediately. SQL mode is forced
+# ON because the eval suite assumes it (PLAN.md S0 sets
+# AGENT_SQL_MODE_ENABLED=true in dev).
+EVAL_QUESTIONS_ROUTING: tuple[tuple[str, str, str], ...] = (
+    # (id, question, expected_route)
+    # Energy + cost rollups (7)
+    ("en_01", "How much energy did vehicle bus_101 consume last month?", "consumption_by_user"),
+    ("en_02", "What was the total electricity cost at depot Vilnius last week?", "sql_general"),
+    ("en_03", "Which depot had the highest energy consumption in April 2026?", "sql_general"),
+    ("en_04", "How many kWh did driver John Smith use this month?", "consumption_by_user"),
+    ("en_05", "Show me the top 5 vehicles by total cost in the last 30 days.", "sql_general"),
+    (
+        "en_06",
+        "What's the average energy per charging session at depot Vilnius this month?",
+        "sql_general",
+    ),
+    ("en_07", "Did any session this week cost more than €100?", "sql_general"),
+    # Operations status (7)
+    ("op_08", "Which chargers were faulted yesterday?", "sql_general"),
+    ("op_09", "How many optimization runs went infeasible last week?", "sql_general"),
+    ("op_10", "What triggered the last 5 reoptimizations at depot Vilnius?", "sql_general"),
+    ("op_11", "Which alerts are still active right now?", "sql_general"),
+    ("op_12", "Show me chargers that have been unavailable for more than 24 hours.", "sql_general"),
+    (
+        "op_13",
+        "How many charging sessions did we have yesterday, total and per depot?",
+        "sql_general",
+    ),
+    ("op_14", "Are any depots running in degraded optimization mode?", "sql_general"),
+    # Pricing & market context (6)
+    ("pr_15", "What were the 5 highest electricity prices last week?", "sql_general"),
+    ("pr_16", "How many times did a price spike trigger reoptimization last month?", "sql_general"),
+    (
+        "pr_17",
+        "What was the average price during morning peak (07–09 local) last week?",
+        "sql_general",
+    ),
+    ("pr_18", "Compare today's day-ahead prices vs last Friday's at depot Vilnius.", "sql_general"),
+    ("pr_19", "Did the electricity price ever go negative in April?", "sql_general"),
+    ("pr_20", "When was the most expensive hour in the past 7 days?", "sql_general"),
+)
+
+
+@pytest.mark.parametrize(
+    "qid,question,expected_route",
+    EVAL_QUESTIONS_ROUTING,
+    ids=[q[0] for q in EVAL_QUESTIONS_ROUTING],
+)
+def test_eval_suite_question_routing(monkeypatch, qid, question, expected_route):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    decision = classify(question, organization_id=ORG_A)
+    assert decision.route == expected_route, (
+        f"{qid}: {question!r} routed to {decision.route!r} "
+        f"(reason={decision.reason!r}), expected {expected_route!r}"
+    )
+
+
+def test_eval_suite_covers_all_20_questions():
+    """Guard against accidental row deletion / dedup in the parametrize."""
+    assert len(EVAL_QUESTIONS_ROUTING) == 20
+    ids = [q[0] for q in EVAL_QUESTIONS_ROUTING]
+    assert len(set(ids)) == 20, f"duplicate ids: {ids}"
