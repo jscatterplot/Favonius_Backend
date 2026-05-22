@@ -143,6 +143,7 @@ Favonius_Backend/
 │   │   │   └── charging_point_resolver.py
 │   │   ├── caiso/               # CAISO price ingestion (deprecated — Europe-only feeder; module retained as dead code, see follow-up)
 │   │   ├── entsoe/              # ENTSO-E European price ingestion
+│   │   ├── kempower/            # Kempower ChargEye one-shot inventory + history import (scripts/onboard_depot_from_kempower.py)
 │   │   ├── weather/             # OpenMeteo weather adapter
 │   │   └── handoff/
 │   │       └── manager.py       # Inter-depot vehicle handoff manager
@@ -295,6 +296,10 @@ Migration 042 adds the three tables and extends `charging_command_queue.command_
 Price lookup goes through `src/db/queries.py::fetch_or_pull_prices_by_zone` — a read-through cache around `electricity_prices` (keyed by ENTSO-E `node_id`, EUR/MWh stored, EUR/kWh returned). On cache miss the helper calls `ENTSOEAdapter.get_day_ahead_prices(zone, start, end)` directly against the Transparency Platform API, persists the result back to `electricity_prices`, and re-reads through the standard forward-fill path. This is what keeps billing working when the WS handler's price feeder is misconfigured or hasn't populated the table yet. Requires `EUROPEAN_ELECTRICITY_API`; without it the helper returns whatever the cache has (possibly empty) and the calculator lands `'unpriceable'`. Each call site resolves the bidding zone for a depot via `src/db/queries.py::resolve_bidding_zone(static_pool, site_id)` once, with a cascade: `sites.tariff_config['entsoe_zone']` → `get_bidding_zone(sites.timezone)` → `None`. Callers (cost calculator + `StateAssembler._get_prices`) inject the resolved zone; the calculator returns `'unpriceable'` and the optimizer falls back to $0.15/kWh when no zone resolves. The legacy `prices` table (per-depot tariff) is unused on the current ENTSO-E deployment — `ENTSOEAdapter.store_prices_to_db` and `_get_cached_prices` write/read `electricity_prices` keyed by bidding zone too, so all ENTSO-E ingestion paths (this adapter + the WS-handler feeder + the read-through cache) land in one canonical hypertable.
 
 The OCPP close path (`TimescaleClient.close_open_session`, `recover_orphaned_sessions`) schedules the calc as a post-commit `asyncio.create_task`; if it fails, the row stays NULL and `scripts/backfill_session_cost.py` sweeps it on the next run (predicate `WHERE cost_total IS NULL OR cost_total = 0`). The backfill script takes two URLs (`--database-url` for TimescaleDB, `--static-database-url` for Supabase; fall through to `DATABASE_URL` / `STATIC_DATABASE_URL` / `SUPABASE_DB_URL` env). It builds a `{site_id → zone}` cache at startup so the resolver hits Supabase once per depot, not per row. Chunked (default 500 rows) with `SELECT FOR UPDATE SKIP LOCKED` and is safely re-runnable. Metrics: `favonius_session_cost_computed_total{source}`, `favonius_session_cost_compute_failures_total{reason}`, `favonius_session_cost_duration_seconds`.
+
+### Kempower ChargEye onboarding (`src/adapters/kempower/` + `scripts/onboard_depot_from_kempower.py`)
+
+Two-step onboarding for Kempower customers. The operator first creates the Favonius depot via the existing `POST /admin/depots` flow (so commercial/regulatory context — utility, tariff, currency, timezone, building-load source, stationary battery — is set correctly by the human who actually knows it). Then `python scripts/onboard_depot_from_kempower.py --depot-id <uuid> --kempower-location-id <kempower_loc> --backfill-since <date> --execute` attaches Kempower's inventory and history to that depot: chargers (dedup on `(site_id, station_id)`), vehicles (dedup on `(site_id, external_id)` with `kempower:<vehicleId>` namespacing to avoid global-UNIQUE collisions across tenants), all-to-all `charger_vehicle_access`, and historical `charging_sessions` rows with `source='import'` matching migration 030's `import_row_hash` contract (`sha256(depot_id|start_time_utc|id_tag)`). Idempotent across days — re-running adds zero new rows when nothing has changed in Kempower. The adapter (`KempowerClient`) is a small httpx wrapper with JWT bearer auth (cached, refreshed on 401 or T-5min expiry), pagination, 429 back-off, and 5xx retry; mappers in `mapping.py` produce locally-validated Pydantic payloads (mirrors of `ChargerCreateRequest` / `VehicleIdentityBase` — duplicated rather than imported so the CLI stays standalone). The script bypasses `next_charger_ocpp_id` and uses the Kempower `stationId` verbatim so the physical charger keeps its existing identity when OCPP is later cut over to Favonius. Per-charger Basic Auth credentials are minted once and emitted to stderr; rotate via `POST /admin/depots/{id}/chargers/{cid}/rotate_credentials`. Non-CCS connectors are skipped per-station with a warning (PRD §3.2 MVP constraint). `--dry-run` (the default) plans the writes; `--execute` commits. `--apply-site-suggestions` adds an interactive per-field PATCH against the depot row from Kempower's Location + root Power Group data (name, address, lat/lng, max_grid_kw) — read-only diff without the flag. Env vars: `KEMPOWER_API_BASE_URL`, `KEMPOWER_USERNAME`, `KEMPOWER_PASSWORD`. **No new migrations** — the existing `charging_stations.station_id` UNIQUE, `vehicles.external_id` UNIQUE, and `charging_sessions_import_dedup_idx` (migration 030) carry the dedup load.
 
 ### Optimization Control Loop
 
@@ -854,6 +859,14 @@ test(api): add coverage for handoff rate limiting
 | `CHARGER_LOG_UPLOAD_SIGNING_KEY` | — | HMAC secret for signing per-import upload tokens. Rotating invalidates every in-flight URL. |
 | `CHARGER_LOG_UPLOAD_TOKEN_TTL_S` | `3600` | Upload-token lifetime, seconds. Floor of 60 s. |
 | `CHARGER_LOG_UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | Per-upload size cap. `MaxBodySizeMiddleware` reads this for the upload path so the global 1 MiB cap doesn't apply. |
+
+### Kempower ChargEye onboarding
+Consumed only by `scripts/onboard_depot_from_kempower.py` — the running API does not call ChargEye.
+| Variable | Default | Description |
+|---|---|---|
+| `KEMPOWER_API_BASE_URL` | `https://api.chargeye.com` | ChargEye REST API base URL. Override for sandbox / on-prem deployments. |
+| `KEMPOWER_USERNAME` | — | ChargEye account login. The CLI exchanges this + password for a JWT cached for the documented 8 h TTL. |
+| `KEMPOWER_PASSWORD` | — | ChargEye account password. Runtime-only secret (never bake into a Docker build arg). If absent and a username is set, the CLI prompts on stdin. |
 
 ### Alerts pipeline (notifications)
 The pipeline has shipped; the implementation in `src/api/main.py` (alert endpoints, Resend webhook), `src/websocket_handler/` (AlertDispatcher), and migration 022 is the source of truth. The PR-era design plan has been retired.
