@@ -621,8 +621,9 @@ def test_cancel_with_bad_date_returns_400(client, world):
             json={},
         )
     assert r.status_code == 400
-    detail = r.json()["detail"]
-    assert detail["error_code"] == "VALIDATION_ERROR"
+    payload = r.json()
+    assert payload["error_code"] == "VALIDATION_ERROR"
+    assert "occurrence_date" in payload["field_errors"]
 
 
 # --------------------------------------------------------------------------- #

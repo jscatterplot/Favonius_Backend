@@ -5362,24 +5362,12 @@ async def resume_recurring_schedule_template(
     )
 
 
-def _parse_occurrence_date(value: str) -> date:
-    """Parse a path param ``YYYY-MM-DD``; raise HTTPException 400 otherwise."""
+def _parse_occurrence_date(value: str) -> date | JSONResponse:
+    """Parse a path param ``YYYY-MM-DD``; return 400 JSONResponse on failure."""
     try:
         return date.fromisoformat(value)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "detail": "Validation failed",
-                "error_code": "VALIDATION_ERROR",
-                "field_errors": {
-                    "occurrence_date": ["must be YYYY-MM-DD"]
-                },
-                "validation_errors": [
-                    {"path": "occurrence_date", "message": "must be YYYY-MM-DD"}
-                ],
-            },
-        )
+        return _recurring_validation_400("occurrence_date", "must be YYYY-MM-DD")
 
 
 @app.post(
@@ -5399,6 +5387,8 @@ async def cancel_recurring_occurrence(
     await _assert_recurring_depot_access(depot_id, user)
     validate_uuid(template_id, "template_id")
     parsed_date = _parse_occurrence_date(occurrence_date)
+    if isinstance(parsed_date, JSONResponse):
+        return parsed_date
     payload_obj = payload or OccurrenceCancellationRequest()
 
     depot_uuid = UUID(depot_id)
@@ -5454,6 +5444,8 @@ async def uncancel_recurring_occurrence(
     await _assert_recurring_depot_access(depot_id, user)
     validate_uuid(template_id, "template_id")
     parsed_date = _parse_occurrence_date(occurrence_date)
+    if isinstance(parsed_date, JSONResponse):
+        return parsed_date
 
     depot_uuid = UUID(depot_id)
     template_uuid = UUID(template_id)
