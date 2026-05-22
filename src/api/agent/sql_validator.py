@@ -84,6 +84,7 @@ HYPERTABLE_TIME_COLUMNS: frozenset[str] = frozenset({"hour"})
 # Forbidden schemas — anything resolving here is an instant reject.
 FORBIDDEN_SCHEMAS: frozenset[str] = frozenset(
     {
+        "public",
         "pg_catalog",
         "pg_temp",
         "pg_toast",

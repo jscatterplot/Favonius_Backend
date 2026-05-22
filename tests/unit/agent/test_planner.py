@@ -108,6 +108,7 @@ def test_whitespace_only_refused(monkeypatch):
 def test_sql_mode_truthy_values(monkeypatch):
     for v in ("1", "true", "TRUE", "yes", "on"):
         monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", v)
+        is_sql_mode_enabled.cache_clear()
         d = classify("List all chargers", organization_id=ORG_A)
         assert d.route == "sql_general", f"value {v!r} should enable SQL mode"
 
