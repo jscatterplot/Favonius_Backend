@@ -685,10 +685,62 @@ async def test_ensure_tenant_mirrored_runs_repair_before_mirror(
 
     user = _orphaned_user(sub)
     returned = await tm.ensure_tenant_mirrored(user)
-    assert returned is user  # dependency returns the verified token unchanged
-    assert len(_record_admin_calls) == 1
-    # Mirror still skips because the in-flight token wasn't mutated.
-    assert pool.conn.executes == []
+    assert returned is user  # same dict object is returned
+    assert len(_record_admin_calls) == 1  # Supabase was patched
+    # Mirror runs on the now-corrected claims: org UPSERT + membership UPSERT.
+    assert len(pool.conn.executes) == 2
+
+
+# ============ repair — in-place user dict mutation ============
+
+
+@pytest.mark.asyncio
+async def test_repair_patches_user_dict_in_place_case_a(_supabase_env, _record_admin_calls):
+    """Case A: after repair the in-flight user dict carries the derived claims so
+    the current request's auth check sees the corrected role immediately."""
+    sub = "d24f55e8-2ee1-4d09-88a6-0811bdb3411b"
+    org_id = "d1288ddc-c696-4a94-b70b-7368f674580b"
+    pool = _FetchablePool([{"organization_id": org_id, "role": "owner", "name": "HRX, UAB"}])
+    user = _orphaned_user(sub)
+
+    await tm.repair_user_tenant_metadata(user, pool)
+
+    assert user["app_metadata"]["favonius_role"] == "customer_admin"
+    assert user["app_metadata"]["organization_id"] == org_id
+    assert user["app_metadata"]["organization_name"] == "HRX, UAB"
+
+
+@pytest.mark.asyncio
+async def test_repair_patches_user_dict_in_place_case_b(_supabase_env, _record_admin_calls):
+    """Case B: after repair favonius_role is written to the user dict without
+    overwriting organization_id (which was already correct)."""
+    sub = "11111111-1111-4111-8111-111111111111"
+    org_id = "22222222-2222-4222-8222-222222222222"
+    pool = _FetchablePool([{"role": "owner", "name": "HRX, UAB"}])
+    user = _user_with_org_no_role(sub, org_id)
+
+    await tm.repair_user_tenant_metadata(user, pool)
+
+    assert user["app_metadata"]["favonius_role"] == "customer_admin"
+    assert user["app_metadata"]["organization_id"] == org_id  # untouched
+
+
+@pytest.mark.asyncio
+async def test_repair_does_not_mutate_user_dict_on_api_failure(_supabase_env, monkeypatch):
+    """If the Supabase admin API call fails the user dict must NOT be mutated —
+    a 403 is better than silently granting a role that wasn't persisted."""
+    async def _fail(**_kwargs):
+        raise RuntimeError("admin API down")
+
+    monkeypatch.setattr(tm, "_patch_supabase_app_metadata", _fail)
+    sub = "11111111-1111-4111-8111-111111111111"
+    pool = _FetchablePool([{"organization_id": "y", "role": "owner", "name": "Y"}])
+    user = _orphaned_user(sub)
+    original_meta = dict(user["app_metadata"])
+
+    await tm.repair_user_tenant_metadata(user, pool)
+
+    assert user["app_metadata"] == original_meta
 
 
 # ============ _fetch_single_user_org_membership ============
