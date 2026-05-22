@@ -321,6 +321,23 @@ _SENTINEL_FOR_TEST = object()
 class TestGetSchedules:
     """Test _get_schedules method."""
 
+    @staticmethod
+    def _dispatch_schedule_fetch(manual_rows: list[dict]):
+        """Return a ``conn.fetch`` side_effect that routes manual vs recurring queries.
+
+        Post-PR #119 ``_get_schedules`` issues a second SELECT against
+        ``recurring_schedule_template``; return an empty list for that
+        query so the legacy manual-only test fixtures still pass through
+        the merge unchanged.
+        """
+        async def _fetch(query: str, *args, **kwargs):
+            if "FROM schedules s" in query:
+                return manual_rows
+            if "FROM recurring_schedule_template" in query:
+                return []
+            return []
+        return _fetch
+
     @pytest.mark.asyncio
     async def test_get_schedules_single(self, assembler, mock_db_pool):
         """Test retrieving single schedule."""
@@ -334,8 +351,9 @@ class TestGetSchedules:
             "return_time": base_time + timedelta(hours=10),
             "estimated_energy_kwh": 150.0,
             "route_id": "route_1",
+            "created_at": base_time,
         }
-        mock_conn.fetch.return_value = [mock_row]
+        mock_conn.fetch.side_effect = self._dispatch_schedule_fetch([mock_row])
 
         start = base_time
         end = start + timedelta(hours=24)
@@ -344,7 +362,9 @@ class TestGetSchedules:
         assert len(schedules) == 1
         assert schedules[0]["vehicle_id"] == "bus_1"
         assert schedules[0]["estimated_energy_kwh"] == 150.0
-        schedule_query = mock_conn.fetch.call_args.args[0]
+        # created_at is an internal column — must not surface to the caller.
+        assert "created_at" not in schedules[0]
+        schedule_query = mock_conn.fetch.call_args_list[0].args[0]
         assert "JOIN vehicles v ON s.vehicle_id = v.id" in schedule_query
         assert "WHERE v.site_id = $1" in schedule_query
 
@@ -362,6 +382,7 @@ class TestGetSchedules:
                 "return_time": base_time + timedelta(hours=10),
                 "estimated_energy_kwh": 150.0,
                 "route_id": "route_1",
+                "created_at": base_time,
             },
             {
                 "vehicle_id": "bus_2",
@@ -369,9 +390,10 @@ class TestGetSchedules:
                 "return_time": base_time + timedelta(hours=12),
                 "estimated_energy_kwh": 200.0,
                 "route_id": "route_2",
+                "created_at": base_time,
             },
         ]
-        mock_conn.fetch.return_value = rows
+        mock_conn.fetch.side_effect = self._dispatch_schedule_fetch(rows)
 
         start = base_time
         end = start + timedelta(hours=24)
@@ -386,7 +408,7 @@ class TestGetSchedules:
         """Test retrieving schedules when none exist."""
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
-        mock_conn.fetch.return_value = []
+        mock_conn.fetch.side_effect = self._dispatch_schedule_fetch([])
 
         start = datetime.utcnow()
         end = start + timedelta(hours=24)

@@ -19,7 +19,7 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, time as _dt_time, timezone
 from typing import Annotated, Any, AsyncIterator, Iterator, Literal, Optional, Union
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -1656,6 +1656,204 @@ class ManualScheduleUpdateResponse(BaseModel):
     """Response from manual schedule update."""
 
     updated: ManualScheduleItem
+    readiness: ScheduleReadinessResponse
+
+
+# ============ Recurring schedule template models ============
+
+# Allowed day-of-week codes; mirrors the CHECK constraint on the table and
+# the canonical Zod schema in the frontend (see PR #119).
+_RECURRING_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _parse_hhmm(value: str) -> "_dt_time":
+    """Parse ``HH:MM`` into ``datetime.time``. Raises ``ValueError`` otherwise."""
+    if not isinstance(value, str) or not _HHMM_RE.match(value):
+        raise ValueError("must match HH:MM (00:00 to 23:59)")
+    hh, mm = value.split(":")
+    return _dt_time(hour=int(hh), minute=int(mm))
+
+
+class RecurringTemplateCreate(BaseModel):
+    """Create body for a recurring schedule template.
+
+    Wire format: ``departure_time_of_day`` and ``return_time_of_day`` are
+    depot-local ``HH:MM`` strings; ``start_date`` / ``end_date`` are
+    depot-local ``YYYY-MM-DD`` strings (no time component); ``days_of_week``
+    is a non-empty subset of ``{mon, tue, ..., sun}``.
+    """
+
+    vehicle_id: str = Field(..., description="Vehicle UUID")
+    route_id: str = Field(..., min_length=1, max_length=100)
+    departure_time_of_day: str = Field(..., description="Depot-local HH:MM")
+    return_time_of_day: str = Field(..., description="Depot-local HH:MM")
+    days_of_week: list[str] = Field(..., min_length=1, max_length=7)
+    start_date: date = Field(..., description="Depot-local start date (inclusive)")
+    end_date: Optional[date] = Field(
+        default=None, description="Depot-local end date (inclusive); null = open-ended"
+    )
+    required_soc: float = Field(default=1.0, ge=0.99, le=1.0)
+    energy_kwh: Optional[float] = Field(default=None, ge=0)
+
+    @field_validator("vehicle_id")
+    @classmethod
+    def _validate_vehicle_uuid(cls, value: str) -> str:
+        try:
+            UUID(value)
+        except ValueError:
+            raise ValueError(f"vehicle_id must be a valid UUID, got: {value}")
+        return value
+
+    @field_validator("departure_time_of_day", "return_time_of_day")
+    @classmethod
+    def _validate_hhmm(cls, value: str) -> str:
+        _parse_hhmm(value)
+        return value
+
+    @field_validator("days_of_week")
+    @classmethod
+    def _validate_days(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("days_of_week must be non-empty")
+        invalid = sorted(set(value) - _RECURRING_DAYS)
+        if invalid:
+            raise ValueError(
+                f"days_of_week contains invalid values: {invalid}; "
+                f"allowed: mon,tue,wed,thu,fri,sat,sun"
+            )
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        out: list[str] = []
+        for d in value:
+            if d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
+
+    @model_validator(mode="after")
+    def _validate_combinations(self) -> "RecurringTemplateCreate":
+        if self.end_date is not None and self.end_date < self.start_date:
+            raise ValueError("end_date must be on or after start_date")
+        if self.departure_time_of_day == self.return_time_of_day:
+            raise ValueError(
+                "departure_time_of_day and return_time_of_day must differ"
+            )
+        return self
+
+
+class RecurringTemplatePatch(BaseModel):
+    """Partial update of a recurring template. All fields optional."""
+
+    vehicle_id: Optional[str] = Field(default=None)
+    route_id: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    departure_time_of_day: Optional[str] = Field(default=None)
+    return_time_of_day: Optional[str] = Field(default=None)
+    days_of_week: Optional[list[str]] = Field(default=None, min_length=1, max_length=7)
+    start_date: Optional[date] = Field(default=None)
+    end_date: Optional[date] = Field(default=None)
+    required_soc: Optional[float] = Field(default=None, ge=0.99, le=1.0)
+    energy_kwh: Optional[float] = Field(default=None, ge=0)
+    active: Optional[bool] = Field(default=None)
+
+    @field_validator("vehicle_id")
+    @classmethod
+    def _validate_vehicle_uuid(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        try:
+            UUID(value)
+        except ValueError:
+            raise ValueError(f"vehicle_id must be a valid UUID, got: {value}")
+        return value
+
+    @field_validator("departure_time_of_day", "return_time_of_day")
+    @classmethod
+    def _validate_hhmm(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        _parse_hhmm(value)
+        return value
+
+    @field_validator("days_of_week")
+    @classmethod
+    def _validate_days(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        if value is None:
+            return value
+        invalid = sorted(set(value) - _RECURRING_DAYS)
+        if invalid:
+            raise ValueError(
+                f"days_of_week contains invalid values: {invalid}; "
+                f"allowed: mon,tue,wed,thu,fri,sat,sun"
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for d in value:
+            if d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
+
+
+class OccurrenceCancellationRequest(BaseModel):
+    """Body for cancelling a single recurring template occurrence."""
+
+    reason: Optional[str] = Field(default=None, max_length=280)
+
+
+class RecurringTemplateResponse(BaseModel):
+    """Serialized template returned to admin clients."""
+
+    template_id: str
+    vehicle_id: str
+    route_id: str
+    departure_time_of_day: str
+    return_time_of_day: str
+    days_of_week: list[str]
+    start_date: date
+    end_date: Optional[date] = None
+    required_soc: float
+    energy_kwh: Optional[float] = None
+    active: bool
+    crosses_midnight: bool
+    created_at: datetime
+    updated_at: datetime
+    cancelled_dates: list[date] = Field(default_factory=list)
+
+
+class RecurringTemplateListResponse(BaseModel):
+    templates: list[RecurringTemplateResponse]
+
+
+class ScheduleReadinessOnlyResponse(BaseModel):
+    readiness: ScheduleReadinessResponse
+
+
+class RecurringTemplateCreateResponse(BaseModel):
+    created: RecurringTemplateResponse
+    readiness: ScheduleReadinessResponse
+
+
+class RecurringTemplateUpdateResponse(BaseModel):
+    updated: RecurringTemplateResponse
+    readiness: ScheduleReadinessResponse
+
+
+class RecurringOccurrenceCancellationResponse(BaseModel):
+    """Response from cancelling a single recurring occurrence."""
+
+    template_id: str
+    occurrence_date: date
+    cancelled_at: datetime
+    reason: Optional[str] = None
+    readiness: ScheduleReadinessResponse
+
+
+class RecurringOccurrenceUncancelResponse(BaseModel):
+    """Response from removing a single cancellation."""
+
+    template_id: str
+    occurrence_date: date
     readiness: ScheduleReadinessResponse
 
 
@@ -4783,6 +4981,498 @@ async def patch_manual_schedule(
     checks = await _build_depot_readiness_checklist(depot_id)
     return {
         "updated": _format_manual_schedule_row(updated),
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
+
+
+# ============ Recurring schedule template endpoints ============
+
+
+def _format_recurring_template_row(row: dict, cancelled_dates: list) -> dict:
+    """Normalize a recurring template row for the API.
+
+    ``departure_time_of_day`` / ``return_time_of_day`` are serialised as
+    ``HH:MM`` (no seconds) to match the wire format the frontend Zod schema
+    expects. ``crosses_midnight`` is derived from the times.
+    """
+    dep: _dt_time = row["departure_time_of_day"]
+    ret: _dt_time = row["return_time_of_day"]
+    return {
+        "template_id": str(row["template_id"]),
+        "vehicle_id": str(row["vehicle_id"]),
+        "route_id": row["route_id"],
+        "departure_time_of_day": dep.strftime("%H:%M"),
+        "return_time_of_day": ret.strftime("%H:%M"),
+        "days_of_week": list(row["days_of_week"]),
+        "start_date": row["start_date"],
+        "end_date": row["end_date"],
+        "required_soc": float(row["required_soc"]),
+        "energy_kwh": (float(row["energy_kwh"]) if row["energy_kwh"] is not None else None),
+        "active": bool(row["active"]),
+        "crosses_midnight": ret <= dep,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "cancelled_dates": list(cancelled_dates),
+    }
+
+
+def _recurring_validation_400(field: str, message: str) -> JSONResponse:
+    """Return a 400 VALIDATION_ERROR for a single business-rule failure."""
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={
+            "detail": "Validation failed",
+            "error_code": "VALIDATION_ERROR",
+            "field_errors": {field: [message]},
+            "validation_errors": [{"path": field, "message": message}],
+        },
+    )
+
+
+async def _assert_recurring_depot_access(depot_id: str, user: dict) -> None:
+    """Shared auth + depot-access check used by every recurring endpoint."""
+    _require_customer_admin_with_org(user)
+    validate_depot_id(depot_id)
+    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+
+async def _serialize_templates_with_cancellations(
+    conn, depot_uuid: UUID
+) -> list[dict]:
+    """List all templates for a depot with their cancelled_dates inlined."""
+    templates = await db_queries.list_recurring_templates(conn, depot_id=depot_uuid)
+    template_ids = [UUID(t["template_id"]) for t in templates]
+    cancelled_map = await db_queries.get_cancelled_dates_for_templates(
+        conn, template_ids=template_ids
+    )
+    return [
+        _format_recurring_template_row(
+            t,
+            cancelled_dates=cancelled_map.get(t["template_id"], []),
+        )
+        for t in templates
+    ]
+
+
+@app.get(
+    "/admin/depots/{depot_id}/schedule/recurring",
+    response_model=RecurringTemplateListResponse,
+    tags=["admin"],
+    summary="List recurring schedule templates for a depot",
+)
+async def list_recurring_schedule_templates(
+    depot_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """List all recurring templates for the depot, including cancelled dates."""
+    await _assert_recurring_depot_access(depot_id, user)
+    depot_uuid = UUID(depot_id)
+    async with db_pools.static.acquire() as conn:
+        templates = await _serialize_templates_with_cancellations(conn, depot_uuid)
+    return {"templates": templates}
+
+
+@app.post(
+    "/admin/depots/{depot_id}/schedule/recurring",
+    response_model=RecurringTemplateCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["admin"],
+    summary="Create a recurring schedule template",
+)
+async def create_recurring_schedule_template(
+    depot_id: str,
+    request: RecurringTemplateCreate,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Create one recurring template for a vehicle in this depot.
+
+    Pydantic validation errors flow through the global
+    ``RequestValidationError`` handler which returns 400 VALIDATION_ERROR
+    with the standard ``{detail, error_code, field_errors, validation_errors}``
+    envelope (see ``validation_exception_handler``).
+    """
+    await _assert_recurring_depot_access(depot_id, user)
+
+    depot_uuid = UUID(depot_id)
+    vehicle_uuid = UUID(request.vehicle_id)
+    departure_time = _parse_hhmm(request.departure_time_of_day)
+    return_time = _parse_hhmm(request.return_time_of_day)
+
+    async with db_pools.static.acquire() as conn:
+        valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(
+            conn, depot_uuid, [vehicle_uuid]
+        )
+        if str(vehicle_uuid) not in valid_vehicle_ids:
+            return _recurring_validation_400(
+                "vehicle_id",
+                f"vehicle_id {request.vehicle_id} is not a member of depot {depot_id}",
+            )
+
+        async with conn.transaction():
+            row = await db_queries.create_recurring_template(
+                conn,
+                depot_id=depot_uuid,
+                vehicle_id=vehicle_uuid,
+                route_id=request.route_id,
+                departure_time_of_day=departure_time,
+                return_time_of_day=return_time,
+                days_of_week=list(request.days_of_week),
+                start_date=request.start_date,
+                end_date=request.end_date,
+                required_soc=float(request.required_soc),
+                energy_kwh=request.energy_kwh,
+            )
+
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "created": _format_recurring_template_row(row, cancelled_dates=[]),
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
+
+
+@app.patch(
+    "/admin/depots/{depot_id}/schedule/recurring/{template_id}",
+    response_model=RecurringTemplateUpdateResponse,
+    tags=["admin"],
+    summary="Update a recurring schedule template",
+)
+async def patch_recurring_schedule_template(
+    depot_id: str,
+    template_id: str,
+    patch: RecurringTemplatePatch,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Partially update a recurring template; null fields keep prior values."""
+    await _assert_recurring_depot_access(depot_id, user)
+    validate_uuid(template_id, "template_id")
+
+    patch_data = patch.model_dump(exclude_unset=True)
+    if not patch_data:
+        return _recurring_validation_400(
+            "body", "At least one recurring template field is required"
+        )
+
+    depot_uuid = UUID(depot_id)
+    template_uuid = UUID(template_id)
+
+    async with db_pools.static.acquire() as conn:
+        existing = await db_queries.get_recurring_template_for_depot(
+            conn, depot_id=depot_uuid, template_id=template_uuid
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recurring template not found",
+            )
+
+        # Merge patch over the existing row. Patch values for HH:MM strings
+        # come in as the raw string; convert to time. days_of_week is a
+        # list; other fields are scalars.
+        merged: dict = {**existing}
+        if "vehicle_id" in patch_data:
+            merged["vehicle_id"] = UUID(patch_data["vehicle_id"])
+        if "route_id" in patch_data:
+            merged["route_id"] = patch_data["route_id"]
+        if "departure_time_of_day" in patch_data:
+            merged["departure_time_of_day"] = _parse_hhmm(
+                patch_data["departure_time_of_day"]
+            )
+        if "return_time_of_day" in patch_data:
+            merged["return_time_of_day"] = _parse_hhmm(
+                patch_data["return_time_of_day"]
+            )
+        if "days_of_week" in patch_data:
+            merged["days_of_week"] = list(patch_data["days_of_week"])
+        if "start_date" in patch_data:
+            merged["start_date"] = patch_data["start_date"]
+        if "end_date" in patch_data:
+            merged["end_date"] = patch_data["end_date"]
+        if "required_soc" in patch_data:
+            merged["required_soc"] = float(patch_data["required_soc"])
+        if "energy_kwh" in patch_data:
+            merged["energy_kwh"] = patch_data["energy_kwh"]
+        if "active" in patch_data:
+            merged["active"] = bool(patch_data["active"])
+
+        # Cross-field validation on merged state.
+        if merged["departure_time_of_day"] == merged["return_time_of_day"]:
+            return _recurring_validation_400(
+                "return_time_of_day",
+                "departure_time_of_day and return_time_of_day must differ",
+            )
+        if merged["end_date"] is not None and merged["end_date"] < merged["start_date"]:
+            return _recurring_validation_400(
+                "end_date", "end_date must be on or after start_date"
+            )
+
+        vehicle_uuid = UUID(str(merged["vehicle_id"]))
+        if "vehicle_id" in patch_data:
+            valid_vehicle_ids = await db_queries.get_vehicle_ids_for_depot(
+                conn, depot_uuid, [vehicle_uuid]
+            )
+            if str(vehicle_uuid) not in valid_vehicle_ids:
+                return _recurring_validation_400(
+                    "vehicle_id",
+                    f"vehicle_id {patch_data['vehicle_id']} is not a member of "
+                    f"depot {depot_id}",
+                )
+
+        updated = await db_queries.update_recurring_template(
+            conn,
+            depot_id=depot_uuid,
+            template_id=template_uuid,
+            vehicle_id=vehicle_uuid,
+            route_id=merged["route_id"],
+            departure_time_of_day=merged["departure_time_of_day"],
+            return_time_of_day=merged["return_time_of_day"],
+            days_of_week=list(merged["days_of_week"]),
+            start_date=merged["start_date"],
+            end_date=merged["end_date"],
+            required_soc=float(merged["required_soc"]),
+            energy_kwh=merged.get("energy_kwh"),
+            active=bool(merged["active"]),
+        )
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recurring template not found",
+            )
+        cancelled_map = await db_queries.get_cancelled_dates_for_templates(
+            conn, template_ids=[template_uuid]
+        )
+
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "updated": _format_recurring_template_row(
+            updated, cancelled_dates=cancelled_map.get(str(template_uuid), [])
+        ),
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
+
+
+@app.delete(
+    "/admin/depots/{depot_id}/schedule/recurring/{template_id}",
+    response_model=ScheduleReadinessOnlyResponse,
+    tags=["admin"],
+    summary="Delete a recurring schedule template",
+)
+async def delete_recurring_schedule_template(
+    depot_id: str,
+    template_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Delete a recurring template and any cancellations it owned."""
+    await _assert_recurring_depot_access(depot_id, user)
+    validate_uuid(template_id, "template_id")
+    depot_uuid = UUID(depot_id)
+    template_uuid = UUID(template_id)
+    async with db_pools.static.acquire() as conn:
+        deleted = await db_queries.delete_recurring_template(
+            conn, depot_id=depot_uuid, template_id=template_uuid
+        )
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recurring template not found",
+            )
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {"readiness": _readiness_response_payload(depot_id, checks)}
+
+
+async def _set_recurring_template_active(
+    depot_id: str, template_id: str, active: bool, user: dict
+) -> dict:
+    """Shared body for the pause / resume endpoints."""
+    await _assert_recurring_depot_access(depot_id, user)
+    validate_uuid(template_id, "template_id")
+    depot_uuid = UUID(depot_id)
+    template_uuid = UUID(template_id)
+    async with db_pools.static.acquire() as conn:
+        existing = await db_queries.get_recurring_template_for_depot(
+            conn, depot_id=depot_uuid, template_id=template_uuid
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recurring template not found",
+            )
+        updated = await db_queries.update_recurring_template(
+            conn,
+            depot_id=depot_uuid,
+            template_id=template_uuid,
+            vehicle_id=UUID(str(existing["vehicle_id"])),
+            route_id=existing["route_id"],
+            departure_time_of_day=existing["departure_time_of_day"],
+            return_time_of_day=existing["return_time_of_day"],
+            days_of_week=list(existing["days_of_week"]),
+            start_date=existing["start_date"],
+            end_date=existing["end_date"],
+            required_soc=float(existing["required_soc"]),
+            energy_kwh=existing.get("energy_kwh"),
+            active=active,
+        )
+        cancelled_map = await db_queries.get_cancelled_dates_for_templates(
+            conn, template_ids=[template_uuid]
+        )
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "updated": _format_recurring_template_row(
+            updated, cancelled_dates=cancelled_map.get(str(template_uuid), [])
+        ),
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
+
+
+@app.post(
+    "/admin/depots/{depot_id}/schedule/recurring/{template_id}/pause",
+    response_model=RecurringTemplateUpdateResponse,
+    tags=["admin"],
+    summary="Pause a recurring schedule template (active=false)",
+)
+async def pause_recurring_schedule_template(
+    depot_id: str,
+    template_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    return await _set_recurring_template_active(
+        depot_id, template_id, active=False, user=user
+    )
+
+
+@app.post(
+    "/admin/depots/{depot_id}/schedule/recurring/{template_id}/resume",
+    response_model=RecurringTemplateUpdateResponse,
+    tags=["admin"],
+    summary="Resume a recurring schedule template (active=true)",
+)
+async def resume_recurring_schedule_template(
+    depot_id: str,
+    template_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    return await _set_recurring_template_active(
+        depot_id, template_id, active=True, user=user
+    )
+
+
+def _parse_occurrence_date(value: str) -> date:
+    """Parse a path param ``YYYY-MM-DD``; raise HTTPException 400 otherwise."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "detail": "Validation failed",
+                "error_code": "VALIDATION_ERROR",
+                "field_errors": {
+                    "occurrence_date": ["must be YYYY-MM-DD"]
+                },
+                "validation_errors": [
+                    {"path": "occurrence_date", "message": "must be YYYY-MM-DD"}
+                ],
+            },
+        )
+
+
+@app.post(
+    "/admin/depots/{depot_id}/schedule/recurring/{template_id}/occurrences/{occurrence_date}/cancel",
+    response_model=RecurringOccurrenceCancellationResponse,
+    tags=["admin"],
+    summary="Cancel one occurrence of a recurring schedule template",
+)
+async def cancel_recurring_occurrence(
+    depot_id: str,
+    template_id: str,
+    occurrence_date: str,
+    payload: Optional[OccurrenceCancellationRequest] = None,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Skip a single date for one template. Idempotent (re-posting refreshes reason)."""
+    await _assert_recurring_depot_access(depot_id, user)
+    validate_uuid(template_id, "template_id")
+    parsed_date = _parse_occurrence_date(occurrence_date)
+    payload_obj = payload or OccurrenceCancellationRequest()
+
+    depot_uuid = UUID(depot_id)
+    template_uuid = UUID(template_id)
+    actor_id: Optional[UUID] = None
+    sub = user.get("sub") if isinstance(user, dict) else None
+    if sub:
+        try:
+            actor_id = UUID(str(sub))
+        except (ValueError, TypeError):
+            actor_id = None
+
+    async with db_pools.static.acquire() as conn:
+        existing = await db_queries.get_recurring_template_for_depot(
+            conn, depot_id=depot_uuid, template_id=template_uuid
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recurring template not found",
+            )
+        row = await db_queries.upsert_recurring_cancellation(
+            conn,
+            template_id=template_uuid,
+            occurrence_date=parsed_date,
+            cancelled_by_user_id=actor_id,
+            reason=payload_obj.reason,
+        )
+
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "template_id": row["template_id"],
+        "occurrence_date": row["occurrence_date"],
+        "cancelled_at": row["cancelled_at"],
+        "reason": row["reason"],
+        "readiness": _readiness_response_payload(depot_id, checks),
+    }
+
+
+@app.delete(
+    "/admin/depots/{depot_id}/schedule/recurring/{template_id}/occurrences/{occurrence_date}/cancel",
+    response_model=RecurringOccurrenceUncancelResponse,
+    tags=["admin"],
+    summary="Un-cancel one occurrence of a recurring schedule template",
+)
+async def uncancel_recurring_occurrence(
+    depot_id: str,
+    template_id: str,
+    occurrence_date: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Remove a single-date cancellation; the recurring template resumes on that day."""
+    await _assert_recurring_depot_access(depot_id, user)
+    validate_uuid(template_id, "template_id")
+    parsed_date = _parse_occurrence_date(occurrence_date)
+
+    depot_uuid = UUID(depot_id)
+    template_uuid = UUID(template_id)
+    async with db_pools.static.acquire() as conn:
+        existing = await db_queries.get_recurring_template_for_depot(
+            conn, depot_id=depot_uuid, template_id=template_uuid
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recurring template not found",
+            )
+        removed = await db_queries.delete_recurring_cancellation(
+            conn, template_id=template_uuid, occurrence_date=parsed_date
+        )
+        if not removed:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Cancellation not found",
+            )
+    checks = await _build_depot_readiness_checklist(depot_id)
+    return {
+        "template_id": str(template_uuid),
+        "occurrence_date": parsed_date,
         "readiness": _readiness_response_payload(depot_id, checks),
     }
 

@@ -12,8 +12,16 @@ from uuid import UUID
 
 import asyncpg
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from ...adapters.weather.storage import DEFAULT_WEATHER_SOURCE
 from ..models import DepotConfig, DepotState, IncomingVehicle
+from ..scheduling.recurring import (
+    RecurringTemplate,
+    ScheduleCancellation,
+    expand_recurring_templates,
+    merge_recurring_with_manual,
+)
 from ...db.pools import DatabasePools
 
 if TYPE_CHECKING:
@@ -647,40 +655,148 @@ class StateAssembler:
             preconditioning_requests,
         )
 
+    async def _get_depot_timezone(self) -> ZoneInfo:
+        """Return the depot's IANA timezone (cached per assembler).
+
+        Falls back to UTC with a warning if ``sites.timezone`` is missing or
+        names an unknown zone — recurring expansion needs *some* zone to
+        materialise local-wall-clock occurrences and UTC is the safest
+        default since it round-trips cleanly.
+        """
+        cached = getattr(self, "_depot_timezone_cache", _SENTINEL)
+        if cached is not _SENTINEL:
+            return cached
+        try:
+            async with self.pools.static.acquire() as conn:
+                tz_name = await conn.fetchval(
+                    "SELECT timezone FROM sites WHERE id = $1", self.depot_id
+                )
+        except asyncpg.PostgresError as e:
+            logger.warning(
+                f"Failed to load depot timezone for {self.depot_id}: {e}; "
+                "defaulting to UTC."
+            )
+            tz = ZoneInfo("UTC")
+            self._depot_timezone_cache = tz
+            return tz
+        if not tz_name:
+            logger.warning(
+                f"sites.timezone is empty for depot {self.depot_id}; defaulting to UTC."
+            )
+            tz = ZoneInfo("UTC")
+        else:
+            try:
+                tz = ZoneInfo(tz_name)
+            except ZoneInfoNotFoundError:
+                logger.warning(
+                    f"Unknown IANA timezone '{tz_name}' for depot {self.depot_id}; "
+                    "defaulting to UTC."
+                )
+                tz = ZoneInfo("UTC")
+        self._depot_timezone_cache = tz
+        return tz
+
     async def _get_schedules(self, start: datetime, end: datetime) -> list[dict]:
-        """Get vehicle schedules.
+        """Get vehicle schedules merged from one-off rows + recurring templates.
+
+        Pulls concrete ``schedules`` rows whose departure falls inside the
+        horizon, then materialises any active recurring templates that
+        match the horizon (DST + cancellation aware — see
+        ``src/core/scheduling/recurring.py``). When both sources would
+        yield trips for the same vehicle on the same depot-local day, the
+        row with the later ``created_at`` wins.
 
         Args:
-            start: Start time
-            end: End time
+            start: Start time (timezone-aware UTC).
+            end: End time (timezone-aware UTC).
 
         Returns:
-            List of schedule dictionaries
+            List of merged schedule dicts in the same shape the optimizer
+            consumes (``vehicle_id``, ``departure_time``, ``return_time``,
+            ``estimated_energy_kwh``, ``route_id``).
 
         Raises:
-            asyncpg.PostgresError: If database query fails
+            asyncpg.PostgresError: If a database query fails.
         """
-        query = """
-        SELECT s.vehicle_id::text, departure_time, return_time, 
-               energy_kwh as estimated_energy_kwh, route_id
+        manual_query = """
+        SELECT s.vehicle_id::text, s.departure_time, s.return_time,
+               s.energy_kwh AS estimated_energy_kwh, s.route_id, s.created_at
         FROM schedules s
         JOIN vehicles v ON s.vehicle_id = v.id
-        WHERE v.site_id = $1 
-          AND s.departure_time >= $2 
+        WHERE v.site_id = $1
+          AND s.departure_time >= $2
           AND s.departure_time < $3
         ORDER BY departure_time
         """
         try:
-            # schedules and vehicles both live in Supabase (static pool)
             async with self.pools.static.acquire() as conn:
-                rows = await conn.fetch(query, self.depot_id, start, end)
-
-            schedules = [dict(row) for row in rows]
-            logger.debug(f"Retrieved {len(schedules)} schedules")
-            return schedules
+                manual_rows = await conn.fetch(manual_query, self.depot_id, start, end)
+                # Fetch templates + cancellations on the same connection to
+                # avoid a second pool checkout.
+                from ...db.queries import fetch_recurring_horizon_data
+                template_rows, cancellation_rows = await fetch_recurring_horizon_data(
+                    conn,
+                    depot_id=UUID(self.depot_id),
+                    horizon_start=start,
+                    horizon_end=end,
+                )
         except asyncpg.PostgresError as e:
             logger.error(f"Database error fetching schedules for depot {self.depot_id}: {e}")
             raise
+
+        manual = [dict(row) for row in manual_rows]
+        if not template_rows:
+            # No recurring templates → strip created_at from manual rows so
+            # downstream callers see the original schema.
+            cleaned = [
+                {k: v for k, v in row.items() if k != "created_at"}
+                for row in manual
+            ]
+            logger.debug(f"Retrieved {len(cleaned)} schedules (no templates)")
+            return cleaned
+
+        depot_tz = await self._get_depot_timezone()
+        templates = [
+            RecurringTemplate(
+                template_id=row["id"],
+                depot_id=row["depot_id"],
+                vehicle_id=row["vehicle_id"],
+                route_id=row["route_id"],
+                departure_time_of_day=row["departure_time_of_day"],
+                return_time_of_day=row["return_time_of_day"],
+                days_of_week=tuple(row["days_of_week"]),
+                start_date=row["start_date"],
+                end_date=row["end_date"],
+                required_soc=float(row["required_soc"]),
+                energy_kwh=(
+                    float(row["energy_kwh"]) if row["energy_kwh"] is not None else None
+                ),
+                active=bool(row["active"]),
+                created_at=row["created_at"],
+            )
+            for row in template_rows
+        ]
+        cancellations = [
+            ScheduleCancellation(
+                template_id=row["template_id"], occurrence_date=row["occurrence_date"]
+            )
+            for row in cancellation_rows
+        ]
+        recurring_rows = expand_recurring_templates(
+            templates,
+            cancellations,
+            depot_tz=depot_tz,
+            horizon_start=start,
+            horizon_end=end,
+        )
+        merged = merge_recurring_with_manual(
+            manual, recurring_rows, depot_tz=depot_tz
+        )
+        logger.debug(
+            f"Retrieved {len(merged)} schedules "
+            f"({len(manual)} manual + {len(recurring_rows)} recurring expansions)"
+        )
+        return merged
 
     def _compute_availability(
         self, schedules: list[dict], start: datetime, n_steps: int

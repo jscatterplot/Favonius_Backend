@@ -739,6 +739,290 @@ async def update_manual_schedule(
     return dict(row) if row else None
 
 
+# ============ RECURRING SCHEDULE TEMPLATES ============
+
+
+def _row_to_recurring_template(row: Any) -> dict:
+    """Normalize a recurring_schedule_template row for the API."""
+    return {
+        "template_id": str(row["id"]),
+        "depot_id": str(row["depot_id"]),
+        "vehicle_id": str(row["vehicle_id"]),
+        "route_id": row["route_id"],
+        "departure_time_of_day": row["departure_time_of_day"],
+        "return_time_of_day": row["return_time_of_day"],
+        "days_of_week": list(row["days_of_week"]),
+        "start_date": row["start_date"],
+        "end_date": row["end_date"],
+        "required_soc": float(row["required_soc"]),
+        "energy_kwh": (float(row["energy_kwh"]) if row["energy_kwh"] is not None else None),
+        "active": bool(row["active"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+async def list_recurring_templates(db, *, depot_id: UUID) -> list[dict]:
+    """Return all recurring templates for the depot."""
+    query = """
+        SELECT id, depot_id, vehicle_id, route_id,
+               departure_time_of_day, return_time_of_day, days_of_week,
+               start_date, end_date, required_soc, energy_kwh, active,
+               created_at, updated_at
+        FROM recurring_schedule_template
+        WHERE depot_id = $1
+        ORDER BY created_at ASC
+    """
+    rows = await db.fetch(query, depot_id)
+    return [_row_to_recurring_template(r) for r in rows]
+
+
+async def get_cancelled_dates_for_templates(
+    db, *, template_ids: list[UUID]
+) -> dict[str, list]:
+    """Map ``template_id (str) → sorted list of cancelled occurrence_dates``."""
+    if not template_ids:
+        return {}
+    query = """
+        SELECT template_id, occurrence_date
+        FROM recurring_schedule_cancellation
+        WHERE template_id = ANY($1::uuid[])
+        ORDER BY occurrence_date ASC
+    """
+    rows = await db.fetch(query, template_ids)
+    out: dict[str, list] = {}
+    for row in rows:
+        out.setdefault(str(row["template_id"]), []).append(row["occurrence_date"])
+    return out
+
+
+async def create_recurring_template(
+    db,
+    *,
+    depot_id: UUID,
+    vehicle_id: UUID,
+    route_id: str,
+    departure_time_of_day,
+    return_time_of_day,
+    days_of_week: list[str],
+    start_date,
+    end_date,
+    required_soc: float,
+    energy_kwh: Optional[float],
+) -> dict:
+    """Insert a new recurring template and return the inserted row."""
+    query = """
+        INSERT INTO recurring_schedule_template (
+            depot_id, vehicle_id, route_id,
+            departure_time_of_day, return_time_of_day, days_of_week,
+            start_date, end_date, required_soc, energy_kwh
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id, depot_id, vehicle_id, route_id,
+                  departure_time_of_day, return_time_of_day, days_of_week,
+                  start_date, end_date, required_soc, energy_kwh, active,
+                  created_at, updated_at
+    """
+    row = await db.fetchrow(
+        query,
+        depot_id,
+        vehicle_id,
+        route_id,
+        departure_time_of_day,
+        return_time_of_day,
+        days_of_week,
+        start_date,
+        end_date,
+        required_soc,
+        energy_kwh,
+    )
+    return _row_to_recurring_template(row)
+
+
+async def get_recurring_template_for_depot(
+    db, *, depot_id: UUID, template_id: UUID
+) -> Optional[dict]:
+    """Fetch one template only if it belongs to the depot."""
+    query = """
+        SELECT id, depot_id, vehicle_id, route_id,
+               departure_time_of_day, return_time_of_day, days_of_week,
+               start_date, end_date, required_soc, energy_kwh, active,
+               created_at, updated_at
+        FROM recurring_schedule_template
+        WHERE id = $1 AND depot_id = $2
+    """
+    row = await db.fetchrow(query, template_id, depot_id)
+    return _row_to_recurring_template(row) if row else None
+
+
+async def update_recurring_template(
+    db,
+    *,
+    depot_id: UUID,
+    template_id: UUID,
+    vehicle_id: UUID,
+    route_id: str,
+    departure_time_of_day,
+    return_time_of_day,
+    days_of_week: list[str],
+    start_date,
+    end_date,
+    required_soc: float,
+    energy_kwh: Optional[float],
+    active: bool,
+) -> Optional[dict]:
+    """Update a recurring template scoped to the depot."""
+    query = """
+        UPDATE recurring_schedule_template
+        SET vehicle_id = $3,
+            route_id = $4,
+            departure_time_of_day = $5,
+            return_time_of_day = $6,
+            days_of_week = $7,
+            start_date = $8,
+            end_date = $9,
+            required_soc = $10,
+            energy_kwh = $11,
+            active = $12
+        WHERE id = $1 AND depot_id = $2
+        RETURNING id, depot_id, vehicle_id, route_id,
+                  departure_time_of_day, return_time_of_day, days_of_week,
+                  start_date, end_date, required_soc, energy_kwh, active,
+                  created_at, updated_at
+    """
+    row = await db.fetchrow(
+        query,
+        template_id,
+        depot_id,
+        vehicle_id,
+        route_id,
+        departure_time_of_day,
+        return_time_of_day,
+        days_of_week,
+        start_date,
+        end_date,
+        required_soc,
+        energy_kwh,
+        active,
+    )
+    return _row_to_recurring_template(row) if row else None
+
+
+async def delete_recurring_template(
+    db, *, depot_id: UUID, template_id: UUID
+) -> bool:
+    """Delete a template (cascades to cancellations). Returns True if removed."""
+    query = """
+        DELETE FROM recurring_schedule_template
+        WHERE id = $1 AND depot_id = $2
+    """
+    result = await db.execute(query, template_id, depot_id)
+    # asyncpg returns "DELETE <n>"
+    try:
+        return int(result.split()[-1]) > 0
+    except (AttributeError, IndexError, ValueError):
+        return False
+
+
+async def upsert_recurring_cancellation(
+    db,
+    *,
+    template_id: UUID,
+    occurrence_date,
+    cancelled_by_user_id: Optional[UUID],
+    reason: Optional[str],
+) -> dict:
+    """Insert (or refresh) a single-occurrence cancellation."""
+    query = """
+        INSERT INTO recurring_schedule_cancellation (
+            template_id, occurrence_date, cancelled_by_user_id, reason
+        )
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (template_id, occurrence_date)
+        DO UPDATE SET
+            cancelled_at = NOW(),
+            cancelled_by_user_id = EXCLUDED.cancelled_by_user_id,
+            reason = EXCLUDED.reason
+        RETURNING template_id, occurrence_date, cancelled_at,
+                  cancelled_by_user_id, reason
+    """
+    row = await db.fetchrow(
+        query, template_id, occurrence_date, cancelled_by_user_id, reason
+    )
+    return {
+        "template_id": str(row["template_id"]),
+        "occurrence_date": row["occurrence_date"],
+        "cancelled_at": row["cancelled_at"],
+        "cancelled_by_user_id": (
+            str(row["cancelled_by_user_id"])
+            if row["cancelled_by_user_id"] is not None
+            else None
+        ),
+        "reason": row["reason"],
+    }
+
+
+async def delete_recurring_cancellation(
+    db, *, template_id: UUID, occurrence_date
+) -> bool:
+    """Remove a single-occurrence cancellation. Returns True if a row was deleted."""
+    query = """
+        DELETE FROM recurring_schedule_cancellation
+        WHERE template_id = $1 AND occurrence_date = $2
+    """
+    result = await db.execute(query, template_id, occurrence_date)
+    try:
+        return int(result.split()[-1]) > 0
+    except (AttributeError, IndexError, ValueError):
+        return False
+
+
+async def fetch_recurring_horizon_data(
+    db, *, depot_id: UUID, horizon_start: datetime, horizon_end: datetime
+) -> tuple[list[dict], list[dict]]:
+    """Fetch ``(templates, cancellations)`` for a depot covering the horizon.
+
+    Pulls all active templates whose date range overlaps the horizon, plus
+    all cancellations whose ``occurrence_date`` falls within a small buffer
+    of the horizon (so crosses-midnight + tz conversions don't miss edges).
+    """
+    horizon_start_date = horizon_start.date()
+    horizon_end_date = horizon_end.date()
+    # Pad by one day on each side: an occurrence whose local date is one
+    # day before/after the UTC horizon edge can still depart inside the
+    # horizon after timezone conversion.
+    template_query = """
+        SELECT id, depot_id, vehicle_id, route_id,
+               departure_time_of_day, return_time_of_day, days_of_week,
+               start_date, end_date, required_soc, energy_kwh, active,
+               created_at, updated_at
+        FROM recurring_schedule_template
+        WHERE depot_id = $1
+          AND active = TRUE
+          AND start_date <= $3
+          AND (end_date IS NULL OR end_date >= $2)
+    """
+    pad_start = horizon_start_date - timedelta(days=1)
+    pad_end = horizon_end_date + timedelta(days=1)
+    template_rows = await db.fetch(template_query, depot_id, pad_start, pad_end)
+
+    if not template_rows:
+        return [], []
+
+    template_ids = [row["id"] for row in template_rows]
+    cancel_query = """
+        SELECT template_id, occurrence_date
+        FROM recurring_schedule_cancellation
+        WHERE template_id = ANY($1::uuid[])
+          AND occurrence_date BETWEEN $2 AND $3
+    """
+    cancel_rows = await db.fetch(cancel_query, template_ids, pad_start, pad_end)
+
+    templates = [dict(r) for r in template_rows]
+    cancellations = [dict(r) for r in cancel_rows]
+    return templates, cancellations
+
+
 # ============ OPTIMIZATION RUN QUERIES ============
 
 
