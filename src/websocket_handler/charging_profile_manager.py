@@ -7,6 +7,25 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from uuid import UUID
+
+
+def _coerce_uuid(value: Any) -> Optional[UUID]:
+    """Parse a UUID from a payload value, returning ``None`` on any failure.
+
+    The OCPP command queue stores ``import_id`` in JSONB as a string
+    (``str(import_id)`` at enqueue time). asyncpg binds Python ``UUID``
+    instances to ``uuid``-typed columns, not raw strings — passing a
+    string would silently fail the UPDATE and leave the row stuck.
+    """
+    if value is None:
+        return None
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 from .cache_manager import CacheManager
 from .connection_pool import open_dedicated_connection
@@ -1061,6 +1080,41 @@ class ChargingCommandQueueConsumer:
                             self.logger.info("Expired %d overdue queue row(s)", n)
                     except Exception as exc:
                         self.logger.warning("expire_overdue_commands failed: %s", exc)
+                    # Same loop expires stale charger_log_imports rows so
+                    # the comparison endpoint surfaces a terminal state
+                    # instead of an indefinite "pending". Best-effort —
+                    # the upload endpoint can still complete a row that
+                    # races this expirer, gated by the per-status WHERE
+                    # in receive_upload's UPDATE. TTL comes from
+                    # ``CHARGER_LOG_UPLOAD_TOKEN_TTL_S`` so the expirer
+                    # tracks operator-configured token lifetime instead
+                    # of a hard-coded constant.
+                    try:
+                        expire_fn = getattr(
+                            self.timescale_client,
+                            "expire_overdue_charger_log_imports",
+                            None,
+                        )
+                        if expire_fn is not None:
+                            # Lazy import: keep this module independent
+                            # of src.adapters at module-load time.
+                            from src.adapters.chargers.upload_token import (
+                                get_token_ttl_seconds,
+                            )
+                            try:
+                                ttl = get_token_ttl_seconds()
+                            except Exception:
+                                ttl = 3600
+                            n_imports = await expire_fn(ttl)
+                            if n_imports:
+                                self.logger.info(
+                                    "Expired %d overdue charger_log_imports row(s)",
+                                    n_imports,
+                                )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "expire_overdue_charger_log_imports failed: %s", exc
+                        )
                     last_expiry_scan = now
 
                 # Wait for either a NOTIFY wakeup or the polling timeout.
@@ -1188,6 +1242,9 @@ class ChargingCommandQueueConsumer:
             return await self._handle_remote_start_transaction(
                 queue_id, cp_id, cp, connector_id, payload
             )
+
+        if command_type == "get_diagnostics":
+            return await self._handle_get_diagnostics(queue_id, cp_id, cp, payload)
 
         if command_type != "set_charging_profile":
             self.logger.warning(
@@ -1339,6 +1396,187 @@ class ChargingCommandQueueConsumer:
                 exc,
             )
         return True
+
+    async def _handle_get_diagnostics(
+        self,
+        queue_id: int,
+        cp_id: str,
+        cp: Any,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Push an OCPP ``GetDiagnostics`` to a connected charger.
+
+        Enqueued by ``POST /admin/depots/.../fetch_logs`` together with a
+        row in ``charger_log_imports``. The charger asynchronously
+        uploads the diagnostic archive to the signed URL in
+        ``payload['location']``; the API service receives it on
+        ``POST /internal/charger_logs/upload`` and flips the import row
+        to ``status='received'``.
+
+        Like ``_handle_remote_reset``, the row goes terminal on the first
+        attempt: a Rejected GetDiagnostics shouldn't be retried on every
+        BootNotification because the upload URL expires.
+        """
+        send = getattr(cp, "get_diagnostics", None)
+        if send is None:
+            self.logger.warning(
+                "cp_id=%s session has no get_diagnostics; marking failed",
+                cp_id,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "session does not support get_diagnostics"
+                )
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            await self._mark_import_failed(
+                payload, "session does not support get_diagnostics"
+            )
+            return True
+
+        location = (payload or {}).get("location")
+        if not location:
+            self.logger.warning(
+                "get_diagnostics queue_id=%s cp=%s missing location — marking failed",
+                queue_id,
+                cp_id,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "payload missing location"
+                )
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            await self._mark_import_failed(payload, "payload missing location")
+            return True
+
+        kwargs: Dict[str, Any] = {"location": location}
+        for src_key, dst_key in (
+            ("retries", "retries"),
+            ("retry_interval", "retry_interval"),
+            ("start_time", "start_time"),
+            ("stop_time", "stop_time"),
+        ):
+            if (payload or {}).get(src_key) is not None:
+                kwargs[dst_key] = payload[src_key]
+
+        try:
+            filename = await send(**kwargs)
+        except Exception as exc:
+            self.logger.warning(
+                "get_diagnostics raised for cp=%s queue_id=%s: %s",
+                cp_id,
+                queue_id,
+                exc,
+            )
+            try:
+                await self.timescale_client.mark_command_failed(queue_id, str(exc))
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            await self._mark_import_failed(payload, str(exc))
+            return True
+
+        # ``filename is None`` means the charger Rejected or the call
+        # raised inside FleetChargePoint.get_diagnostics (it swallows
+        # exceptions and returns None). Treat both as failed.
+        if filename is None:
+            try:
+                await self.timescale_client.mark_command_failed(
+                    queue_id, "charger Rejected GetDiagnostics or returned no filename"
+                )
+            except Exception as mark_exc:
+                self.logger.error(
+                    "mark_command_failed raised for queue_id=%s: %s",
+                    queue_id,
+                    mark_exc,
+                )
+            await self._mark_import_failed(payload, "charger Rejected GetDiagnostics")
+            return True
+
+        try:
+            await self.timescale_client.mark_command_sent(queue_id)
+        except Exception as exc:
+            self.logger.error(
+                "Failed to mark queue row sent queue_id=%s: %s", queue_id, exc
+            )
+
+        await self._mark_import_uploading(payload, filename)
+        return True
+
+    async def _mark_import_uploading(
+        self, payload: Dict[str, Any], filename: str
+    ) -> None:
+        """Flip ``charger_log_imports`` row to ``uploading`` + record filename.
+
+        Best-effort: a DB failure here doesn't change OCPP delivery
+        state (the queue row is already ``sent``). The upload endpoint
+        will still flip status to ``received`` when the file arrives.
+        """
+        import_id = _coerce_uuid((payload or {}).get("import_id"))
+        if import_id is None:
+            return
+        pool = getattr(self.timescale_client, "pg_pool", None)
+        if pool is None:
+            return
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE charger_log_imports
+                       SET status = 'uploading',
+                           file_name = COALESCE(file_name, $2)
+                     WHERE id = $1
+                       AND status = 'requested'
+                    """,
+                    import_id,
+                    filename,
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "Could not mark charger_log_imports=%s uploading: %s",
+                import_id,
+                exc,
+            )
+
+    async def _mark_import_failed(self, payload: Dict[str, Any], reason: str) -> None:
+        """Flip ``charger_log_imports`` row to ``failed``. Best-effort."""
+        import_id = _coerce_uuid((payload or {}).get("import_id"))
+        if import_id is None:
+            return
+        pool = getattr(self.timescale_client, "pg_pool", None)
+        if pool is None:
+            return
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE charger_log_imports
+                       SET status = 'failed',
+                           error_message = $2
+                     WHERE id = $1
+                       AND status IN ('requested', 'uploading')
+                    """,
+                    import_id,
+                    reason[:500],  # error_message can be long; clip
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "Could not mark charger_log_imports=%s failed: %s",
+                import_id,
+                exc,
+            )
 
     async def _handle_remote_start_transaction(
         self,

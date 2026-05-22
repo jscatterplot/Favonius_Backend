@@ -268,6 +268,22 @@ Sprint 4 ships the five tools the daily-readiness workflow needs (PRD §6.1) on 
 
 Tools registered: `get_scheduled_departures(depot_id, window_start, window_end)`, `get_vehicle_state(vehicle_id)`, `get_charger_state(charger_id)`, `get_charging_plan(vehicle_id)`, `get_driver_assignment(route_id)`. The data plumbing this depends on: Supabase migration 013 (`schedules.driver_id`) and migration 014 (`routes` view aliasing `schedules` to the PRD §5.1 `Route` shape).
 
+### Charger-side log extraction (`src/adapters/chargers/` + `src/api/charger_logs.py`)
+
+Operators can pull a charger's own session log on demand and compare it against `charging_sessions`/`telemetry`. Wire-up — all in TimescaleDB (`db_pools.ts`) alongside `charging_sessions`:
+
+- **Trigger** — `POST /admin/depots/{depot_id}/chargers/{charger_id}/sessions/{session_id}/fetch_logs` (customer_admin/favonius_admin) calls `dispatch_get_diagnostics()` (`src/adapters/ocpp/dispatch.py`). One transaction inserts a `charger_log_imports` row in `status='requested'` and a `charging_command_queue` row with `command_type='get_diagnostics'` carrying the signed upload URL in `payload['location']`. Writes a `charger.logs.fetched` admin-audit row.
+- **WS handler dispatch** — `ChargingCommandQueueConsumer._handle_get_diagnostics` (`src/websocket_handler/charging_profile_manager.py`) drains the queue and calls `FleetChargePoint.get_diagnostics(...)`. The charger asynchronously uploads to the URL.
+- **Upload** — public route `POST /internal/charger_logs/upload?token=<HMAC>` (no JWT — chargers don't carry one). Token is `<import_id>.<expiry_unix>.<hmac_hex>`, signed with `CHARGER_LOG_UPLOAD_SIGNING_KEY`. `MaxBodySizeMiddleware` enforces the per-endpoint cap (`CHARGER_LOG_UPLOAD_MAX_BYTES`, default 50 MiB) instead of the global 1 MiB cap. Stores body in `charger_log_imports.raw_payload BYTEA`, flips status to `'received'`, schedules parse+reconcile as a post-commit `asyncio.create_task` (same pattern as session-cost calculator).
+- **Parser dispatch** — `src/adapters/chargers/__init__.py::get_parser_for_vendor` normalises the vendor string (matching `_is_abb_vendor`) and returns the per-vendor parser. ABB Terra AC archives (`.tar.gz` containing CSV) → `src/adapters/chargers/abb/log_parser.py`. Unknown vendor → raw blob retained, no entries; a future parser can backfill without re-fetching.
+- **Normalized entries** — written to the `charger_session_log_entries` hypertable. Schema mirrors `telemetry` so reconciliation joins are symmetric (`(station_id, transaction_id, time)`). Vendor-unknown columns land in `raw_fields JSONB`.
+- **Reconciler** — `src/core/reconciliation/session_log_reconciliation.py::reconcile_session_log` integrates `telemetry.charging_kw` over the session window (trapezoidal, same SQL shape as `session_cost.py`) and compares against the cumulative meter delta from `charger_session_log_entries`. Writes one `session_log_reconciliations` row per `(session_id, log_import_id)` with a `source` enum: `reconciled` | `partial` | `no_log_entries` | `no_session` | `parse_failed`. Idempotent via `ON CONFLICT (session_id, log_import_id) DO UPDATE`.
+- **Read** — `GET /admin/depots/{depot_id}/sessions/{session_id}/log_comparison` returns `{session, import, charger_entries, reconciliation}` for the UI. 200 with `reconciliation=null` while parse/reconcile is in flight; 404 when no import exists yet.
+
+Vendor metadata is persisted on `BootNotification` via `OCPP16Session._persist_station_vendor` (UPDATEs `charging_stations.vendor` / `firmware_version`). The Supabase mig-006 vendor column was previously empty; new boots fill it in.
+
+Migration 042 adds the three tables and extends `charging_command_queue.command_type` to allow `'get_diagnostics'` and `'get_log'` (placeholder for future OCPP 2.0.1 chargers — same queue, same upload endpoint, new dispatch helper).
+
 ### Per-session billing (`src/core/billing/session_cost.py`)
 
 `compute_session_cost(ts_pool, session_row)` returns a `SessionCostResult` (`cost`, `source`, diagnostics). Two strategies, automatic selection: **granular** integrates `charging_kw × Δt × price(t)` via TimescaleDB `time_bucket('1 hour', telemetry.time)` (trapezoidal between consecutive samples) joined to `electricity_prices`, **fallback_average** uses `energy_delivered_kwh × avg(price over [start,end])`. The granular path is gated: telemetry timestamps must cover ≥80% of the session AND telemetry-implied energy must reconcile to within ±10% of `energy_delivered_kwh`. The chosen strategy is written to `charging_sessions.cost_total_source` (migration 040). Missing prices → `'unpriceable'`, `cost_total` stays NULL; billing never fabricates a price.
@@ -446,6 +462,9 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `PATCH` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Patch a recipient |
 | `DELETE` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Hard-delete a recipient (cascades deliveries). |
 | `POST` | `/webhooks/resend` | Public, signature-verified Resend webhook for delivery status updates (alerts pipeline) |
+| `POST` | `/admin/depots/{id}/chargers/{cid}/sessions/{sid}/fetch_logs` | Trigger OCPP `GetDiagnostics` on a session's charger and store the upload alongside the session. customer_admin or favonius_admin; writes `charger.logs.fetched` audit. |
+| `GET` | `/admin/depots/{id}/sessions/{sid}/log_comparison` | Return `{session, import, charger_entries, reconciliation}` for side-by-side comparison. 404 until an import exists. |
+| `POST` | `/internal/charger_logs/upload` | Public charger-uploaded diagnostic archive. Auth via HMAC token in query string (`CHARGER_LOG_UPLOAD_SIGNING_KEY`). |
 | `POST` | `/agent/turn` | Depot chat agent — synchronous turn; returns `AgentReply` (10 req/min; requires `AGENT_SEARCH_ENABLED=true`) |
 | `POST` | `/agent/turn/stream` | Depot chat agent — SSE streaming turn; emits `step` events then `answer` (10 req/min; same gate) |
 | `GET` | `/agent/runs/{run_id}` | Fetch stored agent run trace (ownership-gated; `favonius_admin` may access any run) |
@@ -823,6 +842,14 @@ test(api): add coverage for handoff rate limiting
 | `GEOIP_DB_PATH` | `/app/data/GeoLite2-Country.mmdb` | MaxMind DB path |
 | `MAXMIND_ACCOUNT_ID` | — | MaxMind account ID. Required since MaxMind's 2024 policy change — paired with `MAXMIND_LICENSE_KEY` in HTTP Basic Auth (account ID = username, license key = password) against `https://download.maxmind.com/geoip/databases/GeoLite2-Country/download`. Set as a **runtime** (Service) variable only. Never a Docker build arg — that would leak the credential into image history and build logs. Without it the download is skipped and the app fails closed. |
 | `MAXMIND_LICENSE_KEY` | — | MaxMind license. Set as a **runtime** (Service) variable only. `src/security/geo_block.py::_download_geoip_db` downloads `GeoLite2-Country.mmdb` on startup with retries. Requires `MAXMIND_ACCOUNT_ID`; without either set, the app fails closed. |
+
+### Charger log extraction
+| Variable | Default | Description |
+|---|---|---|
+| `CHARGER_LOG_UPLOAD_BASE_URL` | — | Public URL chargers reach to upload diagnostic archives (the `location` in OCPP `GetDiagnostics`). Must resolve to `POST /internal/charger_logs/upload` on this API service. Without it, the trigger endpoint returns 503. |
+| `CHARGER_LOG_UPLOAD_SIGNING_KEY` | — | HMAC secret for signing per-import upload tokens. Rotating invalidates every in-flight URL. |
+| `CHARGER_LOG_UPLOAD_TOKEN_TTL_S` | `3600` | Upload-token lifetime, seconds. Floor of 60 s. |
+| `CHARGER_LOG_UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | Per-upload size cap. `MaxBodySizeMiddleware` reads this for the upload path so the global 1 MiB cap doesn't apply. |
 
 ### Alerts pipeline (notifications)
 The pipeline has shipped; the implementation in `src/api/main.py` (alert endpoints, Resend webhook), `src/websocket_handler/` (AlertDispatcher), and migration 022 is the source of truth. The PR-era design plan has been retired.

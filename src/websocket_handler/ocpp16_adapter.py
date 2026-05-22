@@ -688,6 +688,63 @@ class OCPP16Session:
         logger.debug("clear_der_control called on OCPP 1.6 session — skipping")
         return False
 
+    async def get_diagnostics(
+        self,
+        location: str,
+        *,
+        retries: Optional[int] = None,
+        retry_interval: Optional[int] = None,
+        start_time: Any = None,
+        stop_time: Any = None,
+    ) -> Optional[str]:
+        """Send OCPP 1.6 ``GetDiagnostics`` to the connected charger.
+
+        The queue consumer dispatches charger-log fetches by calling
+        ``cp.get_diagnostics(location=…)`` on whatever the in-memory
+        session exposes. Without this wrapper, the ``getattr`` lookup
+        on an ``OCPP16Session`` returned ``None`` and the row was
+        terminally marked failed — GetDiagnostics never reached the
+        charger. Delegates to ``FleetChargePoint.get_diagnostics`` and
+        returns the upload filename the charger reported (``None`` on
+        any failure — the underlying call swallows exceptions).
+
+        ``start_time`` / ``stop_time`` are accepted as datetime or
+        ISO-8601 strings; they're forwarded as ISO-8601 strings because
+        the underlying ``call.GetDiagnostics`` expects that shape.
+        """
+        if not self._is_connection_open():
+            logger.info(
+                "get_diagnostics requested for station=%s while offline — skipping push",
+                self._station_id,
+            )
+            return None
+
+        def _coerce(ts: Any) -> Optional[str]:
+            if ts is None or ts == "":
+                return None
+            if isinstance(ts, str):
+                return ts
+            try:
+                return ts.isoformat()
+            except AttributeError:
+                return str(ts)
+
+        try:
+            return await self._cp.get_diagnostics(
+                location=location,
+                start_time=_coerce(start_time),
+                stop_time=_coerce(stop_time),
+                retries=retries,
+                retry_interval=retry_interval,
+            )
+        except Exception as exc:
+            logger.warning(
+                "send_get_diagnostics failed for station=%s: %s",
+                self._station_id,
+                exc,
+            )
+            return None
+
     # ------------------------------------------------------------------
     # FleetChargePoint callbacks
     # ------------------------------------------------------------------
@@ -744,6 +801,11 @@ class OCPP16Session:
         # Cached on the session and reused by _on_status_change to label
         # connector_status rows for the alerts pipeline (migration 029).
         await self._resolve_tenant_context()
+        # Persist vendor metadata so vendor-keyed dispatch (parser
+        # selection for GetDiagnostics, ABB-safe measurand guard at
+        # endpoint boundaries) can read it from the DB without holding
+        # an in-memory FleetChargePoint reference.
+        await self._persist_station_vendor(vendor, model, firmware_version)
         # Cross-restart safety:
         #   1. Reload still-open transactions into FleetChargePoint.transactions
         #      so an incoming StopTransaction from the rebooted charger is
@@ -1039,6 +1101,53 @@ class OCPP16Session:
             logger.warning(
                 "metering_config_cache station=%s update failed (%s); "
                 "next reconnect will re-push",
+                self._station_id,
+                exc,
+            )
+
+    async def _persist_station_vendor(
+        self,
+        vendor: Optional[str],
+        model: Optional[str],  # noqa: ARG002  reserved for a future model column
+        firmware_version: Optional[str],  # noqa: ARG002  tracked via metering_config_applied_firmware
+    ) -> None:
+        """Best-effort UPDATE of ``charging_stations.vendor``.
+
+        Drives the per-vendor parser dispatch in
+        :func:`src.adapters.chargers.get_parser_for_vendor`. The column
+        was added by Supabase mig 006 but never populated until now —
+        existing rows pick up the value on first reconnect after this
+        ships. Only writes when the stored vendor differs to avoid
+        churning ``updated_at`` on every reconnect.
+
+        Firmware tracking already lives in
+        ``charging_stations.metering_config_applied_firmware`` (Supabase
+        mig 014), so this method intentionally does not touch it — one
+        column, one writer.
+        """
+        if not vendor:
+            return
+        pool = self._resolve_static_pool()
+        if pool is None:
+            return
+        try:
+            await pool.execute(
+                """
+                UPDATE charging_stations
+                   SET vendor = $1
+                 WHERE station_id = $2
+                   AND vendor IS DISTINCT FROM $1
+                """,
+                vendor,
+                self._station_id,
+            )
+        except Exception as exc:
+            sqlstate = getattr(exc, "sqlstate", None)
+            if sqlstate == "42703":
+                # Column missing on this DB — Supabase mig 006 not applied.
+                return
+            logger.warning(
+                "Could not persist vendor for station=%s: %s",
                 self._station_id,
                 exc,
             )
