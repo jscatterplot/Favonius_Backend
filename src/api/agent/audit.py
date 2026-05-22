@@ -142,6 +142,23 @@ async def agent_runs_close(
         )
 
 
+def sql_audit_target_type(functions_accessed: list[str]) -> str:
+    """Map agent_views functions touched in a SQL-mode turn to ``target_type``.
+
+    ``audit_log.target_type`` is VARCHAR(64); multi-table turns use a
+    comma-separated label (truncated when needed) with the full list in
+    metadata ``functions_accessed``.
+    """
+    if not functions_accessed:
+        return "agent_views"
+    if len(functions_accessed) == 1:
+        return functions_accessed[0]
+    joined = ",".join(functions_accessed)
+    if len(joined) <= 64:
+        return joined
+    return joined[:61] + "..."
+
+
 async def write_agent_query_audit(
     ts_pool: Any,
     auth: AuthContext,
@@ -149,6 +166,9 @@ async def write_agent_query_audit(
     intent: str,
     row_count: int,
     depot_id: Optional[UUID] = None,
+    *,
+    target_type: str = "charging_sessions",
+    functions_accessed: Optional[list[str]] = None,
 ) -> None:
     """Mirror an executed agent query into ``audit_log``.
 
@@ -169,16 +189,25 @@ async def write_agent_query_audit(
         row_count: Number of rows the query returned.
         depot_id: Optional depot UUID when the query targets a single
             depot. ``None`` when the query may span multiple depots.
+        target_type: Data surface for the admin audit feed (e.g.
+            ``charging_sessions`` for the consumption fast path, or an
+            ``agent_views`` function name for SQL mode).
+        functions_accessed: Optional list of ``agent_views`` function
+            names from SQL-mode tool calls; stored in metadata for
+            multi-table turns.
     """
+    metadata: dict[str, Any] = {"intent": intent, "row_count": row_count}
+    if functions_accessed:
+        metadata["functions_accessed"] = functions_accessed
     row = AdminAuditRow(
         action="agent.query",
         actor_user_id=str(auth.user_id),
         actor_role=auth.role,
         organization_id=str(auth.organization_id) if auth.organization_id else None,
         depot_id=str(depot_id) if depot_id else None,
-        target_type="charging_sessions",
+        target_type=target_type,
         target_id=str(run_id),
-        metadata={"intent": intent, "row_count": row_count},
+        metadata=metadata,
     )
     await write_admin_audit_row(ts_pool, row)
 

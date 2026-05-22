@@ -57,6 +57,7 @@ from src.api.agent_workflows.tools import (
     ToolRegistry,
 )
 from src.monitoring.metrics import (
+    AGENT_LLM_TOKENS,
     WORKFLOW_LLM_TOKENS,
     WORKFLOW_TURN_DURATION,
     WORKFLOW_TURNS,
@@ -71,6 +72,7 @@ logger = logging.getLogger(__name__)
 # schema-validated shape. Naming is part of the contract; do not rename
 # without a coordinated prompt change.
 EMIT_DECISION_TOOL_NAME: str = "emit_decision"
+EMIT_FINAL_ANSWER_TOOL: str = "emit_final_answer"
 
 
 # Sprint-1's launch default for a workflow without an explicit
@@ -86,6 +88,12 @@ class WorkflowRuntimeError(RuntimeError):
 class ToolNotAllowedError(WorkflowRuntimeError):
     """The LLM tried to dispatch a tool outside the workflow's allow-list.
 
+    Carries the partial ``tool_calls`` trace as ``self.tool_calls`` so
+    the controller can mirror any executed SQL to the admin audit feed
+    BEFORE returning the error reply — without this, a policy violation
+    that lands AFTER a successful ``run_select_*`` would drop the
+    audit trail for the part that did execute (P2 codex finding).
+
     This is a policy violation, not a programming error. It happens if
     the upstream service hands the runtime a workflow whose
     ``allowed_tools`` does not match the tools array the LLM was given —
@@ -93,6 +101,19 @@ class ToolNotAllowedError(WorkflowRuntimeError):
     and the metric carries ``status='tool_not_allowed'``; the exception
     propagates to the caller.
     """
+
+    def __init__(
+        self,
+        *args: Any,
+        tool_calls: "Optional[list[ToolCall]]" = None,
+        iterations: int = 0,
+    ) -> None:
+        super().__init__(*args)
+        # Partial trace up to the disallowed call. Empty list (not None)
+        # when no tool dispatch had completed yet, so callers don't need
+        # a None-check before iterating.
+        self.tool_calls: list[ToolCall] = list(tool_calls or [])
+        self.iterations: int = max(0, int(iterations))
 
 
 class AnthropicClient(Protocol):
@@ -110,6 +131,18 @@ class _ClientFacade(Protocol):
     """Top-level facade — what the runtime calls ``client.messages.create`` on."""
 
     messages: AnthropicClient
+
+
+def _messages_api(client: _ClientFacade | AnthropicClient) -> AnthropicClient:
+    """Return the Messages API sub-client.
+
+    Callers may pass either the top-level AsyncAnthropic façade (with a
+    ``.messages`` attribute) or the messages sub-client directly.
+    """
+    nested = getattr(client, "messages", None)
+    if nested is not None:
+        return nested
+    return client  # type: ignore[return-value]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -362,7 +395,9 @@ class WorkflowAgent:
                         status = "tool_not_allowed"
                         raise ToolNotAllowedError(
                             f"workflow {workflow.name!r} attempted to call "
-                            f"disallowed tool {name!r}"
+                            f"disallowed tool {name!r}",
+                            tool_calls=tool_calls,
+                            iterations=_iteration + 1,
                         )
 
                     # Pre-dispatch hard-constraint guard.
@@ -654,10 +689,391 @@ def _violation_to_error_envelope(violation: ConstraintViolation) -> dict[str, An
     }
 
 
+# ── Q&A extension (depot chat agent SQL mode) ──────────────────────────────
+#
+# The depot chat agent's SQL mode reuses the same Anthropic tool-use loop
+# but writes to ``agent_runs`` instead of ``decisions``, has no Decision /
+# disposition / permission-tier semantics, and uses a different
+# terminator tool. The loop logic is otherwise identical to ``run_turn``,
+# so the implementation here is intentionally a thin twin rather than a
+# refactor of the existing path — the workflow runtime is gated by golden
+# tests and we do not want to perturb its shape for this change.
+
+
+class QAResult:
+    """Outcome of one Q&A tool-use loop.
+
+    Attributes mirror what the chat agent's :func:`agent_runs_close` path
+    needs: the final answer text, the per-step tool-call trace, the row
+    evidence count from the terminator, and a status string.
+    """
+
+    __slots__ = ("text", "tool_calls", "status", "row_evidence", "iterations")
+
+    def __init__(
+        self,
+        *,
+        text: str,
+        tool_calls: list[ToolCall],
+        status: str,
+        row_evidence: int = 0,
+        iterations: int = 0,
+    ) -> None:
+        self.text = text
+        self.tool_calls = tool_calls
+        self.status = status
+        self.row_evidence = row_evidence
+        self.iterations = iterations
+
+
+async def run_qa_turn(
+    *,
+    anthropic_client: _ClientFacade,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    tool_registry: ToolRegistry,
+    allowed_tools: Sequence[str],
+    max_iterations: int = 8,
+    max_tokens: int = 2048,
+    temperature: float = 0.0,
+    on_step: Optional[Callable[[ToolCall], Any]] = None,
+) -> QAResult:
+    """Run one Anthropic tool-use loop in Q&A mode (no Decision row).
+
+    Mirrors :meth:`WorkflowAgent.run_turn` minus the workflow-specific
+    machinery: no :class:`HardConstraintGuard`, no Decision write, no
+    per-(workflow, depot) permission_tier. The caller is the depot chat
+    agent's controller, which writes the trace to ``agent_runs`` via
+    the existing ``audit.py`` writers.
+
+    Args:
+        anthropic_client: Facade exposing ``.messages.create``.
+        model: Model ID (e.g. ``"claude-sonnet-4-6"``).
+        system_prompt: The cacheable system prompt body. Passed as a
+            single text block with ``cache_control: ephemeral``.
+        user_message: Per-turn user message (kept OUTSIDE the cache).
+        tool_registry: Registry containing the SQL agent tools and the
+            ``emit_final_answer`` terminator.
+        allowed_tools: Tool names from ``tool_registry`` the LLM may
+            call. Must include :data:`~src.api.agent_workflows.runtime.EMIT_FINAL_ANSWER_TOOL`.
+        max_iterations: Hard cap on tool-use turns. Default 8.
+        max_tokens, temperature: Anthropic Messages API parameters.
+        on_step: Optional async callback invoked after each tool call
+            with the populated :class:`ToolCall`. Used by the controller
+            to write ``agent_runs.steps_json`` and SSE step events.
+
+    Returns:
+        :class:`QAResult`.
+
+    Raises:
+        ToolNotAllowedError: LLM tried to call something outside
+            ``allowed_tools`` and not the terminator.
+        ToolNotRegisteredError: a registered name has no callable.
+    """
+    if EMIT_FINAL_ANSWER_TOOL not in allowed_tools:
+        raise WorkflowRuntimeError(
+            f"allowed_tools must include the terminator {EMIT_FINAL_ANSWER_TOOL!r}"
+        )
+
+    # Clamp to at least 1 — mirrors WorkflowAgent.__init__'s
+    # `max(1, int(max_iterations))`. Without this, max_iterations=0
+    # skips the loop entirely and returns iterations=0 with
+    # status="max_iterations", which is nonsensical (the loop never ran).
+    try:
+        max_iterations = max(1, int(max_iterations))
+    except (TypeError, ValueError):
+        max_iterations = 1
+
+    tools = tool_registry.anthropic_schemas(list(allowed_tools))
+    system_blocks: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+
+    tool_calls: list[ToolCall] = []
+    final_text: str = ""
+    row_evidence: int = 0
+    status: str = "success"
+    iterations: int = 0
+
+    try:
+        for iterations in range(1, max_iterations + 1):
+            response = await _messages_api(anthropic_client).create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system_blocks,
+                tools=tools,
+                messages=messages,
+            )
+            # Record token usage on EVERY round-trip. Bugbot M-sev: a
+            # SQL-mode turn can make up to `max_iterations` (default 8)
+            # Anthropic API calls — by far the most expensive execution
+            # path the agent has — and without this hook the cost was
+            # entirely invisible in Prometheus. Mirrors the
+            # `_record_usage` pattern in `src/api/agent/llm.py` (the
+            # consumption fast path) and the `_record_tokens` pattern on
+            # WorkflowAgent, but lands the count in the same
+            # `AGENT_LLM_TOKENS` metric the consumption path uses so a
+            # single dashboard covers both agent paths.
+            _record_qa_tokens(response, model)
+
+            assistant_content = list(response.content)
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            tool_use_blocks = [
+                b for b in assistant_content if getattr(b, "type", None) == "tool_use"
+            ]
+
+            if not tool_use_blocks:
+                # No tool call — model returned text only. Treat as failure
+                # to terminate properly; we still surface whatever text the
+                # model produced as the answer.
+                text_blocks = [
+                    getattr(b, "text", "")
+                    for b in assistant_content
+                    if getattr(b, "type", None) == "text"
+                ]
+                final_text = "".join(text_blocks).strip()
+                status = "no_terminator"
+                break
+
+            tool_results: list[dict[str, Any]] = []
+            terminated = False
+            for block in tool_use_blocks:
+                name = getattr(block, "name", None) or ""
+                block_id = getattr(block, "id", "") or ""
+                block_input = dict(getattr(block, "input", {}) or {})
+
+                if name not in allowed_tools:
+                    # status is intentionally not set here — the raise below
+                    # propagates out of run_qa_turn entirely (this function
+                    # has no `except ToolNotAllowedError` handler) so the
+                    # QAResult below is unreachable. The caller reads the
+                    # state off the exception instead.
+                    raise ToolNotAllowedError(
+                        f"SQL agent attempted to call disallowed tool {name!r}",
+                        tool_calls=tool_calls,
+                        iterations=iterations,
+                    )
+
+                if name == EMIT_FINAL_ANSWER_TOOL:
+                    try:
+                        result = await tool_registry.dispatch(name, block_input)
+                        ok = True
+                        err = None
+                    except ToolNotRegisteredError as exc:
+                        # Attach the partial trace so the controller can
+                        # audit any SQL that already executed in this turn.
+                        # ToolNotAllowedError carries the same fields via its
+                        # ctor; ToolNotRegisteredError is a stdlib KeyError
+                        # subclass so we set attributes after the fact.
+                        exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
+                        exc.iterations = iterations  # type: ignore[attr-defined]
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("SQL agent terminator dispatch failed: %s", name)
+                        result = {
+                            "error": "tool_failure",
+                            "tool": name,
+                            "detail": str(exc),
+                        }
+                        ok = False
+                        err = str(exc)
+                    else:
+                        if isinstance(result, dict) and "error" in result:
+                            ok = False
+                            err = str(
+                                result.get("error_kind") or result.get("error") or "tool error"
+                            )
+                    tc = ToolCall(
+                        name=name,
+                        arguments=block_input,
+                        result=result,
+                        ok=ok,
+                        error=err,
+                    )
+                    tool_calls.append(tc)
+                    if on_step is not None:
+                        await _dispatch_on_step(on_step, tc)
+
+                    # The terminator is TERMINAL regardless of success or
+                    # failure (Bugbot M-sev): on failure we used to
+                    # ``continue`` and process the remaining tool_use
+                    # blocks in the same response, which (a) wasted work
+                    # and tokens on a turn the model has already declared
+                    # over, and (b) violated the semantic contract — the
+                    # model asked to stop. WorkflowAgent's ``emit_decision``
+                    # path (line 382 above) breaks unconditionally; this
+                    # path now matches. Subsequent blocks in the same
+                    # response are intentionally skipped without
+                    # appending tool_results because ``terminated = True``
+                    # causes the outer loop to break before any further
+                    # API call, so the messages-list inconsistency is
+                    # never observed by Anthropic.
+                    terminated = True
+                    if ok:
+                        final_text = str(result.get("text", "")).strip()
+                        try:
+                            row_evidence = int(result.get("row_evidence", 0) or 0)
+                        except (TypeError, ValueError):
+                            row_evidence = 0
+                    else:
+                        # final_text stays "" — the controller maps this to
+                        # the generic "I wasn't able to compose…" reply.
+                        status = "terminator_failed"
+                    # Append the terminator's tool_result so the in-memory
+                    # messages list stays consistent with the assistant
+                    # turn that produced it. We break the outer loop right
+                    # after, so this entry is never sent to the API — but
+                    # if a future change persists or replays messages, the
+                    # tool_use block having no matching tool_result would
+                    # surface as "unmatched tool_use_id" on the next call.
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block_id,
+                            "content": json.dumps(result, default=str),
+                            "is_error": not ok,
+                        }
+                    )
+                    break
+
+                try:
+                    result = await tool_registry.dispatch(name, block_input)
+                    ok = True
+                    err = None
+                except ToolNotRegisteredError as exc:
+                    # Attach the partial trace so the controller can audit
+                    # any SQL that already executed in this turn (parallel
+                    # to the ToolNotAllowedError path above).
+                    exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
+                    exc.iterations = iterations  # type: ignore[attr-defined]
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("SQL agent tool dispatch failed: %s", name)
+                    result = {"error": "tool_failure", "tool": name, "detail": str(exc)}
+                    ok = False
+                    err = str(exc)
+                else:
+                    # A tool may signal logical failure by returning an error
+                    # envelope (top-level "error" key) without raising —
+                    # e.g. the SQL agent's validator/executor wraps the
+                    # rejection reason for the LLM. Treat that as ok=False
+                    # so audit aggregation in the controller and the
+                    # tool_result is_error flag downstream both match what
+                    # actually happened. See PR #216 review thread.
+                    if isinstance(result, dict) and "error" in result:
+                        ok = False
+                        err = str(result.get("error_kind") or result.get("error") or "tool error")
+
+                tc = ToolCall(
+                    name=name,
+                    arguments=block_input,
+                    result=result,
+                    ok=ok,
+                    error=err,
+                )
+                tool_calls.append(tc)
+                if on_step is not None:
+                    await _dispatch_on_step(on_step, tc)
+
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block_id,
+                        "content": json.dumps(result, default=str),
+                        "is_error": not ok,
+                    }
+                )
+
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+
+            if terminated:
+                break
+
+            # No stop-reason early break needed here: the empty
+            # ``tool_use_blocks`` case is handled upstream (line ~801) where
+            # we treat a model that returns text only as ``no_terminator``
+            # and exit. When we get here, ``tool_use_blocks`` was non-empty
+            # which means the Anthropic API set ``stop_reason='tool_use'``
+            # — we always want to loop back so the model can see the
+            # ``tool_result`` payloads we just appended.
+        else:
+            status = "max_iterations"
+
+    except Exception as exc:
+        if not hasattr(exc, "iterations"):
+            exc.iterations = iterations  # type: ignore[attr-defined]
+        if not hasattr(exc, "tool_calls"):
+            exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
+        raise
+
+    return QAResult(
+        text=final_text,
+        tool_calls=tool_calls,
+        status=status,
+        row_evidence=row_evidence,
+        iterations=iterations,
+    )
+
+
+def _record_qa_tokens(response: Any, model: str) -> None:
+    """Increment AGENT_LLM_TOKENS from an Anthropic response's usage block.
+
+    Used by ``run_qa_turn`` after every API round-trip in the SQL-mode
+    tool-use loop. Lands counts in the same metric the consumption
+    fast path uses (`src/api/agent/llm.py:_record_usage`) so a single
+    dashboard panel covers both agent paths. WorkflowAgent uses a
+    DIFFERENT metric (`WORKFLOW_LLM_TOKENS`) because workflows are a
+    distinct product surface.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    in_tokens = getattr(usage, "input_tokens", 0) or 0
+    out_tokens = getattr(usage, "output_tokens", 0) or 0
+    if in_tokens:
+        AGENT_LLM_TOKENS.labels(model=model, direction="input").inc(in_tokens)
+    if out_tokens:
+        AGENT_LLM_TOKENS.labels(model=model, direction="output").inc(out_tokens)
+
+
+async def _dispatch_on_step(cb: Callable[[ToolCall], Any], tc: ToolCall) -> None:
+    """Dispatch the on_step callback, awaiting it if it returns a coroutine.
+
+    Renamed from ``_safe_on_step`` after review: the "safe" suffix
+    elsewhere in this codebase (cf. ``_emit_answer_safe`` in
+    ``src/api/agent/controller.py``) means "swallows exceptions". This
+    helper used to do that, but it now PROPAGATES — the SQL
+    controller's on_step persists each tool call to
+    ``agent_runs.steps_json`` (which the migration-042 trigger may
+    reject on structural violations) and emits SSE step events; if
+    either side effect fails, continuing as if logging succeeded would
+    silently violate the append-only audit trace guarantee. The
+    runtime lets the exception bubble up — the caller's outer except
+    handler will close the run with ``status='error'`` so the audit
+    trail still reflects that something went wrong, even if the
+    per-step row is incomplete.
+    """
+    result = cb(tc)
+    if hasattr(result, "__await__"):
+        await result
+
+
 __all__ = [
     "DEFAULT_PERMISSION_TIER",
     "EMIT_DECISION_TOOL_NAME",
+    "EMIT_FINAL_ANSWER_TOOL",
+    "QAResult",
     "ToolNotAllowedError",
     "WorkflowAgent",
     "WorkflowRuntimeError",
+    "run_qa_turn",
 ]
