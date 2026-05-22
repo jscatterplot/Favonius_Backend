@@ -282,6 +282,98 @@ Receive inter-depot handoff message (called by origin depot).
 
 ---
 
+### GET /depots/{depot_id}/agent-actions
+List depot agent-proposed actions surfaced on the today view. Polled by the frontend; ordered by `created_at` desc. Wire format is camelCase to match the frontend `AgentActionSchema`.
+
+**Response:**
+```json
+[
+    {
+        "id": "uuid",
+        "depotId": "uuid",
+        "agentType": "reporting",
+        "actionClass": "report_draft",
+        "mode": "proposed",
+        "status": "pending",
+        "summary": "Generate April 2026 consumption report by RFID card",
+        "entityType": null,
+        "entityId": null,
+        "createdAt": "2026-05-01T00:00:00Z",
+        "resolvedAt": null,
+        "payload": {
+            "kind": "monthly_consumption",
+            "groupBy": "card",
+            "periodStart": "2026-04-01",
+            "periodEnd": "2026-04-30",
+            "title": "Monthly consumption — April 2026 (by card)"
+        }
+    }
+]
+```
+
+`status` values: `pending | executed | rejected | rolled_back | failed | shadow`. `mode` values: `shadow | proposed | auto_notify | auto_silent`.
+
+---
+
+### GET /depots/{depot_id}/autonomy-settings
+Per-depot autonomy matrix. Defaults are returned for the five known action classes (`charger_restart`, `session_reassign`, `price_reoptimize`, `soc_guardrail`, `report_draft`); any rows persisted in `agent_autonomy_settings` (migration 043) layer on top and any extra `actionClass` values surface as additional rows.
+
+**Response:**
+```json
+{
+    "rows": [
+        {"actionClass": "charger_restart", "level": "shadow"},
+        {"actionClass": "price_reoptimize", "level": "proposed"},
+        {"actionClass": "report_draft", "level": "auto_silent"},
+        {"actionClass": "session_reassign", "level": "proposed"},
+        {"actionClass": "soc_guardrail", "level": "proposed"}
+    ],
+    "asOf": "2026-05-22T10:00:00Z"
+}
+```
+
+`level` values: `shadow | proposed | auto_notify | auto_silent`. Writes go through `agents.autonomy.set` on `POST /commands/execute`.
+
+---
+
+### POST /commands/execute
+Unified command dispatcher (see CLAUDE.md endpoint table for the full command list). Depot agent commands:
+
+| Command | Params | Permission |
+|---|---|---|
+| `agents.action.approve` | `{actionId}` | `depot:manage` |
+| `agents.action.reject` | `{actionId}` | `depot:manage` |
+| `agents.action.rollback` | `{actionId}` | `depot:manage` |
+| `agents.autonomy.set` | `{actionClass, level}` | `depot:manage` |
+
+`agents.action.approve` on a `report_draft` action triggers a `reports.generate` with the action's `payload` and flips the action to `executed`. `agents.autonomy.set` upserts a row in `agent_autonomy_settings`; `level` must be one of `shadow | proposed | auto_notify | auto_silent`. Set `dry_run: true` to validate without writes. Every execution writes `COMMAND_EXECUTED` to the security audit log.
+
+**Request:**
+```json
+{
+    "command": "agents.autonomy.set",
+    "depot_id": "uuid",
+    "params": {"actionClass": "charger_restart", "level": "auto_notify"},
+    "dry_run": false
+}
+```
+
+**Response (real execution):**
+```json
+{
+    "status": "ok",
+    "command": "agents.autonomy.set",
+    "depot_id": "uuid",
+    "result": {
+        "actionClass": "charger_restart",
+        "level": "auto_notify",
+        "updatedAt": "2026-05-22T10:00:00Z"
+    }
+}
+```
+
+---
+
 ### GET /health
 Health check endpoint.
 

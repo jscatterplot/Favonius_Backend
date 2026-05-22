@@ -454,6 +454,9 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `POST` | `/depots/{id}/alerts/{alert_id}/acknowledge` | Mark a notification alert as acknowledged (alerts pipeline) |
 | `POST` | `/depots/{id}/vehicles/{vid}/handoff` | Send inter-depot handoff |
 | `POST` | `/depots/{id}/handoff/receive` | Receive inter-depot handoff |
+| `GET` | `/depots/{id}/agent-actions` | List depot agent-proposed actions ordered by `created_at` desc (camelCase wire format; `AgentActionSchema`). Polled by the today view. |
+| `GET` | `/depots/{id}/autonomy-settings` | Per-depot autonomy matrix: `{rows: [{actionClass, level}], asOf}`. Returns defaults for the five known classes (`charger_restart`, `session_reassign`, `price_reoptimize`, `soc_guardrail`, `report_draft`) plus any persisted rows from `agent_autonomy_settings` (mig 043). |
+| `POST` | `/commands/execute` | Unified command dispatcher. Agent commands (all `depot:manage`): `agents.action.approve` / `agents.action.reject` / `agents.action.rollback` (`{actionId}`), `agents.autonomy.set` (`{actionClass, level}`). |
 | `GET` | `/health` | Component health (DB, OCPP server, Gurobi license) |
 | `GET` | `/metrics` | Prometheus metrics (text format) |
 | `GET` | `/admin/controllers` | List active depot controllers |

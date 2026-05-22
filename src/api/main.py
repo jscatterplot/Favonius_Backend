@@ -5635,7 +5635,12 @@ class Report(BaseModel):
 
 
 class AgentAction(BaseModel):
-    """A proposed / shadow / executed agent-generated action."""
+    """A proposed / shadow / executed agent-generated action.
+
+    Wire format is camelCase to match the frontend zod schema
+    (``AgentActionSchema`` in ``src/lib/schemas/today.ts``).  Routes that
+    return ``AgentAction`` must set ``response_model_by_alias=True``.
+    """
 
     id: str
     depot_id: str
@@ -5650,7 +5655,7 @@ class AgentAction(BaseModel):
     resolved_at: Optional[datetime] = None
     payload: Optional[dict] = None
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
 
 
 def _parse_report_date(value: str, field_name: str) -> date:
@@ -6820,6 +6825,7 @@ def _row_to_agent_action(row: asyncpg.Record) -> AgentAction:
 @app.get(
     "/depots/{depot_id}/agent-actions",
     response_model=list[AgentAction],
+    response_model_by_alias=True,
     tags=["depots"],
     summary="List agent actions for a depot",
     description=(
@@ -6856,37 +6862,57 @@ async def list_agent_actions(
 
 
 # ── Autonomy-settings endpoint ─────────────────────────────────────────────────
-# Returns per-depot agent autonomy configuration.  The frontend uses this to
-# render the agents page and gate which action classes are surfaced.
+# Returns the per-depot autonomy matrix.  The frontend renders one row per
+# action_class with a level selector; writes go through the
+# `agents.autonomy.set` command (POST /commands/execute).  Persistence lives
+# in `agent_autonomy_settings` (migration 043).
+
+
+_AGENT_AUTONOMY_LEVELS: tuple[str, ...] = ("shadow", "proposed", "auto_notify", "auto_silent")
+
+# Default action classes surfaced even when no row has been written yet.
+# Keep in sync with the frontend matrix renderer (src/lib/schemas/today.ts).
+# Additional classes returned by the DB are layered on top of these defaults.
+_DEFAULT_AGENT_AUTONOMY_CLASSES: tuple[str, ...] = (
+    "charger_restart",
+    "session_reassign",
+    "price_reoptimize",
+    "soc_guardrail",
+    "report_draft",
+)
+
+_DEFAULT_AGENT_AUTONOMY_LEVEL: str = "proposed"
+
+
+class AutonomySettingsRow(BaseModel):
+    """One row of the depot autonomy matrix."""
+
+    action_class: str
+    level: str = Field(..., description="shadow | proposed | auto_notify | auto_silent")
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
 
 
 class AutonomySettings(BaseModel):
-    """Per-depot autonomous agent configuration."""
+    """Per-depot autonomy matrix returned by GET /depots/{id}/autonomy-settings."""
 
-    depot_id: str
-    enabled: bool = True
-    mode: str = Field(
-        "proposed",
-        description="Default action mode: shadow | proposed | auto_notify | auto_silent",
-    )
-    enabled_action_classes: list[str] = Field(
-        default_factory=lambda: ["report_draft"],
-        description="Action classes the agent is allowed to propose.",
-    )
-    auto_approve_threshold: Optional[float] = Field(
-        None,
-        description="Confidence threshold above which actions are auto-approved (null = never).",
-    )
+    rows: list[AutonomySettingsRow]
+    as_of: datetime
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
 
 
 @app.get(
     "/depots/{depot_id}/autonomy-settings",
     response_model=AutonomySettings,
+    response_model_by_alias=True,
     tags=["depots"],
-    summary="Get depot agent autonomy settings",
+    summary="Get depot agent autonomy matrix",
     description=(
-        "Returns the autonomous agent configuration for the depot. "
-        "Settings are currently depot-level defaults; per-class overrides are not yet stored."
+        "Returns the per-depot autonomy matrix: one row per action_class with the "
+        "current level (shadow | proposed | auto_notify | auto_silent). "
+        "Defaults are returned for known action classes that have not yet been written. "
+        "Writes go through the `agents.autonomy.set` command on POST /commands/execute."
     ),
     responses={
         401: {"model": ErrorResponse, "description": "Unauthorized"},
@@ -6899,12 +6925,38 @@ async def get_autonomy_settings(
     user: dict = Depends(ensure_tenant_mirrored),
 ) -> AutonomySettings:
     """GET /depots/{depot_id}/autonomy-settings."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT action_class, level, updated_at
+            FROM agent_autonomy_settings
+            WHERE depot_id = $1::uuid
+            """,
+            depot_id,
+        )
+
+    stored: dict[str, str] = {r["action_class"]: r["level"] for r in rows}
+    latest_update: Optional[datetime] = max(
+        (r["updated_at"] for r in rows), default=None
+    )
+
+    # Layer defaults so the matrix is fully populated even for fresh depots.
+    merged: dict[str, str] = {
+        cls: _DEFAULT_AGENT_AUTONOMY_LEVEL for cls in _DEFAULT_AGENT_AUTONOMY_CLASSES
+    }
+    merged.update(stored)
+
+    matrix_rows = [
+        AutonomySettingsRow(action_class=cls, level=level)
+        for cls, level in sorted(merged.items())
+    ]
+
     return AutonomySettings(
-        depot_id=depot_id,
-        enabled=True,
-        mode="proposed",
-        enabled_action_classes=["report_draft"],
-        auto_approve_threshold=None,
+        rows=matrix_rows,
+        as_of=latest_update or datetime.now(timezone.utc),
     )
 
 
@@ -10909,6 +10961,76 @@ async def _handle_agent_action_rollback(
     return {"actionId": action_id, "actionStatus": "rolled_back"}
 
 
+async def _handle_agent_autonomy_set(
+    params: dict,
+    depot_id: str,
+    dry_run: bool,
+    user: Optional[dict] = None,
+) -> dict:
+    """Upsert one row of the depot autonomy matrix.
+
+    Params:
+        actionClass: action class string (any non-empty value).
+        level: one of shadow | proposed | auto_notify | auto_silent.
+    """
+    action_class = params.get("actionClass") or params.get("action_class")
+    level = params.get("level")
+    if not action_class or not isinstance(action_class, str):
+        raise HTTPException(
+            status_code=400, detail="params.actionClass is required (non-empty string)"
+        )
+    if level not in _AGENT_AUTONOMY_LEVELS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"params.level must be one of {list(_AGENT_AUTONOMY_LEVELS)}; "
+                f"got {level!r}"
+            ),
+        )
+
+    if dry_run:
+        return {
+            "actionClass": action_class,
+            "level": level,
+            "simulated": True,
+        }
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    actor_raw = user.get("sub") if isinstance(user, dict) else None
+    actor_id: Optional[UUID] = None
+    if actor_raw:
+        try:
+            actor_id = UUID(str(actor_raw))
+        except (TypeError, ValueError):
+            actor_id = None
+
+    async with db_pools.ts.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO agent_autonomy_settings
+                (depot_id, action_class, level, updated_at, updated_by)
+            VALUES ($1::uuid, $2, $3, NOW(), $4)
+            ON CONFLICT (depot_id, action_class) DO UPDATE
+            SET level = EXCLUDED.level,
+                updated_at = NOW(),
+                updated_by = EXCLUDED.updated_by
+            RETURNING action_class, level, updated_at
+            """,
+            depot_id,
+            action_class,
+            level,
+            actor_id,
+        )
+
+    return {
+        "actionClass": row["action_class"],
+        "level": row["level"],
+        "updatedAt": row["updated_at"].isoformat(),
+    }
+
+
 class _CommandSpec:
     """Registry entry for a dispatchable command."""
 
@@ -10954,6 +11076,10 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
         required_permission=Permission.DEPOT_MANAGE,
         handler=_handle_agent_action_rollback,
     ),
+    "agents.autonomy.set": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_agent_autonomy_set,
+    ),
 }
 
 
@@ -10978,6 +11104,7 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
     | `agents.action.approve` | `depot:manage` (operator+) | `actionId` |
     | `agents.action.reject` | `depot:manage` (operator+) | `actionId` |
     | `agents.action.rollback` | `depot:manage` (operator+) | `actionId` |
+    | `agents.autonomy.set` | `depot:manage` (operator+) | `actionClass`, `level` |
 
     Set `dry_run: true` to validate and simulate the command without side effects.
     Every execution (real or dry-run) is written to the security audit log.
