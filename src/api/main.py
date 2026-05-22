@@ -5313,6 +5313,11 @@ async def _set_recurring_template_active(
             energy_kwh=existing.get("energy_kwh"),
             active=active,
         )
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recurring template not found",
+            )
         cancelled_map = await db_queries.get_cancelled_dates_for_templates(
             conn, template_ids=[template_uuid]
         )

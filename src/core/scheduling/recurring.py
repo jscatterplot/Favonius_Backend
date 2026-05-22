@@ -37,7 +37,7 @@ The merge happens after expansion so the recurring code stays pure.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Iterable, Optional
 from uuid import UUID
@@ -46,7 +46,6 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 DAYS_OF_WEEK: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-_WEEKDAY_INDEX: dict[str, int] = {name: idx for idx, name in enumerate(DAYS_OF_WEEK)}
 
 
 @dataclass(frozen=True)
@@ -78,21 +77,6 @@ class ScheduleCancellation:
 
     template_id: UUID
     occurrence_date: date
-
-
-@dataclass(frozen=True)
-class ManualScheduleRow:
-    """Manual ``schedules`` row used for the tiebreaker against templates.
-
-    Only the fields the merge logic reads. Full row shape is whatever
-    ``StateAssembler._get_schedules`` returns; that dict is passed through
-    untouched in the output.
-    """
-
-    vehicle_id: UUID
-    departure_time_utc: datetime
-    created_at: datetime
-    payload: dict = field(default_factory=dict)
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
