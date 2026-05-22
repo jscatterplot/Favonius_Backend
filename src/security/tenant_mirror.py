@@ -387,6 +387,16 @@ async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]
         # outage doesn't lock the user out of the wizard for a full TTL.
         return
 
+    # Patch the in-flight user dict so the current request's auth check sees
+    # the corrected role without requiring a token refresh. Safe because:
+    # (a) we only reach here when favonius_role was absent — we never overwrite
+    #     an existing lower-privilege claim; (b) the payload is the same data
+    #     we just pushed to Supabase as the authoritative source.
+    if isinstance(user.get("app_metadata"), dict):
+        user["app_metadata"].update(payload)
+    else:
+        user["app_metadata"] = dict(payload)
+
     logger.warning(
         "tenant_metadata_repair: backfilled app_metadata user=%s org=%s role=%s",
         user_id,
@@ -402,10 +412,9 @@ async def ensure_tenant_mirrored(user: dict = Depends(verify_token)) -> dict:
 
     pool = api_main.db_pools.static if api_main.db_pools else None
     try:
-        # Repair runs before mirror so a healed JWT on a future request can
-        # then mirror normally. The current request still uses the unpatched
-        # token; that's by design — we never trust the DB-derived role for
-        # the in-flight authorization decision.
+        # Repair patches Supabase AND the in-flight user dict when favonius_role
+        # was absent, so the current request's auth check and the subsequent
+        # mirror call both see the corrected claims.
         await repair_user_tenant_metadata(user, pool)
     except Exception:
         logger.warning("ensure_tenant_mirrored: repair step failed", exc_info=True)
