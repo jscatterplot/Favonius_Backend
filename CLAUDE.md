@@ -449,6 +449,7 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 |---|---|---|
 | `POST` | `/optimize` | Trigger depot MILP optimization |
 | `GET` | `/depots/{id}/state` | Current SoCs, battery state, peak demand, price |
+| `GET` | `/depots/{id}/savings-summary` | Month-to-date charging cost vs flat-rate baseline (current_month_eur, baseline_month_eur, saved_eur, saved_pct, period_start, period_end, as_of). Computed from `charging_sessions.cost_total` + `electricity_prices` average over the period. Missing-data paths (no sessions, no zone, no prices) return zeros instead of 500 so the UI shows '—'. |
 | `GET` | `/depots/{id}/schedule` | Latest charging schedule |
 | `GET` | `/depots/{id}/alerts` | Charger faults + last optimization + notification_alerts (alerts pipeline) |
 | `POST` | `/depots/{id}/alerts/{alert_id}/acknowledge` | Mark a notification alert as acknowledged (alerts pipeline) |

@@ -118,6 +118,7 @@ from .reports import (
     compute_energy_totals,
     stream_rows_as_csv,
 )
+from .savings import compute_savings_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1084,6 +1085,46 @@ class DepotStateResponse(BaseModel):
     )
     current_month_peak_kw: float = Field(..., ge=0.0, description="Current month peak demand (kW)")
     current_price_kwh: float = Field(..., ge=0.0, description="Current electricity price ($/kWh)")
+
+
+class SavingsSummaryResponse(BaseModel):
+    """Month-to-date savings summary for the depot 'today' card.
+
+    Spec from the frontend ``SavingsSummarySchema`` in
+    ``src/lib/schemas/today.ts``. All seven fields are required and
+    non-null; the backend forces ``0.0`` rather than NaN/Infinity when
+    there's no data, so the UI never has to special-case empty months.
+    """
+
+    current_month_eur: float = Field(
+        ..., description="Actual charging cost month-to-date (EUR)."
+    )
+    baseline_month_eur: float = Field(
+        ...,
+        description=(
+            "What the same energy would have cost without optimization "
+            "(flat-rate baseline: total energy × average day-ahead price "
+            "across the period)."
+        ),
+    )
+    saved_eur: float = Field(
+        ..., description="baseline_month_eur - current_month_eur."
+    )
+    saved_pct: float = Field(
+        ...,
+        description=(
+            "Savings as a percentage of baseline, one decimal place. "
+            "Forced to 0.0 when baseline is 0."
+        ),
+    )
+    period_start: str = Field(
+        ...,
+        description="First instant of the current calendar month, depot tz, returned as UTC ISO 8601.",
+    )
+    period_end: str = Field(..., description="\"Now\" as UTC ISO 8601.")
+    as_of: str = Field(
+        ..., description="When the figures were computed (UTC ISO 8601)."
+    )
 
 
 class ReadinessResponse(BaseModel):
@@ -5423,6 +5464,60 @@ async def get_depot_state(
                 "detail": "Failed to get depot state",
             },
         ) from e
+
+
+@app.get(
+    "/depots/{depot_id}/savings-summary",
+    response_model=SavingsSummaryResponse,
+    tags=["depots"],
+    summary="Month-to-date charging cost vs unmanaged baseline",
+    description=(
+        "Returns the seven fields the frontend's 'today' savings card "
+        "needs: actual cost, flat-rate baseline cost, absolute and "
+        "percentage savings, and the period window (UTC). 'Month-to-date' "
+        "means sessions started in the current calendar month in the "
+        "depot's local timezone. Missing-data paths (no sessions yet, no "
+        "bidding zone, no price rows) return zeros instead of erroring so "
+        "the UI shows '—' rather than a generic failure. Polling cadence "
+        "is 60s; values change slowly so caching is appropriate."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_savings_summary(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> SavingsSummaryResponse:
+    """Return month-to-date savings vs flat-rate baseline."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        summary = await compute_savings_summary(
+            db_pools.static, db_pools.ts, depot_id
+        )
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error computing savings summary: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError() from exc
+
+    return SavingsSummaryResponse(
+        current_month_eur=summary.current_month_eur,
+        baseline_month_eur=summary.baseline_month_eur,
+        saved_eur=summary.saved_eur,
+        saved_pct=summary.saved_pct,
+        period_start=summary.period_start.isoformat().replace("+00:00", "Z"),
+        period_end=summary.period_end.isoformat().replace("+00:00", "Z"),
+        as_of=summary.as_of.isoformat().replace("+00:00", "Z"),
+    )
 
 
 @app.get(
