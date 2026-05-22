@@ -344,7 +344,7 @@ GLOSSARY: tuple[str, ...] = (
     "consumption = SUM(energy_kwh) in agent_views.sessions over the window of interest.",
     "cost / spend = SUM(cost_total) in agent_views.sessions; rows where cost_total IS NULL are 'unpriceable' and should be excluded from the headline number. Use cost_total_source = 'granular' for the most accurate subset.",
     "peak demand = MAX(peak_demand_kw) from agent_views.optimization_runs($1) for solver-reported depot peaks, or MAX(peak_kw) from agent_views.building_load_hourly($1) for non-EV building load. telemetry_hourly is not exposed in V1 — do not reference it.",
-    "depot-local day boundaries: use `start_time AT TIME ZONE (SELECT timezone FROM agent_views.depots($1) WHERE depot_id = …)`.",
+    "depot-local time: any timestamptz column converts with `<col> AT TIME ZONE (SELECT timezone FROM agent_views.depots($1) WHERE depot_id = …)`. Works for `sessions.start_time` day-bucket boundaries AND for time-of-day windows on `prices_hourly.hour` (e.g. morning peak 07:00–09:00 local). Note `prices_hourly` is zone-keyed, not depot-keyed: read both `timezone` and `entsoe_zone` from the same `depots($1)` row, then filter prices by `bidding_zone` and convert `hour` to local with the timezone.",
     "current driver of an RFID card: NOT in agent_views directly; use the lookup_entity tool with kind='rfid'.",
     "an 'open' session has end_time IS NULL.",
     "the cross-DB boundary: vehicles/drivers/chargers/depots/schedules_recent live on the static pool; sessions/optimization_runs/alerts/prices_hourly/building_load_hourly/connector_status_latest live on the TS pool. You cannot JOIN across; resolve IDs via one pool, then query the other.",

@@ -114,3 +114,18 @@ def test_glossary_teaches_trigger_reason_prefix_idiom():
     joined = " ".join(GLOSSARY)
     assert "trigger_reason" in joined
     assert "LIKE" in joined
+
+
+def test_glossary_teaches_tz_idiom_for_prices_hourly():
+    """Q17 ("average price during morning peak 07–09 local") needs
+    the AT TIME ZONE idiom on `prices_hourly.hour`. The original
+    glossary line only mentioned `sessions.start_time`; an LLM
+    answering Q17 had to generalise on its own. Pin the broader
+    phrasing so future edits don't accidentally narrow it back.
+    """
+    joined = " ".join(GLOSSARY)
+    assert "AT TIME ZONE" in joined
+    assert "prices_hourly" in joined
+    # The zone-keyed nature of prices_hourly (not depot-keyed) is the
+    # specific footgun this line exists to defuse.
+    assert "bidding_zone" in joined or "entsoe_zone" in joined
