@@ -30,7 +30,7 @@ class ColumnSpec:
 
 @dataclass(frozen=True)
 class FunctionSpec:
-    name: str               # e.g. "sessions" — UNQUALIFIED
+    name: str  # e.g. "sessions" — UNQUALIFIED
     purpose: str
     columns: tuple[ColumnSpec, ...]
     examples: tuple[str, ...] = field(default_factory=tuple)
@@ -49,14 +49,22 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
         columns=(
             ColumnSpec("session_id", "uuid", "Primary key."),
             ColumnSpec("vehicle_id", "varchar", "FK to vehicles."),
-            ColumnSpec("driver_id", "uuid", "Nullable — set when session was authorized via driver-bound RFID."),
+            ColumnSpec(
+                "driver_id",
+                "uuid",
+                "Nullable — set when session was authorized via driver-bound RFID.",
+            ),
             ColumnSpec("card_id", "uuid", "Nullable — RFID card that started the session."),
             ColumnSpec("station_id", "varchar", "OCPP station id (textual), not a UUID."),
             ColumnSpec("depot_id", "uuid", "FK to depots."),
             ColumnSpec("start_time", "timestamptz", "Session start (UTC)."),
             ColumnSpec("end_time", "timestamptz", "NULL while the session is open."),
             ColumnSpec("energy_kwh", "numeric", "Total energy delivered, kWh."),
-            ColumnSpec("cost_total", "numeric", "Customer-facing cost in depot currency. NULL if unpriceable."),
+            ColumnSpec(
+                "cost_total",
+                "numeric",
+                "Customer-facing cost in depot currency. NULL if unpriceable.",
+            ),
             ColumnSpec(
                 "cost_total_source",
                 "text",
@@ -84,17 +92,38 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("run_id", "uuid"),
             ColumnSpec("depot_id", "uuid"),
             ColumnSpec("run_time", "timestamptz"),
-            ColumnSpec("trigger_reason", "varchar", "'scheduled' | 'price_spike' | 'soc_deviation' | 'return_time_deviation' | 'interdepot_handoff'."),
+            ColumnSpec(
+                "trigger_reason",
+                "varchar",
+                "Free-form string, NOT a tidy enum. Literal values: "
+                "control-loop writes 'scheduled', 'hourly', "
+                "'vdv463_charging_request_change'; the API writes "
+                "'api_request' (POST /optimize), 'manual_command' "
+                "(operator-triggered runs), 'schedule_adjust_command' "
+                "(schedule-change triggered runs). Prefix-tagged values "
+                "carry detail after a colon: 'SoC deviation: …', "
+                "'Price change: …', 'Return delay: …', "
+                "'interdepot_handoff: …'. Filter by category with LIKE, "
+                "e.g. WHERE trigger_reason LIKE 'Price change%' for "
+                "price-spike-triggered runs.",
+            ),
             ColumnSpec("horizon_start", "timestamptz"),
             ColumnSpec("horizon_end", "timestamptz"),
             ColumnSpec("solve_time_s", "double precision"),
             ColumnSpec("peak_demand_kw", "double precision"),
-            ColumnSpec("status", "varchar", "'optimal' | 'feasible' | 'degraded' | 'infeasible' | 'timeout'."),
+            ColumnSpec(
+                "status",
+                "varchar",
+                "'optimal' | 'feasible' | 'degraded' | 'infeasible' | 'timeout'.",
+            ),
             ColumnSpec("solver_used", "varchar", "'gurobi' | 'highs'."),
         ),
         examples=(
             "SELECT trigger_reason, COUNT(*) FROM agent_views.optimization_runs($1) "
             "WHERE run_time >= now() - interval '24 hours' GROUP BY trigger_reason",
+            "SELECT COUNT(*) FROM agent_views.optimization_runs($1) "
+            "WHERE run_time >= now() - interval '30 days' "
+            "AND trigger_reason LIKE 'Price change%'",
         ),
     ),
     FunctionSpec(
@@ -106,7 +135,19 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("created_at", "timestamptz"),
             ColumnSpec("severity_level", "smallint", "1=info, 2=warning, 3=critical."),
             ColumnSpec("status", "text", "'active' | 'acknowledged' | 'resolved'."),
-            ColumnSpec("alert_type", "text"),
+            ColumnSpec(
+                "alert_type",
+                "text",
+                "Values emitted in production today: 'charger_fault' "
+                "(migration 022's fn_alerts_on_connector_status trigger, "
+                "when a connector goes Faulted/Unavailable), plus three "
+                "written by src/core/controller.py via upsert_alert: "
+                "'missing_input' (state-assembler input missing), "
+                "'degraded_optimization' (solver ran in degraded mode), "
+                "'stale_telemetry' (telemetry age exceeded the freshness "
+                "threshold). Column is TEXT, not enum-constrained — "
+                "future versions may add types.",
+            ),
         ),
         examples=(
             "SELECT severity_level, COUNT(*) FROM agent_views.alerts($1) "
@@ -182,7 +223,11 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("station_id", "varchar", "OCPP station id."),
             ColumnSpec("connector_id", "integer", "OCPP connector index (1, 2, …)."),
             ColumnSpec("depot_id", "uuid"),
-            ColumnSpec("status", "varchar", "OCPP connector status, e.g. 'Available', 'Charging', 'Faulted', 'Unavailable'."),
+            ColumnSpec(
+                "status",
+                "varchar",
+                "OCPP connector status, e.g. 'Available', 'Charging', 'Faulted', 'Unavailable'.",
+            ),
             ColumnSpec("error_code", "varchar", "OCPP error code; blank when status is healthy."),
             ColumnSpec("last_changed_at", "timestamptz"),
         ),
@@ -217,9 +262,7 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
                 "filter by depot.",
             ),
         ),
-        examples=(
-            "SELECT depot_id, name, timezone, entsoe_zone FROM agent_views.depots($1)",
-        ),
+        examples=("SELECT depot_id, name, timezone, entsoe_zone FROM agent_views.depots($1)",),
     ),
     FunctionSpec(
         name="vehicles",
@@ -245,13 +288,17 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
         columns=(
             ColumnSpec("charger_id", "uuid"),
             ColumnSpec("depot_id", "uuid"),
-            ColumnSpec("ocpp_id", "text", "Free-form OCPP station id used in StatusNotification, etc."),
+            ColumnSpec(
+                "ocpp_id", "text", "Free-form OCPP station id used in StatusNotification, etc."
+            ),
             ColumnSpec("rated_kw", "double precision"),
             ColumnSpec("connector_type", "text", "MVP is CCS only."),
             ColumnSpec("vendor", "text"),
             ColumnSpec("display_name", "text"),
         ),
-        examples=("SELECT depot_id, AVG(rated_kw) FROM agent_views.chargers($1) GROUP BY depot_id",),
+        examples=(
+            "SELECT depot_id, AVG(rated_kw) FROM agent_views.chargers($1) GROUP BY depot_id",
+        ),
     ),
     FunctionSpec(
         name="drivers",
@@ -264,7 +311,9 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("email", "text"),
             ColumnSpec("status", "text", "'active' | 'inactive'."),
         ),
-        examples=("SELECT driver_id, display_name FROM agent_views.drivers($1) WHERE status = 'active'",),
+        examples=(
+            "SELECT driver_id, display_name FROM agent_views.drivers($1) WHERE status = 'active'",
+        ),
     ),
     FunctionSpec(
         name="schedules_recent",
@@ -280,7 +329,9 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("route_id", "text", "Customer-supplied route identifier."),
             ColumnSpec("departure_time", "timestamptz"),
             ColumnSpec("return_time", "timestamptz", "Scheduled return."),
-            ColumnSpec("actual_return_time", "timestamptz", "Observed return (may differ from scheduled)."),
+            ColumnSpec(
+                "actual_return_time", "timestamptz", "Observed return (may differ from scheduled)."
+            ),
             ColumnSpec("energy_kwh", "double precision", "Estimated energy demand for the route."),
             ColumnSpec("required_soc", "double precision", "Target SoC at departure (0.0–1.0)."),
         ),
@@ -301,11 +352,12 @@ GLOSSARY: tuple[str, ...] = (
     "consumption = SUM(energy_kwh) in agent_views.sessions over the window of interest.",
     "cost / spend = SUM(cost_total) in agent_views.sessions; rows where cost_total IS NULL are 'unpriceable' and should be excluded from the headline number. Use cost_total_source = 'granular' for the most accurate subset.",
     "peak demand = MAX(peak_demand_kw) from agent_views.optimization_runs($1) for solver-reported depot peaks, or MAX(peak_kw) from agent_views.building_load_hourly($1) for non-EV building load. telemetry_hourly is not exposed in V1 — do not reference it.",
-    "depot-local day boundaries: use `start_time AT TIME ZONE (SELECT timezone FROM agent_views.depots($1) WHERE depot_id = …)`.",
+    "depot-local time: any timestamptz column converts with `<col> AT TIME ZONE (SELECT timezone FROM agent_views.depots($1) WHERE depot_id = …)`. Works for `sessions.start_time` day-bucket boundaries AND for time-of-day windows on `prices_hourly.hour` (e.g. morning peak 07:00–09:00 local). Note `prices_hourly` is zone-keyed, not depot-keyed: read both `timezone` and `entsoe_zone` from the same `depots($1)` row, then filter prices by `bidding_zone` and convert `hour` to local with the timezone.",
     "current driver of an RFID card: NOT in agent_views directly; use the lookup_entity tool with kind='rfid'.",
     "an 'open' session has end_time IS NULL.",
     "the cross-DB boundary: vehicles/drivers/chargers/depots/schedules_recent live on the static pool; sessions/optimization_runs/alerts/prices_hourly/building_load_hourly/connector_status_latest live on the TS pool. You cannot JOIN across; resolve IDs via one pool, then query the other.",
     "the LLM must NEVER include the org id / depot ids as a literal — the server binds those automatically via $1.",
+    "optimization_runs.trigger_reason is free-form, not enum: scheduled / hourly / vdv463_charging_request_change are literals; SoC deviation / Price change / Return delay / interdepot_handoff are prefixes followed by detail strings. Use `LIKE 'Price change%'` (etc.) to filter by category.",
 )
 
 
@@ -360,10 +412,7 @@ def describe_function(name: str) -> dict | None:
             return {
                 "name": f"agent_views.{spec.name}",
                 "purpose": spec.purpose,
-                "columns": [
-                    {"name": c.name, "type": c.type, "note": c.note}
-                    for c in spec.columns
-                ],
+                "columns": [{"name": c.name, "type": c.type, "note": c.note} for c in spec.columns],
                 "requires_time_predicate": spec.requires_time_predicate,
                 "examples": list(spec.examples),
             }

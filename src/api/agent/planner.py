@@ -42,7 +42,12 @@ class PlannerDecision:
 
 
 # Phrases that strongly suggest the consumption fast path. All
-# lowercased; matched against a lowercased user message.
+# lowercased; matched against a lowercased user message. The fast
+# path's compiler (`compile_consumption_by_user`) only handles
+# resolved DRIVER subjects, so any pattern here must encode that:
+# borderline shapes that could resolve to a vehicle/depot/charger
+# subject have to fall through to sql_general instead — otherwise
+# the compiler raises ValueError at runtime.
 _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bhow much (did|has) .+ (charg(?:e|ed|ing)|consum(?:e|ed|ing)|used)\b"),
     re.compile(r"\bconsumption (of|for|by) \S+"),
@@ -54,6 +59,10 @@ _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
 # back to sql_general (e.g. "which charger consumed the most" is a
 # ranking question, not a per-user consumption question).
 _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
+    # Per-vehicle rollups need agent_views.sessions on the SQL path; the fast
+    # path compiler only aggregates by resolved driver/card subjects. Match
+    # both singular and plural (`vehicle` / `vehicles`).
+    re.compile(r"\bvehicles?\b"),
     re.compile(r"\bwhich (depots?|chargers?|vehicles?|drivers?)\b"),
     re.compile(r"\bcompare\b"),
     re.compile(r"\bunderutil"),

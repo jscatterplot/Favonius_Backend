@@ -9,10 +9,21 @@ worked only because each FunctionSpec lived in exactly one tuple).
 from __future__ import annotations
 
 from src.api.agent.catalogue import (
+    GLOSSARY,
     STATIC_FUNCTIONS,
     TS_FUNCTIONS,
     list_functions_summary,
 )
+
+
+def _column_note(funcs, fn_name: str, col_name: str) -> str:
+    for fn in funcs:
+        if fn.name == fn_name:
+            for col in fn.columns:
+                if col.name == col_name:
+                    return col.note
+            raise AssertionError(f"column {col_name!r} missing from {fn_name!r}")
+    raise AssertionError(f"function {fn_name!r} not found")
 
 
 def test_list_functions_summary_labels_ts_and_static_correctly():
@@ -20,13 +31,13 @@ def test_list_functions_summary_labels_ts_and_static_correctly():
     pool_by_name = {entry["name"]: entry["pool"] for entry in summary}
 
     for spec in TS_FUNCTIONS:
-        assert pool_by_name[f"agent_views.{spec.name}"] == "ts", (
-            f"TS function {spec.name!r} mislabelled"
-        )
+        assert (
+            pool_by_name[f"agent_views.{spec.name}"] == "ts"
+        ), f"TS function {spec.name!r} mislabelled"
     for spec in STATIC_FUNCTIONS:
-        assert pool_by_name[f"agent_views.{spec.name}"] == "static", (
-            f"Static function {spec.name!r} mislabelled"
-        )
+        assert (
+            pool_by_name[f"agent_views.{spec.name}"] == "static"
+        ), f"Static function {spec.name!r} mislabelled"
 
 
 def test_list_functions_summary_pool_label_uses_name_not_identity():
@@ -48,8 +59,7 @@ def test_list_functions_summary_includes_purpose_first_line():
     for entry in summary:
         assert entry["purpose"], f"empty purpose for {entry['name']}"
         assert "\n" not in entry["purpose"], (
-            f"purpose for {entry['name']} contains newline — "
-            "should be one line only"
+            f"purpose for {entry['name']} contains newline — " "should be one line only"
         )
 
 
@@ -65,3 +75,70 @@ def test_list_functions_summary_marks_hypertable_time_predicate():
     # Non-hypertable functions should NOT require a time predicate.
     assert by_name["agent_views.sessions"]["requires_time_predicate"] is False
     assert by_name["agent_views.depots"]["requires_time_predicate"] is False
+
+
+def test_optimization_runs_trigger_reason_vocab_matches_emitters():
+    """The previous catalogue claimed `trigger_reason` was a clean enum
+    ('price_spike' | 'soc_deviation' | …). The real emitters write a
+    mix of literals and prefix-tagged strings; pin every emit-site so
+    a future regression on this column note surfaces immediately.
+
+    Emit sites (kept in sync with this list):
+    - src/core/state/triggers.py — 'scheduled',
+      'vdv463_charging_request_change', and the four prefix tags.
+    - src/core/controller.py — 'hourly'.
+    - src/api/main.py — 'api_request', 'manual_command',
+      'schedule_adjust_command'.
+    """
+    note = _column_note(TS_FUNCTIONS, "optimization_runs", "trigger_reason")
+    control_loop_literals = ("scheduled", "hourly", "vdv463_charging_request_change")
+    api_literals = ("api_request", "manual_command", "schedule_adjust_command")
+    for literal in control_loop_literals + api_literals:
+        assert literal in note, f"literal value {literal!r} missing from trigger_reason note"
+    for prefix in ("SoC deviation", "Price change", "Return delay", "interdepot_handoff"):
+        assert prefix in note, f"prefix {prefix!r} missing from trigger_reason note"
+    assert "LIKE" in note, "trigger_reason note should teach the LIKE-prefix filter idiom"
+    # The misleading old enum value must not reappear.
+    assert "'price_spike'" not in note
+
+
+def test_alerts_alert_type_documents_emitted_values():
+    """`alerts.alert_type` is TEXT, not enum-constrained. Migration 022
+    emits 'charger_fault'; src/core/controller.py emits three more via
+    upsert_alert ('missing_input', 'degraded_optimization',
+    'stale_telemetry'). The LLM needs all four to answer ops-status
+    questions without undercounting non-fault alerts.
+    """
+    note = _column_note(TS_FUNCTIONS, "alerts", "alert_type")
+    for value in (
+        "charger_fault",
+        "missing_input",
+        "degraded_optimization",
+        "stale_telemetry",
+    ):
+        assert value in note, f"alert_type {value!r} missing from catalogue note"
+
+
+def test_glossary_teaches_trigger_reason_prefix_idiom():
+    """The cross-question idiom ('use LIKE for trigger_reason
+    categories') belongs in the glossary so the LLM picks it up
+    regardless of which column note it lands on first.
+    """
+    joined = " ".join(GLOSSARY)
+    assert "trigger_reason" in joined
+    assert "LIKE" in joined
+
+
+def test_glossary_teaches_tz_idiom_for_prices_hourly():
+    """Q17 ("average price during morning peak 07–09 local") needs
+    the AT TIME ZONE idiom on `prices_hourly.hour`. The original
+    glossary line only mentioned `sessions.start_time`; an LLM
+    answering Q17 had to generalise on its own. Pin the broader
+    phrasing so future edits don't accidentally narrow it back.
+    """
+    joined = " ".join(GLOSSARY)
+    assert "AT TIME ZONE" in joined
+    assert "prices_hourly" in joined
+    # The zone-keyed nature of prices_hourly (not depot-keyed) is the
+    # specific footgun this line exists to defuse.
+    assert "bidding_zone" in joined or "entsoe_zone" in joined
