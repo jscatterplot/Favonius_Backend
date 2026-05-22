@@ -129,7 +129,7 @@ def test_planner_decision_is_frozen():
 EVAL_QUESTIONS_ROUTING: tuple[tuple[str, str, str], ...] = (
     # (id, question, expected_route)
     # Energy + cost rollups (7)
-    ("en_01", "How much energy did vehicle bus_101 consume last month?", "consumption_by_user"),
+    ("en_01", "How much energy did vehicle bus_101 consume last month?", "sql_general"),
     ("en_02", "What was the total electricity cost at depot Vilnius last week?", "sql_general"),
     ("en_03", "Which depot had the highest energy consumption in April 2026?", "sql_general"),
     ("en_04", "How many kWh did driver John Smith use this month?", "consumption_by_user"),

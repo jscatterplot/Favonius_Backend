@@ -60,6 +60,9 @@ _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
 # back to sql_general (e.g. "which charger consumed the most" is a
 # ranking question, not a per-user consumption question).
 _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
+    # Per-vehicle rollups need agent_views.sessions on the SQL path; the fast
+    # path compiler only aggregates by resolved driver/card subjects.
+    re.compile(r"\bvehicle\b"),
     re.compile(r"\bwhich (depots?|chargers?|vehicles?|drivers?)\b"),
     re.compile(r"\bcompare\b"),
     re.compile(r"\bunderutil"),
