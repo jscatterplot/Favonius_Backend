@@ -388,14 +388,18 @@ async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]
         return
 
     # Patch the in-flight user dict so the current request's auth check sees
-    # the corrected role without requiring a token refresh. Safe because:
-    # (a) we only reach here when favonius_role was absent — we never overwrite
-    #     an existing lower-privilege claim; (b) the payload is the same data
-    #     we just pushed to Supabase as the authoritative source.
+    # repaired claims without requiring a token refresh. Never overwrite an
+    # existing favonius_role: Case A runs when organization_id is missing even
+    # if the JWT already carries a role (the early return requires both set).
+    in_flight = (
+        payload
+        if not has_favonius_role
+        else {k: v for k, v in payload.items() if k != "favonius_role"}
+    )
     if isinstance(user.get("app_metadata"), dict):
-        user["app_metadata"].update(payload)
+        user["app_metadata"].update(in_flight)
     else:
-        user["app_metadata"] = dict(payload)
+        user["app_metadata"] = dict(in_flight)
 
     logger.warning(
         "tenant_metadata_repair: backfilled app_metadata user=%s org=%s role=%s",
