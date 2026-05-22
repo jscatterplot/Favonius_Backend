@@ -5148,7 +5148,7 @@ async def patch_recurring_schedule_template(
     await _assert_recurring_depot_access(depot_id, user)
     validate_uuid(template_id, "template_id")
 
-    patch_data = patch.model_dump(exclude_unset=True)
+    patch_data = patch.model_dump(exclude_unset=True, exclude_none=True)
     if not patch_data:
         return _recurring_validation_400(
             "body", "At least one recurring template field is required"
