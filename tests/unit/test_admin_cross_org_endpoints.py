@@ -1087,3 +1087,238 @@ class TestWriteAdminAuditRowStrictMode:
             await write_admin_audit_row(None, AdminAuditRow(action="admin.read"))
 
         asyncio.run(_run())
+
+
+# ── GET /admin/depots/{depot_id}/chargers/{charger_id}/sessions ─────────────
+
+
+class TestListChargerCompletedSessionsRBAC:
+    """GET .../chargers/{id}/sessions — favonius_admin or matching customer_admin.
+
+    Feeds the charger-logs admin UI: operator picks a session, then triggers
+    ``POST .../sessions/{session_id}/fetch_logs``. Role gate matches the
+    action endpoint so the listing and the workflow it leads into share
+    the same audience.
+    """
+
+    URL = f"/admin/depots/{DEPOT_ID}/chargers/{CHARGER_ID}/sessions"
+
+    def _hit(self, client, query: str = ""):
+        return client.get(f"{self.URL}{query}", headers=AUTH_HDR)
+
+    @staticmethod
+    def _session_row(*, source: str = "live", ocpp_id: str = "acme-berlin-001") -> dict:
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        return {
+            "session_id": str(uuid4()),
+            "ocpp_id": ocpp_id,
+            "connector_id": 1,
+            "vehicle_id": str(uuid4()),
+            "driver_id": None,
+            "started_at": now - timedelta(minutes=45),
+            "ended_at": now - timedelta(minutes=5),
+            "energy_delivered_kwh": 21.5,
+            "energy_received_kwh": None,
+            "cost_total": 4.30,
+            "start_soc_percent": 30.0,
+            "end_soc_percent": 90.0,
+            "source": source,
+        }
+
+    def test_favonius_admin_200_returns_sessions(self, client, mock_pool):
+        pool, conn = mock_pool
+        _override_user(_user("favonius_admin"))
+        conn.fetchrow = AsyncMock(return_value={"ocpp_id": "acme-berlin-001"})
+        rows = [self._session_row(), self._session_row()]
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.list_completed_sessions_for_charger",
+                new_callable=AsyncMock,
+                return_value=rows,
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock),
+        ):
+            response = self._hit(client, "?limit=2")
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert len(body["items"]) == 2
+        # Page is full at the requested limit → cursor must be returned.
+        assert body["next_cursor"] is not None
+        assert "fetched_at" in body
+
+    def test_customer_admin_own_org_200(self, client, mock_pool):
+        pool, conn = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        conn.fetchrow = AsyncMock(return_value={"ocpp_id": "acme-berlin-001"})
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.list_completed_sessions_for_charger",
+                new_callable=AsyncMock,
+                return_value=[self._session_row()],
+            ),
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert len(body["items"]) == 1
+        # Partial page → no cursor.
+        assert body["next_cursor"] is None
+
+    def test_customer_admin_other_org_403_not_404(self, client, mock_pool):
+        pool, _ = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+        ):
+            response = self._hit(client)
+        # 403 (not 404) — never leak depot existence across tenants.
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+        assert response.json()["detail"]["error_code"] == "FORBIDDEN_DEPOT"
+
+    def test_customer_operator_403_role_gate(self, client, mock_pool):
+        """customer_operator is blocked here even though it can read /depots/{}/sessions.
+
+        The role gate matches the sibling fetch_logs action — only customer_admin
+        and favonius_admin can use the charger-logs admin workflow.
+        """
+        _override_user(_user("customer_operator", organization_id=ORG_ID))
+        response = self._hit(client)
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+        assert response.json()["detail"]["error_code"] == "FORBIDDEN_ROLE"
+
+    def test_viewer_403(self, client, mock_pool):
+        _override_user(_user("viewer"))
+        response = self._hit(client)
+        assert response.status_code == http_status.HTTP_403_FORBIDDEN
+        assert response.json()["detail"]["error_code"] == "FORBIDDEN_ROLE"
+
+    def test_charger_not_in_depot_404(self, client, mock_pool):
+        """Charger UUID exists but belongs to a different depot → 404 CHARGER_NOT_FOUND."""
+        pool, conn = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        conn.fetchrow = AsyncMock(return_value=None)
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_404_NOT_FOUND
+        assert response.json()["detail"]["error_code"] == "CHARGER_NOT_FOUND"
+
+    def test_invalid_charger_uuid_400(self, client, mock_pool):
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        bad_url = f"/admin/depots/{DEPOT_ID}/chargers/not-a-uuid/sessions"
+        response = client.get(bad_url, headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+
+    def test_invalid_depot_uuid_400(self, client, mock_pool):
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        bad_url = f"/admin/depots/not-a-uuid/chargers/{CHARGER_ID}/sessions"
+        response = client.get(bad_url, headers=AUTH_HDR)
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+
+    def test_from_after_to_400(self, client, mock_pool):
+        pool, conn = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        conn.fetchrow = AsyncMock(return_value={"ocpp_id": "acme-berlin-001"})
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+        ):
+            response = self._hit(
+                client,
+                "?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+            )
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+
+    def test_invalid_cursor_400(self, client, mock_pool):
+        pool, conn = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        conn.fetchrow = AsyncMock(return_value={"ocpp_id": "acme-berlin-001"})
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+        ):
+            response = self._hit(client, "?cursor=not-base64")
+        assert response.status_code == http_status.HTTP_400_BAD_REQUEST
+
+    def test_cursor_round_trip(self, client, mock_pool):
+        """Last item's cursor on page N opens a valid query for page N+1."""
+        pool, conn = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        conn.fetchrow = AsyncMock(return_value={"ocpp_id": "acme-berlin-001"})
+        rows = [self._session_row()]
+        list_mock = AsyncMock(return_value=rows)
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.list_completed_sessions_for_charger", list_mock
+            ),
+        ):
+            r1 = self._hit(client, "?limit=1")
+            cursor = r1.json()["next_cursor"]
+            assert cursor is not None
+            r2 = self._hit(client, f"?limit=1&cursor={cursor}")
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # Second call passed a decoded cursor tuple through to the query.
+        assert list_mock.await_args.kwargs["cursor"] is not None
+
+    def test_empty_result(self, client, mock_pool):
+        pool, conn = mock_pool
+        _override_user(_user("customer_admin", organization_id=ORG_ID))
+        conn.fetchrow = AsyncMock(return_value={"ocpp_id": "acme-berlin-001"})
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=ORG_ID),
+            ),
+            patch(
+                "src.api.main.db_queries.list_completed_sessions_for_charger",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert body["items"] == []
+        assert body["next_cursor"] is None

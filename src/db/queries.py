@@ -3070,6 +3070,68 @@ async def list_completed_sessions_for_depot(
     return [dict(r) for r in rows]
 
 
+async def list_completed_sessions_for_charger(
+    db,
+    *,
+    station_ocpp_id: str,
+    from_ts: Optional[datetime],
+    to_ts: Optional[datetime],
+    limit: int,
+    cursor: Optional[tuple[datetime, str]],
+) -> list[dict]:
+    """Paginated completed sessions filtered to a single charger's OCPP id.
+
+    Backs ``GET /admin/depots/{id}/chargers/{id}/sessions`` — the listing
+    operators use to pick a session before triggering a charger-side log
+    pull via ``POST .../sessions/{id}/fetch_logs``. Same keyset shape as
+    :func:`list_completed_sessions_for_depot`; the only difference is the
+    scope: strict ``station_id = $1`` (no ``site_id`` fallback, since a
+    legacy import without ``station_id`` cannot be attributed to a
+    specific charger).
+    """
+    clauses: list[str] = ["end_time IS NOT NULL", "station_id = $1"]
+    params: list[Any] = [station_ocpp_id]
+
+    if from_ts is not None:
+        params.append(from_ts)
+        clauses.append(f"end_time >= ${len(params)}")
+    if to_ts is not None:
+        params.append(to_ts)
+        clauses.append(f"end_time < ${len(params)}")
+
+    if cursor is not None:
+        cursor_ts, cursor_session_id = cursor
+        params.append(cursor_ts)
+        params.append(cursor_session_id)
+        clauses.append(
+            f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)"
+        )
+
+    params.append(limit)
+    where_sql = " AND ".join(clauses)
+    query = f"""
+        SELECT session_id::text          AS session_id,
+               station_id                AS ocpp_id,
+               connector_id,
+               vehicle_id::text          AS vehicle_id,
+               driver_id::text           AS driver_id,
+               start_time                AS started_at,
+               end_time                  AS ended_at,
+               energy_delivered_kwh,
+               energy_received_kwh,
+               cost_total,
+               start_soc_percent,
+               end_soc_percent,
+               source
+        FROM charging_sessions
+        WHERE {where_sql}
+        ORDER BY end_time DESC, session_id DESC
+        LIMIT ${len(params)}
+    """
+    rows = await db.fetch(query, *params)
+    return [dict(r) for r in rows]
+
+
 async def latest_telemetry_for_depot_vehicles(db, *, vehicle_ids: list[str]) -> list[dict]:
     """Lightweight per-vehicle real-time state for a depot.
 
