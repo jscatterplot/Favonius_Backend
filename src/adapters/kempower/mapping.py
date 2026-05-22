@@ -105,13 +105,15 @@ def kempower_station_to_charger_request(
     connector_types = {(c.get("type") or "").upper() for c in connectors}
     # Accept the canonical CCS variants. Kempower's enum hasn't been pinned
     # — some deployments report "CCS", some "CCS1", "CCS2", "CCS_TYPE_2".
-    if not all(t.startswith("CCS") or t == "" for t in connector_types):
+    if not all(t.startswith("CCS") for t in connector_types):
         raise UnsupportedConnectorError(
             f"Kempower station {station.get('stationId')!r} has non-CCS connectors: "
             f"{sorted(connector_types)}"
         )
 
-    connector_ids = sorted({int(c["connectorId"]) for c in connectors if "connectorId" in c})
+    connector_ids = sorted(
+        {int(c["connectorId"]) for c in connectors if "connectorId" in c}
+    )
     if not connector_ids:
         # Connector list present but no numeric ids — fall back to a 1-based
         # sequence matching len(connectors). ChargerCreateRequest validates
@@ -119,7 +121,9 @@ def kempower_station_to_charger_request(
         connector_ids = list(range(1, len(connectors) + 1))
 
     return KempowerChargerPayload(
-        display_name=station.get("name") or station.get("stationId") or "Kempower charger",
+        display_name=station.get("name")
+        or station.get("stationId")
+        or "Kempower charger",
         vendor="Kempower",
         model=station.get("model"),
         serial_number=station.get("serialNumber"),
@@ -263,16 +267,12 @@ def kempower_location_to_site_suggestions(
     Returned keys (omitted when Kempower has no value):
 
     - ``name``: ``Location.name``
-    - ``address``: full one-line ``Location.address`` (we don't split — the
-      depot's structured address is already operator-supplied)
     - ``latitude`` / ``longitude``: ``Location.lat`` / ``Location.lng``
     - ``max_grid_kw``: ``power_group.limitKw`` if present
     """
     suggestions: dict[str, Any] = {}
     if location.get("name"):
         suggestions["name"] = location["name"]
-    if location.get("address"):
-        suggestions["address"] = location["address"]
     lat, lng = location.get("lat"), location.get("lng")
     if lat is not None:
         suggestions["latitude"] = float(lat)

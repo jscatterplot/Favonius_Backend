@@ -90,7 +90,10 @@ class _FakeConn:
         if "from sites where id = $1::uuid" in sql_lc and "select id::text" in sql_lc:
             row = self._store.sites.get(args[0])
             return dict(row) if row else None
-        if "from charging_stations where site_id = $1::uuid and station_id = $2" in sql_lc:
+        if (
+            "from charging_stations where site_id = $1::uuid and station_id = $2"
+            in sql_lc
+        ):
             for station in self._store.charging_stations:
                 if station["site_id"] == args[0] and station["station_id"] == args[1]:
                     return {"id": station["id"]}
@@ -127,7 +130,10 @@ class _FakeConn:
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         sql_lc = " ".join(sql.lower().split())
-        if "from charging_stations where site_id = $1::uuid and id = any($2::uuid[])" in sql_lc:
+        if (
+            "from charging_stations where site_id = $1::uuid and id = any($2::uuid[])"
+            in sql_lc
+        ):
             wanted = set(args[1])
             return [
                 {"charger_id": st["id"]}
@@ -404,18 +410,21 @@ class _FakeKempower:
         async def gen():
             for s in self._stations:
                 yield s
+
         return gen()
 
     def iter_vehicles(self, _location_id: str):
         async def gen():
             for v in self._vehicles:
                 yield v
+
         return gen()
 
     def iter_transactions(self, *, station_id: str, start_iso: str, end_iso: str):
         async def gen():
             for tx in self._transactions_by_station.get(station_id, []):
                 yield tx
+
         return gen()
 
 
@@ -651,24 +660,40 @@ async def test_rerun_is_idempotent(store, static_pool, ts_pool):
         counts = _counts()
         depot = await cli._load_depot(static_pool, _DEPOT)
         station_map = await cli._import_chargers(
-            static_pool, kempower, depot_id=depot["depot_id"],
-            kempower_location_id="loc-1", dry_run=False, counts=counts,
+            static_pool,
+            kempower,
+            depot_id=depot["depot_id"],
+            kempower_location_id="loc-1",
+            dry_run=False,
+            counts=counts,
         )
         vehicle_map = await cli._import_vehicles(
-            static_pool, kempower, depot_id=depot["depot_id"],
+            static_pool,
+            kempower,
+            depot_id=depot["depot_id"],
             organization_id=depot["organization_id"],
-            kempower_location_id="loc-1", dry_run=False, counts=counts,
+            kempower_location_id="loc-1",
+            dry_run=False,
+            counts=counts,
         )
         await cli._upsert_access_matrix(
-            static_pool, depot_id=depot["depot_id"],
-            station_map=station_map, vehicle_map=vehicle_map,
-            dry_run=False, counts=counts,
+            static_pool,
+            depot_id=depot["depot_id"],
+            station_map=station_map,
+            vehicle_map=vehicle_map,
+            dry_run=False,
+            counts=counts,
         )
         await cli._backfill_sessions(
-            ts_pool, kempower, depot_id=depot["depot_id"],
-            station_map=station_map, vehicle_map=vehicle_map,
+            ts_pool,
+            kempower,
+            depot_id=depot["depot_id"],
+            station_map=station_map,
+            vehicle_map=vehicle_map,
             backfill_since=datetime(2025, 1, 1, tzinfo=timezone.utc),
-            batch_id=batch_id, dry_run=False, counts=counts,
+            batch_id=batch_id,
+            dry_run=False,
+            counts=counts,
         )
         return counts
 
@@ -720,8 +745,12 @@ async def test_non_ccs_charger_is_skipped(store, static_pool, ts_pool):
     counts = _counts()
     depot = await cli._load_depot(static_pool, _DEPOT)
     station_map = await cli._import_chargers(
-        static_pool, kempower, depot_id=depot["depot_id"],
-        kempower_location_id="loc-1", dry_run=False, counts=counts,
+        static_pool,
+        kempower,
+        depot_id=depot["depot_id"],
+        kempower_location_id="loc-1",
+        dry_run=False,
+        counts=counts,
     )
 
     assert counts.chargers_created == 1
@@ -737,13 +766,11 @@ async def test_non_ccs_charger_is_skipped(store, static_pool, ts_pool):
 
 
 @pytest.mark.asyncio
-async def test_site_suggestions_patches_chosen_fields(
-    monkeypatch, store, static_pool
-):
+async def test_site_suggestions_patches_chosen_fields(monkeypatch, store, static_pool):
     # Operator agrees to name + max_grid_kw only.
-    # Diff is ordered (name, address, latitude, longitude, max_grid_kw),
-    # so y/n/n/n/y selects exactly those two fields.
-    inputs = iter(["y", "n", "n", "n", "y"])
+    # Diff is ordered (name, latitude, longitude, max_grid_kw),
+    # so y/n/n/y selects exactly those two fields.
+    inputs = iter(["y", "n", "n", "y"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
 
     kempower = _FakeKempower(
@@ -760,10 +787,13 @@ async def test_site_suggestions_patches_chosen_fields(
     counts = _counts()
     depot = await cli._load_depot(static_pool, _DEPOT)
     await cli._maybe_apply_site_suggestions(
-        static_pool, kempower,
+        static_pool,
+        kempower,
         depot_row=depot,
         kempower_location_id="loc-1",
-        apply=True, dry_run=False, counts=counts,
+        apply=True,
+        dry_run=False,
+        counts=counts,
     )
 
     assert counts.site_suggestions  # diff was non-empty
@@ -777,9 +807,7 @@ async def test_site_suggestions_patches_chosen_fields(
 
 
 @pytest.mark.asyncio
-async def test_site_suggestions_no_diff_writes_nothing(
-    monkeypatch, store, static_pool
-):
+async def test_site_suggestions_no_diff_writes_nothing(monkeypatch, store, static_pool):
     # Seed depot already matches Kempower exactly — no prompts should fire.
     monkeypatch.setattr(
         "builtins.input",
@@ -794,10 +822,13 @@ async def test_site_suggestions_no_diff_writes_nothing(
     # address mismatches (seed has structured address dict) — drop it
     kempower._location["address"] = None
     await cli._maybe_apply_site_suggestions(
-        static_pool, kempower,
+        static_pool,
+        kempower,
         depot_row=depot,
         kempower_location_id="loc-1",
-        apply=True, dry_run=False, counts=counts,
+        apply=True,
+        dry_run=False,
+        counts=counts,
     )
     assert counts.site_patch_applied is False
 

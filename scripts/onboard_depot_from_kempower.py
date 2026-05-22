@@ -143,10 +143,7 @@ class _Counts:
 
 
 def _resolve_ts_url() -> str:
-    url = (
-        os.getenv("DATABASE_URL")
-        or os.getenv("TIMESCALE_SERVICE_URL")
-    )
+    url = os.getenv("DATABASE_URL") or os.getenv("TIMESCALE_SERVICE_URL")
     if not url:
         raise RuntimeError(
             "Set DATABASE_URL (or TIMESCALE_SERVICE_URL) to point at the "
@@ -274,8 +271,11 @@ async def _import_chargers(
         if dry_run:
             counts.chargers_created += 1
             station_map[kempower_station_id] = f"<would-create:{kempower_station_id}>"
-            logger.info("DRY would create charger %s (rated=%skW)",
-                        kempower_station_id, charger_request.rated_kw)
+            logger.info(
+                "DRY would create charger %s (rated=%skW)",
+                kempower_station_id,
+                charger_request.rated_kw,
+            )
             continue
 
         password = _generate_ocpp_basic_password()
@@ -347,16 +347,21 @@ async def _import_vehicles(
             counts.vehicles_already_linked += 1
             logger.info(
                 "Vehicle %s already linked → %s",
-                kempower_vehicle_id, existing["id"],
+                kempower_vehicle_id,
+                existing["id"],
             )
             continue
 
         if dry_run:
             counts.vehicles_created += 1
-            vehicle_map[str(kempower_vehicle_id)] = f"<would-create:{kempower_vehicle_id}>"
+            vehicle_map[str(kempower_vehicle_id)] = (
+                f"<would-create:{kempower_vehicle_id}>"
+            )
             logger.info(
                 "DRY would create vehicle %s (battery=%skWh, max_charge=%skW)",
-                kempower_vehicle_id, identity.battery_kwh, identity.max_charge_kw,
+                kempower_vehicle_id,
+                identity.battery_kwh,
+                identity.max_charge_kw,
             )
             continue
 
@@ -486,7 +491,8 @@ async def _backfill_sessions(
             counts.sessions_inserted += len(rows_to_insert)
             logger.info(
                 "DRY would insert %d sessions for station %s",
-                len(rows_to_insert), kempower_station_id,
+                len(rows_to_insert),
+                kempower_station_id,
             )
             continue
 
@@ -501,7 +507,8 @@ async def _backfill_sessions(
 
         logger.info(
             "Inserted/refreshed %d sessions for station %s",
-            len(rows_to_insert), kempower_station_id,
+            len(rows_to_insert),
+            kempower_station_id,
         )
 
 
@@ -510,7 +517,9 @@ def _chunked(items: list[Any], size: int):
         yield items[i : i + size]
 
 
-async def _insert_session_chunk(conn: asyncpg.Connection, rows: list[dict[str, Any]]) -> int:
+async def _insert_session_chunk(
+    conn: asyncpg.Connection, rows: list[dict[str, Any]]
+) -> int:
     """INSERT one chunk, returning the number of actually-inserted rows.
 
     Uses ``ON CONFLICT (site_id, import_row_hash) WHERE source = 'import'
@@ -574,16 +583,12 @@ async def _maybe_apply_site_suggestions(
     """Pull Kempower Location + Power Group; render the diff; optionally PATCH."""
     location = await kempower.get_location(kempower_location_id)
     power_group: Optional[dict[str, Any]] = None
-    root_group_id = (
-        location.get("rootPowerGroupId") or location.get("powerGroupId")
-    )
+    root_group_id = location.get("rootPowerGroupId") or location.get("powerGroupId")
     if root_group_id:
         try:
             power_group = await kempower.get_power_group(root_group_id)
         except KempowerClientError as exc:
-            logger.warning(
-                "Could not fetch power group %s: %s", root_group_id, exc
-            )
+            logger.warning("Could not fetch power group %s: %s", root_group_id, exc)
 
     suggestions = kempower_location_to_site_suggestions(location, power_group)
     diff: dict[str, Any] = {}
@@ -641,9 +646,7 @@ async def _maybe_apply_site_suggestions(
             **patch_args,
         )
     counts.site_patch_applied = result is not None
-    logger.info(
-        "Applied site suggestions: %s", ", ".join(sorted(chosen.keys()))
-    )
+    logger.info("Applied site suggestions: %s", ", ".join(sorted(chosen.keys())))
 
 
 def _values_differ(a: Any, b: Any) -> bool:
@@ -693,6 +696,7 @@ def _jsonb_to_dict(value: Any) -> dict[str, Any]:
         return value
     if isinstance(value, str):
         import json
+
         return json.loads(value)
     return dict(value)  # type: ignore[arg-type]
 
@@ -756,17 +760,18 @@ async def _run(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run,
                 counts=counts,
             )
-            await _backfill_sessions(
-                ts_pool,
-                kempower,
-                depot_id=depot_row["depot_id"],
-                station_map=station_map,
-                vehicle_map=vehicle_map,
-                backfill_since=args.backfill_since,
-                batch_id=batch_id,
-                dry_run=args.dry_run,
-                counts=counts,
-            )
+            if args.backfill_since is not None:
+                await _backfill_sessions(
+                    ts_pool,
+                    kempower,
+                    depot_id=depot_row["depot_id"],
+                    station_map=station_map,
+                    vehicle_map=vehicle_map,
+                    backfill_since=args.backfill_since,
+                    batch_id=batch_id,
+                    dry_run=args.dry_run,
+                    counts=counts,
+                )
             await _maybe_apply_site_suggestions(
                 static_pool,
                 kempower,
@@ -843,7 +848,9 @@ def _print_summary(
     if counts.site_suggestions:
         print("\nSite-data diff present (see above).", file=sys.stderr)
         if counts.site_patch_applied:
-            print("Applied selected suggestions via update_depot_setup.", file=sys.stderr)
+            print(
+                "Applied selected suggestions via update_depot_setup.", file=sys.stderr
+            )
 
 
 # ----------------------------------------------------------------------
@@ -940,11 +947,6 @@ def _parse_args() -> argparse.Namespace:
         UUID(args.depot_id)
     except ValueError:
         p.error(f"--depot-id must be a UUID, got {args.depot_id!r}")
-    if args.backfill_since is None:
-        # Fall back to "everything from 1970" so the iterator pulls
-        # whatever the operator's account has — same effective default
-        # as passing 1970-01-01 explicitly.
-        args.backfill_since = datetime(1970, 1, 1, tzinfo=timezone.utc)
     return args
 
 

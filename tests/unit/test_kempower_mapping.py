@@ -99,6 +99,18 @@ def test_station_falls_back_to_stationid_when_name_missing(ccs_station):
     assert payload.display_name == "KEM-DC-001"
 
 
+def test_station_rejects_missing_connector_type():
+    bad = {
+        "stationId": "X-0",
+        "name": "B",
+        "maxPowerKw": 50,
+        "connectors": [{"connectorId": 1}],
+    }
+    with pytest.raises(UnsupportedConnectorError) as exc_info:
+        kempower_station_to_charger_request(bad)
+    assert "X-0" in str(exc_info.value)
+
+
 def test_station_rejects_chademo():
     bad = {
         "stationId": "X-1",
@@ -376,7 +388,6 @@ def test_site_suggestions_with_power_group():
     suggestions = kempower_location_to_site_suggestions(location, power_group)
     assert suggestions == {
         "name": "Vilnius Depot",
-        "address": "5 Vilnius Street, Vilnius, LT",
         "latitude": 54.6872,
         "longitude": 25.2797,
         "max_grid_kw": 600.0,
