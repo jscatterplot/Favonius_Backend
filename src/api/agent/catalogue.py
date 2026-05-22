@@ -96,9 +96,13 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
                 "trigger_reason",
                 "varchar",
                 "Free-form string, NOT a tidy enum. Literal values: "
-                "'scheduled', 'hourly', 'vdv463_charging_request_change'. "
-                "Prefix-tagged values carry detail after a colon: "
-                "'SoC deviation: …', 'Price change: …', 'Return delay: …', "
+                "control-loop writes 'scheduled', 'hourly', "
+                "'vdv463_charging_request_change'; the API writes "
+                "'api_request' (POST /optimize), 'manual_command' "
+                "(operator-triggered runs), 'schedule_adjust_command' "
+                "(schedule-change triggered runs). Prefix-tagged values "
+                "carry detail after a colon: 'SoC deviation: …', "
+                "'Price change: …', 'Return delay: …', "
                 "'interdepot_handoff: …'. Filter by category with LIKE, "
                 "e.g. WHERE trigger_reason LIKE 'Price change%' for "
                 "price-spike-triggered runs.",
@@ -134,11 +138,15 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec(
                 "alert_type",
                 "text",
-                "Only value emitted in production today is 'charger_fault' "
-                "(written by migration 022's fn_alerts_on_connector_status "
-                "trigger when a connector goes Faulted/Unavailable). The "
-                "column is TEXT, not enum-constrained — future versions may "
-                "add types.",
+                "Values emitted in production today: 'charger_fault' "
+                "(migration 022's fn_alerts_on_connector_status trigger, "
+                "when a connector goes Faulted/Unavailable), plus three "
+                "written by src/core/controller.py via upsert_alert: "
+                "'missing_input' (state-assembler input missing), "
+                "'degraded_optimization' (solver ran in degraded mode), "
+                "'stale_telemetry' (telemetry age exceeded the freshness "
+                "threshold). Column is TEXT, not enum-constrained — "
+                "future versions may add types.",
             ),
         ),
         examples=(

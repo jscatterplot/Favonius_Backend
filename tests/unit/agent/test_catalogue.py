@@ -79,15 +79,21 @@ def test_list_functions_summary_marks_hypertable_time_predicate():
 
 def test_optimization_runs_trigger_reason_vocab_matches_emitters():
     """The previous catalogue claimed `trigger_reason` was a clean enum
-    ('price_spike' | 'soc_deviation' | …). The real emitters in
-    src/core/state/triggers.py + src/core/controller.py write a mix of
-    literals ('scheduled', 'hourly', 'vdv463_charging_request_change')
-    and prefix-tagged strings ('Price change: …', 'SoC deviation: …',
-    'Return delay: …', 'interdepot_handoff: …'). An LLM that trusts
-    the old enum writes `= 'price_spike'` and gets zero rows.
+    ('price_spike' | 'soc_deviation' | …). The real emitters write a
+    mix of literals and prefix-tagged strings; pin every emit-site so
+    a future regression on this column note surfaces immediately.
+
+    Emit sites (kept in sync with this list):
+    - src/core/state/triggers.py — 'scheduled',
+      'vdv463_charging_request_change', and the four prefix tags.
+    - src/core/controller.py — 'hourly'.
+    - src/api/main.py — 'api_request', 'manual_command',
+      'schedule_adjust_command'.
     """
     note = _column_note(TS_FUNCTIONS, "optimization_runs", "trigger_reason")
-    for literal in ("scheduled", "hourly", "vdv463_charging_request_change"):
+    control_loop_literals = ("scheduled", "hourly", "vdv463_charging_request_change")
+    api_literals = ("api_request", "manual_command", "schedule_adjust_command")
+    for literal in control_loop_literals + api_literals:
         assert literal in note, f"literal value {literal!r} missing from trigger_reason note"
     for prefix in ("SoC deviation", "Price change", "Return delay", "interdepot_handoff"):
         assert prefix in note, f"prefix {prefix!r} missing from trigger_reason note"
@@ -96,14 +102,21 @@ def test_optimization_runs_trigger_reason_vocab_matches_emitters():
     assert "'price_spike'" not in note
 
 
-def test_alerts_alert_type_documents_charger_fault():
-    """`alerts.alert_type` is TEXT, not enum-constrained, but the only
-    value emitted today (migration 022 fn_alerts_on_connector_status)
-    is 'charger_fault'. The LLM needs that string to answer Q8-style
-    questions ("which chargers were faulted yesterday?").
+def test_alerts_alert_type_documents_emitted_values():
+    """`alerts.alert_type` is TEXT, not enum-constrained. Migration 022
+    emits 'charger_fault'; src/core/controller.py emits three more via
+    upsert_alert ('missing_input', 'degraded_optimization',
+    'stale_telemetry'). The LLM needs all four to answer ops-status
+    questions without undercounting non-fault alerts.
     """
     note = _column_note(TS_FUNCTIONS, "alerts", "alert_type")
-    assert "charger_fault" in note
+    for value in (
+        "charger_fault",
+        "missing_input",
+        "degraded_optimization",
+        "stale_telemetry",
+    ):
+        assert value in note, f"alert_type {value!r} missing from catalogue note"
 
 
 def test_glossary_teaches_trigger_reason_prefix_idiom():

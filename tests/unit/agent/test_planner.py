@@ -186,3 +186,26 @@ def test_eval_suite_covers_all_20_questions():
     assert len(EVAL_QUESTIONS_ROUTING) == 20
     ids = [q[0] for q in EVAL_QUESTIONS_ROUTING]
     assert len(set(ids)) == 20, f"duplicate ids: {ids}"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "How much did vehicle ABC-123 consume last week?",
+        "How much did vehicles consume last week?",
+        "How much have the vehicles charged this month?",
+    ],
+)
+def test_vehicle_subject_falls_through_to_sql_general(monkeypatch, message):
+    """The anti-pattern must cover both singular `vehicle` and plural
+    `vehicles`, otherwise plural-vehicle prompts reach
+    `compile_consumption_by_user` (driver-only) and crash. Regression
+    guard for the Codex P2 plural-vehicle finding on PR #230.
+    """
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    d = classify(message, organization_id=ORG_A)
+    assert d.route == "sql_general", (
+        f"{message!r} routed to {d.route!r}; vehicle-subject prompts must "
+        "fall through to sql_general because the fast path is driver-only."
+    )
