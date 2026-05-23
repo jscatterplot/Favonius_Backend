@@ -381,20 +381,15 @@ async def claim_run(
     was already claimed (the UNIQUE constraint is the cron idempotency anchor).
 
     The initial status is 'skipped' with no ``completed_at`` — a placeholder until
-    ``finalize_run`` writes the real outcome. A crash leaves that placeholder; a
-    later tick may reclaim it once the row is older than five minutes. Finished
-    runs (``completed_at`` set) are never reclaimed.
+    ``finalize_run`` writes the real outcome. Conflicting claims are ignored (no
+    stale reclaim) so an in-flight or partially-finished run cannot be executed
+    twice for the same slot.
     """
     row = await conn.fetchrow(
         """
         INSERT INTO schedule_runs (schedule_id, scheduled_for, status)
         VALUES ($1::uuid, $2, 'skipped')
-        ON CONFLICT (schedule_id, scheduled_for) DO UPDATE
-        SET triggered_at = NOW()
-        WHERE schedule_runs.status = 'skipped'
-          AND schedule_runs.completed_at IS NULL
-          AND schedule_runs.report_id IS NULL
-          AND schedule_runs.triggered_at < NOW() - INTERVAL '5 minutes'
+        ON CONFLICT (schedule_id, scheduled_for) DO NOTHING
         RETURNING id::text
         """,
         schedule_id,

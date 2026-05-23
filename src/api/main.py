@@ -10919,6 +10919,7 @@ async def _handle_agent_action_approve(
 
     scheduled_run_id: Optional[str] = None
     scheduled_payload: dict = {}
+    mark_executed_after_delivery = False
 
     async with db_pools.ts.acquire() as conn:
         async with conn.transaction():
@@ -10947,10 +10948,11 @@ async def _handle_agent_action_approve(
             if action_class == "report_draft":
                 payload = _coerce_payload(action_row["payload"])
                 if payload.get("runId") and payload.get("scheduleId"):
-                    # Schedule-originated draft: defer delivery to post-commit so
-                    # the email I/O does not run inside this DB transaction.
+                    # Schedule-originated draft: deliver post-commit; keep the
+                    # action pending until delivery succeeds so approval can retry.
                     scheduled_run_id = str(payload["runId"])
                     scheduled_payload = payload
+                    mark_executed_after_delivery = True
                 else:
                     report_result = await _handle_reports_generate(
                         _report_params_from_payload(payload),
@@ -10960,23 +10962,24 @@ async def _handle_agent_action_approve(
                         ts_conn=conn,
                     )
 
-            updated = await conn.fetchrow(
-                """
-                UPDATE agent_actions
-                SET status = 'executed', resolved_at = NOW()
-                WHERE id = $1::uuid
-                  AND depot_id = $2::uuid
-                  AND status IN ('pending', 'shadow')
-                RETURNING id::text
-                """,
-                action_row["id"],
-                depot_id,
-            )
-            if not updated:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Action could not be approved because its status changed",
+            if not mark_executed_after_delivery:
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE agent_actions
+                    SET status = 'executed', resolved_at = NOW()
+                    WHERE id = $1::uuid
+                      AND depot_id = $2::uuid
+                      AND status IN ('pending', 'shadow')
+                    RETURNING id::text
+                    """,
+                    action_row["id"],
+                    depot_id,
                 )
+                if not updated:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Action could not be approved because its status changed",
+                    )
 
     # Post-commit: deliver the already-generated scheduled report and flip its
     # run to succeeded. Done outside the transaction to avoid holding the row
@@ -10990,6 +10993,24 @@ async def _handle_agent_action_approve(
                 email_client=report_email_client,
                 default_from=report_email_from,
             )
+        async with db_pools.ts.acquire() as conn:
+            updated = await conn.fetchrow(
+                """
+                UPDATE agent_actions
+                SET status = 'executed', resolved_at = NOW()
+                WHERE id = $1::uuid
+                  AND depot_id = $2::uuid
+                  AND status IN ('pending', 'shadow')
+                RETURNING id::text
+                """,
+                action_id,
+                depot_id,
+            )
+            if not updated:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Action could not be approved because its status changed",
+                )
         report_result = {
             "reportId": scheduled_payload.get("reportId"),
             "scheduleId": scheduled_payload.get("scheduleId"),
