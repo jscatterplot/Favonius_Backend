@@ -121,9 +121,16 @@ def evaluate_readiness(
             ),
         }
     elif building_load_source == BUILDING_LOAD_ABSENT:
-        # Forecast was not even applied (e.g. n_steps=0). Building load is
-        # required per PRD 9.4 — refuse.
-        missing.append("building_load")
+        # Building-load absence is no longer a hard prerequisite (post-PR #119:
+        # the readiness response surfaces the gap as a degraded reason and
+        # the upstream ``_get_building_power`` path falls back to the
+        # synthetic business-hours forecast). status never becomes
+        # 'not_ready' on account of building load alone.
+        degraded.append("building_load_meter_unavailable")
+        assumptions["building_load"] = {
+            "source": BUILDING_LOAD_ABSENT,
+            "note": "no building-load source available; treated as forecast fallback",
+        }
 
     # Telemetry: the assembler defaults missing SoCs to 0.5; record that
     # as an assumption so replays can flag stale state. We only know "any

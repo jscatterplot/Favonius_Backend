@@ -164,15 +164,22 @@ class TestMissingBuildingLoad:
         assert readiness.assumptions["building_load"]["note"]
         assert readiness.building_load_source == BUILDING_LOAD_FORECAST
 
-    def test_absent_building_load_is_blocking(self):
+    def test_absent_building_load_is_non_blocking(self):
+        """Post-PR #119: absent building load degrades but never blocks.
+
+        Building load is treated as forecast-fallback territory now —
+        ``missing_inputs`` must never contain ``"building_load"`` and the
+        run must not be marked ``not_ready`` on this basis alone.
+        """
         readiness = evaluate_readiness(
             _full_config(),
             _full_state(building_power_n=0),
             building_load_source="absent",
             schedules_present=True,
         )
-        assert readiness.status == "not_ready"
-        assert "building_load" in readiness.missing_inputs
+        assert readiness.status == "degraded"
+        assert "building_load" not in readiness.missing_inputs
+        assert "building_load_meter_unavailable" in readiness.degraded_reasons
 
     def test_snapshot_payload_records_forecast_source(self):
         snap = _build_full_snapshot(building_source=BUILDING_LOAD_FORECAST)
