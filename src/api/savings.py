@@ -190,6 +190,8 @@ async def compute_savings_summary(
 
     async with static_pool.acquire() as static_conn:
         depot = await db_queries.get_depot_by_id(static_conn, depot_id)
+        if depot is None:
+            raise ValueError(f"Depot {depot_id} not found")
         ocpp_id_map = await db_queries.charger_id_by_ocpp_id(
             static_conn, depot_id=depot_id
         )
