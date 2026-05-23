@@ -3347,6 +3347,13 @@ async def _build_depot_readiness_checklist(
                     JOIN vehicles v ON v.id = s.vehicle_id
                     WHERE v.site_id = $1::uuid AND s.departure_time >= NOW() - INTERVAL '1 hour'
                 )
+                OR EXISTS(
+                    SELECT 1
+                    FROM recurring_schedule_template rst
+                    WHERE rst.depot_id = $1::uuid
+                      AND rst.active = TRUE
+                      AND (rst.end_date IS NULL OR rst.end_date >= CURRENT_DATE)
+                )
                 """,
                 depot_id,
             )
