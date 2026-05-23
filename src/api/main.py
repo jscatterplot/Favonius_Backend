@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as _dt_time, timezone
 from typing import Annotated, Any, AsyncIterator, Iterator, Literal, Optional, Union
 from uuid import UUID
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncpg
 import bcrypt
@@ -58,6 +58,11 @@ from ..core.optimizer.exceptions import OptimizationError as _CoreOptimizationEr
 from ..core.optimizer.exceptions import (
     SolverError,
     SolverTimeoutError,
+)
+from ..core.scheduling.recurring import (
+    RecurringTemplate,
+    ScheduleCancellation,
+    expand_recurring_templates,
 )
 from ..core.state.assembler import StateAssembler
 from ..core.state.readiness import (
@@ -3347,17 +3352,69 @@ async def _build_depot_readiness_checklist(
                     JOIN vehicles v ON v.id = s.vehicle_id
                     WHERE v.site_id = $1::uuid AND s.departure_time >= NOW() - INTERVAL '1 hour'
                 )
-                OR EXISTS(
-                    SELECT 1
-                    FROM recurring_schedule_template rst
-                    WHERE rst.depot_id = $1::uuid
-                      AND rst.active = TRUE
-                      AND (rst.end_date IS NULL OR rst.end_date >= CURRENT_DATE)
-                )
                 """,
                 depot_id,
             )
         )
+        if not has_schedules:
+            now_utc = datetime.now(timezone.utc)
+            horizon_start = now_utc - timedelta(hours=1)
+            horizon_end = now_utc + timedelta(hours=24)
+            template_rows, cancellation_rows = await db_queries.fetch_recurring_horizon_data(
+                static_conn,
+                depot_id=UUID(depot_id),
+                horizon_start=horizon_start,
+                horizon_end=horizon_end,
+            )
+            if template_rows:
+                tz_name = await static_conn.fetchval(
+                    "SELECT timezone FROM sites WHERE id = $1::uuid", depot_id
+                )
+                if not tz_name:
+                    depot_tz = ZoneInfo("UTC")
+                else:
+                    try:
+                        depot_tz = ZoneInfo(tz_name)
+                    except ZoneInfoNotFoundError:
+                        depot_tz = ZoneInfo("UTC")
+                templates = [
+                    RecurringTemplate(
+                        template_id=row["id"],
+                        depot_id=row["depot_id"],
+                        vehicle_id=row["vehicle_id"],
+                        route_id=row["route_id"],
+                        departure_time_of_day=row["departure_time_of_day"],
+                        return_time_of_day=row["return_time_of_day"],
+                        days_of_week=tuple(row["days_of_week"]),
+                        start_date=row["start_date"],
+                        end_date=row["end_date"],
+                        required_soc=float(row["required_soc"]),
+                        energy_kwh=(
+                            float(row["energy_kwh"])
+                            if row["energy_kwh"] is not None
+                            else None
+                        ),
+                        active=bool(row["active"]),
+                        created_at=row["created_at"],
+                    )
+                    for row in template_rows
+                ]
+                cancellations = [
+                    ScheduleCancellation(
+                        template_id=row["template_id"],
+                        occurrence_date=row["occurrence_date"],
+                    )
+                    for row in cancellation_rows
+                ]
+                has_schedules = bool(
+                    expand_recurring_templates(
+                        templates,
+                        cancellations,
+                        depot_tz=depot_tz,
+                        horizon_start=horizon_start,
+                        horizon_end=horizon_end,
+                    )
+                )
         has_battery = bool(
             await static_conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM battery_storage WHERE site_id = $1::uuid)",
