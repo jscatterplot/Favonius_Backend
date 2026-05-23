@@ -10970,15 +10970,16 @@ async def _handle_agent_autonomy_set(
     """Upsert one row of the depot autonomy matrix.
 
     Params:
-        actionClass: action class string (any non-empty value).
+        actionClass: action class string (any non-empty value; trimmed).
         level: one of shadow | proposed | auto_notify | auto_silent.
     """
     action_class = params.get("actionClass") or params.get("action_class")
     level = params.get("level")
-    if not action_class or not isinstance(action_class, str):
+    if not isinstance(action_class, str) or not action_class.strip():
         raise HTTPException(
             status_code=400, detail="params.actionClass is required (non-empty string)"
         )
+    action_class = action_class.strip()
     if level not in _AGENT_AUTONOMY_LEVELS:
         raise HTTPException(
             status_code=422,

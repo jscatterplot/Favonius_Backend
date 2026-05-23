@@ -15,13 +15,32 @@
 
 CREATE TABLE IF NOT EXISTS agent_autonomy_settings (
     depot_id      UUID        NOT NULL,
-    action_class  TEXT        NOT NULL,
+    action_class  TEXT        NOT NULL
+                  CONSTRAINT agent_autonomy_settings_action_class_not_blank
+                  CHECK (btrim(action_class) <> ''),
     level         TEXT        NOT NULL
                   CHECK (level IN ('shadow', 'proposed', 'auto_notify', 'auto_silent')),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_by    UUID,
     PRIMARY KEY (depot_id, action_class)
 );
+
+-- Idempotent guard: if the table predates the non-empty CHECK (created by an
+-- earlier revision of this migration), add the constraint now. The named
+-- inline CHECK above means fresh installs already satisfy this and skip.
+DO $add_action_class_not_blank$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'agent_autonomy_settings'::regclass
+          AND conname = 'agent_autonomy_settings_action_class_not_blank'
+    ) THEN
+        ALTER TABLE agent_autonomy_settings
+            ADD CONSTRAINT agent_autonomy_settings_action_class_not_blank
+            CHECK (btrim(action_class) <> '');
+    END IF;
+END;
+$add_action_class_not_blank$ LANGUAGE plpgsql;
 
 CREATE INDEX IF NOT EXISTS idx_agent_autonomy_settings_depot
     ON agent_autonomy_settings (depot_id);

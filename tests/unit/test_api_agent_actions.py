@@ -273,6 +273,9 @@ class TestAgentsAutonomySet:
         "params,expected",
         [
             ({"actionClass": "", "level": "proposed"}, 400),
+            ({"actionClass": "   ", "level": "proposed"}, 400),  # whitespace-only
+            ({"actionClass": "\t\n", "level": "proposed"}, 400),  # other whitespace
+            ({"actionClass": 5, "level": "proposed"}, 400),  # non-string
             ({"level": "proposed"}, 400),
             ({"actionClass": "charger_restart", "level": "nonsense"}, 422),
             ({"actionClass": "charger_restart"}, 422),
@@ -335,6 +338,29 @@ class TestAgentsAutonomySet:
             f"role={role}: expected {expected_status}, got {response.status_code} "
             f"body={response.text}"
         )
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_action_class_trimmed_before_write(self, _audit, client, mock_db_pool):
+        """Surrounding whitespace is stripped before validation and persistence."""
+        pool, conn = mock_db_pool
+        conn.fetchval = AsyncMock(return_value=True)
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "action_class": "charger_restart",
+                "level": "proposed",
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        with patch("src.api.main.db_pools", pool):
+            response = client.post(
+                "/commands/execute",
+                json=_autonomy_set_body("  charger_restart  ", "proposed"),
+                headers=AUTH_HDR,
+            )
+        assert response.status_code == http_status.HTTP_200_OK
+        # The trimmed value is what gets written to the DB.
+        write_call = conn.fetchrow.await_args
+        assert write_call.args[2] == "charger_restart"
 
     @patch("src.api.main.get_audit_logger", return_value=None)
     def test_all_four_levels_accepted(self, _audit, client, mock_db_pool):
