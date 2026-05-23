@@ -50,6 +50,16 @@ class FakeConn:
             return self.store.get("origin_delivery")
         if "INSERT INTO schedule_runs" in query:
             return self.store.get("claim_result")
+        if "INSERT INTO agent_actions" in query:
+            self.executes.append((query, args))
+            if self.store.get("report_draft_conflict"):
+                return None
+            return {"id": "action-1"}
+        if "UPDATE schedule_runs SET status = 'succeeded'" in query:
+            run_row = self.store.get("run_row")
+            if run_row is not None:
+                run_row["status"] = "succeeded"
+            return {"schedule_id": "11111111-1111-1111-1111-111111111111"}
         return None
 
     async def fetch(self, query: str, *args):
@@ -61,6 +71,12 @@ class FakeConn:
 
     async def execute(self, query: str, *args):
         self.executes.append((query, args))
+        if "UPDATE schedule_runs" in query and "SET status" in query:
+            run_row = self.store.get("run_row")
+            if run_row is not None and len(args) >= 2:
+                run_row["status"] = args[1]
+                if len(args) >= 5:
+                    run_row["error_message"] = args[4]
         return "OK"
 
     def transaction(self):
@@ -188,6 +204,15 @@ def test_proposed_generates_report_emits_action_and_pends():
     assert not _has_execute(store, "INSERT INTO schedule_run_deliveries")
 
 
+def test_proposed_duplicate_period_skips_run_without_orphan_pending():
+    store: dict = {"autonomy_row": None, "report_draft_conflict": True}
+    status = run(_run_execute(store, autonomy_mode="proposed"))
+    assert status == "skipped"
+    assert store["generate_calls"] == 1
+    assert _finalize_status(store) == "skipped"
+    assert not _has_execute(store, "INSERT INTO schedule_run_deliveries")
+
+
 def test_auto_silent_delivers_without_agent_action():
     store: dict = {
         "autonomy_row": None,
@@ -252,6 +277,79 @@ def test_report_generation_failure_marks_run_failed():
     )
     assert status == "failed"
     assert _finalize_status(store) == "failed"
+
+
+def test_deliver_pending_run_keeps_pending_when_send_fails():
+    store: dict = {
+        "run_row": {
+            "id": "run-1",
+            "schedule_id": "11111111-1111-1111-1111-111111111111",
+            "report_id": "33333333-3333-3333-3333-333333333333",
+            "triggered_at": _dt(2026, 6, 1, 3, 0),
+            "completed_at": None,
+            "status": "pending_approval",
+            "error_message": None,
+        },
+        "report_row": _report_row(),
+        "recipient_rows": _recipient_rows(),
+    }
+    conn = FakeConn(store)
+    pools = FakePools(conn)
+
+    def failing_script(message, counter):
+        return DeliveryResult(status="failed", provider_message_id=None, detail={"error": "boom"})
+
+    email = FakeEmailClient(script=failing_script)
+
+    async def _deliver():
+        wire, ok = await rs.deliver_pending_run(
+            pools,
+            run_id="run-1",
+            email_client=email,
+            default_from="reports@favonius.energy",
+        )
+        return wire, ok
+
+    wire, ok = run(_deliver())
+    assert ok is False
+    assert wire is not None
+    assert wire["status"] == "pending_approval"
+    assert not any(
+        "SET status = 'succeeded'" in q for q, _ in store["executes"] if "schedule_runs" in q
+    )
+
+
+def test_deliver_pending_run_marks_succeeded_when_all_sent():
+    store: dict = {
+        "run_row": {
+            "id": "run-1",
+            "schedule_id": "11111111-1111-1111-1111-111111111111",
+            "report_id": "33333333-3333-3333-3333-333333333333",
+            "triggered_at": _dt(2026, 6, 1, 3, 0),
+            "completed_at": None,
+            "status": "pending_approval",
+            "error_message": None,
+        },
+        "report_row": _report_row(),
+        "recipient_rows": _recipient_rows(),
+    }
+    conn = FakeConn(store)
+    pools = FakePools(conn)
+    email = FakeEmailClient()
+
+    async def _deliver():
+        return await rs.deliver_pending_run(
+            pools,
+            run_id="run-1",
+            email_client=email,
+            default_from="reports@favonius.energy",
+        )
+
+    wire, ok = run(_deliver())
+    assert ok is True
+    assert wire is not None
+    assert wire["status"] == "succeeded"
+    assert len(email.sent) == 1
 
 
 def test_delivery_failure_recorded_per_recipient():

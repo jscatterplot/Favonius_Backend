@@ -516,12 +516,15 @@ async def emit_report_draft_action(
     group_by: Optional[str],
     title: str,
     summary: str,
-) -> None:
+) -> bool:
     """Emit the schedule-originated report_draft agent_action.
 
     payload carries scheduleId + runId so agents.action.approve/reject can find
     and resolve the originating run. The (depot_id, scheduleId, periodStart)
     uniqueness (migration 044) prevents duplicate drafts for one slot.
+
+    Returns True when a new row was inserted, False when a draft for the same
+    (depot, schedule, period) already exists.
     """
     payload = {
         "kind": kind,
@@ -533,12 +536,13 @@ async def emit_report_draft_action(
         "runId": run_id,
         "reportId": report_id,
     }
-    await conn.execute(
+    row = await conn.fetchrow(
         """
         INSERT INTO agent_actions
             (depot_id, agent_type, action_class, mode, status, summary, payload)
         VALUES ($1::uuid, 'reporting', 'report_draft', $2, $3, $4, $5::jsonb)
         ON CONFLICT DO NOTHING
+        RETURNING id::text
         """,
         depot_id,
         mode,
@@ -546,6 +550,7 @@ async def emit_report_draft_action(
         summary,
         json.dumps(payload),
     )
+    return row is not None
 
 
 # ── Delivery ──────────────────────────────────────────────────────────────────
@@ -608,12 +613,15 @@ async def _deliver_to_recipients(
     recipient_rows: list["asyncpg.Record"],
     email_client: "EmailDeliveryClient",
     default_from: str,
-) -> None:
+) -> bool:
     """Render + send to each recipient and record one delivery row per attempt.
 
     Email I/O happens outside any DB transaction; each delivery row is written
     in its own short statement so a provider hiccup mid-list still records the
     attempts that did complete.
+
+    Returns True when every recipient was sent successfully (or there are no
+    recipients to deliver to).
     """
     from ..notifications.email_client import EmailMessage  # lazy
 
@@ -631,6 +639,7 @@ async def _deliver_to_recipients(
         f"<p>Period: {period_label}</p>"
     )
 
+    all_sent = True
     for rec in recipient_rows:
         fmt = rec["format"]
         status = "failed"
@@ -658,6 +667,8 @@ async def _deliver_to_recipients(
                 "report delivery failed for run=%s recipient=%s: %s", run_id, rec["id"], exc
             )
 
+        if status != "sent":
+            all_sent = False
         async with pools.ts.acquire() as conn:
             await insert_delivery(
                 conn,
@@ -669,6 +680,7 @@ async def _deliver_to_recipients(
                 provider_message_id=provider_message_id,
                 error=error,
             )
+    return all_sent
 
 
 async def _fetch_report_row(pools: "DatabasePools", report_id: str) -> Optional["asyncpg.Record"]:
@@ -750,7 +762,7 @@ async def execute_schedule_run(
     if mode == "proposed":
         async with pools.ts.acquire() as conn:
             async with conn.transaction():
-                await emit_report_draft_action(
+                draft_inserted = await emit_report_draft_action(
                     conn,
                     depot_id=depot_id,
                     schedule_id=schedule_id,
@@ -765,8 +777,22 @@ async def execute_schedule_run(
                     title=title,
                     summary=f"Approve to send '{schedule_row['name']}' for {period_start}–{period_end}",
                 )
-                await finalize_run(conn, run_id, status="pending_approval", report_id=report_id)
-        return "pending_approval"
+                if draft_inserted:
+                    await finalize_run(
+                        conn, run_id, status="pending_approval", report_id=report_id
+                    )
+                else:
+                    await finalize_run(
+                        conn,
+                        run_id,
+                        status="skipped",
+                        report_id=report_id,
+                        error_message=(
+                            "A report draft for this schedule and period is already "
+                            "pending approval"
+                        ),
+                    )
+        return "pending_approval" if draft_inserted else "skipped"
 
     # auto_notify / auto_silent → deliver now.
     report_row = await _fetch_report_row(pools, report_id)
@@ -810,25 +836,28 @@ async def deliver_pending_run(
     run_id: str,
     email_client: "EmailDeliveryClient",
     default_from: str,
-) -> Optional[dict]:
+) -> tuple[Optional[dict], bool]:
     """Deliver a run that was held in 'pending_approval' (proposed mode → approved).
 
     Idempotent: only acts on a run still in 'pending_approval'. Returns the run's
-    wire dict (or None if the run no longer exists).
+    wire dict (or None if the run no longer exists) and whether delivery succeeded
+    (all recipients sent, or nothing to deliver).
     """
     async with pools.ts.acquire() as conn:
         run = await fetch_run(conn, run_id)
     if run is None:
-        return None
+        return None, False
     if run["status"] != "pending_approval" or run["report_id"] is None:
         # Already resolved (or never had a report) — return current state.
         async with pools.ts.acquire() as conn:
-            return await serialize_run(conn, run_id)
+            wire = await serialize_run(conn, run_id)
+        return wire, wire is not None and wire.get("status") == "succeeded"
 
     report_row = await _fetch_report_row(pools, str(run["report_id"]))
     recipient_rows = await _fetch_recipient_rows(pools, str(run["schedule_id"]))
+    delivery_ok = True
     if report_row is not None and recipient_rows:
-        await _deliver_to_recipients(
+        delivery_ok = await _deliver_to_recipients(
             pools,
             run_id=run_id,
             report_row=report_row,
@@ -838,15 +867,16 @@ async def deliver_pending_run(
         )
 
     async with pools.ts.acquire() as conn:
-        updated = await conn.fetchrow(
-            "UPDATE schedule_runs SET status = 'succeeded', completed_at = NOW() "
-            "WHERE id = $1::uuid AND status = 'pending_approval' "
-            "RETURNING schedule_id::text",
-            run_id,
-        )
-        if updated is not None:
-            await _update_schedule_last_run_status(conn, run_id, "succeeded")
-        return await serialize_run(conn, run_id)
+        if delivery_ok:
+            updated = await conn.fetchrow(
+                "UPDATE schedule_runs SET status = 'succeeded', completed_at = NOW() "
+                "WHERE id = $1::uuid AND status = 'pending_approval' "
+                "RETURNING schedule_id::text",
+                run_id,
+            )
+            if updated is not None:
+                await _update_schedule_last_run_status(conn, run_id, "succeeded")
+        return await serialize_run(conn, run_id), delivery_ok
 
 
 async def skip_pending_run(pools: "DatabasePools", *, run_id: str) -> None:

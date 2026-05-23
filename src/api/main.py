@@ -10986,12 +10986,24 @@ async def _handle_agent_action_approve(
     # lock across email I/O.
     if scheduled_run_id is not None:
         run_wire: Optional[dict] = None
+        delivery_succeeded = False
         if report_email_client is not None:
-            run_wire = await _report_schedules.deliver_pending_run(
+            run_wire, delivery_succeeded = await _report_schedules.deliver_pending_run(
                 db_pools,
                 run_id=scheduled_run_id,
                 email_client=report_email_client,
                 default_from=report_email_from,
+            )
+        else:
+            async with db_pools.ts.acquire() as conn:
+                run_wire = await _report_schedules.serialize_run(conn, scheduled_run_id)
+        if not delivery_succeeded:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Report delivery failed or is unavailable; the action remains "
+                    "pending so approval can be retried"
+                ),
             )
         async with db_pools.ts.acquire() as conn:
             updated = await conn.fetchrow(
