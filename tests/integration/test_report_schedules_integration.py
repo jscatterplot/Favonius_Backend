@@ -1,6 +1,6 @@
 """Integration tests for scheduled reports against a real Postgres.
 
-These exercise the migration 043 schema and the report_schedules repo/runtime
+These exercise the migration 044 schema and the report_schedules repo/runtime
 end-to-end (idempotency AC#7, bounce → lastDelivery AC#6, serialization
 contract). They call the production repo functions directly and inject a fake
 report generator + FakeEmailClient, so they validate the new SQL without needing
@@ -27,8 +27,8 @@ _MIGRATIONS = Path(__file__).resolve().parents[2] / "migrations"
 
 
 async def _apply_migrations(conn) -> None:
-    """Apply migrations 033 (reports/agent_actions) and 043 idempotently."""
-    for name in ("033_reports_agent_actions.sql", "043_report_schedules.sql"):
+    """Apply migrations 033 (reports/agent_actions) and 044 idempotently."""
+    for name in ("033_reports_agent_actions.sql", "044_report_schedules.sql"):
         sql = (_MIGRATIONS / name).read_text()
         await conn.execute(sql)
 
@@ -84,13 +84,12 @@ async def _insert_schedule(pool, depot_id: str, name: str, autonomy_mode: str = 
 
 
 @pytest.mark.asyncio
-async def test_migration_043_creates_tables(schedules_db):
+async def test_migration_044_creates_tables(schedules_db):
     expected = {
         "report_schedules",
         "report_schedule_recipients",
         "schedule_runs",
         "schedule_run_deliveries",
-        "autonomy_settings",
     }
     async with schedules_db.acquire() as conn:
         rows = await conn.fetch(

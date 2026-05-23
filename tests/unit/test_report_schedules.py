@@ -40,7 +40,7 @@ class FakeConn:
         store["executes"] = self.executes
 
     async def fetchrow(self, query: str, *args):
-        if "FROM autonomy_settings" in query:
+        if "FROM agent_autonomy_settings" in query:
             return self.store.get("autonomy_row")
         if "FROM reports WHERE id" in query:
             return self.store.get("report_row")
@@ -222,9 +222,9 @@ def test_auto_notify_delivers_and_emits_informational_action():
     assert _finalize_status(store) == "succeeded"
 
 
-def test_autonomy_settings_override_wins_over_schedule_mode():
-    # Schedule says auto_silent, but the autonomy_settings row forces shadow.
-    store: dict = {"autonomy_row": {"mode": "shadow"}}
+def test_agent_autonomy_settings_override_wins_over_schedule_mode():
+    # Schedule says auto_silent, but the agent_autonomy_settings row forces shadow.
+    store: dict = {"autonomy_row": {"level": "shadow"}}
     status = run(_run_execute(store, autonomy_mode="auto_silent"))
     assert status == "skipped"
     assert store["generate_calls"] == 0

@@ -1,11 +1,16 @@
--- Migration 043: Scheduled reports
+-- Migration 044: Scheduled reports
 --
 -- Backs the configurable report-scheduling feature (frontend PR #124):
 --   report_schedules            — one row per configured schedule
 --   report_schedule_recipients  — ordered recipient list per schedule
 --   schedule_runs               — one row per fired (or attempted) slot
 --   schedule_run_deliveries     — append-only per-recipient delivery ledger
---   autonomy_settings           — per-(depot, action_class) autonomy override
+--
+-- Numbered 044 to avoid colliding with in-flight PR #233's 043. Per-depot
+-- autonomy overrides are NOT created here: the worker reads PR #233's
+-- `agent_autonomy_settings(depot_id, action_class, level)` for action_class
+-- 'report_draft' (graceful fallback to the schedule's own autonomy_mode when
+-- that table is absent), so there is a single autonomy matrix.
 --
 -- All tables live in the TimescaleDB (operational) schema alongside `reports`
 -- and `agent_actions` (migration 033).  Like 033, depot_id / created_by are
@@ -122,20 +127,6 @@ CREATE INDEX IF NOT EXISTS schedule_run_deliveries_recipient_recent_idx
 CREATE INDEX IF NOT EXISTS schedule_run_deliveries_provider_msg_idx
     ON schedule_run_deliveries (provider_message_id)
     WHERE provider_message_id IS NOT NULL;
-
--- ── autonomy_settings ─────────────────────────────────────────────────────────
--- Per-(depot, action_class) autonomy override.  When no row exists the caller
--- falls back to the per-schedule autonomy_mode column.
-
-CREATE TABLE IF NOT EXISTS autonomy_settings (
-    depot_id     UUID        NOT NULL,
-    action_class TEXT        NOT NULL,
-    mode         TEXT        NOT NULL CHECK (mode IN (
-                     'shadow', 'proposed', 'auto_notify', 'auto_silent'
-                 )),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (depot_id, action_class)
-);
 
 -- ── agent_actions report_draft uniqueness (schedule-aware) ────────────────────
 -- Migration 033 keyed report_draft idempotency on (depot_id, periodStart),

@@ -125,13 +125,27 @@ def run_to_wire(row: "asyncpg.Record", deliveries: list[dict]) -> dict:
 async def resolve_autonomy_mode(
     conn: "asyncpg.Connection", depot_id: str, action_class: str, fallback: str
 ) -> str:
-    """Per-(depot, action_class) autonomy override, falling back to ``fallback``."""
-    row = await conn.fetchrow(
-        "SELECT mode FROM autonomy_settings WHERE depot_id = $1::uuid AND action_class = $2",
-        depot_id,
-        action_class,
-    )
-    return row["mode"] if row else fallback
+    """Per-(depot, action_class) autonomy override, falling back to ``fallback``.
+
+    Reads the shared ``agent_autonomy_settings`` matrix (PR #233): one row per
+    (depot, action_class) with a ``level`` in the same four-value vocabulary as
+    a schedule's autonomy_mode. If that table is not present yet (different merge
+    order), fall back to the per-schedule mode rather than erroring — undefined
+    table is SQLSTATE 42P01. Called on a bare connection (no open transaction),
+    so a swallowed error does not poison a transaction.
+    """
+    try:
+        row = await conn.fetchrow(
+            "SELECT level FROM agent_autonomy_settings "
+            "WHERE depot_id = $1::uuid AND action_class = $2",
+            depot_id,
+            action_class,
+        )
+    except Exception as exc:  # noqa: BLE001 - tolerate the table not existing yet
+        if getattr(exc, "sqlstate", None) == "42P01":
+            return fallback
+        raise
+    return row["level"] if row else fallback
 
 
 # ── Repo: schedules + recipients ──────────────────────────────────────────────
@@ -490,7 +504,7 @@ async def emit_report_draft_action(
 
     payload carries scheduleId + runId so agents.action.approve/reject can find
     and resolve the originating run. The (depot_id, scheduleId, periodStart)
-    uniqueness (migration 043) prevents duplicate drafts for one slot.
+    uniqueness (migration 044) prevents duplicate drafts for one slot.
     """
     payload = {
         "kind": kind,
