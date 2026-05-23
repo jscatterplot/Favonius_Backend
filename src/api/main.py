@@ -9486,7 +9486,7 @@ async def list_charger_completed_sessions(
     if role not in ("favonius_admin", "customer_admin"):
         raise _forbidden("FORBIDDEN_ROLE", "favonius_admin or customer_admin role required")
 
-    await _resolve_depot_for_admin(
+    depot_row, cross_org_read = await _resolve_depot_for_admin(
         depot_id,
         user,
         endpoint_name="GET /admin/depots/{depot_id}/chargers/{charger_id}/sessions",
@@ -9500,6 +9500,31 @@ async def list_charger_completed_sessions(
 
     cursor_tuple = _decode_session_cursor(cursor) if cursor else None
 
+    async def _audit_cross_org(result: str) -> None:
+        # Mirror the credentials_status read: a favonius_admin reading
+        # another tenant's depot leaves an ``admin.read`` trail. strict=True
+        # so a missing audit log fails closed (503) rather than silently
+        # serving cross-tenant data without provenance.
+        if not cross_org_read:
+            return
+        await _record_admin_action(
+            user=user,
+            action="admin.read",
+            depot_id=depot_id,
+            organization_id_override=(
+                str(depot_row.get("organization_id"))
+                if depot_row.get("organization_id")
+                else None
+            ),
+            target_type="charger",
+            target_id=str(charger_id),
+            metadata={
+                "endpoint": "GET /admin/depots/{depot_id}/chargers/{charger_id}/sessions",
+                "result": result,
+            },
+            strict=True,
+        )
+
     try:
         async with db_pools.static.acquire() as static_conn:
             charger_row = await static_conn.fetchrow(
@@ -9512,6 +9537,7 @@ async def list_charger_completed_sessions(
                 depot_id,
             )
         if charger_row is None:
+            await _audit_cross_org("not_found")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"error_code": "CHARGER_NOT_FOUND", "message": "Charger not found"},
@@ -9527,6 +9553,7 @@ async def list_charger_completed_sessions(
                 cursor=cursor_tuple,
             )
 
+        await _audit_cross_org("ok")
         return _build_completed_sessions_response(rows, limit)
 
     except HTTPException:

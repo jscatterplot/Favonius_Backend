@@ -139,6 +139,37 @@ class TestComputeSavingsSummary:
         assert result.period_end == now
         assert result.as_of == now
 
+    def test_missing_depot_raises_value_error(self, pools_with_data):
+        """No sites row → ValueError('... not found') → 404 via global handler.
+
+        Matters for favonius_admin, whose access check bypasses the
+        depot-existence lookup; without this a bad UUID would read as an
+        empty month (200 + zeros) instead of a 404.
+        """
+        static_pool, ts_pool, _, ts_conn = pools_with_data
+        with (
+            patch(
+                "src.api.savings.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "src.api.savings.db_queries.charger_id_by_ocpp_id",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "src.api.savings.db_queries.resolve_bidding_zone",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            with pytest.raises(ValueError, match="not found"):
+                _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
+        # We must not have touched the time-series pool for a depot that
+        # doesn't exist.
+        ts_conn.fetchrow.assert_not_called()
+
     def test_no_sessions_yet_returns_all_zeros(self, pools_with_data):
         static_pool, ts_pool, _, ts_conn = pools_with_data
         # Only the sessions aggregation runs — price lookup is skipped
@@ -546,3 +577,25 @@ class TestSavingsSummaryEndpoint:
                 "/depots/not-a-uuid/savings-summary", headers=AUTH_HDR
             )
         assert response.status_code == 400
+
+    def test_missing_depot_returns_404(self, client, mock_db_pool):
+        """favonius_admin + valid-but-nonexistent depot → 404, not 200 zeros.
+
+        favonius_admin bypasses the depot-existence check in
+        verify_depot_access, so the ValueError raised by
+        compute_savings_summary is what produces the documented 404.
+        """
+        pool, _ = mock_db_pool
+        depot_id = str(uuid4())
+        _override_user(_user("favonius_admin"))
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.verify_depot_access", new_callable=AsyncMock),
+            patch(
+                "src.api.main.compute_savings_summary",
+                new_callable=AsyncMock,
+                side_effect=ValueError(f"Depot {depot_id} not found"),
+            ),
+        ):
+            response = client.get(self.URL_TMPL.format(depot_id), headers=AUTH_HDR)
+        assert response.status_code == 404

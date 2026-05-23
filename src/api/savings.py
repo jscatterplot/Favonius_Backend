@@ -175,16 +175,26 @@ async def compute_savings_summary(
 ) -> SavingsSummary:
     """Compute the month-to-date savings summary for one depot.
 
-    Treats every "missing data" path as a zero-valued summary instead of
-    an error: no sessions yet → zeros; no bidding zone → zero baseline;
-    no electricity-price rows in the window → zero baseline. The
-    frontend's "TodayEmpty" panel renders these as ``—``.
+    A *missing depot* (no ``sites`` row for ``depot_id``) raises
+    ``ValueError("Depot ... not found")`` — the API's global ValueError
+    handler maps "not found" to HTTP 404, matching the route's documented
+    contract. This matters for ``favonius_admin``, whose access check
+    bypasses the depot-existence lookup; without this, a bad UUID would
+    return a misleading all-zero 200 instead of a 404.
+
+    Every other "missing data" path is treated as a zero-valued summary
+    rather than an error: no sessions yet → zeros; no bidding zone →
+    zero baseline; no electricity-price rows in the window → zero
+    baseline. The frontend's "TodayEmpty" panel renders these as ``—``.
 
     Args:
         static_pool: Supabase / static schema pool (``sites`` + ``charging_stations``).
         ts_pool: TimescaleDB pool (``charging_sessions`` + ``electricity_prices``).
         depot_id: Depot UUID.
         now: Test injection point for "current time". Defaults to ``datetime.now(UTC)``.
+
+    Raises:
+        ValueError: When no depot exists for ``depot_id`` (→ HTTP 404).
     """
     as_of = now if now is not None else datetime.now(timezone.utc)
 
@@ -197,7 +207,7 @@ async def compute_savings_summary(
         )
         bidding_zone = await db_queries.resolve_bidding_zone(static_conn, UUID(depot_id))
 
-    timezone_name = depot.get("timezone") if depot else None
+    timezone_name = depot.get("timezone")
     period_start = _month_start_local_as_utc(as_of, timezone_name)
     period_end = as_of
     station_ids = list(ocpp_id_map.keys())

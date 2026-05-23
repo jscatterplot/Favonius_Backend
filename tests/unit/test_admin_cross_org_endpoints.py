@@ -1144,7 +1144,7 @@ class TestListChargerCompletedSessionsRBAC:
                 new_callable=AsyncMock,
                 return_value=rows,
             ),
-            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
         ):
             response = self._hit(client, "?limit=2")
         assert response.status_code == http_status.HTTP_200_OK
@@ -1153,6 +1153,31 @@ class TestListChargerCompletedSessionsRBAC:
         # Page is full at the requested limit → cursor must be returned.
         assert body["next_cursor"] is not None
         assert "fetched_at" in body
+        # favonius_admin reading another org's depot → admin.read audit.
+        audit.assert_awaited_once()
+        row = audit.await_args.args[1]
+        assert row.action == "admin.read"
+        assert row.target_type == "charger"
+
+    def test_favonius_admin_cross_org_charger_not_found_audits(self, client, mock_pool):
+        """Cross-org 404 still leaves an audit trail (result=not_found)."""
+        pool, conn = mock_pool
+        _override_user(_user("favonius_admin"))
+        conn.fetchrow = AsyncMock(return_value=None)  # charger not in depot
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value=_depot_row(organization_id=OTHER_ORG_ID),
+            ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
+        ):
+            response = self._hit(client)
+        assert response.status_code == http_status.HTTP_404_NOT_FOUND
+        assert response.json()["detail"]["error_code"] == "CHARGER_NOT_FOUND"
+        audit.assert_awaited_once()
+        assert audit.await_args.args[1].metadata["result"] == "not_found"
 
     def test_customer_admin_own_org_200(self, client, mock_pool):
         pool, conn = mock_pool
@@ -1170,6 +1195,7 @@ class TestListChargerCompletedSessionsRBAC:
                 new_callable=AsyncMock,
                 return_value=[self._session_row()],
             ),
+            patch("src.api.main.write_admin_audit_row", new_callable=AsyncMock) as audit,
         ):
             response = self._hit(client)
         assert response.status_code == http_status.HTTP_200_OK
@@ -1177,6 +1203,8 @@ class TestListChargerCompletedSessionsRBAC:
         assert len(body["items"]) == 1
         # Partial page → no cursor.
         assert body["next_cursor"] is None
+        # Own-org read is NOT cross-org → no audit row written.
+        audit.assert_not_awaited()
 
     def test_customer_admin_other_org_403_not_404(self, client, mock_pool):
         pool, _ = mock_pool
