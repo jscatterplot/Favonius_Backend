@@ -417,6 +417,65 @@ class TestGetSchedules:
         assert len(schedules) == 0
         assert isinstance(schedules, list)
 
+    @pytest.mark.asyncio
+    async def test_get_schedules_naive_horizon_with_active_template(
+        self, assembler, mock_db_pool
+    ):
+        """Regression (Codex P1): get_current_state passes naive datetime.utcnow().
+
+        _get_schedules must normalize to aware UTC before the recurring
+        expander runs, otherwise any depot with an active template raises
+        ValueError and state assembly fails.
+        """
+        from datetime import date, time, timezone
+        from uuid import uuid4 as _uuid4
+
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        vehicle_id = _uuid4()
+        # A Friday inside the horizon (2026-05-22 is a Friday).
+        base_time = datetime(2026, 5, 22, 0, 0, 0)  # NAIVE, like datetime.utcnow()
+        template_row = {
+            "id": _uuid4(),
+            "depot_id": _uuid4(),
+            "vehicle_id": vehicle_id,
+            "route_id": "R-rec",
+            "departure_time_of_day": time(7, 30),
+            "return_time_of_day": time(19, 0),
+            "days_of_week": ["fri"],
+            "start_date": date(2026, 5, 1),
+            "end_date": None,
+            "required_soc": 1.0,
+            "energy_kwh": 180.0,
+            "active": True,
+            "created_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+        }
+
+        async def _fetch(query: str, *args, **kwargs):
+            if "FROM schedules s" in query:
+                return []
+            if "FROM recurring_schedule_template" in query:
+                return [template_row]
+            if "FROM recurring_schedule_cancellation" in query:
+                return []
+            return []
+
+        mock_conn.fetch.side_effect = _fetch
+        # _get_depot_timezone reads sites.timezone via fetchval.
+        mock_conn.fetchval.return_value = "Europe/Vilnius"
+
+        end = base_time + timedelta(hours=24)
+        # Must not raise despite naive inputs.
+        schedules = await assembler._get_schedules(base_time, end)
+
+        assert len(schedules) == 1
+        assert schedules[0]["route_id"] == "R-rec"
+        # Departure surfaced as aware UTC (07:30 Vilnius = 04:30 UTC in May).
+        assert schedules[0]["departure_time"].tzinfo is not None
+        assert schedules[0]["departure_time"].hour == 4
+
 
 class TestComputeAvailability:
     """Test _compute_availability method."""

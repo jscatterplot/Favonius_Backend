@@ -718,6 +718,13 @@ class StateAssembler:
         Raises:
             asyncpg.PostgresError: If a database query fails.
         """
+        # get_current_state passes naive UTC (datetime.utcnow()); the
+        # recurring expander requires tz-aware bounds. Normalize here so
+        # both the SQL query and the expansion see aware UTC.
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
         manual_query = """
         SELECT s.vehicle_id::text, s.departure_time, s.return_time,
                s.energy_kwh AS estimated_energy_kwh, s.route_id, s.created_at

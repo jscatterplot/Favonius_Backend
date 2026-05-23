@@ -5148,10 +5148,35 @@ async def patch_recurring_schedule_template(
     await _assert_recurring_depot_access(depot_id, user)
     validate_uuid(template_id, "template_id")
 
-    patch_data = patch.model_dump(exclude_unset=True, exclude_none=True)
+    patch_data = patch.model_dump(exclude_unset=True)
     if not patch_data:
         return _recurring_validation_400(
             "body", "At least one recurring template field is required"
+        )
+
+    # Reject explicit JSON null on fields backed by NOT NULL columns. end_date
+    # and energy_kwh are nullable, so an explicit null there is a legitimate
+    # "clear it" — only those two may be set to None. (Mirrors the manual
+    # /schedule PATCH null-field guard; do NOT use exclude_none here or
+    # clearing end_date/energy_kwh becomes impossible.)
+    non_nullable_patch_fields = {
+        "vehicle_id",
+        "route_id",
+        "departure_time_of_day",
+        "return_time_of_day",
+        "days_of_week",
+        "start_date",
+        "required_soc",
+        "active",
+    }
+    null_fields = sorted(
+        name
+        for name, value in patch_data.items()
+        if name in non_nullable_patch_fields and value is None
+    )
+    if null_fields:
+        return _recurring_validation_400(
+            null_fields[0], f"{', '.join(null_fields)} cannot be null"
         )
 
     depot_uuid = UUID(depot_id)
@@ -5290,27 +5315,13 @@ async def _set_recurring_template_active(
     depot_uuid = UUID(depot_id)
     template_uuid = UUID(template_id)
     async with db_pools.static.acquire() as conn:
-        existing = await db_queries.get_recurring_template_for_depot(
-            conn, depot_id=depot_uuid, template_id=template_uuid
-        )
-        if existing is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Recurring template not found",
-            )
-        updated = await db_queries.update_recurring_template(
+        # Single-column UPDATE keyed by (id, depot_id): no read-modify-write,
+        # so a concurrent edit to other fields can't be clobbered. A missing
+        # row (deleted concurrently or wrong depot) returns None → 404.
+        updated = await db_queries.set_recurring_template_active(
             conn,
             depot_id=depot_uuid,
             template_id=template_uuid,
-            vehicle_id=UUID(str(existing["vehicle_id"])),
-            route_id=existing["route_id"],
-            departure_time_of_day=existing["departure_time_of_day"],
-            return_time_of_day=existing["return_time_of_day"],
-            days_of_week=list(existing["days_of_week"]),
-            start_date=existing["start_date"],
-            end_date=existing["end_date"],
-            required_soc=float(existing["required_soc"]),
-            energy_kwh=existing.get("energy_kwh"),
             active=active,
         )
         if updated is None:

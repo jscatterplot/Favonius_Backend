@@ -908,6 +908,28 @@ async def update_recurring_template(
     return _row_to_recurring_template(row) if row else None
 
 
+async def set_recurring_template_active(
+    db, *, depot_id: UUID, template_id: UUID, active: bool
+) -> Optional[dict]:
+    """Toggle only the ``active`` flag (pause/resume).
+
+    Touches a single column so a concurrent edit to other fields between the
+    read and this write can't be clobbered (the full-row UPDATE used by the
+    PATCH path would otherwise restore stale values).
+    """
+    query = """
+        UPDATE recurring_schedule_template
+        SET active = $3
+        WHERE id = $1 AND depot_id = $2
+        RETURNING id, depot_id, vehicle_id, route_id,
+                  departure_time_of_day, return_time_of_day, days_of_week,
+                  start_date, end_date, required_soc, energy_kwh, active,
+                  created_at, updated_at
+    """
+    row = await db.fetchrow(query, template_id, depot_id, active)
+    return _row_to_recurring_template(row) if row else None
+
+
 async def delete_recurring_template(
     db, *, depot_id: UUID, template_id: UUID
 ) -> bool:

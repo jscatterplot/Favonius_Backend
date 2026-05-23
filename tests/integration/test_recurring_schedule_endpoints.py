@@ -186,6 +186,14 @@ def _build_static_pool(store: _TemplateStore) -> tuple[MagicMock, AsyncMock]:
                 energy_kwh=args[9],
             )
             return row
+        if q.startswith("UPDATE recurring_schedule_template") and "SET active = $3" in q:
+            # set_recurring_template_active: args (template_id, depot_id, active)
+            template_id = str(args[0])
+            depot_id = args[1]
+            existing = store.templates.get(template_id)
+            if existing is None or existing["depot_id"] != depot_id:
+                return None
+            return store.update_template(template_id, active=args[2])
         if q.startswith("UPDATE recurring_schedule_template"):
             template_id = str(args[0])
             depot_id = args[1]
@@ -624,6 +632,110 @@ def test_cancel_with_bad_date_returns_400(client, world):
     payload = r.json()
     assert payload["error_code"] == "VALIDATION_ERROR"
     assert "occurrence_date" in payload["field_errors"]
+
+
+# --------------------------------------------------------------------------- #
+# PATCH null handling (clear nullable fields; reject null on NOT NULL columns)
+# --------------------------------------------------------------------------- #
+
+
+def _create_template(client, world, **overrides):
+    body = {
+        "vehicle_id": world["vehicle_id"],
+        "route_id": "R1",
+        "departure_time_of_day": "07:30",
+        "return_time_of_day": "19:00",
+        "days_of_week": ["mon", "tue"],
+        "start_date": "2026-05-22",
+        "end_date": "2026-12-31",
+        "required_soc": 1.0,
+        "energy_kwh": 180,
+    }
+    body.update(overrides)
+    return client.post(
+        f"/admin/depots/{world['depot_id']}/schedule/recurring",
+        headers=AUTH_HDR,
+        json=body,
+    )
+
+
+def test_patch_can_clear_nullable_fields_with_explicit_null(client, world):
+    """end_date and energy_kwh are nullable: explicit null clears them.
+
+    Regression guard for the Bugbot High finding — the earlier
+    exclude_none autofix silently dropped these and made clearing impossible.
+    """
+    depot_id = world["depot_id"]
+    with _patches(world["pools"]):
+        created = _create_template(client, world).json()["created"]
+        assert created["end_date"] == "2026-12-31"
+        assert created["energy_kwh"] == 180.0
+        template_id = created["template_id"]
+
+        r = client.patch(
+            f"/admin/depots/{depot_id}/schedule/recurring/{template_id}",
+            headers=AUTH_HDR,
+            json={"end_date": None, "energy_kwh": None},
+        )
+    assert r.status_code == 200, r.text
+    updated = r.json()["updated"]
+    assert updated["end_date"] is None
+    assert updated["energy_kwh"] is None
+
+
+def test_patch_rejects_null_on_non_nullable_field(client, world):
+    """Explicit null on a NOT NULL column → 400 VALIDATION_ERROR, not a 500."""
+    depot_id = world["depot_id"]
+    with _patches(world["pools"]):
+        template_id = _create_template(client, world).json()["created"]["template_id"]
+        r = client.patch(
+            f"/admin/depots/{depot_id}/schedule/recurring/{template_id}",
+            headers=AUTH_HDR,
+            json={"route_id": None},
+        )
+    assert r.status_code == 400, r.text
+    payload = r.json()
+    assert payload["error_code"] == "VALIDATION_ERROR"
+    assert "route_id" in payload["field_errors"]
+
+
+def test_patch_rejects_null_active(client, world):
+    """active is non-nullable: null must 400 rather than silently deactivate."""
+    depot_id = world["depot_id"]
+    with _patches(world["pools"]):
+        template_id = _create_template(client, world).json()["created"]["template_id"]
+        r = client.patch(
+            f"/admin/depots/{depot_id}/schedule/recurring/{template_id}",
+            headers=AUTH_HDR,
+            json={"active": None},
+        )
+    assert r.status_code == 400
+    assert "active" in r.json()["field_errors"]
+
+
+def test_pause_only_updates_active_column(client, world):
+    """pause/resume must issue a single-column UPDATE so it can't clobber
+    a concurrent edit to other fields."""
+    depot_id = world["depot_id"]
+    conn = world["conn"]
+    with _patches(world["pools"]):
+        template_id = _create_template(client, world).json()["created"]["template_id"]
+        r = client.post(
+            f"/admin/depots/{depot_id}/schedule/recurring/{template_id}/pause",
+            headers=AUTH_HDR,
+        )
+    assert r.status_code == 200
+    assert r.json()["updated"]["active"] is False
+    # The UPDATE the pause path issued must be the active-only form.
+    update_calls = [
+        c.args[0]
+        for c in conn.fetchrow.call_args_list
+        if c.args and c.args[0].strip().startswith("UPDATE recurring_schedule_template")
+    ]
+    assert update_calls, "pause should issue an UPDATE"
+    assert all("SET active = $3" in q for q in update_calls), (
+        "pause must only update the active column"
+    )
 
 
 # --------------------------------------------------------------------------- #
