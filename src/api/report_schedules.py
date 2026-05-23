@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from .report_schedule_timing import (
@@ -380,21 +380,43 @@ async def claim_run(
     """Insert a run row for (schedule, slot); return its id, or None if the slot
     was already claimed (the UNIQUE constraint is the cron idempotency anchor).
 
-    The initial status is 'skipped' — a neutral terminal value so a crash before
-    finalisation leaves the slot safe (no delivery, no re-fire). The executing
-    caller overwrites it with the real outcome.
+    The initial status is 'skipped' with no ``completed_at`` — a placeholder until
+    ``finalize_run`` writes the real outcome. A crash leaves that placeholder; a
+    later tick may reclaim it once the row is older than five minutes. Finished
+    runs (``completed_at`` set) are never reclaimed.
     """
     row = await conn.fetchrow(
         """
         INSERT INTO schedule_runs (schedule_id, scheduled_for, status)
         VALUES ($1::uuid, $2, 'skipped')
-        ON CONFLICT (schedule_id, scheduled_for) DO NOTHING
+        ON CONFLICT (schedule_id, scheduled_for) DO UPDATE
+        SET triggered_at = NOW()
+        WHERE schedule_runs.status = 'skipped'
+          AND schedule_runs.completed_at IS NULL
+          AND schedule_runs.report_id IS NULL
+          AND schedule_runs.triggered_at < NOW() - INTERVAL '5 minutes'
         RETURNING id::text
         """,
         schedule_id,
         scheduled_for,
     )
     return row["id"] if row else None
+
+
+async def _update_schedule_last_run_status(
+    conn: "asyncpg.Connection", run_id: str, status: str
+) -> None:
+    """Keep ``report_schedules.last_run_status`` in sync after a run is resolved."""
+    await conn.execute(
+        """
+        UPDATE report_schedules rs
+        SET last_run_status = $2, updated_at = NOW()
+        FROM schedule_runs sr
+        WHERE sr.id = $1::uuid AND rs.id = sr.schedule_id
+        """,
+        run_id,
+        status,
+    )
 
 
 async def finalize_run(
@@ -685,6 +707,7 @@ async def execute_schedule_run(
     generate_report: GenerateReportFn,
     default_from: str,
     now_utc: datetime,
+    scheduled_for: Optional[datetime] = None,
 ) -> str:
     """Execute a claimed run end-to-end and return its terminal status.
 
@@ -696,7 +719,8 @@ async def execute_schedule_run(
     """
     depot_id = str(schedule_row["depot_id"])
     schedule_id = str(schedule_row["id"])
-    now_local = now_utc.astimezone(resolve_timezone(tz_name))
+    tz = resolve_timezone(tz_name)
+    period_anchor = (scheduled_for if scheduled_for is not None else now_utc).astimezone(tz)
 
     async with pools.ts.acquire() as conn:
         mode = await resolve_autonomy_mode(
@@ -709,7 +733,7 @@ async def execute_schedule_run(
         return "skipped"
 
     # Generate the report (any kind). On failure mark the run failed.
-    period_start, period_end = compute_report_period(schedule_row["frequency"], now_local)
+    period_start, period_end = compute_report_period(schedule_row["frequency"], period_anchor)
     title = f"{schedule_row['name']} — {period_start} to {period_end}"
     params = {
         "kind": schedule_row["kind"],
@@ -819,22 +843,28 @@ async def deliver_pending_run(
         )
 
     async with pools.ts.acquire() as conn:
-        await conn.execute(
+        updated = await conn.fetchrow(
             "UPDATE schedule_runs SET status = 'succeeded', completed_at = NOW() "
-            "WHERE id = $1::uuid AND status = 'pending_approval'",
+            "WHERE id = $1::uuid AND status = 'pending_approval' "
+            "RETURNING schedule_id::text",
             run_id,
         )
+        if updated is not None:
+            await _update_schedule_last_run_status(conn, run_id, "succeeded")
         return await serialize_run(conn, run_id)
 
 
 async def skip_pending_run(pools: "DatabasePools", *, run_id: str) -> None:
     """Flip a pending_approval run to skipped (proposed mode → rejected)."""
     async with pools.ts.acquire() as conn:
-        await conn.execute(
+        updated = await conn.fetchrow(
             "UPDATE schedule_runs SET status = 'skipped', completed_at = NOW() "
-            "WHERE id = $1::uuid AND status = 'pending_approval'",
+            "WHERE id = $1::uuid AND status = 'pending_approval' "
+            "RETURNING schedule_id::text",
             run_id,
         )
+        if updated is not None:
+            await _update_schedule_last_run_status(conn, run_id, "skipped")
 
 
 # ── Webhook: append delivery status ───────────────────────────────────────────
@@ -902,51 +932,56 @@ async def _tick(
     for schedule in due:
         schedule_id = str(schedule["id"])
         scheduled_for = schedule["next_run_at"]
+        tz_name: Optional[str] = None
         try:
             tz_name = await get_timezone(str(schedule["depot_id"]))
         except Exception as exc:  # noqa: BLE001 - skip depots we can't resolve
             logger.warning("report worker: cannot resolve tz for schedule %s: %s", schedule_id, exc)
-            continue
-
-        async with pools.ts.acquire() as conn:
-            run_id = await claim_run(conn, schedule_id, scheduled_for)
 
         terminal_status: Optional[str] = None
-        if run_id is not None:
-            try:
-                terminal_status = await execute_schedule_run(
-                    pools,
-                    schedule_row=schedule,
-                    run_id=run_id,
-                    tz_name=tz_name,
-                    email_client=email_client,
-                    generate_report=generate_report,
-                    default_from=default_from,
-                    now_utc=now_utc,
-                )
-                executed += 1
-            except Exception as exc:  # noqa: BLE001 - one bad run must not stall the worker
-                logger.error(
-                    "report worker: run failed schedule=%s: %s", schedule_id, exc, exc_info=True
-                )
-                async with pools.ts.acquire() as conn:
-                    await finalize_run(conn, run_id, status="failed", error_message=str(exc))
-                terminal_status = "failed"
+        if tz_name is not None:
+            async with pools.ts.acquire() as conn:
+                run_id = await claim_run(conn, schedule_id, scheduled_for)
+
+            if run_id is not None:
+                try:
+                    terminal_status = await execute_schedule_run(
+                        pools,
+                        schedule_row=schedule,
+                        run_id=run_id,
+                        tz_name=tz_name,
+                        email_client=email_client,
+                        generate_report=generate_report,
+                        default_from=default_from,
+                        now_utc=now_utc,
+                        scheduled_for=scheduled_for,
+                    )
+                    executed += 1
+                except Exception as exc:  # noqa: BLE001 - one bad run must not stall the worker
+                    logger.error(
+                        "report worker: run failed schedule=%s: %s", schedule_id, exc, exc_info=True
+                    )
+                    async with pools.ts.acquire() as conn:
+                        await finalize_run(conn, run_id, status="failed", error_message=str(exc))
+                    terminal_status = "failed"
 
         # Advance next_run_at so we never spin on a past slot — even if another
-        # process claimed the run (run_id is None here).
-        try:
-            next_at = compute_next_run_at(
-                now_utc,
-                frequency=schedule["frequency"],
-                time_of_day=schedule["time_of_day"],
-                tz_name=tz_name,
-                day_of_month=schedule["day_of_month"],
-                day_of_week=schedule["day_of_week"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("report worker: reschedule failed schedule=%s: %s", schedule_id, exc)
-            continue
+        # process claimed the run (run_id is None here) or tz/reschedule failed.
+        next_at: Optional[datetime] = None
+        if tz_name is not None:
+            try:
+                next_at = compute_next_run_at(
+                    now_utc,
+                    frequency=schedule["frequency"],
+                    time_of_day=schedule["time_of_day"],
+                    tz_name=tz_name,
+                    day_of_month=schedule["day_of_month"],
+                    day_of_week=schedule["day_of_week"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("report worker: reschedule failed schedule=%s: %s", schedule_id, exc)
+        if next_at is None:
+            next_at = now_utc + timedelta(hours=1)
 
         async with pools.ts.acquire() as conn:
             if terminal_status is not None:
