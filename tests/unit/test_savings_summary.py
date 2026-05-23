@@ -298,6 +298,87 @@ class TestComputeSavingsSummary:
         assert result.saved_eur == pytest.approx(200.0)
         assert result.saved_pct == pytest.approx(20.0)
 
+    def test_negative_avg_price_preserves_signed_baseline(self, pools_with_data):
+        """ENTSO-E day-ahead prices go negative in high-renewable hours.
+
+        A negative average is real data, not a missing-data sentinel — the
+        baseline must keep its sign instead of collapsing to 0 (Codex P2 on
+        PR #232). Here the unmanaged baseline is negative (you'd have been
+        paid to consume), and the depot did worse than that baseline, so
+        saved_eur and saved_pct are both negative.
+        """
+        static_pool, ts_pool, _, ts_conn = pools_with_data
+        ts_conn.fetchrow.side_effect = [
+            {"actual": -5.0, "energy": 1000.0},  # we were paid €5
+            {"avg_eur_mwh": -10.0},  # -0.01 €/kWh average
+        ]
+
+        with (
+            patch(
+                "src.api.savings.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value={"timezone": "UTC"},
+            ),
+            patch(
+                "src.api.savings.db_queries.charger_id_by_ocpp_id",
+                new_callable=AsyncMock,
+                return_value={"acme-001": str(uuid4())},
+            ),
+            patch(
+                "src.api.savings.db_queries.resolve_bidding_zone",
+                new_callable=AsyncMock,
+                return_value="10YLT-1001A0008Q",
+            ),
+        ):
+            result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
+
+        # baseline = 1000 kWh × -0.01 €/kWh = -10.00 (NOT zeroed out)
+        assert result.baseline_month_eur == pytest.approx(-10.0)
+        assert result.current_month_eur == pytest.approx(-5.0)
+        # saved = -10.00 - (-5.00) = -5.00 → we did €5 worse than baseline
+        assert result.saved_eur == pytest.approx(-5.0)
+        # pct uses abs(baseline) denominator so the sign reflects worse(-)
+        # vs better(+): -5 / |−10| × 100 = -50.0%
+        assert result.saved_pct == pytest.approx(-50.0)
+
+    def test_negative_price_but_optimized_better_positive_savings(self, pools_with_data):
+        """Negative-price month where smart charging beat the baseline.
+
+        baseline is negative (you'd have been paid), and the depot got
+        paid even more by loading into the negative hours → positive
+        savings.
+        """
+        static_pool, ts_pool, _, ts_conn = pools_with_data
+        ts_conn.fetchrow.side_effect = [
+            {"actual": -20.0, "energy": 1000.0},  # we were paid €20
+            {"avg_eur_mwh": -10.0},  # baseline -0.01 €/kWh
+        ]
+
+        with (
+            patch(
+                "src.api.savings.db_queries.get_depot_by_id",
+                new_callable=AsyncMock,
+                return_value={"timezone": "UTC"},
+            ),
+            patch(
+                "src.api.savings.db_queries.charger_id_by_ocpp_id",
+                new_callable=AsyncMock,
+                return_value={"acme-001": str(uuid4())},
+            ),
+            patch(
+                "src.api.savings.db_queries.resolve_bidding_zone",
+                new_callable=AsyncMock,
+                return_value="10YLT-1001A0008Q",
+            ),
+        ):
+            result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
+
+        # baseline = -10.00; saved = -10.00 - (-20.00) = +10.00 (we beat it)
+        assert result.baseline_month_eur == pytest.approx(-10.0)
+        assert result.saved_eur == pytest.approx(10.0)
+        # +10 / |−10| × 100 = +100.0%
+        assert result.saved_pct == pytest.approx(100.0)
+
 
 # ── /depots/{depot_id}/savings-summary endpoint ─────────────────────────────
 

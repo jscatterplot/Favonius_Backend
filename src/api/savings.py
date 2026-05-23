@@ -218,14 +218,24 @@ async def compute_savings_summary(
                 period_end=period_end,
             )
 
+    # avg_price is None only when there are no price rows for the window
+    # (or no zone / no energy, so we never queried) — that's the genuine
+    # "unknown baseline" case and degrades to 0. A *negative* average is
+    # NOT missing data: ENTSO-E day-ahead prices go negative in
+    # high-renewable hours, and a depot exposed to them has a real
+    # (negative) unmanaged baseline. Preserve the sign.
     baseline_cost = (
-        round(total_energy_kwh * avg_price, 2)
-        if avg_price is not None and avg_price > 0
-        else 0.0
+        round(total_energy_kwh * avg_price, 2) if avg_price is not None else 0.0
     )
     actual_cost = round(actual_cost, 2)
     saved = round(baseline_cost - actual_cost, 2)
-    saved_pct = round((saved / baseline_cost) * 100.0, 1) if baseline_cost > 0 else 0.0
+    # Percentage is signed against the baseline's magnitude: a negative
+    # baseline with a worse-than-baseline actual must read as a negative
+    # saved_pct (we did worse), not flip positive from sign cancellation.
+    # Only a zero baseline is undefined → 0.0.
+    saved_pct = (
+        round((saved / abs(baseline_cost)) * 100.0, 1) if baseline_cost != 0 else 0.0
+    )
 
     return SavingsSummary(
         current_month_eur=actual_cost,
