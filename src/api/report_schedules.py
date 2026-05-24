@@ -468,6 +468,35 @@ async def fetch_run(conn: "asyncpg.Connection", run_id: str) -> Optional["asyncp
     )
 
 
+_RUN_FINALIZE_POLL_INTERVAL_S = 0.25
+_RUN_FINALIZE_WAIT_TIMEOUT_S = 300.0
+
+
+async def wait_for_run_finalized(
+    pools: "DatabasePools",
+    run_id: str,
+    *,
+    poll_interval_s: float = _RUN_FINALIZE_POLL_INTERVAL_S,
+    timeout_s: float = _RUN_FINALIZE_WAIT_TIMEOUT_S,
+) -> None:
+    """Block until ``finalize_run`` sets ``completed_at`` (placeholder rows omit it)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        async with pools.ts.acquire() as conn:
+            completed_at = await conn.fetchval(
+                "SELECT completed_at FROM schedule_runs WHERE id = $1::uuid",
+                run_id,
+            )
+        if completed_at is not None:
+            return
+        await asyncio.sleep(poll_interval_s)
+    logger.warning(
+        "wait_for_run_finalized timed out for run_id=%s after %.0fs",
+        run_id,
+        timeout_s,
+    )
+
+
 async def serialize_run(conn: "asyncpg.Connection", run_id: str) -> Optional[dict]:
     run = await fetch_run(conn, run_id)
     if run is None:

@@ -12153,6 +12153,8 @@ async def _handle_report_schedule_run_now(
                 now_utc,
             )
         target_run_id = existing_run["id"] if existing_run else None
+        if target_run_id is not None:
+            await _report_schedules.wait_for_run_finalized(db_pools, target_run_id)
 
     if target_run_id is None:
         raise HTTPException(status_code=500, detail="run_now failed to produce a run")
