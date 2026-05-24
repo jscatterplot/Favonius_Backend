@@ -124,6 +124,63 @@ def _allowed_tools() -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_thinking_capable_model_sends_adaptive_thinking_and_effort():
+    # A thinking-capable model (Sonnet 4.6) must get adaptive thinking +
+    # effort and NO temperature on the loop's create call — thinking is
+    # incompatible with custom sampling params.
+    reg, _log = _registry()
+    script = [
+        _FakeResponse(
+            [_tool_use(EMIT_FINAL_ANSWER_TOOL, "b1", {"text": "done", "row_evidence": 0})]
+        ),
+    ]
+    client = _FakeClient(script)
+
+    await run_qa_turn(
+        anthropic_client=client,
+        model="claude-sonnet-4-6",
+        system_prompt="sys",
+        user_message="user q",
+        tool_registry=reg,
+        allowed_tools=_allowed_tools(),
+        effort="medium",
+    )
+
+    call = client.messages.calls[0]
+    assert call["thinking"] == {"type": "adaptive"}
+    assert call["output_config"] == {"effort": "medium"}
+    assert "temperature" not in call
+
+
+@pytest.mark.asyncio
+async def test_non_thinking_model_sends_temperature_not_thinking():
+    # Haiku 4.5 supports neither adaptive thinking nor effort; the loop
+    # must fall back to temperature and omit thinking/output_config.
+    reg, _log = _registry()
+    script = [
+        _FakeResponse(
+            [_tool_use(EMIT_FINAL_ANSWER_TOOL, "b1", {"text": "done", "row_evidence": 0})]
+        ),
+    ]
+    client = _FakeClient(script)
+
+    await run_qa_turn(
+        anthropic_client=client,
+        model="claude-haiku-4-5",
+        system_prompt="sys",
+        user_message="user q",
+        tool_registry=reg,
+        allowed_tools=_allowed_tools(),
+        temperature=0.0,
+    )
+
+    call = client.messages.calls[0]
+    assert call["temperature"] == 0.0
+    assert "thinking" not in call
+    assert "output_config" not in call
+
+
+@pytest.mark.asyncio
 async def test_happy_path_explorer_then_select_then_terminator():
     reg, log = _registry()
     script = [

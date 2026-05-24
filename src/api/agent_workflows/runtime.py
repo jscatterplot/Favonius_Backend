@@ -39,6 +39,7 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from src.api.agent.auth_context import AuthContext
+from src.api.agent.thinking import DEFAULT_EFFORT, generation_kwargs
 from src.api.agent_workflows.constraints import (
     ConstraintViolation,
     DepotConstraints,
@@ -241,8 +242,11 @@ class WorkflowAgent:
         decision_repo: Optional[DecisionRepo] = None,
         model: str = "claude-sonnet-4-6",
         max_iterations: int = 8,
-        max_tokens: int = 2048,
+        # 4096 (up from 2048) so adaptive-thinking tokens and the
+        # decision output share enough headroom across the tool-use loop.
+        max_tokens: int = 4096,
         temperature: float = 0.0,
+        effort: str = DEFAULT_EFFORT,
         constraints: Optional[DepotConstraints] = None,
         constraints_resolver: Optional[Callable[[UUID], DepotConstraints]] = None,
     ) -> None:
@@ -252,6 +256,7 @@ class WorkflowAgent:
         self._max_iterations = max(1, int(max_iterations))
         self._max_tokens = int(max_tokens)
         self._temperature = float(temperature)
+        self._effort = effort
         self._constraints = constraints or DepotConstraints()
         self._constraints_resolver = constraints_resolver
 
@@ -340,13 +345,22 @@ class WorkflowAgent:
             ]
 
             for _iteration in range(self._max_iterations):
+                # Adaptive thinking + effort on capable models (interleaved
+                # thinking across tool calls); temperature otherwise. The
+                # tool-use loop already appends full response.content as the
+                # assistant turn, so thinking blocks are preserved between
+                # iterations as the API requires.
                 response = await self._client.messages.create(
                     model=self._model,
                     max_tokens=self._max_tokens,
-                    temperature=self._temperature,
                     system=system_blocks,
                     tools=tools,
                     messages=messages,
+                    **generation_kwargs(
+                        self._model,
+                        effort=self._effort,
+                        temperature=self._temperature,
+                    ),
                 )
                 self._record_tokens(workflow.name, response)
 
@@ -735,8 +749,11 @@ async def run_qa_turn(
     tool_registry: ToolRegistry,
     allowed_tools: Sequence[str],
     max_iterations: int = 8,
-    max_tokens: int = 2048,
+    # 4096 (up from 2048) so adaptive-thinking tokens and the answer share
+    # enough headroom across the up-to-`max_iterations` tool-use loop.
+    max_tokens: int = 4096,
     temperature: float = 0.0,
+    effort: str = DEFAULT_EFFORT,
     on_step: Optional[Callable[[ToolCall], Any]] = None,
 ) -> QAResult:
     """Run one Anthropic tool-use loop in Q&A mode (no Decision row).
@@ -759,6 +776,13 @@ async def run_qa_turn(
             call. Must include :data:`~src.api.agent_workflows.runtime.EMIT_FINAL_ANSWER_TOOL`.
         max_iterations: Hard cap on tool-use turns. Default 8.
         max_tokens, temperature: Anthropic Messages API parameters.
+            ``temperature`` is only sent on models that don't support
+            adaptive thinking (see ``effort``).
+        effort: Adaptive-thinking effort level for thinking-capable
+            models (one of :data:`~src.api.agent.thinking.VALID_EFFORT_LEVELS`).
+            On those models the call uses adaptive thinking + effort and
+            omits ``temperature``; elsewhere it falls back to
+            ``temperature``. See :func:`src.api.agent.thinking.generation_kwargs`.
         on_step: Optional async callback invoked after each tool call
             with the populated :class:`ToolCall`. Used by the controller
             to write ``agent_runs.steps_json`` and SSE step events.
@@ -803,13 +827,18 @@ async def run_qa_turn(
 
     try:
         for iterations in range(1, max_iterations + 1):
+            # Adaptive thinking + effort on capable models gives the loop
+            # interleaved reasoning across tool calls (ideal for multi-step
+            # SQL exploration); temperature otherwise. Full response.content
+            # is appended as the assistant turn below, so thinking blocks
+            # are preserved between iterations as the API requires.
             response = await _messages_api(anthropic_client).create(
                 model=model,
                 max_tokens=max_tokens,
-                temperature=temperature,
                 system=system_blocks,
                 tools=tools,
                 messages=messages,
+                **generation_kwargs(model, effort=effort, temperature=temperature),
             )
             # Record token usage on EVERY round-trip. Bugbot M-sev: a
             # SQL-mode turn can make up to `max_iterations` (default 8)

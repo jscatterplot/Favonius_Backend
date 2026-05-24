@@ -48,6 +48,7 @@ def _replace_config(monkeypatch: pytest.MonkeyPatch, **fields) -> None:
         extract_max_tokens=fields.get("extract_max_tokens", base.extract_max_tokens),
         format_max_tokens=fields.get("format_max_tokens", base.format_max_tokens),
         temperature=fields.get("temperature", base.temperature),
+        effort=fields.get("effort", base.effort),
         request_timeout_s=fields.get("request_timeout_s", base.request_timeout_s),
     )
     monkeypatch.setattr(llm_module, "CONFIG", new_config)
@@ -154,6 +155,20 @@ class TestLLMConfig:
         assert config.format_max_tokens == 1500
         assert config.temperature == 0.5
         assert config.request_timeout_s == 60
+
+    def test_default_effort_is_high(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("AGENT_LLM_EFFORT", raising=False)
+        assert LLMConfig.from_env().effort == "high"
+
+    def test_reads_effort_from_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("AGENT_LLM_EFFORT", "low")
+        assert LLMConfig.from_env().effort == "low"
+
+    def test_rejects_invalid_effort_at_load(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("AGENT_LLM_EFFORT", "turbo")
+        with pytest.raises((ValueError, ValidationError)) as excinfo:
+            LLMConfig.from_env()
+        assert "turbo" in str(excinfo.value)
 
     def test_config_is_frozen(self):
         config = LLMConfig(model="claude-haiku-4-5")
@@ -410,9 +425,7 @@ class TestFormatAnswer:
         assert text == "John charged 1,243.0 kWh in May 2026."
 
     @pytest.mark.asyncio
-    async def test_uses_format_token_budget_and_higher_temperature(
-        self, patch_anthropic_client: AsyncMock
-    ):
+    async def test_uses_format_token_budget(self, patch_anthropic_client: AsyncMock):
         patch_anthropic_client.return_value = _make_response([_make_text_block("ok")])
 
         plan = QueryPlan.model_validate(VALID_PLAN_INPUT)
@@ -420,9 +433,42 @@ class TestFormatAnswer:
 
         kwargs = patch_anthropic_client.call_args.kwargs
         assert kwargs["max_tokens"] == llm_module.CONFIG.format_max_tokens
-        # Format step uses 0.3 (FORMAT_STEP_TEMPERATURE), not the
-        # extraction temperature (default 0.0).
+
+    @pytest.mark.asyncio
+    async def test_thinking_capable_model_uses_adaptive_thinking_and_effort(
+        self, monkeypatch: pytest.MonkeyPatch, patch_anthropic_client: AsyncMock
+    ):
+        # Sonnet 4.6 supports adaptive thinking + effort. The format step
+        # must send both and OMIT temperature — thinking is incompatible
+        # with custom sampling params.
+        _replace_config(monkeypatch, model="claude-sonnet-4-6", effort="high")
+        patch_anthropic_client.return_value = _make_response([_make_text_block("ok")])
+
+        plan = QueryPlan.model_validate(VALID_PLAN_INPUT)
+        await format_answer(plan, [], {}, [])
+
+        kwargs = patch_anthropic_client.call_args.kwargs
+        assert kwargs["thinking"] == {"type": "adaptive"}
+        assert kwargs["output_config"] == {"effort": "high"}
+        assert "temperature" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_non_thinking_model_falls_back_to_temperature(
+        self, monkeypatch: pytest.MonkeyPatch, patch_anthropic_client: AsyncMock
+    ):
+        # Haiku 4.5 supports neither adaptive thinking nor effort; sending
+        # either is a 400, so the format step must fall back to temperature
+        # and omit thinking/output_config.
+        _replace_config(monkeypatch, model="claude-haiku-4-5")
+        patch_anthropic_client.return_value = _make_response([_make_text_block("ok")])
+
+        plan = QueryPlan.model_validate(VALID_PLAN_INPUT)
+        await format_answer(plan, [], {}, [])
+
+        kwargs = patch_anthropic_client.call_args.kwargs
         assert kwargs["temperature"] == llm_module.FORMAT_STEP_TEMPERATURE
+        assert "thinking" not in kwargs
+        assert "output_config" not in kwargs
 
     @pytest.mark.asyncio
     async def test_per_call_model_override_used(self, patch_anthropic_client: AsyncMock):
