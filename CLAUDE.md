@@ -449,6 +449,7 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 |---|---|---|
 | `POST` | `/optimize` | Trigger depot MILP optimization |
 | `GET` | `/depots/{id}/state` | Current SoCs, battery state, peak demand, price |
+| `GET` | `/depots/{id}/savings-summary` | Month-to-date charging cost vs flat-rate baseline (current_month_eur, baseline_month_eur, saved_eur, saved_pct, period_start, period_end, as_of). Computed from `charging_sessions.cost_total` + `electricity_prices` average over the period. Missing-data paths (no sessions, no zone, no prices) return zeros instead of 500 so the UI shows '—'. |
 | `GET` | `/depots/{id}/schedule` | Latest charging schedule |
 | `GET` | `/depots/{id}/alerts` | Charger faults + last optimization + notification_alerts (alerts pipeline) |
 | `POST` | `/depots/{id}/alerts/{alert_id}/acknowledge` | Mark a notification alert as acknowledged (alerts pipeline) |
@@ -474,6 +475,7 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `PATCH` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Patch a recipient |
 | `DELETE` | `/admin/organizations/{org_id}/notification_recipients/{id}` | Hard-delete a recipient (cascades deliveries). |
 | `POST` | `/webhooks/resend` | Public, signature-verified Resend webhook for delivery status updates (alerts pipeline) |
+| `GET` | `/admin/depots/{id}/chargers/{cid}/sessions` | List completed charging sessions for a single charger (keyset pagination, `from`/`to` filters). Feeds the charger-logs admin UI: operator picks a session, then triggers `fetch_logs`. Same role gate as `fetch_logs` (customer_admin or favonius_admin); same response shape as `GET /depots/{id}/sessions`. |
 | `POST` | `/admin/depots/{id}/chargers/{cid}/sessions/{sid}/fetch_logs` | Trigger OCPP `GetDiagnostics` on a session's charger and store the upload alongside the session. customer_admin or favonius_admin; writes `charger.logs.fetched` audit. |
 | `GET` | `/admin/depots/{id}/sessions/{sid}/log_comparison` | Return `{session, import, charger_entries, reconciliation}` for side-by-side comparison. 404 until an import exists. |
 | `POST` | `/internal/charger_logs/upload` | Public charger-uploaded diagnostic archive. Auth via HMAC token in query string (`CHARGER_LOG_UPLOAD_SIGNING_KEY`). |

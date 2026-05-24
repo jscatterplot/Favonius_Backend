@@ -123,6 +123,7 @@ from .reports import (
     compute_energy_totals,
     stream_rows_as_csv,
 )
+from .savings import compute_savings_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1089,6 +1090,46 @@ class DepotStateResponse(BaseModel):
     )
     current_month_peak_kw: float = Field(..., ge=0.0, description="Current month peak demand (kW)")
     current_price_kwh: float = Field(..., ge=0.0, description="Current electricity price ($/kWh)")
+
+
+class SavingsSummaryResponse(BaseModel):
+    """Month-to-date savings summary for the depot 'today' card.
+
+    Spec from the frontend ``SavingsSummarySchema`` in
+    ``src/lib/schemas/today.ts``. All seven fields are required and
+    non-null; the backend forces ``0.0`` rather than NaN/Infinity when
+    there's no data, so the UI never has to special-case empty months.
+    """
+
+    current_month_eur: float = Field(
+        ..., description="Actual charging cost month-to-date (EUR)."
+    )
+    baseline_month_eur: float = Field(
+        ...,
+        description=(
+            "What the same energy would have cost without optimization "
+            "(flat-rate baseline: total energy × average day-ahead price "
+            "across the period)."
+        ),
+    )
+    saved_eur: float = Field(
+        ..., description="baseline_month_eur - current_month_eur."
+    )
+    saved_pct: float = Field(
+        ...,
+        description=(
+            "Savings as a percentage of baseline, one decimal place. "
+            "Forced to 0.0 when baseline is 0."
+        ),
+    )
+    period_start: str = Field(
+        ...,
+        description="First instant of the current calendar month, depot tz, returned as UTC ISO 8601.",
+    )
+    period_end: str = Field(..., description="\"Now\" as UTC ISO 8601.")
+    as_of: str = Field(
+        ..., description="When the figures were computed (UTC ISO 8601)."
+    )
 
 
 class ReadinessResponse(BaseModel):
@@ -6188,6 +6229,60 @@ async def get_depot_state(
 
 
 @app.get(
+    "/depots/{depot_id}/savings-summary",
+    response_model=SavingsSummaryResponse,
+    tags=["depots"],
+    summary="Month-to-date charging cost vs unmanaged baseline",
+    description=(
+        "Returns the seven fields the frontend's 'today' savings card "
+        "needs: actual cost, flat-rate baseline cost, absolute and "
+        "percentage savings, and the period window (UTC). 'Month-to-date' "
+        "means sessions started in the current calendar month in the "
+        "depot's local timezone. Missing-data paths (no sessions yet, no "
+        "bidding zone, no price rows) return zeros instead of erroring so "
+        "the UI shows '—' rather than a generic failure. Polling cadence "
+        "is 60s; values change slowly so caching is appropriate."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "No access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_savings_summary(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> SavingsSummaryResponse:
+    """Return month-to-date savings vs flat-rate baseline."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    try:
+        summary = await compute_savings_summary(
+            db_pools.static, db_pools.ts, depot_id
+        )
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error computing savings summary: %s",
+            exc,
+            exc_info=True,
+            extra={"depot_id": depot_id},
+        )
+        raise DatabaseError() from exc
+
+    return SavingsSummaryResponse(
+        current_month_eur=summary.current_month_eur,
+        baseline_month_eur=summary.baseline_month_eur,
+        saved_eur=summary.saved_eur,
+        saved_pct=summary.saved_pct,
+        period_start=summary.period_start.isoformat().replace("+00:00", "Z"),
+        period_end=summary.period_end.isoformat().replace("+00:00", "Z"),
+        as_of=summary.as_of.isoformat().replace("+00:00", "Z"),
+    )
+
+
+@app.get(
     "/depots/{depot_id}/optimization/readiness",
     response_model=ReadinessResponse,
     tags=["depots"],
@@ -8304,6 +8399,58 @@ def _decode_session_cursor(cursor: str) -> tuple[datetime, str]:
     return ts, session_id
 
 
+def _build_completed_sessions_response(
+    rows: list[dict], limit: int
+) -> CompletedSessionsResponse:
+    """Shared row -> response shaping for the completed-sessions endpoints."""
+    items = [
+        CompletedSessionItem(
+            session_id=r["session_id"],
+            ocpp_id=r.get("ocpp_id"),
+            connector_id=r.get("connector_id"),
+            vehicle_id=r.get("vehicle_id"),
+            driver_id=r.get("driver_id"),
+            started_at=_isoformat(r["started_at"]),
+            ended_at=_isoformat(r["ended_at"]),
+            energy_delivered_kwh=(
+                float(r["energy_delivered_kwh"])
+                if r.get("energy_delivered_kwh") is not None
+                else None
+            ),
+            energy_received_kwh=(
+                float(r["energy_received_kwh"])
+                if r.get("energy_received_kwh") is not None
+                else None
+            ),
+            cost_total=(
+                float(r["cost_total"]) if r.get("cost_total") is not None else None
+            ),
+            start_soc_percent=(
+                float(r["start_soc_percent"])
+                if r.get("start_soc_percent") is not None
+                else None
+            ),
+            end_soc_percent=(
+                float(r["end_soc_percent"])
+                if r.get("end_soc_percent") is not None
+                else None
+            ),
+            source=r.get("source") or "live",
+        )
+        for r in rows
+    ]
+    next_cursor = (
+        _encode_session_cursor(rows[-1]["ended_at"], rows[-1]["session_id"])
+        if len(rows) == limit
+        else None
+    )
+    return CompletedSessionsResponse(
+        items=items,
+        next_cursor=next_cursor,
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
 @app.get(
     "/depots/{depot_id}/sessions/active",
     response_model=ActiveSessionsResponse,
@@ -8478,53 +8625,7 @@ async def get_depot_sessions(
                 cursor=cursor_tuple,
             )
 
-        items = [
-            CompletedSessionItem(
-                session_id=r["session_id"],
-                ocpp_id=r.get("ocpp_id"),
-                connector_id=r.get("connector_id"),
-                vehicle_id=r.get("vehicle_id"),
-                driver_id=r.get("driver_id"),
-                started_at=_isoformat(r["started_at"]),
-                ended_at=_isoformat(r["ended_at"]),
-                energy_delivered_kwh=(
-                    float(r["energy_delivered_kwh"])
-                    if r.get("energy_delivered_kwh") is not None
-                    else None
-                ),
-                energy_received_kwh=(
-                    float(r["energy_received_kwh"])
-                    if r.get("energy_received_kwh") is not None
-                    else None
-                ),
-                cost_total=(
-                    float(r["cost_total"]) if r.get("cost_total") is not None else None
-                ),
-                start_soc_percent=(
-                    float(r["start_soc_percent"])
-                    if r.get("start_soc_percent") is not None
-                    else None
-                ),
-                end_soc_percent=(
-                    float(r["end_soc_percent"])
-                    if r.get("end_soc_percent") is not None
-                    else None
-                ),
-                source=r.get("source") or "live",
-            )
-            for r in rows
-        ]
-
-        next_cursor = (
-            _encode_session_cursor(rows[-1]["ended_at"], rows[-1]["session_id"])
-            if len(rows) == limit
-            else None
-        )
-        return CompletedSessionsResponse(
-            items=items,
-            next_cursor=next_cursor,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
-        )
+        return _build_completed_sessions_response(rows, limit)
 
     except HTTPException:
         raise
@@ -10146,6 +10247,140 @@ async def rotate_charger_credentials_endpoint(
         },
         "rotated_at": result["last_rotated_at"],
     }
+
+
+@app.get(
+    "/admin/depots/{depot_id}/chargers/{charger_id}/sessions",
+    response_model=CompletedSessionsResponse,
+    tags=["admin"],
+    summary="Paginated completed charging sessions for a single charger",
+    description=(
+        "Lists completed charging sessions on a specific charger, scoped "
+        "by the charger's OCPP ``station_id``. Companion to "
+        "``POST .../sessions/{session_id}/fetch_logs`` — operators pick a "
+        "session here, then trigger a charger-side log pull. Same keyset "
+        "pagination shape as ``GET /depots/{id}/sessions``. Gated to "
+        "favonius_admin or customer_admin since it feeds the admin "
+        "log-pull workflow."
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid query parameters"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Insufficient role or no access to this depot"},
+        404: {"model": ErrorResponse, "description": "Depot or charger not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_charger_completed_sessions(
+    depot_id: str,
+    charger_id: str,
+    user: dict = Depends(ensure_tenant_mirrored),
+    from_ts: Optional[datetime] = Query(
+        None, alias="from", description="Filter end_time >= this ISO 8601 timestamp"
+    ),
+    to_ts: Optional[datetime] = Query(
+        None, alias="to", description="Filter end_time < this ISO 8601 timestamp"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    cursor: Optional[str] = Query(
+        None, description="Opaque cursor returned in `next_cursor` from the prior page"
+    ),
+) -> CompletedSessionsResponse:
+    """List completed sessions for a specific charger.
+
+    Mirrors ``GET /depots/{id}/sessions`` (same paging, same row shape)
+    but restricts results to one charger. Role-gated identically to
+    ``POST .../sessions/{session_id}/fetch_logs`` so the listing and
+    the action it feeds have the same audience.
+    """
+    validate_uuid(depot_id, "depot_id")
+    validate_uuid(charger_id, "charger_id")
+
+    role = get_user_role(user)
+    if role not in ("favonius_admin", "customer_admin"):
+        raise _forbidden("FORBIDDEN_ROLE", "favonius_admin or customer_admin role required")
+
+    depot_row, cross_org_read = await _resolve_depot_for_admin(
+        depot_id,
+        user,
+        endpoint_name="GET /admin/depots/{depot_id}/chargers/{charger_id}/sessions",
+    )
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    if from_ts is not None and to_ts is not None and from_ts >= to_ts:
+        raise HTTPException(status_code=400, detail="`from` must be earlier than `to`")
+
+    cursor_tuple = _decode_session_cursor(cursor) if cursor else None
+
+    async def _audit_cross_org(result: str) -> None:
+        # Mirror the credentials_status read: a favonius_admin reading
+        # another tenant's depot leaves an ``admin.read`` trail. strict=True
+        # so a missing audit log fails closed (503) rather than silently
+        # serving cross-tenant data without provenance.
+        if not cross_org_read:
+            return
+        await _record_admin_action(
+            user=user,
+            action="admin.read",
+            depot_id=depot_id,
+            organization_id_override=(
+                str(depot_row.get("organization_id"))
+                if depot_row.get("organization_id")
+                else None
+            ),
+            target_type="charger",
+            target_id=str(charger_id),
+            metadata={
+                "endpoint": "GET /admin/depots/{depot_id}/chargers/{charger_id}/sessions",
+                "result": result,
+            },
+            strict=True,
+        )
+
+    try:
+        async with db_pools.static.acquire() as static_conn:
+            charger_row = await static_conn.fetchrow(
+                """
+                SELECT station_id AS ocpp_id
+                  FROM charging_stations
+                 WHERE id = $1::uuid AND site_id = $2::uuid
+                """,
+                charger_id,
+                depot_id,
+            )
+        if charger_row is None:
+            await _audit_cross_org("not_found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error_code": "CHARGER_NOT_FOUND", "message": "Charger not found"},
+            )
+
+        async with db_pools.ts.acquire() as ts_conn:
+            rows = await db_queries.list_completed_sessions_for_charger(
+                ts_conn,
+                station_ocpp_id=charger_row["ocpp_id"],
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                cursor=cursor_tuple,
+            )
+
+        await _audit_cross_org("ok")
+        return _build_completed_sessions_response(rows, limit)
+
+    except HTTPException:
+        raise
+    except asyncpg.PostgresError as exc:
+        logger.error(
+            "Database error listing sessions for charger %s in depot %s: %s",
+            charger_id,
+            depot_id,
+            exc,
+            exc_info=True,
+        )
+        raise DatabaseError() from exc
 
 
 @app.post(
