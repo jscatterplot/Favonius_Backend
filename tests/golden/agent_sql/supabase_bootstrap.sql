@@ -15,13 +15,32 @@
 -- up the static schema on a vanilla Postgres by replaying the migrations:
 -- the base tables would be missing (`relation "public.sites" does not exist`).
 --
--- So this file reconstructs the Supabase-owned base tables with exactly the
--- columns the agent_views.* functions read, in the Supabase naming
--- convention (`id` PK, `site_id` FKs). Migration 040 is then applied
--- VERBATIM on top — it remains the single source of truth for the
--- agent_views surface the golden suite gates. If a column the functions
--- read is renamed or retyped in 040, this base must track it, and the
+-- So this file reconstructs the Supabase-owned base tables. Migration 040 is
+-- then applied VERBATIM on top — it remains the single source of truth for the
+-- agent_views surface the golden suite gates. If a column the functions read
+-- is renamed or retyped in 040, this base must track it, and the
 -- function-creation step (check_function_bodies) fails loudly if it drifts.
+--
+-- SCHEMA PROVENANCE
+-- -----------------
+-- The column names AND types below were verified against the live
+-- `favonius-pilot` Supabase project (ref hmxdpuzqkotmorheyexv) via the Supabase
+-- MCP on 2026-05-24. Every column the agent_views.* functions read is present
+-- in production with the type used here:
+--   sites:             id, organization_id, name, timezone, currency, max_grid_kw,
+--                      address (jsonb), latitude, longitude, tariff_config
+--   vehicles:          id, site_id, vin, license_plate, battery_capacity_kwh,
+--                      max_charge_rate_kw, v2g_capable, status
+--   charging_stations: id, site_id, station_id, max_power_kw, connector_type,
+--                      vendor, display_name
+--   drivers:           id, site_id, display_name, external_driver_id, email, status
+--   schedules:         id, vehicle_id, driver_id, route_id, departure_time,
+--                      return_time, actual_return_time, energy_kwh, required_soc
+-- This is the MINIMAL subset the functions read. Production carries many more
+-- columns (most NOT NULL); they are deliberately omitted because no agent_views
+-- function reads them. Nullability is also relaxed vs production so a scenario's
+-- minimal fixtures don't have to populate unread columns — the column TYPES,
+-- which drive the function bodies' casts/coercions, are what mirror production.
 --
 -- Apply order for the static test DB:
 --   1. psql -f tests/golden/agent_sql/supabase_bootstrap.sql
@@ -30,19 +49,21 @@
 -- Organizations — only `id` is referenced (sites.organization_id FK).
 CREATE TABLE IF NOT EXISTS public.organizations (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    name        text NOT NULL DEFAULT 'Eval org',
+    name        varchar NOT NULL DEFAULT 'Eval org',
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
 -- Sites — the depot configuration record (agent_views.depots).
+-- `address` is jsonb in production; agent_views.depots reads it as `address::text`.
+-- A default keeps it out of the minimal fixtures.
 CREATE TABLE IF NOT EXISTS public.sites (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id  uuid REFERENCES public.organizations(id),
-    name             text NOT NULL,
-    timezone         text DEFAULT 'Europe/Vilnius',
-    currency         text DEFAULT 'EUR',
+    name             varchar NOT NULL,
+    timezone         varchar DEFAULT 'Europe/Vilnius',
+    currency         varchar NOT NULL DEFAULT 'EUR',
     max_grid_kw      double precision,
-    address          text,
+    address          jsonb NOT NULL DEFAULT '{}'::jsonb,
     latitude         double precision,
     longitude        double precision,
     tariff_config    jsonb
@@ -52,33 +73,33 @@ CREATE TABLE IF NOT EXISTS public.sites (
 CREATE TABLE IF NOT EXISTS public.vehicles (
     id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     site_id               uuid REFERENCES public.sites(id),
-    vin                   text,
-    license_plate         text,
-    battery_capacity_kwh  double precision,
-    max_charge_rate_kw    double precision,
+    vin                   varchar,
+    license_plate         varchar,
+    battery_capacity_kwh  numeric,
+    max_charge_rate_kw    numeric,
     v2g_capable           boolean DEFAULT false,
-    status                text DEFAULT 'active'
+    status                varchar DEFAULT 'active'
 );
 
 -- Charging stations (agent_views.chargers).
 CREATE TABLE IF NOT EXISTS public.charging_stations (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     site_id         uuid REFERENCES public.sites(id),
-    station_id      text,
-    max_power_kw    double precision,
-    connector_type  text DEFAULT 'CCS',
-    vendor          text,
-    display_name    text
+    station_id      varchar,
+    max_power_kw    numeric,
+    connector_type  varchar DEFAULT 'CCS',
+    vendor          varchar,
+    display_name    varchar
 );
 
 -- Drivers (agent_views.drivers).
 CREATE TABLE IF NOT EXISTS public.drivers (
     id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     site_id             uuid REFERENCES public.sites(id),
-    display_name        text,
-    external_driver_id  text,
-    email               text,
-    status              text DEFAULT 'active'
+    display_name        varchar,
+    external_driver_id  varchar,
+    email               varchar,
+    status              varchar DEFAULT 'active'
 );
 
 -- Schedules (agent_views.schedules_recent; joined to vehicles for site_id).
@@ -86,7 +107,7 @@ CREATE TABLE IF NOT EXISTS public.schedules (
     id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     vehicle_id          uuid REFERENCES public.vehicles(id),
     driver_id           uuid REFERENCES public.drivers(id),
-    route_id            text,
+    route_id            varchar,
     departure_time      timestamptz,
     return_time         timestamptz,
     actual_return_time  timestamptz,

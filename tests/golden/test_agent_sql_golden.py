@@ -301,11 +301,13 @@ async def _load_static_snapshot(
         tariff = (
             json.dumps({"entsoe_zone": depot["entsoe_zone"]}) if depot.get("entsoe_zone") else None
         )
+        # address is jsonb NOT NULL DEFAULT '{}' in production (and in the
+        # bootstrap); no eval reads it, so we leave it to the column default.
         await conn.execute(
             """
             INSERT INTO sites (id, organization_id, name, timezone, currency,
-                               max_grid_kw, address, latitude, longitude, tariff_config)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+                               max_grid_kw, latitude, longitude, tariff_config)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
             """,
             depot_id,
             org_map.get(depot_id, _DEFAULT_ORG_ID),
@@ -313,7 +315,6 @@ async def _load_static_snapshot(
             depot.get("timezone", "Europe/Vilnius"),
             depot.get("currency", "EUR"),
             depot.get("max_grid_kw"),
-            depot.get("address"),
             depot.get("latitude"),
             depot.get("longitude"),
             tariff,

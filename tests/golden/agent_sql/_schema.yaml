@@ -127,7 +127,6 @@ properties:
             timezone:        { type: string }
             currency:        { type: string }
             max_grid_kw:     { type: number }
-            address:         { type: string }
             latitude:        { type: number }
             longitude:       { type: number }
             entsoe_zone:     { type: [string, "null"] }
