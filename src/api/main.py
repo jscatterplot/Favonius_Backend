@@ -12289,6 +12289,7 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
     "reports.schedule.run_now": _CommandSpec(
         required_permission=Permission.ADMIN_CONFIG,
         handler=_handle_report_schedule_run_now,
+    ),
     "agents.autonomy.set": _CommandSpec(
         required_permission=Permission.DEPOT_MANAGE,
         handler=_handle_agent_autonomy_set,
