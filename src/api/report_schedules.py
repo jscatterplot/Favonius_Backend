@@ -999,6 +999,22 @@ async def _tick(
                     async with pools.ts.acquire() as conn:
                         await finalize_run(conn, run_id, status="failed", error_message=str(exc))
                     terminal_status = "failed"
+        else:
+            # Timezone unresolved (depot deleted or static DB unreachable). Record
+            # a visible failed run for this slot rather than silently advancing, so
+            # the miss shows up in last_run_status / the runs list and an operator
+            # can act on it. The ts pool is independent of the static pool that
+            # resolves the tz, so this write still succeeds during a static outage.
+            async with pools.ts.acquire() as conn:
+                run_id = await claim_run(conn, schedule_id, scheduled_for)
+                if run_id is not None:
+                    await finalize_run(
+                        conn,
+                        run_id,
+                        status="failed",
+                        error_message="could not resolve depot timezone",
+                    )
+                    terminal_status = "failed"
 
         # Advance next_run_at from the slot we just fired (NOT from now), so a
         # backlog after an outage is worked off one missed slot per tick instead

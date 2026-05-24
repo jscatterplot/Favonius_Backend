@@ -619,3 +619,53 @@ def test_tick_advances_from_fired_slot_not_now():
         scheduled_for, frequency="monthly", time_of_day=time(6, 0), tz_name="UTC", day_of_month=1
     )
     assert next_at == expected == _dt(2026, 7, 1, 6, 0)  # July, not September
+
+
+def test_tick_tz_failure_records_visible_failed_run():
+    # When the depot timezone can't be resolved, the slot must not be silently
+    # skipped — a failed run is recorded and last_run_status reflects it.
+    scheduled_for = _dt(2026, 6, 1, 6, 0)
+    now = _dt(2026, 6, 1, 12, 0)
+    due_row = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "depot_id": "22222222-2222-2222-2222-222222222222",
+        "name": "Monthly",
+        "kind": "monthly_consumption",
+        "group_by": "card",
+        "frequency": "monthly",
+        "day_of_month": 1,
+        "day_of_week": None,
+        "time_of_day": time(6, 0),
+        "autonomy_mode": "auto_silent",
+        "next_run_at": scheduled_for,
+    }
+    store: dict = {"due": [due_row], "claim_result": {"id": "run-1"}}
+    conn = FakeConn(store)
+    pools = FakePools(conn)
+
+    async def gettz(depot_id):
+        raise RuntimeError("sites unreachable")
+
+    async def fake_generate(params, depot_id):  # pragma: no cover - never reached
+        return "report-x"
+
+    run(
+        rs._tick(
+            pools,
+            email_client=FakeEmailClient(),
+            generate_report=fake_generate,
+            get_timezone=gettz,
+            default_from="reports@favonius.energy",
+            now_utc=now,
+        )
+    )
+
+    # schedule_runs finalized as failed…
+    assert _finalize_status(store) == "failed"
+    # …and report_schedules.last_run_status reflects it (not a silent skip).
+    sched_updates = [
+        args
+        for q, args in store["executes"]
+        if "UPDATE report_schedules" in q and "last_run_status" in q
+    ]
+    assert sched_updates and sched_updates[0][3] == "failed"
