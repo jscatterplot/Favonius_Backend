@@ -778,9 +778,7 @@ async def execute_schedule_run(
                     summary=f"Approve to send '{schedule_row['name']}' for {period_start}–{period_end}",
                 )
                 if draft_inserted:
-                    await finalize_run(
-                        conn, run_id, status="pending_approval", report_id=report_id
-                    )
+                    await finalize_run(conn, run_id, status="pending_approval", report_id=report_id)
                 else:
                     await finalize_run(
                         conn,
@@ -905,27 +903,39 @@ async def append_delivery_status_from_webhook(
     """On a provider callback, append a NEW delivery row mirroring the original
     send but with the updated (mapped) status, so lastDelivery reflects it.
 
-    Returns True if a matching report delivery was found and appended.
+    Resend events for one send can arrive out of order. A terminal-negative
+    state (bounced / suppressed / failed) is final for that send, so a late
+    positive event ('sent'/'delivered' → 'sent') is dropped rather than appended
+    — otherwise it would mask the bounce in lastDelivery. A new run sends a new
+    provider_message_id, so genuine re-delivery after a bounce is unaffected.
+
+    Returns True if a matching report delivery was found.
     """
-    origin = await conn.fetchrow(
+    latest = await conn.fetchrow(
         """
-        SELECT run_id, recipient_id, email_address, format
+        SELECT run_id, recipient_id, email_address, format, status
         FROM schedule_run_deliveries
         WHERE provider_message_id = $1
-        ORDER BY attempted_at ASC
+        ORDER BY attempted_at DESC
         LIMIT 1
         """,
         provider_message_id,
     )
-    if origin is None:
+    if latest is None:
         return False
+
+    mapped = map_provider_status_to_wire(provider_status)
+    if latest["status"] in ("bounced", "suppressed", "failed") and mapped == "sent":
+        # Out-of-order positive event after a terminal-negative one — ignore.
+        return True
+
     await insert_delivery(
         conn,
-        run_id=str(origin["run_id"]),
-        recipient_id=str(origin["recipient_id"]),
-        email_address=origin["email_address"],
-        fmt=origin["format"],
-        status=map_provider_status_to_wire(provider_status),
+        run_id=str(latest["run_id"]),
+        recipient_id=str(latest["recipient_id"]),
+        email_address=latest["email_address"],
+        fmt=latest["format"],
+        status=mapped,
         provider_message_id=provider_message_id,
         error=json.dumps(detail) if detail else None,
     )
@@ -990,13 +1000,16 @@ async def _tick(
                         await finalize_run(conn, run_id, status="failed", error_message=str(exc))
                     terminal_status = "failed"
 
-        # Advance next_run_at so we never spin on a past slot — even if another
-        # process claimed the run (run_id is None here) or tz/reschedule failed.
+        # Advance next_run_at from the slot we just fired (NOT from now), so a
+        # backlog after an outage is worked off one missed slot per tick instead
+        # of skipping the intermediate periods. compute_next_run_at returns the
+        # first occurrence strictly after scheduled_for; while that is still in
+        # the past the schedule stays due and the next tick fires it.
         next_at: Optional[datetime] = None
         if tz_name is not None:
             try:
                 next_at = compute_next_run_at(
-                    now_utc,
+                    scheduled_for,
                     frequency=schedule["frequency"],
                     time_of_day=schedule["time_of_day"],
                     tz_name=tz_name,

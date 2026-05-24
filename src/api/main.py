@@ -11868,6 +11868,33 @@ async def _handle_agent_action_reject(
         raise DatabaseError("Database not available")
 
     async with db_pools.ts.acquire() as conn:
+        action_row = await conn.fetchrow(
+            """
+            SELECT action_class, status, payload
+            FROM agent_actions
+            WHERE id = $1::uuid AND depot_id = $2::uuid
+            """,
+            action_id,
+            depot_id,
+        )
+
+    if not action_row or action_row["status"] not in ("pending", "shadow"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Action {action_id} not found or not in a rejectable state",
+        )
+
+    # Resolve the originating run BEFORE marking the action terminal, so a
+    # failure skipping the run cannot strand it in pending_approval behind a
+    # no-longer-rejectable action (symmetric to the approve→deliver ordering).
+    # skip_pending_run is idempotent and only touches pending_approval runs.
+    if action_row["action_class"] == "report_draft":
+        payload = _coerce_payload(action_row["payload"])
+        run_id = payload.get("runId")
+        if run_id and payload.get("scheduleId"):
+            await _report_schedules.skip_pending_run(db_pools, run_id=str(run_id))
+
+    async with db_pools.ts.acquire() as conn:
         updated = await conn.fetchrow(
             """
             UPDATE agent_actions
@@ -11875,7 +11902,7 @@ async def _handle_agent_action_reject(
             WHERE id = $1::uuid
               AND depot_id = $2::uuid
               AND status IN ('pending', 'shadow')
-            RETURNING id::text, action_class, payload
+            RETURNING id::text
             """,
             action_id,
             depot_id,
@@ -11883,16 +11910,9 @@ async def _handle_agent_action_reject(
 
     if not updated:
         raise HTTPException(
-            status_code=404,
-            detail=f"Action {action_id} not found or not in a rejectable state",
+            status_code=409,
+            detail="Action could not be rejected because its status changed",
         )
-
-    # Schedule-originated draft: rejection skips the originating run.
-    if updated["action_class"] == "report_draft":
-        payload = _coerce_payload(updated["payload"])
-        run_id = payload.get("runId")
-        if run_id and payload.get("scheduleId"):
-            await _report_schedules.skip_pending_run(db_pools, run_id=str(run_id))
 
     return {"actionId": action_id, "actionStatus": "rejected"}
 

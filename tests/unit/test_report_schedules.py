@@ -8,9 +8,10 @@ tests use asyncio.run to avoid coupling to a pytest-asyncio version.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 
 from src.api import report_schedules as rs
+from src.api.report_schedule_timing import compute_next_run_at
 from src.notifications.email_client import DeliveryResult, FakeEmailClient
 
 
@@ -63,6 +64,8 @@ class FakeConn:
         return None
 
     async def fetch(self, query: str, *args):
+        if "FROM report_schedules" in query and "is_active" in query:
+            return self.store.get("due", [])
         if "FROM report_schedule_recipients" in query:
             return self.store.get("recipient_rows", [])
         if "FROM schedule_run_deliveries" in query:
@@ -385,6 +388,7 @@ def test_webhook_append_inserts_mapped_status():
             "recipient_id": "rcpt-1",
             "email_address": "manager@depot.example",
             "format": "pdf",
+            "status": "sent",
         }
     }
     conn = FakeConn(store)
@@ -409,6 +413,7 @@ def test_webhook_append_complaint_maps_to_suppressed():
             "recipient_id": "rcpt-1",
             "email_address": "m@d.example",
             "format": "csv",
+            "status": "sent",
         }
     }
     conn = FakeConn(store)
@@ -430,7 +435,50 @@ def test_webhook_append_unknown_message_is_noop():
         )
     )
     assert found is False
-    assert not _has_execute(store, "INSERT INTO schedule_run_deliveries")
+
+
+def test_webhook_late_sent_after_bounce_is_ignored():
+    # Out-of-order: a 'delivered'/'sent' event arriving after a terminal bounce
+    # must NOT append (which would mask the bounce in lastDelivery).
+    store: dict = {
+        "origin_delivery": {
+            "run_id": "run-1",
+            "recipient_id": "rcpt-1",
+            "email_address": "m@d.example",
+            "format": "pdf",
+            "status": "bounced",
+        }
+    }
+    conn = FakeConn(store)
+    found = run(
+        rs.append_delivery_status_from_webhook(
+            conn, provider_message_id="msg-1", provider_status="delivered", detail=None
+        )
+    )
+    assert found is True  # message recognized…
+    inserts = [args for q, args in store["executes"] if "INSERT INTO schedule_run_deliveries" in q]
+    assert inserts == []  # …but the regressive 'sent' row was dropped
+
+
+def test_webhook_second_bounce_after_bounce_still_appends():
+    # A terminal-negative following a terminal-negative is fine (keep latest).
+    store: dict = {
+        "origin_delivery": {
+            "run_id": "run-1",
+            "recipient_id": "rcpt-1",
+            "email_address": "m@d.example",
+            "format": "pdf",
+            "status": "bounced",
+        }
+    }
+    conn = FakeConn(store)
+    run(
+        rs.append_delivery_status_from_webhook(
+            conn, provider_message_id="msg-1", provider_status="complained", detail=None
+        )
+    )
+    inserts = [args for q, args in store["executes"] if "INSERT INTO schedule_run_deliveries" in q]
+    assert inserts[0][4] == "suppressed"
 
 
 # ── Serializers (null-presence contract) ──────────────────────────────────────
@@ -516,3 +564,58 @@ def test_delivery_to_wire_shape():
         "providerMessageId": "msg-1",
         "error": None,
     }
+
+
+# ── Worker catch-up (overdue slots) ───────────────────────────────────────────
+
+
+def test_tick_advances_from_fired_slot_not_now():
+    # After an outage, the worker must walk forward from the slot it just fired
+    # (catching up missed periods one tick at a time), NOT jump to next-from-now.
+    scheduled_for = _dt(2026, 6, 1, 6, 0)  # the overdue monthly slot (UTC)
+    now = _dt(2026, 8, 15, 12, 0)  # two months later
+    due_row = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "depot_id": "22222222-2222-2222-2222-222222222222",
+        "name": "Monthly",
+        "kind": "monthly_consumption",
+        "group_by": "card",
+        "frequency": "monthly",
+        "day_of_month": 1,
+        "day_of_week": None,
+        "time_of_day": time(6, 0),
+        "autonomy_mode": "shadow",  # quick skip — no report/delivery needed
+        "next_run_at": scheduled_for,
+    }
+    store: dict = {"due": [due_row], "autonomy_row": None, "claim_result": {"id": "run-1"}}
+    conn = FakeConn(store)
+    pools = FakePools(conn)
+
+    async def gettz(depot_id):
+        return "UTC"
+
+    async def fake_generate(params, depot_id):  # pragma: no cover - shadow never calls
+        return "report-x"
+
+    run(
+        rs._tick(
+            pools,
+            email_client=FakeEmailClient(),
+            generate_report=fake_generate,
+            get_timezone=gettz,
+            default_from="reports@favonius.energy",
+            now_utc=now,
+        )
+    )
+
+    updates = [
+        args
+        for q, args in store["executes"]
+        if "UPDATE report_schedules" in q and "next_run_at" in q
+    ]
+    assert updates, "expected a report_schedules reschedule UPDATE"
+    next_at = updates[0][1]
+    expected = compute_next_run_at(
+        scheduled_for, frequency="monthly", time_of_day=time(6, 0), tz_name="UTC", day_of_month=1
+    )
+    assert next_at == expected == _dt(2026, 7, 1, 6, 0)  # July, not September
