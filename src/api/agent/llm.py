@@ -35,6 +35,7 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from src.api.agent.plan import QueryPlan
+from src.api.agent.thinking import VALID_EFFORT_LEVELS, generation_kwargs
 from src.monitoring.metrics import AGENT_LLM_TOKENS
 from src.security.secrets import get_secrets_manager
 
@@ -50,8 +51,13 @@ KNOWN_GOOD_MODELS: tuple[str, ...] = (
     "claude-haiku-4-5",
 )
 
-# Format step uses a non-zero temperature so the prose has some warmth;
-# extraction stays at 0.0 for stability of structured output.
+# Fallback temperature for the format step on models that don't support
+# adaptive thinking (e.g. Haiku 4.5) — a little warmth in the prose.
+# Thinking-capable models ignore this and use adaptive thinking + effort
+# instead (thinking forbids custom sampling params; see
+# src/api/agent/thinking.py). Extraction stays at 0.0 for stable
+# structured output and can't use thinking at all — its forced
+# tool_choice is incompatible with thinking.
 FORMAT_STEP_TEMPERATURE: float = 0.3
 
 _SCHEMA_GRAPH_PATH = Path(__file__).parent / "schema_graph.yaml"
@@ -71,8 +77,16 @@ class LLMConfig(BaseModel):
 
     model: str = Field(default="claude-sonnet-4-6")
     extract_max_tokens: int = Field(default=400)
-    format_max_tokens: int = Field(default=800)
+    # Bumped from 800 to leave headroom for adaptive-thinking tokens on
+    # the format step — thinking and the answer share this ceiling.
+    format_max_tokens: int = Field(default=2048)
     temperature: float = Field(default=0.0)
+    # Soft thinking-depth control for thinking-capable models. "high" (the
+    # API default) keeps the agent prepared for messy result sets; lower
+    # values trade depth for latency/cost. Ignored on models without
+    # effort support. Shared by the format step and the SQL Q&A loop
+    # (src/api/agent/controller.py passes it to run_qa_turn).
+    effort: str = Field(default="high")
     request_timeout_s: int = Field(default=30)
 
     @field_validator("model")
@@ -87,14 +101,24 @@ class LLMConfig(BaseModel):
             )
         return v
 
+    @field_validator("effort")
+    @classmethod
+    def _effort_must_be_valid(cls, v: str) -> str:
+        if v not in VALID_EFFORT_LEVELS:
+            raise ValueError(
+                f"AGENT_LLM_EFFORT={v!r} is not one of {sorted(VALID_EFFORT_LEVELS)}."
+            )
+        return v
+
     @classmethod
     def from_env(cls) -> "LLMConfig":
         """Build the config from environment variables."""
         return cls(
             model=os.environ.get("AGENT_LLM_MODEL", "claude-sonnet-4-6"),
             extract_max_tokens=int(os.environ.get("AGENT_LLM_EXTRACT_MAX_TOKENS", "400")),
-            format_max_tokens=int(os.environ.get("AGENT_LLM_FORMAT_MAX_TOKENS", "800")),
+            format_max_tokens=int(os.environ.get("AGENT_LLM_FORMAT_MAX_TOKENS", "2048")),
             temperature=float(os.environ.get("AGENT_LLM_TEMPERATURE", "0.0")),
+            effort=os.environ.get("AGENT_LLM_EFFORT", "high"),
             request_timeout_s=int(os.environ.get("AGENT_LLM_TIMEOUT_S", "30")),
         )
 
@@ -105,11 +129,12 @@ class LLMConfig(BaseModel):
 CONFIG: LLMConfig = LLMConfig.from_env()
 logger.info(
     "agent LLM configured: model=%s extract_max_tokens=%d format_max_tokens=%d "
-    "temperature=%s timeout_s=%d",
+    "temperature=%s effort=%s timeout_s=%d",
     CONFIG.model,
     CONFIG.extract_max_tokens,
     CONFIG.format_max_tokens,
     CONFIG.temperature,
+    CONFIG.effort,
     CONFIG.request_timeout_s,
 )
 
@@ -585,12 +610,19 @@ async def format_answer(
         }
     ]
 
+    # Adaptive thinking lets the model reason about messier result sets
+    # (empty windows, RFID-only sessions, multi-row groupings) before it
+    # writes the reply. generation_kwargs picks adaptive thinking + effort
+    # on capable models (which forbid custom sampling params) and falls
+    # back to temperature elsewhere — see src/api/agent/thinking.py.
     response = await client.messages.create(
         model=chosen_model,
         max_tokens=CONFIG.format_max_tokens,
-        temperature=FORMAT_STEP_TEMPERATURE,
         system=system,
         messages=[{"role": "user", "content": user_message}],
+        **generation_kwargs(
+            chosen_model, effort=CONFIG.effort, temperature=FORMAT_STEP_TEMPERATURE
+        ),
     )
     _record_usage(response, chosen_model)
 

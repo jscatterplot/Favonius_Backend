@@ -602,8 +602,12 @@ async def _run_sql_general_turn(
             tool_registry=registry,
             allowed_tools=SQL_AGENT_TOOL_NAMES,
             max_iterations=8,
-            max_tokens=2048,
+            # 4096 (up from 2048) for adaptive-thinking headroom across the
+            # tool-use loop; effort drives how deeply the model reasons on
+            # complex queries (thinking-capable models only).
+            max_tokens=4096,
             temperature=0.0,
+            effort=config.effort,
             on_step=_on_step,
         )
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
