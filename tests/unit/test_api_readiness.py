@@ -247,6 +247,36 @@ class TestReadinessEndpoint:
         assert response.json()["horizon_hours"] == 12
         assembler.get_current_state.assert_awaited_once_with(12)
 
+    @patch("src.api.main.StateAssembler")
+    @patch("src.api.main._get_depot_config")
+    @patch("src.api.main.db_pools")
+    def test_absent_building_load_now_degrades_instead_of_blocks(
+        self, mock_pool, mock_get_config, mock_assembler_cls, client
+    ):
+        """PR #119 contract: meter unavailable produces a degraded run, not
+        ``not_ready``. ``missing_inputs`` must NEVER include
+        ``"building_load"`` in any response.
+
+        Set ``building_source="absent"`` (the pre-PR-#119 hard-block path) and
+        assert the endpoint returns ``status="degraded"`` with
+        ``building_load_meter_unavailable`` in ``degraded_reasons``.
+        """
+        mock_pool_value = MagicMock()
+        mock_get_config.return_value = _full_config()
+        mock_assembler_cls.return_value = _stub_assembler(
+            building_source="absent", schedules_present=True
+        )
+
+        depot_id = str(uuid4())
+        with patch("src.api.main.db_pools", mock_pool_value):
+            response = client.get(f"/depots/{depot_id}/optimization/readiness")
+
+        assert response.status_code == http_status.HTTP_200_OK
+        body = response.json()
+        assert body["status"] == "degraded"
+        assert "building_load" not in body["missing_inputs"]
+        assert "building_load_meter_unavailable" in body["degraded_reasons"]
+
     @patch("src.api.main.persist_snapshot")
     @patch("src.api.main.StateAssembler")
     @patch("src.api.main._get_depot_config")

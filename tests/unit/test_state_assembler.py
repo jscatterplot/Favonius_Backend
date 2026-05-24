@@ -321,6 +321,23 @@ _SENTINEL_FOR_TEST = object()
 class TestGetSchedules:
     """Test _get_schedules method."""
 
+    @staticmethod
+    def _dispatch_schedule_fetch(manual_rows: list[dict]):
+        """Return a ``conn.fetch`` side_effect that routes manual vs recurring queries.
+
+        Post-PR #119 ``_get_schedules`` issues a second SELECT against
+        ``recurring_schedule_template``; return an empty list for that
+        query so the legacy manual-only test fixtures still pass through
+        the merge unchanged.
+        """
+        async def _fetch(query: str, *args, **kwargs):
+            if "FROM schedules s" in query:
+                return manual_rows
+            if "FROM recurring_schedule_template" in query:
+                return []
+            return []
+        return _fetch
+
     @pytest.mark.asyncio
     async def test_get_schedules_single(self, assembler, mock_db_pool):
         """Test retrieving single schedule."""
@@ -334,8 +351,9 @@ class TestGetSchedules:
             "return_time": base_time + timedelta(hours=10),
             "estimated_energy_kwh": 150.0,
             "route_id": "route_1",
+            "created_at": base_time,
         }
-        mock_conn.fetch.return_value = [mock_row]
+        mock_conn.fetch.side_effect = self._dispatch_schedule_fetch([mock_row])
 
         start = base_time
         end = start + timedelta(hours=24)
@@ -344,7 +362,9 @@ class TestGetSchedules:
         assert len(schedules) == 1
         assert schedules[0]["vehicle_id"] == "bus_1"
         assert schedules[0]["estimated_energy_kwh"] == 150.0
-        schedule_query = mock_conn.fetch.call_args.args[0]
+        # created_at is an internal column — must not surface to the caller.
+        assert "created_at" not in schedules[0]
+        schedule_query = mock_conn.fetch.call_args_list[0].args[0]
         assert "JOIN vehicles v ON s.vehicle_id = v.id" in schedule_query
         assert "WHERE v.site_id = $1" in schedule_query
 
@@ -362,6 +382,7 @@ class TestGetSchedules:
                 "return_time": base_time + timedelta(hours=10),
                 "estimated_energy_kwh": 150.0,
                 "route_id": "route_1",
+                "created_at": base_time,
             },
             {
                 "vehicle_id": "bus_2",
@@ -369,9 +390,10 @@ class TestGetSchedules:
                 "return_time": base_time + timedelta(hours=12),
                 "estimated_energy_kwh": 200.0,
                 "route_id": "route_2",
+                "created_at": base_time,
             },
         ]
-        mock_conn.fetch.return_value = rows
+        mock_conn.fetch.side_effect = self._dispatch_schedule_fetch(rows)
 
         start = base_time
         end = start + timedelta(hours=24)
@@ -386,7 +408,7 @@ class TestGetSchedules:
         """Test retrieving schedules when none exist."""
         mock_conn = AsyncMock()
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
-        mock_conn.fetch.return_value = []
+        mock_conn.fetch.side_effect = self._dispatch_schedule_fetch([])
 
         start = datetime.utcnow()
         end = start + timedelta(hours=24)
@@ -394,6 +416,65 @@ class TestGetSchedules:
 
         assert len(schedules) == 0
         assert isinstance(schedules, list)
+
+    @pytest.mark.asyncio
+    async def test_get_schedules_naive_horizon_with_active_template(
+        self, assembler, mock_db_pool
+    ):
+        """Regression (Codex P1): get_current_state passes naive datetime.utcnow().
+
+        _get_schedules must normalize to aware UTC before the recurring
+        expander runs, otherwise any depot with an active template raises
+        ValueError and state assembly fails.
+        """
+        from datetime import date, time, timezone
+        from uuid import uuid4 as _uuid4
+
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        vehicle_id = _uuid4()
+        # A Friday inside the horizon (2026-05-22 is a Friday).
+        base_time = datetime(2026, 5, 22, 0, 0, 0)  # NAIVE, like datetime.utcnow()
+        template_row = {
+            "id": _uuid4(),
+            "depot_id": _uuid4(),
+            "vehicle_id": vehicle_id,
+            "route_id": "R-rec",
+            "departure_time_of_day": time(7, 30),
+            "return_time_of_day": time(19, 0),
+            "days_of_week": ["fri"],
+            "start_date": date(2026, 5, 1),
+            "end_date": None,
+            "required_soc": 1.0,
+            "energy_kwh": 180.0,
+            "active": True,
+            "created_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+        }
+
+        async def _fetch(query: str, *args, **kwargs):
+            if "FROM schedules s" in query:
+                return []
+            if "FROM recurring_schedule_template" in query:
+                return [template_row]
+            if "FROM recurring_schedule_cancellation" in query:
+                return []
+            return []
+
+        mock_conn.fetch.side_effect = _fetch
+        # _get_depot_timezone reads sites.timezone via fetchval.
+        mock_conn.fetchval.return_value = "Europe/Vilnius"
+
+        end = base_time + timedelta(hours=24)
+        # Must not raise despite naive inputs.
+        schedules = await assembler._get_schedules(base_time, end)
+
+        assert len(schedules) == 1
+        assert schedules[0]["route_id"] == "R-rec"
+        # Departure surfaced as aware UTC (07:30 Vilnius = 04:30 UTC in May).
+        assert schedules[0]["departure_time"].tzinfo is not None
+        assert schedules[0]["departure_time"].hour == 4
 
 
 class TestComputeAvailability:
