@@ -37,12 +37,8 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    SELECT d.organization_id, d.depot_id
-      INTO org_id, dep_id
-      FROM chargers c
-      JOIN depots   d ON d.depot_id = c.depot_id
-     WHERE c.ocpp_id = NEW.station_id
-     LIMIT 1;
+    org_id := NEW.organization_id;
+    dep_id := NEW.depot_id;
 
     IF org_id IS NULL THEN
         RETURN NEW;

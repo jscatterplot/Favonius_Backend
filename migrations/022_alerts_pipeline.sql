@@ -122,7 +122,22 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_alert
     ON notification_deliveries (alert_id, sent_at DESC);
 
 -- ---------------------------------------------------------------------------
--- 4. Trigger on connector_status: produce charger_fault alerts
+-- 4. Tenant context on connector_status (used by trigger below; no shadow JOINs)
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE connector_status
+    ADD COLUMN IF NOT EXISTS organization_id UUID,
+    ADD COLUMN IF NOT EXISTS depot_id        UUID;
+
+COMMENT ON COLUMN connector_status.organization_id IS
+    'Resolved from Supabase at insert time by the OCPP handler. NULL for '
+    'legacy inserts; trigger bails silently.';
+
+COMMENT ON COLUMN connector_status.depot_id IS
+    'Supabase sites.id for the depot that owns this charger.';
+
+-- ---------------------------------------------------------------------------
+-- 5. Trigger on connector_status: produce charger_fault alerts
 -- ---------------------------------------------------------------------------
 -- Faulted/Unavailable rows UPSERT an active alert keyed by station_id+connector_id;
 -- any other status resolves an existing active alert for that charger.
@@ -150,14 +165,10 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Resolve org/depot via chargers; bail silently if the station is unknown
-    -- (e.g. test rows or chargers not yet onboarded).
-    SELECT d.organization_id, d.depot_id
-      INTO org_id, dep_id
-      FROM chargers c
-      JOIN depots   d ON d.depot_id = c.depot_id
-     WHERE c.ocpp_id = NEW.station_id
-     LIMIT 1;
+    -- Tenant context comes from the row itself; bail silently when absent
+    -- (legacy inserts or connectors not yet onboarded).
+    org_id := NEW.organization_id;
+    dep_id := NEW.depot_id;
 
     IF org_id IS NULL THEN
         RETURN NEW;
@@ -214,7 +225,7 @@ CREATE TRIGGER trg_alerts_on_connector_status
     EXECUTE FUNCTION fn_alerts_on_connector_status();
 
 -- ---------------------------------------------------------------------------
--- 5. Permissions (mirror migration 001 pattern)
+-- 6. Permissions (mirror migration 001 pattern)
 -- ---------------------------------------------------------------------------
 DO $$
 BEGIN
