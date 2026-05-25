@@ -63,6 +63,11 @@ class FakeConn:
             return {"schedule_id": "11111111-1111-1111-1111-111111111111"}
         return None
 
+    async def fetchval(self, query: str, *args):
+        if "completed_at FROM schedule_runs" in query:
+            return self.store.get("completed_at")
+        return None
+
     async def fetch(self, query: str, *args):
         if "FROM report_schedules" in query and "is_active" in query:
             return self.store.get("due", [])
@@ -666,3 +671,13 @@ def test_tick_tz_failure_leaves_slot_due_for_retry():
     assert _finalize_status(store) is None
     assert not _has_execute(store, "INSERT INTO schedule_runs")
     assert not _has_execute(store, "UPDATE report_schedules")
+
+
+def test_wait_for_run_finalized_returns_when_completed():
+    # Regression guard: exercises wait_for_run_finalized (uses time.monotonic),
+    # which would NameError if `import time` were missing from the module.
+    store: dict = {"completed_at": _dt(2026, 6, 1, 3, 5)}
+    conn = FakeConn(store)
+    pools = FakePools(conn)
+    # Returns promptly because completed_at is already set.
+    run(rs.wait_for_run_finalized(pools, "run-1", poll_interval_s=0.01, timeout_s=1.0))
