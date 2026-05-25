@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS public.organizations (
 -- Sites — the depot configuration record (agent_views.depots).
 -- `address` is jsonb in production; agent_views.depots reads it as `address::text`.
 -- A default keeps it out of the minimal fixtures.
+--
+-- The trailing block (utility_id .. building_load_source) is NOT read by any
+-- agent_views.* function — it exists because the HTTP /agent/turn path resolves
+-- the caller's scope through `src.db.queries.get_depots_for_organization`
+-- (via `build_auth_context`), whose SELECT lists these columns. The S2 golden
+-- gate pre-builds AuthContext and never touches them, but the S3 real-DB
+-- integration test and the AT-18 SQL-mode e2e drive the real endpoint, so the
+-- base table has to carry them or `build_auth_context` raises UndefinedColumn.
+-- Types/defaults mirror the production sites table (and the AT-18 inline DDL).
 CREATE TABLE IF NOT EXISTS public.sites (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id  uuid REFERENCES public.organizations(id),
@@ -66,7 +75,12 @@ CREATE TABLE IF NOT EXISTS public.sites (
     address          jsonb NOT NULL DEFAULT '{}'::jsonb,
     latitude         double precision,
     longitude        double precision,
-    tariff_config    jsonb
+    tariff_config    jsonb,
+    utility_id                     varchar,
+    demand_charge_rate_kw          double precision DEFAULT 20.0,
+    demand_charge_billing_period   varchar NOT NULL DEFAULT 'monthly',
+    billing_metadata               jsonb NOT NULL DEFAULT '{}'::jsonb,
+    building_load_source           jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
 -- Vehicles (agent_views.vehicles).

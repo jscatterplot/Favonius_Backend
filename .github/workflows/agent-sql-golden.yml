@@ -29,6 +29,8 @@ on:
       - "tests/golden/agent_sql/**"
       - "tests/golden/test_agent_sql_golden.py"
       - "tests/golden/conftest.py"
+      - "tests/integration/agent_sql/**"
+      - "tests/e2e/test_agent_search.py"
       - "migrations/**"
       - ".github/workflows/agent-sql-golden.yml"
   push:
@@ -41,6 +43,8 @@ on:
       - "tests/golden/agent_sql/**"
       - "tests/golden/test_agent_sql_golden.py"
       - "tests/golden/conftest.py"
+      - "tests/integration/agent_sql/**"
+      - "tests/e2e/test_agent_search.py"
       - "migrations/**"
 
 concurrency:
@@ -112,3 +116,24 @@ jobs:
           pytest tests/golden/test_agent_sql_golden.py \
             -m "agent_sql_golden or not agent_sql_golden" \
             --tb=short
+
+      - name: Run AT-18 SQL-mode e2e (S3 step B)
+        # The TS+static pair set up above also backs the AT-18 SQL-mode
+        # acceptance tests (planner -> run_qa_turn -> sql_validator ->
+        # sql_executor over SSE, with a deterministic FakeAnthropicClient — no
+        # key, no token spend). `-k sql_mode` runs only the two S3 additions;
+        # the pre-existing consumption-path AT-18 tests are intentionally not
+        # wired here (one, test_at18_refusal_not_stored_as_success, fails on a
+        # pre-existing run_turn empty-subjects path — see the S3 followups note
+        # in tests/integration/agent_sql/test_sql_mode_real_db.py).
+        run: |
+          pytest tests/e2e/test_agent_search.py -k sql_mode --tb=short
+
+      - name: Run agent-SQL real-DB integration (skips without ANTHROPIC_API_KEY)
+        # The S3 real-Anthropic integration test. With the secret set it runs
+        # against the same pair plus a live Anthropic call; without it the
+        # autouse fixture skips all three so PRs stay green and burn no tokens.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          pytest tests/integration/agent_sql/ -m agent_sql_real --tb=short
