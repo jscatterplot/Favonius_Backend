@@ -95,6 +95,11 @@ _VALIDATOR_REJECTION_KINDS = frozenset(
     }
 )
 
+# Executor-side failures (role swap / EXPLAIN preflight / timeout / exec). Distinct
+# from validator rejections: these mean the SQL parsed but did not run against the
+# real schema, so they are always a scenario bug in a well-formed golden case.
+_EXECUTOR_ERROR_KINDS = frozenset({"role_error", "plan_error", "timeout", "exec_error"})
+
 
 class ScenarioError(ValueError):
     """Raised when a scenario is structurally invalid (before it can run)."""
@@ -515,6 +520,25 @@ def _validator_rejected(qa: QAResult) -> bool:
     return False
 
 
+def _executor_error_kinds(qa: QAResult) -> list[str]:
+    """run_select calls that failed in the EXECUTOR (not the validator).
+
+    A plan_error/role_error/timeout/exec_error means the canned SQL parsed but
+    did not execute against the real schema (e.g. a hallucinated column caught
+    by the EXPLAIN preflight). That is always a scenario bug — without flagging
+    it, ``agent_views_used`` would still resolve via the SQL-text regex and the
+    hand-written answer's substrings would still match, so a broken query could
+    false-pass. Surfacing it keeps the gate honest.
+    """
+    kinds: list[str] = []
+    for tc in qa.tool_calls:
+        if tc.name not in _RUN_SELECT_TOOLS:
+            continue
+        if isinstance(tc.result, dict) and tc.result.get("error_kind") in _EXECUTOR_ERROR_KINDS:
+            kinds.append(str(tc.result.get("error_kind")))
+    return kinds
+
+
 def _evaluate(scenario: dict[str, Any], qa: QAResult) -> list[str]:
     expected = scenario["expected"]
     failures: list[str] = []
@@ -527,6 +551,13 @@ def _evaluate(scenario: dict[str, Any], qa: QAResult) -> list[str]:
     if actual_fns != want_fns:
         failures.append(
             f"agent_views_used: expected {sorted(want_fns)!r}, got {sorted(actual_fns)!r}"
+        )
+
+    exec_errors = _executor_error_kinds(qa)
+    if exec_errors:
+        failures.append(
+            f"run_select hit executor error(s) {exec_errors!r} — the canned SQL parsed "
+            "but did not execute against the real schema (check column/function names)"
         )
 
     rejected = _validator_rejected(qa)
