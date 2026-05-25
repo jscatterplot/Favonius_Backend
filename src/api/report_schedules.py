@@ -448,6 +448,21 @@ async def finalize_run(
     )
 
 
+async def _persist_run_report_id(
+    conn: "asyncpg.Connection", run_id: str, report_id: str
+) -> None:
+    """Record the generated report on an in-flight run so stale retries can resume."""
+    await conn.execute(
+        """
+        UPDATE schedule_runs
+        SET report_id = $2::uuid
+        WHERE id = $1::uuid AND completed_at IS NULL
+        """,
+        run_id,
+        report_id,
+    )
+
+
 async def insert_delivery(
     conn: "asyncpg.Connection",
     *,
@@ -793,25 +808,35 @@ async def execute_schedule_run(
             await finalize_run(conn, run_id, status="skipped")
         return "skipped"
 
-    # Generate the report (any kind). On failure mark the run failed.
     period_start, period_end = compute_report_period(schedule_row["frequency"], period_anchor)
     title = f"{schedule_row['name']} — {period_start} to {period_end}"
-    params = {
-        "kind": schedule_row["kind"],
-        "groupBy": schedule_row["group_by"],
-        "title": title,
-        "periodStart": period_start,
-        "periodEnd": period_end,
-    }
-    try:
-        report_id = await generate_report(params, depot_id)
-    except Exception as exc:  # noqa: BLE001 - report generation failure is a run failure
-        logger.error(
-            "report generation failed for schedule=%s: %s", schedule_id, exc, exc_info=True
-        )
+
+    async with pools.ts.acquire() as conn:
+        existing_run = await fetch_run(conn, run_id)
+
+    report_id: Optional[str] = None
+    if existing_run is not None and existing_run["report_id"] is not None:
+        report_id = str(existing_run["report_id"])
+    else:
+        # Generate the report (any kind). On failure mark the run failed.
+        params = {
+            "kind": schedule_row["kind"],
+            "groupBy": schedule_row["group_by"],
+            "title": title,
+            "periodStart": period_start,
+            "periodEnd": period_end,
+        }
+        try:
+            report_id = await generate_report(params, depot_id)
+        except Exception as exc:  # noqa: BLE001 - report generation failure is a run failure
+            logger.error(
+                "report generation failed for schedule=%s: %s", schedule_id, exc, exc_info=True
+            )
+            async with pools.ts.acquire() as conn:
+                await finalize_run(conn, run_id, status="failed", error_message=str(exc))
+            return "failed"
         async with pools.ts.acquire() as conn:
-            await finalize_run(conn, run_id, status="failed", error_message=str(exc))
-        return "failed"
+            await _persist_run_report_id(conn, run_id, report_id)
 
     if mode == "proposed":
         async with pools.ts.acquire() as conn:
@@ -1080,28 +1105,27 @@ async def _tick(
             # reached a terminal state. An in-flight placeholder keeps the slot due
             # (so we never double-fire); a stale placeholder from a crashed worker is
             # abandoned after an hour so a single crash can't freeze the schedule.
+            stale_threshold = now_utc - timedelta(hours=1)
             async with pools.ts.acquire() as conn:
-                existing = await conn.fetchrow(
-                    "SELECT id::text, completed_at, triggered_at FROM schedule_runs "
-                    "WHERE schedule_id = $1::uuid AND scheduled_for = $2",
+                stale_run_id = await conn.fetchval(
+                    """
+                    UPDATE schedule_runs
+                    SET triggered_at = NOW()
+                    WHERE schedule_id = $1::uuid AND scheduled_for = $2
+                      AND completed_at IS NULL
+                      AND triggered_at <= $3
+                    RETURNING id::text
+                    """,
                     schedule_id,
                     scheduled_for,
+                    stale_threshold,
                 )
-            unfinished = existing is not None and existing["completed_at"] is None
-            in_flight = (
-                unfinished
-                and existing["triggered_at"] is not None
-                and existing["triggered_at"] > now_utc - timedelta(hours=1)
-            )
-            if in_flight:
-                continue  # let the owning worker finish; leave next_run_at as-is
-            if unfinished:
+            if stale_run_id:
                 logger.warning(
                     "report worker: retrying stale unfinished run for schedule %s slot %s",
                     schedule_id,
                     scheduled_for,
                 )
-                stale_run_id = existing["id"]
                 try:
                     terminal_status = await execute_schedule_run(
                         pools,
@@ -1127,6 +1151,22 @@ async def _tick(
                             conn, stale_run_id, status="failed", error_message=str(exc)
                         )
                     terminal_status = "failed"
+            else:
+                async with pools.ts.acquire() as conn:
+                    in_flight = await conn.fetchval(
+                        """
+                        SELECT 1 FROM schedule_runs
+                        WHERE schedule_id = $1::uuid AND scheduled_for = $2
+                          AND completed_at IS NULL
+                          AND triggered_at > $3
+                        LIMIT 1
+                        """,
+                        schedule_id,
+                        scheduled_for,
+                        stale_threshold,
+                    )
+                if in_flight:
+                    continue  # let the owning worker finish; leave next_run_at as-is
 
         # Advance next_run_at from the slot just handled (NOT from now), so a backlog
         # after an outage is worked off one missed slot per tick. Never fabricate a
