@@ -258,7 +258,22 @@ class _AcquireCtx:
         return self._conn
 
     async def __aexit__(self, *_exc: Any) -> None:
-        return None
+        # The sql_executor sets `SET LOCAL ROLE agent_reader_ts` and
+        # `SET LOCAL transaction_read_only = on` inside a SAVEPOINT.  When the
+        # SAVEPOINT is RELEASED (committed), PostgreSQL preserves those SET LOCAL
+        # changes in the outer transaction — meaning the connection stays
+        # read-only and runs as agent_reader_ts for the rest of the outer
+        # transaction.  That blocks the `_on_step` callback and
+        # `agent_runs_close` from writing to agent_runs (which run via the
+        # *same* connection when _TxPool is used).  Resetting both here (after
+        # the executor's `async with pool.acquire()` context exits, before
+        # `on_step` fires) restores full write access.  Safe to swallow errors
+        # because the test will fail loudly on the subsequent write attempt.
+        try:
+            await self._conn.execute("RESET ROLE")
+            await self._conn.execute("SET LOCAL transaction_read_only = off")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class _TxPool:
