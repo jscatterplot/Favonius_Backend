@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
@@ -21,10 +22,14 @@ from src.api.agent.audit import (
     agent_runs_close,
     agent_runs_open,
     agent_runs_step,
+    classify_failure,
     sql_audit_target_type,
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import AuthContext
+from src.api.agent.sql_executor import SqlExecutorError, SqlExecutorTimeoutError
+from src.api.agent_workflows.runtime import ToolNotAllowedError
+from src.api.agent_workflows.tools import ToolNotRegisteredError
 
 pytestmark = pytest.mark.asyncio
 
@@ -168,10 +173,24 @@ class TestAgentRunsClose:
         sql, *params = pool._conn.execute.await_args.args
         assert "UPDATE agent_runs" in sql
         assert "SET status" in sql
-        assert "final_intent = COALESCE($2, final_intent)" in sql
-        # Duration is COALESCE'd so a second close() doesn't reset it.
-        assert "duration_ms  = COALESCE" in sql
-        assert params == ["success", "consumption_by_user", str(run_id)]
+        assert "COALESCE($2, final_intent)" in sql
+        # failure_reason is COALESCE-preserved (a None re-close can't erase a
+        # recorded reason), same idempotency contract as duration_ms.
+        assert "failure_reason = COALESCE($3, failure_reason)" in sql
+        assert "duration_ms" in sql and "COALESCE" in sql
+        # A success close passes failure_reason=None (param $3).
+        assert params == ["success", "consumption_by_user", None, str(run_id)]
+
+    async def test_failure_reason_is_written_as_param_three(self):
+        pool = _make_pool()
+        run_id = uuid4()
+        reply = {"intent": "sql_general"}
+
+        await agent_runs_close(pool, run_id, "error", reply, failure_reason="validator_rejected")
+
+        sql, *params = pool._conn.execute.await_args.args
+        assert "failure_reason = COALESCE($3, failure_reason)" in sql
+        assert params == ["error", "sql_general", "validator_rejected", str(run_id)]
 
     async def test_extracts_intent_from_object_with_attribute(self):
         pool = _make_pool()
@@ -322,3 +341,122 @@ class TestWriteAgentQueryAudit:
             "row_count": 12,
             "functions_accessed": ["optimization_runs", "alerts"],
         }
+
+
+# ── classify_failure (S3.5 taxonomy) ─────────────────────────────────────────
+
+
+def _tc(name: str, *, ok: bool, error_kind: str | None = None, row_count: int | None = None) -> Any:
+    """A run-time-shaped ToolCall stand-in (duck-typed by classify_failure)."""
+    result: dict[str, Any] = {}
+    if error_kind is not None:
+        result["error_kind"] = error_kind
+    if row_count is not None:
+        result["row_count"] = row_count
+    return SimpleNamespace(name=name, ok=ok, result=result, arguments={}, error=error_kind)
+
+
+def _qa(
+    *, status: str = "success", tool_calls: list | None = None, empty_result: bool = False
+) -> Any:
+    """A QAResult-shaped terminal object (duck-typed by classify_failure)."""
+    return SimpleNamespace(status=status, tool_calls=tool_calls or [], empty_result=empty_result)
+
+
+class BudgetExceededError(Exception):
+    """Forward-declared S4 exception; classify_failure matches it by name.
+
+    The name must match exactly what budget.py (S4) will raise — that is the
+    whole point of the name-based hook in classify_failure.
+    """
+
+
+class TestClassifyFailure:
+    """One assertion per failure_reason value showing the mapping works."""
+
+    async def test_validator_rejected_from_failed_run_select_kind(self):
+        # The §S3.5 done-when case: a validator rejection the model never
+        # recovered from (ran out of iterations) classifies as validator_rejected.
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("run_select_ts", ok=False, error_kind="parse_error")],
+        )
+        assert classify_failure(qa) == "validator_rejected"
+
+    async def test_executor_timeout_from_exception(self):
+        assert classify_failure(SqlExecutorTimeoutError("statement_timeout fired")) == (
+            "executor_timeout"
+        )
+
+    async def test_executor_timeout_from_run_select_kind(self):
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("run_select_ts", ok=False, error_kind="timeout")],
+        )
+        assert classify_failure(qa) == "executor_timeout"
+
+    async def test_empty_result_flag_takes_precedence_over_success(self):
+        qa = _qa(
+            status="success",
+            tool_calls=[_tc("run_select_ts", ok=True, row_count=0)],
+            empty_result=True,
+        )
+        assert classify_failure(qa) == "empty_result"
+
+    async def test_budget_exceeded_matched_by_class_name(self):
+        assert classify_failure(BudgetExceededError("over monthly ceiling")) == "budget_exceeded"
+
+    async def test_tool_error_from_disallowed_tool(self):
+        assert classify_failure(ToolNotAllowedError("nope")) == "tool_error"
+
+    async def test_tool_error_from_unregistered_tool(self):
+        assert classify_failure(ToolNotRegisteredError("missing")) == "tool_error"
+
+    async def test_tool_error_from_executor_role_error_kind(self):
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("run_select_static", ok=False, error_kind="role_error")],
+        )
+        assert classify_failure(qa) == "tool_error"
+
+    async def test_tool_error_from_generic_sql_executor_error(self):
+        assert classify_failure(SqlExecutorError("boom")) == "tool_error"
+
+    async def test_llm_error_from_anthropic_sdk_exception(self):
+        # Match by module so audit.py needn't import the SDK.
+        fake = type("APIStatusError", (Exception,), {})
+        fake.__module__ = "anthropic"
+        assert classify_failure(fake("rate limited")) == "llm_error"
+
+    async def test_llm_error_from_model_giving_up(self):
+        qa = _qa(status="no_terminator", tool_calls=[])
+        assert classify_failure(qa) == "llm_error"
+
+    async def test_other_from_unattributable_exception(self):
+        assert classify_failure(ValueError("unexpected")) == "other"
+
+    async def test_other_from_bare_error_status_token(self):
+        assert classify_failure("error") == "other"
+
+    async def test_none_for_no_signal(self):
+        assert classify_failure(None) is None
+
+    async def test_none_for_successful_qa_result(self):
+        qa = _qa(status="success", tool_calls=[_tc("run_select_ts", ok=True, row_count=5)])
+        assert classify_failure(qa) is None
+
+    async def test_none_for_graceful_status_tokens(self):
+        for token in ("success", "running", "disambiguation", "not_found"):
+            assert classify_failure(token) is None
+
+    async def test_recovered_validator_rejection_on_success_is_not_a_failure(self):
+        # A rejection the model recovered from (final status success) records
+        # no failure_reason — success wins over a stale earlier tool error.
+        qa = _qa(
+            status="success",
+            tool_calls=[
+                _tc("run_select_ts", ok=False, error_kind="parse_error"),
+                _tc("run_select_ts", ok=True, row_count=3),
+            ],
+        )
+        assert classify_failure(qa) is None

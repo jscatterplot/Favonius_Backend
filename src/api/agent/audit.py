@@ -23,6 +23,9 @@ from typing import Any, Optional
 from uuid import UUID
 
 from src.api.agent.auth_context import AuthContext
+from src.api.agent.sql_executor import SqlExecutorError, SqlExecutorTimeoutError
+from src.api.agent_workflows.runtime import ToolNotAllowedError
+from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.security.admin_audit import AdminAuditRow, write_admin_audit_row
 
 
@@ -104,8 +107,10 @@ async def agent_runs_close(
     run_id: UUID,
     status: str,
     reply: Any,
+    *,
+    failure_reason: Optional[str] = None,
 ) -> None:
-    """Stamp final status, duration, and intent onto a run.
+    """Stamp final status, duration, intent, and failure reason onto a run.
 
     ``duration_ms`` is computed from the row's ``created_at`` so it
     reflects the wall-clock time of the turn end-to-end and is captured
@@ -122,24 +127,205 @@ async def agent_runs_close(
             constraint.
         reply: The end-of-turn reply object (or dict). Inspected for
             an ``intent`` field; ignored otherwise.
+        failure_reason: One of the seven S3.5 taxonomy values (migration
+            045), or ``None`` for a success / graceful non-failure. Always
+            obtained from :func:`classify_failure` — never a bare literal.
+            COALESCE-preserved like ``duration_ms`` so a graceful re-close
+            (``None``) cannot erase a previously recorded reason.
     """
     final_intent = _extract_intent(reply)
     async with ts_pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE agent_runs
-            SET status       = $1,
-                final_intent = COALESCE($2, final_intent),
-                duration_ms  = COALESCE(
+            SET status         = $1,
+                final_intent   = COALESCE($2, final_intent),
+                failure_reason = COALESCE($3, failure_reason),
+                duration_ms    = COALESCE(
                     duration_ms,
                     (EXTRACT(EPOCH FROM (NOW() - created_at)) * 1000)::int
                 )
-            WHERE run_id = $3::uuid
+            WHERE run_id = $4::uuid
             """,
             status,
             final_intent,
+            failure_reason,
             str(run_id),
         )
+
+
+# ── Failure taxonomy (S3.5) ─────────────────────────────────────────────────
+#
+# classify_failure() is THE single source of truth for the seven
+# ``failure_reason`` string literals. No other module may write these strings;
+# every call site classifies via this function and passes the result to
+# :func:`agent_runs_close`. The set is frozen to match the CHECK constraint in
+# migrations/045_agent_failure_reason.sql — do not extend it without revisiting
+# PLAN.md Open Question 6.
+#
+# These two sets are the only error_kinds the read-only executor emits
+# (src/api/agent/sql_executor.py, surfaced by sql_tools._make_runner). Any
+# OTHER error_kind a ``run_select_*`` call reports is, by construction, a
+# validator rejection — the validator owns the long tail of rejection kinds
+# (src/api/agent/sql_validator.py), so we infer it by exclusion rather than
+# enumerating ~17 kinds that would drift.
+_EXECUTOR_TIMEOUT_KIND = "timeout"
+_EXECUTOR_TOOL_ERROR_KINDS = frozenset({"role_error", "plan_error", "exec_error"})
+
+# Tool names whose results carry a queryable row_count / error_kind. Mirrors
+# the names registered in src/api/agent/sql_tools.py (kept local to avoid a
+# src→src import just for a 2-tuple; a shared constant is an easy followup).
+_RUN_SELECT_TOOLS = frozenset({"run_select_ts", "run_select_static"})
+
+# Terminal statuses that are NOT failures — failure_reason stays NULL.
+_GRACEFUL_STATUSES = frozenset({"success", "running", "disambiguation", "not_found"})
+
+# S3.5 followups (failure modes that don't map cleanly to the seven categories
+# are classified as 'other' or folded per the notes below; revisit per
+# PLAN.md Open Question 6 after a month of data):
+#  * ``no_terminator`` / ``max_iterations`` fold into ``llm_error`` (the model
+#    exited the loop without delivering an answer). Arguably its own category
+#    ("model_gave_up"); merged for now.
+#  * ``empty_result`` is detected in SQL mode only (the spec's
+#    ``emit_final_answer`` site). The consumption fast path's zero-row case is
+#    not flagged yet.
+#  * The "zero rows" rule sums ``row_count`` across ALL successful
+#    ``run_select_*`` calls (see classify_failure docstring). A turn whose
+#    resolve-query returns a row but whose main aggregation returns none is
+#    therefore NOT flagged — conservative, no false positives. Revisit if
+#    "last-query-empty" proves more useful.
+#  * ``budget_exceeded`` has no concrete exception yet (S4). It is matched by
+#    class name so it lights up the moment budget.py lands BudgetExceededError.
+#  * DB / compile errors on the consumption fast path fall through to 'other'
+#    (they are not executor-tool failures). Split out later only if noisy.
+
+
+def classify_failure(exc_or_status: Any) -> Optional[str]:
+    """Map a turn's failure signal to one of the seven ``failure_reason`` values.
+
+    This is the ONLY place the failure_reason string literals appear. Returns
+    ``None`` for a success or graceful non-failure (the column stays NULL).
+
+    Accepts one of:
+      * ``None`` → ``None``.
+      * an ``Exception`` — classified by type.
+      * a terminal QA-result-like object (duck-typed on ``.status``,
+        ``.tool_calls``, ``.empty_result`` — i.e.
+        :class:`~src.api.agent_workflows.runtime.QAResult`) — classified from
+        the tool-call trace and terminal status.
+      * a bare status / error_kind ``str`` — for callers holding only a token.
+
+    Categories:
+      * ``validator_rejected`` — a ``run_select_*`` call was rejected by the
+        SQL validator (any executor error_kind that is not ``timeout`` /
+        ``role_error`` / ``plan_error`` / ``exec_error``).
+      * ``executor_timeout`` — :class:`SqlExecutorTimeoutError`, or error_kind
+        ``timeout``: the read-only ``statement_timeout`` fired.
+      * ``empty_result`` — the turn ANSWERED (``emit_final_answer`` succeeded)
+        but every underlying query came back empty. **Zero rows** is defined
+        precisely as: at least one ``run_select_ts`` / ``run_select_static``
+        call executed successfully (``ok=True``) AND the SUM of the
+        server-reported ``row_count`` across all such successful calls equals
+        zero. A turn that ran no ``run_select_*`` at all (e.g. answered from
+        ``current_time`` only) is NOT ``empty_result``. This signal is computed
+        at the ``emit_final_answer`` site in ``run_qa_turn`` and surfaced as
+        :attr:`QAResult.empty_result`; it takes precedence over a ``success``
+        status (an answered-but-empty turn is flagged even though it succeeded).
+      * ``budget_exceeded`` — a per-org token-budget refusal (S4). Matched by
+        exception class name (``BudgetExceededError``) until S4 lands it.
+      * ``tool_error`` — a tool failed or was misused: executor
+        role/plan/exec errors, a disallowed / unregistered tool
+        (:class:`ToolNotAllowedError` / :class:`ToolNotRegisteredError`), or
+        the terminator dispatch raising (status ``terminator_failed``).
+      * ``llm_error`` — the LLM layer failed: an Anthropic SDK error, or the
+        model exiting the loop without an answer (``no_terminator`` /
+        ``max_iterations``).
+      * ``other`` — anything not attributable more precisely.
+    """
+    if exc_or_status is None:
+        return None
+    if isinstance(exc_or_status, BaseException):
+        return _classify_exception(exc_or_status)
+    if isinstance(exc_or_status, str):
+        return _classify_status_token(exc_or_status)
+    return _classify_qa_result(exc_or_status)
+
+
+def _classify_exception(exc: BaseException) -> str:
+    """Classify a raised exception. See :func:`classify_failure`."""
+    # S4 hook: the budget exception isn't built yet (PLAN.md §S4). Match by
+    # name so it classifies correctly the moment budget.py lands it, without
+    # importing a class that doesn't exist.
+    if type(exc).__name__ == "BudgetExceededError":
+        return "budget_exceeded"
+    # SqlExecutorTimeoutError subclasses SqlExecutorError — check it first.
+    if isinstance(exc, SqlExecutorTimeoutError):
+        return "executor_timeout"
+    if isinstance(exc, (SqlExecutorError, ToolNotAllowedError, ToolNotRegisteredError)):
+        return "tool_error"
+    # Anthropic SDK errors (rate limit, 5xx, connection, malformed output).
+    # Match by module so audit.py needn't import the SDK (the agent keeps it
+    # an optional import for llm-free test envs).
+    root_module = (type(exc).__module__ or "").split(".", 1)[0]
+    if root_module == "anthropic":
+        return "llm_error"
+    return "other"
+
+
+def _classify_status_token(token: str) -> Optional[str]:
+    """Classify a bare status / error_kind token. See :func:`classify_failure`."""
+    if token in _GRACEFUL_STATUSES:
+        return None
+    if token == "empty_result":
+        return "empty_result"
+    if token == "terminator_failed":
+        return "tool_error"
+    if token in ("no_terminator", "max_iterations"):
+        return "llm_error"
+    if token == _EXECUTOR_TIMEOUT_KIND:
+        return "executor_timeout"
+    if token in _EXECUTOR_TOOL_ERROR_KINDS:
+        return "tool_error"
+    # A bare, unrecognised token (including the generic ``error`` status)
+    # carries no more-specific signal.
+    return "other"
+
+
+def _classify_qa_result(qa: Any) -> Optional[str]:
+    """Classify a terminal QA-result-like object. See :func:`classify_failure`."""
+    # empty_result takes precedence: it is recorded even when the turn
+    # otherwise succeeded (status == "success").
+    if getattr(qa, "empty_result", False):
+        return "empty_result"
+    status = getattr(qa, "status", None)
+    if status == "success":
+        return None
+    # Dominant tool-level cause = the most recent failed run_select_* error_kind
+    # (e.g. a validator rejection the model never recovered from — the §S3.5
+    # "deliberate validator rejection" done-when case).
+    kind = _last_failed_run_select_kind(getattr(qa, "tool_calls", None) or [])
+    if kind is not None:
+        if kind == _EXECUTOR_TIMEOUT_KIND:
+            return "executor_timeout"
+        if kind in _EXECUTOR_TOOL_ERROR_KINDS:
+            return "tool_error"
+        return "validator_rejected"
+    # No tool-level error_kind — classify by terminal status.
+    return _classify_status_token(status) if isinstance(status, str) else "other"
+
+
+def _last_failed_run_select_kind(tool_calls: Any) -> Optional[str]:
+    """Return the error_kind of the LAST failed run_select_* call, if any."""
+    kind: Optional[str] = None
+    for tc in tool_calls:
+        if getattr(tc, "name", None) not in _RUN_SELECT_TOOLS:
+            continue
+        if getattr(tc, "ok", True):
+            continue
+        result = getattr(tc, "result", None)
+        if isinstance(result, dict) and result.get("error_kind"):
+            kind = str(result["error_kind"])
+    return kind
 
 
 def sql_audit_target_type(functions_accessed: list[str]) -> str:

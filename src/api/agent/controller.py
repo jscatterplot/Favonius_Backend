@@ -39,6 +39,7 @@ from src.api.agent.audit import (
     agent_runs_close,
     agent_runs_open,
     agent_runs_step,
+    classify_failure,
     sql_audit_target_type,
     write_agent_query_audit,
 )
@@ -475,7 +476,7 @@ async def run_turn(
         await _emit_answer_safe(sse, reply, run_id)
         return reply
 
-    except Exception:
+    except Exception as exc:
         # Stamp the row with status='error' on a best-effort basis so the
         # audit trail is preserved, then re-raise so the route handler can
         # convert this into a sanitized 502. The exception text is logged
@@ -483,7 +484,9 @@ async def run_turn(
         logger.exception("Agent turn failed (run_id=%s)", run_id)
         try:
             error_reply = AgentReply.error(run_id=run_id)
-            await agent_runs_close(ts_pool, run_id, "error", error_reply)
+            await agent_runs_close(
+                ts_pool, run_id, "error", error_reply, failure_reason=classify_failure(exc)
+            )
         except Exception:  # pragma: no cover - audit close is best-effort
             logger.exception("Failed to close agent_run %s in error state", run_id)
         raise
@@ -693,7 +696,9 @@ async def _run_sql_general_turn(
             )
         reply = AgentReply.error(run_id=run_id)
         try:
-            await agent_runs_close(ts_pool, run_id, "error", reply)
+            await agent_runs_close(
+                ts_pool, run_id, "error", reply, failure_reason=classify_failure(exc)
+            )
         except Exception:  # pragma: no cover - audit close is best-effort
             logger.exception("Failed to close agent_run %s in error state", run_id)
         await _emit_answer_safe(sse, reply, run_id)
@@ -796,7 +801,12 @@ async def _run_sql_general_turn(
 
     if qa.status == "success" and qa.text:
         reply = AgentReply.success(run_id=run_id, intent="sql_general", text=qa.text)
-        await agent_runs_close(ts_pool, run_id, "success", reply)
+        # A successful turn normally classifies to None; the exception is an
+        # answered-but-empty turn, which classify_failure flags as
+        # 'empty_result' off QAResult.empty_result.
+        await agent_runs_close(
+            ts_pool, run_id, "success", reply, failure_reason=classify_failure(qa)
+        )
         await _emit_answer_safe(sse, reply, run_id)
         return reply
 
@@ -818,6 +828,12 @@ async def _run_sql_general_turn(
         text=text,
         intent="sql_general",
     )
-    await agent_runs_close(ts_pool, run_id, reply.status, reply)
+    # The user-facing reply.status collapses several qa.status values to
+    # not_found; classify_failure reads the richer qa (status + tool-call
+    # trace) so the recorded failure_reason keeps the true cause — e.g. a
+    # validator rejection the model never recovered from.
+    await agent_runs_close(
+        ts_pool, run_id, reply.status, reply, failure_reason=classify_failure(qa)
+    )
     await _emit_answer_safe(sse, reply, run_id)
     return reply
