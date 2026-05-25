@@ -221,30 +221,42 @@ class AgentReply(BaseModel):
         )
 
 
-# ── Step-summary helpers (shown in SSE) ────────────────────────────────────
+# ── Step labels (user-facing SSE progress text) ────────────────────────────
+#
+# The SSE ``step`` event's ``summary`` is shown verbatim in the chat UI, so it
+# must read as plain progress text — never a raw phase or tool name. The
+# technical detail (full plan, resolved entities, per-tool ok/error) still
+# lands in ``agent_runs.steps_json`` via ``agent_runs_step`` for debugging;
+# this map only governs what the operator sees stream by.
+#
+# Keyed by BOTH consumption fast-path phase names and SQL-mode tool names
+# (they never collide). A new SQL tool with no entry here surfaces the generic
+# fallback — ``tests/unit/agent/test_step_labels.py`` guards against drift.
+_STEP_LABELS: dict[str, str] = {
+    # Consumption fast-path phases.
+    "planner_decision": "Understanding your question",
+    "extract_plan": "Working out what you're asking",
+    "resolve_entities": "Finding who and what you mentioned",
+    "compile": "Preparing the query",
+    "execute": "Fetching the data",
+    # SQL-mode tools. The SSE event name stays "tool_call"; the tool name is
+    # the label key.
+    "list_tables": "Reviewing the available data",
+    "describe_table": "Checking the data structure",
+    "sample_values": "Looking at sample values",
+    "run_select_ts": "Querying charging & telemetry data",
+    "run_select_static": "Querying depot & vehicle records",
+    "current_time": "Checking the current time",
+    "lookup_entity": "Finding the matching record",
+    "emit_final_answer": "Composing your answer",
+}
+
+_DEFAULT_STEP_LABEL = "Working on your request"
 
 
-def _summarize_plan(plan: QueryPlan) -> str:
-    if plan.time_window.kind == "relative":
-        when = plan.time_window.relative or "?"
-    else:
-        when = f"{plan.time_window.from_iso}..{plan.time_window.to_iso}"
-    n_subjects = len(plan.subjects)
-    return f"{plan.intent}, {n_subjects} subject(s), {when}"
-
-
-def _summarize_resolved(resolved: list[ResolvedEntity]) -> str:
-    if not resolved:
-        return "no subjects to resolve"
-    parts: list[str] = []
-    for e in resolved:
-        if e.candidates:
-            parts.append(f"{e.kind}: ambiguous ({len(e.candidates)} candidates)")
-        elif e.primary_id is None:
-            parts.append(f"{e.kind}: not found ({e.display!r})")
-        else:
-            parts.append(f"{e.kind}: {e.display}")
-    return "; ".join(parts)
+def _friendly_step_label(name: str) -> str:
+    """Return user-facing progress text for an internal step/tool name."""
+    return _STEP_LABELS.get(name, _DEFAULT_STEP_LABEL)
 
 
 def _describe_params(params: list[Any]) -> list[dict[str, Any]]:
@@ -317,8 +329,13 @@ async def run_turn(
     auth = await build_auth_context(token_payload, static_pool)
     run_id = await agent_runs_open(ts_pool, auth, message)
 
-    async def _emit_step(name: str, summary: str) -> None:
+    async def _emit_step(name: str, *, label_key: str | None = None) -> None:
+        # ``name`` is the SSE event's step name (a phase, or "tool_call");
+        # ``label_key`` overrides which entry drives the user-facing summary
+        # so SQL-mode tool calls (all emitted under name="tool_call") still
+        # get a per-tool label keyed by the actual tool name.
         if sse is not None:
+            summary = _friendly_step_label(label_key or name)
             await sse.emit("step", {"name": name, "summary": summary})
 
     try:
@@ -330,7 +347,7 @@ async def run_turn(
             "planner_decision",
             {"route": decision.route, "reason": decision.reason},
         )
-        await _emit_step("planner_decision", f"{decision.route} ({decision.reason})")
+        await _emit_step("planner_decision")
 
         if decision.route == "refuse":
             reply_text = "Please enter a question about depot charging or analytics."
@@ -358,7 +375,7 @@ async def run_turn(
         # 1. Extract the plan.
         plan = await llm_client.extract_plan(message)
         await agent_runs_step(ts_pool, run_id, "extract_plan", plan.model_dump())
-        await _emit_step("extract_plan", _summarize_plan(plan))
+        await _emit_step("extract_plan")
 
         # 2. Resolve entity mentions to UUIDs.
         resolved = await resolve_entities(plan.subjects, auth, static_pool)
@@ -368,7 +385,7 @@ async def run_turn(
             "resolve_entities",
             [e.model_dump() for e in resolved],
         )
-        await _emit_step("resolve_entities", _summarize_resolved(resolved))
+        await _emit_step("resolve_entities")
 
         # 3a. Disambiguation short-circuit.
         ambiguous = [e for e in resolved if e.candidates]
@@ -406,12 +423,12 @@ async def run_turn(
             "compile",
             {"intent": plan.intent, "param_shapes": _describe_params(params)},
         )
-        await _emit_step("compile", f"{plan.intent} SQL prepared")
+        await _emit_step("compile")
 
         rows = await ts_pool.fetch(sql, *params)
         rows_list = [dict(r) for r in rows]
         await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
-        await _emit_step("execute", f"{len(rows_list)} rows returned")
+        await _emit_step("execute")
 
         # 6. Mirror the executed query into the admin audit feed.
         await write_agent_query_audit(
@@ -580,8 +597,7 @@ async def _run_sql_general_turn(
             "error": tool_call.error,
         }
         await agent_runs_step(ts_pool, run_id, "tool_call", payload)
-        summary = f"{name}: {'ok' if tool_call.ok else 'error'}"
-        await emit_step("tool_call", summary)
+        await emit_step("tool_call", label_key=name)
 
     # Bugbot L-sev: previous shape was ``sql_tool_turns = 0`` +
     # try/except/else/finally with the variable reassigned in three

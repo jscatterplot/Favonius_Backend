@@ -546,13 +546,21 @@ data: <json>\n
 
 | Event name | When emitted | `data` shape |
 |---|---|---|
-| `step` | After each pipeline phase completes | `{"name": "<phase>", "summary": "<human-readable summary>"}` |
+| `step` | After each pipeline phase completes | `{"name": "<phase>", "summary": "<user-facing progress text>"}` |
 | `answer` | After the final phase | Full `AgentReply` JSON (same shape as the sync endpoint) |
 | `error` | On unrecoverable failure | `{"status": <http_code>, "detail": "<message>"}` |
 
-**Phase names** (emitted in order): `extract_plan` → `resolve_entities` →
-`compile` → `execute` → *(answer emitted next)*.  The `compile` and `execute`
-steps are skipped when the turn short-circuits at disambiguation or not-found.
+**Phase names** (consumption fast path, emitted in order): `planner_decision` →
+`extract_plan` → `resolve_entities` → `compile` → `execute` → *(answer emitted
+next)*.  The `compile` and `execute` steps are skipped when the turn
+short-circuits at disambiguation or not-found.  In SQL mode the planner routes
+to a tool-use loop instead: each tool call is emitted as a step with
+`name: "tool_call"` and a per-tool `summary`.
+
+The `summary` is user-facing progress text meant for direct display (e.g.
+"Querying charging & telemetry data", "Composing your answer").  The full
+technical trace for each step is persisted to `agent_runs.steps_json` and
+returned by `GET /agent/runs/{id}` — it is not duplicated into the SSE summary.
 
 **Required client headers for proxies:**
 ```
@@ -565,16 +573,19 @@ These are set in the response automatically (`SSE_HEADERS` in `src/api/agent/str
 **Example SSE sequence (success):**
 ```
 event: step
-data: {"name": "extract_plan", "summary": "consumption_by_user, 1 subject(s), last_month"}
+data: {"name": "planner_decision", "summary": "Understanding your question"}
 
 event: step
-data: {"name": "resolve_entities", "summary": "driver: John Smith (Vilnius)"}
+data: {"name": "extract_plan", "summary": "Working out what you're asking"}
 
 event: step
-data: {"name": "compile", "summary": "consumption_by_user SQL prepared"}
+data: {"name": "resolve_entities", "summary": "Finding who and what you mentioned"}
 
 event: step
-data: {"name": "execute", "summary": "2 rows returned"}
+data: {"name": "compile", "summary": "Preparing the query"}
+
+event: step
+data: {"name": "execute", "summary": "Fetching the data"}
 
 event: answer
 data: {"run_id": "…", "status": "success", "text": "John Smith consumed 83.9 kWh…", "intent": "consumption_by_user", "candidates": [], "not_found": []}
