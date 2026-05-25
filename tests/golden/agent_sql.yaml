@@ -494,8 +494,7 @@
   question: "Show me chargers that have been unavailable for more than 24 hours."
   description: >
     connector_status_latest WHERE status='Unavailable' AND last_changed_at <
-    now() - interval '24 hours'. The Unavailable timestamps are fixed days in
-    the past, so they are > 24h ago on any realistic run date (deterministic);
+    '2026-05-24T12:00:00Z' (24h before scenario_now). CP-10 and CP-11 qualify;
     an Available charger is a decoy.
   scenario_now: "2026-05-25T12:00:00Z"
   graph_snapshot:
@@ -513,7 +512,7 @@
           input:
             sql: >-
               SELECT station_id FROM agent_views.connector_status_latest($1)
-              WHERE status = 'Unavailable' AND last_changed_at < now() - interval '24 hours'
+              WHERE status = 'Unavailable' AND last_changed_at < '2026-05-24T12:00:00Z'
               ORDER BY station_id
     - content:
         - type: tool_use
