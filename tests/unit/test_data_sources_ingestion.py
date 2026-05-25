@@ -96,6 +96,18 @@ async def test_already_terminal_job_is_skipped(monkeypatch, patched):
     patched["finalize"].assert_not_awaited()
 
 
+async def test_startup_recovery_reclaims_running_without_stale_threshold(monkeypatch, patched):
+    claim = AsyncMock(return_value=_claimed())
+    monkeypatch.setattr(repo, "claim_job", claim)
+    monkeypatch.setattr(repo, "get_connection_secret", AsyncMock(return_value=_secret()))
+
+    await ingestion.run_ingestion_job(
+        MagicMock(), MagicMock(), job_id="j1", allow_stale_running_claim=True
+    )
+
+    assert claim.await_args.kwargs["allow_running_reclaim"] is True
+
+
 async def test_missing_connection_fails(monkeypatch, patched):
     monkeypatch.setattr(repo, "claim_job", AsyncMock(return_value=_claimed()))
     monkeypatch.setattr(repo, "get_connection_secret", AsyncMock(return_value=None))

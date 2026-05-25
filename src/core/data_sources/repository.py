@@ -359,13 +359,13 @@ async def claim_job(
     pool: asyncpg.Pool,
     job_id: str,
     *,
-    stale_threshold_seconds: Optional[int] = None,
+    allow_running_reclaim: bool = False,
 ) -> Optional[asyncpg.Record]:
     """Single-winner start.
 
-    Normal execution only claims ``pending`` jobs. Startup recovery may pass
-    any ``stale_threshold_seconds`` value (non-NULL) to reclaim ``running`` jobs
-    left by a crashed process, including rows with a recent heartbeat.
+    Normal execution only claims ``pending`` jobs. Startup recovery passes
+    ``allow_running_reclaim=True`` to reclaim ``running`` jobs left by a crashed
+    process, including rows with a recent heartbeat.
     """
     async with pool.acquire() as conn:
         return await conn.fetchrow(
@@ -377,12 +377,12 @@ async def claim_job(
             WHERE id = $1::uuid
               AND (
                 status = 'pending'
-                OR ($2::int IS NOT NULL AND status = 'running')
+                OR ($2::boolean AND status = 'running')
               )
             RETURNING {_JOB_COLS}
             """,
             job_id,
-            stale_threshold_seconds,
+            allow_running_reclaim,
         )
 
 
