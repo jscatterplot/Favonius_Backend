@@ -236,13 +236,32 @@ async def update_connection(
 
 
 async def disable_connection(pool: asyncpg.Pool, connection_id: str) -> bool:
-    """Soft-delete a connection (status='disabled'); returns True if a row changed."""
+    """Soft-delete a connection (status='disabled'); returns True if a row changed.
+
+    Pending/running ingestion jobs are terminalized so the one-active-job overlap
+    guard does not block reactivation or new syncs after the connection is
+    re-enabled.
+    """
+    cancelled_progress = json.dumps({"stage": "cancelled"})
     async with pool.acquire() as conn:
-        result: str = await conn.execute(
-            "UPDATE data_source_connections SET status = 'disabled', updated_at = NOW() "
-            "WHERE id = $1::uuid AND status <> 'disabled'",
-            connection_id,
-        )
+        async with conn.transaction():
+            result: str = await conn.execute(
+                "UPDATE data_source_connections SET status = 'disabled', updated_at = NOW() "
+                "WHERE id = $1::uuid AND status <> 'disabled'",
+                connection_id,
+            )
+            await conn.execute(
+                "UPDATE data_source_ingestion_jobs "
+                "SET status = 'failed', "
+                "    error_detail = 'connection disabled', "
+                "    finished_at = NOW(), "
+                "    heartbeat_at = NOW(), "
+                "    progress = progress || $2::jsonb "
+                "WHERE connection_id = $1::uuid "
+                "  AND status IN ('pending', 'running')",
+                connection_id,
+                cancelled_progress,
+            )
     return result.endswith(" 1")
 
 
