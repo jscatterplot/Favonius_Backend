@@ -1,0 +1,114 @@
+# Agent-SQL golden gate (PLAN.md session S2).
+#
+# Replays the hand-written scenarios in tests/golden/agent_sql.yaml through the
+# real SQL-mode loop (run_qa_turn + sql_validator + sql_executor) against the
+# agent_views.* functions, over fixtures loaded into a rolled-back savepoint on
+# a real TimescaleDB + Supabase pair.
+#
+# Unlike the workflow-golden gate (one DB), the SQL agent reads TWO pools, and
+# the two migration sets create colliding static-table names, so they cannot
+# share one database. We host both halves as two databases in the one
+# TimescaleDB service container:
+#   favonius_test    <- migrations/*.sql            (agent_views.* TS functions)
+#   favonius_static  <- supabase_bootstrap.sql       (Supabase-owned base tables)
+#                       + migrations/supabase/040_agent_views_static.sql
+# See tests/golden/agent_sql/supabase_bootstrap.sql for why the static base is
+# reconstructed rather than replayed.
+#
+# Trigger: PRs touching the agent code, the harness, the scenarios, or the
+# migrations. Pushes to main also run so the default branch stays green.
+
+name: agent-sql-golden
+
+on:
+  pull_request:
+    paths:
+      - "src/api/agent/**"
+      - "src/api/agent_workflows/**"
+      - "tests/golden/agent_sql.yaml"
+      - "tests/golden/agent_sql/**"
+      - "tests/golden/test_agent_sql_golden.py"
+      - "tests/golden/conftest.py"
+      - "migrations/**"
+      - ".github/workflows/agent-sql-golden.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/api/agent/**"
+      - "src/api/agent_workflows/**"
+      - "tests/golden/agent_sql.yaml"
+      - "tests/golden/agent_sql/**"
+      - "tests/golden/test_agent_sql_golden.py"
+      - "tests/golden/conftest.py"
+      - "migrations/**"
+
+concurrency:
+  group: agent-sql-golden-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  golden:
+    name: Agent-SQL golden scenarios
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: favonius_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: favonius_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U favonius_test -d favonius_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql://favonius_test:test_password@localhost:5433/favonius_test
+      TEST_STATIC_DATABASE_URL: postgresql://favonius_test:test_password@localhost:5433/favonius_static
+      PGPASSWORD: test_password
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" "jsonschema>=4.20.0"
+      - name: Wait for TimescaleDB
+        # The timescaledb image restarts Postgres once during first init (to
+        # load its preload library); pg_isready can pass against the transient
+        # server. Require several consecutive real queries before proceeding.
+        run: |
+          ok=0
+          for _ in $(seq 1 60); do
+            if psql "$TEST_DATABASE_URL" -tAc "SELECT 1" >/dev/null 2>&1; then
+              ok=$((ok + 1)); [ "$ok" -ge 3 ] && break
+            else ok=0; fi
+            sleep 1
+          done
+          psql "$TEST_DATABASE_URL" -tAc "SELECT 1" >/dev/null
+      - name: Create static (Supabase) database
+        run: psql "$TEST_DATABASE_URL" -c "CREATE DATABASE favonius_static OWNER favonius_test;"
+      - name: Apply TimescaleDB migrations -> favonius_test
+        run: python scripts/run_migrations.py
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+      - name: Apply static base + agent_views (040) -> favonius_static
+        run: |
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/golden/agent_sql/supabase_bootstrap.sql
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/040_agent_views_static.sql
+      - name: Run agent-SQL golden gate
+        # `-m "agent_sql_golden or not agent_sql_golden"` runs both the
+        # parametrised gate (real DB) and the no-DB invariants in the file
+        # (schema validation, unique ids, tone gate, and the 7/7/6 == 20
+        # distribution gate).
+        run: |
+          pytest tests/golden/test_agent_sql_golden.py \
+            -m "agent_sql_golden or not agent_sql_golden" \
+            --tb=short
