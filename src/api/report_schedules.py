@@ -918,8 +918,11 @@ async def deliver_pending_run(
 
     report_row = await _fetch_report_row(pools, str(run["report_id"]))
     recipient_rows = await _fetch_recipient_rows(pools, str(run["schedule_id"]))
-    delivery_ok = True
-    if report_row is not None and recipient_rows:
+    if not recipient_rows:
+        delivery_ok = True
+    elif report_row is None:
+        delivery_ok = False
+    else:
         delivery_ok = await _deliver_to_recipients(
             pools,
             run_id=run_id,
