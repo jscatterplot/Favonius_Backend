@@ -500,7 +500,7 @@ class APIServer:
     async def get_active_sessions(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get active charging sessions."""
         return web.json_response(
-            {"error": "Endpoint removed. Use GET /depots/{id}/state on the FastAPI service."},
+            {"error": "Endpoint removed. Use GET /depots/{id}/sessions/active on the FastAPI service."},
             status=410,
         )
 
