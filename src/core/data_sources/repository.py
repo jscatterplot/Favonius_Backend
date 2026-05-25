@@ -360,12 +360,13 @@ async def claim_job(
     job_id: str,
     *,
     allow_running_reclaim: bool = False,
+    stale_threshold_seconds: int = 120,
 ) -> Optional[asyncpg.Record]:
     """Single-winner start.
 
-    Normal execution only claims ``pending`` jobs. Startup recovery passes
-    ``allow_running_reclaim=True`` to reclaim ``running`` jobs left by a crashed
-    process, including rows with a recent heartbeat.
+    Normal execution only claims ``pending`` jobs. Startup recovery may also
+    reclaim ``running`` jobs, but only when they are stale by heartbeat/start
+    age so overlapping workers cannot concurrently resume the same live job.
     """
     async with pool.acquire() as conn:
         return await conn.fetchrow(
@@ -377,12 +378,18 @@ async def claim_job(
             WHERE id = $1::uuid
               AND (
                 status = 'pending'
-                OR ($2::boolean AND status = 'running')
+                OR (
+                    $2::boolean
+                    AND status = 'running'
+                    AND COALESCE(heartbeat_at, started_at, created_at)
+                        < NOW() - ($3::int * INTERVAL '1 second')
+                )
               )
             RETURNING {_JOB_COLS}
             """,
             job_id,
             allow_running_reclaim,
+            stale_threshold_seconds,
         )
 
 
@@ -496,9 +503,9 @@ async def find_orphaned_jobs(
     ordered by ``(created_at, id)``; pass the last row's cursor back in to page
     through more than ``limit`` orphans.
 
-    ``running`` jobs are included regardless of heartbeat age because recovery is
-    executed once during process startup: after a crash/restart every non-terminal
-    job from the previous process is orphaned, including freshly-started rows.
+    ``running`` jobs are included only once their heartbeat/start timestamp is
+    older than ``threshold_seconds`` so recovery does not steal actively running
+    work from another live process.
     """
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -507,7 +514,11 @@ async def find_orphaned_jobs(
             FROM data_source_ingestion_jobs
             WHERE (
                 status = 'pending'
-                OR status = 'running'
+                OR (
+                    status = 'running'
+                    AND COALESCE(heartbeat_at, started_at, created_at)
+                        < NOW() - ($1::int * INTERVAL '1 second')
+                )
             )
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
