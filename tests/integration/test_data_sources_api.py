@@ -297,6 +297,14 @@ def test_update_credentials_not_ready_returns_503(client, monkeypatch):
     assert resp.status_code == 503
 
 
+def test_update_vanished_row_returns_404(client, monkeypatch):
+    rec = _connection_row()
+    monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=rec))
+    monkeypatch.setattr(repo, "update_connection", AsyncMock(return_value=None))
+    resp = client.patch(f"/admin/data-sources/connections/{rec['id']}", json={"displayName": "x"})
+    assert resp.status_code == 404
+
+
 def test_update_reactivation_conflict_returns_409(client, monkeypatch):
     rec = _connection_row(status="disabled")
     monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=rec))

@@ -54,6 +54,39 @@ async def test_recovery_noop_when_none(monkeypatch):
     assert n == 0 and captured == []
 
 
+async def test_recovery_paginates_through_all(monkeypatch):
+    import datetime as _dt
+
+    monkeypatch.setattr(scheduler, "_RECOVERY_PAGE_SIZE", 2)
+    page1 = [
+        {
+            "id": str(uuid4()),
+            "status": "running",
+            "connection_id": str(uuid4()),
+            "created_at": _dt.datetime(2026, 5, 25, tzinfo=_dt.timezone.utc),
+        }
+        for _ in range(2)
+    ]
+    page2 = [
+        {
+            "id": str(uuid4()),
+            "status": "pending",
+            "connection_id": str(uuid4()),
+            "created_at": _dt.datetime(2026, 5, 25, 1, tzinfo=_dt.timezone.utc),
+        }
+    ]
+    find = AsyncMock(side_effect=[page1, page2])
+    monkeypatch.setattr(repo, "find_orphaned_jobs", find)
+    spawn, captured = _spawner()
+
+    n = await scheduler.recover_orphaned_data_source_jobs(MagicMock(), MagicMock(), spawn=spawn)
+    assert n == 3
+    assert len(captured) == 3
+    assert find.await_count == 2  # full first page → fetched again
+    # Second fetch carried the keyset cursor from the last row of page 1.
+    assert find.await_args_list[1].kwargs["after_id"] == page1[-1]["id"]
+
+
 async def test_tick_enqueues_and_spawns(monkeypatch):
     conn = _conn_row()
     monkeypatch.setattr(repo, "find_due_connections", AsyncMock(return_value=[conn]))

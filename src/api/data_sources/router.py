@@ -368,6 +368,8 @@ async def update_connection(
                 "detail": "A connection for this depot and provider already exists",
             },
         )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="connection not found")
     await _audit(
         ts_pool,
         action="data_source.connection.updated",
@@ -443,10 +445,15 @@ async def trigger_sync(
         )
 
     job_wire = _job_wire(job_rec)
-    # A due connection just got a manual run; push the scheduled clock forward so
-    # the next tick doesn't enqueue a redundant scheduled job right behind it.
-    await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
     _spawn(run_ingestion_job(static_pool, ts_pool, job_id=job_wire["id"]))
+    # Best-effort: push the scheduled clock forward so the next tick doesn't
+    # enqueue a redundant scheduled job behind this manual one. The job is
+    # already running, so a failure here must not fail the request — the
+    # scheduler's overlap path will advance next_sync_at on its next tick.
+    try:
+        await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to advance next_sync_at after manual sync of %s", connection_id)
     await _audit(
         ts_pool,
         action="data_source.sync.triggered",

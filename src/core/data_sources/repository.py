@@ -475,12 +475,19 @@ async def list_jobs(
 
 
 async def find_orphaned_jobs(
-    pool: asyncpg.Pool, *, threshold_seconds: int, limit: int
+    pool: asyncpg.Pool,
+    *,
+    threshold_seconds: int,
+    limit: int,
+    after_created_at: Optional[datetime] = None,
+    after_id: Optional[str] = None,
 ) -> list[asyncpg.Record]:
     """Pending/running jobs whose heartbeat is stale — candidates for recovery.
 
     Jobs whose parent connection has been disabled are excluded so a soft-deleted
-    connection is never resurrected by the startup sweep.
+    connection is never resurrected by the startup sweep. Results are keyset-
+    ordered by ``(created_at, id)``; pass the last row's cursor back in to page
+    through more than ``limit`` orphans.
     """
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -495,9 +502,15 @@ async def find_orphaned_jobs(
                   WHERE c.id = data_source_ingestion_jobs.connection_id
                     AND c.status <> 'disabled'
               )
-            ORDER BY created_at ASC
+              AND (
+                  $3::timestamptz IS NULL
+                  OR (created_at, id) > ($3::timestamptz, $4::uuid)
+              )
+            ORDER BY created_at ASC, id ASC
             LIMIT $2
             """,
             threshold_seconds,
             limit,
+            after_created_at,
+            after_id,
         )

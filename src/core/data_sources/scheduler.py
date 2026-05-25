@@ -26,6 +26,7 @@ Spawn = Callable[[Awaitable[Any]], None]
 _SCHEDULER_INTERVAL_S = int(os.getenv("DATA_SOURCES_SCHEDULER_INTERVAL_S", "300"))
 _ORPHAN_THRESHOLD_S = int(os.getenv("DATA_SOURCES_ORPHAN_THRESHOLD_S", "1800"))
 _BATCH_LIMIT = int(os.getenv("DATA_SOURCES_SCHEDULER_BATCH", "50"))
+_RECOVERY_PAGE_SIZE = int(os.getenv("DATA_SOURCES_RECOVERY_PAGE", "100"))
 
 
 def check_single_worker() -> None:
@@ -51,30 +52,48 @@ async def recover_orphaned_data_source_jobs(
 ) -> int:
     """Re-kick pending/running jobs whose heartbeat is stale. Returns the count.
 
-    Run once at startup. Resumes the existing row (the overlap unique index
+    Run once at startup. Pages through every stale job with a keyset cursor so a
+    large backlog is fully recovered, not just the first page — leftover
+    non-terminal rows would otherwise keep blocking fresh enqueues via the
+    one-active-job index. Resumes the existing row (the overlap unique index
     forbids a duplicate); ingestion idempotency makes resume safe.
     """
-    rows = await repo.find_orphaned_jobs(
-        static_pool, threshold_seconds=_ORPHAN_THRESHOLD_S, limit=100
-    )
-    for row in rows:
-        logger.warning(
-            "Recovering orphaned data-source job %s (status=%s, connection=%s)",
-            row["id"],
-            row["status"],
-            row["connection_id"],
+    total = 0
+    after_created_at = None
+    after_id = None
+    while True:
+        rows = await repo.find_orphaned_jobs(
+            static_pool,
+            threshold_seconds=_ORPHAN_THRESHOLD_S,
+            limit=_RECOVERY_PAGE_SIZE,
+            after_created_at=after_created_at,
+            after_id=after_id,
         )
-        spawn(
-            run_ingestion_job(
-                static_pool,
-                ts_pool,
-                job_id=row["id"],
-                allow_stale_running_claim=True,
+        if not rows:
+            break
+        for row in rows:
+            logger.warning(
+                "Recovering orphaned data-source job %s (status=%s, connection=%s)",
+                row["id"],
+                row["status"],
+                row["connection_id"],
             )
-        )
-    if rows:
-        logger.info("Re-kicked %d orphaned data-source job(s)", len(rows))
-    return len(rows)
+            spawn(
+                run_ingestion_job(
+                    static_pool,
+                    ts_pool,
+                    job_id=row["id"],
+                    allow_stale_running_claim=True,
+                )
+            )
+        total += len(rows)
+        if len(rows) < _RECOVERY_PAGE_SIZE:
+            break
+        after_created_at = rows[-1]["created_at"]
+        after_id = rows[-1]["id"]
+    if total:
+        logger.info("Re-kicked %d orphaned data-source job(s)", total)
+    return total
 
 
 async def run_data_source_scheduler(
@@ -113,8 +132,11 @@ async def _tick(static_pool: asyncpg.Pool, ts_pool: asyncpg.Pool, *, spawn: Spaw
             # A manual sync won the race for this connection; just advance.
             await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
             continue
-        await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
+        # Spawn the just-inserted job before the non-critical reschedule write so
+        # a transient failure there can't strand it 'pending' and block the
+        # connection behind the one-active-job index.
         spawn(run_ingestion_job(static_pool, ts_pool, job_id=job["id"]))
+        await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
         logger.info(
             "Scheduled sync enqueued for connection %s (job %s)",
             connection_id,
