@@ -411,14 +411,19 @@ async def finalize_job(
     error_detail: Optional[str],
     import_batch_id: Optional[str],
 ) -> None:
-    """Write the terminal state of a job."""
+    """Write the terminal state of a job.
+
+    The WHERE guards ``status = 'running'`` so that a worker which finishes
+    after ``disable_connection`` already terminalized the row (status='failed',
+    reason='connection disabled') does not overwrite the cancellation state.
+    """
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE data_source_ingestion_jobs "
             "SET status = $2, progress = progress || $3::jsonb, "
             "error_detail = $4, import_batch_id = $5::uuid, "
             "finished_at = NOW(), heartbeat_at = NOW() "
-            "WHERE id = $1::uuid",
+            "WHERE id = $1::uuid AND status = 'running'",
             job_id,
             status,
             json.dumps(progress),
@@ -494,9 +499,14 @@ async def find_orphaned_jobs(
             f"""
             SELECT {_JOB_COLS}
             FROM data_source_ingestion_jobs
-            WHERE status IN ('pending', 'running')
-              AND COALESCE(heartbeat_at, started_at, created_at)
-                  < NOW() - make_interval(secs => $1)
+            WHERE (
+                status = 'pending'
+                OR (
+                    status = 'running'
+                    AND COALESCE(heartbeat_at, started_at, created_at)
+                        < NOW() - make_interval(secs => $1)
+                )
+            )
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
                   WHERE c.id = data_source_ingestion_jobs.connection_id

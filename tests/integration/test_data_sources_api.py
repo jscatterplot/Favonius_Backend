@@ -314,3 +314,30 @@ def test_update_reactivation_conflict_returns_409(client, monkeypatch):
     resp = client.patch(f"/admin/data-sources/connections/{rec['id']}", json={"status": "active"})
     assert resp.status_code == 409
     assert resp.json()["error_code"] == "CONNECTION_ALREADY_EXISTS"
+
+
+def test_create_zero_interval_is_rejected(client, monkeypatch):
+    # sync_interval_minutes=0 must not silently default to the provider default.
+    monkeypatch.setattr(repo, "insert_connection", AsyncMock(return_value=_connection_row()))
+    resp = client.post(
+        "/admin/data-sources/connections",
+        json={
+            "depotId": _DEPOT,
+            "providerKey": "kempower",
+            "credentials": {"username": "u", "password": "p"},
+            "config": {"locationId": "loc1"},
+            "syncIntervalMinutes": 0,
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_list_jobs_naive_before_is_accepted(client, monkeypatch):
+    # Naive ISO timestamps must be normalised to UTC rather than causing a 500.
+    monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=_connection_row()))
+    monkeypatch.setattr(repo, "list_jobs", AsyncMock(return_value=[]))
+    cid = _connection_row()["id"]
+    resp = client.get(
+        f"/admin/data-sources/connections/{cid}/jobs?before=2026-05-25T10:00:00"
+    )
+    assert resp.status_code == 200

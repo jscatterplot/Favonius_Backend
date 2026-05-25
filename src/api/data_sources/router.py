@@ -114,11 +114,14 @@ def _parse_before(value: Optional[str]) -> Optional[datetime]:
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(text)
+        dt = datetime.fromisoformat(text)
     except ValueError as exc:
         raise HTTPException(
             status_code=422, detail=f"invalid 'before' timestamp: {value!r}"
         ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def _audit(
@@ -170,7 +173,9 @@ async def create_connection(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     interval = (
-        body.sync_interval_minutes or provider.catalogue_entry().default_sync_interval_minutes
+        provider.catalogue_entry().default_sync_interval_minutes
+        if body.sync_interval_minutes is None
+        else body.sync_interval_minutes
     )
     if interval < _MIN_SYNC_INTERVAL:
         raise HTTPException(
