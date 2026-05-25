@@ -324,9 +324,13 @@ async def claim_job(
     pool: asyncpg.Pool,
     job_id: str,
     *,
-    stale_threshold_seconds: int = _ORPHAN_THRESHOLD_S,
+    stale_threshold_seconds: Optional[int] = None,
 ) -> Optional[asyncpg.Record]:
-    """Single-winner start: pending jobs, or stale running jobs for recovery."""
+    """Single-winner start.
+
+    Normal execution only claims ``pending`` jobs. Startup recovery may pass
+    ``stale_threshold_seconds`` to reclaim stale ``running`` jobs.
+    """
     async with pool.acquire() as conn:
         return await conn.fetchrow(
             f"""
@@ -338,7 +342,8 @@ async def claim_job(
               AND (
                 status = 'pending'
                 OR (
-                  status = 'running'
+                  $2::int IS NOT NULL
+                  AND status = 'running'
                   AND COALESCE(heartbeat_at, started_at, created_at)
                       < NOW() - make_interval(secs => $2)
                 )

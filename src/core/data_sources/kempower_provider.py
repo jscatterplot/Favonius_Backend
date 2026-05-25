@@ -120,14 +120,15 @@ class KempowerProvider(DataSourceProvider):
         return KempowerClient(
             username=credentials.get("username"),
             password=credentials.get("password"),
-            base_url=config.get("baseUrl") or os.getenv("KEMPOWER_API_BASE_URL"),
+            base_url=(config.get("baseUrl") or credentials.get("baseUrl"))
+            or os.getenv("KEMPOWER_API_BASE_URL"),
         )
 
     async def validate_credentials(
         self, credentials: dict[str, Any], config: dict[str, Any]
     ) -> None:
         """Cheap authenticated probe: fetch the configured location."""
-        location_id = config.get("locationId")
+        location_id = config.get("locationId") or credentials.get("locationId")
         if not location_id:
             raise CredentialValidationError("locationId is required")
         if not credentials.get("username") or not credentials.get("password"):
@@ -142,12 +143,14 @@ class KempowerProvider(DataSourceProvider):
 
     async def run_ingestion(self, ctx: IngestionContext) -> IngestionResult:
         """Drive the shared onboarding stages, reporting progress per stage."""
-        location_id = ctx.config.get("locationId")
+        location_id = ctx.config.get("locationId") or ctx.credentials.get("locationId")
         if not location_id:
             return IngestionResult(
-                status="failed", error_detail="locationId missing from connection config"
+                status="failed", error_detail="locationId missing from connection config/credentials"
             )
-        backfill_since = _parse_backfill_since(ctx.config.get("backfillSince"))
+        backfill_since = _parse_backfill_since(
+            ctx.config.get("backfillSince") or ctx.credentials.get("backfillSince")
+        )
         counts = OnboardingCounts()
         error_detail: Optional[str] = None
 

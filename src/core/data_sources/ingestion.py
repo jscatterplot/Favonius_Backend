@@ -55,10 +55,16 @@ async def run_ingestion_job(
     ts_pool: asyncpg.Pool,
     *,
     job_id: str,
+    allow_stale_running_claim: bool = False,
 ) -> None:
     """Execute one ingestion job to a terminal state. Never raises."""
     try:
-        await _run(static_pool, ts_pool, job_id=job_id)
+        await _run(
+            static_pool,
+            ts_pool,
+            job_id=job_id,
+            allow_stale_running_claim=allow_stale_running_claim,
+        )
     except Exception:  # noqa: BLE001 — background task: log, never propagate.
         logger.exception("Data-source ingestion job %s crashed", job_id)
         try:
@@ -74,8 +80,18 @@ async def run_ingestion_job(
             logger.exception("Failed to mark job %s failed after crash", job_id)
 
 
-async def _run(static_pool: asyncpg.Pool, ts_pool: asyncpg.Pool, *, job_id: str) -> None:
-    claimed = await repo.claim_job(static_pool, job_id)
+async def _run(
+    static_pool: asyncpg.Pool,
+    ts_pool: asyncpg.Pool,
+    *,
+    job_id: str,
+    allow_stale_running_claim: bool,
+) -> None:
+    claimed = await repo.claim_job(
+        static_pool,
+        job_id,
+        stale_threshold_seconds=repo._ORPHAN_THRESHOLD_S if allow_stale_running_claim else None,
+    )
     if claimed is None:
         logger.info("Job %s already terminal or gone; skipping", job_id)
         return

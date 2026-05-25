@@ -64,7 +64,14 @@ async def recover_orphaned_data_source_jobs(
             row["status"],
             row["connection_id"],
         )
-        spawn(run_ingestion_job(static_pool, ts_pool, job_id=row["id"]))
+        spawn(
+            run_ingestion_job(
+                static_pool,
+                ts_pool,
+                job_id=row["id"],
+                allow_stale_running_claim=True,
+            )
+        )
     if rows:
         logger.info("Re-kicked %d orphaned data-source job(s)", len(rows))
     return len(rows)
