@@ -289,6 +289,17 @@ Vendor metadata is persisted on `BootNotification` via `OCPP16Session._persist_s
 
 Migration 042 adds the three tables and extends `charging_command_queue.command_type` to allow `'get_diagnostics'` and `'get_log'` (placeholder for future OCPP 2.0.1 chargers — same queue, same upload endpoint, new dispatch helper).
 
+### Scheduled reports (`src/api/report_schedules.py` + `report_schedule_timing.py` + `report_pdf.py`)
+
+Configurable per-depot report schedules (frontend PR #124). A depot admin defines a schedule (e.g. "Monthly electricity consumption", `kind=monthly_consumption`, `frequency=monthly`, `dayOfMonth=1`, `timeOfDay=06:00`, `autonomyMode=auto_silent`) with PDF/CSV recipients; a per-minute worker fires due schedules, generates the report via the existing `reports.generate` pipeline, renders a PDF/CSV, and emails it.
+
+- **Schema (migration 044, TimescaleDB):** `report_schedules`, `report_schedule_recipients` (ordered, stable ids, `UNIQUE(schedule_id, email, format)`), `schedule_runs` (`UNIQUE(schedule_id, scheduled_for)` = cron idempotency anchor), `schedule_run_deliveries` (append-only delivery ledger). Like migration 033, `depot_id`/`created_by` are bare UUIDs (no cross-DB FK to Supabase `sites`/`auth.users`). 044 also rekeys the `report_draft` agent-action uniqueness index to `(depot_id, COALESCE(scheduleId,'_legacy'), periodStart)` so multiple schedules per depot can each emit a draft. Numbered 044 to avoid colliding with in-flight PR #233's 043. **The legacy hardcoded `monthly_scheduler` is removed** — this feature replaces it.
+- **Reads:** `GET /depots/{id}/report-schedules`, `/{schedule_id}`, `/{schedule_id}/runs` — any depot member. Responses are plain camelCase dicts with all nullable fields present (`nextRunAt`/`lastRunAt`/`lastRunStatus`/`recipients[].lastDelivery`) for the frontend's strict Zod.
+- **Writes:** via `POST /commands/execute` — `reports.schedule.{create,update,delete,run_now}`, gated by `Permission.ADMIN_CONFIG` (customer_admin+). Handlers return the domain object as `CommandResponse.result`. `run_now` executes inline (scheduled_for = now truncated to the second → double-click safe) and returns a `ScheduleRun`.
+- **Autonomy gating** (resolved by `resolve_autonomy_mode`, which reads PR #233's shared `agent_autonomy_settings.level` for `report_draft` — gracefully falling back when that table isn't present yet — then falls back to the schedule's `autonomy_mode`): `shadow`→`skipped` (no report/delivery); `proposed`→generate + emit a pending `report_draft` agent_action (payload carries `scheduleId`/`runId`/`reportId`), run `pending_approval` (approving via `agents.action.approve` delivers + flips run to `succeeded`; rejecting flips to `skipped`); `auto_notify`→deliver + informational action; `auto_silent`→deliver, no action.
+- **Scheduling/DST:** `compute_next_run_at` (in `report_schedule_timing.py`, pure stdlib) computes the next wall-clock occurrence in the depot tz then converts to UTC via `zoneinfo`, so a 06:00 schedule stays 06:00 local across DST (the UTC instant shifts). spec weekday is 0=Sun..6=Sat. Quarterly = calendar quarters (Jan/Apr/Jul/Oct).
+- **Delivery:** PDF via `reportlab` (`report_pdf.py`), CSV reuses `reports.stream_rows_as_csv`. `EmailMessage.attachments` (new) carries them; `ResendEmailClient` base64-encodes. The API process builds its own email client at startup (`report_email_client`: Resend when `RESEND_API_KEY` set, else `FakeEmailClient`). Provider webhook callbacks (`POST /webhooks/resend`) **append** a new `schedule_run_deliveries` row with the mapped status (`delivered→sent`, `complained→suppressed`), so `lastDelivery` reflects the latest provider state. Env vars reuse the alerts pipeline's `RESEND_API_KEY`/`RESEND_FROM_ADDRESS`/`EMAIL_DELIVERY_ENABLED`/`RESEND_WEBHOOK_SECRET`.
+
 ### Per-session billing (`src/core/billing/session_cost.py`)
 
 `compute_session_cost(ts_pool, session_row)` returns a `SessionCostResult` (`cost`, `source`, diagnostics). Two strategies, automatic selection: **granular** integrates `charging_kw × Δt × price(t)` via TimescaleDB `time_bucket('1 hour', telemetry.time)` (trapezoidal between consecutive samples) joined to `electricity_prices`, **fallback_average** uses `energy_delivered_kwh × avg(price over [start,end])`. The granular path is gated: telemetry timestamps must cover ≥80% of the session AND telemetry-implied energy must reconcile to within ±10% of `energy_delivered_kwh`. The chosen strategy is written to `charging_sessions.cost_total_source` (migration 040). Missing prices → `'unpriceable'`, `cost_total` stays NULL; billing never fabricates a price.
@@ -482,6 +493,11 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `POST` | `/agent/turn` | Depot chat agent — synchronous turn; returns `AgentReply` (10 req/min; requires `AGENT_SEARCH_ENABLED=true`) |
 | `POST` | `/agent/turn/stream` | Depot chat agent — SSE streaming turn; emits `step` events then `answer` (10 req/min; same gate) |
 | `GET` | `/agent/runs/{run_id}` | Fetch stored agent run trace (ownership-gated; `favonius_admin` may access any run) |
+| `GET` | `/depots/{id}/report-schedules` | List report schedules (any depot member; `[]` when none) |
+| `GET` | `/depots/{id}/report-schedules/{schedule_id}` | Get one report schedule |
+| `GET` | `/depots/{id}/report-schedules/{schedule_id}/runs` | List a schedule's runs (most-recent first) |
+
+Report-schedule mutations flow through `POST /commands/execute` (customer_admin+, `ADMIN_CONFIG`): `reports.schedule.create` (`params.input`), `reports.schedule.update` (`params.scheduleId`+`patch`), `reports.schedule.delete` (`params.scheduleId`), `reports.schedule.run_now` (`params.scheduleId` → returns `ScheduleRun`).
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)

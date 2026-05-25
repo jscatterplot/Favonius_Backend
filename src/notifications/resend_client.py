@@ -14,6 +14,7 @@ typical 5xx is transient. We don't want a global circuit breaker yet.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from typing import Any, Optional
 
@@ -65,6 +66,15 @@ class ResendEmailClient:
         }
         if message.headers:
             payload["headers"] = dict(message.headers)
+        if message.attachments:
+            payload["attachments"] = [
+                {
+                    "filename": att.filename,
+                    "content": base64.b64encode(att.content).decode("ascii"),
+                    "content_type": att.content_type,
+                }
+                for att in message.attachments
+            ]
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -74,9 +84,7 @@ class ResendEmailClient:
         last_detail: dict[str, Any] = {}
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._client.post(
-                    _RESEND_API_URL, json=payload, headers=headers
-                )
+                response = await self._client.post(_RESEND_API_URL, json=payload, headers=headers)
             except httpx.HTTPError as exc:
                 last_detail = {"error": "transport", "message": str(exc), "attempt": attempt + 1}
                 if attempt < self._max_retries:
@@ -92,7 +100,11 @@ class ResendEmailClient:
                     return DeliveryResult(
                         status="failed",
                         provider_message_id=None,
-                        detail={"error": "no_id", "body": body, "status_code": response.status_code},
+                        detail={
+                            "error": "no_id",
+                            "body": body,
+                            "status_code": response.status_code,
+                        },
                     )
                 return DeliveryResult(
                     status="sent",

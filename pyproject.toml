@@ -76,6 +76,8 @@ dependencies = [
     "uvicorn[standard]>=0.24.0",
     # Email templates (alerts pipeline; see docs/plans/alerts-pipeline.md)
     "jinja2>=3.1.0",
+    # Scheduled-report PDF rendering (pure-Python; no system libs required)
+    "reportlab>=4.0.0",
     # Weather API
     "openmeteo-requests>=1.2.0",
     "requests-cache>=1.1.0",

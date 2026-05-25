@@ -627,6 +627,80 @@ the collapsible reasoning panel in the UI.
 
 ---
 
+## Scheduled Reports
+
+Configurable per-depot report schedules. The worker fires due schedules every
+minute, generates a `Report` (visible at `GET /depots/{id}/reports`), renders a
+PDF/CSV, and emails it to the schedule's recipients. All timestamps are
+ISO-8601 UTC (`…Z`); all body fields are camelCase.
+
+### GET /depots/{depot_id}/report-schedules
+
+List schedules for the depot. Any depot member. Returns `[]` (not 404) when the
+depot has no schedules. Each item is a `ReportSchedule`:
+
+```json
+{
+  "id": "uuid", "depotId": "uuid", "name": "Monthly electricity consumption",
+  "kind": "monthly_consumption", "groupBy": "card", "frequency": "monthly",
+  "dayOfMonth": 1, "dayOfWeek": null, "timeOfDay": "06:00",
+  "autonomyMode": "auto_silent", "isActive": true,
+  "recipients": [
+    {"recipientId": "uuid", "emailAddress": "manager@depot.example",
+     "format": "pdf", "lastDelivery": {"status": "sent", "attemptedAt": "2026-06-01T03:00:05Z"}}
+  ],
+  "nextRunAt": "2026-07-01T03:00:00Z", "lastRunAt": "2026-06-01T03:00:00Z",
+  "lastRunStatus": "succeeded", "createdAt": "2026-05-20T09:00:00Z",
+  "createdBy": "uuid", "updatedAt": "2026-05-20T09:00:00Z"
+}
+```
+
+`nextRunAt`/`lastRunAt`/`lastRunStatus` and `recipients[].lastDelivery` are
+always present (may be `null`); `recipients` is always an array.
+
+### GET /depots/{depot_id}/report-schedules/{schedule_id}
+
+Single `ReportSchedule`. 404 when not found.
+
+### GET /depots/{depot_id}/report-schedules/{schedule_id}/runs
+
+`ScheduleRun[]`, most-recent first:
+
+```json
+{
+  "runId": "uuid", "scheduleId": "uuid", "reportId": "uuid",
+  "triggeredAt": "2026-06-01T03:00:00Z", "completedAt": "2026-06-01T03:00:06Z",
+  "status": "succeeded",
+  "deliveries": [
+    {"recipientId": "uuid", "emailAddress": "manager@depot.example", "format": "pdf",
+     "status": "sent", "attemptedAt": "2026-06-01T03:00:05Z",
+     "providerMessageId": "…", "error": null}
+  ],
+  "errorMessage": null
+}
+```
+
+### Mutations — POST /commands/execute
+
+`customer_admin` or higher (`ADMIN_CONFIG`). The handler's domain object is
+returned as `result`; the dispatcher wraps it as `{status, command, depot_id, result}`.
+
+| `command` | `params` | `result` |
+|---|---|---|
+| `reports.schedule.create` | `{ input: ScheduleCreatePayload }` | `ReportSchedule` (with computed `nextRunAt`) |
+| `reports.schedule.update` | `{ scheduleId, patch: SchedulePatchPayload }` | updated `ReportSchedule` |
+| `reports.schedule.delete` | `{ scheduleId }` | `{ scheduleId, deleted: true }` |
+| `reports.schedule.run_now` | `{ scheduleId }` | `ScheduleRun` (with populated `reportId`) |
+
+`ScheduleCreatePayload` = `ReportSchedule` minus server-assigned fields. In a
+`SchedulePatchPayload` all fields are optional; `recipients[]` replaces the full
+list when present (absent = unchanged). Enums: `ScheduleRunStatus` =
+`succeeded|failed|skipped|pending_approval`; `DeliveryStatus` =
+`sent|failed|bounced|suppressed`. In `proposed` autonomy the run is
+`pending_approval` until approved via `agents.action.approve`.
+
+---
+
 ## Implementation Notes
 
 - All endpoints use FastAPI framework

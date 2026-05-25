@@ -116,6 +116,13 @@ from .charging_import import (
     TimescalePriceSource,
 )
 from .error_codes import ERROR_MESSAGES, ErrorCode, http_status_for, safe_message_for
+from . import report_schedules as _report_schedules
+from .report_schedule_timing import (
+    ScheduleValidationError,
+    compute_next_run_at,
+    normalize_create_payload,
+    normalize_patch_payload,
+)
 from .reports import (
     REPORT_GROUP_BY_VALUES,
     SessionRow,
@@ -129,6 +136,13 @@ logger = logging.getLogger(__name__)
 
 # Database connection pools (set during lifespan startup)
 db_pools: Optional[DatabasePools] = None
+
+# Outbound email client for scheduled-report delivery (set during lifespan).
+# Mirrors the websocket_handler alert dispatcher: a real ResendEmailClient when
+# RESEND_API_KEY is configured, else a FakeEmailClient that records but does not
+# send. The report worker and the agents.action.approve delivery path use it.
+report_email_client: Optional[Any] = None
+report_email_from: str = os.getenv("RESEND_FROM_ADDRESS", "alerts@favonius.energy")
 
 
 # Controller manager and OCPP server
@@ -491,13 +505,41 @@ async def lifespan(app: FastAPI):
     liveness_hub = LivenessHub(ts_pool)
     await liveness_hub.start()
 
-    # ── Monthly report-draft scheduler ───────────────────────────────────────
-    # Emits one agent_action(action_class='report_draft') per depot on day 1
-    # of each calendar month in the depot's local timezone.
-    from .monthly_scheduler import run_monthly_scheduler  # noqa: PLC0415
+    # ── Scheduled-report delivery email client ────────────────────────────────
+    # Mirrors the websocket_handler alert dispatcher: a real Resend client when
+    # RESEND_API_KEY is set, else a FakeEmailClient that records but never sends
+    # (so dev/staging can exercise the pipeline). EMAIL_DELIVERY_ENABLED=false
+    # also forces the fake.
+    global report_email_client
+    _resend_key = os.getenv("RESEND_API_KEY", "")
+    _email_enabled = os.getenv("EMAIL_DELIVERY_ENABLED", "true").lower() == "true"
+    if _email_enabled and _resend_key:
+        from ..notifications.resend_client import ResendEmailClient  # noqa: PLC0415
 
-    _create_background_task(run_monthly_scheduler(ts_pool))
-    logger.info("Monthly report-draft scheduler started")
+        report_email_client = ResendEmailClient(api_key=_resend_key, default_from=report_email_from)
+        logger.info("report scheduler: using Resend for outbound report email")
+    else:
+        from ..notifications.email_client import FakeEmailClient  # noqa: PLC0415
+
+        report_email_client = FakeEmailClient()
+        logger.warning(
+            "report scheduler: RESEND_API_KEY missing or email disabled; using "
+            "FakeEmailClient — scheduled reports will NOT be emailed"
+        )
+
+    # ── Scheduled-report worker ───────────────────────────────────────────────
+    # Replaces the legacy hardcoded monthly_scheduler: fires configurable
+    # per-depot report schedules every minute, idempotent via schedule_runs.
+    _create_background_task(
+        _report_schedules.run_report_schedule_worker(
+            db_pools,
+            email_client=report_email_client,
+            generate_report=_generate_report_for_schedule,
+            get_timezone=_get_depot_timezone,
+            default_from=report_email_from,
+        )
+    )
+    logger.info("Report schedule worker started")
 
     yield
 
@@ -7652,6 +7694,91 @@ async def export_report(
     return StreamingResponse(_generate(), media_type="text/csv", headers=headers_resp)
 
 
+# ── Report schedules (read endpoints) ─────────────────────────────────────────
+# Writes flow through POST /commands/execute (reports.schedule.*); these GETs
+# are readable by any depot member. Responses are plain dicts (camelCase, all
+# nullable fields present) to satisfy the frontend's strict Zod schemas.
+
+
+@app.get(
+    "/depots/{depot_id}/report-schedules",
+    tags=["depots"],
+    summary="List report schedules for a depot",
+    description="Returns all report schedules for the depot (empty array when none).",
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_report_schedules(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> list[dict]:
+    """GET /depots/{depot_id}/report-schedules."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        return await _report_schedules.serialize_schedules(conn, depot_id)
+
+
+@app.get(
+    "/depots/{depot_id}/report-schedules/{schedule_id}",
+    tags=["depots"],
+    summary="Get a single report schedule",
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Schedule not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_report_schedule(
+    schedule_id: str,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> dict:
+    """GET /depots/{depot_id}/report-schedules/{schedule_id}."""
+    validate_uuid(schedule_id, "schedule_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        schedule = await _report_schedules.serialize_schedule(conn, depot_id, schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail=f"Report schedule {schedule_id} not found")
+    return schedule
+
+
+@app.get(
+    "/depots/{depot_id}/report-schedules/{schedule_id}/runs",
+    tags=["depots"],
+    summary="List runs for a report schedule (most-recent first)",
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        404: {"model": ErrorResponse, "description": "Schedule not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_report_schedule_runs(
+    schedule_id: str,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> list[dict]:
+    """GET /depots/{depot_id}/report-schedules/{schedule_id}/runs."""
+    validate_uuid(schedule_id, "schedule_id")
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        # Scope check: the schedule must belong to this depot.
+        schedule = await _report_schedules.fetch_schedule_row(conn, depot_id, schedule_id)
+        if schedule is None:
+            raise HTTPException(
+                status_code=404, detail=f"Report schedule {schedule_id} not found"
+            )
+        return await _report_schedules.serialize_runs(conn, schedule_id)
+
+
 # ── Agent Actions endpoint ─────────────────────────────────────────────────────
 
 
@@ -11570,9 +11697,9 @@ async def _handle_reports_generate(
             detail="periodStart and periodEnd must both be provided together",
         )
     if not period_start_str and not period_end_str:
-        from .monthly_scheduler import _prev_month_bounds  # noqa: PLC0415
+        from .report_schedule_timing import previous_month_bounds  # noqa: PLC0415
 
-        period_start_str, period_end_str, _ = _prev_month_bounds(datetime.now(tz))
+        period_start_str, period_end_str, _ = previous_month_bounds(datetime.now(tz))
 
     try:
         period_start_date = date.fromisoformat(period_start_str)
@@ -11755,6 +11882,19 @@ async def _handle_reports_approve(
     }
 
 
+def _coerce_payload(raw: Any) -> dict:
+    """Return an agent_action payload as a dict, tolerating str-encoded JSONB."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
 async def _handle_agent_action_approve(
     params: dict,
     depot_id: str,
@@ -11763,9 +11903,11 @@ async def _handle_agent_action_approve(
 ) -> dict:
     """Approve a pending agent action.
 
-    When the action is a report_draft, this triggers the same effect as
-    reports.generate using the payload embedded in the action, then sets
-    the action status to 'executed'.
+    For a manual report_draft this regenerates the report from the embedded
+    payload (legacy behaviour). For a schedule-originated report_draft (payload
+    carries runId + scheduleId) the report already exists, so approval instead
+    delivers it and flips the originating run from pending_approval to
+    succeeded. Either way the action is marked 'executed'.
     """
     action_id = params.get("actionId") or params.get("action_id")
     if not action_id:
@@ -11807,18 +11949,26 @@ async def _handle_agent_action_approve(
             )
 
         if action_row["action_class"] == "report_draft":
-            payload = action_row["payload"] or {}
-            report_result = await _handle_reports_generate(
-                _report_params_from_payload(payload),
-                depot_id,
-                dry_run=True,
-                user=user,
-            )
+            payload = _coerce_payload(action_row["payload"])
+            if payload.get("runId") and payload.get("scheduleId"):
+                # Scheduled draft: the report already exists; approval delivers it.
+                report_result = {"reportId": payload.get("reportId"), "scheduled": True}
+            else:
+                report_result = await _handle_reports_generate(
+                    _report_params_from_payload(payload),
+                    depot_id,
+                    dry_run=True,
+                    user=user,
+                )
 
         result: dict = {"actionId": action_id, "actionStatus": "executed"}
         if report_result:
             result["report"] = report_result
         return result
+
+    scheduled_run_id: Optional[str] = None
+    scheduled_payload: dict = {}
+    mark_executed_after_delivery = False
 
     async with db_pools.ts.acquire() as conn:
         async with conn.transaction():
@@ -11845,15 +11995,66 @@ async def _handle_agent_action_approve(
             action_class = action_row["action_class"]
 
             if action_class == "report_draft":
-                payload = action_row["payload"] or {}
-                report_result = await _handle_reports_generate(
-                    _report_params_from_payload(payload),
-                    depot_id,
-                    dry_run=False,
-                    user=user,
-                    ts_conn=conn,
-                )
+                payload = _coerce_payload(action_row["payload"])
+                if payload.get("runId") and payload.get("scheduleId"):
+                    # Schedule-originated draft: deliver post-commit; keep the
+                    # action pending until delivery succeeds so approval can retry.
+                    scheduled_run_id = str(payload["runId"])
+                    scheduled_payload = payload
+                    mark_executed_after_delivery = True
+                else:
+                    report_result = await _handle_reports_generate(
+                        _report_params_from_payload(payload),
+                        depot_id,
+                        dry_run=False,
+                        user=user,
+                        ts_conn=conn,
+                    )
 
+            if not mark_executed_after_delivery:
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE agent_actions
+                    SET status = 'executed', resolved_at = NOW()
+                    WHERE id = $1::uuid
+                      AND depot_id = $2::uuid
+                      AND status IN ('pending', 'shadow')
+                    RETURNING id::text
+                    """,
+                    action_row["id"],
+                    depot_id,
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Action could not be approved because its status changed",
+                    )
+
+    # Post-commit: deliver the already-generated scheduled report and flip its
+    # run to succeeded. Done outside the transaction to avoid holding the row
+    # lock across email I/O.
+    if scheduled_run_id is not None:
+        run_wire: Optional[dict] = None
+        delivery_succeeded = False
+        if report_email_client is not None:
+            run_wire, delivery_succeeded = await _report_schedules.deliver_pending_run(
+                db_pools,
+                run_id=scheduled_run_id,
+                email_client=report_email_client,
+                default_from=report_email_from,
+            )
+        else:
+            async with db_pools.ts.acquire() as conn:
+                run_wire = await _report_schedules.serialize_run(conn, scheduled_run_id)
+        if not delivery_succeeded:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Report delivery failed or is unavailable; the action remains "
+                    "pending so approval can be retried"
+                ),
+            )
+        async with db_pools.ts.acquire() as conn:
             updated = await conn.fetchrow(
                 """
                 UPDATE agent_actions
@@ -11863,7 +12064,7 @@ async def _handle_agent_action_approve(
                   AND status IN ('pending', 'shadow')
                 RETURNING id::text
                 """,
-                action_row["id"],
+                action_id,
                 depot_id,
             )
             if not updated:
@@ -11871,6 +12072,11 @@ async def _handle_agent_action_approve(
                     status_code=409,
                     detail="Action could not be approved because its status changed",
                 )
+        report_result = {
+            "reportId": scheduled_payload.get("reportId"),
+            "scheduleId": scheduled_payload.get("scheduleId"),
+            "run": run_wire,
+        }
 
     result: dict = {"actionId": action_id, "actionStatus": "executed"}
     if report_result:
@@ -11896,25 +12102,49 @@ async def _handle_agent_action_reject(
     if not db_pools:
         raise DatabaseError("Database not available")
 
+    # Lock the action row FOR UPDATE and skip the originating run in the SAME
+    # transaction, so a concurrent approve (which also locks the row FOR UPDATE)
+    # is serialized — it can't race the run/action state apart and strand a run.
     async with db_pools.ts.acquire() as conn:
-        updated = await conn.fetchrow(
-            """
-            UPDATE agent_actions
-            SET status = 'rejected', resolved_at = NOW()
-            WHERE id = $1::uuid
-              AND depot_id = $2::uuid
-              AND status IN ('pending', 'shadow')
-            RETURNING id::text
-            """,
-            action_id,
-            depot_id,
-        )
+        async with conn.transaction():
+            action_row = await conn.fetchrow(
+                """
+                SELECT action_class, status, payload
+                FROM agent_actions
+                WHERE id = $1::uuid AND depot_id = $2::uuid
+                FOR UPDATE
+                """,
+                action_id,
+                depot_id,
+            )
+            if not action_row or action_row["status"] not in ("pending", "shadow"):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Action {action_id} not found or not in a rejectable state",
+                )
 
-    if not updated:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Action {action_id} not found or not in a rejectable state",
-        )
+            if action_row["action_class"] == "report_draft":
+                payload = _coerce_payload(action_row["payload"])
+                run_id = payload.get("runId")
+                if run_id and payload.get("scheduleId"):
+                    skipped = await conn.fetchrow(
+                        "UPDATE schedule_runs SET status = 'skipped', completed_at = NOW() "
+                        "WHERE id = $1::uuid AND status = 'pending_approval' "
+                        "RETURNING schedule_id::text",
+                        str(run_id),
+                    )
+                    if skipped is not None:
+                        await _report_schedules._update_schedule_last_run_status(
+                            conn, str(run_id), "skipped"
+                        )
+
+            await conn.execute(
+                "UPDATE agent_actions SET status = 'rejected', resolved_at = NOW() "
+                "WHERE id = $1::uuid AND depot_id = $2::uuid",
+                action_id,
+                depot_id,
+            )
+
     return {"actionId": action_id, "actionStatus": "rejected"}
 
 
@@ -11958,6 +12188,226 @@ async def _handle_agent_action_rollback(
     return {"actionId": action_id, "actionStatus": "rolled_back"}
 
 
+# ── Report schedule command handlers (reports.schedule.*) ─────────────────────
+# Writes require ADMIN_CONFIG (granted to customer_admin + favonius_admin only).
+# Each handler returns its domain object as the CommandResponse.result; the
+# dispatcher supplies the surrounding {status, command, depot_id} envelope.
+
+
+async def _generate_report_for_schedule(params: dict, depot_id: str) -> str:
+    """Adapter for the worker: run reports.generate, return the new report id."""
+    result = await _handle_reports_generate(params, depot_id, dry_run=False, user=None)
+    return result["reportId"]
+
+
+async def _get_depot_timezone(depot_id: str) -> str:
+    """Resolve a depot's IANA timezone from its static `sites` row."""
+    _, timezone_name, *_ = await _load_report_context(depot_id)
+    return timezone_name
+
+
+async def _resolve_schedule_next_run_at(
+    depot_id: str, norm, *, now_utc: Optional[datetime] = None
+) -> Optional[datetime]:
+    """Compute next_run_at for a normalized schedule (None when inactive)."""
+    if not norm.is_active:
+        return None
+    timezone_name = await _get_depot_timezone(depot_id)
+    return compute_next_run_at(
+        now_utc or datetime.now(timezone.utc),
+        frequency=norm.frequency,
+        time_of_day=norm.time_of_day,
+        tz_name=timezone_name,
+        day_of_month=norm.day_of_month,
+        day_of_week=norm.day_of_week,
+    )
+
+
+async def _handle_report_schedule_create(
+    params: dict, depot_id: str, dry_run: bool, user: Optional[dict] = None
+) -> dict:
+    """reports.schedule.create — params.input is a ScheduleCreatePayload."""
+    try:
+        norm = normalize_create_payload(params.get("input"))
+    except ScheduleValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if dry_run:
+        return {"valid": True}
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    try:
+        next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
+    except ScheduleValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    created_by = (user or {}).get("sub")
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            row = await _report_schedules.insert_schedule(
+                conn,
+                depot_id=depot_id,
+                norm=norm,
+                next_run_at=next_run_at,
+                created_by=created_by,
+            )
+            await _report_schedules.replace_recipients(conn, str(row["id"]), norm.recipients)
+            schedule = await _report_schedules.serialize_schedule(conn, depot_id, str(row["id"]))
+    return schedule  # type: ignore[return-value]
+
+
+async def _handle_report_schedule_update(
+    params: dict, depot_id: str, dry_run: bool, user: Optional[dict] = None
+) -> dict:
+    """reports.schedule.update — params.scheduleId + params.patch (SchedulePatchPayload)."""
+    schedule_id = params.get("scheduleId") or params.get("schedule_id")
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="params.scheduleId is required")
+    validate_uuid(schedule_id, "scheduleId")
+    patch = params.get("patch") or {}
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        existing = await _report_schedules.fetch_schedule_row(conn, depot_id, schedule_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"Report schedule {schedule_id} not found")
+
+    current = {
+        "name": existing["name"],
+        "kind": existing["kind"],
+        "group_by": existing["group_by"],
+        "frequency": existing["frequency"],
+        "day_of_month": existing["day_of_month"],
+        "day_of_week": existing["day_of_week"],
+        "time_of_day": existing["time_of_day"],
+        "autonomy_mode": existing["autonomy_mode"],
+        "is_active": existing["is_active"],
+    }
+    try:
+        norm = normalize_patch_payload(patch, current=current)
+    except ScheduleValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if dry_run:
+        return {"valid": True}
+
+    # Only recompute next_run_at when the patch changes cadence/activation.
+    # A metadata-only edit (name, kind, groupBy, recipients) must keep the
+    # existing next_run_at so an overdue pending slot isn't silently jumped
+    # forward and dropped.
+    _cadence_keys = {"frequency", "dayOfMonth", "dayOfWeek", "timeOfDay", "isActive"}
+    if isinstance(patch, dict) and _cadence_keys & set(patch.keys()):
+        try:
+            next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
+        except ScheduleValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        next_run_at = existing["next_run_at"]
+
+    recipients_present = isinstance(patch, dict) and "recipients" in patch
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            await _report_schedules.update_schedule_fields(
+                conn, schedule_id=schedule_id, norm=norm, next_run_at=next_run_at
+            )
+            if recipients_present:
+                await _report_schedules.replace_recipients(conn, schedule_id, norm.recipients)
+            schedule = await _report_schedules.serialize_schedule(conn, depot_id, schedule_id)
+    return schedule  # type: ignore[return-value]
+
+
+async def _handle_report_schedule_delete(
+    params: dict, depot_id: str, dry_run: bool, user: Optional[dict] = None
+) -> dict:
+    """reports.schedule.delete — params.scheduleId."""
+    schedule_id = params.get("scheduleId") or params.get("schedule_id")
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="params.scheduleId is required")
+    validate_uuid(schedule_id, "scheduleId")
+    if dry_run:
+        return {"scheduleId": schedule_id, "deleted": True}
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        deleted = await _report_schedules.delete_schedule(conn, depot_id, schedule_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Report schedule {schedule_id} not found")
+    return {"scheduleId": schedule_id, "deleted": True}
+
+
+async def _handle_report_schedule_run_now(
+    params: dict, depot_id: str, dry_run: bool, user: Optional[dict] = None
+) -> dict:
+    """reports.schedule.run_now — fire a schedule immediately (returns ScheduleRun).
+
+    Behaves like a tick that resolved this schedule, with scheduled_for = now
+    (truncated to the second so a double-click is deduped by the schedule_runs
+    UNIQUE constraint). Does not alter the cadence-based next_run_at.
+    """
+    schedule_id = params.get("scheduleId") or params.get("schedule_id")
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="params.scheduleId is required")
+    validate_uuid(schedule_id, "scheduleId")
+    if dry_run:
+        return {"scheduleId": schedule_id, "status": "ok"}
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    async with db_pools.ts.acquire() as conn:
+        schedule = await _report_schedules.fetch_schedule_row(conn, depot_id, schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail=f"Report schedule {schedule_id} not found")
+
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    timezone_name = await _get_depot_timezone(depot_id)
+
+    async with db_pools.ts.acquire() as conn:
+        run_id = await _report_schedules.claim_run(conn, schedule_id, now_utc)
+
+    if run_id is not None:
+        try:
+            terminal_status = await _report_schedules.execute_schedule_run(
+                db_pools,
+                schedule_row=schedule,
+                run_id=run_id,
+                tz_name=timezone_name,
+                email_client=report_email_client,
+                generate_report=_generate_report_for_schedule,
+                default_from=report_email_from,
+                now_utc=now_utc,
+            )
+        except Exception as exc:  # noqa: BLE001 - record a clean failed run, not a stuck placeholder
+            logger.error("run_now failed schedule=%s: %s", schedule_id, exc, exc_info=True)
+            async with db_pools.ts.acquire() as conn:
+                await _report_schedules.finalize_run(
+                    conn, run_id, status="failed", error_message=str(exc)
+                )
+            terminal_status = "failed"
+        async with db_pools.ts.acquire() as conn:
+            await conn.execute(
+                "UPDATE report_schedules SET last_run_at = $2, last_run_status = $3, "
+                "updated_at = NOW() WHERE id = $1::uuid",
+                schedule_id,
+                now_utc,
+                terminal_status,
+            )
+        target_run_id: Optional[str] = run_id
+    else:
+        # Double-click within the same second → return the run already claimed.
+        async with db_pools.ts.acquire() as conn:
+            existing_run = await conn.fetchrow(
+                "SELECT id::text FROM schedule_runs "
+                "WHERE schedule_id = $1::uuid AND scheduled_for = $2",
+                schedule_id,
+                now_utc,
+            )
+        target_run_id = existing_run["id"] if existing_run else None
+        if target_run_id is not None:
+            await _report_schedules.wait_for_run_finalized(db_pools, target_run_id)
+
+    if target_run_id is None:
+        raise HTTPException(status_code=500, detail="run_now failed to produce a run")
+    async with db_pools.ts.acquire() as conn:
+        return await _report_schedules.serialize_run(conn, target_run_id)  # type: ignore[return-value]
 async def _handle_agent_autonomy_set(
     params: dict,
     depot_id: str,
@@ -12073,6 +12523,22 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
     "agents.action.rollback": _CommandSpec(
         required_permission=Permission.DEPOT_MANAGE,
         handler=_handle_agent_action_rollback,
+    ),
+    "reports.schedule.create": _CommandSpec(
+        required_permission=Permission.ADMIN_CONFIG,
+        handler=_handle_report_schedule_create,
+    ),
+    "reports.schedule.update": _CommandSpec(
+        required_permission=Permission.ADMIN_CONFIG,
+        handler=_handle_report_schedule_update,
+    ),
+    "reports.schedule.delete": _CommandSpec(
+        required_permission=Permission.ADMIN_CONFIG,
+        handler=_handle_report_schedule_delete,
+    ),
+    "reports.schedule.run_now": _CommandSpec(
+        required_permission=Permission.ADMIN_CONFIG,
+        handler=_handle_report_schedule_run_now,
     ),
     "agents.autonomy.set": _CommandSpec(
         required_permission=Permission.DEPOT_MANAGE,
@@ -12460,11 +12926,20 @@ async def resend_webhook(request: Request):
     from src.notifications import alerts as alerts_repo
 
     async with db_pools.ts.acquire() as conn:
+        # Alert deliveries (existing): updates notification_deliveries in place.
         await alerts_repo.update_delivery_status(
             conn,
             provider_message_id=event.provider_message_id,
             status=event.status,
             status_detail=event.detail,
+        )
+        # Scheduled-report deliveries: append a new row so lastDelivery reflects
+        # the latest provider status (e.g. bounced) for that recipient triple.
+        await _report_schedules.append_delivery_status_from_webhook(
+            conn,
+            provider_message_id=event.provider_message_id,
+            provider_status=event.status,
+            detail=event.detail,
         )
     return {"status": "ok", "provider_message_id": event.provider_message_id}
 
