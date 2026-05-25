@@ -33,7 +33,7 @@ END $$;
 
 CREATE TABLE IF NOT EXISTS charger_onboarding_idempotency (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    organization_id    UUID NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
+    organization_id    UUID NOT NULL,
     user_id            UUID NOT NULL,
     endpoint           TEXT NOT NULL,
     idempotency_key    TEXT NOT NULL,

@@ -1,40 +1,10 @@
 -- Organizations, memberships, and depot tenancy.
--- Default org UUID is stable for seed/backfill across environments.
-
-CREATE TABLE IF NOT EXISTS organizations (
-    organization_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name            VARCHAR(255) NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-COMMENT ON TABLE organizations IS 'Customer / workspace tenant';
-
-CREATE TABLE IF NOT EXISTS organization_users (
-    user_id         UUID PRIMARY KEY,
-    organization_id UUID NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
-    role            VARCHAR(50) NOT NULL DEFAULT 'customer_operator',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-COMMENT ON TABLE organization_users IS 'At most one organization per user (enforced by UNIQUE user_id)';
-
--- Stable default tenant for existing seed depots
-INSERT INTO organizations (organization_id, name)
-VALUES (
-    '00000000-0000-4000-8000-000000000001'::uuid,
-    'Default Development Organization'
-)
-ON CONFLICT (organization_id) DO NOTHING;
-
-ALTER TABLE depots
-    ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations (organization_id);
-
-UPDATE depots
-SET organization_id = '00000000-0000-4000-8000-000000000001'::uuid
-WHERE organization_id IS NULL;
-
-ALTER TABLE depots
-    ALTER COLUMN organization_id SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_depots_organization_id ON depots (organization_id);
+--
+-- Static reference tables organizations and organization_users (later renamed
+-- user_organizations) live exclusively in Supabase (`pools.static`).  This
+-- TimescaleDB migration previously created shadow copies that were never
+-- populated in production; those shadows are retired here.  Migrations
+-- 024_rename_organization_users and 029_remove_static_shadows are no-ops on
+-- fresh databases as a result.
+--
+-- Idempotent no-op.

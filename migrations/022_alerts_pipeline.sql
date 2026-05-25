@@ -12,8 +12,8 @@
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS notification_alerts (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    organization_id       UUID NOT NULL REFERENCES organizations (organization_id),
-    depot_id              UUID REFERENCES depots (depot_id),
+    organization_id       UUID NOT NULL,
+    depot_id              UUID,
     alert_type            VARCHAR(64) NOT NULL,
     severity              VARCHAR(16) NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
     severity_level        SMALLINT GENERATED ALWAYS AS (
@@ -63,7 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_notification_alerts_dispatch
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS notification_recipients (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    organization_id       UUID NOT NULL REFERENCES organizations (organization_id),
+    organization_id       UUID NOT NULL,
     email                 VARCHAR(255) NOT NULL,
     display_name          VARCHAR(255),
     alert_types           TEXT[] NOT NULL DEFAULT ARRAY['*']::TEXT[],
