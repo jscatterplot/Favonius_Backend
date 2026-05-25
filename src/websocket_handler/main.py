@@ -19,8 +19,6 @@ from .config import Config
 from .config_validator import ConfigValidator
 from .connection_monitor import ConnectionMonitor
 from .connection_pool import open_dedicated_connection
-from .data_sync import DataSyncService
-from .database_schema import create_schema_from_config
 from .health import HealthCheckServer
 from .health_checks import create_health_checks, notify_websocket_ready
 from .monitoring import (
@@ -53,7 +51,6 @@ class Application:
         # Supabase components
         self.supabase_client: Optional[SupabaseClient] = None
         self.auth_manager: Optional[AuthManager] = None
-        self.data_sync_service: Optional[DataSyncService] = None
         self.api_server: Optional[APIServer] = None
 
         # TimescaleDB components
@@ -145,12 +142,6 @@ class Application:
             # Start components
             await self.health_server.start()
             await self.api_server.start(port=self.config.monitoring.api_port)
-
-            # Start data sync service (skipped silently when Supabase was
-            # unavailable — the service is then None and there is nothing
-            # to sync).
-            if self.data_sync_service is not None:
-                await self.data_sync_service.start()
 
             # Initialize connection monitoring
             self.connection_monitor = ConnectionMonitor(
@@ -498,12 +489,6 @@ class Application:
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
 
-        # DataSyncService shares timescale_client.pg_pool; its stop() cancels
-        # the sync task but disconnect() must not close the pool until that
-        # cancellation has finished (otherwise in-flight queries see InterfaceError).
-        if self.data_sync_service:
-            await asyncio.gather(self.data_sync_service.stop(), return_exceptions=True)
-
         db_teardown = []
         if self.timescale_client:
             db_teardown.append(self.timescale_client.disconnect())
@@ -524,7 +509,6 @@ class Application:
                     pass
                 self.supabase_client = None
             self.auth_manager = None
-            self.data_sync_service = None
         elif component_name == "TimescaleDB":
             if self.price_feeder:
                 try:
@@ -546,11 +530,6 @@ class Application:
                 except Exception:
                     pass
                 self.analytics_service = None
-            # DataSyncService now shares the TimescaleClient pool — it lives
-            # in the TimescaleDB-init phase, so reset it here. It is safe to
-            # null without calling .stop() because the pool we'd want to
-            # close is owned by ``self.timescale_client`` (closed below).
-            self.data_sync_service = None
             if self.timescale_client:
                 try:
                     await self.timescale_client.disconnect()
@@ -604,37 +583,12 @@ class Application:
     async def _initialize_supabase_components(self) -> None:
         """Initialize Supabase components."""
         try:
-            # In production the Supabase schema is managed via SQL migrations
-            # (see migrations/ and scripts/run_migrations.py) and must not be
-            # mutated by this service at runtime. In lower environments we keep
-            # the convenience of creating the schema on startup.
-            if self.config.environment != "production":
-                try:
-                    await create_schema_from_config(self.config.supabase)
-                    self.logger.info("Database schema initialized")
-                except Exception as e:
-                    self.logger.warning(
-                        "Schema initialization failed or already applied; "
-                        f"continuing with existing schema: {e}"
-                    )
-            else:
-                self.logger.info(
-                    "Skipping Supabase schema initialization in production; "
-                    "migrations/ and scripts/run_migrations.py are authoritative."
-                )
-
             # Create Supabase client
             self.supabase_client = SupabaseClient(self.config.supabase)
             await self.supabase_client.connect()
 
             # Create auth manager
             self.auth_manager = AuthManager(self.config.supabase, self.supabase_client)
-
-            # DataSyncService is constructed later in
-            # _initialize_timescale_components so it can share the live
-            # TimescaleClient pool instead of opening its own. Leaving the
-            # attribute None here keeps the cleanup paths safe.
-            self.data_sync_service = None
 
             self.logger.info("Supabase components initialized successfully")
 
@@ -675,17 +629,6 @@ class Application:
             # Authorize/StartTransaction is rejected as Invalid.
             if self.supabase_client is not None:
                 self.timescale_client.set_supabase_client(self.supabase_client)
-
-            # Create data sync service now that the TimescaleClient pool
-            # exists; share its pool so we do not open a second 1-10
-            # connection pool against the same Postgres.
-            if self.supabase_client is not None:
-                self.data_sync_service = DataSyncService(
-                    self.config.supabase,
-                    self.supabase_client,
-                    self.config.timescale,
-                    timescale_client=self.timescale_client,
-                )
 
             # Initialize analytics service
             self.analytics_service = AnalyticsService(

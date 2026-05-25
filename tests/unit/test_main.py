@@ -33,6 +33,8 @@ class TestApplication:
         config.price_feeder = Mock()
         config.price_feeder.enabled = True
         config.main_api = Mock()
+        config.notifications = Mock()
+        config.notifications.enabled = False
         return config
 
     @pytest.mark.timeout(10)
@@ -47,7 +49,6 @@ class TestApplication:
         assert app.health_server is None
         assert app.supabase_client is None
         assert app.auth_manager is None
-        assert app.data_sync_service is None
         assert app.api_server is None
         assert app.timescale_client is None
         assert app.analytics_service is None
@@ -64,22 +65,15 @@ class TestApplication:
         # Mock Supabase components
         mock_supabase_client = AsyncMock()
         mock_auth_manager = Mock()
-        mock_data_sync_service = AsyncMock()
-
         with (
             patch("src.websocket_handler.main.SupabaseClient", return_value=mock_supabase_client),
             patch("src.websocket_handler.main.AuthManager", return_value=mock_auth_manager),
-            patch(
-                "src.websocket_handler.main.DataSyncService", return_value=mock_data_sync_service
-            ),
-            patch("src.websocket_handler.main.create_schema_from_config", AsyncMock()),
         ):
 
             await app._initialize_supabase_components()
 
             assert app.supabase_client == mock_supabase_client
             assert app.auth_manager == mock_auth_manager
-            assert app.data_sync_service == mock_data_sync_service
             mock_supabase_client.connect.assert_called_once()
 
     @pytest.mark.asyncio
@@ -161,7 +155,6 @@ class TestApplication:
         mock_websocket_server = AsyncMock()
         mock_health_server = AsyncMock()
         mock_api_server = AsyncMock()
-        mock_data_sync_service = AsyncMock()
         mock_connection_monitor = AsyncMock()
 
         with (
@@ -176,7 +169,6 @@ class TestApplication:
             patch(
                 "src.websocket_handler.main.ConnectionMonitor", return_value=mock_connection_monitor
             ),
-            patch.object(app, "data_sync_service", mock_data_sync_service),
         ):
 
             # Mock the websocket server start to complete immediately
@@ -203,7 +195,6 @@ class TestApplication:
         mock_websocket_server = AsyncMock()
         mock_health_server = AsyncMock()
         mock_api_server = AsyncMock()
-        mock_data_sync_service = AsyncMock()
         mock_connection_monitor = AsyncMock()
         mock_timescale_client = AsyncMock()
         mock_supabase_client = AsyncMock()
@@ -212,7 +203,6 @@ class TestApplication:
         app.websocket_server = mock_websocket_server
         app.health_server = mock_health_server
         app.api_server = mock_api_server
-        app.data_sync_service = mock_data_sync_service
         app.connection_monitor = mock_connection_monitor
         app.timescale_client = mock_timescale_client
         app.supabase_client = mock_supabase_client
@@ -222,7 +212,6 @@ class TestApplication:
 
         assert app.running is False
         mock_connection_monitor.stop_monitoring.assert_called_once()
-        mock_data_sync_service.stop.assert_called_once()
         mock_api_server.stop.assert_called_once()
         mock_websocket_server.stop.assert_called_once()
         mock_health_server.stop.assert_called_once()
@@ -251,7 +240,6 @@ class TestApplication:
         mock_websocket_server = AsyncMock()
         mock_health_server = AsyncMock()
         mock_api_server = AsyncMock()
-        mock_data_sync_service = AsyncMock()
         mock_connection_monitor = AsyncMock()
 
         with (
@@ -266,7 +254,6 @@ class TestApplication:
             patch(
                 "src.websocket_handler.main.ConnectionMonitor", return_value=mock_connection_monitor
             ),
-            patch.object(app, "data_sync_service", mock_data_sync_service),
         ):
 
             # Mock websocket server to raise exception then complete

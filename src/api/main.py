@@ -1517,13 +1517,11 @@ class VehicleListResponse(BaseModel):
     fetched_at: str = Field(..., description="Server-side fetch timestamp (ISO 8601)")
 
 
-# ===== Live Sessions / Realtime State (replaces Supabase mirror tables) =====
+# ===== Live Sessions / Realtime State =====
 #
-# These three endpoints replace direct frontend reads of the Supabase tables
-# `charging_sessions_active`, `charging_sessions_summary`, and
-# `vehicle_realtime_state`. The canonical store is TimescaleDB
-# (`charging_sessions`, `telemetry`); Supabase keeps only static reference
-# data (sites, charging_stations, vehicles, organizations).
+# These three endpoints serve all session and realtime-state queries.
+# The canonical store is TimescaleDB (`charging_sessions`, `telemetry`);
+# Supabase holds only static reference data (sites, charging_stations, vehicles, organizations).
 
 
 class ActiveSessionItem(BaseModel):
@@ -8584,8 +8582,7 @@ def _build_completed_sessions_response(
     tags=["depots"],
     summary="List currently-open charging sessions for a depot",
     description=(
-        "Replaces frontend reads of the Supabase `charging_sessions_active` "
-        "mirror table. Returns one row per open `charging_sessions` row "
+        "Returns one row per open `charging_sessions` row "
         "(`end_time IS NULL AND source='live'`) for any OCPP station belonging "
         "to this depot. Live `current_power_kw` and `current_soc` are kept "
         "fresh on the row by every MeterValues; poll this endpoint at the "
@@ -8698,8 +8695,7 @@ async def get_depot_active_sessions(
     tags=["depots"],
     summary="Paginated completed charging sessions for a depot",
     description=(
-        "Replaces frontend reads of the Supabase `charging_sessions_summary` "
-        "mirror table. Keyset pagination over `(end_time DESC, session_id "
+        "Keyset pagination over `(end_time DESC, session_id "
         "DESC)` so concurrent inserts don't shift pages. Includes both `live` "
         "(OCPP-derived) and `import` (XLSX-backfilled) rows."
     ),
@@ -8772,11 +8768,9 @@ async def get_depot_sessions(
     tags=["depots"],
     summary="Latest telemetry per vehicle in a depot",
     description=(
-        "Replaces frontend reads of the Supabase `vehicle_realtime_state` "
-        "mirror table. Returns one row per vehicle in the depot that has at "
-        "least one telemetry sample. Lightweight by design — for the richer "
-        "vehicle list with schedule/state derivation, use "
-        "`GET /depots/{id}/vehicles`."
+        "Returns one row per vehicle in the depot that has at least one "
+        "telemetry sample. Lightweight by design — for the richer vehicle list "
+        "with schedule/state derivation, use `GET /depots/{id}/vehicles`."
     ),
     responses={
         401: {"model": ErrorResponse, "description": "Unauthorized"},
