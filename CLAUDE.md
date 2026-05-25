@@ -373,6 +373,8 @@ These come directly from the PRD and are non-negotiable:
 
 ## Database Schema (TimescaleDB / PostgreSQL 16)
 
+> **Two-database invariant:** Static reference tables (`sites`/depots, `vehicles`, `charging_stations`/chargers, `organizations`, `schedules`, `battery_storage`, `charger_vehicle_access`, `drivers`, `rfid_cards`) live **exclusively in Supabase** (`pools.static`). The TimescaleDB migration set (`migrations/*.sql`) NEVER creates these tables. Depot/vehicle/charger identity columns on TimescaleDB operational tables are plain `UUID` columns — no FK constraints pointing at static data. This invariant was established by migrations 028–029 and 039 and is now enforced from the very first migration so that a fresh TimescaleDB install contains zero shadow copies.
+
 ### Reference (static) tables — Supabase project `favonius-pilot`
 
 > **Naming convention:** Supabase owns the canonical naming for the static
@@ -425,9 +427,8 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 - Promotion overrides any explicit `app_metadata.favonius_role`, so a stale Supabase metadata value cannot demote a Favonius employee. To exclude a specific Favonius email (e.g. a contractor on a `@favoniusenergy.com` address), do not issue them an `@favoniusenergy.com` JWT email — there is no per-user opt-out hook.
 
 ### Operational tables
-- `schedules` — Vehicle route schedules (departure/return times)
 - `optimization_runs` — Solver results, schedule JSON, status, solver_used
-- `charging_commands` — OCPP SetChargingProfile records and acknowledgment status (per-run audit, FK to `chargers`)
+- `charging_commands` — OCPP SetChargingProfile records and acknowledgment status (per-run audit; `charger_id` and `vehicle_id` are plain UUID references — no FK to Supabase static tables)
 - `charging_command_queue` — Durable buffer for SetChargingProfile pushes that arrived while a charger was offline; replayed by the legacy WS handler on next BootNotification (migration 013)
 - `charging_sessions` — OCPP 1.6 transaction lifecycle. `transaction_id` (BIGINT, from `ocpp_transaction_id` sequence), `last_seen_at` stamped by the WS close hook
 - `interdepot_messages` — Cross-depot vehicle handoff messages
@@ -449,6 +450,8 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 
 ### Migrations
 Migrations in `migrations/` run automatically on `docker-compose up` (mounted to `/docker-entrypoint-initdb.d`). To run manually: `python scripts/run_migrations.py`.
+
+The runner is **stateless** (no `applied` tracking table) — every file re-executes on each deploy, and all DDL uses `IF [NOT] EXISTS` / `DROP … IF EXISTS` for idempotency. Migrations that formerly altered shadow tables (011, 016, 017, 018, 020, 021) are guarded with `to_regclass('public.<shadow_table>') IS NULL` checks so they silently skip on fresh databases. The `schedules` Supabase table is listed under §"Reference (static) tables" above; there is no `schedules` table in TimescaleDB.
 
 ---
 

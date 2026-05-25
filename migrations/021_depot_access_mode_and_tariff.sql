@@ -13,19 +13,26 @@
 --                     energy_cap_kwh of cumulative billing-period kWh,
 --                     over_cap_penalty_per_kwh above. Reset cadence is
 --                     given by cap_billing_period.
-
-ALTER TABLE depots
-    ADD COLUMN IF NOT EXISTS charger_vehicle_access_default VARCHAR(32) NOT NULL
-        DEFAULT 'explicit_matrix',
-    ADD COLUMN IF NOT EXISTS tariff_type VARCHAR(32) NOT NULL
-        DEFAULT 'simple_demand',
-    ADD COLUMN IF NOT EXISTS energy_cap_kwh DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS under_cap_rate_per_kwh DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS over_cap_penalty_per_kwh DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS cap_billing_period VARCHAR(32) DEFAULT 'monthly';
+--
+-- Guard: depots is a Supabase shadow table retired from 001; skip when absent.
 
 DO $$
 BEGIN
+    IF to_regclass('public.depots') IS NULL THEN
+        RAISE NOTICE 'Skipping 021 depots columns/constraints: shadow table depots does not exist';
+        RETURN;
+    END IF;
+
+    ALTER TABLE depots
+        ADD COLUMN IF NOT EXISTS charger_vehicle_access_default VARCHAR(32) NOT NULL
+            DEFAULT 'explicit_matrix',
+        ADD COLUMN IF NOT EXISTS tariff_type VARCHAR(32) NOT NULL
+            DEFAULT 'simple_demand',
+        ADD COLUMN IF NOT EXISTS energy_cap_kwh DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS under_cap_rate_per_kwh DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS over_cap_penalty_per_kwh DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS cap_billing_period VARCHAR(32) DEFAULT 'monthly';
+
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'depots_charger_vehicle_access_default_check'

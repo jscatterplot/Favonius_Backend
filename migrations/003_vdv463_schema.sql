@@ -1,14 +1,14 @@
 -- VDV 463 Transit Operations Integration
 -- Per favonius_development_plan_v3.md Phase 5 Step 5.3 and PRD Section 9.6
--- Requires: 001_initial_schema.sql (depots, vehicles, chargers)
+-- Requires: 001_initial_schema.sql (TimescaleDB extension)
 
 CREATE TABLE IF NOT EXISTS vdv463_charging_requests (
     id UUID DEFAULT gen_random_uuid(),
-    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    depot_id UUID NOT NULL,
     charging_request_id TEXT NOT NULL,
     presystem_id TEXT NOT NULL,
-    vehicle_id UUID NOT NULL REFERENCES vehicles(vehicle_id),
-    charging_point_id UUID REFERENCES chargers(charger_id),
+    vehicle_id UUID NOT NULL,
+    charging_point_id UUID,
     priority INTEGER DEFAULT 1,
     charging_instruction TEXT DEFAULT 'Normal',  -- 'Normal', 'Changed', 'Terminate'
     expected_arrival TIMESTAMPTZ,
@@ -45,7 +45,7 @@ SELECT create_hypertable('vdv463_charging_requests', 'received_at', if_not_exist
 -- VDV 463 connection log
 CREATE TABLE IF NOT EXISTS vdv463_connections (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    depot_id UUID NOT NULL,
     presystem_id TEXT NOT NULL,
     system_type TEXT NOT NULL,              -- 'BMS' or 'ITCS'
     connected_at TIMESTAMPTZ DEFAULT NOW(),
@@ -59,7 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_vdv463_connections_depot
 -- VDV 463 errors (operator diagnostics)
 CREATE TABLE IF NOT EXISTS vdv463_errors (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    depot_id UUID NOT NULL REFERENCES depots(depot_id),
+    depot_id UUID NOT NULL,
     presystem_id TEXT NOT NULL,
     charging_request_id TEXT,
     error_code TEXT NOT NULL,
@@ -72,6 +72,6 @@ CREATE INDEX IF NOT EXISTS idx_vdv463_errors_depot_created
 
 -- Last VDV 463 update timestamp per depot (for trigger monitor)
 CREATE TABLE IF NOT EXISTS vdv463_depot_updates (
-    depot_id UUID PRIMARY KEY REFERENCES depots(depot_id),
+    depot_id UUID PRIMARY KEY,
     last_update_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
