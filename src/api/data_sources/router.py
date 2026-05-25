@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from src.core.data_sources import errors as ds_errors
 from src.core.data_sources import registry
 from src.core.data_sources import repository as repo
+from src.core.data_sources.catalogue_config import merge_catalogue_config
 from src.core.data_sources.ingestion import run_ingestion_job
 from src.security.admin_audit import AdminAuditRow, write_admin_audit_row
 from src.security.auth import get_user_id, verify_depot_access
@@ -175,8 +176,9 @@ async def create_connection(
             detail=f"sync_interval_minutes must be >= {_MIN_SYNC_INTERVAL}",
         )
 
+    config = merge_catalogue_config(provider, body.credentials, body.config)
     try:
-        await provider.validate_credentials(body.credentials, body.config)
+        await provider.validate_credentials(body.credentials, config)
     except ds_errors.CredentialValidationError as exc:
         return JSONResponse(
             status_code=422,
@@ -199,7 +201,7 @@ async def create_connection(
             site_id=body.depot_id,
             provider_key=body.provider_key,
             display_name=body.display_name,
-            config=body.config,
+            config=config,
             encrypted_credentials=token,
             encryption_version=version,
             sync_interval_minutes=interval,
@@ -317,7 +319,8 @@ async def update_connection(
     if body.credentials is not None:
         try:
             provider = registry.get_provider(rec["provider_key"])
-            await provider.validate_credentials(body.credentials, _as_dict(rec["config"]))
+            config = merge_catalogue_config(provider, body.credentials, _as_dict(rec["config"]))
+            await provider.validate_credentials(body.credentials, config)
         except ds_errors.ProviderNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ds_errors.CredentialValidationError as exc:
@@ -396,6 +399,8 @@ async def trigger_sync(
         raise HTTPException(status_code=404, detail="connection not found")
     if rec["status"] == "disabled":
         raise HTTPException(status_code=409, detail="connection is disabled")
+    if rec["status"] == "paused":
+        raise HTTPException(status_code=409, detail="connection is paused")
 
     try:
         job_rec = await repo.enqueue_job(

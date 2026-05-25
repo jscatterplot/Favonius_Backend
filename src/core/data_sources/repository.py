@@ -9,10 +9,13 @@ is only called by the ingestion runtime.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from typing import Any, Optional
 
 import asyncpg
+
+_ORPHAN_THRESHOLD_S = int(os.getenv("DATA_SOURCES_ORPHAN_THRESHOLD_S", "1800"))
 
 # Columns safe to expose to the API (never the encrypted blob).
 _CONNECTION_PUBLIC_COLS = """
@@ -246,7 +249,7 @@ async def touch_connection_after_run(
         await conn.execute(
             "UPDATE data_source_connections "
             "SET last_run_at = NOW(), last_status = $2, "
-            "status = CASE WHEN status = 'disabled' THEN status "
+            "status = CASE WHEN status IN ('disabled', 'paused') THEN status "
             "             WHEN $2 = 'failed' THEN 'error' ELSE 'active' END, "
             "updated_at = NOW() "
             "WHERE id = $1::uuid",
@@ -317,8 +320,13 @@ async def enqueue_job(
         )
 
 
-async def claim_job(pool: asyncpg.Pool, job_id: str) -> Optional[asyncpg.Record]:
-    """Transition a pending/running job to running; None if already terminal."""
+async def claim_job(
+    pool: asyncpg.Pool,
+    job_id: str,
+    *,
+    stale_threshold_seconds: int = _ORPHAN_THRESHOLD_S,
+) -> Optional[asyncpg.Record]:
+    """Single-winner start: pending jobs, or stale running jobs for recovery."""
     async with pool.acquire() as conn:
         return await conn.fetchrow(
             f"""
@@ -326,10 +334,19 @@ async def claim_job(pool: asyncpg.Pool, job_id: str) -> Optional[asyncpg.Record]
             SET status = 'running',
                 started_at = COALESCE(started_at, NOW()),
                 heartbeat_at = NOW()
-            WHERE id = $1::uuid AND status IN ('pending', 'running')
+            WHERE id = $1::uuid
+              AND (
+                status = 'pending'
+                OR (
+                  status = 'running'
+                  AND COALESCE(heartbeat_at, started_at, created_at)
+                      < NOW() - make_interval(secs => $2)
+                )
+              )
             RETURNING {_JOB_COLS}
             """,
             job_id,
+            stale_threshold_seconds,
         )
 
 
