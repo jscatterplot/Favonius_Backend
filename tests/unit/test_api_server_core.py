@@ -397,10 +397,9 @@ class TestAPIServerCore:
         # Test the core functionality by calling the method directly
         response = await api_server.get_sessions(request, user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["sessions"]) == 2
-        assert data["sessions"][0]["status"] == "active"
+        assert "endpoint removed" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -428,7 +427,6 @@ class TestAPIServerCore:
         # Test the core functionality by calling the method directly
         response = await api_server.get_energy_analytics(request, user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["analytics"]) == 2
-        assert data["analytics"][0]["energy_kwh"] == 25.5
+        assert "energy analytics" in data["error"].lower() or "endpoint removed" in data["error"].lower()
