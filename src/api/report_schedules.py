@@ -241,7 +241,8 @@ async def replace_recipients(
     existing_keys = {(r["email_address"], r["format"]) for r in existing}
     incoming_keys = {(r.email_address, r.format) for r in recipients}
 
-    # Delete recipients removed from the list (cascades their deliveries).
+    # Delete recipients removed from the list. Their delivery rows survive with
+    # recipient_id set NULL (FK ON DELETE SET NULL), preserving send history.
     to_delete = existing_keys - incoming_keys
     for email, fmt in to_delete:
         await conn.execute(
