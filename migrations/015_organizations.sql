@@ -8,3 +8,4 @@
 -- fresh databases as a result.
 --
 -- Idempotent no-op.
+DO $$ BEGIN END $$;
