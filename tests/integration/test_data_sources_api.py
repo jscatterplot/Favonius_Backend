@@ -21,7 +21,11 @@ from src.api.data_sources import router as router_mod
 from src.api.data_sources.router import get_static_pool, get_ts_pool, router
 from src.core.data_sources import registry
 from src.core.data_sources import repository as repo
-from src.core.data_sources.base import IngestionResult, ProviderCatalogueEntry
+from src.core.data_sources.base import (
+    CredentialField,
+    IngestionResult,
+    ProviderCatalogueEntry,
+)
 from src.core.data_sources.errors import CredentialValidationError
 from src.security.tenant_mirror import ensure_tenant_mirrored
 
@@ -41,7 +45,12 @@ class _FakeProvider:
 
     def catalogue_entry(self) -> ProviderCatalogueEntry:
         return ProviderCatalogueEntry(
-            provider_key="kempower", display_name="Kempower", description="d"
+            provider_key="kempower",
+            display_name="Kempower",
+            description="d",
+            credential_fields=[
+                CredentialField(key="locationId", label="Location", type="string"),
+            ],
         )
 
     async def validate_credentials(self, credentials, config) -> None:
@@ -216,3 +225,84 @@ def test_delete_connection(client, monkeypatch):
     monkeypatch.setattr(repo, "disable_connection", AsyncMock(return_value=True))
     resp = client.delete(f"/admin/data-sources/connections/{uuid4()}")
     assert resp.status_code == 204
+
+
+def test_malformed_connection_id_returns_400(client):
+    resp = client.get("/admin/data-sources/connections/not-a-uuid")
+    assert resp.status_code == 400
+
+
+def test_malformed_job_id_returns_400(client):
+    resp = client.get("/admin/data-sources/jobs/not-a-uuid")
+    assert resp.status_code == 400
+
+
+def test_create_malformed_depot_returns_400(client):
+    resp = client.post(
+        "/admin/data-sources/connections",
+        json={
+            "depotId": "not-a-uuid",
+            "providerKey": "kempower",
+            "credentials": {"username": "u", "password": "p"},
+            "config": {"locationId": "loc1"},
+        },
+    )
+    assert resp.status_code == 400
+
+
+def test_sync_advances_next_sync(client, monkeypatch):
+    rec = _connection_row()
+    advance = AsyncMock()
+    monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=rec))
+    monkeypatch.setattr(repo, "enqueue_job", AsyncMock(return_value=_job_row()))
+    monkeypatch.setattr(repo, "set_next_sync_now_plus_interval", advance)
+    resp = client.post(f"/admin/data-sources/connections/{rec['id']}/sync")
+    assert resp.status_code == 202
+    advance.assert_awaited_once()
+
+
+def test_update_rename(client, monkeypatch):
+    rec = _connection_row()
+    monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=rec))
+    monkeypatch.setattr(
+        repo, "update_connection", AsyncMock(return_value=_connection_row(display_name="New"))
+    )
+    resp = client.patch(f"/admin/data-sources/connections/{rec['id']}", json={"displayName": "New"})
+    assert resp.status_code == 200
+    assert resp.json()["display_name"] == "New"
+
+
+def test_update_credentials_persists_merged_config(client, monkeypatch):
+    # Empty stored config → the new locationId in credentials fills + persists.
+    rec = _connection_row(config={})
+    upd = AsyncMock(return_value=_connection_row())
+    monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=rec))
+    monkeypatch.setattr(repo, "update_connection", upd)
+    resp = client.patch(
+        f"/admin/data-sources/connections/{rec['id']}",
+        json={"credentials": {"username": "u", "password": "p", "locationId": "loc9"}},
+    )
+    assert resp.status_code == 200
+    assert upd.call_args.kwargs["config"]["locationId"] == "loc9"
+
+
+def test_update_credentials_not_ready_returns_503(client, monkeypatch):
+    rec = _connection_row()
+    monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=rec))
+    monkeypatch.setattr(router_mod, "is_data_sources_ready", lambda: False)
+    resp = client.patch(
+        f"/admin/data-sources/connections/{rec['id']}",
+        json={"credentials": {"username": "u", "password": "p"}},
+    )
+    assert resp.status_code == 503
+
+
+def test_update_reactivation_conflict_returns_409(client, monkeypatch):
+    rec = _connection_row(status="disabled")
+    monkeypatch.setattr(repo, "get_connection", AsyncMock(return_value=rec))
+    monkeypatch.setattr(
+        repo, "update_connection", AsyncMock(side_effect=asyncpg.UniqueViolationError("dup"))
+    )
+    resp = client.patch(f"/admin/data-sources/connections/{rec['id']}", json={"status": "active"})
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "CONNECTION_ALREADY_EXISTS"

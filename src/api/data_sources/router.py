@@ -27,6 +27,7 @@ from src.security.admin_audit import AdminAuditRow, write_admin_audit_row
 from src.security.auth import get_user_id, verify_depot_access
 from src.security.credential_cipher import encrypt_credentials
 from src.security.tenant_mirror import ensure_tenant_mirrored
+from src.security.validators import validate_uuid
 
 from .feature_flag import is_data_sources_ready
 from .schemas import CreateConnectionRequest, UpdateConnectionRequest
@@ -160,6 +161,7 @@ async def create_connection(
     """Create a connection, then auto-kick the first ingestion."""
     org_id = _require_admin_org(user)
     _require_ready()
+    validate_uuid(body.depot_id, "depot_id")
     await verify_depot_access(body.depot_id, user, static_pool)
 
     try:
@@ -261,6 +263,7 @@ async def list_connections(
     """List the caller's connections, optionally filtered to one depot."""
     org_id = _require_admin_org(user)
     if depot_id is not None:
+        validate_uuid(depot_id, "depot_id")
         await verify_depot_access(depot_id, user, static_pool)
     rows = await repo.list_connections(static_pool, organization_id=org_id, site_id=depot_id)
     return {"connections": [_connection_wire(r) for r in rows]}
@@ -274,6 +277,7 @@ async def get_connection(
 ) -> dict[str, Any]:
     """Fetch one connection (scoped to the caller's org)."""
     org_id = _require_admin_org(user)
+    validate_uuid(connection_id, "connection_id")
     rec = await repo.get_connection(static_pool, connection_id, organization_id=org_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="connection not found")
@@ -290,6 +294,7 @@ async def update_connection(
 ) -> Any:
     """Patch a connection's settings or rotate its credentials."""
     org_id = _require_admin_org(user)
+    validate_uuid(connection_id, "connection_id")
     rec = await repo.get_connection(static_pool, connection_id, organization_id=org_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="connection not found")
@@ -316,11 +321,15 @@ async def update_connection(
 
     token: Optional[bytes] = None
     version: Optional[int] = None
+    merged_config: Optional[dict[str, Any]] = None
     if body.credentials is not None:
+        _require_ready()
         try:
             provider = registry.get_provider(rec["provider_key"])
-            config = merge_catalogue_config(provider, body.credentials, _as_dict(rec["config"]))
-            await provider.validate_credentials(body.credentials, config)
+            merged_config = merge_catalogue_config(
+                provider, body.credentials, _as_dict(rec["config"])
+            )
+            await provider.validate_credentials(body.credentials, merged_config)
         except ds_errors.ProviderNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ds_errors.CredentialValidationError as exc:
@@ -342,13 +351,23 @@ async def update_connection(
     if not updates and token is None:
         return _connection_wire(rec)
 
-    updated = await repo.update_connection(
-        static_pool,
-        connection_id,
-        updates=updates,
-        encrypted_credentials=token,
-        encryption_version=version,
-    )
+    try:
+        updated = await repo.update_connection(
+            static_pool,
+            connection_id,
+            updates=updates,
+            encrypted_credentials=token,
+            encryption_version=version,
+            config=merged_config,
+        )
+    except asyncpg.UniqueViolationError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error_code": "CONNECTION_ALREADY_EXISTS",
+                "detail": "A connection for this depot and provider already exists",
+            },
+        )
     await _audit(
         ts_pool,
         action="data_source.connection.updated",
@@ -369,6 +388,7 @@ async def delete_connection(
 ) -> Response:
     """Soft-delete a connection (status='disabled')."""
     org_id = _require_admin_org(user)
+    validate_uuid(connection_id, "connection_id")
     rec = await repo.get_connection(static_pool, connection_id, organization_id=org_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="connection not found")
@@ -394,6 +414,7 @@ async def trigger_sync(
     """Enqueue + kick a manual sync. 409 if one is already in flight."""
     org_id = _require_admin_org(user)
     _require_ready()
+    validate_uuid(connection_id, "connection_id")
     rec = await repo.get_connection(static_pool, connection_id, organization_id=org_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="connection not found")
@@ -422,6 +443,9 @@ async def trigger_sync(
         )
 
     job_wire = _job_wire(job_rec)
+    # A due connection just got a manual run; push the scheduled clock forward so
+    # the next tick doesn't enqueue a redundant scheduled job right behind it.
+    await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
     _spawn(run_ingestion_job(static_pool, ts_pool, job_id=job_wire["id"]))
     await _audit(
         ts_pool,
@@ -449,6 +473,7 @@ async def list_jobs(
 ) -> dict[str, Any]:
     """List a connection's sync history (newest first)."""
     org_id = _require_admin_org(user)
+    validate_uuid(connection_id, "connection_id")
     rec = await repo.get_connection(static_pool, connection_id, organization_id=org_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="connection not found")
@@ -466,6 +491,7 @@ async def get_job(
 ) -> dict[str, Any]:
     """Poll one ingestion job's status/progress (scoped to the caller's org)."""
     org_id = _require_admin_org(user)
+    validate_uuid(job_id, "job_id")
     rec = await repo.get_job(static_pool, job_id, organization_id=org_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="job not found")

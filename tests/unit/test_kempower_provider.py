@@ -60,6 +60,20 @@ async def test_validate_credentials_missing_location():
         await provider.validate_credentials({"username": "u", "password": "p"}, {})
 
 
+async def test_validate_credentials_rejects_bad_backfill(monkeypatch):
+    client = MagicMock()
+    client.get_location = AsyncMock(return_value={"id": "loc1"})
+    provider = kp.KempowerProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda c, cfg: _FakeClientCM(client))
+    with pytest.raises(CredentialValidationError):
+        await provider.validate_credentials(
+            {"username": "u", "password": "p"},
+            {"locationId": "loc1", "backfillSince": "not-a-date"},
+        )
+    # Rejected before any network probe.
+    client.get_location.assert_not_awaited()
+
+
 async def test_validate_credentials_maps_client_error(monkeypatch):
     client = MagicMock()
     client.get_location = AsyncMock(side_effect=KempowerClientError("bad creds"))

@@ -183,10 +183,17 @@ async def update_connection(
     updates: dict[str, Any],
     encrypted_credentials: Optional[bytes] = None,
     encryption_version: Optional[int] = None,
+    config: Optional[dict[str, Any]] = None,
 ) -> Optional[asyncpg.Record]:
-    """Patch mutable fields; optionally rotate the encrypted credentials.
+    """Patch mutable fields; optionally rotate credentials and/or refresh config.
 
-    ``updates`` keys are restricted to a known set by the caller.
+    ``updates`` keys are restricted to a known set by the caller. When
+    ``sync_interval_minutes`` changes, ``next_sync_at`` is recomputed from now so
+    the new cadence takes effect immediately instead of at the old due time.
+
+    Raises:
+        asyncpg.UniqueViolationError: If the patch reactivates a connection that
+            collides with an existing non-disabled ``(site_id, provider_key)``.
     """
     sets: list[str] = ["updated_at = NOW()"]
     args: list[Any] = []
@@ -197,11 +204,18 @@ async def update_connection(
         "scheduled_sync_enabled": "",
         "status": "",
     }
+    interval_param_idx: Optional[int] = None
     for key, value in updates.items():
         if key not in column_casts:
             continue
         sets.append(f"{key} = ${idx}")
         args.append(value)
+        if key == "sync_interval_minutes":
+            interval_param_idx = idx
+        idx += 1
+    if config is not None:
+        sets.append(f"config = ${idx}::jsonb")
+        args.append(json.dumps(config))
         idx += 1
     if encrypted_credentials is not None:
         sets.append(f"encrypted_credentials = ${idx}")
@@ -210,6 +224,8 @@ async def update_connection(
         sets.append(f"encryption_version = ${idx}")
         args.append(encryption_version)
         idx += 1
+    if interval_param_idx is not None:
+        sets.append(f"next_sync_at = NOW() + make_interval(mins => ${interval_param_idx}::int)")
     args.append(connection_id)
     async with pool.acquire() as conn:
         return await conn.fetchrow(
@@ -442,7 +458,11 @@ async def list_jobs(
 async def find_orphaned_jobs(
     pool: asyncpg.Pool, *, threshold_seconds: int, limit: int
 ) -> list[asyncpg.Record]:
-    """Pending/running jobs whose heartbeat is stale — candidates for recovery."""
+    """Pending/running jobs whose heartbeat is stale — candidates for recovery.
+
+    Jobs whose parent connection has been disabled are excluded so a soft-deleted
+    connection is never resurrected by the startup sweep.
+    """
     async with pool.acquire() as conn:
         return await conn.fetch(
             f"""
@@ -451,6 +471,11 @@ async def find_orphaned_jobs(
             WHERE status IN ('pending', 'running')
               AND COALESCE(heartbeat_at, started_at, created_at)
                   < NOW() - make_interval(secs => $1)
+              AND EXISTS (
+                  SELECT 1 FROM data_source_connections c
+                  WHERE c.id = data_source_ingestion_jobs.connection_id
+                    AND c.status <> 'disabled'
+              )
             ORDER BY created_at ASC
             LIMIT $2
             """,

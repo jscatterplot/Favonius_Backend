@@ -133,6 +133,14 @@ class KempowerProvider(DataSourceProvider):
             raise CredentialValidationError("locationId is required")
         if not credentials.get("username") or not credentials.get("password"):
             raise CredentialValidationError("username and password are required")
+        raw_backfill = config.get("backfillSince") or credentials.get("backfillSince")
+        if raw_backfill:
+            try:
+                _parse_backfill_since(raw_backfill)
+            except (ValueError, TypeError) as exc:
+                raise CredentialValidationError(
+                    f"backfillSince must be a YYYY-MM-DD or ISO-8601 date: {exc}"
+                ) from exc
         try:
             async with self._build_client(credentials, config) as client:
                 await client.get_location(location_id)
@@ -146,7 +154,8 @@ class KempowerProvider(DataSourceProvider):
         location_id = ctx.config.get("locationId") or ctx.credentials.get("locationId")
         if not location_id:
             return IngestionResult(
-                status="failed", error_detail="locationId missing from connection config/credentials"
+                status="failed",
+                error_detail="locationId missing from connection config/credentials",
             )
         backfill_since = _parse_backfill_since(
             ctx.config.get("backfillSince") or ctx.credentials.get("backfillSince")
