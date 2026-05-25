@@ -14,7 +14,6 @@ from src.websocket_handler.analytics_service import AnalyticsService
 from src.websocket_handler.api_server import APIServer
 from src.websocket_handler.config import Config
 from src.websocket_handler.connection_manager import ConnectionManager
-from src.websocket_handler.data_sync import DataSyncService
 from src.websocket_handler.der_control_manager import DERControlManager
 from src.websocket_handler.health import HealthCheckServer
 from src.websocket_handler.message_handler import MessageHandler
@@ -118,16 +117,6 @@ class TestCrossModuleIntegration:
         service._calculate_peak_power = AsyncMock(return_value=100.0)
         service._calculate_energy_efficiency = AsyncMock(return_value=0.95)
         service._calculate_v2g_performance = AsyncMock(return_value=0.90)
-        return service
-
-    @pytest_asyncio.fixture
-    async def data_sync_service(self, config, mock_supabase_client):
-        """Create data sync service."""
-        service = DataSyncService(config.supabase, mock_supabase_client)
-        service.sync_charging_sessions = AsyncMock()
-        service.sync_vehicle_states = AsyncMock()
-        service.sync_optimization_decisions = AsyncMock()
-        service.sync_energy_metrics = AsyncMock()
         return service
 
     @pytest_asyncio.fixture
@@ -294,40 +283,6 @@ class TestCrossModuleIntegration:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
-    async def test_data_sync_integration(
-        self,
-        config,
-        mock_timescale_client,
-        mock_supabase_client,
-        data_sync_service,
-        analytics_service,
-    ):
-        """Test data sync service integration with analytics service."""
-        # Test data sync service initialization
-        assert data_sync_service.config == config.supabase
-        assert data_sync_service.supabase_client == mock_supabase_client
-        # timescale_pool is None until start() is called
-
-        # Test data synchronization
-        await data_sync_service.sync_charging_sessions()
-        await data_sync_service.sync_vehicle_states()
-        await data_sync_service.sync_optimization_decisions()
-        await data_sync_service.sync_energy_metrics()
-
-        # Verify sync methods were called
-        data_sync_service.sync_charging_sessions.assert_called_once()
-        data_sync_service.sync_vehicle_states.assert_called_once()
-        data_sync_service.sync_optimization_decisions.assert_called_once()
-        data_sync_service.sync_energy_metrics.assert_called_once()
-
-        # Test sync status
-        sync_status = await data_sync_service.get_sync_status()
-        assert sync_status is not None
-        assert "batch_size" in sync_status
-        assert "sync_interval" in sync_status
-
-    @pytest.mark.asyncio
-    @pytest.mark.timeout(60)
     async def test_api_server_integration(
         self, config, mock_supabase_client, api_server, analytics_service
     ):
@@ -407,7 +362,6 @@ class TestCrossModuleIntegration:
         v2x_controller,
         der_control_manager,
         analytics_service,
-        data_sync_service,
         telemetry_service,
         api_server,
         health_server,
@@ -473,11 +427,7 @@ class TestCrossModuleIntegration:
         # Note: Analytics processing requires real database connection
         # This test focuses on module integration without database dependencies
 
-        # 6. Data synchronization
-        await data_sync_service.sync_charging_sessions()
-        await data_sync_service.sync_energy_metrics()
-
-        # 7. Health monitoring
+        # 6. Health monitoring
         mock_request = AsyncMock()
         health_response = await health_server._health_check(mock_request)
         assert health_response is not None
