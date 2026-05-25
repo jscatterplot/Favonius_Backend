@@ -410,20 +410,26 @@ async def finalize_job(
     progress: dict[str, Any],
     error_detail: Optional[str],
     import_batch_id: Optional[str],
+    allow_pending: bool = False,
 ) -> None:
     """Write the terminal state of a job.
 
-    The WHERE guards ``status = 'running'`` so that a worker which finishes
-    after ``disable_connection`` already terminalized the row (status='failed',
-    reason='connection disabled') does not overwrite the cancellation state.
+    By default the WHERE guards ``status = 'running'`` so that a worker which
+    finishes after ``disable_connection`` already terminalized the row
+    (status='failed', reason='connection disabled') does not overwrite the
+    cancellation state. Pass ``allow_pending=True`` only from the top-level
+    crash handler so jobs that never reached ``running`` can still be failed.
     """
+    status_predicate = (
+        "status IN ('pending', 'running')" if allow_pending else "status = 'running'"
+    )
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE data_source_ingestion_jobs "
             "SET status = $2, progress = progress || $3::jsonb, "
             "error_detail = $4, import_batch_id = $5::uuid, "
             "finished_at = NOW(), heartbeat_at = NOW() "
-            "WHERE id = $1::uuid AND status = 'running'",
+            f"WHERE id = $1::uuid AND {status_predicate}",
             job_id,
             status,
             json.dumps(progress),

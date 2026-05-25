@@ -75,6 +75,7 @@ async def run_ingestion_job(
                 progress={"stage": "error"},
                 error_detail="internal error (see server logs)",
                 import_batch_id=None,
+                allow_pending=True,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to mark job %s failed after crash", job_id)
