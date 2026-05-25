@@ -1,55 +1,48 @@
-# Agent-SQL golden scenarios (PLAN.md session S2).
+# Agent-SQL golden scenarios (PLAN.md session S2) — 20 questions.
 #
-# Validated against tests/golden/agent_sql/_schema.yaml by the harness in
-# tests/golden/test_agent_sql_golden.py. Each scenario replays a hand-written
-# llm_trace through the real run_qa_turn loop + sql_validator + sql_executor
-# against the agent_views.* functions over the graph_snapshot fixtures.
+# Validated against tests/golden/agent_sql/_schema.yaml and replayed through the
+# real run_qa_turn loop + sql_validator + sql_executor against the agent_views.*
+# functions over each scenario's graph_snapshot (loaded into a rolled-back
+# savepoint on a real TimescaleDB + Supabase pair). See the harness in
+# tests/golden/test_agent_sql_golden.py.
 #
-# SQL authoring rules (enforced at run time by the real validator/executor):
-#   * FROM agent_views.<fn>($1) only — never a base table.
-#   * $1 is the only placeholder (server binds it to the caller's depots).
-#   * Absolute literal time bounds (not now()) so results are reproducible.
-# Column names/units are the catalogue's (src/api/agent/catalogue.py); ground
-# truth is migrations/042_agent_views_ts.sql + migrations/supabase/040_agent_views_static.sql.
+# Conventions shared across scenarios (DRY — one universe, not 20):
+#   * Depots: Vilnius (1111…) and Kaunas (2222…), declared once as YAML anchors
+#     (&dep_vil / &dep_kau) and referenced elsewhere (*dep_vil / *dep_kau).
+#   * Driver John Smith (d0000001…) at Vilnius. Vehicles are the textual session
+#     ids bus_NNN (agent_views.sessions.vehicle_id is varchar).
+#   * No `auth:` block — the harness defaults the org and derives
+#     visible_depot_ids (the $1 bind) from graph_snapshot.depots.
+#   * Name resolution goes through agent_views.depots/drivers (run_select_static),
+#     never raw UUIDs in the answer (the tone gate forbids "UUID").
+#
+# SQL authoring rules (enforced at run time): FROM agent_views.<fn>($1) only;
+# $1 is the sole placeholder; absolute literal time bounds (reproducible);
+# hypertable functions (prices_hourly) carry a bounding predicate on `hour`.
+# Column names/units: src/api/agent/catalogue.py. Ground truth:
+# migrations/042_agent_views_ts.sql + migrations/supabase/040_agent_views_static.sql.
 
-# ── energy + cost rollups ────────────────────────────────────────────────────
+# ════════════════════════ energy + cost rollups (7) ════════════════════════
 
 - id: en_01
   category: energy_cost
   question: "How much energy did vehicle bus_101 consume last month?"
   description: >
-    SUM(energy_kwh) for one vehicle over April 2026. Decoy rows (a different
-    vehicle, and a March session) confirm the vehicle filter and the month
-    bound both apply. "last month" relative to scenario_now 2026-05-25.
+    SUM(energy_kwh) for one vehicle over April 2026 ("last month" vs
+    scenario_now 2026-05-25). A March session and a different vehicle are decoys
+    that confirm the month bound and the vehicle filter both apply.
   scenario_now: "2026-05-25T12:00:00Z"
-  auth:
-    organization_id: "bb000000-0000-4000-8000-0000000000bb"
   graph_snapshot:
     depots:
-      - depot_id: "11111111-1111-4111-8111-111111111111"
+      - &dep_vil
+        depot_id: "11111111-1111-4111-8111-111111111111"
         name: "Vilnius"
         entsoe_zone: "10YLT-1001A0008Q"
     sessions:
-      - vehicle_id: "bus_101"      # April — counts
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        start_time: "2026-04-10T08:00:00Z"
-        end_time: "2026-04-10T10:00:00Z"
-        energy_kwh: 120.5
-      - vehicle_id: "bus_101"      # April — counts
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        start_time: "2026-04-20T08:00:00Z"
-        end_time: "2026-04-20T11:00:00Z"
-        energy_kwh: 200.0
-      - vehicle_id: "bus_101"      # March — out of window, excluded
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        start_time: "2026-03-15T08:00:00Z"
-        end_time: "2026-03-15T09:00:00Z"
-        energy_kwh: 90.0
-      - vehicle_id: "bus_202"      # different vehicle, excluded
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        start_time: "2026-04-12T08:00:00Z"
-        end_time: "2026-04-12T10:00:00Z"
-        energy_kwh: 150.0
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-04-10T08:00:00Z", energy_kwh: 120.5 }
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-04-20T08:00:00Z", energy_kwh: 200.0 }
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-03-15T08:00:00Z", energy_kwh: 90.0 }
+      - { vehicle_id: "bus_202", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-04-12T08:00:00Z", energy_kwh: 150.0 }
   llm_trace:
     - content:
         - type: tool_use
@@ -65,9 +58,7 @@
         - type: tool_use
           id: "en01_a"
           name: emit_final_answer
-          input:
-            text: "Bus_101 consumed 320.5 kWh across 2 sessions in April 2026."
-            row_evidence: 1
+          input: { text: "Bus_101 consumed 320.5 kWh across 2 sessions in April 2026.", row_evidence: 1 }
   expected:
     status: success
     agent_views_used: ["sessions"]
@@ -75,7 +66,266 @@
     final_answer_must_include: ["320.5 kWh", "2 sessions"]
     final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
 
-# ── operations status ────────────────────────────────────────────────────────
+- id: en_02
+  category: energy_cost
+  question: "What was the total electricity cost at depot Vilnius last week?"
+  description: >
+    Resolve "Vilnius" to its id via agent_views.depots, then SUM(cost_total)
+    over last week (2026-05-18..2026-05-25), excluding unpriceable sessions. A
+    Kaunas session and an unpriceable Vilnius session are decoys.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+      - &dep_kau
+        depot_id: "22222222-2222-4222-8222-222222222222"
+        name: "Kaunas"
+        entsoe_zone: "10YLT-1001A0008Q"
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-19T08:00:00Z", energy_kwh: 220.0, cost_total: 60.00, cost_total_source: "granular" }
+      - { vehicle_id: "bus_102", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-20T08:00:00Z", energy_kwh: 150.0, cost_total: 45.50, cost_total_source: "granular" }
+      - { vehicle_id: "bus_103", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-21T08:00:00Z", energy_kwh: 100.0, cost_total: null, cost_total_source: "unpriceable" }
+      - { vehicle_id: "bus_201", depot_id: "22222222-2222-4222-8222-222222222222", start_time: "2026-05-19T08:00:00Z", energy_kwh: 300.0, cost_total: 100.00, cost_total_source: "granular" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "en02_resolve"
+          name: run_select_static
+          input:
+            sql: "SELECT depot_id FROM agent_views.depots($1) WHERE name ILIKE 'Vilnius'"
+    - content:
+        - type: tool_use
+          id: "en02_sum"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT SUM(cost_total) AS total_cost FROM agent_views.sessions($1)
+              WHERE depot_id = '11111111-1111-4111-8111-111111111111'
+                AND start_time >= '2026-05-18' AND start_time < '2026-05-25'
+                AND cost_total_source <> 'unpriceable'
+    - content:
+        - type: tool_use
+          id: "en02_a"
+          name: emit_final_answer
+          input: { text: "Depot Vilnius spent 105.50 EUR on electricity last week.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["depots", "sessions"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["105.50", "Vilnius"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: en_03
+  category: energy_cost
+  question: "Which depot had the highest energy consumption in April 2026?"
+  description: >
+    GROUP BY depot_id, ORDER BY SUM(energy_kwh) DESC LIMIT 1 (TS), then resolve
+    the winning depot_id to a name via agent_views.depots (static). Kaunas (350)
+    beats Vilnius (220) so the winner is not just the first depot.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+      - *dep_kau
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-04-05T08:00:00Z", energy_kwh: 100.0 }
+      - { vehicle_id: "bus_102", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-04-06T08:00:00Z", energy_kwh: 120.0 }
+      - { vehicle_id: "bus_201", depot_id: "22222222-2222-4222-8222-222222222222", start_time: "2026-04-05T08:00:00Z", energy_kwh: 300.0 }
+      - { vehicle_id: "bus_202", depot_id: "22222222-2222-4222-8222-222222222222", start_time: "2026-04-06T08:00:00Z", energy_kwh: 50.0 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "en03_rank"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT depot_id, SUM(energy_kwh) AS total_kwh FROM agent_views.sessions($1)
+              WHERE start_time >= '2026-04-01' AND start_time < '2026-05-01'
+              GROUP BY depot_id ORDER BY total_kwh DESC LIMIT 1
+    - content:
+        - type: tool_use
+          id: "en03_name"
+          name: run_select_static
+          input:
+            sql: "SELECT name FROM agent_views.depots($1) WHERE depot_id = '22222222-2222-4222-8222-222222222222'"
+    - content:
+        - type: tool_use
+          id: "en03_a"
+          name: emit_final_answer
+          input: { text: "Kaunas had the highest energy consumption in April 2026, at 350 kWh.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["sessions", "depots"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["Kaunas", "350 kWh"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: en_04
+  category: energy_cost
+  question: "How many kWh did driver John Smith use this month?"
+  description: >
+    Resolve "John Smith" to a driver_id via agent_views.drivers (not the
+    lookup_entity tool, whose resolver reads base-table columns outside the
+    agent_views surface), then SUM(energy_kwh) for that driver this month
+    (May 2026). Another driver's session is a decoy.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    drivers:
+      - { driver_id: "d0000001-0000-4000-8000-000000000001", depot_id: "11111111-1111-4111-8111-111111111111", display_name: "John Smith", external_driver_id: "EMP-1042" }
+      - { driver_id: "d0000002-0000-4000-8000-000000000002", depot_id: "11111111-1111-4111-8111-111111111111", display_name: "Jane Doe", external_driver_id: "EMP-1043" }
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", driver_id: "d0000001-0000-4000-8000-000000000001", start_time: "2026-05-08T08:00:00Z", energy_kwh: 80.0 }
+      - { vehicle_id: "bus_102", depot_id: "11111111-1111-4111-8111-111111111111", driver_id: "d0000001-0000-4000-8000-000000000001", start_time: "2026-05-18T08:00:00Z", energy_kwh: 95.0 }
+      - { vehicle_id: "bus_103", depot_id: "11111111-1111-4111-8111-111111111111", driver_id: "d0000002-0000-4000-8000-000000000002", start_time: "2026-05-10T08:00:00Z", energy_kwh: 200.0 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "en04_resolve"
+          name: run_select_static
+          input:
+            sql: "SELECT driver_id FROM agent_views.drivers($1) WHERE display_name ILIKE 'John Smith'"
+    - content:
+        - type: tool_use
+          id: "en04_sum"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT SUM(energy_kwh) AS total_kwh FROM agent_views.sessions($1)
+              WHERE driver_id = 'd0000001-0000-4000-8000-000000000001'
+                AND start_time >= '2026-05-01' AND start_time < '2026-06-01'
+    - content:
+        - type: tool_use
+          id: "en04_a"
+          name: emit_final_answer
+          input: { text: "Driver John Smith used 175 kWh this month.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["drivers", "sessions"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["John Smith", "175 kWh"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: en_05
+  category: energy_cost
+  question: "Show me the top 5 vehicles by total cost in the last 30 days."
+  description: >
+    GROUP BY vehicle_id, ORDER BY SUM(cost_total) DESC LIMIT 5 over the trailing
+    30 days. agent_views.sessions.vehicle_id is already the human-readable id
+    (bus_NNN), so no name join is needed; bus_606 (6th) confirms the LIMIT.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-02T08:00:00Z", energy_kwh: 300.0, cost_total: 300.00 }
+      - { vehicle_id: "bus_202", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-03T08:00:00Z", energy_kwh: 250.0, cost_total: 250.00 }
+      - { vehicle_id: "bus_303", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-04T08:00:00Z", energy_kwh: 200.0, cost_total: 200.00 }
+      - { vehicle_id: "bus_404", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-05T08:00:00Z", energy_kwh: 150.0, cost_total: 150.00 }
+      - { vehicle_id: "bus_505", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-06T08:00:00Z", energy_kwh: 100.0, cost_total: 100.00 }
+      - { vehicle_id: "bus_606", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-07T08:00:00Z", energy_kwh: 50.0, cost_total: 50.00 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "en05_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT vehicle_id, SUM(cost_total) AS total_cost FROM agent_views.sessions($1)
+              WHERE start_time >= '2026-04-25' AND start_time < '2026-05-25'
+              GROUP BY vehicle_id ORDER BY total_cost DESC LIMIT 5
+    - content:
+        - type: tool_use
+          id: "en05_a"
+          name: emit_final_answer
+          input:
+            text: >-
+              Top 5 vehicles by cost (last 30 days): bus_101 (300 EUR), bus_202 (250 EUR),
+              bus_303 (200 EUR), bus_404 (150 EUR), bus_505 (100 EUR).
+            row_evidence: 5
+  expected:
+    status: success
+    agent_views_used: ["sessions"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["bus_101", "bus_505"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: en_06
+  category: energy_cost
+  question: "What's the average energy per charging session at depot Vilnius this month?"
+  description: >
+    AVG(energy_kwh) over May 2026, depot-scoped (visible depots = {Vilnius}, so
+    sessions($1) is already Vilnius-only). An April session is excluded by the
+    month bound; three May sessions average to 150 kWh.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-04T08:00:00Z", energy_kwh: 100.0 }
+      - { vehicle_id: "bus_102", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-05T08:00:00Z", energy_kwh: 150.0 }
+      - { vehicle_id: "bus_103", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-06T08:00:00Z", energy_kwh: 200.0 }
+      - { vehicle_id: "bus_104", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-04-30T08:00:00Z", energy_kwh: 999.0 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "en06_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT AVG(energy_kwh) AS avg_kwh, COUNT(*) AS n FROM agent_views.sessions($1)
+              WHERE start_time >= '2026-05-01' AND start_time < '2026-06-01'
+    - content:
+        - type: tool_use
+          id: "en06_a"
+          name: emit_final_answer
+          input: { text: "Sessions at Vilnius averaged 150 kWh each this month, across 3 sessions.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["sessions"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["150 kWh", "Vilnius"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: en_07
+  category: energy_cost
+  question: "Did any session this week cost more than €100?"
+  description: >
+    WHERE cost_total > 100 over this week (2026-05-18..2026-05-25) — a yes/no
+    answer that names the offending session. Only bus_101 (150) exceeds 100.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-19T08:00:00Z", energy_kwh: 400.0, cost_total: 150.00 }
+      - { vehicle_id: "bus_102", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-20T08:00:00Z", energy_kwh: 200.0, cost_total: 80.00 }
+      - { vehicle_id: "bus_103", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-21T08:00:00Z", energy_kwh: 220.0, cost_total: 95.00 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "en07_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT vehicle_id, cost_total FROM agent_views.sessions($1)
+              WHERE cost_total > 100
+                AND start_time >= '2026-05-18' AND start_time < '2026-05-25'
+              ORDER BY cost_total DESC
+    - content:
+        - type: tool_use
+          id: "en07_a"
+          name: emit_final_answer
+          input: { text: "Yes — bus_101's session on 19 May cost 150 EUR, above the 100 EUR mark.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["sessions"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["Yes", "150"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+# ════════════════════════ operations status (7) ════════════════════════════
 
 - id: ops_08
   category: ops_status
@@ -83,40 +333,18 @@
   description: >
     Names the chargers currently Faulted whose status flipped yesterday
     (2026-05-24). Uses connector_status_latest, not alerts: the alerts view
-    exposes no station/charger id, so it cannot answer "which chargers" — the
-    PLAN.md hint (agent_views.alerts) predates that view's final shape.
-    CP-01 also has an earlier Available row to exercise the view's
-    latest-row-per-(station,connector) DISTINCT ON.
-  scenario_now: "2026-05-25T09:00:00Z"
-  auth:
-    organization_id: "bb000000-0000-4000-8000-0000000000bb"
+    exposes no station/charger id, so it cannot answer "which chargers". CP-01
+    also has an earlier Available row to exercise the view's latest-row-per-
+    (station,connector) DISTINCT ON.
+  scenario_now: "2026-05-25T12:00:00Z"
   graph_snapshot:
     depots:
-      - depot_id: "11111111-1111-4111-8111-111111111111"
-        name: "Vilnius"
+      - *dep_vil
     connector_status:
-      - station_id: "CP-01"        # latest = Faulted yesterday → counts
-        connector_id: 1
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        status: "Available"
-        timestamp: "2026-05-20T08:00:00Z"
-      - station_id: "CP-01"
-        connector_id: 1
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        status: "Faulted"
-        error_code: "GroundFailure"
-        timestamp: "2026-05-24T14:00:00Z"
-      - station_id: "CP-02"        # Faulted yesterday → counts
-        connector_id: 1
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        status: "Faulted"
-        error_code: "OverCurrentFailure"
-        timestamp: "2026-05-24T16:00:00Z"
-      - station_id: "CP-03"        # Available → excluded
-        connector_id: 1
-        depot_id: "11111111-1111-4111-8111-111111111111"
-        status: "Available"
-        timestamp: "2026-05-24T10:00:00Z"
+      - { station_id: "CP-01", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Available", timestamp: "2026-05-20T08:00:00Z" }
+      - { station_id: "CP-01", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Faulted", error_code: "GroundFailure", timestamp: "2026-05-24T14:00:00Z" }
+      - { station_id: "CP-02", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Faulted", error_code: "OverCurrentFailure", timestamp: "2026-05-24T16:00:00Z" }
+      - { station_id: "CP-03", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Available", timestamp: "2026-05-24T10:00:00Z" }
   llm_trace:
     - content:
         - type: tool_use
@@ -132,9 +360,7 @@
         - type: tool_use
           id: "ops08_a"
           name: emit_final_answer
-          input:
-            text: "Two chargers were faulted yesterday: CP-01 and CP-02."
-            row_evidence: 2
+          input: { text: "Two chargers were faulted yesterday: CP-01 and CP-02.", row_evidence: 2 }
   expected:
     status: success
     agent_views_used: ["connector_status_latest"]
@@ -142,24 +368,270 @@
     final_answer_must_include: ["CP-01", "CP-02"]
     final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
 
-# ── pricing + market context ─────────────────────────────────────────────────
+- id: ops_09
+  category: ops_status
+  question: "How many optimization runs went infeasible last week?"
+  description: >
+    COUNT optimization_runs WHERE status='infeasible' over last week
+    (2026-05-18..2026-05-25). An infeasible run on 2026-05-10 is outside the
+    window; two optimal runs inside it are excluded by status.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    optimization_runs:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-19T01:00:00Z", status: "infeasible", trigger_reason: "scheduled" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-20T01:00:00Z", status: "infeasible", trigger_reason: "scheduled" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-21T01:00:00Z", status: "optimal", trigger_reason: "scheduled" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-22T01:00:00Z", status: "optimal", trigger_reason: "scheduled" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-10T01:00:00Z", status: "infeasible", trigger_reason: "scheduled" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "ops09_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT COUNT(*) AS n FROM agent_views.optimization_runs($1)
+              WHERE status = 'infeasible'
+                AND run_time >= '2026-05-18' AND run_time < '2026-05-25'
+    - content:
+        - type: tool_use
+          id: "ops09_a"
+          name: emit_final_answer
+          input: { text: "2 optimization runs went infeasible last week.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["optimization_runs"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["2 optimization runs", "infeasible"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: ops_10
+  category: ops_status
+  question: "What triggered the last 5 reoptimizations at depot Vilnius?"
+  description: >
+    SELECT trigger_reason, run_time ORDER BY run_time DESC LIMIT 5. trigger_reason
+    is free-form (catalogue): literals like 'scheduled'/'hourly' and prefixes
+    like 'Price change: …'/'SoC deviation: …'/'Return delay: …'. The oldest of
+    six runs is dropped by the LIMIT.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    optimization_runs:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-24T10:00:00Z", trigger_reason: "Price change: +30%" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-24T09:00:00Z", trigger_reason: "scheduled" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-24T08:00:00Z", trigger_reason: "SoC deviation: bus_101" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-24T07:00:00Z", trigger_reason: "hourly" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-24T06:00:00Z", trigger_reason: "Return delay: bus_202" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-24T05:00:00Z", trigger_reason: "scheduled" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "ops10_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT trigger_reason, run_time FROM agent_views.optimization_runs($1)
+              ORDER BY run_time DESC LIMIT 5
+    - content:
+        - type: tool_use
+          id: "ops10_a"
+          name: emit_final_answer
+          input:
+            text: >-
+              The last 5 reoptimizations were triggered by: Price change, scheduled,
+              SoC deviation, hourly, and Return delay.
+            row_evidence: 5
+  expected:
+    status: success
+    agent_views_used: ["optimization_runs"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["Price change", "SoC deviation"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: ops_11
+  category: ops_status
+  question: "Which alerts are still active right now?"
+  description: >
+    SELECT WHERE status='active'. A resolved and an acknowledged alert are
+    decoys. severity maps to severity_level (1/2/3) in the view.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    alerts:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-24T14:00:00Z", severity: "critical", status: "active", alert_type: "charger_fault" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-23T09:00:00Z", severity: "warning", status: "active", alert_type: "stale_telemetry" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-22T09:00:00Z", severity: "warning", status: "resolved", alert_type: "degraded_optimization" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-21T09:00:00Z", severity: "info", status: "acknowledged", alert_type: "missing_input" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "ops11_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT alert_type, severity_level FROM agent_views.alerts($1)
+              WHERE status = 'active' ORDER BY severity_level DESC
+    - content:
+        - type: tool_use
+          id: "ops11_a"
+          name: emit_final_answer
+          input:
+            text: "2 alerts are active: a critical charger_fault and a warning-level stale_telemetry."
+            row_evidence: 2
+  expected:
+    status: success
+    agent_views_used: ["alerts"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["charger_fault", "stale_telemetry"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: ops_12
+  category: ops_status
+  question: "Show me chargers that have been unavailable for more than 24 hours."
+  description: >
+    connector_status_latest WHERE status='Unavailable' AND last_changed_at <
+    now() - interval '24 hours'. The Unavailable timestamps are fixed days in
+    the past, so they are > 24h ago on any realistic run date (deterministic);
+    an Available charger is a decoy.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    connector_status:
+      - { station_id: "CP-10", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Unavailable", timestamp: "2026-05-20T08:00:00Z" }
+      - { station_id: "CP-11", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Unavailable", timestamp: "2026-05-22T08:00:00Z" }
+      - { station_id: "CP-12", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Available", timestamp: "2026-05-24T08:00:00Z" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "ops12_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT station_id FROM agent_views.connector_status_latest($1)
+              WHERE status = 'Unavailable' AND last_changed_at < now() - interval '24 hours'
+              ORDER BY station_id
+    - content:
+        - type: tool_use
+          id: "ops12_a"
+          name: emit_final_answer
+          input: { text: "Two chargers have been unavailable for over 24 hours: CP-10 and CP-11.", row_evidence: 2 }
+  expected:
+    status: success
+    agent_views_used: ["connector_status_latest"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["CP-10", "CP-11"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: ops_13
+  category: ops_status
+  question: "How many charging sessions did we have yesterday, total and per depot?"
+  description: >
+    COUNT(*) GROUP BY depot_id over yesterday (2026-05-24), then resolve the
+    depot_ids to names via agent_views.depots. Vilnius had 3, Kaunas 2.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+      - *dep_kau
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-24T06:00:00Z", energy_kwh: 50.0 }
+      - { vehicle_id: "bus_102", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-24T07:00:00Z", energy_kwh: 60.0 }
+      - { vehicle_id: "bus_103", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-24T08:00:00Z", energy_kwh: 70.0 }
+      - { vehicle_id: "bus_201", depot_id: "22222222-2222-4222-8222-222222222222", start_time: "2026-05-24T06:00:00Z", energy_kwh: 80.0 }
+      - { vehicle_id: "bus_202", depot_id: "22222222-2222-4222-8222-222222222222", start_time: "2026-05-24T07:00:00Z", energy_kwh: 90.0 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "ops13_count"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT depot_id, COUNT(*) AS n FROM agent_views.sessions($1)
+              WHERE start_time >= '2026-05-24' AND start_time < '2026-05-25'
+              GROUP BY depot_id ORDER BY n DESC
+    - content:
+        - type: tool_use
+          id: "ops13_names"
+          name: run_select_static
+          input:
+            sql: "SELECT depot_id, name FROM agent_views.depots($1)"
+    - content:
+        - type: tool_use
+          id: "ops13_a"
+          name: emit_final_answer
+          input: { text: "Yesterday we had 5 charging sessions: 3 at Vilnius and 2 at Kaunas.", row_evidence: 2 }
+  expected:
+    status: success
+    agent_views_used: ["sessions", "depots"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["5 charging sessions", "3 at Vilnius", "2 at Kaunas"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: ops_14
+  category: ops_status
+  question: "Are any depots running in degraded optimization mode?"
+  description: >
+    Latest run per depot (DISTINCT ON … ORDER BY run_time DESC) filtered to
+    status='degraded', then resolve the depot name. Vilnius's latest run is
+    degraded (a prior optimal run is superseded); Kaunas's latest is optimal.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+      - *dep_kau
+    optimization_runs:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-23T01:00:00Z", status: "optimal", trigger_reason: "scheduled" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-05-24T01:00:00Z", status: "degraded", trigger_reason: "scheduled" }
+      - { depot_id: "22222222-2222-4222-8222-222222222222", run_time: "2026-05-24T01:00:00Z", status: "optimal", trigger_reason: "scheduled" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "ops14_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT depot_id FROM (
+                SELECT DISTINCT ON (depot_id) depot_id, status, run_time
+                FROM agent_views.optimization_runs($1)
+                ORDER BY depot_id, run_time DESC
+              ) latest WHERE status = 'degraded'
+    - content:
+        - type: tool_use
+          id: "ops14_name"
+          name: run_select_static
+          input:
+            sql: "SELECT name FROM agent_views.depots($1) WHERE depot_id = '11111111-1111-4111-8111-111111111111'"
+    - content:
+        - type: tool_use
+          id: "ops14_a"
+          name: emit_final_answer
+          input: { text: "Yes — Vilnius is running in degraded optimization mode; its latest run was degraded.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["optimization_runs", "depots"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["Vilnius", "degraded"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+# ════════════════════════ pricing + market context (6) ══════════════════════
 
 - id: pm_15
   category: pricing_market
   question: "What were the 5 highest electricity prices last week?"
   description: >
     ORDER BY price_per_kwh DESC LIMIT 5 over the trailing week
-    (2026-05-18..2026-05-25). prices_hourly is a hypertable function so the
-    query carries a bounding predicate on `hour`. Prices are EUR/MWh in the
-    fixture; the view returns EUR/kWh (= MWh / 1000).
+    (2026-05-18..2026-05-25), with a bounding predicate on `hour` (prices_hourly
+    is a hypertable function). Prices are EUR/MWh in the fixture; the view returns
+    EUR/kWh (= MWh / 1000). This graph_snapshot is shared with pm_20.
   scenario_now: "2026-05-25T12:00:00Z"
-  auth:
-    organization_id: "bb000000-0000-4000-8000-0000000000bb"
-  graph_snapshot:
+  graph_snapshot: &gs_week_prices
     depots:
-      - depot_id: "11111111-1111-4111-8111-111111111111"
-        name: "Vilnius"
-        entsoe_zone: "10YLT-1001A0008Q"
+      - *dep_vil
     electricity_prices:
       - { time: "2026-05-19T08:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 250.0 }
       - { time: "2026-05-19T09:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 230.0 }
@@ -193,4 +665,197 @@
     agent_views_used: ["prices_hourly"]
     sql_validator_rejected: false
     final_answer_must_include: ["0.25", "0.17", "EUR/kWh"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: pm_16
+  category: pricing_market
+  question: "How many times did a price spike trigger reoptimization last month?"
+  description: >
+    COUNT optimization_runs WHERE trigger_reason LIKE 'Price change%' over April
+    2026. Per the catalogue, price-spike runs carry the 'Price change: …' prefix
+    (the PLAN.md 'price_spike' hint predates that vocabulary). A March price-spike
+    run and two April scheduled runs are decoys.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    optimization_runs:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-04-10T01:00:00Z", trigger_reason: "Price change: +30%" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-04-11T01:00:00Z", trigger_reason: "Price change: +28%" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-04-12T01:00:00Z", trigger_reason: "Price change: +40%" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-04-13T01:00:00Z", trigger_reason: "scheduled" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-04-14T01:00:00Z", trigger_reason: "hourly" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", run_time: "2026-03-20T01:00:00Z", trigger_reason: "Price change: +50%" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "pm16_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT COUNT(*) AS n FROM agent_views.optimization_runs($1)
+              WHERE trigger_reason LIKE 'Price change%'
+                AND run_time >= '2026-04-01' AND run_time < '2026-05-01'
+    - content:
+        - type: tool_use
+          id: "pm16_a"
+          name: emit_final_answer
+          input: { text: "Price spikes triggered reoptimization 3 times last month.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["optimization_runs"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["3 times", "last month"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: pm_17
+  category: pricing_market
+  question: "What was the average price during morning peak (07-09 local) last week?"
+  description: >
+    AVG(price_per_kwh) over last week, restricted to the 07:00-09:00 LOCAL
+    window via `hour AT TIME ZONE 'Europe/Vilnius'`. May is EEST (UTC+3), so
+    04:00/05:00Z = 07:00/08:00 local (peak); 10:00Z = 13:00 local (excluded).
+    The week bound on `hour` satisfies the hypertable predicate; the EXTRACT
+    filter selects the peak hours. Peak avg = (0.20 + 0.22) / 2 = 0.21 EUR/kWh.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    electricity_prices:
+      - { time: "2026-05-19T04:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 200.0 }
+      - { time: "2026-05-19T05:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 220.0 }
+      - { time: "2026-05-19T10:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 100.0 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "pm17_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT AVG(price_per_kwh) AS avg_peak FROM agent_views.prices_hourly($1)
+              WHERE hour >= '2026-05-18' AND hour < '2026-05-25'
+                AND EXTRACT(HOUR FROM (hour AT TIME ZONE 'Europe/Vilnius')) IN (7, 8)
+    - content:
+        - type: tool_use
+          id: "pm17_a"
+          name: emit_final_answer
+          input: { text: "The average morning-peak (07-09 local) price last week was 0.21 EUR/kWh.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["prices_hourly"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["0.21", "EUR/kWh"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: pm_18
+  category: pricing_market
+  question: "Compare today's day-ahead prices vs last Friday's at depot Vilnius."
+  description: >
+    Two windowed averages over prices_hourly — today (2026-05-25) and last
+    Friday (2026-05-22) — each with its own bounding predicate on `hour`; the
+    agent narrates the difference. Today (0.18) is higher than Friday (0.15).
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    electricity_prices:
+      - { time: "2026-05-25T08:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 180.0 }
+      - { time: "2026-05-22T08:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 150.0 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "pm18_today"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT AVG(price_per_kwh) AS avg_today FROM agent_views.prices_hourly($1)
+              WHERE hour >= '2026-05-25' AND hour < '2026-05-26'
+    - content:
+        - type: tool_use
+          id: "pm18_friday"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT AVG(price_per_kwh) AS avg_friday FROM agent_views.prices_hourly($1)
+              WHERE hour >= '2026-05-22' AND hour < '2026-05-23'
+    - content:
+        - type: tool_use
+          id: "pm18_a"
+          name: emit_final_answer
+          input:
+            text: >-
+              Today's average day-ahead price at Vilnius is 0.18 EUR/kWh, versus
+              0.15 EUR/kWh last Friday — about 20% higher today.
+            row_evidence: 2
+  expected:
+    status: success
+    agent_views_used: ["prices_hourly"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["0.18", "0.15"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: pm_19
+  category: pricing_market
+  question: "Did the electricity price ever go negative in April?"
+  description: >
+    WHERE price_per_kwh < 0 over April 2026, with a bounding predicate on `hour`.
+    One hour was negative (-5 EUR/MWh = -0.005 EUR/kWh); a positive hour is a decoy.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    electricity_prices:
+      - { time: "2026-04-15T03:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: -5.0 }
+      - { time: "2026-04-15T12:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 80.0 }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "pm19_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT hour, price_per_kwh FROM agent_views.prices_hourly($1)
+              WHERE hour >= '2026-04-01' AND hour < '2026-05-01' AND price_per_kwh < 0
+              ORDER BY price_per_kwh
+    - content:
+        - type: tool_use
+          id: "pm19_a"
+          name: emit_final_answer
+          input: { text: "Yes — the price went negative once in April, on 15 April (-0.005 EUR/kWh).", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["prices_hourly"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["Yes", "negative"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: pm_20
+  category: pricing_market
+  question: "When was the most expensive hour in the past 7 days?"
+  description: >
+    ORDER BY price_per_kwh DESC LIMIT 1 over the past 7 days. Reuses pm_15's
+    shared price week (anchor *gs_week_prices); the peak is 0.25 EUR/kWh at
+    2026-05-19T08:00Z = 11:00 local (EEST).
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot: *gs_week_prices
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "pm20_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT hour, price_per_kwh FROM agent_views.prices_hourly($1)
+              WHERE hour >= '2026-05-18' AND hour < '2026-05-25'
+              ORDER BY price_per_kwh DESC LIMIT 1
+    - content:
+        - type: tool_use
+          id: "pm20_a"
+          name: emit_final_answer
+          input: { text: "The most expensive hour in the past 7 days was 11:00 local on 19 May, at 0.25 EUR/kWh.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["prices_hourly"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["0.25", "19 May"]
     final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
