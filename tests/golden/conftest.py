@@ -101,7 +101,10 @@ async def _make_pool(url: str, label: str):
     sql_executor's role-swap path assumes.
     """
     if asyncpg is None:
-        pytest.skip("asyncpg not installed; agent-SQL golden tests require it")
+        msg = "asyncpg not installed; agent-SQL golden tests require it"
+        if _ci_requires_db():
+            pytest.fail(msg)
+        pytest.skip(msg)
     try:
         return await asyncpg.create_pool(
             url,

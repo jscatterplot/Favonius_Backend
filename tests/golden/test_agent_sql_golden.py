@@ -117,7 +117,14 @@ def _load_all_scenarios() -> list[dict[str, Any]]:
         return []
     if not isinstance(raw, list):
         raise ScenarioError("agent_sql.yaml must be a top-level list of scenarios")
-    return [s for s in raw if isinstance(s, dict)]
+    scenarios: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ScenarioError(
+                f"agent_sql.yaml entry {index} must be a mapping, got {type(item).__name__}"
+            )
+        scenarios.append(item)
+    return scenarios
 
 
 _SCENARIO_JSON_SCHEMA: Optional[dict[str, Any]] = None
@@ -136,11 +143,13 @@ def _scenario_schema() -> dict[str, Any]:
 
 
 def _validate_against_schema(scenario: dict[str, Any]) -> None:
-    from jsonschema import Draft7Validator
+    from jsonschema import Draft7Validator, draft7_format_checker
     from jsonschema.exceptions import ValidationError
 
     try:
-        Draft7Validator(_scenario_schema()).validate(scenario)
+        Draft7Validator(
+            _scenario_schema(), format_checker=draft7_format_checker
+        ).validate(scenario)
     except ValidationError as exc:
         loc = ".".join(str(p) for p in exc.path) if exc.path else "<root>"
         raise ScenarioError(
@@ -220,7 +229,7 @@ def _build_auth_context(scenario: dict[str, Any], snapshot: dict[str, Any]) -> A
     user_id = _coerce_uuid(auth_raw.get("user_id", _DEFAULT_USER_ID), field_name="auth.user_id")
     role = auth_raw.get("role", "customer_operator")
 
-    if auth_raw.get("visible_depot_ids"):
+    if "visible_depot_ids" in auth_raw:
         visible = [
             _coerce_uuid(d, field_name="auth.visible_depot_ids")
             for d in auth_raw["visible_depot_ids"]
@@ -713,14 +722,15 @@ def test_every_scenario_has_tone_gate() -> None:
 
 
 def test_suite_size_and_distribution() -> None:
-    """Gate the full 20-question shape (7 energy / 7 ops / 6 pricing) once complete.
+    """Gate the full 20-question shape (7 energy / 7 ops / 6 pricing)."""
+    from tests.golden.conftest import _ci_requires_db
 
-    Skips while the suite is still being built (S2 lands scenarios in steps),
-    so it is green at every stage and becomes a hard gate at 20.
-    """
     n = len(_ALL_SCENARIOS)
     if n < 20:
-        pytest.skip(f"agent_sql suite has {n}/20 scenarios (S2 in progress)")
+        msg = f"agent_sql suite has {n}/20 scenarios (expected 20)"
+        if _ci_requires_db():
+            pytest.fail(msg)
+        pytest.skip(msg)
     by_cat: dict[str, int] = {}
     for s in _ALL_SCENARIOS:
         by_cat[s.get("category", "?")] = by_cat.get(s.get("category", "?"), 0) + 1
