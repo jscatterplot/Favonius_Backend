@@ -17,6 +17,7 @@ just flags ``credentials_pending_rotation``.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -56,6 +57,7 @@ async def run_ingestion_job(
     *,
     job_id: str,
     allow_stale_running_claim: bool = False,
+    expected_running_lease_at: datetime | None = None,
 ) -> None:
     """Execute one ingestion job to a terminal state. Never raises."""
     try:
@@ -64,6 +66,7 @@ async def run_ingestion_job(
             ts_pool,
             job_id=job_id,
             allow_stale_running_claim=allow_stale_running_claim,
+            expected_running_lease_at=expected_running_lease_at,
         )
     except Exception:  # noqa: BLE001 — background task: log, never propagate.
         logger.exception("Data-source ingestion job %s crashed", job_id)
@@ -87,12 +90,14 @@ async def _run(
     *,
     job_id: str,
     allow_stale_running_claim: bool,
+    expected_running_lease_at: datetime | None,
 ) -> None:
     claimed = await repo.claim_job(
         static_pool,
         job_id,
         allow_running_reclaim=allow_stale_running_claim,
-        stale_threshold_seconds=repo._ORPHAN_THRESHOLD_S,
+        stale_threshold_seconds=0 if allow_stale_running_claim else repo._ORPHAN_THRESHOLD_S,
+        expected_running_lease_at=expected_running_lease_at,
     )
     if claimed is None:
         logger.info("Job %s already terminal or gone; skipping", job_id)

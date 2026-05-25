@@ -361,12 +361,15 @@ async def claim_job(
     *,
     allow_running_reclaim: bool = False,
     stale_threshold_seconds: int = 120,
+    expected_running_lease_at: Optional[datetime] = None,
 ) -> Optional[asyncpg.Record]:
     """Single-winner start.
 
     Normal execution only claims ``pending`` jobs. Startup recovery may also
-    reclaim ``running`` jobs, but only when they are stale by heartbeat/start
-    age so overlapping workers cannot concurrently resume the same live job.
+    reclaim ``running`` jobs. When reclaiming a running row, pass
+    ``expected_running_lease_at`` from the orphan sweep to enforce a
+    single-winner compare-and-swap (the first worker bumps heartbeat and later
+    contenders no longer match).
     """
     async with pool.acquire() as conn:
         return await conn.fetchrow(
@@ -381,8 +384,10 @@ async def claim_job(
                 OR (
                     $2::boolean
                     AND status = 'running'
-                    AND COALESCE(heartbeat_at, started_at, created_at)
-                        < NOW() - ($3::int * INTERVAL '1 second')
+                    AND (
+                        $4::timestamptz IS NULL
+                        OR COALESCE(heartbeat_at, started_at, created_at) = $4::timestamptz
+                    )
                 )
               )
             RETURNING {_JOB_COLS}
@@ -390,6 +395,7 @@ async def claim_job(
             job_id,
             allow_running_reclaim,
             stale_threshold_seconds,
+            expected_running_lease_at,
         )
 
 
@@ -491,7 +497,6 @@ async def list_jobs(
 async def find_orphaned_jobs(
     pool: asyncpg.Pool,
     *,
-    threshold_seconds: int,
     limit: int,
     after_created_at: Optional[datetime] = None,
     after_id: Optional[str] = None,
@@ -503,9 +508,9 @@ async def find_orphaned_jobs(
     ordered by ``(created_at, id)``; pass the last row's cursor back in to page
     through more than ``limit`` orphans.
 
-    ``running`` jobs are included only once their heartbeat/start timestamp is
-    older than ``threshold_seconds`` so recovery does not steal actively running
-    work from another live process.
+    ``running`` jobs are always included during startup recovery. Reclaim is
+    made safe by ``claim_job`` compare-and-swap on the last observed lease
+    timestamp, so only one worker can resume each row.
     """
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -514,11 +519,7 @@ async def find_orphaned_jobs(
             FROM data_source_ingestion_jobs
             WHERE (
                 status = 'pending'
-                OR (
-                    status = 'running'
-                    AND COALESCE(heartbeat_at, started_at, created_at)
-                        < NOW() - ($1::int * INTERVAL '1 second')
-                )
+                OR status = 'running'
             )
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
@@ -526,13 +527,12 @@ async def find_orphaned_jobs(
                     AND c.status <> 'disabled'
               )
               AND (
-                  $3::timestamptz IS NULL
-                  OR (created_at, id) > ($3::timestamptz, $4::uuid)
+                  $2::timestamptz IS NULL
+                  OR (created_at, id) > ($2::timestamptz, $3::uuid)
               )
             ORDER BY created_at ASC, id ASC
-            LIMIT $2
+            LIMIT $1
             """,
-            threshold_seconds,
             limit,
             after_created_at,
             after_id,

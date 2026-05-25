@@ -50,9 +50,9 @@ async def recover_orphaned_data_source_jobs(
     *,
     spawn: Spawn,
 ) -> int:
-    """Re-kick pending/running jobs whose heartbeat is stale. Returns the count.
+    """Re-kick non-terminal ingestion jobs during startup recovery.
 
-    Run once at startup. Pages through every stale job with a keyset cursor so a
+    Run once at startup. Pages through every job with a keyset cursor so a
     large backlog is fully recovered, not just the first page — leftover
     non-terminal rows would otherwise keep blocking fresh enqueues via the
     one-active-job index. Resumes the existing row (the overlap unique index
@@ -64,7 +64,6 @@ async def recover_orphaned_data_source_jobs(
     while True:
         rows = await repo.find_orphaned_jobs(
             static_pool,
-            threshold_seconds=_ORPHAN_THRESHOLD_S,
             limit=_RECOVERY_PAGE_SIZE,
             after_created_at=after_created_at,
             after_id=after_id,
@@ -84,6 +83,9 @@ async def recover_orphaned_data_source_jobs(
                     ts_pool,
                     job_id=row["id"],
                     allow_stale_running_claim=True,
+                    expected_running_lease_at=(
+                        row.get("heartbeat_at") or row.get("started_at") or row.get("created_at")
+                    ),
                 )
             )
         total += len(rows)
