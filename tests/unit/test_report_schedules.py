@@ -621,9 +621,10 @@ def test_tick_advances_from_fired_slot_not_now():
     assert next_at == expected == _dt(2026, 7, 1, 6, 0)  # July, not September
 
 
-def test_tick_tz_failure_records_visible_failed_run():
-    # When the depot timezone can't be resolved, the slot must not be silently
-    # skipped — a failed run is recorded and last_run_status reflects it.
+def test_tick_tz_failure_leaves_slot_due_for_retry():
+    # When the depot timezone can't be resolved, the slot is left due (next_run_at
+    # untouched, no run claimed) so a transient outage is retried next tick rather
+    # than the slot being advanced/dropped.
     scheduled_for = _dt(2026, 6, 1, 6, 0)
     now = _dt(2026, 6, 1, 12, 0)
     due_row = {
@@ -660,12 +661,8 @@ def test_tick_tz_failure_records_visible_failed_run():
         )
     )
 
-    # schedule_runs finalized as failed…
-    assert _finalize_status(store) == "failed"
-    # …and report_schedules.last_run_status reflects it (not a silent skip).
-    sched_updates = [
-        args
-        for q, args in store["executes"]
-        if "UPDATE report_schedules" in q and "last_run_status" in q
-    ]
-    assert sched_updates and sched_updates[0][3] == "failed"
+    # No run was claimed/finalized and next_run_at was NOT advanced — the slot
+    # stays due so the next tick retries it.
+    assert _finalize_status(store) is None
+    assert not _has_execute(store, "INSERT INTO schedule_runs")
+    assert not _has_execute(store, "UPDATE report_schedules")

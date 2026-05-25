@@ -107,7 +107,7 @@ CREATE INDEX IF NOT EXISTS schedule_runs_schedule_recent_idx
 CREATE TABLE IF NOT EXISTS schedule_run_deliveries (
     id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id              UUID        NOT NULL REFERENCES schedule_runs(id) ON DELETE CASCADE,
-    recipient_id        UUID        NOT NULL REFERENCES report_schedule_recipients(id) ON DELETE CASCADE,
+    recipient_id        UUID        REFERENCES report_schedule_recipients(id) ON DELETE SET NULL,
     email_address       TEXT        NOT NULL,
     format              TEXT        NOT NULL CHECK (format IN ('pdf', 'csv')),
     status              TEXT        NOT NULL CHECK (status IN (

@@ -11867,52 +11867,48 @@ async def _handle_agent_action_reject(
     if not db_pools:
         raise DatabaseError("Database not available")
 
+    # Lock the action row FOR UPDATE and skip the originating run in the SAME
+    # transaction, so a concurrent approve (which also locks the row FOR UPDATE)
+    # is serialized — it can't race the run/action state apart and strand a run.
     async with db_pools.ts.acquire() as conn:
-        action_row = await conn.fetchrow(
-            """
-            SELECT action_class, status, payload
-            FROM agent_actions
-            WHERE id = $1::uuid AND depot_id = $2::uuid
-            """,
-            action_id,
-            depot_id,
-        )
+        async with conn.transaction():
+            action_row = await conn.fetchrow(
+                """
+                SELECT action_class, status, payload
+                FROM agent_actions
+                WHERE id = $1::uuid AND depot_id = $2::uuid
+                FOR UPDATE
+                """,
+                action_id,
+                depot_id,
+            )
+            if not action_row or action_row["status"] not in ("pending", "shadow"):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Action {action_id} not found or not in a rejectable state",
+                )
 
-    if not action_row or action_row["status"] not in ("pending", "shadow"):
-        raise HTTPException(
-            status_code=404,
-            detail=f"Action {action_id} not found or not in a rejectable state",
-        )
+            if action_row["action_class"] == "report_draft":
+                payload = _coerce_payload(action_row["payload"])
+                run_id = payload.get("runId")
+                if run_id and payload.get("scheduleId"):
+                    skipped = await conn.fetchrow(
+                        "UPDATE schedule_runs SET status = 'skipped', completed_at = NOW() "
+                        "WHERE id = $1::uuid AND status = 'pending_approval' "
+                        "RETURNING schedule_id::text",
+                        str(run_id),
+                    )
+                    if skipped is not None:
+                        await _report_schedules._update_schedule_last_run_status(
+                            conn, str(run_id), "skipped"
+                        )
 
-    # Resolve the originating run BEFORE marking the action terminal, so a
-    # failure skipping the run cannot strand it in pending_approval behind a
-    # no-longer-rejectable action (symmetric to the approve→deliver ordering).
-    # skip_pending_run is idempotent and only touches pending_approval runs.
-    if action_row["action_class"] == "report_draft":
-        payload = _coerce_payload(action_row["payload"])
-        run_id = payload.get("runId")
-        if run_id and payload.get("scheduleId"):
-            await _report_schedules.skip_pending_run(db_pools, run_id=str(run_id))
-
-    async with db_pools.ts.acquire() as conn:
-        updated = await conn.fetchrow(
-            """
-            UPDATE agent_actions
-            SET status = 'rejected', resolved_at = NOW()
-            WHERE id = $1::uuid
-              AND depot_id = $2::uuid
-              AND status IN ('pending', 'shadow')
-            RETURNING id::text
-            """,
-            action_id,
-            depot_id,
-        )
-
-    if not updated:
-        raise HTTPException(
-            status_code=409,
-            detail="Action could not be rejected because its status changed",
-        )
+            await conn.execute(
+                "UPDATE agent_actions SET status = 'rejected', resolved_at = NOW() "
+                "WHERE id = $1::uuid AND depot_id = $2::uuid",
+                action_id,
+                depot_id,
+            )
 
     return {"actionId": action_id, "actionStatus": "rejected"}
 
@@ -12058,10 +12054,19 @@ async def _handle_report_schedule_update(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if dry_run:
         return {"valid": True}
-    try:
-        next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
-    except ScheduleValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Only recompute next_run_at when the patch changes cadence/activation.
+    # A metadata-only edit (name, kind, groupBy, recipients) must keep the
+    # existing next_run_at so an overdue pending slot isn't silently jumped
+    # forward and dropped.
+    _cadence_keys = {"frequency", "dayOfMonth", "dayOfWeek", "timeOfDay", "isActive"}
+    if isinstance(patch, dict) and _cadence_keys & set(patch.keys()):
+        try:
+            next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
+        except ScheduleValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        next_run_at = existing["next_run_at"]
 
     recipients_present = isinstance(patch, dict) and "recipients" in patch
     async with db_pools.ts.acquire() as conn:
@@ -12124,16 +12129,24 @@ async def _handle_report_schedule_run_now(
         run_id = await _report_schedules.claim_run(conn, schedule_id, now_utc)
 
     if run_id is not None:
-        terminal_status = await _report_schedules.execute_schedule_run(
-            db_pools,
-            schedule_row=schedule,
-            run_id=run_id,
-            tz_name=timezone_name,
-            email_client=report_email_client,
-            generate_report=_generate_report_for_schedule,
-            default_from=report_email_from,
-            now_utc=now_utc,
-        )
+        try:
+            terminal_status = await _report_schedules.execute_schedule_run(
+                db_pools,
+                schedule_row=schedule,
+                run_id=run_id,
+                tz_name=timezone_name,
+                email_client=report_email_client,
+                generate_report=_generate_report_for_schedule,
+                default_from=report_email_from,
+                now_utc=now_utc,
+            )
+        except Exception as exc:  # noqa: BLE001 - record a clean failed run, not a stuck placeholder
+            logger.error("run_now failed schedule=%s: %s", schedule_id, exc, exc_info=True)
+            async with db_pools.ts.acquire() as conn:
+                await _report_schedules.finalize_run(
+                    conn, run_id, status="failed", error_message=str(exc)
+                )
+            terminal_status = "failed"
         async with db_pools.ts.acquire() as conn:
             await conn.execute(
                 "UPDATE report_schedules SET last_run_at = $2, last_run_status = $3, "

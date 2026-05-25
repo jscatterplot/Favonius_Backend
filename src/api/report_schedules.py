@@ -63,8 +63,11 @@ def _iso_z(value: Optional[datetime]) -> Optional[str]:
 
 
 def delivery_to_wire(row: "asyncpg.Record") -> dict:
+    # recipient_id is null when the recipient was later removed (FK ON DELETE
+    # SET NULL keeps the historical delivery row); the snapshotted email_address
+    # / status still describe the attempt.
     return {
-        "recipientId": str(row["recipient_id"]),
+        "recipientId": str(row["recipient_id"]) if row["recipient_id"] is not None else None,
         "emailAddress": row["email_address"],
         "format": row["format"],
         "status": row["status"],
@@ -401,13 +404,22 @@ async def claim_run(
 async def _update_schedule_last_run_status(
     conn: "asyncpg.Connection", run_id: str, status: str
 ) -> None:
-    """Keep ``report_schedules.last_run_status`` in sync after a run is resolved."""
+    """Keep ``report_schedules.last_run_status`` in sync after a run is resolved.
+
+    Only mutates the summary when this run is the schedule's most recent slot, so
+    resolving an older pending draft (approved/rejected out of order) cannot
+    regress ``last_run_status`` behind a newer run that already ran.
+    """
     await conn.execute(
         """
         UPDATE report_schedules rs
-        SET last_run_status = $2, updated_at = NOW()
+        SET last_run_status = $2, last_run_at = sr.scheduled_for, updated_at = NOW()
         FROM schedule_runs sr
-        WHERE sr.id = $1::uuid AND rs.id = sr.schedule_id
+        WHERE sr.id = $1::uuid
+          AND rs.id = sr.schedule_id
+          AND sr.scheduled_for >= (
+              SELECT MAX(scheduled_for) FROM schedule_runs WHERE schedule_id = sr.schedule_id
+          )
         """,
         run_id,
         status,
@@ -668,8 +680,20 @@ async def _deliver_to_recipients(
         f"<p>Period: {period_label}</p>"
     )
 
+    # Recipients already delivered for this run (e.g. a prior approve attempt that
+    # partially succeeded) must not be emailed again on retry.
+    async with pools.ts.acquire() as conn:
+        sent_rows = await conn.fetch(
+            "SELECT DISTINCT recipient_id FROM schedule_run_deliveries "
+            "WHERE run_id = $1::uuid AND status = 'sent' AND recipient_id IS NOT NULL",
+            run_id,
+        )
+    already_sent = {str(r["recipient_id"]) for r in sent_rows}
+
     all_sent = True
     for rec in recipient_rows:
+        if str(rec["id"]) in already_sent:
+            continue  # already delivered on a previous attempt
         fmt = rec["format"]
         status = "failed"
         provider_message_id: Optional[str] = None
@@ -835,21 +859,32 @@ async def execute_schedule_run(
         )
 
     if mode == "auto_notify":
-        async with pools.ts.acquire() as conn:
-            await emit_report_draft_action(
-                conn,
-                depot_id=depot_id,
-                schedule_id=schedule_id,
-                report_id=report_id,
-                run_id=run_id,
-                mode="auto_notify",
-                status="executed",
-                period_start=period_start,
-                period_end=period_end,
-                kind=schedule_row["kind"],
-                group_by=schedule_row["group_by"],
-                title=title,
-                summary=f"Sent '{schedule_row['name']}' for {period_start}–{period_end}",
+        # The report is already delivered; the informational action is a
+        # best-effort feed entry. A failure here must not flip a delivered run
+        # to 'failed' (which would trigger retries + duplicate sends).
+        try:
+            async with pools.ts.acquire() as conn:
+                await emit_report_draft_action(
+                    conn,
+                    depot_id=depot_id,
+                    schedule_id=schedule_id,
+                    report_id=report_id,
+                    run_id=run_id,
+                    mode="auto_notify",
+                    status="executed",
+                    period_start=period_start,
+                    period_end=period_end,
+                    kind=schedule_row["kind"],
+                    group_by=schedule_row["group_by"],
+                    title=title,
+                    summary=f"Sent '{schedule_row['name']}' for {period_start}–{period_end}",
+                )
+        except Exception as exc:  # noqa: BLE001 - informational write is non-blocking
+            logger.warning(
+                "report worker: auto_notify action write failed (delivery already done) "
+                "schedule=%s: %s",
+                schedule_id,
+                exc,
             )
 
     async with pools.ts.acquire() as conn:
@@ -996,75 +1031,90 @@ async def _tick(
     for schedule in due:
         schedule_id = str(schedule["id"])
         scheduled_for = schedule["next_run_at"]
-        tz_name: Optional[str] = None
         try:
             tz_name = await get_timezone(str(schedule["depot_id"]))
-        except Exception as exc:  # noqa: BLE001 - skip depots we can't resolve
-            logger.warning("report worker: cannot resolve tz for schedule %s: %s", schedule_id, exc)
+        except Exception as exc:  # noqa: BLE001 - transient/static failure
+            # Timezone unresolved (depot deleted or static DB unreachable). Leave
+            # next_run_at untouched so the slot stays due and a transient outage is
+            # retried on the next tick rather than silently dropped.
+            logger.warning(
+                "report worker: cannot resolve tz for schedule %s; leaving slot due: %s",
+                schedule_id,
+                exc,
+            )
+            continue
+
+        async with pools.ts.acquire() as conn:
+            run_id = await claim_run(conn, schedule_id, scheduled_for)
 
         terminal_status: Optional[str] = None
-        if tz_name is not None:
-            async with pools.ts.acquire() as conn:
-                run_id = await claim_run(conn, schedule_id, scheduled_for)
-
-            if run_id is not None:
-                try:
-                    terminal_status = await execute_schedule_run(
-                        pools,
-                        schedule_row=schedule,
-                        run_id=run_id,
-                        tz_name=tz_name,
-                        email_client=email_client,
-                        generate_report=generate_report,
-                        default_from=default_from,
-                        now_utc=now_utc,
-                        scheduled_for=scheduled_for,
-                    )
-                    executed += 1
-                except Exception as exc:  # noqa: BLE001 - one bad run must not stall the worker
-                    logger.error(
-                        "report worker: run failed schedule=%s: %s", schedule_id, exc, exc_info=True
-                    )
-                    async with pools.ts.acquire() as conn:
-                        await finalize_run(conn, run_id, status="failed", error_message=str(exc))
-                    terminal_status = "failed"
-        else:
-            # Timezone unresolved (depot deleted or static DB unreachable). Record
-            # a visible failed run for this slot rather than silently advancing, so
-            # the miss shows up in last_run_status / the runs list and an operator
-            # can act on it. The ts pool is independent of the static pool that
-            # resolves the tz, so this write still succeeds during a static outage.
-            async with pools.ts.acquire() as conn:
-                run_id = await claim_run(conn, schedule_id, scheduled_for)
-                if run_id is not None:
-                    await finalize_run(
-                        conn,
-                        run_id,
-                        status="failed",
-                        error_message="could not resolve depot timezone",
-                    )
-                    terminal_status = "failed"
-
-        # Advance next_run_at from the slot we just fired (NOT from now), so a
-        # backlog after an outage is worked off one missed slot per tick instead
-        # of skipping the intermediate periods. compute_next_run_at returns the
-        # first occurrence strictly after scheduled_for; while that is still in
-        # the past the schedule stays due and the next tick fires it.
-        next_at: Optional[datetime] = None
-        if tz_name is not None:
+        if run_id is not None:
             try:
-                next_at = compute_next_run_at(
-                    scheduled_for,
-                    frequency=schedule["frequency"],
-                    time_of_day=schedule["time_of_day"],
+                terminal_status = await execute_schedule_run(
+                    pools,
+                    schedule_row=schedule,
+                    run_id=run_id,
                     tz_name=tz_name,
-                    day_of_month=schedule["day_of_month"],
-                    day_of_week=schedule["day_of_week"],
+                    email_client=email_client,
+                    generate_report=generate_report,
+                    default_from=default_from,
+                    now_utc=now_utc,
+                    scheduled_for=scheduled_for,
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("report worker: reschedule failed schedule=%s: %s", schedule_id, exc)
-        if next_at is None:
-            next_at = now_utc + timedelta(hours=1)
+                executed += 1
+            except Exception as exc:  # noqa: BLE001 - one bad run must not stall the worker
+                logger.error(
+                    "report worker: run failed schedule=%s: %s", schedule_id, exc, exc_info=True
+                )
+                async with pools.ts.acquire() as conn:
+                    await finalize_run(conn, run_id, status="failed", error_message=str(exc))
+                terminal_status = "failed"
+        else:
+            # The slot already has a run row. Advance past it only once that run has
+            # reached a terminal state. An in-flight placeholder keeps the slot due
+            # (so we never double-fire); a stale placeholder from a crashed worker is
+            # abandoned after an hour so a single crash can't freeze the schedule.
+            async with pools.ts.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT completed_at, triggered_at FROM schedule_runs "
+                    "WHERE schedule_id = $1::uuid AND scheduled_for = $2",
+                    schedule_id,
+                    scheduled_for,
+                )
+            unfinished = existing is not None and existing["completed_at"] is None
+            in_flight = (
+                unfinished
+                and existing["triggered_at"] is not None
+                and existing["triggered_at"] > now_utc - timedelta(hours=1)
+            )
+            if in_flight:
+                continue  # let the owning worker finish; leave next_run_at as-is
+            if unfinished:
+                logger.warning(
+                    "report worker: abandoning stale unfinished run for schedule %s slot %s",
+                    schedule_id,
+                    scheduled_for,
+                )
+
+        # Advance next_run_at from the slot just handled (NOT from now), so a backlog
+        # after an outage is worked off one missed slot per tick. Never fabricate a
+        # fallback time on failure — leave the slot due so it is retried, not dropped.
+        try:
+            next_at = compute_next_run_at(
+                scheduled_for,
+                frequency=schedule["frequency"],
+                time_of_day=schedule["time_of_day"],
+                tz_name=tz_name,
+                day_of_month=schedule["day_of_month"],
+                day_of_week=schedule["day_of_week"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "report worker: reschedule failed schedule=%s; leaving slot due: %s",
+                schedule_id,
+                exc,
+            )
+            continue
 
         async with pools.ts.acquire() as conn:
             if terminal_status is not None:
@@ -1077,7 +1127,8 @@ async def _tick(
                     terminal_status,
                 )
             else:
-                # Slot already handled elsewhere; only advance if still on it.
+                # Slot already terminal (handled by another worker); only advance
+                # if still on it.
                 await conn.execute(
                     "UPDATE report_schedules SET next_run_at = $2, updated_at = NOW() "
                     "WHERE id = $1::uuid AND next_run_at = $3",
