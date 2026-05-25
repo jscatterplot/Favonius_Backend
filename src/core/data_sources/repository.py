@@ -493,12 +493,16 @@ async def find_orphaned_jobs(
     after_created_at: Optional[datetime] = None,
     after_id: Optional[str] = None,
 ) -> list[asyncpg.Record]:
-    """Pending/running jobs whose heartbeat is stale — candidates for recovery.
+    """Pending/running jobs that should be re-kicked during startup recovery.
 
     Jobs whose parent connection has been disabled are excluded so a soft-deleted
     connection is never resurrected by the startup sweep. Results are keyset-
     ordered by ``(created_at, id)``; pass the last row's cursor back in to page
     through more than ``limit`` orphans.
+
+    ``running`` jobs are included regardless of heartbeat age because recovery is
+    executed once during process startup: after a crash/restart every non-terminal
+    job from the previous process is orphaned, including freshly-started rows.
     """
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -507,11 +511,7 @@ async def find_orphaned_jobs(
             FROM data_source_ingestion_jobs
             WHERE (
                 status = 'pending'
-                OR (
-                    status = 'running'
-                    AND COALESCE(heartbeat_at, started_at, created_at)
-                        < NOW() - make_interval(secs => $1)
-                )
+                OR status = 'running'
             )
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
