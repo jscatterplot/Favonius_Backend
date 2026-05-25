@@ -377,6 +377,30 @@ async def run_turn(
         await agent_runs_step(ts_pool, run_id, "extract_plan", plan.model_dump())
         await _emit_step("extract_plan")
 
+        # 1a. Empty-subjects refusal short-circuit.
+        # An empty ``subjects`` list is the extraction stage's documented
+        # refusal / out-of-scope signal (see the "Refusal / out-of-scope" rule
+        # in src/api/agent/llm.py's extraction prompt). There is nothing to
+        # resolve or aggregate, and ``compile_consumption_by_user`` raises on an
+        # empty subject set by contract — so close the run as a graceful refusal
+        # here rather than letting it fall through to the compiler and surface
+        # as a 502. Mirrors the planner ``refuse`` branch above.
+        if not plan.subjects:
+            reply = AgentReply(
+                run_id=run_id,
+                status="not_found",
+                text=(
+                    "I can only answer questions about depot charging and "
+                    "consumption for a specific driver, vehicle, depot, or card. "
+                    "I couldn't find anything like that to look up in your "
+                    "request — try naming a driver or vehicle, or rephrasing."
+                ),
+                intent=plan.intent,
+            )
+            await agent_runs_close(ts_pool, run_id, "not_found", reply)
+            await _emit_answer_safe(sse, reply, run_id)
+            return reply
+
         # 2. Resolve entity mentions to UUIDs.
         resolved = await resolve_entities(plan.subjects, auth, static_pool)
         await agent_runs_step(
