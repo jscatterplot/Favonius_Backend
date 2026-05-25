@@ -92,7 +92,7 @@ async def _run(
         static_pool,
         job_id,
         allow_running_reclaim=allow_stale_running_claim,
-        stale_threshold_seconds=120,
+        stale_threshold_seconds=repo._ORPHAN_THRESHOLD_S,
     )
     if claimed is None:
         logger.info("Job %s already terminal or gone; skipping", job_id)
