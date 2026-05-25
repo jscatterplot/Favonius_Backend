@@ -106,7 +106,7 @@ async def test_startup_recovery_reclaims_running_without_stale_threshold(monkeyp
     )
 
     assert claim.await_args.kwargs["allow_running_reclaim"] is True
-    assert claim.await_args.kwargs["stale_threshold_seconds"] == repo._ORPHAN_THRESHOLD_S
+    assert claim.await_args.kwargs["stale_threshold_seconds"] == 0
 
 
 async def test_missing_connection_fails(monkeypatch, patched):
