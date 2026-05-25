@@ -452,7 +452,7 @@ async def insert_delivery(
     conn: "asyncpg.Connection",
     *,
     run_id: str,
-    recipient_id: str,
+    recipient_id: Optional[str],
     email_address: str,
     fmt: str,
     status: str,
@@ -997,7 +997,9 @@ async def append_delivery_status_from_webhook(
     await insert_delivery(
         conn,
         run_id=str(latest["run_id"]),
-        recipient_id=str(latest["recipient_id"]),
+        recipient_id=(
+            str(latest["recipient_id"]) if latest["recipient_id"] is not None else None
+        ),
         email_address=latest["email_address"],
         fmt=latest["format"],
         status=mapped,
@@ -1077,7 +1079,7 @@ async def _tick(
             # abandoned after an hour so a single crash can't freeze the schedule.
             async with pools.ts.acquire() as conn:
                 existing = await conn.fetchrow(
-                    "SELECT completed_at, triggered_at FROM schedule_runs "
+                    "SELECT id::text, completed_at, triggered_at FROM schedule_runs "
                     "WHERE schedule_id = $1::uuid AND scheduled_for = $2",
                     schedule_id,
                     scheduled_for,
@@ -1092,10 +1094,36 @@ async def _tick(
                 continue  # let the owning worker finish; leave next_run_at as-is
             if unfinished:
                 logger.warning(
-                    "report worker: abandoning stale unfinished run for schedule %s slot %s",
+                    "report worker: retrying stale unfinished run for schedule %s slot %s",
                     schedule_id,
                     scheduled_for,
                 )
+                stale_run_id = existing["id"]
+                try:
+                    terminal_status = await execute_schedule_run(
+                        pools,
+                        schedule_row=schedule,
+                        run_id=stale_run_id,
+                        tz_name=tz_name,
+                        email_client=email_client,
+                        generate_report=generate_report,
+                        default_from=default_from,
+                        now_utc=now_utc,
+                        scheduled_for=scheduled_for,
+                    )
+                    executed += 1
+                except Exception as exc:  # noqa: BLE001 - one bad run must not stall the worker
+                    logger.error(
+                        "report worker: stale run retry failed schedule=%s: %s",
+                        schedule_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    async with pools.ts.acquire() as conn:
+                        await finalize_run(
+                            conn, stale_run_id, status="failed", error_message=str(exc)
+                        )
+                    terminal_status = "failed"
 
         # Advance next_run_at from the slot just handled (NOT from now), so a backlog
         # after an outage is worked off one missed slot per tick. Never fabricate a
