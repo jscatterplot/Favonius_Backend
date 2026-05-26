@@ -1092,7 +1092,7 @@ if is_agent_search_enabled():
 
 
 # ── Data Sources (feature-flagged) ─────────────────────────────────────────
-# Mounted behind ``DATA_SOURCES_ENABLED`` (default off). Self-serve external
+# Mounted behind ``DATA_SOURCES_ENABLED`` (default on). Self-serve external
 # data-source connections (Kempower ChargEye first) with encrypted credentials,
 # durable scheduled ingestion, and a dynamic provider catalogue. The router
 # inherits the JWT + geo-block pipeline above.

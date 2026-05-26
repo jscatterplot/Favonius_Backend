@@ -10,9 +10,9 @@ from src.security.credential_cipher import is_configured
 def is_data_sources_enabled() -> bool:
     """Return True iff the Data Sources router + scheduler should be active.
 
-    Default off. Set ``DATA_SOURCES_ENABLED=true`` to enable.
+    Default on. Set ``DATA_SOURCES_ENABLED=false`` to disable.
     """
-    return os.environ.get("DATA_SOURCES_ENABLED", "false").lower() == "true"
+    return os.environ.get("DATA_SOURCES_ENABLED", "true").lower() == "true"
 
 
 def is_data_sources_ready() -> bool:
