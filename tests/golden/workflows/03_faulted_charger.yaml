@@ -1,0 +1,137 @@
+# Sprint 5 scenario 03 — vehicle plugged into a Faulted charger.
+#
+# BUS-301 is plugged into CP-301 which is reporting Faulted. A free
+# 80 kW charger (CP-302) on a different circuit is available. The
+# agent emits a swap_charger proposal moving BUS-301 to CP-302.
+
+id: readiness-03-faulted-charger
+description: >
+  One vehicle on a faulted charger with a clean alternate. Expected:
+  one swap_charger proposal targeting BUS-301, no constraint
+  violations filtered.
+severity: blocking
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+workflow:
+  id: "10000000-0000-4000-8000-00000000d003"
+  name: daily_readiness_check
+  version: "1.0.0"
+  description: Daily readiness check (PRD §6.1).
+  prompt: |
+    You confirm every vehicle will be ready for its assigned route at
+    scheduled departure, and surface anything that won't.
+  allowed_tools:
+    - get_scheduled_departures
+    - get_vehicle_state
+    - get_charger_state
+  parameters:
+    lead_time_min: 60
+    soc_tolerance_pct: 1.0
+    escalation_threshold: 3
+
+# draft_and_wait: proposals are a graduated-tier feature (PRD §9.1).
+# At `inform` this workflow is a read-only brief and emits no actions;
+# this scenario exercises the post-graduation proposal path.
+permission_tier: draft_and_wait
+
+graph_snapshot:
+  depot:
+    depot_id: "11111111-1111-4111-8111-1111111100d3"
+    name: "Kaunas depot"
+    latitude: 54.8985
+    longitude: 23.9036
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000003d1"
+      external_id: "BUS-301"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "ccccccc0-0000-4000-8000-0000000003d1"
+      ocpp_id: "CP-301"
+      rated_kw: 80.0
+      status: "Faulted"
+    - charger_id: "ccccccc0-0000-4000-8000-0000000003d2"
+      ocpp_id: "CP-302"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000003d1"
+      route_id: "R-301"
+      departure_time: "+2h"
+      return_time: "+12h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+
+  telemetry:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000003d1"
+      charger_id: "ccccccc0-0000-4000-8000-0000000003d1"
+      time: "-5m"
+      soc: 0.92
+      is_plugged: true
+      charging_kw: 0.0
+
+llm_trace:
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_03_sched"
+        name: get_scheduled_departures
+        input: {}
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_03_charger"
+        name: get_charger_state
+        input:
+          charger_id: "ccccccc0-0000-4000-8000-0000000003d1"
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_03_emit"
+        name: emit_decision
+        input:
+          summary: >-
+            BUS-301 plugged into faulted CP-301; recommend swap to CP-302
+            (Available, 80 kW).
+          rule_applied: "charger_fault_swap"
+          proposed_actions:
+            - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000003d1"
+              type: "swap_charger"
+              from_charger_id: "ccccccc0-0000-4000-8000-0000000003d1"
+              to_charger_id: "ccccccc0-0000-4000-8000-0000000003d2"
+              expected_departure_soc: 0.99
+              justification: "Source charger CP-301 is Faulted; CP-302 is Available with matching kW."
+          coverage:
+            vehicles_checked: 1
+            chargers_checked: 2
+            routes_checked: 1
+
+expected:
+  disposition: pending
+  rule_applied: charger_fault_swap
+  output:
+    summary_contains: "faulted"
+    proposed_action_types:
+      - swap_charger
+    proposed_action_count_min: 1
+    proposed_action_count_max: 1
+    must_propose_for_vehicle:
+      - vehicle_id: "aaaaaaa0-0000-4000-8000-0000000003d1"
+        action_type_contains: "swap"
+    filtered_violations_max: 0
+    coverage:
+      vehicles_checked: 1
+      chargers_checked: 2
+      routes_checked: 1
+  tool_calls:
+    count_min: 2
+    names_in_order:
+      - get_scheduled_departures
+      - get_charger_state
+    all_ok: true

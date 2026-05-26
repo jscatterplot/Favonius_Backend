@@ -1,0 +1,129 @@
+# Sprint 5 scenario 11 — inform-tier read-only brief with a real problem.
+#
+# Same undercharge situation as scenario 02 (BUS-1101 projected below
+# its required SoC), but the depot's permission tier for this workflow
+# is the launch default `inform`. Per PRD §9.1, at `inform` the agent
+# only describes — no actions are proposed. So the agent surfaces the
+# exception in the summary but emits ZERO proposed_actions.
+#
+# This is the read-only side of the tier contract: scenario 02 proves
+# the graduated `draft_and_wait` proposal path; this one proves that the
+# very same problem yields a describe-only brief before graduation. A
+# regression that emits proposals at `inform` would flip this to a
+# non-empty proposed_actions list and fail the count assertion.
+
+id: readiness-11-inform-tier-brief
+description: >
+  Undercharged vehicle at the launch `inform` tier. Expected: the
+  summary names the exception, but proposed_actions is empty — `inform`
+  is a read-only brief (PRD §9.1).
+severity: blocking
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+workflow:
+  id: "10000000-0000-4000-8000-00000000d011"
+  name: daily_readiness_check
+  version: "1.0.0"
+  description: Daily readiness check (PRD §6.1).
+  prompt: |
+    You confirm every vehicle will be ready for its assigned route at
+    scheduled departure, and surface anything that won't. At the
+    `inform` tier you describe only — emit no proposed_actions.
+  allowed_tools:
+    - get_scheduled_departures
+    - get_vehicle_state
+    - get_charger_state
+  parameters:
+    lead_time_min: 60
+    soc_tolerance_pct: 1.0
+    escalation_threshold: 3
+
+permission_tier: inform
+
+graph_snapshot:
+  depot:
+    depot_id: "11111111-1111-4111-8111-111111111101"
+    name: "Vilnius depot"
+    latitude: 54.6872
+    longitude: 25.2797
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001101"
+      external_id: "BUS-1101"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "ccccccc0-0000-4000-8000-000000001101"
+      ocpp_id: "CP-1101"
+      rated_kw: 80.0
+      status: "Available"
+
+  schedules:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001101"
+      route_id: "R-1101"
+      departure_time: "+90m"
+      return_time: "+12h"
+      energy_kwh: 260.0
+      required_soc: 0.85
+
+  telemetry:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001101"
+      charger_id: "ccccccc0-0000-4000-8000-000000001101"
+      time: "-5m"
+      soc: 0.55
+      is_plugged: true
+      charging_kw: 60.0
+
+llm_trace:
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_11_sched"
+        name: get_scheduled_departures
+        input: {}
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_11_veh"
+        name: get_vehicle_state
+        input:
+          vehicle_id: "aaaaaaa0-0000-4000-8000-000000001101"
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_11_emit"
+        name: emit_decision
+        input:
+          summary: >-
+            BUS-1101 projected 71% SoC vs 85% required at 06:30. At the
+            inform tier this is a read-only brief — no action proposed;
+            graduating this workflow to draft_and_wait would let the
+            agent propose extending charging.
+          rule_applied: "undercharge_inform"
+          proposed_actions: []
+          coverage:
+            vehicles_checked: 1
+            chargers_checked: 1
+            routes_checked: 1
+
+expected:
+  disposition: pending
+  rule_applied: undercharge_inform
+  output:
+    summary_contains: "BUS-1101"
+    proposed_action_count_max: 0
+    filtered_violations_max: 0
+    coverage:
+      vehicles_checked: 1
+      chargers_checked: 1
+      routes_checked: 1
+  tool_calls:
+    count_min: 2
+    names_in_order:
+      - get_scheduled_departures
+      - get_vehicle_state
+    all_ok: true

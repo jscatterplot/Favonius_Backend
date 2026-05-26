@@ -64,6 +64,52 @@ async def get_workflow(pool: Any, name: str) -> Workflow:
     return _workflow_from_row(row)
 
 
+async def upsert_workflow(
+    pool: Any,
+    *,
+    name: str,
+    version: str,
+    description: str,
+    prompt: str,
+    allowed_tools: list[str],
+    parameters: dict[str, Any],
+) -> Workflow:
+    """Upsert a workflow row by unique ``name``.
+
+    Used by the per-workflow startup registration paths (sprint 5 +
+    later workflows). The row is fully rewritten on every call so the
+    DB always tracks the code's prompt + tool allow-list + parameter
+    defaults — drift is impossible.
+
+    Returns the resulting :class:`Workflow` (insert or update — the
+    returned row reflects whichever happened).
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            INSERT INTO workflows
+                (name, version, description, prompt, allowed_tools, parameters,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW())
+            ON CONFLICT (name) DO UPDATE SET
+                version       = EXCLUDED.version,
+                description   = EXCLUDED.description,
+                prompt        = EXCLUDED.prompt,
+                allowed_tools = EXCLUDED.allowed_tools,
+                parameters    = EXCLUDED.parameters,
+                updated_at    = NOW()
+            RETURNING {_WORKFLOW_COLUMNS}
+            """,
+            name,
+            version,
+            description,
+            prompt,
+            list(allowed_tools),
+            json.dumps(parameters),
+        )
+    return _workflow_from_row(row)
+
+
 # ── workflow_tiers ────────────────────────────────────────────────────────
 
 
@@ -152,6 +198,58 @@ async def set_tier(
             rule.requires_human_signoff,
             rule.next_tier.value if rule.next_tier else None,
         )
+
+
+async def insert_default_tiers_bulk(
+    pool: Any,
+    workflow_id: UUID,
+    depot_ids: list[UUID],
+    tier: PermissionTier,
+    rule: GraduationRule,
+) -> int:
+    """Seed launch-default tier rows for many depots in one statement.
+
+    Insert-only contract (``ON CONFLICT DO NOTHING`` — existing rows are
+    never touched, so a concurrent graduation can't be clobbered back to
+    the default), but does every depot in a single round-trip via
+    ``unnest``. This is what the startup seed uses so cold-start time
+    does not grow linearly with the depot count (no per-depot awaited
+    INSERT in a loop).
+
+    Returns the number of rows actually inserted (depots that already
+    had a row are skipped and not counted).
+    """
+    if not depot_ids:
+        return 0
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            INSERT INTO workflow_tiers (
+                workflow_id,
+                depot_id,
+                tier,
+                min_decisions,
+                max_override_rate,
+                max_edit_rate,
+                requires_human_signoff,
+                next_tier,
+                updated_at
+            )
+            SELECT $1, d, $3, $4, $5, $6, $7, $8, NOW()
+            FROM unnest($2::uuid[]) AS d
+            ON CONFLICT (workflow_id, depot_id) DO NOTHING
+            RETURNING depot_id
+            """,
+            workflow_id,
+            list(depot_ids),
+            tier.value,
+            rule.min_decisions,
+            rule.max_override_rate,
+            rule.max_edit_rate,
+            rule.requires_human_signoff,
+            rule.next_tier.value if rule.next_tier else None,
+        )
+    return len(rows)
 
 
 # ── decisions ─────────────────────────────────────────────────────────────

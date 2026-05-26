@@ -17,7 +17,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from datetime import time as _dt_time
 from datetime import timedelta, timezone
@@ -84,6 +84,7 @@ from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_ad
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import (
     decode_jwt_for_rate_limit,
+    get_user_email,
     get_user_organization_id,
     get_user_role,
     is_platform_admin,
@@ -600,6 +601,41 @@ async def lifespan(app: FastAPI):
     # Harmless no-op when the agent is idle (empty in-process counters).
     _create_background_task(_agent_budget_reconcile_loop())
     logger.info("Agent token-budget reconcile loop started")
+    # ── Depot agent — daily readiness workflow (sprint 5) ────────────────────
+    # Behind DEPOT_AGENT_ENABLED. Upserts the `daily_readiness_check` row in
+    # `workflows` and seeds `workflow_tiers` at tier='inform' for every depot
+    # the static schema knows about. Idempotent on every cold start. Spawned as
+    # a background task (like the schedulers above) so registration never delays
+    # the lifespan `yield` / readiness probe; failures log but never affect the
+    # rest of the API.
+    from .agent_workflows.feature_flag import is_depot_agent_enabled  # noqa: PLC0415
+
+    if is_depot_agent_enabled():
+
+        async def _register_readiness_workflow() -> None:
+            try:
+                from .agent_workflows.readiness_workflow import (  # noqa: PLC0415
+                    register_daily_readiness_workflow,
+                )
+
+                result = await register_daily_readiness_workflow(
+                    static_pool=static_pool,
+                    ts_pool=ts_pool,
+                )
+                logger.info(
+                    "Daily readiness workflow registered: %s "
+                    "(tiers_seeded=%d, depots_seen=%d)",
+                    result["workflow_id"],
+                    result["tiers_seeded"],
+                    result["depots_seen"],
+                )
+            except Exception as exc:  # never affect the running API
+                logger.error(
+                    "Failed to register daily readiness workflow: %s", exc, exc_info=True
+                )
+
+        _create_background_task(_register_readiness_workflow())
+        logger.info("Daily readiness workflow registration scheduled")
 
     yield
 
@@ -1395,6 +1431,9 @@ class NotificationAlertItem(BaseModel):
         ..., description="Times the dedup_key has fired since first_seen_at"
     )
     acknowledged_by: Optional[str] = Field(None, description="User UUID who acknowledged")
+    acknowledged_by_email: Optional[str] = Field(
+        None, description="Email of the user who acknowledged (set by alerts.acknowledge command)"
+    )
     resolved_at: Optional[str] = Field(None, description="ISO 8601 if status == resolved")
     last_notified_at: Optional[str] = Field(None, description="ISO 8601 or null if not yet sent")
 
@@ -1416,6 +1455,15 @@ class AlertsResponse(BaseModel):
         default_factory=list,
         description="Aggregated alerts from the notification_alerts pipeline (active or acknowledged)",
     )
+
+
+class OrgAlertsListResponse(BaseModel):
+    """Paginated, org-scoped alert list (GET /alerts)."""
+
+    items: list[NotificationAlertItem]
+    total: int = Field(..., description="Total matching rows, for pagination")
+    page: int
+    page_size: int
 
 
 class NotificationRecipientItem(BaseModel):
@@ -8271,27 +8319,7 @@ async def get_depot_alerts(
 
                 rows = await _list_alerts(conn, UUID(depot_id), statuses=("active", "acknowledged"))
                 notification_alerts = [
-                    NotificationAlertItem(
-                        alert_id=str(a.id),
-                        organization_id=str(a.organization_id),
-                        depot_id=str(a.depot_id) if a.depot_id else None,
-                        depot_name=depot_name,
-                        alert_type=a.alert_type,
-                        severity=a.severity.value,
-                        subject=a.title,
-                        body=a.detail,
-                        dedup_key=a.dedup_key,
-                        status=a.status,
-                        first_seen_at=a.first_occurrence_at.isoformat(),
-                        last_seen_at=a.last_occurrence_at.isoformat(),
-                        occurrence_count=a.occurrence_count,
-                        acknowledged_by=str(a.acknowledged_by) if a.acknowledged_by else None,
-                        resolved_at=a.resolved_at.isoformat() if a.resolved_at else None,
-                        last_notified_at=(
-                            a.last_notified_at.isoformat() if a.last_notified_at else None
-                        ),
-                    )
-                    for a in rows
+                    _alert_to_notification_item(a, depot_name=depot_name) for a in rows
                 ]
         except asyncpg.UndefinedTableError:
             logger.debug("notification_alerts table not present; skipping")
@@ -12575,6 +12603,234 @@ async def _handle_agent_autonomy_set(
     }
 
 
+async def _handle_alerts_acknowledge(
+    params: dict,
+    depot_id: str,
+    dry_run: bool = False,
+    user: Optional[dict] = None,
+) -> dict:
+    """Transition an active alert to acknowledged.
+
+    Params: alert_id (UUID), acknowledged_by_email (email string, optional).
+    Looks up by alert_id within the caller's org and command depot_id.
+    """
+    alert_id = params.get("alert_id")
+    if not alert_id:
+        raise HTTPException(status_code=422, detail="params.alert_id is required")
+    validate_uuid(alert_id, "alert_id")
+
+    acknowledged_by_email = params.get("acknowledged_by_email")
+    if acknowledged_by_email is not None and not isinstance(acknowledged_by_email, str):
+        raise HTTPException(
+            status_code=422, detail="params.acknowledged_by_email must be a string or null"
+        )
+
+    role = get_user_role(user or {})
+    org_id = get_user_organization_id(user or {})
+    if role != "favonius_admin" and not org_id:
+        raise HTTPException(status_code=400, detail="organization_id not present in token")
+
+    actor_raw = (user or {}).get("sub")
+    if not actor_raw:
+        raise _forbidden("FORBIDDEN", "user id not present in token")
+    try:
+        actor_uuid = UUID(str(actor_raw))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="user sub claim is not a valid UUID")
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    from src.notifications import alerts as alerts_repo
+
+    async with db_pools.ts.acquire() as conn:
+        existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
+
+    if (
+        existing is None
+        or (role != "favonius_admin" and str(existing.organization_id) != str(org_id))
+        or not _alert_belongs_to_depot(existing.depot_id, depot_id)
+    ):
+        raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+
+    if existing.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Alert {alert_id} has status '{existing.status}'; only active alerts can be acknowledged",
+        )
+
+    effective_email = acknowledged_by_email
+    if effective_email is None and isinstance(user, dict):
+        effective_email = get_user_email(user)
+
+    if dry_run:
+        projected = _project_alert_acknowledged(
+            existing,
+            user_id=actor_uuid,
+            user_email=effective_email,
+        )
+        depot_name: Optional[str] = None
+        if existing.depot_id and db_pools:
+            try:
+                async with db_pools.static.acquire() as sc:
+                    row = await sc.fetchrow(
+                        "SELECT name FROM sites WHERE id = $1", existing.depot_id
+                    )
+                    depot_name = row["name"] if row else None
+            except Exception:
+                logger.warning(
+                    "Failed to fetch depot name for alert %s; omitting from response", alert_id
+                )
+        return _alert_to_notification_item(projected, depot_name=depot_name).model_dump()
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await alerts_repo.acknowledge_for_org(
+            conn,
+            UUID(alert_id),
+            org_id=UUID(str(existing.organization_id)),
+            user_id=actor_uuid,
+            user_email=effective_email,
+        )
+
+    if updated is None:
+        async with db_pools.ts.acquire() as conn:
+            current = await alerts_repo.get_by_id(conn, UUID(alert_id))
+        if current is not None and current.status != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Alert {alert_id} is already {current.status}",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Alert {alert_id} could not be acknowledged",
+        )
+
+    depot_name = None
+    if updated.depot_id and db_pools:
+        try:
+            async with db_pools.static.acquire() as sc:
+                row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
+                depot_name = row["name"] if row else None
+        except Exception:
+            logger.warning("Failed to fetch depot name for alert %s; omitting from response", alert_id)
+
+    return _alert_to_notification_item(updated, depot_name=depot_name).model_dump()
+
+
+async def _handle_alerts_resolve(
+    params: dict,
+    depot_id: str,
+    dry_run: bool = False,
+    user: Optional[dict] = None,
+) -> dict:
+    """Transition an active or acknowledged alert to resolved.
+
+    Params: alert_id (UUID), acknowledged_by_email (email string, optional).
+    Sets acknowledged_by/email via COALESCE so existing values are preserved.
+    Looks up by alert_id within the caller's org and command depot_id.
+    """
+    alert_id = params.get("alert_id")
+    if not alert_id:
+        raise HTTPException(status_code=422, detail="params.alert_id is required")
+    validate_uuid(alert_id, "alert_id")
+
+    acknowledged_by_email = params.get("acknowledged_by_email")
+    if acknowledged_by_email is not None and not isinstance(acknowledged_by_email, str):
+        raise HTTPException(
+            status_code=422, detail="params.acknowledged_by_email must be a string or null"
+        )
+
+    role = get_user_role(user or {})
+    org_id = get_user_organization_id(user or {})
+    if role != "favonius_admin" and not org_id:
+        raise HTTPException(status_code=400, detail="organization_id not present in token")
+
+    actor_raw = (user or {}).get("sub")
+    if not actor_raw:
+        raise _forbidden("FORBIDDEN", "user id not present in token")
+    try:
+        actor_uuid = UUID(str(actor_raw))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="user sub claim is not a valid UUID")
+
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    from src.notifications import alerts as alerts_repo
+
+    async with db_pools.ts.acquire() as conn:
+        existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
+
+    if (
+        existing is None
+        or (role != "favonius_admin" and str(existing.organization_id) != str(org_id))
+        or not _alert_belongs_to_depot(existing.depot_id, depot_id)
+    ):
+        raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+
+    if existing.status == "resolved":
+        raise HTTPException(
+            status_code=409, detail=f"Alert {alert_id} is already resolved"
+        )
+
+    effective_email = acknowledged_by_email
+    if effective_email is None and isinstance(user, dict):
+        effective_email = get_user_email(user)
+
+    if dry_run:
+        projected = _project_alert_resolved(
+            existing,
+            user_id=actor_uuid,
+            user_email=effective_email,
+        )
+        depot_name = None
+        if existing.depot_id and db_pools:
+            try:
+                async with db_pools.static.acquire() as sc:
+                    row = await sc.fetchrow(
+                        "SELECT name FROM sites WHERE id = $1", existing.depot_id
+                    )
+                    depot_name = row["name"] if row else None
+            except Exception:
+                logger.warning(
+                    "Failed to fetch depot name for alert %s; omitting from response", alert_id
+                )
+        return _alert_to_notification_item(projected, depot_name=depot_name).model_dump()
+
+    async with db_pools.ts.acquire() as conn:
+        updated = await alerts_repo.resolve_by_id(
+            conn,
+            UUID(alert_id),
+            org_id=UUID(str(existing.organization_id)),
+            user_id=actor_uuid,
+            user_email=effective_email,
+        )
+
+    if updated is None:
+        async with db_pools.ts.acquire() as conn:
+            current = await alerts_repo.get_by_id(conn, UUID(alert_id))
+        if current is not None and current.status == "resolved":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Alert {alert_id} is already resolved",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Alert {alert_id} could not be resolved",
+        )
+
+    depot_name = None
+    if updated.depot_id and db_pools:
+        try:
+            async with db_pools.static.acquire() as sc:
+                row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
+                depot_name = row["name"] if row else None
+        except Exception:
+            logger.warning("Failed to fetch depot name for alert %s; omitting from response", alert_id)
+
+    return _alert_to_notification_item(updated, depot_name=depot_name).model_dump()
+
+
 class _CommandSpec:
     """Registry entry for a dispatchable command."""
 
@@ -12640,6 +12896,14 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
         required_permission=Permission.DEPOT_MANAGE,
         handler=_handle_agent_autonomy_set,
     ),
+    "alerts.acknowledge": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_alerts_acknowledge,
+    ),
+    "alerts.resolve": _CommandSpec(
+        required_permission=Permission.DEPOT_MANAGE,
+        handler=_handle_alerts_resolve,
+    ),
 }
 
 
@@ -12665,6 +12929,8 @@ _COMMAND_REGISTRY: dict[str, _CommandSpec] = {
     | `agents.action.reject` | `depot:manage` (operator+) | `actionId` |
     | `agents.action.rollback` | `depot:manage` (operator+) | `actionId` |
     | `agents.autonomy.set` | `depot:manage` (operator+) | `actionClass`, `level` |
+    | `alerts.acknowledge` | `depot:manage` (operator+) | `alert_id`, `acknowledged_by_email` |
+    | `alerts.resolve` | `depot:manage` (operator+) | `alert_id`, `acknowledged_by_email` |
 
     Set `dry_run: true` to validate and simulate the command without side effects.
     Every execution (real or dry-run) is written to the security audit log.
@@ -12761,15 +13027,34 @@ async def acknowledge_notification_alert(
     if not actor_user_id:
         raise _forbidden("FORBIDDEN", "user id not present in token")
 
+    role = get_user_role(user)
+    caller_org = get_user_organization_id(user)
+    if role != "favonius_admin" and caller_org is None:
+        raise _forbidden("FORBIDDEN", "organization_id not present in token")
+
     from src.notifications import alerts as alerts_repo
 
     async with db_pools.ts.acquire() as conn:
         existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
-        if existing is None or str(existing.depot_id) != depot_id:
+        # Depot-visibility check + org scope check (the latter prevents a
+        # favonius_admin from acknowledging an org-level alert that belongs
+        # to a different tenant just by supplying any valid depot_id).
+        if (
+            existing is None
+            or not _alert_belongs_to_depot(existing.depot_id, depot_id)
+            or (
+                role != "favonius_admin"
+                and str(existing.organization_id) != str(caller_org)
+            )
+        ):
             raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
-        updated = await alerts_repo.acknowledge(
-            conn, UUID(alert_id), user_id=UUID(str(actor_user_id))
+        updated = await alerts_repo.acknowledge_for_org(
+            conn,
+            UUID(alert_id),
+            org_id=UUID(str(existing.organization_id)),
+            user_id=UUID(str(actor_user_id)),
+            user_email=get_user_email(user) if isinstance(user, dict) else None,
         )
     if updated is None:
         # Existed and depot matched on get_by_id but acknowledge() returned None
@@ -12783,6 +13068,196 @@ async def acknowledge_notification_alert(
         status=updated.status,
         acknowledged_at=updated.acknowledged_at.isoformat(),
     )
+
+
+def _alert_belongs_to_depot(alert_depot_id: Optional[UUID], depot_id: str) -> bool:
+    """Whether an alert is visible for a depot-scoped route or command.
+
+    Org-level alerts (``depot_id IS NULL``) are not tied to one depot and match
+    any depot context within the caller's organization.
+    """
+    if alert_depot_id is None:
+        return True
+    return str(alert_depot_id) == depot_id
+
+
+def _project_alert_acknowledged(
+    alert: Any,
+    *,
+    user_id: Optional[UUID],
+    user_email: Optional[str],
+) -> Any:
+    """Dry-run projection of acknowledge_for_org outcome."""
+    now = datetime.now(timezone.utc)
+    return replace(
+        alert,
+        status="acknowledged",
+        acknowledged_at=now,
+        acknowledged_by=user_id,
+        acknowledged_by_email=user_email,
+    )
+
+
+def _project_alert_resolved(
+    alert: Any,
+    *,
+    user_id: Optional[UUID],
+    user_email: Optional[str],
+) -> Any:
+    """Dry-run projection of resolve_by_id outcome."""
+    now = datetime.now(timezone.utc)
+    ack_by = alert.acknowledged_by if alert.acknowledged_by is not None else user_id
+    ack_email = alert.acknowledged_by_email if alert.acknowledged_by_email is not None else user_email
+    ack_at = alert.acknowledged_at
+    if ack_at is None and ack_by is not None:
+        ack_at = now
+    return replace(
+        alert,
+        status="resolved",
+        resolved_at=now,
+        acknowledged_by=ack_by,
+        acknowledged_by_email=ack_email,
+        acknowledged_at=ack_at,
+    )
+
+
+def _alert_to_notification_item(
+    alert: Any,
+    *,
+    depot_name: Optional[str] = None,
+) -> "NotificationAlertItem":
+    """Convert an Alert dataclass to its API wire shape."""
+    return NotificationAlertItem(
+        alert_id=str(alert.id),
+        organization_id=str(alert.organization_id),
+        depot_id=str(alert.depot_id) if alert.depot_id else None,
+        depot_name=depot_name,
+        alert_type=alert.alert_type,
+        severity=alert.severity.value,
+        subject=alert.title,
+        body=alert.detail,
+        dedup_key=alert.dedup_key,
+        status=alert.status,
+        first_seen_at=alert.first_occurrence_at.isoformat(),
+        last_seen_at=alert.last_occurrence_at.isoformat(),
+        occurrence_count=alert.occurrence_count,
+        acknowledged_by=str(alert.acknowledged_by) if alert.acknowledged_by else None,
+        acknowledged_by_email=alert.acknowledged_by_email,
+        resolved_at=alert.resolved_at.isoformat() if alert.resolved_at else None,
+        last_notified_at=alert.last_notified_at.isoformat() if alert.last_notified_at else None,
+    )
+
+
+@app.get(
+    "/alerts",
+    response_model=OrgAlertsListResponse,
+    tags=["alerts"],
+    summary="List organization alerts",
+    description="""
+    Paginated, org-scoped alert list. Scope is derived from the caller's JWT
+    ``app_metadata.organization_id``; favonius_admin callers must have an org
+    or will receive a 400.
+
+    **Filters (all optional):** ``status``, ``severity``, ``depot_id``,
+    ``alert_type``, ``page`` (1-based, default 1), ``page_size`` (default 25).
+
+    Returns 200 with an empty ``items`` array when no alerts match.
+
+    **Authentication:** Requires JWT in Authorization header.
+    """,
+    responses={
+        400: {"model": ErrorResponse, "description": "organization_id missing in token"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        422: {"model": ErrorResponse, "description": "Invalid filter value"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def list_org_alerts(
+    status: Optional[str] = Query(
+        None, description="Filter by status: active | acknowledged | resolved"
+    ),
+    severity: Optional[str] = Query(
+        None, description="Filter by severity: info | warning | critical"
+    ),
+    depot_id: Optional[str] = Query(None, description="Filter to a specific depot UUID"),
+    alert_type: Optional[str] = Query(None, description="Filter by alert_type string"),
+    page: int = Query(1, ge=1, description="1-based page number"),
+    page_size: int = Query(25, ge=1, le=200, description="Items per page (max 200)"),
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """GET /alerts — paginated org-scoped alert list."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    role = get_user_role(user)
+    if not has_permission(role, Permission.DEPOT_MANAGE):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    org_id = get_user_organization_id(user)
+    if not org_id:
+        raise HTTPException(
+            status_code=400,
+            detail="organization_id not present in token app_metadata",
+        )
+
+    if status and status not in ("active", "acknowledged", "resolved"):
+        raise HTTPException(status_code=422, detail=f"Invalid status: {status!r}")
+    if severity and severity not in ("info", "warning", "critical"):
+        raise HTTPException(status_code=422, detail=f"Invalid severity: {severity!r}")
+    if depot_id:
+        validate_uuid(depot_id, "depot_id")
+
+    from src.notifications import alerts as alerts_repo
+
+    depot_id_uuid = UUID(depot_id) if depot_id else None
+
+    try:
+        org_id_uuid = UUID(str(org_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="organization_id in token is not a valid UUID")
+
+    alerts_list: list[Any] = []
+    total = 0
+    try:
+        async with db_pools.ts.acquire() as conn:
+            alerts_list, total = await alerts_repo.list_for_org(
+                conn,
+                org_id_uuid,
+                status_filter=status,
+                severity_filter=severity,
+                depot_id_filter=depot_id_uuid,
+                alert_type_filter=alert_type,
+                page=page,
+                page_size=page_size,
+            )
+    except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError) as exc:
+        logger.warning("notification_alerts schema unavailable, returning empty list: %s", exc)
+        alerts_repo.reset_column_probe()
+
+    # Batch-fetch depot names from static pool (best-effort — alerts are primary)
+    unique_depot_ids = [a.depot_id for a in alerts_list if a.depot_id is not None]
+    depot_name_map: dict[str, str] = {}
+    if unique_depot_ids:
+        try:
+            async with db_pools.static.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, name FROM sites WHERE id = ANY($1::uuid[])",
+                    unique_depot_ids,
+                )
+                depot_name_map = {str(r["id"]): r["name"] for r in rows}
+        except Exception:
+            logger.warning(
+                "Failed to batch-fetch depot names for org alerts; omitting from response"
+            )
+
+    items = [
+        _alert_to_notification_item(
+            a, depot_name=depot_name_map.get(str(a.depot_id)) if a.depot_id else None
+        )
+        for a in alerts_list
+    ]
+
+    return OrgAlertsListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 def _require_org_admin_access(user: dict, org_id: str) -> tuple[str, bool]:

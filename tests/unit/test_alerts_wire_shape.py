@@ -79,6 +79,7 @@ def test_depot_alerts_endpoint_emits_frontend_aligned_wire_shape(client, mock_db
         occurrence_count=7,
         acknowledged_at=None,
         acknowledged_by=None,
+        acknowledged_by_email=None,
         resolved_at=None,
         last_notified_at=None,
         last_notified_count=0,

@@ -112,6 +112,9 @@ logs/*.log
 # Test coverage
 .coverage
 
+# Generated test result artifacts (JUnit XML, run reports)
+tests/results/
+
 # Environment variables
 .env
 .env.local

@@ -29,7 +29,6 @@ Where to set each variable: **Railway project → select service (API or WebSock
 |----------|---------|------------------------|
 | **OPTIMIZATION_TIMEOUT** | `60` | Solver time limit in seconds (PRD: &lt; 60 s). |
 | **OPTIMIZATION_MIP_GAP** | `0.01` | MIP optimality gap (e.g. 0.01 = 1%). |
-| **JWT_ALGORITHM** | `HS256` | Only change if your auth provider uses another algorithm. |
 | **GUROBI_LIC_CONTENT** | — | **Secret.** Required only if you use Gurobi. Paste the **entire contents** of your `gurobi.lic` file. The app/entrypoint must write this to `/opt/gurobi/gurobi.lic`; if your Dockerfile/entrypoint does not do that, you may need to add it. Without this, the solver falls back to HiGHS. |
 | **HANDOFF_DEST_DEPOT_ENDPOINT** | — | Base URL of the “destination” depot API for inter-depot handoff (e.g. `https://other-api.railway.app`). Only if you use handoff. |
 | **DEFAULT_DEPOT_ENDPOINT** | `http://localhost:8000` | Default depot API URL used when a specific destination is not set. |
@@ -103,8 +102,7 @@ These are for the Supabase **client** (REST API, auth, optional sync). Get them 
 | **LOG_LEVEL** | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | **METRICS_PORT** | `8080` | Port for Prometheus metrics (if exposed). |
 | **HEALTH_CHECK_PORT** | `8081` | Port for internal health checks. |
-| **PRICE_FEEDER_ENABLED** | `true` | Set to `false` to disable CAISO/ENTSO-E price ingestion in the WebSocket service. |
-| **PRICE_FEEDER_NODES** | `TH_SP15_GEN-APND,TH_NP15_GEN-APND` | CAISO node IDs; only if you use CAISO and want to override. |
+| **PRICE_FEEDER_ENABLED** | `true` | Set to `false` to disable ENTSO-E day-ahead price ingestion in the WebSocket service. |
 | **PRICE_FEEDER_ENTSOE_ZONES** | — | Comma-separated EIC codes for ENTSO-E (e.g. `10Y1001A1001A82H` for DE-LU). Only for European depots. |
 | **EUROPEAN_ELECTRICITY_API** | — | ENTSO-E API token if you use European price feeds. |
 | **OPTIMIZATION_ENABLED** | `true` | Set to `false` to disable optimization in the WebSocket handler. |
