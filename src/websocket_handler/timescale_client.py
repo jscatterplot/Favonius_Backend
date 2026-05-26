@@ -291,6 +291,16 @@ class TimescaleClient:
                         telemetry_time = (
                             raw_sample.get("timestamp") or data["time"]
                         ) if raw_sample else data["time"]
+                        sample_index = data.get("sample_index")
+                        if (
+                            raw_sample
+                            and isinstance(sample_index, int)
+                            and sample_index > 0
+                            and hasattr(telemetry_time, "microsecond")
+                        ):
+                            telemetry_time = telemetry_time + timedelta(
+                                microseconds=sample_index
+                            )
 
                         await conn.execute(
                             """
