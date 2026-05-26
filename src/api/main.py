@@ -12518,6 +12518,10 @@ async def _handle_alerts_acknowledge(
     actor_raw = (user or {}).get("sub")
     if not actor_raw:
         raise _forbidden("FORBIDDEN", "user id not present in token")
+    try:
+        actor_uuid = UUID(str(actor_raw))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="user sub claim is not a valid UUID")
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -12540,7 +12544,6 @@ async def _handle_alerts_acknowledge(
             detail=f"Alert {alert_id} has status '{existing.status}'; only active alerts can be acknowledged",
         )
 
-    actor_uuid = UUID(str(actor_raw))
     effective_email = acknowledged_by_email
     if effective_email is None and isinstance(user, dict):
         effective_email = get_user_email(user)
@@ -12570,16 +12573,26 @@ async def _handle_alerts_acknowledge(
         )
 
     if updated is None:
+        async with db_pools.ts.acquire() as conn:
+            current = await alerts_repo.get_by_id(conn, UUID(alert_id))
+        if current is not None and current.status != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Alert {alert_id} is already {current.status}",
+            )
         raise HTTPException(
             status_code=409,
-            detail=f"Alert {alert_id} could not be acknowledged (concurrent update?)",
+            detail=f"Alert {alert_id} could not be acknowledged",
         )
 
     depot_name = None
     if updated.depot_id and db_pools:
-        async with db_pools.static.acquire() as sc:
-            row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
-            depot_name = row["name"] if row else None
+        try:
+            async with db_pools.static.acquire() as sc:
+                row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
+                depot_name = row["name"] if row else None
+        except Exception:
+            logger.warning("Failed to fetch depot name for alert %s; omitting from response", alert_id)
 
     return _alert_to_notification_item(updated, depot_name=depot_name).model_dump()
 
@@ -12615,6 +12628,10 @@ async def _handle_alerts_resolve(
     actor_raw = (user or {}).get("sub")
     if not actor_raw:
         raise _forbidden("FORBIDDEN", "user id not present in token")
+    try:
+        actor_uuid = UUID(str(actor_raw))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="user sub claim is not a valid UUID")
 
     if not db_pools:
         raise DatabaseError("Database not available")
@@ -12636,7 +12653,6 @@ async def _handle_alerts_resolve(
             status_code=409, detail=f"Alert {alert_id} is already resolved"
         )
 
-    actor_uuid = UUID(str(actor_raw))
     effective_email = acknowledged_by_email
     if effective_email is None and isinstance(user, dict):
         effective_email = get_user_email(user)
@@ -12666,16 +12682,26 @@ async def _handle_alerts_resolve(
         )
 
     if updated is None:
+        async with db_pools.ts.acquire() as conn:
+            current = await alerts_repo.get_by_id(conn, UUID(alert_id))
+        if current is not None and current.status == "resolved":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Alert {alert_id} is already resolved",
+            )
         raise HTTPException(
             status_code=409,
-            detail=f"Alert {alert_id} could not be resolved (concurrent update?)",
+            detail=f"Alert {alert_id} could not be resolved",
         )
 
     depot_name = None
     if updated.depot_id and db_pools:
-        async with db_pools.static.acquire() as sc:
-            row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
-            depot_name = row["name"] if row else None
+        try:
+            async with db_pools.static.acquire() as sc:
+                row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
+                depot_name = row["name"] if row else None
+        except Exception:
+            logger.warning("Failed to fetch depot name for alert %s; omitting from response", alert_id)
 
     return _alert_to_notification_item(updated, depot_name=depot_name).model_dump()
 
@@ -13039,7 +13065,7 @@ async def list_org_alerts(
         raise DatabaseError("Database not available")
 
     role = get_user_role(user)
-    if not has_permission(role, Permission.DEPOT_VIEW):
+    if not has_permission(role, Permission.DEPOT_MANAGE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     org_id = get_user_organization_id(user)
