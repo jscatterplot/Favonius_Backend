@@ -153,7 +153,11 @@ class TestDmlInCte:
 
 class TestSchemaAllowlist:
     def test_public_schema_rejected(self):
-        _rej("SELECT * FROM public.charging_sessions", kind="table_not_allowed")
+        # `public` is in FORBIDDEN_SCHEMAS (hardened in 37627db) — the real
+        # operational tables live there and must only be read via the
+        # agent_views.* SECURITY DEFINER functions, so a direct public.* ref
+        # is a forbidden_schema reject, not the generic table_not_allowed.
+        _rej("SELECT * FROM public.charging_sessions", kind="forbidden_schema")
 
     def test_pg_catalog_rejected(self):
         _rej("SELECT * FROM pg_catalog.pg_class", kind="forbidden_schema")
@@ -179,17 +183,18 @@ class TestSchemaAllowlist:
 
 class TestUnionEvasion:
     def test_union_with_forbidden(self):
+        # public.* is a forbidden_schema reject (see test_public_schema_rejected).
         _rej(
             "SELECT depot_id FROM agent_views.sessions($1) "
             "UNION SELECT id FROM public.audit_log",
-            kind="table_not_allowed",
+            kind="forbidden_schema",
         )
 
     def test_intersect_with_forbidden(self):
         _rej(
             "SELECT depot_id FROM agent_views.sessions($1) "
             "INTERSECT SELECT id FROM public.audit_log",
-            kind="table_not_allowed",
+            kind="forbidden_schema",
         )
 
     def test_union_of_two_allowed(self):

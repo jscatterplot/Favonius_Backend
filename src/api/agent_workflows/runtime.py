@@ -719,10 +719,12 @@ class QAResult:
 
     Attributes mirror what the chat agent's :func:`agent_runs_close` path
     needs: the final answer text, the per-step tool-call trace, the row
-    evidence count from the terminator, and a status string.
+    evidence count from the terminator, a status string, and ``empty_result``
+    — the S3.5 signal that the turn answered but every underlying query came
+    back empty (see :func:`_is_empty_result`).
     """
 
-    __slots__ = ("text", "tool_calls", "status", "row_evidence", "iterations")
+    __slots__ = ("text", "tool_calls", "status", "row_evidence", "iterations", "empty_result")
 
     def __init__(
         self,
@@ -732,12 +734,14 @@ class QAResult:
         status: str,
         row_evidence: int = 0,
         iterations: int = 0,
+        empty_result: bool = False,
     ) -> None:
         self.text = text
         self.tool_calls = tool_calls
         self.status = status
         self.row_evidence = row_evidence
         self.iterations = iterations
+        self.empty_result = empty_result
 
 
 async def run_qa_turn(
@@ -824,6 +828,7 @@ async def run_qa_turn(
     row_evidence: int = 0
     status: str = "success"
     iterations: int = 0
+    empty_result: bool = False
 
     try:
         for iterations in range(1, max_iterations + 1):
@@ -952,6 +957,11 @@ async def run_qa_turn(
                             row_evidence = int(result.get("row_evidence", 0) or 0)
                         except (TypeError, ValueError):
                             row_evidence = 0
+                        # S3.5: the turn answered — flag it if every underlying
+                        # query came back empty (see _is_empty_result). The
+                        # controller maps this to failure_reason='empty_result'
+                        # via classify_failure even though status stays success.
+                        empty_result = _is_empty_result(tool_calls)
                     else:
                         # final_text stays "" — the controller maps this to
                         # the generic "I wasn't able to compose…" reply.
@@ -1050,7 +1060,33 @@ async def run_qa_turn(
         status=status,
         row_evidence=row_evidence,
         iterations=iterations,
+        empty_result=empty_result,
     )
+
+
+def _is_empty_result(tool_calls: list[ToolCall]) -> bool:
+    """Return True when the turn answered but every underlying query was empty.
+
+    S3.5 "zero rows" definition (kept in sync with the authoritative prose in
+    ``src/api/agent/audit.py::classify_failure``): at least one
+    ``run_select_ts`` / ``run_select_static`` call executed successfully
+    (``ok=True``) AND the SUM of the server-reported ``row_count`` across all
+    such successful calls is zero. A turn that ran no ``run_select_*`` at all
+    (e.g. answered from ``current_time`` only) is NOT empty — there was no
+    underlying query.
+    """
+    saw_run_select = False
+    total_rows = 0
+    for tc in tool_calls:
+        if tc.name not in ("run_select_ts", "run_select_static") or not tc.ok:
+            continue
+        saw_run_select = True
+        if isinstance(tc.result, dict):
+            try:
+                total_rows += int(tc.result.get("row_count", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    return saw_run_select and total_rows == 0
 
 
 def _record_qa_tokens(response: Any, model: str) -> None:

@@ -1,0 +1,150 @@
+# Agent-SQL nightly SHADOW scenarios (PLAN.md §S3.5).
+#
+# These 5 scenarios are copied VERBATIM from tests/golden/agent_sql.yaml — the
+# simplest one per category (en_05 / ops_11 / pm_15, the same trio the S3
+# real-DB integration test proved against a live model) plus two extras across
+# categories (en_07, ops_12). Two transformations vs. the source:
+#
+#   1. `llm_trace` and `expected.agent_views_used` are STRIPPED. The shadow
+#      suite drives a REAL Sonnet over the real /agent/turn endpoint — the
+#      model authors the SQL itself, so there is no canned trace to replay and
+#      no fixed set of agent_views functions to assert. We keep
+#      `final_answer_must_include` / `final_answer_must_not_include` (the
+#      operator tone gate) plus `status` and `sql_validator_rejected`.
+#   2. The `*dep_vil` YAML anchor (defined in the source's en_01, which is not
+#      selected here) is INLINED so this file parses standalone. The loaded
+#      data is identical to the source scenarios.
+#
+# Picks are deliberately re-anchor-safe (tests/live/test_agent_sql_live.py
+# shifts every fixture timestamp by whole days to the live clock): all use
+# rolling windows ("last 30 days", "this week", "last week"), a 24h-relative
+# window, or no window at all ("active right now") — never a calendar month or
+# an absolute date in an assertion. This is the additive shadow suite; it does
+# NOT touch the canned-trace golden gate (agent_sql.yaml or its harness).
+
+# ════════════════════════ energy + cost (2) ════════════════════════════════
+
+- id: en_05
+  category: energy_cost
+  question: "Show me the top 5 vehicles by total cost in the last 30 days."
+  description: >
+    GROUP BY vehicle_id, ORDER BY SUM(cost_total) DESC LIMIT 5 over the trailing
+    30 days. agent_views.sessions.vehicle_id is already the human-readable id
+    (bus_NNN), so no name join is needed; bus_606 (6th) confirms the LIMIT.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        name: "Vilnius"
+        entsoe_zone: "10YLT-1001A0008Q"
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-02T08:00:00Z", energy_kwh: 300.0, cost_total: 300.00 }
+      - { vehicle_id: "bus_202", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-03T08:00:00Z", energy_kwh: 250.0, cost_total: 250.00 }
+      - { vehicle_id: "bus_303", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-04T08:00:00Z", energy_kwh: 200.0, cost_total: 200.00 }
+      - { vehicle_id: "bus_404", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-05T08:00:00Z", energy_kwh: 150.0, cost_total: 150.00 }
+      - { vehicle_id: "bus_505", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-06T08:00:00Z", energy_kwh: 100.0, cost_total: 100.00 }
+      - { vehicle_id: "bus_606", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-07T08:00:00Z", energy_kwh: 50.0, cost_total: 50.00 }
+  expected:
+    status: success
+    sql_validator_rejected: false
+    final_answer_must_include: ["bus_101", "bus_505"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: en_07
+  category: energy_cost
+  question: "Did any session this week cost more than €100?"
+  description: >
+    WHERE cost_total > 100 over this week — a yes/no answer that names the
+    offending session. Only bus_101 (150) exceeds 100.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        name: "Vilnius"
+        entsoe_zone: "10YLT-1001A0008Q"
+    sessions:
+      - { vehicle_id: "bus_101", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-19T08:00:00Z", energy_kwh: 400.0, cost_total: 150.00 }
+      - { vehicle_id: "bus_102", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-20T08:00:00Z", energy_kwh: 200.0, cost_total: 80.00 }
+      - { vehicle_id: "bus_103", depot_id: "11111111-1111-4111-8111-111111111111", start_time: "2026-05-21T08:00:00Z", energy_kwh: 220.0, cost_total: 95.00 }
+  expected:
+    status: success
+    sql_validator_rejected: false
+    final_answer_must_include: ["Yes", "150"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+# ════════════════════════ operations status (2) ════════════════════════════
+
+- id: ops_11
+  category: ops_status
+  question: "Which alerts are still active right now?"
+  description: >
+    SELECT WHERE status='active'. A resolved and an acknowledged alert are
+    decoys. severity maps to severity_level (1/2/3) in the view.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        name: "Vilnius"
+        entsoe_zone: "10YLT-1001A0008Q"
+    alerts:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-24T14:00:00Z", severity: "critical", status: "active", alert_type: "charger_fault" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-23T09:00:00Z", severity: "warning", status: "active", alert_type: "stale_telemetry" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-22T09:00:00Z", severity: "warning", status: "resolved", alert_type: "degraded_optimization" }
+      - { depot_id: "11111111-1111-4111-8111-111111111111", created_at: "2026-05-21T09:00:00Z", severity: "info", status: "acknowledged", alert_type: "missing_input" }
+  expected:
+    status: success
+    sql_validator_rejected: false
+    final_answer_must_include: ["charger_fault", "stale_telemetry"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+- id: ops_12
+  category: ops_status
+  question: "Show me chargers that have been unavailable for more than 24 hours."
+  description: >
+    connector_status_latest WHERE status='Unavailable' AND last_changed_at <
+    24h before now. CP-10 and CP-11 qualify; an Available charger is a decoy.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        name: "Vilnius"
+        entsoe_zone: "10YLT-1001A0008Q"
+    connector_status:
+      - { station_id: "CP-10", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Unavailable", timestamp: "2026-05-20T08:00:00Z" }
+      - { station_id: "CP-11", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Unavailable", timestamp: "2026-05-22T08:00:00Z" }
+      - { station_id: "CP-12", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Available", timestamp: "2026-05-24T08:00:00Z" }
+  expected:
+    status: success
+    sql_validator_rejected: false
+    final_answer_must_include: ["CP-10", "CP-11"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+# ════════════════════════ pricing + market (1) ══════════════════════════════
+
+- id: pm_15
+  category: pricing_market
+  question: "What were the 5 highest electricity prices last week?"
+  description: >
+    ORDER BY price_per_kwh DESC LIMIT 5 over the trailing week, with a bounding
+    predicate on `hour` (prices_hourly is a hypertable function). Prices are
+    EUR/MWh in the fixture; the view returns EUR/kWh (= MWh / 1000).
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        name: "Vilnius"
+        entsoe_zone: "10YLT-1001A0008Q"
+    electricity_prices:
+      - { time: "2026-05-19T08:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 250.0 }
+      - { time: "2026-05-19T09:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 230.0 }
+      - { time: "2026-05-19T10:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 210.0 }
+      - { time: "2026-05-19T11:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 190.0 }
+      - { time: "2026-05-19T12:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 170.0 }
+      - { time: "2026-05-20T08:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 150.0 }
+      - { time: "2026-05-20T09:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 130.0 }
+      - { time: "2026-05-20T10:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 110.0 }
+  expected:
+    status: success
+    sql_validator_rejected: false
+    final_answer_must_include: ["0.25", "0.17", "EUR/kWh"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
