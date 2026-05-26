@@ -96,7 +96,7 @@ logger = logging.getLogger("onboard_depot_from_kempower")
 
 
 def _resolve_ts_url() -> str:
-    url = os.getenv("DATABASE_URL") or os.getenv("TIMESCALE_SERVICE_URL")
+    url = os.getenv("TIMESCALE_SERVICE_URL") or os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError(
             "Set DATABASE_URL (or TIMESCALE_SERVICE_URL) to point at the "
