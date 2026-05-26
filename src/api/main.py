@@ -12867,8 +12867,9 @@ async def acknowledge_notification_alert(
     if not actor_user_id:
         raise _forbidden("FORBIDDEN", "user id not present in token")
 
+    role = get_user_role(user)
     caller_org = get_user_organization_id(user)
-    if caller_org is None:
+    if role != "favonius_admin" and caller_org is None:
         raise _forbidden("FORBIDDEN", "organization_id not present in token")
 
     from src.notifications import alerts as alerts_repo
@@ -12881,7 +12882,10 @@ async def acknowledge_notification_alert(
         if (
             existing is None
             or not _alert_belongs_to_depot(existing.depot_id, depot_id)
-            or str(existing.organization_id) != str(caller_org)
+            or (
+                role != "favonius_admin"
+                and str(existing.organization_id) != str(caller_org)
+            )
         ):
             raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
