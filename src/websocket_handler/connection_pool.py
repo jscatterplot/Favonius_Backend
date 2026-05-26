@@ -167,7 +167,7 @@ class EnhancedConnectionPool:
         connection budget without benefit, so under load Postgres started
         rejecting acquires with ``53300 too_many_connections`` ("remaining
         connection slots are reserved for ... pg_use_reserved_connections"),
-        which surfaced as the periodic data_sync ERROR.
+        which surfaced as periodic connection-exhaustion errors.
 
         Cap small and independent. Override via ``SQLALCHEMY_POOL_SIZE`` /
         ``SQLALCHEMY_MAX_OVERFLOW`` if a deployment genuinely needs more

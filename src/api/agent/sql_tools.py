@@ -162,7 +162,10 @@ def build_sql_agent_tool_registry(
         v = validate_sql(sql, allowed_functions=allowed, row_limit=n)
         if not v.ok:
             AGENT_SQL_VALIDATIONS.labels(verdict=f"rejected:{v.error_kind}").inc()
-            return {"error": f"validator rejected sample query: {v.error_kind}: {v.error}"}
+            return {
+                "error": f"validator rejected sample query: {v.error_kind}: {v.error}",
+                "error_kind": v.error_kind,
+            }
         AGENT_SQL_VALIDATIONS.labels(verdict="accepted").inc()
         try:
             r = await run_select(

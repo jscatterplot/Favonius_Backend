@@ -492,105 +492,54 @@ class APIServer:
 
     async def get_sessions(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get charging sessions."""
-        try:
-            org_id = user["organization_id"]
-            start_date = request.query.get("start_date")
-            end_date = request.query.get("end_date")
-
-            query = (
-                self.supabase_client.client.table("charging_sessions_summary")
-                .select("*")
-                .eq("organization_id", org_id)
-            )
-
-            if start_date:
-                query = query.gte("start_time", start_date)
-            if end_date:
-                query = query.lte("start_time", end_date)
-
-            response = query.execute()
-            return web.json_response({"sessions": response.data or []})
-        except Exception as e:
-            self.logger.error(f"Get sessions error: {e}")
-            return web.json_response({"error": "Failed to get sessions"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Use GET /depots/{id}/sessions on the FastAPI service."},
+            status=410,
+        )
 
     async def get_active_sessions(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get active charging sessions."""
-        try:
-            org_id = user["organization_id"]
-            sessions = await self.supabase_client.get_active_sessions(org_id)
-            return web.json_response({"sessions": sessions})
-        except Exception as e:
-            self.logger.error(f"Get active sessions error: {e}")
-            return web.json_response({"error": "Failed to get active sessions"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Use GET /depots/{id}/sessions/active on the FastAPI service."},
+            status=410,
+        )
 
     async def stop_session(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Stop charging session."""
-        try:
-            session_id = request.match_info["session_id"]
-
-            # Update session status
-            session = await self.supabase_client.update_session_status(session_id, "stopped")
-            return web.json_response({"session": session})
-        except Exception as e:
-            self.logger.error(f"Stop session error: {e}")
-            return web.json_response({"error": "Failed to stop session"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Use the FastAPI service for session management."},
+            status=410,
+        )
 
     # Schedule Endpoints
 
     async def get_schedules(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get charging schedules."""
-        try:
-            org_id = user["organization_id"]
-            schedules = await self.supabase_client.get_schedule_configs(org_id)
-            return web.json_response({"schedules": schedules})
-        except Exception as e:
-            self.logger.error(f"Get schedules error: {e}")
-            return web.json_response({"error": "Failed to get schedules"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Schedules are managed via the FastAPI service."},
+            status=410,
+        )
 
     async def create_schedule(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Create charging schedule."""
-        try:
-            data = await request.json()
-            data["organization_id"] = user["organization_id"]
-
-            schedule = await self.supabase_client.create_schedule_config(data)
-            return web.json_response({"schedule": schedule}, status=201)
-        except Exception as e:
-            self.logger.error(f"Create schedule error: {e}")
-            return web.json_response({"error": "Failed to create schedule"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Schedules are managed via the FastAPI service."},
+            status=410,
+        )
 
     async def update_schedule(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Update charging schedule."""
-        try:
-            schedule_id = request.match_info["schedule_id"]
-            data = await request.json()
-
-            schedule_response = (
-                self.supabase_client.client.table("charging_schedules_config")
-                .update(data)
-                .eq("id", schedule_id)
-                .execute()
-            )
-            return web.json_response(
-                {"schedule": schedule_response.data[0] if schedule_response.data else {}}
-            )
-        except Exception as e:
-            self.logger.error(f"Update schedule error: {e}")
-            return web.json_response({"error": "Failed to update schedule"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Schedules are managed via the FastAPI service."},
+            status=410,
+        )
 
     async def delete_schedule(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Delete charging schedule."""
-        try:
-            schedule_id = request.match_info["schedule_id"]
-
-            self.supabase_client.client.table("charging_schedules_config").delete().eq(
-                "id", schedule_id
-            ).execute()
-            return web.json_response({"message": "Schedule deleted"})
-        except Exception as e:
-            self.logger.error(f"Delete schedule error: {e}")
-            return web.json_response({"error": "Failed to delete schedule"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Schedules are managed via the FastAPI service."},
+            status=410,
+        )
 
     # Analytics Endpoints
 
@@ -598,61 +547,26 @@ class APIServer:
         self, request: web.Request, user: Dict[str, Any]
     ) -> web.Response:
         """Get energy analytics."""
-        try:
-            org_id = user["organization_id"]
-            start_date = request.query.get(
-                "start_date", (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            )
-            end_date = request.query.get("end_date", datetime.now(timezone.utc).isoformat())
-
-            analytics = await self.supabase_client.get_daily_energy_summary(
-                org_id, start_date, end_date
-            )
-            return web.json_response({"analytics": analytics})
-        except Exception as e:
-            self.logger.error(f"Get energy analytics error: {e}")
-            return web.json_response({"error": "Failed to get energy analytics"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Use GET /depots/{id}/savings-summary on the FastAPI service."},
+            status=410,
+        )
 
     async def get_cost_analytics(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get cost analytics."""
-        try:
-            org_id = user["organization_id"]
-            start_date = request.query.get(
-                "start_date", (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            )
-            end_date = request.query.get("end_date", datetime.now(timezone.utc).isoformat())
-
-            # Get cost data from sessions
-            response = (
-                self.supabase_client.client.table("charging_sessions_summary")
-                .select("start_time, cost_total, revenue_v2g")
-                .eq("organization_id", org_id)
-                .gte("start_time", start_date)
-                .lte("start_time", end_date)
-                .execute()
-            )
-
-            return web.json_response({"analytics": response.data or []})
-        except Exception as e:
-            self.logger.error(f"Get cost analytics error: {e}")
-            return web.json_response({"error": "Failed to get cost analytics"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Use GET /depots/{id}/savings-summary on the FastAPI service."},
+            status=410,
+        )
 
     async def get_savings_analytics(
         self, request: web.Request, user: Dict[str, Any]
     ) -> web.Response:
         """Get savings analytics."""
-        try:
-            org_id = user["organization_id"]
-            start_date = request.query.get(
-                "start_date", (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            )
-            end_date = request.query.get("end_date", datetime.now(timezone.utc).isoformat())
-
-            savings = await self.supabase_client.calculate_savings(org_id, start_date, end_date)
-            return web.json_response({"savings": savings})
-        except Exception as e:
-            self.logger.error(f"Get savings analytics error: {e}")
-            return web.json_response({"error": "Failed to get savings analytics"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. Use GET /depots/{id}/savings-summary on the FastAPI service."},
+            status=410,
+        )
 
     # Real-time Endpoints
 
@@ -681,31 +595,17 @@ class APIServer:
 
     async def get_sync_status(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Get data sync status."""
-        try:
-            # This would get status from the data sync service
-            return web.json_response(
-                {"sync_status": "running", "last_sync": datetime.now(timezone.utc).isoformat()}
-            )
-        except Exception as e:
-            self.logger.error(f"Get sync status error: {e}")
-            return web.json_response({"error": "Failed to get sync status"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. The Supabase sync pipeline has been retired."},
+            status=410,
+        )
 
     async def force_sync(self, request: web.Request, user: Dict[str, Any]) -> web.Response:
         """Force data synchronization."""
-        try:
-            data = await request.json()
-            data_type = data.get("type", "all")
-
-            # This would trigger sync in the data sync service
-            return web.json_response(
-                {
-                    "message": f"Sync triggered for {data_type}",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-        except Exception as e:
-            self.logger.error(f"Force sync error: {e}")
-            return web.json_response({"error": "Failed to force sync"}, status=500)
+        return web.json_response(
+            {"error": "Endpoint removed. The Supabase sync pipeline has been retired."},
+            status=410,
+        )
 
     # ------------------------------------------------------------------
     # OCPP debug endpoint (session 3) — single charger state dump for ops.

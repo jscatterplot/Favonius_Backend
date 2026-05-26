@@ -1,0 +1,175 @@
+# Agent-SQL nightly SHADOW suite (PLAN.md §S3.5).
+#
+# Drives a REAL Sonnet over the real /agent/turn endpoint against the 5
+# scenarios in tests/golden/agent_sql_live.yaml (loaded into a rolled-back
+# savepoint on the same TimescaleDB + Supabase pair the golden gate uses).
+# This catches model/prompt drift the canned-trace golden gate structurally
+# cannot — see tests/live/test_agent_sql_live.py.
+#
+# INDEPENDENCE: this workflow is triggered ONLY by the nightly cron and manual
+# dispatch — never by pull_request or push. It therefore gates no PR and is
+# independent of every other CI workflow (agent-sql-golden, workflow-golden).
+# The test step is non-gating (continue-on-error): a red shadow night reports
+# to Slack but does not fail the run. Paging on a sustained regression is a
+# SEPARATE concern (see "consecutive-night paging" note at the bottom).
+#
+# SECRETS:
+#   ANTHROPIC_API_KEY  — same secret the agent-sql-golden integration step uses.
+#                        Without it the live tests skip (0 scenarios ran).
+#   SLACK_WEBHOOK_URL   — Slack incoming-webhook URL for the summary line. No
+#                        such secret exists in this repo yet (no workflow
+#                        referenced one when this was written); a maintainer
+#                        must add it. When unset (e.g. on a fork) the summary
+#                        is logged to stdout instead — the job still succeeds.
+
+name: agent-sql-shadow
+
+on:
+  schedule:
+    # 06:00 UTC nightly.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: agent-sql-shadow
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  shadow:
+    name: Agent-SQL nightly shadow (live LLM)
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: favonius_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: favonius_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U favonius_test -d favonius_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql://favonius_test:test_password@localhost:5433/favonius_test
+      TEST_STATIC_DATABASE_URL: postgresql://favonius_test:test_password@localhost:5433/favonius_static
+      PGPASSWORD: test_password
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" "jsonschema>=4.20.0"
+      - name: Wait for TimescaleDB
+        # The timescaledb image restarts Postgres once during first init; require
+        # several consecutive real queries before proceeding (mirrors the golden gate).
+        run: |
+          ok=0
+          for _ in $(seq 1 60); do
+            if psql "$TEST_DATABASE_URL" -tAc "SELECT 1" >/dev/null 2>&1; then
+              ok=$((ok + 1)); [ "$ok" -ge 3 ] && break
+            else ok=0; fi
+            sleep 1
+          done
+          psql "$TEST_DATABASE_URL" -tAc "SELECT 1" >/dev/null
+      - name: Create static (Supabase) database
+        run: psql "$TEST_DATABASE_URL" -c "CREATE DATABASE favonius_static OWNER favonius_test;"
+      - name: Apply TimescaleDB migrations -> favonius_test
+        run: python scripts/run_migrations.py
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+      - name: Apply static base + agent_views (040) + org SQL flag (044) -> favonius_static
+        run: |
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/golden/agent_sql/supabase_bootstrap.sql
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/040_agent_views_static.sql
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/044_agent_sql_mode_org_flag.sql
+      - name: Run live shadow suite (non-gating)
+        id: run
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          pytest tests/live/ -m agent_sql_live \
+            --junitxml=shadow-report.xml \
+            -p no:cacheprovider --tb=short
+      - name: Summarise + post to Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import datetime, json, os, sys, urllib.request
+          from xml.etree import ElementTree as ET
+
+          REPORT = "shadow-report.xml"
+          date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+          def parse(path):
+              root = ET.parse(path).getroot()
+              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+              total = passed = 0
+              failed = []
+              for ts in suites:
+                  for tc in ts.iter("testcase"):
+                      if tc.find("skipped") is not None:
+                          continue  # skipped scenarios did not run
+                      total += 1
+                      name = tc.get("name", "")
+                      sid = name.split("[", 1)[1].rstrip("]") if "[" in name else name
+                      if tc.find("failure") is not None or tc.find("error") is not None:
+                          failed.append(sid)
+                      else:
+                          passed += 1
+              return total, passed, failed
+
+          if not os.path.exists(REPORT):
+              # Collection/setup error before any test produced a result.
+              msg = f":red_circle: shadow run errored ·  agent_sql ·  {date} (no report; see CI logs)"
+          else:
+              total, passed, failed = parse(REPORT)
+              if total == 0:
+                  # e.g. ANTHROPIC_API_KEY unset on a fork -> every scenario skipped.
+                  msg = f":white_circle: shadow skipped (0 ran) ·  agent_sql ·  {date}"
+              elif not failed:
+                  msg = f":green_circle: shadow {passed}/{total} ·  agent_sql ·  {date}"
+              else:
+                  msg = f":red_circle: shadow {passed}/{total} ({len(failed)} failed: {', '.join(failed)})"
+
+          print(msg)
+          webhook = (os.environ.get("SLACK_WEBHOOK_URL") or "").strip()
+          if not webhook:
+              print("SLACK_WEBHOOK_URL unset — logged to stdout only (no Slack post).")
+              sys.exit(0)
+          req = urllib.request.Request(
+              webhook,
+              data=json.dumps({"text": msg}).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print(f"Slack POST -> HTTP {resp.status}")
+          except Exception as exc:  # never fail the job on a Slack hiccup
+              print(f"Slack POST failed (non-fatal): {exc}")
+          PY
+
+# ── Consecutive-night paging — DEFERRED (PLAN.md §S3.5) ──────────────────────
+# The brief asks for paging when the suite is <4/5 green for 2 nights in a row,
+# implemented as a separate check that reads the previous run's conclusion via
+# the GitHub API and pages only on the second consecutive bad night — with an
+# explicit escape hatch: "If implementing the consecutive-night check adds more
+# than 30 lines, defer it and open a followup issue instead." A robust version
+# (persist last night's pass-count as an artifact since the job conclusion is
+# always success here, fetch the previous run + its artifact via the API,
+# compare, then page through a not-yet-configured escalation channel) clears 30
+# lines comfortably, so it is deferred to followup issue #247. Tonight's
+# per-run Slack summary above is the shipped deliverable.

@@ -242,8 +242,8 @@ class OCPPServer:
         self,
         charge_point_id: str,
         connector_id: int,
-        soc: float,
-        power_kw: float,
+        soc: Optional[float],
+        power_kw: Optional[float],
         *args,
         **kwargs,
     ) -> None:
@@ -267,9 +267,11 @@ class OCPPServer:
                     max_charge_kw = args[3] if len(args) > 3 else None
                     args[4] if len(args) > 4 else None
 
+        soc_str = f"{soc:.2f}" if soc is not None else "N/A"
+        power_str = f"{power_kw:.2f}" if power_kw is not None else "N/A"
         logger.debug(
             f"Meter values: {charge_point_id}, connector {connector_id}, "
-            f"SoC={soc:.2f}, Power={power_kw:.2f}kW"
+            f"SoC={soc_str}, Power={power_str}kW"
             + (f", Energy={energy_kwh:.2f}kWh" if energy_kwh else "")
             + (f", max_charge={max_charge_kw:.2f}kW" if max_charge_kw else "")
         )
@@ -452,8 +454,8 @@ class OCPPServer:
         self,
         charge_point_id: str,
         connector_id: int,
-        soc: float,
-        power_kw: float,
+        soc: Optional[float],
+        power_kw: Optional[float],
         energy_kwh: Optional[float],
         timestamp: datetime,
         max_charge_kw: Optional[float] = None,

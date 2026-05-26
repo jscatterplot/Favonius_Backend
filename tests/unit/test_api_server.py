@@ -401,10 +401,9 @@ class TestAPIServer:
 
         response = await api_server.get_sessions(request, user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["sessions"]) == 2
-        assert data["sessions"][0]["status"] == "active"
+        assert "endpoint removed" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -430,10 +429,9 @@ class TestAPIServer:
 
         response = await api_server.get_active_sessions(request, user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["sessions"]) == 2
-        assert all(session["status"] == "active" for session in data["sessions"])
+        assert "/depots/{id}/sessions/active" in data["error"]
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -457,9 +455,9 @@ class TestAPIServer:
 
         response = await api_server.stop_session(request, user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert data["session"]["status"] == "stopped"
+        assert "session management" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -486,10 +484,9 @@ class TestAPIServer:
 
         response = await api_server.get_schedules(request, user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["schedules"]) == 2
-        assert data["schedules"][0]["enabled"] is True
+        assert "schedules" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -520,10 +517,9 @@ class TestAPIServer:
 
         response = await api_server.create_schedule(request, user)
 
-        assert response.status == 201
+        assert response.status == 410
         data = json.loads(response.text)
-        assert data["schedule"]["vehicle_id"] == "vehicle1"
-        assert data["schedule"]["enabled"] is True
+        assert "schedules" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -550,10 +546,9 @@ class TestAPIServer:
 
         response = await api_server.get_energy_analytics(request, user=user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["analytics"]) == 2
-        assert data["analytics"][0]["energy_kwh"] == 25.5
+        assert "energy analytics" in data["error"].lower() or "endpoint removed" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -587,10 +582,9 @@ class TestAPIServer:
 
         response = await api_server.get_cost_analytics(request, user=user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["analytics"]) == 2
-        assert data["analytics"][0]["cost_usd"] == 12.50
+        assert "cost analytics" in data["error"].lower() or "endpoint removed" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -617,10 +611,9 @@ class TestAPIServer:
 
         response = await api_server.get_savings_analytics(request, user=user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert len(data["savings"]) == 2
-        assert data["savings"][0]["savings_usd"] == 5.25
+        assert "savings" in data["error"].lower() or "endpoint removed" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -663,10 +656,9 @@ class TestAPIServer:
 
         response = await api_server.get_sync_status(request, user=user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert data["sync_status"] == "running"
-        assert "last_sync" in data
+        assert "sync status" in data["error"].lower() or "endpoint removed" in data["error"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
@@ -687,7 +679,6 @@ class TestAPIServer:
 
         response = await api_server.force_sync(request, user=user)
 
-        assert response.status == 200
+        assert response.status == 410
         data = json.loads(response.text)
-        assert "message" in data
-        assert "timestamp" in data
+        assert "manual sync" in data["error"].lower() or "endpoint removed" in data["error"].lower()

@@ -65,9 +65,8 @@ def main() -> int:
     ts_migrations = load_tables_from_dir(ROOT / "migrations")
     supabase_migrations = load_tables_from_dir(ROOT / "migrations/supabase")
     ws_timescale_schema = load_tables(ROOT / "src/websocket_handler/timescale_schema.py")
-    ws_supabase_schema = load_tables(ROOT / "src/websocket_handler/database_schema.py")
 
-    static_contract = merge_table_maps(ts_migrations, supabase_migrations, ws_supabase_schema)
+    static_contract = merge_table_maps(ts_migrations, supabase_migrations)
     timescale_contract = merge_table_maps(ts_migrations, ws_timescale_schema)
 
     required_static = {

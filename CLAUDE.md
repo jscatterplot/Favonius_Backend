@@ -291,6 +291,17 @@ Vendor metadata is persisted on `BootNotification` via `OCPP16Session._persist_s
 
 Migration 042 adds the three tables and extends `charging_command_queue.command_type` to allow `'get_diagnostics'` and `'get_log'` (placeholder for future OCPP 2.0.1 chargers — same queue, same upload endpoint, new dispatch helper).
 
+### Scheduled reports (`src/api/report_schedules.py` + `report_schedule_timing.py` + `report_pdf.py`)
+
+Configurable per-depot report schedules (frontend PR #124). A depot admin defines a schedule (e.g. "Monthly electricity consumption", `kind=monthly_consumption`, `frequency=monthly`, `dayOfMonth=1`, `timeOfDay=06:00`, `autonomyMode=auto_silent`) with PDF/CSV recipients; a per-minute worker fires due schedules, generates the report via the existing `reports.generate` pipeline, renders a PDF/CSV, and emails it.
+
+- **Schema (migration 044, TimescaleDB):** `report_schedules`, `report_schedule_recipients` (ordered, stable ids, `UNIQUE(schedule_id, email, format)`), `schedule_runs` (`UNIQUE(schedule_id, scheduled_for)` = cron idempotency anchor), `schedule_run_deliveries` (append-only delivery ledger). Like migration 033, `depot_id`/`created_by` are bare UUIDs (no cross-DB FK to Supabase `sites`/`auth.users`). 044 also rekeys the `report_draft` agent-action uniqueness index to `(depot_id, COALESCE(scheduleId,'_legacy'), periodStart)` so multiple schedules per depot can each emit a draft. Numbered 044 to avoid colliding with in-flight PR #233's 043. **The legacy hardcoded `monthly_scheduler` is removed** — this feature replaces it.
+- **Reads:** `GET /depots/{id}/report-schedules`, `/{schedule_id}`, `/{schedule_id}/runs` — any depot member. Responses are plain camelCase dicts with all nullable fields present (`nextRunAt`/`lastRunAt`/`lastRunStatus`/`recipients[].lastDelivery`) for the frontend's strict Zod.
+- **Writes:** via `POST /commands/execute` — `reports.schedule.{create,update,delete,run_now}`, gated by `Permission.ADMIN_CONFIG` (customer_admin+). Handlers return the domain object as `CommandResponse.result`. `run_now` executes inline (scheduled_for = now truncated to the second → double-click safe) and returns a `ScheduleRun`.
+- **Autonomy gating** (resolved by `resolve_autonomy_mode`, which reads PR #233's shared `agent_autonomy_settings.level` for `report_draft` — gracefully falling back when that table isn't present yet — then falls back to the schedule's `autonomy_mode`): `shadow`→`skipped` (no report/delivery); `proposed`→generate + emit a pending `report_draft` agent_action (payload carries `scheduleId`/`runId`/`reportId`), run `pending_approval` (approving via `agents.action.approve` delivers + flips run to `succeeded`; rejecting flips to `skipped`); `auto_notify`→deliver + informational action; `auto_silent`→deliver, no action.
+- **Scheduling/DST:** `compute_next_run_at` (in `report_schedule_timing.py`, pure stdlib) computes the next wall-clock occurrence in the depot tz then converts to UTC via `zoneinfo`, so a 06:00 schedule stays 06:00 local across DST (the UTC instant shifts). spec weekday is 0=Sun..6=Sat. Quarterly = calendar quarters (Jan/Apr/Jul/Oct).
+- **Delivery:** PDF via `reportlab` (`report_pdf.py`), CSV reuses `reports.stream_rows_as_csv`. `EmailMessage.attachments` (new) carries them; `ResendEmailClient` base64-encodes. The API process builds its own email client at startup (`report_email_client`: Resend when `RESEND_API_KEY` set, else `FakeEmailClient`). Provider webhook callbacks (`POST /webhooks/resend`) **append** a new `schedule_run_deliveries` row with the mapped status (`delivered→sent`, `complained→suppressed`), so `lastDelivery` reflects the latest provider state. Env vars reuse the alerts pipeline's `RESEND_API_KEY`/`RESEND_FROM_ADDRESS`/`EMAIL_DELIVERY_ENABLED`/`RESEND_WEBHOOK_SECRET`.
+
 ### Per-session billing (`src/core/billing/session_cost.py`)
 
 `compute_session_cost(ts_pool, session_row)` returns a `SessionCostResult` (`cost`, `source`, diagnostics). Two strategies, automatic selection: **granular** integrates `charging_kw × Δt × price(t)` via TimescaleDB `time_bucket('1 hour', telemetry.time)` (trapezoidal between consecutive samples) joined to `electricity_prices`, **fallback_average** uses `energy_delivered_kwh × avg(price over [start,end])`. The granular path is gated: telemetry timestamps must cover ≥80% of the session AND telemetry-implied energy must reconcile to within ±10% of `energy_delivered_kwh`. The chosen strategy is written to `charging_sessions.cost_total_source` (migration 040). Missing prices → `'unpriceable'`, `cost_total` stays NULL; billing never fabricates a price.
@@ -308,6 +319,11 @@ Two-step onboarding for Kempower customers. The operator first creates the Favon
 Second source of vehicle SoC, independent of OCPP, so the optimizer has a live SoC even when a vehicle is **unplugged** (out on a route). A background poller (`poller.py::run_navirec_poll_loop`, wired into the FastAPI lifespan next to `_heartbeat_loop`, gated by `NAVIREC_POLL_ENABLED`, default off) pulls the fleet's latest readings from Navirec every `NAVIREC_POLL_INTERVAL_S` (default 300s) and upserts them into the `vehicle_telemetry` hypertable. `StateAssembler._get_vehicle_socs` now `UNION ALL`s `telemetry` + `vehicle_telemetry`, bounds both arms to `time > now() - INTERVAL '24 hours'`, and keeps the freshest row per vehicle (`DISTINCT ON (vehicle_id) ORDER BY time DESC`). Rows carry the **device's own timestamp**, so the existing 15-min `MAX_TELEMETRY_AGE` freshness check still governs whether a SoC is fresh enough to optimize on. One poll cycle = **one** paginated API call + one cached `{normalized_plate → (vehicle_id, depot_id)}` lookup (5-min TTL) + a batched per-depot upsert (no N+1). Navirec ↔ Favonius vehicles are matched by **license plate** (`normalize_plate` strips non-alphanumerics, uppercases); plates resolving to >1 vehicle are dropped (ambiguous), unmatched plates skipped. Each depot's batch is written under a per-depot Postgres advisory lock (`pg_try_advisory_lock(hashtextextended('navirec_poll:<depot>',0))`) so multi-replica deployments are single-flight; a depot that errors is isolated and the rest still write. Upsert is idempotent: `ON CONFLICT (vehicle_id, time) DO NOTHING`.
 
 `NavirecClient` and `KempowerClient` both subclass `src/adapters/rest_client.py::BaseRestClient` (shared cached-bearer auth + 401-refresh + 429/5xx retry + cursor pagination; provider specifics via the `_fetch_token` / `_extract_items` / `_extract_next_cursor` hooks). Auth is either a static `NAVIREC_API_KEY` (used directly as the bearer) or `NAVIREC_USERNAME`/`NAVIREC_PASSWORD` exchanged for a token. **The exact endpoint paths, pagination envelope, and field names are placeholders confirmed by `scripts/probe_navirec_api.py` (read-only) against the live account** — correcting them is a localized edit to the `_*_KEYS` constants in `mapping.py` / the path constants in `client.py`. Historical backfill: `python scripts/backfill_vehicle_telemetry_from_navirec.py --since <date> [--depot-id <uuid>] --execute` (dry-run default; same two-URL / env-fallthrough convention as `backfill_session_cost.py`; re-runs add zero rows via the same upsert). Metrics: `favonius_navirec_poll_cycles_total{outcome}`, `favonius_navirec_poll_duration_seconds`, `favonius_navirec_readings_written_total{depot_id}`, `favonius_navirec_depot_failures_total{depot_id}`, `favonius_navirec_lock_skips_total{depot_id}`, `favonius_navirec_unmatched_plates_total`, `favonius_navirec_ambiguous_plates`, `favonius_navirec_stale_readings_total`. Migration 044 adds the `vehicle_telemetry` hypertable (90-day retention, `(vehicle_id, time DESC)` index).
+### Data Sources — self-serve external integrations (`src/core/data_sources/` + `src/api/data_sources/`)
+
+The website "Data Sources" page lets a customer admin connect an external system (Kempower ChargEye first) by pasting credentials; the backend stores them encrypted, connects, and ingests inventory + history into the depot on a schedule. Provider-agnostic by design: `src/core/data_sources/base.py` defines `DataSourceProvider` (`provider_key`, `catalogue_entry()` → the credential-field schema the UI renders dynamically, `validate_credentials()`, `run_ingestion()`); `registry.py` is the `provider_key → provider` lookup; `kempower_provider.py` is the only concrete provider and drives the **same** `src/adapters/kempower/onboarding.py` stages the CLI uses (one code path — the CLI was refactored to import them). Adding a second provider is a drop-in.
+
+Credentials are Fernet-encrypted at rest via `src/security/credential_cipher.py` (`DATA_SOURCES_ENCRYPTION_KEY`, `encryption_version` column for rotation) — replayable, unlike bcrypt; never logged, never returned by the API. Two Supabase-static tables (so they FK `sites`/`organizations` and each other): `data_source_connections` (mig `supabase/042`) and `data_source_ingestion_jobs` (mig `supabase/043`). Jobs are durable: `ingestion.py::run_ingestion_job` claims a row (`pending→running`), decrypts, runs the provider, writes a terminal `succeeded|partial|failed` with progress counts, and is invoked from three triggers — the manual `/sync` endpoint, the scheduler, and a startup recovery sweep (mirrors `recover_orphaned_sessions`). The overlap guard is a partial unique index `uq_dsij_one_active_per_conn` (one non-terminal job per connection) → manual sync races return 409, the scheduler silently skips; this holds even under `WEB_CONCURRENCY>1` though a single web worker is assumed (`scheduler.py::check_single_worker` logs CRITICAL otherwise). `scheduler.py::run_data_source_scheduler` enqueues due connections (`next_sync_at <= NOW()`) each `DATA_SOURCES_SCHEDULER_INTERVAL_S`. The runtime is gated by `DATA_SOURCES_ENABLED` (default on; fails closed if enabled without an encryption key). Freshly-minted OCPP charger passwords from a first import are **not** surfaced (no plaintext through the API) — the job flags `credentials_pending_rotation` and the operator sets them via the existing rotate-credentials endpoint. Endpoints (all `customer_admin` + depot-scoped, snake_case responses): `GET/POST /admin/data-sources/connections`, `GET/PATCH/DELETE …/connections/{id}`, `POST …/connections/{id}/sync` (202 + `status_url`), `GET …/connections/{id}/jobs`, `GET …/jobs/{id}` (poll), `GET …/providers` (catalogue). No new read endpoints — imported chargers/vehicles/sessions surface in the existing depot views.
 
 ### Optimization Control Loop
 
@@ -370,6 +386,8 @@ These come directly from the PRD and are non-negotiable:
 
 ## Database Schema (TimescaleDB / PostgreSQL 16)
 
+> **Two-database invariant:** Static reference tables (`sites`/depots, `vehicles`, `charging_stations`/chargers, `organizations`, `schedules`, `battery_storage`, `charger_vehicle_access`, `drivers`, `rfid_cards`) live **exclusively in Supabase** (`pools.static`). The TimescaleDB migration set (`migrations/*.sql`) NEVER creates these tables. Depot/vehicle/charger identity columns on TimescaleDB operational tables are plain `UUID` columns — no FK constraints pointing at static data. This invariant was established by migrations 028–029 and 039 and is now enforced from the very first migration so that a fresh TimescaleDB install contains zero shadow copies.
+
 ### Reference (static) tables — Supabase project `favonius-pilot`
 
 > **Naming convention:** Supabase owns the canonical naming for the static
@@ -423,9 +441,8 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 - Promotion overrides any explicit `app_metadata.favonius_role`, so a stale Supabase metadata value cannot demote a Favonius employee. To exclude a specific Favonius email (e.g. a contractor on a `@favoniusenergy.com` address), do not issue them an `@favoniusenergy.com` JWT email — there is no per-user opt-out hook.
 
 ### Operational tables
-- `schedules` — Vehicle route schedules (departure/return times)
 - `optimization_runs` — Solver results, schedule JSON, status, solver_used
-- `charging_commands` — OCPP SetChargingProfile records and acknowledgment status (per-run audit, FK to `chargers`)
+- `charging_commands` — OCPP SetChargingProfile records and acknowledgment status (per-run audit; `charger_id` and `vehicle_id` are plain UUID references — no FK to Supabase static tables)
 - `charging_command_queue` — Durable buffer for SetChargingProfile pushes that arrived while a charger was offline; replayed by the legacy WS handler on next BootNotification (migration 013)
 - `charging_sessions` — OCPP 1.6 transaction lifecycle. `transaction_id` (BIGINT, from `ocpp_transaction_id` sequence), `last_seen_at` stamped by the WS close hook
 - `interdepot_messages` — Cross-depot vehicle handoff messages
@@ -447,6 +464,8 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 
 ### Migrations
 Migrations in `migrations/` run automatically on `docker-compose up` (mounted to `/docker-entrypoint-initdb.d`). To run manually: `python scripts/run_migrations.py`.
+
+The runner is **stateless** (no `applied` tracking table) — every file re-executes on each deploy, and all DDL uses `IF [NOT] EXISTS` / `DROP … IF EXISTS` for idempotency. Migrations that formerly altered shadow tables (011, 016, 017, 018, 020, 021) are guarded with `to_regclass('public.<shadow_table>') IS NULL` checks so they silently skip on fresh databases. The `schedules` Supabase table is listed under §"Reference (static) tables" above; there is no `schedules` table in TimescaleDB.
 
 ---
 
@@ -491,6 +510,11 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `POST` | `/agent/turn` | Depot chat agent — synchronous turn; returns `AgentReply` (10 req/min; requires `AGENT_SEARCH_ENABLED=true`) |
 | `POST` | `/agent/turn/stream` | Depot chat agent — SSE streaming turn; emits `step` events then `answer` (10 req/min; same gate) |
 | `GET` | `/agent/runs/{run_id}` | Fetch stored agent run trace (ownership-gated; `favonius_admin` may access any run) |
+| `GET` | `/depots/{id}/report-schedules` | List report schedules (any depot member; `[]` when none) |
+| `GET` | `/depots/{id}/report-schedules/{schedule_id}` | Get one report schedule |
+| `GET` | `/depots/{id}/report-schedules/{schedule_id}/runs` | List a schedule's runs (most-recent first) |
+
+Report-schedule mutations flow through `POST /commands/execute` (customer_admin+, `ADMIN_CONFIG`): `reports.schedule.create` (`params.input`), `reports.schedule.update` (`params.scheduleId`+`patch`), `reports.schedule.delete` (`params.scheduleId`), `reports.schedule.run_now` (`params.scheduleId` → returns `ScheduleRun`).
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)
@@ -881,6 +905,16 @@ Consumed only by `scripts/onboard_depot_from_kempower.py` — the running API do
 | `KEMPOWER_API_BASE_URL` | `https://api.chargeye.com` | ChargEye REST API base URL. Override for sandbox / on-prem deployments. |
 | `KEMPOWER_USERNAME` | — | ChargEye account login. The CLI exchanges this + password for a JWT cached for the documented 8 h TTL. |
 | `KEMPOWER_PASSWORD` | — | ChargEye account password. Runtime-only secret (never bake into a Docker build arg). If absent and a username is set, the CLI prompts on stdin. |
+
+### Data Sources (self-serve external integrations)
+Gates the `/admin/data-sources/*` router + ingestion scheduler. See the "Data Sources" architecture section.
+| Variable | Default | Description |
+|---|---|---|
+| `DATA_SOURCES_ENABLED` | `true` | Master flag. Mounts the router and starts the scheduler + startup recovery. Set to `false` to disable entirely. |
+| `DATA_SOURCES_ENCRYPTION_KEY` | — | **Required when enabled** (fails closed otherwise). Fernet key encrypting stored provider credentials. Rotation: comma-separated `version:key` pairs (newest encrypts). Runtime-only secret. |
+| `DATA_SOURCES_SCHEDULER_INTERVAL_S` | `300` | Cadence for enqueuing due connection syncs. |
+| `DATA_SOURCES_ORPHAN_THRESHOLD_S` | `1800` | Heartbeat age after which a pending/running job is re-kicked by the startup recovery sweep. |
+| `DATA_SOURCES_MAX_BACKFILL_DAYS` | `730` | Soft cap on a first-run historical backfill window. |
 
 ### Alerts pipeline (notifications)
 The pipeline has shipped; the implementation in `src/api/main.py` (alert endpoints, Resend webhook), `src/websocket_handler/` (AlertDispatcher), and migration 022 is the source of truth. The PR-era design plan has been retired.

@@ -32,6 +32,8 @@ from typing import Any, Optional
 import asyncpg
 import jwt
 from fastapi import Depends, HTTPException, status
+
+from ..db.exceptions import StaticDbUnavailableError
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient, PyJWKClientError
 
@@ -362,18 +364,17 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
 
     if pool is None:
         # Static DB pool unavailable means the auth check cannot be evaluated.
-        # Surface this as 503 so the client (and on-call) can distinguish it
-        # from a real policy denial — silently returning 403 here previously
-        # made every depot endpoint look access-denied during startup blips.
+        # Raise StaticDbUnavailableError so the global DatabaseError handler
+        # returns a structured {error_code: STATIC_DB_UNAVAILABLE} body (HTTP
+        # 503) rather than the plain FastAPI {"detail": "..."} envelope —
+        # making it unambiguous for clients and on-call to distinguish from a
+        # genuine 403 policy denial.
         logger.error(
-            "depot access check unavailable: static DB pool not initialized " "(depot=%s org=%s)",
+            "depot access check unavailable: static DB pool not initialized (depot=%s org=%s)",
             depot_id,
             org_id,
         )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Depot access check is temporarily unavailable",
-        )
+        raise StaticDbUnavailableError()
 
     try:
         async with pool.acquire() as conn:
@@ -400,10 +401,7 @@ async def verify_depot_access(depot_id: str, user: dict, pool: Any = None) -> No
             exc,
             exc_info=True,
         )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Depot access check is temporarily unavailable",
-        ) from exc
+        raise StaticDbUnavailableError() from exc
 
     if has_access:
         return

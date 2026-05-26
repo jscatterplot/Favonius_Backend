@@ -16,11 +16,12 @@ to recover historical sessions that were stuck with
 For each candidate row the script attempts, in order:
 
   1. **Register-sample backfill** — find the earliest
-     ``Energy.Active.Import.Register`` sample in ``telemetry_samples``
-     for the session's transaction window. If one exists, use it as
-     the effective ``meter_start_wh`` and compute the bracket-based
-     delta against ``last_meter_wh`` (or ``meter_stop_wh`` if the
-     running register column is also NULL).
+     ``energy_kwh`` reading in ``telemetry`` for the session's
+     transaction window (``telemetry_samples`` was retired in
+     migration 045; energy_kwh is the same data, normalised to kWh).
+     If one exists, use it as the effective ``meter_start_wh`` and
+     compute the bracket-based delta against ``last_meter_wh`` (or
+     ``meter_stop_wh`` if the running register column is also NULL).
   2. **Synthesised delta** — if no register samples exist for the
      session AND ``meter_stop_wh`` is positive AND below the
      ``OCPP_SYNTHESIZED_DELTA_CAP_KWH`` cap (default 50 kWh), treat
@@ -120,13 +121,13 @@ _CANDIDATE_SQL = """
 
 
 _EARLIEST_REGISTER_SQL = """
-    SELECT MIN(value)::bigint AS earliest_wh
-    FROM telemetry_samples
+    SELECT ROUND(MIN(energy_kwh) * 1000)::bigint AS earliest_wh
+    FROM telemetry
     WHERE station_id     = $1
       AND transaction_id = $2
-      AND measurand      = 'Energy.Active.Import.Register'
+      AND energy_kwh IS NOT NULL
+      AND energy_kwh > 0
       AND time BETWEEN $3 AND $4
-      AND value > 0
 """
 
 

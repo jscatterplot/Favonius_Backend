@@ -12,6 +12,16 @@ from typing import Any, Optional, Protocol
 
 
 @dataclass(frozen=True)
+class EmailAttachment:
+    """A binary attachment. ``content`` is the raw (un-encoded) bytes; the
+    provider client is responsible for any transport encoding (e.g. base64)."""
+
+    filename: str
+    content: bytes
+    content_type: str = "application/octet-stream"
+
+
+@dataclass(frozen=True)
 class EmailMessage:
     """Renderable email payload. The dispatcher fills `to` per recipient
     before passing the message to the client; html/text/subject are produced
@@ -23,6 +33,7 @@ class EmailMessage:
     text: str
     from_address: str
     headers: dict[str, str] = field(default_factory=dict)
+    attachments: list[EmailAttachment] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,7 @@ class FakeEmailClient:
 
 __all__ = [
     "EmailMessage",
+    "EmailAttachment",
     "DeliveryResult",
     "EmailDeliveryClient",
     "FakeEmailClient",

@@ -13,6 +13,7 @@ from src.api.fleet_list import (
     CHARGER_OFFLINE_AGE_S,
     DEFAULT_DEPARTURE_SOC,
     VEHICLE_OFFLINE_AGE_S,
+    _latest,
     derive_charger_status,
     derive_vehicle_state,
     format_charger_item,
@@ -393,6 +394,115 @@ class TestFormatChargerItem:
         )
         assert item["status"] == "idle"
         assert item["last_interaction_at"] == recent.isoformat()
+
+    def test_telemetry_freshness_rescues_stale_connector_status(self):
+        """MeterValues freshness keeps an actively-metering charger online.
+
+        Regression for "charging charger shows offline on the dashboard":
+        connector_status MAX only advances on StatusNotification and the
+        liveness pg_notify bridge can be down, so a steadily-charging charger
+        would flip to ``offline`` once the connector_status row ages past the
+        threshold. telemetry MAX (a row per MeterValues frame) is the third
+        signal that prevents that.
+        """
+        stale = _ago(50 * 60)  # last StatusNotification 50 min ago
+        fresh_meter = _ago(20)  # MeterValues 20 s ago
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={"ocpp_status": "Available", "last_heartbeat_at": stale},
+            open_session=None,
+            now=NOW,
+            last_interaction_override=None,
+            telemetry_last_seen=fresh_meter,
+        )
+        assert item["status"] == "idle", "fresh MeterValues → not offline"
+        assert item["last_interaction_at"] == fresh_meter.isoformat()
+
+    def test_freshest_of_all_three_signals_wins(self):
+        """``last_interaction`` is the max of override / connector / telemetry."""
+        override = _ago(90)
+        connector = _ago(40)
+        telemetry = _ago(10)  # freshest
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={"ocpp_status": "Available", "last_heartbeat_at": connector},
+            open_session=None,
+            now=NOW,
+            last_interaction_override=override,
+            telemetry_last_seen=telemetry,
+        )
+        assert item["last_interaction_at"] == telemetry.isoformat()
+
+    def test_telemetry_only_signal_marks_online(self):
+        """No connector_status and no override, but fresh telemetry → idle."""
+        fresh_meter = _ago(15)
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status=None,
+            open_session=None,
+            now=NOW,
+            telemetry_last_seen=fresh_meter,
+        )
+        assert item["status"] == "idle"
+        assert item["ocpp_connector_status"] is None
+        assert item["last_interaction_at"] == fresh_meter.isoformat()
+
+    def test_all_signals_stale_is_offline(self):
+        """Telemetry that's also stale does not rescue — charger is offline."""
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={
+                "ocpp_status": "Available",
+                "last_heartbeat_at": _ago(CHARGER_OFFLINE_AGE_S + 30),
+            },
+            open_session=None,
+            now=NOW,
+            telemetry_last_seen=_ago(CHARGER_OFFLINE_AGE_S + 10),
+        )
+        assert item["status"] == "offline"
+
+    def test_fresh_telemetry_does_not_override_faulted(self):
+        """A real Faulted state still wins even when MeterValues are fresh."""
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={"ocpp_status": "Faulted", "last_heartbeat_at": _ago(5)},
+            open_session=None,
+            now=NOW,
+            telemetry_last_seen=_ago(5),
+        )
+        assert item["status"] == "fault"
+
+    def test_future_telemetry_timestamp_clamped_to_now(self):
+        """A charger-supplied MeterValues timestamp far in the future is clamped
+        to ``now`` so ``last_interaction_at`` stays sane and ``age()`` never
+        goes negative (which would permanently suppress the offline threshold).
+        """
+        future = NOW + timedelta(hours=6)
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={"ocpp_status": "Available", "last_heartbeat_at": None},
+            open_session=None,
+            now=NOW,
+            telemetry_last_seen=future,
+        )
+        # Age is 0 after clamping — charger is online (it just sent MeterValues).
+        assert item["status"] == "idle"
+        # The response timestamp must be now, not the future raw value.
+        assert item["last_interaction_at"] == NOW.isoformat()
+
+
+class TestLatestHelper:
+    def test_returns_none_when_all_none(self):
+        assert _latest(None, None) is None
+
+    def test_picks_max_and_normalizes_naive_to_utc(self):
+        aware = datetime(2026, 5, 3, 14, 0, tzinfo=timezone.utc)
+        naive_newer = datetime(2026, 5, 3, 14, 5)  # naive → treated as UTC, newer
+        assert _latest(aware, naive_newer, None) == naive_newer.replace(tzinfo=timezone.utc)
+
+    def test_skips_non_datetime_values(self):
+        ts = datetime(2026, 5, 3, 14, 0, tzinfo=timezone.utc)
+        assert _latest("not-a-date", ts, 12345) == ts
 
 
 class TestFormatVehicleItem:

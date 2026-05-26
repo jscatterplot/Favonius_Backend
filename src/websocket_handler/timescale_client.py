@@ -248,45 +248,18 @@ class TimescaleClient:
                         transaction_id = self._coerce_transaction_id(session_id)
 
                         raw_sample = data.get("raw_sample")
-                        if raw_sample:
-                            await conn.execute(
-                                """
-                                INSERT INTO telemetry_samples (
-                                    time,
-                                    station_id,
-                                    connector_id,
-                                    transaction_id,
-                                    measurand,
-                                    phase,
-                                    location,
-                                    unit,
-                                    context,
-                                    format,
-                                    value
-                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                                """,
-                                raw_sample.get("timestamp", data["time"]),
-                                station_id,
-                                connector_id,
-                                transaction_id,
-                                raw_sample.get("measurand"),
-                                raw_sample.get("phase"),
-                                raw_sample.get("location"),
-                                raw_sample.get("unit"),
-                                raw_sample.get("context"),
-                                raw_sample.get("format"),
-                                raw_sample.get("value"),
-                            )
 
-                        # Live session metrics: keep the open charging_sessions row
-                        # fresh so per-charger power/SoC is observable in real time
-                        # without requiring vehicle attribution. When this row
-                        # carries an Energy.Active.Import.Register sample we also
-                        # advance last_meter_wh / energy_delivered_kwh on the
-                        # session — that is the running-meter source of truth the
-                        # orphan-recovery job falls back to when StopTransaction
-                        # is missing.
+                        # Derive energy_kwh from the individual sample so that
+                        # SoC and power rows don't inherit the frame-level register
+                        # reading. Non-register measurands get energy_kwh=NULL,
+                        # which keeps get_session_energy_kwh's delta calculation
+                        # clean. For frame-level rows (no raw_sample) fall back to
+                        # the aggregated energy_kwh that the callback extracted.
                         meter_wh = self._extract_register_wh(raw_sample) if raw_sample else None
+                        if raw_sample is not None:
+                            energy_kwh = meter_wh / 1000.0 if meter_wh is not None else None
+                        else:
+                            energy_kwh = data.get("energy_kwh")
                         if station_id and transaction_id is not None:
                             await self._update_session_live_metrics(
                                 conn,
@@ -310,14 +283,32 @@ class TimescaleClient:
                         charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
                         soc = (soc_percent / 100.0) if soc_percent is not None else None
                         is_plugged = (power_kw > 0.1) if power_kw is not None else None
+                        # Use per-sample timestamp when available (e.g. StopTransaction
+                        # transactionData carries historical readings each with their own
+                        # timestamp — collapsing them to the frame time would lose history
+                        # and break get_session_energy_kwh's energy-delta calculation).
+                        telemetry_time = (
+                            raw_sample.get("timestamp") or data["time"]
+                        ) if raw_sample else data["time"]
+                        sample_index = data.get("sample_index")
+                        if (
+                            raw_sample
+                            and isinstance(sample_index, int)
+                            and sample_index > 0
+                            and hasattr(telemetry_time, "microsecond")
+                        ):
+                            telemetry_time = telemetry_time + timedelta(
+                                microseconds=sample_index
+                            )
 
                         await conn.execute(
                             """
                             INSERT INTO telemetry (
                                 time, station_id, connector_id, transaction_id,
-                                vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
+                                vehicle_id, charger_id, soc, charging_kw, is_plugged,
+                                max_charge_kw, energy_kwh
                             )
-                            VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7, $8, $9, $10)
+                            VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7, $8, $9, $10, $11)
                             ON CONFLICT (time, station_id, connector_id) DO UPDATE
                             SET transaction_id = COALESCE(
                                     EXCLUDED.transaction_id,
@@ -328,9 +319,10 @@ class TimescaleClient:
                                 soc = COALESCE(EXCLUDED.soc, telemetry.soc),
                                 charging_kw = COALESCE(EXCLUDED.charging_kw, telemetry.charging_kw),
                                 is_plugged = COALESCE(EXCLUDED.is_plugged, telemetry.is_plugged),
-                                max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw)
+                                max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw),
+                                energy_kwh = COALESCE(EXCLUDED.energy_kwh, telemetry.energy_kwh)
                             """,
-                            data["time"],
+                            telemetry_time,
                             station_id or "unknown",
                             int(connector_id) if connector_id is not None else 1,
                             transaction_id,
@@ -340,6 +332,7 @@ class TimescaleClient:
                             power_kw,
                             is_plugged,
                             max_charge_kw,
+                            energy_kwh,
                         )
                         inserted += 1
                 finally:

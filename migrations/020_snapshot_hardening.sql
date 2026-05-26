@@ -22,11 +22,17 @@
 -- 'static_assumption'.
 
 -- 1. Depot-level static building-load derate
-ALTER TABLE depots
-    ADD COLUMN IF NOT EXISTS building_load_assumption_kw DOUBLE PRECISION NOT NULL DEFAULT 0.0;
-
+-- Guard: depots is a Supabase shadow table removed from 001; skip when absent.
 DO $$
 BEGIN
+    IF to_regclass('public.depots') IS NULL THEN
+        RAISE NOTICE 'Skipping 020 depots.building_load_assumption_kw: shadow table depots does not exist';
+        RETURN;
+    END IF;
+
+    ALTER TABLE depots
+        ADD COLUMN IF NOT EXISTS building_load_assumption_kw DOUBLE PRECISION NOT NULL DEFAULT 0.0;
+
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.table_constraints
         WHERE constraint_name = 'depots_building_load_assumption_nonneg'

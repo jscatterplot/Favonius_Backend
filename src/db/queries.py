@@ -1115,7 +1115,8 @@ async def get_latest_optimization_run(
     """
     query = """
         SELECT run_id, run_time, trigger_reason, horizon_start, horizon_end,
-               solve_time_s, objective_value, peak_demand_kw, status, schedule_json
+               solve_time_s, objective_value, peak_demand_kw, status,
+               solver_used, schedule_json
         FROM optimization_runs
         WHERE depot_id = $1
         ORDER BY run_time DESC
@@ -3110,6 +3111,39 @@ async def latest_connector_status_by_stations(db, station_ids: list[str]) -> dic
     return out
 
 
+async def latest_telemetry_time_by_stations(
+    db, station_ids: list[str], *, max_age_seconds: int = 3600
+) -> dict[str, datetime]:
+    """Most recent ``telemetry`` timestamp per station_id.
+
+    Returns a mapping ``ocpp_id -> MAX(telemetry.time)``. Unlike
+    :func:`latest_connector_status_by_stations` — whose ``last_interaction_at``
+    only advances on StatusNotification (connector state changes) — the
+    ``telemetry`` hypertable gets a row on every OCPP MeterValues frame
+    (migration 035, keyed by ``(time, station_id, connector_id)``). Surfacing
+    this lets the chargers endpoint treat a steadily-metering charger as
+    "online" even when no connector state change has happened recently and
+    the liveness pg_notify bridge is unavailable — the failure mode where a
+    charging charger showed ``offline`` on the dashboard while MeterValues
+    were flowing.
+
+    ``max_age_seconds`` bounds the scan to recent rows; the freshness window
+    that matters is minutes, and the ``idx_telemetry_station`` index
+    (``station_id, connector_id, time DESC``) keeps the per-station MAX cheap.
+    """
+    if not station_ids:
+        return {}
+    query = """
+        SELECT station_id, MAX(time) AS last_telemetry_at
+        FROM telemetry
+        WHERE station_id = ANY($1)
+          AND time > NOW() - ($2 || ' seconds')::interval
+        GROUP BY station_id
+    """
+    rows = await db.fetch(query, station_ids, str(max_age_seconds))
+    return {row["station_id"]: row["last_telemetry_at"] for row in rows}
+
+
 async def open_sessions_by_stations(db, station_ids: list[str]) -> dict[str, dict]:
     """Latest open ``charging_sessions`` row per station_id.
 
@@ -3155,7 +3189,8 @@ async def latest_telemetry_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, 
                soc               AS current_soc,
                charging_kw       AS current_power_kw,
                charger_id::text  AS charger_id,
-               is_plugged
+               is_plugged,
+               energy_kwh
         FROM telemetry
         WHERE vehicle_id = ANY($1::uuid[])
         ORDER BY vehicle_id, time DESC
@@ -3456,7 +3491,8 @@ async def latest_telemetry_for_depot_vehicles(db, *, vehicle_ids: list[str]) -> 
                time              AS last_seen_at,
                soc               AS soc,
                charging_kw       AS power_kw,
-               is_plugged
+               is_plugged,
+               energy_kwh
         FROM telemetry
         WHERE vehicle_id = ANY($1::uuid[])
         ORDER BY vehicle_id, time DESC
@@ -3488,11 +3524,13 @@ async def get_session_energy_kwh(
        from the OCPP StopTransaction meter delta when the session closes.
        Billing-grade; only available once the session has ended (or for
        imported rows). Returned with ``source = "session_meter_delta"``.
-    2. Meter-register delta from ``telemetry_samples`` — difference between
-       the first and last ``Energy.Active.Import.Register`` samples in the
-       session window (transaction-scoped), normalized to kWh. If the register
-       decreases at any point (rollover/reset), this fallback is treated as
-       unavailable to avoid returning misleading billing values. Returned with
+    2. Meter-register delta from ``telemetry.energy_kwh`` — difference between
+       the first and last energy register readings in the session window
+       (transaction-scoped). telemetry_samples was retired in migration 045;
+       energy_kwh is now a first-class column on the wide table, already
+       normalised to kWh by the write path. If the register decreases at any
+       point (rollover/reset), this fallback is treated as unavailable to
+       avoid returning misleading billing values. Returned with
        ``source = "telemetry_register_delta"``.
 
     Args:
@@ -3550,7 +3588,9 @@ async def get_session_energy_kwh(
             "source": ENERGY_SOURCE_SESSION_METER,
         }
 
-    # Option B: integrate the cumulative register from telemetry_samples.
+    # Option B: integrate the cumulative register from telemetry.energy_kwh.
+    # telemetry_samples was retired in migration 045; energy_kwh is now a
+    # first-class column on the wide telemetry table, already normalised to kWh.
     session_txid = session_row["transaction_id"]
     if session_txid is None:
         return None
@@ -3560,13 +3600,10 @@ async def get_session_energy_kwh(
         WITH normalized_samples AS (
             SELECT
                 time,
-                CASE
-                    WHEN LOWER(COALESCE(unit, 'Wh')) = 'kwh' THEN value
-                    ELSE value / 1000.0
-                END AS value_kwh
-            FROM telemetry_samples
+                energy_kwh AS value_kwh
+            FROM telemetry
             WHERE transaction_id = $1
-              AND measurand = 'Energy.Active.Import.Register'
+              AND energy_kwh IS NOT NULL
               AND time >= $2
               AND time <= COALESCE($3, NOW())
         ),

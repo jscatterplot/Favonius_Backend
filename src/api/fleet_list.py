@@ -35,7 +35,7 @@ DEFAULT_DEPARTURE_SOC: float = 0.95
 
 
 ChargerStatus = Literal["charging", "idle", "offline", "fault"]
-VehicleState = Literal["ready", "charging", "at_risk", "in_route", "offline"]
+VehicleState = Literal["ready", "charging", "at_risk", "in_route", "offline", "unknown"]
 
 
 def _isoformat(value: Any) -> Optional[str]:
@@ -59,6 +59,27 @@ def _age_seconds(timestamp: Any, now: datetime) -> Optional[float]:
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
     return (now - timestamp).total_seconds()
+
+
+def _latest(*timestamps: Any) -> Optional[datetime]:
+    """Return the freshest (max) timestamp among the args, ignoring None.
+
+    Naive datetimes are treated as UTC; non-datetime values are skipped.
+    Used to combine several independent "last interaction" signals (the
+    liveness pg_notify cache, the connector_status MAX, and the telemetry
+    MAX) into the single freshest value — taking the max rather than a
+    priority fallback so any one live signal keeps a charger from being
+    falsely marked offline.
+    """
+    best: Optional[datetime] = None
+    for ts in timestamps:
+        if not isinstance(ts, datetime):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if best is None or ts > best:
+            best = ts
+    return best
 
 
 def derive_charger_status(
@@ -100,14 +121,15 @@ def derive_vehicle_state(
     required_soc: Optional[float],
     now: datetime,
 ) -> VehicleState:
-    """Map runtime signals to the 5-state vehicle pill.
+    """Map runtime signals to the 6-state vehicle pill.
 
     Priority (top wins):
       1. ``offline`` — no telemetry or stale by ``VEHICLE_OFFLINE_AGE_S``.
       2. ``charging`` — open ``charging_sessions`` row exists.
       3. ``in_route`` — within an active schedule window.
       4. ``ready`` — ``current_soc >= required_soc`` (default 0.95 if none).
-      5. ``at_risk`` — otherwise.
+      5. ``at_risk`` — known SoC below threshold.
+      6. ``unknown`` — charger hasn't reported SoC, so risk can't be assessed.
     """
     age = _age_seconds(last_seen_at, now)
     if age is None or age > VEHICLE_OFFLINE_AGE_S:
@@ -119,8 +141,11 @@ def derive_vehicle_state(
     if has_active_schedule:
         return "in_route"
 
+    if current_soc is None:
+        return "unknown"
+
     threshold = required_soc if required_soc is not None else DEFAULT_DEPARTURE_SOC
-    if current_soc is not None and current_soc >= threshold:
+    if current_soc >= threshold:
         return "ready"
     return "at_risk"
 
@@ -155,29 +180,43 @@ def format_charger_item(
     open_session: Optional[dict],
     now: datetime,
     last_interaction_override: Optional[datetime] = None,
+    telemetry_last_seen: Optional[datetime] = None,
 ) -> dict:
     """Build one charger response item from static + runtime data.
 
-    ``last_interaction_override`` is the freshest in-memory liveness
-    timestamp from ``LivenessHub`` (fed by every received OCPP frame
-    via pg_notify). When supplied and non-None, it wins over the
-    ``connector_status`` MAX — which only advances on state changes,
-    not Heartbeats — so the response reflects actual recent activity
-    instead of "the last time the connector changed state ~50 min ago".
-    Both ``last_interaction_at`` and the derived ``status`` are
-    computed from the same source so REST stays self-consistent.
+    ``last_interaction`` is the freshest of three independent signals, so a
+    charger that is demonstrably alive on any one of them is never falsely
+    marked offline:
+
+      1. ``last_interaction_override`` — the in-memory ``LivenessHub`` cache,
+         fed by every OCPP frame via pg_notify. Cold right after an API
+         replica restart, and absent entirely when the pg_notify bridge is
+         down.
+      2. ``connector_status`` MAX — advances only on StatusNotification
+         (connector state changes), so it lags for a charger that's steadily
+         charging without changing state.
+      3. ``telemetry_last_seen`` — MAX(``telemetry``.time), which gets a row
+         on every MeterValues frame. This is the signal that keeps an
+         actively-metering charger "online" even when (1) is unavailable and
+         (2) is stale — the regression where a charging charger showed
+         ``offline`` while MeterValues were flowing.
+
+    Taking the max (not a priority fallback) means the strongest live signal
+    always wins. Both ``last_interaction_at`` and the derived ``status`` are
+    computed from the same combined value so REST stays self-consistent.
     """
     ocpp_status = connector_status.get("ocpp_status") if connector_status else None
-    # Pick the freshest signal we have:
-    #   1. LivenessHub cache (any OCPP frame, including Heartbeats),
-    #   2. connector_status MAX (state changes only — fallback when
-    #      the cache is cold, e.g. right after API replica restart).
     db_last_interaction = (
         (connector_status.get("last_interaction_at") or connector_status.get("last_heartbeat_at"))
         if connector_status
         else None
     )
-    last_interaction = last_interaction_override or db_last_interaction
+    last_interaction = _latest(last_interaction_override, db_last_interaction, telemetry_last_seen)
+    # Cap to now — charger-supplied MeterValues timestamps can be in the
+    # future (clock skew), which would make age() negative and keep a
+    # disconnected charger falsely online until wall-clock catches up.
+    if last_interaction is not None and last_interaction > now:
+        last_interaction = now
     status = derive_charger_status(
         ocpp_status=ocpp_status,
         last_heartbeat_at=last_interaction,

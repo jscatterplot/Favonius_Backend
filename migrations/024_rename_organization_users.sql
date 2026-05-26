@@ -19,6 +19,10 @@ BEGIN
     END IF;
 END $$;
 
-COMMENT ON TABLE user_organizations IS
-    'At most one organization per user (enforced by UNIQUE user_id). '
-    'Cache mirrored JIT from JWT app_metadata; canonical source is Supabase.';
+DO $$
+BEGIN
+    IF to_regclass('public.user_organizations') IS NOT NULL THEN
+        EXECUTE $q$COMMENT ON TABLE user_organizations IS
+            'At most one organization per user (enforced by UNIQUE user_id). Cache mirrored JIT from JWT app_metadata; canonical source is Supabase.'$q$;
+    END IF;
+END $$;
