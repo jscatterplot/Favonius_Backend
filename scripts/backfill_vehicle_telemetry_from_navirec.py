@@ -37,6 +37,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -65,6 +66,32 @@ logger = logging.getLogger("backfill_vehicle_telemetry")
 _LOCK_RETRIES = 5
 _LOCK_RETRY_BACKOFF_S = 1.0
 
+# Flush each depot's rows in bounded batches so a multi-month backfill doesn't
+# buffer the whole fleet's history in memory or issue one oversized insert.
+_WRITE_CHUNK = 2000
+
+
+async def _flush_depot(ts_pool: asyncpg.Pool, depot: str, rows: list[tuple[Any, ...]]) -> int:
+    """Write one depot's buffered rows, retrying advisory-lock contention.
+
+    Uses ``record_throughput=False`` so the backfill doesn't spike the live
+    poller's throughput metric. Raises if the lock can't be acquired after
+    ``_LOCK_RETRIES`` attempts (re-run; the upsert is idempotent).
+    """
+    count: Optional[int] = None
+    for attempt in range(_LOCK_RETRIES):
+        count = await write_depot_readings(ts_pool, depot, rows, record_throughput=False)
+        if count is not None:
+            break
+        await asyncio.sleep(_LOCK_RETRY_BACKOFF_S * (attempt + 1))
+    if count is None:
+        raise RuntimeError(
+            f"Backfill could not acquire the advisory lock for depot {depot} "
+            f"after {_LOCK_RETRIES} attempts (live poller contention?). "
+            "Re-run the backfill — it is idempotent."
+        )
+    return count
+
 
 async def run_backfill(
     static_pool: asyncpg.Pool,
@@ -85,9 +112,13 @@ async def run_backfill(
     start_iso = since.astimezone(timezone.utc).isoformat()
     end_iso = until.astimezone(timezone.utc).isoformat()
 
-    plate_map = await build_plate_map(static_pool)
+    # Scope the plate map to the target depot so a plate shared with another
+    # depot isn't dropped as globally-ambiguous (which would skip valid rows).
+    plate_map = await build_plate_map(static_pool, depot_id=depot_id)
 
-    rows_by_depot: dict[str, list[tuple[Any, ...]]] = {}
+    planned: dict[str, int] = defaultdict(int)
+    written: dict[str, int] = defaultdict(int)
+    buffers: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
     matched_vehicles = 0
     skipped_vehicles = 0
 
@@ -114,35 +145,27 @@ async def run_backfill(
             point = parse_navirec_point(raw)
             if point is None:
                 continue
-            reading = reading_from_point(plate, point, raw)
-            rows_by_depot.setdefault(vehicle_depot, []).append(_reading_to_row(vehicle_id, reading))
+            planned[vehicle_depot] += 1
+            if not execute:
+                continue
+            buf = buffers[vehicle_depot]
+            buf.append(_reading_to_row(vehicle_id, reading_from_point(plate, point, raw)))
+            if len(buf) >= _WRITE_CHUNK:
+                written[vehicle_depot] += await _flush_depot(ts_pool, vehicle_depot, buf)
+                buf.clear()
 
-    planned = {d: len(r) for d, r in rows_by_depot.items()}
-    total_planned = sum(planned.values())
-
-    written: dict[str, int] = {}
     if execute:
-        for depot, rows in rows_by_depot.items():
-            count: Optional[int] = None
-            for attempt in range(_LOCK_RETRIES):
-                count = await write_depot_readings(ts_pool, depot, rows)
-                if count is not None:
-                    break
-                await asyncio.sleep(_LOCK_RETRY_BACKOFF_S * (attempt + 1))
-            if count is None:
-                raise RuntimeError(
-                    f"Backfill could not acquire the advisory lock for depot {depot} "
-                    f"after {_LOCK_RETRIES} attempts (live poller contention?). "
-                    "Re-run the backfill — it is idempotent."
-                )
-            written[depot] = count
+        for depot, buf in buffers.items():
+            if buf:
+                written[depot] += await _flush_depot(ts_pool, depot, buf)
+                buf.clear()
 
     summary = {
         "matched_vehicles": matched_vehicles,
         "skipped_vehicles": skipped_vehicles,
-        "planned_rows": planned,
-        "total_planned": total_planned,
-        "written": written,
+        "planned_rows": dict(planned),
+        "total_planned": sum(planned.values()),
+        "written": dict(written),
         "executed": execute,
     }
     logger.info("Backfill summary: %s", summary)

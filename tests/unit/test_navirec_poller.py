@@ -222,3 +222,20 @@ async def test_poll_once_counts_unmatched():
     summary = await poll_once(None, FakePool(conn), FakeClient(raws), plate_map={}, now=_NOW)
     assert summary["unmatched"] == 1
     assert summary["written"] == {}
+
+
+@pytest.mark.asyncio
+async def test_poll_once_sanitizes_non_finite_raw_fields():
+    # NaN/Infinity in raw_fields must not produce invalid jsonb (would fail the
+    # whole depot batch insert in Postgres).
+    import json
+
+    plate_map = {"PA": ("vA", "dA")}
+    raws = [
+        {"plate": "PA", "soc": 50, "timestamp": _NOW.isoformat(), "weird": float("nan")},
+    ]
+    conn = FakeConn(lock_result=True)
+    await poll_once(None, FakePool(conn), FakeClient(raws), plate_map=plate_map, now=_NOW)
+    payload = conn.recorder[0][6]  # raw_fields JSON column
+    assert "NaN" not in payload and "Infinity" not in payload
+    assert json.loads(payload)["weird"] is None

@@ -29,6 +29,7 @@ _TS_DT = datetime(2026, 5, 26, 10, 0, 0, tzinfo=timezone.utc)
         (None, ""),
         ("", ""),
         ("   ", ""),
+        (12345, "12345"),  # non-string id coerced, not crashed
     ],
 )
 def test_normalize_plate(raw, expected):
@@ -82,6 +83,19 @@ def test_reading_overflow_epoch_returns_none():
 def test_reading_epoch_millis_timestamp():
     r = navirec_vehicle_to_reading({"plate": "X", "soc": 50, "timestamp": 1748253600000})
     assert r.time == datetime(2025, 5, 26, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_reading_string_epoch_timestamp():
+    # Epoch encoded as a string (common API encoding) must parse, not drop.
+    r_ms = navirec_vehicle_to_reading({"plate": "X", "soc": 50, "timestamp": "1748253600000"})
+    assert r_ms.time == datetime(2025, 5, 26, 10, 0, 0, tzinfo=timezone.utc)
+    r_s = navirec_vehicle_to_reading({"plate": "X", "soc": 50, "timestamp": "1748253600"})
+    assert r_s.time == datetime(2025, 5, 26, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_reading_short_numeric_string_not_epoch():
+    # A bare "2026" is not a 10+ digit epoch and isn't a valid datetime → drop.
+    assert navirec_vehicle_to_reading({"plate": "X", "soc": 50, "timestamp": "2026"}) is None
 
 
 def test_reading_lat_lon_aliases():

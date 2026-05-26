@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -84,12 +85,16 @@ def _poll_enabled() -> bool:
     return os.getenv("NAVIREC_POLL_ENABLED", "false").strip().lower() == "true"
 
 
-async def build_plate_map(static_pool: Any) -> PlateMap:
+async def build_plate_map(static_pool: Any, depot_id: Optional[str] = None) -> PlateMap:
     """Build ``{normalized_plate → (vehicle_id, depot_id)}`` from the static DB.
 
     Plates that resolve to more than one vehicle (after normalization) are
     dropped — attributing a reading to the wrong vehicle is worse than missing
     it. Emits the ambiguous count as a gauge.
+
+    When ``depot_id`` is given the map is scoped to that depot, so a plate that
+    also exists in another depot doesn't get dropped as globally-ambiguous and
+    silently skip valid vehicles for a depot-targeted backfill.
     """
     async with static_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -97,7 +102,9 @@ async def build_plate_map(static_pool: Any) -> PlateMap:
             SELECT id::text AS vehicle_id, site_id::text AS depot_id, license_plate
             FROM vehicles
             WHERE license_plate IS NOT NULL AND site_id IS NOT NULL
-            """
+              AND ($1::uuid IS NULL OR site_id = $1::uuid)
+            """,
+            depot_id,
         )
 
     plate_map: PlateMap = {}
@@ -140,6 +147,23 @@ class _PlateMapCache:
 _plate_map_cache = _PlateMapCache()
 
 
+def _json_safe(obj: Any) -> Any:
+    """Recursively replace non-finite floats (NaN/Infinity) with ``None``.
+
+    ``json.dumps`` emits ``NaN``/``Infinity`` tokens by default, which Postgres
+    ``jsonb`` rejects — and since each depot writes as one batched insert, a
+    single such value in ``raw_fields`` would fail the whole batch. Sanitize so
+    the row is stored with the bad field nulled instead.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def _reading_to_row(vehicle_id: str, reading: VehicleTelemetryReading) -> tuple[Any, ...]:
     return (
         reading.time,
@@ -148,7 +172,7 @@ def _reading_to_row(vehicle_id: str, reading: VehicleTelemetryReading) -> tuple[
         reading.latitude,
         reading.longitude,
         "navirec",
-        json.dumps(reading.raw_fields),
+        json.dumps(_json_safe(reading.raw_fields)),
     )
 
 
@@ -173,6 +197,8 @@ async def write_depot_readings(
     ts_pool: Any,
     depot_id: str,
     rows: list[tuple[Any, ...]],
+    *,
+    record_throughput: bool = True,
 ) -> Optional[int]:
     """Upsert one depot's rows under a per-depot advisory lock.
 
@@ -180,6 +206,10 @@ async def write_depot_readings(
     ``ON CONFLICT (vehicle_id, time) DO NOTHING`` are not counted), or ``None``
     if another worker held the lock (skipped this cycle). Shared by the live
     poller and the historical backfill.
+
+    ``record_throughput`` increments the live-poller throughput counter; the
+    one-shot backfill passes ``False`` so a large historical run doesn't spike a
+    metric that dashboards read as live ingestion.
     """
     if not rows:
         return 0
@@ -198,7 +228,7 @@ async def write_depot_readings(
         finally:
             await conn.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock_key)
     count = len(inserted)
-    if count:
+    if count and record_throughput:
         NAVIREC_READINGS_WRITTEN.labels(depot_id=depot_id).inc(count)
     return count
 

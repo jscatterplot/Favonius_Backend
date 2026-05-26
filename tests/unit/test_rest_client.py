@@ -187,12 +187,15 @@ async def test_429_http_date_retry_after_then_success(client):
 
 
 def test_parse_retry_after_variants():
-    from src.adapters.rest_client import _parse_retry_after
+    from src.adapters.rest_client import _MAX_RETRY_AFTER_S, _parse_retry_after
 
     assert _parse_retry_after(None, 7.0) == 7.0
     assert _parse_retry_after("3", 7.0) == 3.0
     assert _parse_retry_after("garbage", 7.0) == 7.0  # malformed → default
     assert _parse_retry_after("Wed, 21 Oct 1999 07:28:00 GMT", 7.0) == 0.0  # past date → 0
+    # Absurd delay-seconds and far-future dates are capped so sleep stays bounded.
+    assert _parse_retry_after("100000", 7.0) == _MAX_RETRY_AFTER_S
+    assert _parse_retry_after("Wed, 21 Oct 2099 07:28:00 GMT", 7.0) == _MAX_RETRY_AFTER_S
 
 
 @pytest.mark.asyncio

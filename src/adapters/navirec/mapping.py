@@ -31,16 +31,22 @@ _ID_KEYS = ("id", "vehicleId", "deviceId", "objectId", "imei")
 _NON_ALNUM = re.compile(r"[^A-Z0-9]")
 
 
-def normalize_plate(raw: Optional[str]) -> str:
+def normalize_plate(raw: Any) -> str:
     """Canonicalize a license plate for cross-system matching.
 
     Uppercases and strips every non-alphanumeric character so that
     ``"ABC-123"``, ``"abc 123"`` and ``"ABC123"`` all collapse to ``"ABC123"``.
-    Returns ``""`` for ``None`` / blank input (callers treat that as unmatchable).
+    Returns ``""`` for ``None`` / blank input (callers treat that as
+    unmatchable). Non-string input (e.g. a numeric provider id) is coerced to
+    ``str`` first so a malformed payload can't abort the whole poll cycle with
+    an ``AttributeError``.
     """
-    if not raw:
+    if raw is None:
         return ""
-    return _NON_ALNUM.sub("", raw.upper())
+    text = raw if isinstance(raw, str) else str(raw)
+    if not text:
+        return ""
+    return _NON_ALNUM.sub("", text.upper())
 
 
 class VehicleTelemetryReading(BaseModel):
@@ -153,6 +159,11 @@ def _coerce_time(value: Any) -> Optional[datetime]:
         text = value.strip()
         if not text:
             return None
+        # Numeric epoch encoded as a string (e.g. "1748253600000"). Require
+        # >= 10 digits so a bare year like "2026" isn't misread as an epoch;
+        # delegate to the numeric branch (handles ms scaling + overflow).
+        if text.isdigit() and len(text) >= 10:
+            return _coerce_time(int(text))
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         try:

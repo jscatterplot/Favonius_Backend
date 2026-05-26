@@ -30,29 +30,38 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on how long we'll honour a 429 Retry-After. A bad/future
+# HTTP-date (or an absurd delay-seconds value) must not park a request inside
+# asyncio.sleep for hours/years — cap it so the cycle stays bounded and the
+# next poll interval retries.
+_MAX_RETRY_AFTER_S = 60.0
+
 
 def _parse_retry_after(value: Optional[str], default: float) -> float:
-    """Parse a 429 ``Retry-After`` header into seconds.
+    """Parse a 429 ``Retry-After`` header into seconds (capped, non-negative).
 
     HTTP permits either delay-seconds or an HTTP-date; fall back to ``default``
     when the header is absent or unparseable so a rate-limit response stays
-    recoverable (retry with backoff) instead of crashing the request.
+    recoverable (retry with backoff) instead of crashing the request. The
+    result is clamped to ``[0, _MAX_RETRY_AFTER_S]`` so a far-future date can't
+    stall the request indefinitely.
     """
     if value is None:
         return default
+    seconds: Optional[float] = None
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
     except (TypeError, ValueError):
-        pass
-    try:
-        when = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return default
-    if when is None:
-        return default
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return default
+        if when is None:
+            return default
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(_MAX_RETRY_AFTER_S, seconds))
 
 
 class RestClientError(RuntimeError):
