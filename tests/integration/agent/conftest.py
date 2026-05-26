@@ -111,6 +111,7 @@ CREATE TABLE charging_stations (
 -- Time-series tables ---------------------------------------------------
 CREATE TABLE charging_sessions (
     session_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    site_id             UUID,
     station_id          VARCHAR(255),
     vehicle_id          VARCHAR(255),
     driver_id           UUID,
