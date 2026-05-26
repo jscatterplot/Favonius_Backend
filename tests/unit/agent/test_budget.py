@@ -25,6 +25,7 @@ from src.api.agent.budget import (
     Reservation,
     TokenBudgetTracker,
     _parse_positive_int,
+    _PeriodCounter,
     current_period_yyyymm,
     estimate_turn_tokens,
     resolve_org_token_budget,
@@ -462,6 +463,51 @@ class TestReconcile:
         # committed := DB(0) + unflushed(50/30): local actuals are NOT lost.
         assert counter.committed_input == 50 and counter.committed_output == 30
         assert counter.unflushed_input == 50 and counter.unflushed_output == 30
+
+    async def test_skips_keys_still_hydrating(self):
+        # A key present in _counters but NOT in _hydrated is mid cold-start
+        # hydration; reconcile must not re-read/clobber it (Bugbot).
+        org = uuid4()
+        ts_pool, conn = self._reconcile_pool()
+        conn.fetchrow = AsyncMock(return_value={"input_tokens": 999, "output_tokens": 999})
+        tr = TokenBudgetTracker(
+            static_pool=_make_pool(fetchval_return="100000"),
+            ts_pool=ts_pool,
+            period_provider=lambda: _PERIOD,
+            flush_every_writes=1000,
+        )
+        key = (str(org), _PERIOD)
+        tr._counters[key] = _PeriodCounter(committed_input=111, committed_output=22)
+        # deliberately NOT added to tr._hydrated
+
+        await tr.reconcile()
+
+        counter = tr._counters[key]
+        assert counter.committed_input == 111 and counter.committed_output == 22
+        conn.fetchrow.assert_not_awaited()  # no re-read for a still-hydrating key
+
+    async def test_evicts_settled_past_period_keys(self):
+        org = uuid4()
+        ts_pool, _conn = self._reconcile_pool()
+        tr = TokenBudgetTracker(
+            static_pool=_make_pool(fetchval_return="100000"),
+            ts_pool=ts_pool,
+            period_provider=lambda: _PERIOD,  # current = 202605
+            flush_every_writes=1000,
+        )
+        settled_past = (str(org), "202504")  # fully flushed, no reservation
+        current = (str(org), _PERIOD)  # current period
+        busy_past = (str(uuid4()), "202504")  # past but has an in-flight reservation
+        tr._counters[settled_past] = _PeriodCounter(committed_input=500)
+        tr._counters[current] = _PeriodCounter(committed_input=10)
+        tr._counters[busy_past] = _PeriodCounter(reserved=50)
+        tr._hydrated.update({settled_past, current, busy_past})
+
+        await tr.reconcile()
+
+        assert settled_past not in tr._counters and settled_past not in tr._hydrated
+        assert current in tr._counters  # current period is never evicted
+        assert busy_past in tr._counters  # in-flight reservation keeps it alive
 
 
 class TestEstimateAndPeriodHelpers:

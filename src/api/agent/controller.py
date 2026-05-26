@@ -28,6 +28,7 @@ never leaked back to the client per the security review.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any, Optional, Protocol
@@ -805,13 +806,12 @@ async def _run_sql_general_turn(
     paths. Per-tool-call step events flow into both ``agent_runs`` and
     the SSE stream via the ``on_step`` callback.
     """
-    from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
-
-    # S4 per-org monthly token budget — gate FIRST, before building the Anthropic
-    # client or making any API call. A None reservation means the org is over its
-    # monthly ceiling: refuse here, touching ZERO Anthropic code (no _get_client,
-    # no messages.create), and record a first-class 'refused' / budget_exceeded
-    # outcome. system_prompt is reused by run_qa_turn below when we proceed.
+    # S4 per-org monthly token budget — gate FIRST, before importing the llm
+    # module or building any Anthropic client. A None reservation means the org
+    # is over its monthly ceiling: refuse here, touching ZERO Anthropic code
+    # (no llm import, no _get_client, no messages.create), and record a
+    # first-class 'refused' / budget_exceeded outcome. system_prompt is reused
+    # by run_qa_turn below when we proceed.
     system_prompt = build_sql_agent_system_prompt()
     est_tokens = budget.estimate_turn_tokens(system_prompt)
     reservation = await budget.check_and_reserve(auth.organization_id, est_tokens)
@@ -870,10 +870,15 @@ async def _run_sql_general_turn(
     # exc.iterations) right next to where the path is decided. One
     # observation per path; no shared mutable state.
     try:
-        # Build the client + registry INSIDE the try so a failure here (e.g.
-        # Anthropic client/config init) still reconciles the reservation via the
-        # except handlers below — otherwise counter.reserved would leak and
-        # wrongly refuse future turns even though no tokens were spent.
+        # Import + build the client + registry INSIDE the try so a failure here
+        # (the llm module import eagerly loads the Anthropic SDK + validates
+        # config; or _get_client/registry init) still reconciles the reservation
+        # via the handlers below — otherwise counter.reserved would leak and
+        # wrongly refuse future turns even though no tokens were spent. Importing
+        # here (not at function top) also keeps the over-budget refusal above
+        # free of any llm dependency.
+        from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
+
         client = agent_llm._get_client()
         config = agent_llm.CONFIG
         registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
@@ -893,6 +898,15 @@ async def _run_sql_general_turn(
             effort=config.effort,
             on_step=_on_step,
         )
+    except asyncio.CancelledError:
+        # CancelledError is a BaseException, so it bypasses the `except`
+        # handlers below: release the reservation explicitly so a cancelled
+        # turn (client disconnect / server shutdown / timeout) doesn't leak
+        # counter.reserved and eventually refuse valid turns. Tokens spent
+        # before cancellation aren't attached to CancelledError, so reconcile to
+        # zero (release) and re-raise so cancellation still propagates.
+        budget.record_actual(reservation, 0, 0)
+        raise
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
         # Both exception types carry ``iterations``: ToolNotAllowedError
         # via its ctor; ToolNotRegisteredError via the attribute

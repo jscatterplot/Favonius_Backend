@@ -382,10 +382,18 @@ class TokenBudgetTracker:
         baseline rather than aborting the sweep.
         """
         await self.flush()
+        self._evict_settled_past_periods()
         _, ts_pool = self._pools()
         if ts_pool is None:
             return
         for key in list(self._counters.keys()):
+            # Only refresh fully-hydrated keys. A key mid cold-start hydration is
+            # in `_counters` but not yet in `_hydrated` (and holds the hydration
+            # lock); re-hydrating it here would race that in-flight read and could
+            # clobber its committed totals (Bugbot). Hydration is one-shot, so a
+            # key already in `_hydrated` has no concurrent hydration to race.
+            if key not in self._hydrated:
+                continue
             try:
                 async with ts_pool.acquire() as conn:
                     row = await conn.fetchrow(
@@ -410,6 +418,30 @@ class TokenBudgetTracker:
             # the DB row we just read.
             counter.committed_input = db_in + counter.unflushed_input
             counter.committed_output = db_out + counter.unflushed_output
+
+    def _evict_settled_past_periods(self) -> None:
+        """Drop fully-settled counters for periods other than the current one.
+
+        Without this, ``_counters`` / ``_hydrated`` grow unbounded in a
+        long-lived worker (one entry per (org, month) ever seen), and each
+        reconcile tick would re-``SELECT`` every stale period forever (Codex).
+        A past-period counter is safe to evict once it carries no un-flushed
+        delta and no in-flight reservation — its usage is durably in
+        ``agent_token_usage`` and a late turn for that period simply re-hydrates.
+        Called after ``flush()`` so past-period deltas are already persisted.
+        """
+        current = self._period_provider()
+        for key in list(self._counters.keys()):
+            if key[1] == current:
+                continue
+            counter = self._counters[key]
+            if (
+                counter.reserved == 0
+                and counter.unflushed_input == 0
+                and counter.unflushed_output == 0
+            ):
+                self._counters.pop(key, None)
+                self._hydrated.discard(key)
 
     # — internals —————————————————————————————————————————————————————
     def _ceiling_args(self, organization_id: UUID) -> tuple[Any, Optional[UUID]]:
