@@ -524,7 +524,7 @@ async def find_orphaned_jobs(
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
                   WHERE c.id = data_source_ingestion_jobs.connection_id
-                    AND c.status <> 'disabled'
+                    AND c.status = 'active'
               )
               AND (
                   $2::timestamptz IS NULL
