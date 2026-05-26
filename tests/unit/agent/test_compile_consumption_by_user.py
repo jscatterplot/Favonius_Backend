@@ -79,16 +79,15 @@ EXPECTED_VEHICLE_SQL = """
 
 EXPECTED_DEPOT_WIDE_SQL = """
         SELECT
-            DATE_TRUNC('day', cs.start_time AT TIME ZONE $5) AS day_local,
+            DATE_TRUNC('day', cs.start_time AT TIME ZONE $4) AS day_local,
             SUM(cs.energy_delivered_kwh) AS energy_kwh,
             SUM(cs.cost_total)           AS cost_total,
             COUNT(*)                     AS session_count,
             COUNT(cs.energy_delivered_kwh) AS energy_sample_count
         FROM charging_sessions cs
         WHERE cs.station_id = ANY($1::text[])
-          AND cs.site_id = ANY($2::uuid[])
-          AND cs.start_time >= $3
-          AND cs.start_time <  $4
+          AND cs.start_time >= $2
+          AND cs.start_time <  $3
         GROUP BY day_local
         ORDER BY day_local
 """
@@ -309,7 +308,6 @@ class TestDepotWidePath:
         assert sql == EXPECTED_DEPOT_WIDE_SQL
         assert params == [
             ["CP-1", "CP-2"],
-            [DEPOT_A, DEPOT_B],
             _window().start_utc,
             _window().end_utc,
             "Europe/Vilnius",

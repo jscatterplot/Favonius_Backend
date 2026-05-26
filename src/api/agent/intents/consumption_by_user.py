@@ -82,23 +82,21 @@ def _assemble(
 
 def _compile_depot_wide(
     station_ids: list[str],
-    depot_ids: list[Any],
     window: ResolvedTimeWindow,
     bucket: str,
 ) -> tuple[str, list[Any]]:
     """Depot-wide total: every session on the given chargers, bucketed by period."""
     select_cols = [
-        f"DATE_TRUNC('{bucket}', cs.start_time AT TIME ZONE $5) AS day_local",
+        f"DATE_TRUNC('{bucket}', cs.start_time AT TIME ZONE $4) AS day_local",
         *_AGG_COLS,
     ]
     where = (
         "        WHERE cs.station_id = ANY($1::text[])\n"
-        "          AND cs.site_id = ANY($2::uuid[])\n"
-        "          AND cs.start_time >= $3\n"
-        "          AND cs.start_time <  $4\n"
+        "          AND cs.start_time >= $2\n"
+        "          AND cs.start_time <  $3\n"
     )
     sql = _assemble(select_cols, where, group_by="day_local", order_by="day_local")
-    params: list[Any] = [list(station_ids), list(depot_ids), window.start_utc, window.end_utc, window.timezone]
+    params: list[Any] = [list(station_ids), window.start_utc, window.end_utc, window.timezone]
     return sql, params
 
 
@@ -138,7 +136,7 @@ def compile_consumption_by_user(
     bucket = _bucket(plan)
 
     if station_ids is not None:
-        return _compile_depot_wide(station_ids, depot_ids or [], window, bucket)
+        return _compile_depot_wide(station_ids, window, bucket)
 
     drivers = [e for e in resolved if e.kind == "driver" and e.primary_id is not None]
     rfids = [e for e in resolved if e.kind == "rfid" and e.primary_id is not None]

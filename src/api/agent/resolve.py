@@ -110,6 +110,12 @@ _VEHICLE_STOPWORDS: frozenset[str] = frozenset(
 _VEHICLE_FLEET_WORDS: frozenset[str] = frozenset(
     {"all", "fleet", "fleets", "vehicles", "vans", "buses", "cars", "trucks"}
 )
+# Singular type words the LLM often emits when the user asked plurally
+# ("renault van" from "Renault vans"). Numeric suffixes ("bus 42") narrow
+# to one unit and must not trigger fleet expansion.
+_VEHICLE_TYPE_SINGULARS: frozenset[str] = frozenset(
+    {"van", "bus", "car", "truck", "vehicle"}
+)
 
 
 def _vehicle_tokens(text: str) -> list[str]:
@@ -159,7 +165,11 @@ def _vehicle_match_clause(text: str, start_idx: int) -> tuple[str, list[str]]:
 def _is_fleet_vehicle_mention(text: str) -> bool:
     """Heuristic: treat clearly-plural/collective mentions as fleet-wide."""
     tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return any(tok in _VEHICLE_FLEET_WORDS for tok in tokens)
+    if any(tok in _VEHICLE_FLEET_WORDS for tok in tokens):
+        return True
+    if re.search(r"\d", text):
+        return False
+    return any(tok in _VEHICLE_TYPE_SINGULARS for tok in tokens)
 
 
 async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> list[ResolvedEntity]:
