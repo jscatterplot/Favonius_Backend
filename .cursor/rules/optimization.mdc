@@ -1,7 +1,7 @@
 # Optimization Engine Rules
 
 ## Reference
-Primary reference: docs/PRD_v2_7_Building_Integration.md#8-optimization-engine-specifications
+Primary reference: `CLAUDE.md` ("Hard Constraints" / "Solver Configuration"); product spec: `docs/PRD_Depot_Agent.md`
 
 ## Mathematical Formulation
 
