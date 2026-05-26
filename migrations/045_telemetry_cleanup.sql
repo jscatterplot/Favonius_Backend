@@ -7,10 +7,10 @@
 --      drop telemetry_samples. All production reads (get_session_energy_kwh
 --      fallback path, backfill_terra_meter_start.py) have been rewired to
 --      telemetry.energy_kwh in the same PR.
---   3. NULL out all poisoned soc values. The ABB Terra AC chargers deployed
---      at HRX do not have a BMS connection and never send SoC measurands.
---      Every non-NULL soc in telemetry was fabricated by the `soc or 0.0`
---      bug in FleetChargePoint.on_meter_values (fixed in the same PR).
+--   3. NULL out poisoned soc values (fabricated 0.0 only). The ABB Terra AC
+--      chargers deployed at HRX do not send SoC measurands; the `soc or 0.0`
+--      bug wrote 0.0 when soc was absent. Real SoC from the SoC measurand is
+--      preserved (any non-zero fraction, and 0.0 when samples prove SoC).
 
 -- Step 1: add energy_kwh column
 ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS energy_kwh DOUBLE PRECISION;
@@ -45,11 +45,12 @@ BEGIN
 
         -- Step 3: insert orphan telemetry_samples rows that have no matching
         -- telemetry row (gaps before migration 035 introduced the wide table)
-        INSERT INTO telemetry (time, station_id, connector_id, energy_kwh)
+        INSERT INTO telemetry (time, station_id, connector_id, transaction_id, energy_kwh)
         SELECT
             time,
             station_id,
             connector_id,
+            MAX(s.transaction_id) AS transaction_id,
             MAX(
                 CASE WHEN measurand = 'Energy.Active.Import.Register'
                      THEN CASE WHEN LOWER(COALESCE(unit, '')) IN ('kwh', 'kw·h')
@@ -71,14 +72,22 @@ BEGIN
         ) IS NOT NULL
         ON CONFLICT (time, station_id, connector_id) DO NOTHING;
 
-        -- Step 4: drop the EAV table — data is now in telemetry.energy_kwh
+        -- Step 4: NULL poisoned soc before dropping samples (soc or 0.0 wrote 0.0
+        -- when the SoC measurand was absent; keep rows backed by a SoC sample).
+        UPDATE telemetry t
+        SET soc = NULL
+        WHERE t.soc = 0.0
+          AND NOT EXISTS (
+            SELECT 1
+            FROM telemetry_samples s
+            WHERE s.time = t.time
+              AND s.station_id = t.station_id
+              AND s.connector_id = t.connector_id
+              AND s.measurand = 'SoC'
+          );
+
+        -- Step 5: drop the EAV table — data is now in telemetry.energy_kwh
         DROP TABLE telemetry_samples;
     END IF;
 END
 $$;
-
--- Step 5: NULL out all poisoned soc values.
--- These chargers never send SoC, so every stored soc was fabricated by the
--- `soc or 0.0` coercion bug. Zeroing them restores correct NULL semantics
--- so StateAssembler and fleet_list.py can distinguish "no data" from "0%".
-UPDATE telemetry SET soc = NULL WHERE soc IS NOT NULL;
