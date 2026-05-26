@@ -249,6 +249,181 @@ class TestOCPP16SessionLiveness:
         assert not s._background_tasks
 
 
+class TestOCPP16SessionLazyTenantContext:
+    """Tenant context must resolve on the frame path, not only on boot.
+
+    Some ABB Terra firmwares skip BootNotification on quick reconnects. If
+    ``_tenant_context`` only resolved in ``_on_boot``, the whole connection
+    would publish ``org_id=None`` and ``LivenessNotifier.maybe_notify`` would
+    no-op — so the charger shows offline on the dashboard even while frames
+    flow. ``_publish_liveness`` resolves it lazily, single-flight and
+    cooldown-guarded.
+    """
+
+    def _session(self, mock_websocket, mock_timescale, mock_message_handler, *, supabase, notifier):
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        return OCPP16Session(
+            station_id="lazy_001",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            supabase_client=supabase,
+            liveness_notifier=notifier,
+        )
+
+    @pytest.mark.asyncio
+    async def test_publish_liveness_resolves_context_lazily(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(
+            return_value={"organization_id": "org-9", "depot_id": "dep-1"}
+        )
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+        assert s._tenant_context is None
+
+        await s._publish_liveness()
+
+        supabase.lookup_tenant_context.assert_awaited_once_with("lazy_001")
+        assert s._tenant_context == {"organization_id": "org-9", "depot_id": "dep-1"}
+        notifier.maybe_notify.assert_awaited_once_with("lazy_001", "org-9")
+
+    @pytest.mark.asyncio
+    async def test_publish_liveness_reuses_cached_context(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(return_value={"organization_id": "x"})
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+        s._tenant_context = {"organization_id": "org-cached", "depot_id": "dep-c"}
+
+        await s._publish_liveness()
+
+        supabase.lookup_tenant_context.assert_not_awaited()
+        notifier.maybe_notify.assert_awaited_once_with("lazy_001", "org-cached")
+
+    @pytest.mark.asyncio
+    async def test_ensure_context_cooldown_blocks_immediate_relookup(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        supabase = MagicMock()
+        # Unonboarded station — lookup keeps returning None.
+        supabase.lookup_tenant_context = AsyncMock(return_value=None)
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+
+        await s._ensure_tenant_context()
+        assert supabase.lookup_tenant_context.await_count == 1
+        # Immediate retry within the cooldown window must NOT re-query.
+        await s._ensure_tenant_context()
+        assert supabase.lookup_tenant_context.await_count == 1
+        # Simulate the cooldown elapsing → a fresh attempt is allowed.
+        s._tenant_context_last_attempt -= 120.0
+        await s._ensure_tenant_context()
+        assert supabase.lookup_tenant_context.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ensure_context_is_single_flight(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        release = asyncio.Event()
+        calls = 0
+
+        async def _slow_lookup(_station_id):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return {"organization_id": "org-sf"}
+
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(side_effect=_slow_lookup)
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+
+        tasks = [asyncio.create_task(s._ensure_tenant_context()) for _ in range(5)]
+        await asyncio.sleep(0)  # let the tasks reach the lock
+        release.set()
+        await asyncio.gather(*tasks)
+
+        assert calls == 1, "lock must collapse concurrent frame-path resolves into one lookup"
+        assert s._tenant_context == {"organization_id": "org-sf"}
+
+    @pytest.mark.asyncio
+    async def test_on_message_received_publishes_with_lazy_org(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(return_value={"organization_id": "org-7"})
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+
+        await s._on_message_received()
+        # The liveness publish runs as a background task — drain it.
+        pending = list(s._background_tasks)
+        assert pending, "a liveness publish task must be scheduled"
+        await asyncio.gather(*pending)
+
+        notifier.maybe_notify.assert_awaited_once_with("lazy_001", "org-7")
+
+    @pytest.mark.asyncio
+    async def test_publish_liveness_no_supabase_client_publishes_none(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """No supabase client wired → publish with org_id=None (notifier no-ops)."""
+        from src.websocket_handler.ocpp16_adapter import OCPP16Session
+
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = OCPP16Session(
+            station_id="lazy_002",
+            websocket=mock_websocket,
+            timescale_client=mock_timescale,
+            message_handler=mock_message_handler,
+            liveness_notifier=notifier,
+        )
+
+        await s._publish_liveness()  # must not raise
+        notifier.maybe_notify.assert_awaited_once_with("lazy_002", None)
+
+
 class TestOCPP16SessionForceBootNotification:
     """Workaround for ABB Terra AC firmware (1.8.x) and similar OCPP 1.6
     chargers that skip BootNotification on WebSocket reconnect."""

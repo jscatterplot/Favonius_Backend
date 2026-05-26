@@ -3110,6 +3110,39 @@ async def latest_connector_status_by_stations(db, station_ids: list[str]) -> dic
     return out
 
 
+async def latest_telemetry_time_by_stations(
+    db, station_ids: list[str], *, max_age_seconds: int = 3600
+) -> dict[str, datetime]:
+    """Most recent ``telemetry`` timestamp per station_id.
+
+    Returns a mapping ``ocpp_id -> MAX(telemetry.time)``. Unlike
+    :func:`latest_connector_status_by_stations` — whose ``last_interaction_at``
+    only advances on StatusNotification (connector state changes) — the
+    ``telemetry`` hypertable gets a row on every OCPP MeterValues frame
+    (migration 035, keyed by ``(time, station_id, connector_id)``). Surfacing
+    this lets the chargers endpoint treat a steadily-metering charger as
+    "online" even when no connector state change has happened recently and
+    the liveness pg_notify bridge is unavailable — the failure mode where a
+    charging charger showed ``offline`` on the dashboard while MeterValues
+    were flowing.
+
+    ``max_age_seconds`` bounds the scan to recent rows; the freshness window
+    that matters is minutes, and the ``idx_telemetry_station`` index
+    (``station_id, connector_id, time DESC``) keeps the per-station MAX cheap.
+    """
+    if not station_ids:
+        return {}
+    query = """
+        SELECT station_id, MAX(time) AS last_telemetry_at
+        FROM telemetry
+        WHERE station_id = ANY($1)
+          AND time > NOW() - ($2 || ' seconds')::interval
+        GROUP BY station_id
+    """
+    rows = await db.fetch(query, station_ids, str(max_age_seconds))
+    return {row["station_id"]: row["last_telemetry_at"] for row in rows}
+
+
 async def open_sessions_by_stations(db, station_ids: list[str]) -> dict[str, dict]:
     """Latest open ``charging_sessions`` row per station_id.
 

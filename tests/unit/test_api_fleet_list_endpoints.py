@@ -258,6 +258,55 @@ class TestGetDepotChargers:
 
         app.dependency_overrides.clear()
 
+    def test_telemetry_freshness_keeps_charger_online(self, client, mock_db_pool):
+        """MeterValues freshness alone keeps a charger online end-to-end.
+
+        Regression: connector_status is cold and the liveness pg_notify bridge
+        is down, but the charger is actively metering. ``telemetry`` MAX must
+        drive ``last_interaction_at`` so the dashboard pill is not ``offline``.
+        """
+        depot_id = str(uuid4())
+        org_id = str(uuid4())
+        pool, _ = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
+
+        charger = _charger_static_row(depot_id)
+        ocpp_id = charger["ocpp_id"]
+        fresh = _now() - timedelta(seconds=20)
+
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch("src.api.main.verify_depot_access", new_callable=AsyncMock),
+            patch(
+                "src.api.main.db_queries.list_chargers_for_depot",
+                new_callable=AsyncMock,
+                return_value=[charger],
+            ),
+            patch(
+                "src.api.main.db_queries.latest_connector_status_by_stations",
+                new_callable=AsyncMock,
+                return_value={},  # no recent StatusNotification
+            ),
+            patch(
+                "src.api.main.db_queries.open_sessions_by_stations",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "src.api.main.db_queries.latest_telemetry_time_by_stations",
+                new_callable=AsyncMock,
+                return_value={ocpp_id: fresh},
+            ),
+        ):
+            response = client.get(f"/depots/{depot_id}/chargers", headers=AUTH_HDR)
+
+        assert response.status_code == 200
+        item = response.json()["items"][0]
+        assert item["status"] == "idle", "fresh MeterValues → not offline"
+        assert item["last_interaction_at"] == fresh.isoformat()
+
+        app.dependency_overrides.clear()
+
     def test_cache_returns_same_payload_within_ttl(self, client, mock_db_pool):
         depot_id = str(uuid4())
         org_id = str(uuid4())

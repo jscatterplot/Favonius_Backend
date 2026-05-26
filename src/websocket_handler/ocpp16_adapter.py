@@ -42,6 +42,12 @@ REPLAY_BACKOFF_SECONDS = 1.0
 # leaving the heartbeat interval un-negotiated and the session stuck.
 BOOT_TRIGGER_GRACE_SECONDS = 5
 
+# Minimum seconds between tenant-context resolution attempts on the frame
+# path. BootNotification resolves it eagerly; this cooldown bounds the
+# lazy retry so an un-onboarded station (or a transient Supabase outage)
+# can't trigger a lookup on every OCPP frame.
+_TENANT_CONTEXT_RETRY_COOLDOWN_S = 60.0
+
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
     from .liveness_notifier import LivenessNotifier
@@ -177,10 +183,12 @@ class OCPP16Session:
         traffic on this socket.
 
         ``supabase_client`` resolves tenant context (organization_id / depot_id)
-        once on BootNotification so ``insert_connector_status`` can label rows
-        for the alerts trigger (post-migration 029). Optional for the same
-        reason as above; when None the connector_status writes carry NULL
-        context and the trigger bails silently.
+        on BootNotification — and lazily on the frame path when a charger
+        reconnects without one (see ``_ensure_tenant_context``) — so
+        ``insert_connector_status`` can label rows for the alerts trigger
+        (post-migration 029) and the liveness pg_notify carries an org scope.
+        Optional for the same reason as above; when None the connector_status
+        writes carry NULL context and the trigger bails silently.
         """
         self._station_id = station_id
         self._timescale = timescale_client
@@ -189,9 +197,14 @@ class OCPP16Session:
         self._authz = message_handler.rfid_authorization
         self._supabase_client = supabase_client
         self._liveness_notifier = liveness_notifier
-        # Resolved once on BootNotification and reused for the lifetime of the
-        # WS connection — values don't change while the charger is online.
+        # Resolved on BootNotification (and lazily on the frame path for
+        # chargers that reconnect without one) and reused for the lifetime of
+        # the WS connection — values don't change while the charger is online.
         self._tenant_context: Optional[Dict[str, Optional[str]]] = None
+        # Single-flight + cooldown guards for lazy resolution off the frame
+        # path. ``_last_attempt`` is monotonic seconds; 0.0 means "never tried".
+        self._tenant_context_lock = asyncio.Lock()
+        self._tenant_context_last_attempt: float = 0.0
         # Single-slot stash for the most recent accepted StartTransaction so
         # ``_next_transaction_id`` can persist the open ``charging_sessions``
         # row alongside the generated tx_id. Safe because FleetChargePoint
@@ -272,9 +285,8 @@ class OCPP16Session:
                 logger.exception("record_message_received failed for station=%s", self._station_id)
 
         if self._liveness_notifier is not None:
-            org_id = (self._tenant_context or {}).get("organization_id")
             task = asyncio.create_task(
-                self._liveness_notifier.maybe_notify(self._station_id, org_id),
+                self._publish_liveness(),
                 name=f"liveness_notify:{self._station_id}",
             )
             self._background_tasks.add(task)
@@ -749,17 +761,66 @@ class OCPP16Session:
     # FleetChargePoint callbacks
     # ------------------------------------------------------------------
 
-    async def _resolve_tenant_context(self) -> None:
-        """Look up (organization_id, depot_id) once per WS connection.
+    async def _publish_liveness(self) -> None:
+        """Resolve tenant context if needed, then publish a liveness signal.
 
-        Fired from ``_on_boot``; the result is cached on the session so every
-        subsequent ``_on_status_change`` can label the ``connector_status``
-        row without an extra DB roundtrip. If the lookup fails (or no
-        supabase_client is wired) we leave the cache as ``None`` and the
-        insert proceeds with NULL context — the alerts trigger added by
-        migration 029 bails silently in that case, matching the legacy
-        behavior.
+        Runs as a fire-and-forget task per OCPP frame, off the
+        message-processing path. BootNotification is the primary trigger for
+        tenant-context resolution, but some ABB Terra firmwares skip
+        BootNotification on quick reconnects; without a lazy resolve here the
+        whole connection would publish ``org_id=None`` and
+        ``LivenessNotifier.maybe_notify`` would no-op, so the charger shows
+        ``offline`` on the dashboard even while frames flow. The notifier
+        rate-limits to one publish per ~10 s per station, so this only does
+        real work on the first frame(s) of such a connection.
         """
+        await self._ensure_tenant_context()
+        org_id = (self._tenant_context or {}).get("organization_id")
+        await self._liveness_notifier.maybe_notify(self._station_id, org_id)
+
+    async def _ensure_tenant_context(self) -> None:
+        """Lazily resolve tenant context off the BootNotification path.
+
+        Single-flight (an ``asyncio.Lock`` so concurrent per-frame tasks issue
+        at most one Supabase lookup) and cooldown-guarded
+        (``_TENANT_CONTEXT_RETRY_COOLDOWN_S``) so a station that isn't
+        onboarded — or a transient Supabase outage — doesn't trigger a lookup
+        on every frame. Once resolved, the fast path returns immediately for
+        the rest of the connection.
+        """
+        if self._tenant_context is not None:
+            return
+        # Cheap pre-check outside the lock to avoid serialising every frame's
+        # task on the lock once we're inside a cooldown window.
+        last = self._tenant_context_last_attempt
+        if last and (time.monotonic() - last) < _TENANT_CONTEXT_RETRY_COOLDOWN_S:
+            return
+        async with self._tenant_context_lock:
+            # Re-check under the lock: another frame's task may have resolved
+            # the context or refreshed the attempt clock while we waited.
+            if self._tenant_context is not None:
+                return
+            last = self._tenant_context_last_attempt
+            if last and (time.monotonic() - last) < _TENANT_CONTEXT_RETRY_COOLDOWN_S:
+                return
+            await self._resolve_tenant_context()
+
+    async def _resolve_tenant_context(self) -> None:
+        """Look up (organization_id, depot_id) for this WS connection.
+
+        Fired eagerly from ``_on_boot`` and lazily from
+        ``_ensure_tenant_context`` on the frame path. The result is cached on
+        the session so every subsequent ``_on_status_change`` /
+        ``_publish_liveness`` reuses it without an extra DB roundtrip. If the
+        lookup fails (or no supabase_client is wired) we leave the cache as
+        ``None`` and the insert proceeds with NULL context — the alerts
+        trigger added by migration 029 bails silently in that case, matching
+        the legacy behavior. The attempt timestamp is always recorded so the
+        frame-path cooldown applies regardless of caller.
+        """
+        # Record the attempt up-front so the lazy retry cooldown holds even
+        # when this was invoked from _on_boot and resolves to None.
+        self._tenant_context_last_attempt = time.monotonic()
         if self._supabase_client is None:
             return
         try:
