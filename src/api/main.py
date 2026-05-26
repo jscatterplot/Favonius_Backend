@@ -84,6 +84,7 @@ from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_ad
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import (
     decode_jwt_for_rate_limit,
+    get_user_email,
     get_user_organization_id,
     get_user_role,
     is_platform_admin,
@@ -12889,8 +12890,12 @@ async def acknowledge_notification_alert(
         ):
             raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
-        updated = await alerts_repo.acknowledge(
-            conn, UUID(alert_id), user_id=UUID(str(actor_user_id))
+        updated = await alerts_repo.acknowledge_for_org(
+            conn,
+            UUID(alert_id),
+            org_id=UUID(str(existing.organization_id)),
+            user_id=UUID(str(actor_user_id)),
+            user_email=get_user_email(user) if isinstance(user, dict) else None,
         )
     if updated is None:
         # Existed and depot matched on get_by_id but acknowledge() returned None
