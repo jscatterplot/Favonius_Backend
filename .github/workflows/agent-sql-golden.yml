@@ -30,6 +30,7 @@ on:
       - "tests/golden/test_agent_sql_golden.py"
       - "tests/golden/conftest.py"
       - "tests/integration/agent_sql/**"
+      - "tests/unit/agent/**"
       - "tests/e2e/test_agent_search.py"
       - "migrations/**"
       - ".github/workflows/agent-sql-golden.yml"
@@ -44,6 +45,7 @@ on:
       - "tests/golden/test_agent_sql_golden.py"
       - "tests/golden/conftest.py"
       - "tests/integration/agent_sql/**"
+      - "tests/unit/agent/**"
       - "tests/e2e/test_agent_search.py"
       - "migrations/**"
 
@@ -52,6 +54,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  unit:
+    # Fast, DB-free gate for the SQL agent's unit tests under tests/unit/agent/
+    # — most importantly test_sql_validator.py, the security boundary between
+    # LLM-emitted SQL and the read-only role. These tests previously ran in NO
+    # CI job, so a sqlglot AST change silently disabled the validator's
+    # time-bound guard and nothing went red. This job closes that gap; it needs
+    # no database (everything is mocked) so it runs in parallel with `golden`.
+    name: Agent unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run agent unit tests
+        run: |
+          pytest tests/unit/agent/ --tb=short
+
   golden:
     name: Agent-SQL golden scenarios
     runs-on: ubuntu-latest
