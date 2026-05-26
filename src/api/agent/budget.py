@@ -277,12 +277,14 @@ class TokenBudgetTracker:
         # the synchronous check-and-reserve below so no await splits the
         # decision (which would let two concurrent turns read the same counter).
         await self._maybe_hydrate(key)
-        ceiling = await self._resolve_ceiling(*self._ceiling_args(organization_id))
-
         counter = self._counters.setdefault(key, _PeriodCounter())
-        if counter.total + est > ceiling:
-            return None
+        # Pin before the ceiling await so reconcile cannot evict this past-period
+        # counter while reserved is still zero (month rollover during _resolve_ceiling).
         counter.reserved += est
+        ceiling = await self._resolve_ceiling(*self._ceiling_args(organization_id))
+        if counter.total > ceiling:
+            counter.reserved -= est
+            return None
         return Reservation(organization_id=key[0], period_yyyymm=period, est_tokens=est)
 
     def record_actual(
@@ -433,6 +435,9 @@ class TokenBudgetTracker:
         current = self._period_provider()
         for key in list(self._counters.keys()):
             if key[1] == current:
+                continue
+            # Mid cold-start hydration: counter exists but DB read not finished.
+            if key not in self._hydrated:
                 continue
             counter = self._counters[key]
             if (
