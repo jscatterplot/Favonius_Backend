@@ -28,7 +28,7 @@ BEGIN
                 connector_id,
                 MAX(
                     CASE WHEN measurand = 'Energy.Active.Import.Register'
-                         THEN CASE WHEN LOWER(COALESCE(unit, '')) IN ('kwh', 'kw·h')
+                         THEN CASE WHEN LOWER(COALESCE(unit, '')) IN ('kwh', 'kw·h', 'kvah', 'kvarh')
                                    THEN value
                                    ELSE value / 1000.0
                               END
@@ -55,7 +55,7 @@ BEGIN
             MAX(s.transaction_id) AS transaction_id,
             MAX(
                 CASE WHEN measurand = 'Energy.Active.Import.Register'
-                     THEN CASE WHEN LOWER(COALESCE(unit, '')) IN ('kwh', 'kw·h')
+                     THEN CASE WHEN LOWER(COALESCE(unit, '')) IN ('kwh', 'kw·h', 'kvah', 'kvarh')
                                THEN value
                                ELSE value / 1000.0
                           END
