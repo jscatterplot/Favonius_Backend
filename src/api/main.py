@@ -1566,10 +1566,10 @@ class VehicleCurrentState(BaseModel):
       3. ``in_route`` — within an active schedule window
          (``departure_time <= now() < COALESCE(actual_return_time, return_time)``).
       4. ``ready`` — ``current_soc >= COALESCE(next_departure.required_soc, 0.95)``.
-      5. ``at_risk`` — ``current_soc < COALESCE(next_departure.required_soc, 0.95)``.
+      5. ``at_risk`` — SoC below threshold, or SoC unknown (conservative fallback).
     """
 
-    state: Literal["ready", "charging", "at_risk", "in_route", "offline", "unknown"]
+    state: Literal["ready", "charging", "at_risk", "in_route", "offline"]
     current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
     current_power_kw: Optional[float] = None
     connected_charger_id: Optional[str] = Field(
