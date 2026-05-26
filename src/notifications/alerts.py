@@ -37,6 +37,7 @@ class Alert:
     occurrence_count: int
     acknowledged_at: Optional[datetime]
     acknowledged_by: Optional[UUID]
+    acknowledged_by_email: Optional[str]
     resolved_at: Optional[datetime]
     last_notified_at: Optional[datetime]
     last_notified_count: int
@@ -58,6 +59,7 @@ class Alert:
             occurrence_count=int(row["occurrence_count"]),
             acknowledged_at=row["acknowledged_at"],
             acknowledged_by=row["acknowledged_by"],
+            acknowledged_by_email=row.get("acknowledged_by_email"),
             resolved_at=row["resolved_at"],
             last_notified_at=row["last_notified_at"],
             last_notified_count=row["last_notified_count"],
@@ -87,8 +89,8 @@ def _coerce_jsonb(value: Any) -> dict[str, Any]:
 _ALERT_COLUMNS = (
     "id, organization_id, depot_id, alert_type, severity, title, detail, "
     "dedup_key, status, first_occurrence_at, last_occurrence_at, "
-    "occurrence_count, acknowledged_at, acknowledged_by, resolved_at, "
-    "last_notified_at, last_notified_count"
+    "occurrence_count, acknowledged_at, acknowledged_by, acknowledged_by_email, "
+    "resolved_at, last_notified_at, last_notified_count"
 )
 
 
@@ -364,13 +366,149 @@ async def update_delivery_status(
     return result.endswith(" 0") is False
 
 
+async def list_for_org(
+    conn: Any,
+    org_id: UUID,
+    *,
+    status_filter: Optional[str] = None,
+    severity_filter: Optional[str] = None,
+    depot_id_filter: Optional[UUID] = None,
+    alert_type_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 25,
+) -> tuple[list[Alert], int]:
+    """Paginated org-scoped alert list for GET /alerts.
+
+    Returns (items, total_count). Sorted by last_occurrence_at DESC.
+    """
+    conditions: list[str] = ["organization_id = $1"]
+    params: list[Any] = [org_id]
+    idx = 2
+
+    if status_filter is not None:
+        conditions.append(f"status = ${idx}")
+        params.append(status_filter)
+        idx += 1
+
+    if severity_filter is not None:
+        conditions.append(f"severity = ${idx}")
+        params.append(severity_filter)
+        idx += 1
+
+    if depot_id_filter is not None:
+        conditions.append(f"depot_id = ${idx}")
+        params.append(depot_id_filter)
+        idx += 1
+
+    if alert_type_filter is not None:
+        conditions.append(f"alert_type = ${idx}")
+        params.append(alert_type_filter)
+        idx += 1
+
+    where = " AND ".join(conditions)
+
+    total: int = int(
+        await conn.fetchval(
+            f"SELECT COUNT(*) FROM notification_alerts WHERE {where}",
+            *params,
+        )
+        or 0
+    )
+
+    offset = (page - 1) * page_size
+    rows = await conn.fetch(
+        f"""
+        SELECT {_ALERT_COLUMNS}
+          FROM notification_alerts
+         WHERE {where}
+         ORDER BY last_occurrence_at DESC
+         LIMIT ${idx} OFFSET ${idx + 1}
+        """,
+        *params,
+        page_size,
+        offset,
+    )
+    return [Alert.from_record(r) for r in rows], total
+
+
+async def acknowledge_for_org(
+    conn: Any,
+    alert_id: UUID,
+    *,
+    org_id: UUID,
+    user_id: UUID,
+    user_email: Optional[str] = None,
+) -> Optional[Alert]:
+    """Acknowledge an active alert scoped to an org.
+
+    Returns the updated row, or None when the alert is not found, doesn't
+    belong to the org, or is not in 'active' state.
+    """
+    row = await conn.fetchrow(
+        f"""
+        UPDATE notification_alerts
+           SET status = 'acknowledged',
+               acknowledged_at = NOW(),
+               acknowledged_by = $3,
+               acknowledged_by_email = $4,
+               updated_at = NOW()
+         WHERE id = $1
+           AND organization_id = $2
+           AND status = 'active'
+         RETURNING {_ALERT_COLUMNS}
+        """,
+        alert_id,
+        org_id,
+        user_id,
+        user_email,
+    )
+    return Alert.from_record(row) if row else None
+
+
+async def resolve_by_id(
+    conn: Any,
+    alert_id: UUID,
+    *,
+    org_id: UUID,
+    user_id: Optional[UUID] = None,
+    user_email: Optional[str] = None,
+) -> Optional[Alert]:
+    """Resolve an active or acknowledged alert by id within an org.
+
+    Preserves existing acknowledged_by/email via COALESCE.
+    Returns the updated row, or None when not found or already resolved.
+    """
+    row = await conn.fetchrow(
+        f"""
+        UPDATE notification_alerts
+           SET status = 'resolved',
+               resolved_at = NOW(),
+               acknowledged_by = COALESCE(acknowledged_by, $3),
+               acknowledged_by_email = COALESCE(acknowledged_by_email, $4),
+               updated_at = NOW()
+         WHERE id = $1
+           AND organization_id = $2
+           AND status != 'resolved'
+         RETURNING {_ALERT_COLUMNS}
+        """,
+        alert_id,
+        org_id,
+        user_id,
+        user_email,
+    )
+    return Alert.from_record(row) if row else None
+
+
 __all__ = [
     "Alert",
     "claim_pending_alerts",
     "mark_notified",
     "list_for_depot",
+    "list_for_org",
     "get_by_id",
     "acknowledge",
+    "acknowledge_for_org",
+    "resolve_by_id",
     "upsert_alert",
     "resolve_alert",
     "record_delivery",
