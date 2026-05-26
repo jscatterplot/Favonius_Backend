@@ -21,6 +21,7 @@ from src.api.agent.resolve import (
     _resolve_driver,
     _resolve_rfid,
     _resolve_vehicle,
+    _vehicle_match_clause,
     resolve_entities,
 )
 from tests.unit.agent.conftest import (
@@ -326,7 +327,8 @@ class TestResolveVehicle:
         call = fake_static_pool.fetch.await_args
         # Admin path: $1 is the visible_depot_ids list; no org filter.
         assert call.args[1] == [DEPOT_A, DEPOT_B]
-        assert call.args[2] == "%VINABCDEFGHI%"
+        # Match params are lowercased ILIKE patterns (ILIKE is case-insensitive).
+        assert call.args[2] == "%vinabcdefghi%"
 
     async def test_zero_match_returns_primary_id_none(self, fake_static_pool):
         fake_static_pool.fetch = AsyncMock(return_value=[])
@@ -338,29 +340,88 @@ class TestResolveVehicle:
         assert result[0].primary_id is None
         assert result[0].display == "ghost-bus"
 
-    async def test_multi_match_collapses_into_head_with_candidates(self, fake_static_pool):
+    async def test_multi_match_expands_to_full_fleet(self, fake_static_pool):
+        """A fleet mention returns ONE entity per matched vehicle (no
+        disambiguation collapse) so the compiler sums across the fleet."""
         v1, v2 = uuid4(), uuid4()
         fake_static_pool.fetch = AsyncMock(
             return_value=[
                 {
                     "vehicle_id": v1,
-                    "display_text": "Bus 42",
+                    "display_text": "Renault Van 1",
                     "depot_id": DEPOT_A,
                     "depot_name": "Vilnius",
                 },
                 {
                     "vehicle_id": v2,
-                    "display_text": "Bus 421",
+                    "display_text": "Renault Van 2",
                     "depot_id": DEPOT_B,
                     "depot_name": "Kaunas",
                 },
             ]
         )
 
-        result = await _resolve_vehicle("42", _customer_auth(), fake_static_pool)
+        result = await _resolve_vehicle("renault vans", _customer_auth(), fake_static_pool)
 
+        # Full expansion: one entity per vehicle, no disambiguation candidates.
+        assert [r.primary_id for r in result] == [v1, v2]
+        assert all(not r.candidates for r in result)
+        assert all(r.kind == "vehicle" for r in result)
+
+    async def test_token_and_match_params_passed_to_query(self, fake_static_pool):
+        """A multi-word fleet mention builds a token-AND clause with
+        lowercased, depluralized ILIKE params (tenant path: $3 onward)."""
+        fake_static_pool.fetch = AsyncMock(return_value=[])
+
+        await _resolve_vehicle("the Renault vans", _customer_auth(), fake_static_pool)
+
+        call = fake_static_pool.fetch.await_args
+        # Tenant path params: (sql, org_id, visible_depots, *match_params).
+        assert call.args[3:] == ("%renault%", "%vans%", "%van%")
+        assert " AND " in call.args[0]
+
+    async def test_specific_vehicle_multi_match_collapses_to_disambiguation(self, fake_static_pool):
+        v1, v2 = uuid4(), uuid4()
+        fake_static_pool.fetch = AsyncMock(
+            return_value=[
+                {"vehicle_id": v1, "display_text": "Bus 42", "depot_id": DEPOT_A, "depot_name": "Vilnius"},
+                {"vehicle_id": v2, "display_text": "Bus 421", "depot_id": DEPOT_A, "depot_name": "Vilnius"},
+            ]
+        )
+        result = await _resolve_vehicle("bus 42", _customer_auth(), fake_static_pool)
         assert len(result) == 1
+        assert result[0].primary_id == v1
         assert [c.primary_id for c in result[0].candidates] == [v1, v2]
+
+
+class TestVehicleMatchClause:
+    """Direct coverage of the token-AND ILIKE clause builder.
+
+    These exercise a pure sync helper; they are ``async def`` only to
+    satisfy this module's module-scoped ``asyncio`` mark.
+    """
+
+    async def test_token_and_with_depluralization(self):
+        sql, params = _vehicle_match_clause("the renault vans", start_idx=3)
+        # "the" is a stopword; "vans" also matches its singular "van".
+        assert params == ["%renault%", "%vans%", "%van%"]
+        assert " AND " in sql
+        assert "$3" in sql and "$4" in sql and "$5" in sql
+
+    async def test_single_token_no_depluralization(self):
+        sql, params = _vehicle_match_clause("renault", start_idx=2)
+        assert params == ["%renault%"]
+        assert " AND " not in sql
+
+    async def test_short_plural_not_depluralized(self):
+        # len <= 3 tokens are left alone ("abs" stays "abs", no "ab").
+        _, params = _vehicle_match_clause("abs", start_idx=1)
+        assert params == ["%abs%"]
+
+    async def test_no_usable_tokens_falls_back_to_whole_string(self):
+        sql, params = _vehicle_match_clause("the", start_idx=2)
+        assert params == ["%the%"]
+        assert "$2" in sql
 
 
 # --------------------------------------------------------------------------- #

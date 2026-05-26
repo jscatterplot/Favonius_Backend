@@ -271,6 +271,8 @@ class _FakeLLMClient:
         resolved: list[dict[str, Any]],
         window: dict[str, Any],
         rows: list[dict[str, Any]],
+        *,
+        result_summary: dict[str, Any] | None = None,
     ) -> str:
         if not rows:
             return "John Smith had no charging sessions in that period."

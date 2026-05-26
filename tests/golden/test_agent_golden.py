@@ -220,10 +220,11 @@ def _pool_for_entry(entry: dict[str, Any]) -> Any:
 
 # ── YAML count integrity check ────────────────────────────────────────────────
 
-def test_yaml_has_fifty_entries() -> None:
-    """The golden file must have exactly 50 entries (PRD §7)."""
-    assert len(_ALL_ENTRIES) == 50, (
-        f"agent_consumption.yaml has {len(_ALL_ENTRIES)} entries; expected 50"
+def test_yaml_entry_count() -> None:
+    """The golden file must have exactly 52 entries (PRD §7 baseline of 50
+    plus the vehicle-fleet and depot-wide additions)."""
+    assert len(_ALL_ENTRIES) == 52, (
+        f"agent_consumption.yaml has {len(_ALL_ENTRIES)} entries; expected 52"
     )
 
 
@@ -256,7 +257,7 @@ def test_yaml_category_counts() -> None:
     assert prefixes.get("hp", 0) == 10, f"Expected 10 happy-path entries, got {prefixes.get('hp', 0)}"
     assert prefixes.get("amb", 0) == 10, f"Expected 10 ambiguity entries, got {prefixes.get('amb', 0)}"
     assert prefixes.get("nf", 0) == 10, f"Expected 10 not-found entries, got {prefixes.get('nf', 0)}"
-    assert prefixes.get("edge", 0) == 15, f"Expected 15 edge-case entries, got {prefixes.get('edge', 0)}"
+    assert prefixes.get("edge", 0) == 17, f"Expected 17 edge-case entries, got {prefixes.get('edge', 0)}"
     assert prefixes.get("ref", 0) == 5, f"Expected 5 refusal entries, got {prefixes.get('ref', 0)}"
 
 

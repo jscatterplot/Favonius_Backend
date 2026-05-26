@@ -62,9 +62,9 @@ class TestQueryPlan:
             intent="consumption_by_user",
             subjects=[EntityMention(kind="driver", text="John")],
             time_window=TimeWindow(kind="relative", relative="last_month"),
-            group_by=["driver", "category"],
+            group_by=["driver", "vehicle", "category"],
         )
-        assert plan.group_by == ["driver", "category"]
+        assert plan.group_by == ["driver", "vehicle", "category"]
 
     def test_rejects_unknown_group_by_value(self):
         with pytest.raises(ValidationError):
@@ -72,8 +72,26 @@ class TestQueryPlan:
                 intent="consumption_by_user",
                 subjects=[EntityMention(kind="driver", text="John")],
                 time_window=TimeWindow(kind="relative", relative="last_month"),
-                group_by=["vehicle"],  # not in the v0 literal
+                group_by=["charger"],  # not in the literal
             )
+
+    def test_depot_wide_defaults_false(self):
+        plan = QueryPlan(
+            intent="consumption_by_user",
+            subjects=[EntityMention(kind="driver", text="John")],
+            time_window=TimeWindow(kind="relative", relative="last_month"),
+        )
+        assert plan.depot_wide is False
+
+    def test_depot_wide_accepts_true_with_empty_subjects(self):
+        plan = QueryPlan(
+            intent="consumption_by_user",
+            subjects=[],
+            time_window=TimeWindow(kind="relative", relative="last_month"),
+            depot_wide=True,
+        )
+        assert plan.depot_wide is True
+        assert plan.subjects == []
 
 
 class TestEntityMention:

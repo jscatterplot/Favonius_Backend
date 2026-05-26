@@ -105,9 +105,7 @@ class LLMConfig(BaseModel):
     @classmethod
     def _effort_must_be_valid(cls, v: str) -> str:
         if v not in VALID_EFFORT_LEVELS:
-            raise ValueError(
-                f"AGENT_LLM_EFFORT={v!r} is not one of {sorted(VALID_EFFORT_LEVELS)}."
-            )
+            raise ValueError(f"AGENT_LLM_EFFORT={v!r} is not one of {sorted(VALID_EFFORT_LEVELS)}.")
         return v
 
     @classmethod
@@ -184,15 +182,20 @@ time_window:
                                        last_week, this_week, today,
                                        yesterday> }}
   | {{ kind: "absolute", from_iso: "YYYY-MM-DD", to_iso: "YYYY-MM-DD" }}
-group_by: list[ "driver" | "depot" | "day" | "month" | "category" ]   # optional
+group_by: list[ "driver" | "vehicle" | "depot" | "day" | "month" | "category" ]   # optional
+depot_wide: bool                        # true ONLY for a no-named-subject depot total
 ```
 
 ## Entity kinds
 
 - driver  — a person, often referred to by first name, full name, or an
             employee/badge ID. Examples: "John", "Jane Doe", "EMP-1234".
-- vehicle — a bus or van, referred to by license plate, VIN suffix, or
-            a customer label. Examples: "bus 42", "EV-007".
+- vehicle — a single bus/van OR a whole fleet named by make or type.
+            Extract the most discriminating words and drop filler: for
+            "the renault vans" use text "renault van", for "all our
+            e-buses" use "e-bus". The server resolves the phrase to every
+            matching vehicle and sums across the fleet. Examples:
+            "bus 42", "EV-007", "the renault vans", "the artics".
 - depot   — a physical site. Examples: "Vilnius depot", "the main yard".
 - rfid    — an RFID card by tag or label. Use only when the user
             explicitly mentions a card/tag/badge.
@@ -212,10 +215,19 @@ backend uses (e.g. "driver" not "user", "depot" not "yard"):
 {schema_yaml}
 ```
 
+## Depot-wide totals (no named subject)
+
+If the user asks for a consumption total with NO specific driver,
+vehicle, card, or depot named — "how much power was consumed last
+month", "what was our total energy use this week", "depot consumption
+in April" — return ``subjects: []`` AND ``depot_wide: true``. The
+server sums every charging session at the depots the caller can see.
+This is IN scope and DIFFERENT from a refusal.
+
 ## Refusal / out-of-scope
 
 If the message asks for ANY of the following, return ``subjects: []``
-(an empty list) so the server returns a refusal to the user:
+AND ``depot_wide: false`` so the server returns a refusal to the user:
 
 - Anything that would write or change state ("schedule", "assign",
   "update", "send", "create", "delete").
@@ -227,7 +239,7 @@ If the message asks for ANY of the following, return ``subjects: []``
 
 When refusing, still pick a syntactically valid time_window
 (``kind="relative", relative="this_month"`` is fine) — the empty
-``subjects`` array is the signal.
+``subjects`` array WITH ``depot_wide: false`` is the signal.
 
 ## Few-shot examples
 
@@ -237,7 +249,8 @@ Example 1 — happy path, single driver, relative time:
     "intent": "consumption_by_user",
     "subjects": [{{ "kind": "driver", "text": "John" }}],
     "time_window": {{ "kind": "relative", "relative": "last_month" }},
-    "group_by": []
+    "group_by": [],
+    "depot_wide": false
   }}
 
 Example 2 — happy path, multiple drivers, absolute dates:
@@ -254,7 +267,8 @@ Example 2 — happy path, multiple drivers, absolute dates:
       "from_iso": "2026-04-01",
       "to_iso": "2026-04-30"
     }},
-    "group_by": ["day"]
+    "group_by": ["day"],
+    "depot_wide": false
   }}
 
 Example 3 — ambiguity (two Johns) — extract both as written, the
@@ -264,25 +278,49 @@ server-side resolver handles ambiguity:
     "intent": "consumption_by_user",
     "subjects": [{{ "kind": "driver", "text": "John" }}],
     "time_window": {{ "kind": "relative", "relative": "yesterday" }},
-    "group_by": []
+    "group_by": [],
+    "depot_wide": false
   }}
 
-Example 4 — refusal (write intent):
+Example 4 — vehicle fleet (make / type), relative time. Extract the
+discriminating words, drop filler ("the", "vans" → singular root):
+  USER: How much power did the Renault vans consume last night?
+  PLAN: {{
+    "intent": "consumption_by_user",
+    "subjects": [{{ "kind": "vehicle", "text": "renault van" }}],
+    "time_window": {{ "kind": "relative", "relative": "yesterday" }},
+    "group_by": [],
+    "depot_wide": false
+  }}
+
+Example 5 — depot-wide total, NO named subject:
+  USER: How much power was consumed last month?
+  PLAN: {{
+    "intent": "consumption_by_user",
+    "subjects": [],
+    "time_window": {{ "kind": "relative", "relative": "last_month" }},
+    "group_by": [],
+    "depot_wide": true
+  }}
+
+Example 6 — refusal (write intent):
   USER: Schedule John for a charge tomorrow morning.
   PLAN: {{
     "intent": "consumption_by_user",
     "subjects": [],
     "time_window": {{ "kind": "relative", "relative": "this_month" }},
-    "group_by": []
+    "group_by": [],
+    "depot_wide": false
   }}
 
-Example 5 — refusal (out-of-scope intent):
+Example 7 — refusal (out-of-scope intent):
   USER: What's the current SoC of bus 42?
   PLAN: {{
     "intent": "consumption_by_user",
     "subjects": [],
     "time_window": {{ "kind": "relative", "relative": "this_month" }},
-    "group_by": []
+    "group_by": [],
+    "depot_wide": false
   }}
 """
 
@@ -308,12 +346,31 @@ reply.
   never raw UUIDs.
 - Energy in kWh with one decimal place. Cost with the currency symbol
   the depot uses.
-- If the result is empty, say so plainly and suggest the most likely
-  reason ("no charging sessions in that window").
 - If some sessions had no assigned driver but matched on RFID card,
   surface that as a footnote: "N sessions on cards not currently
   assigned to this driver."
 - Never speculate about data you weren't given.
+
+## Result summary (lead with this)
+
+The payload includes a ``result_summary`` with the authoritative totals
+and a ``disposition``. Use ``total_energy_kwh`` / ``total_cost`` for the
+headline figure; the ``rows`` are the per-group breakdown (and may be
+truncated — see ``rows_truncated``). Honour the disposition exactly —
+these three are NOT the same and must never be conflated:
+
+- ``ok`` — real data. Lead with the total, then any breakdown.
+- ``no_sessions`` — zero charging sessions matched the subject(s) and
+  window. Say so plainly and suggest the likely reason ("no charging
+  sessions for that vehicle in that window"). Do NOT say "0 kWh" as if
+  it were a measured value.
+- ``no_energy_recorded`` — sessions DID happen (``total_sessions`` > 0)
+  but none recorded an energy figure. Say that energy wasn't recorded
+  for those sessions — explicitly NOT "no consumption" and NOT "0 kWh".
+  Mention the session count so the operator knows charging occurred.
+
+When the question was depot-wide (``resolved_subjects`` is empty), frame
+the answer as "across your depot(s)" rather than naming a subject.
 """
 
 
@@ -558,12 +615,20 @@ async def extract_plan(message: str, *, model: Optional[str] = None) -> QueryPla
 # ── Answer formatting ──────────────────────────────────────────────────────
 
 
+# Cap the per-group rows handed to the formatter so a depot-wide or
+# large-fleet query can't balloon the format-step prompt. The
+# ``result_summary`` already carries the authoritative totals, so a
+# truncated breakdown never changes the headline figure.
+_FORMAT_ROW_CAP = 200
+
+
 async def format_answer(
     plan: QueryPlan,
     resolved: list[dict[str, Any]],
     window: dict[str, Any],
     rows: list[dict[str, Any]],
     *,
+    result_summary: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
 ) -> str:
     """Format a SQL result set into a natural-language reply.
@@ -579,6 +644,11 @@ async def format_answer(
             converted via ``.model_dump()`` upstream.
         window: Resolved time window — start/end UTC strings + tz.
         rows: SQL result rows, serialized to plain dicts.
+        result_summary: Pre-computed authoritative totals + three-state
+            ``disposition`` (see
+            :func:`src.api.agent.intents.consumption_by_user.summarize_consumption_rows`).
+            Lets the formatter distinguish "no sessions" from "no energy
+            recorded" from a real total without re-deriving it from rows.
         model: Optional per-call model override.
 
     Returns:
@@ -587,13 +657,17 @@ async def format_answer(
     chosen_model = model or CONFIG.model
     client = _get_client()
 
+    capped_rows = rows[:_FORMAT_ROW_CAP]
     payload = {
         "user_intent": plan.intent,
         "user_group_by": plan.group_by,
+        "depot_wide": plan.depot_wide,
         "resolved_subjects": resolved,
         "time_window": window,
+        "result_summary": result_summary,
         "row_count": len(rows),
-        "rows": rows,
+        "rows_truncated": len(rows) > len(capped_rows),
+        "rows": capped_rows,
     }
     user_message = (
         "Format the following result set into a friendly, concise reply. "
