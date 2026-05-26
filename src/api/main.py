@@ -13096,13 +13096,18 @@ async def list_org_alerts(
 
     depot_id_uuid = UUID(depot_id) if depot_id else None
 
+    try:
+        org_id_uuid = UUID(str(org_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="organization_id in token is not a valid UUID")
+
     alerts_list: list[Any] = []
     total = 0
     try:
         async with db_pools.ts.acquire() as conn:
             alerts_list, total = await alerts_repo.list_for_org(
                 conn,
-                UUID(str(org_id)),
+                org_id_uuid,
                 status_filter=status,
                 severity_filter=severity,
                 depot_id_filter=depot_id_uuid,
@@ -13112,6 +13117,7 @@ async def list_org_alerts(
             )
     except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError) as exc:
         logger.warning("notification_alerts schema unavailable, returning empty list: %s", exc)
+        alerts_repo.reset_column_probe()
 
     # Batch-fetch depot names from static pool (best-effort — alerts are primary)
     unique_depot_ids = [a.depot_id for a in alerts_list if a.depot_id is not None]

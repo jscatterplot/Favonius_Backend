@@ -109,6 +109,18 @@ def _is_undefined_column_error(exc: BaseException) -> bool:
     return getattr(exc, "sqlstate", None) == "42703"
 
 
+def reset_column_probe() -> None:
+    """Force the next _alert_select_columns call to re-probe the DB.
+
+    Call this whenever a real query fails with sqlstate 42703 so that a
+    migration rollback is reflected within one request cycle instead of
+    requiring a worker restart.
+    """
+    global _ACK_EMAIL_COLUMN_AVAILABLE, _ACK_EMAIL_COLUMN_RETRY_AFTER
+    _ACK_EMAIL_COLUMN_AVAILABLE = None
+    _ACK_EMAIL_COLUMN_RETRY_AFTER = 0.0
+
+
 async def _alert_select_columns(conn: Any) -> str:
     """Return SELECT column list, probing for migration 046.
 
@@ -498,42 +510,47 @@ async def acknowledge_for_org(
     """
     cols = await _alert_select_columns(conn)
     use_email_col = cols == _ALERT_COLUMNS
-    if use_email_col:
-        row = await conn.fetchrow(
-            f"""
-            UPDATE notification_alerts
-               SET status = 'acknowledged',
-                   acknowledged_at = NOW(),
-                   acknowledged_by = $3,
-                   acknowledged_by_email = $4,
-                   updated_at = NOW()
-             WHERE id = $1
-               AND organization_id = $2
-               AND status = 'active'
-             RETURNING {cols}
-            """,
-            alert_id,
-            org_id,
-            user_id,
-            user_email,
-        )
-    else:
-        row = await conn.fetchrow(
-            f"""
-            UPDATE notification_alerts
-               SET status = 'acknowledged',
-                   acknowledged_at = NOW(),
-                   acknowledged_by = $3,
-                   updated_at = NOW()
-             WHERE id = $1
-               AND organization_id = $2
-               AND status = 'active'
-             RETURNING {cols}
-            """,
-            alert_id,
-            org_id,
-            user_id,
-        )
+    try:
+        if use_email_col:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'acknowledged',
+                       acknowledged_at = NOW(),
+                       acknowledged_by = $3,
+                       acknowledged_by_email = $4,
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status = 'active'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+                user_email,
+            )
+        else:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'acknowledged',
+                       acknowledged_at = NOW(),
+                       acknowledged_by = $3,
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status = 'active'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+            )
+    except Exception as exc:
+        if _is_undefined_column_error(exc):
+            reset_column_probe()
+        raise
     return Alert.from_record(row) if row else None
 
 
@@ -552,55 +569,61 @@ async def resolve_by_id(
     """
     cols = await _alert_select_columns(conn)
     use_email_col = cols == _ALERT_COLUMNS
-    if use_email_col:
-        row = await conn.fetchrow(
-            f"""
-            UPDATE notification_alerts
-               SET status = 'resolved',
-                   resolved_at = NOW(),
-                   acknowledged_by = COALESCE(acknowledged_by, $3),
-                   acknowledged_by_email = COALESCE(acknowledged_by_email, $4),
-                   acknowledged_at = COALESCE(
-                       acknowledged_at,
-                       CASE WHEN COALESCE(acknowledged_by, $3) IS NOT NULL THEN NOW() END
-                   ),
-                   updated_at = NOW()
-             WHERE id = $1
-               AND organization_id = $2
-               AND status != 'resolved'
-             RETURNING {cols}
-            """,
-            alert_id,
-            org_id,
-            user_id,
-            user_email,
-        )
-    else:
-        row = await conn.fetchrow(
-            f"""
-            UPDATE notification_alerts
-               SET status = 'resolved',
-                   resolved_at = NOW(),
-                   acknowledged_by = COALESCE(acknowledged_by, $3),
-                   acknowledged_at = COALESCE(
-                       acknowledged_at,
-                       CASE WHEN COALESCE(acknowledged_by, $3) IS NOT NULL THEN NOW() END
-                   ),
-                   updated_at = NOW()
-             WHERE id = $1
-               AND organization_id = $2
-               AND status != 'resolved'
-             RETURNING {cols}
-            """,
-            alert_id,
-            org_id,
-            user_id,
-        )
+    try:
+        if use_email_col:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'resolved',
+                       resolved_at = NOW(),
+                       acknowledged_by = COALESCE(acknowledged_by, $3),
+                       acknowledged_by_email = COALESCE(acknowledged_by_email, $4),
+                       acknowledged_at = COALESCE(
+                           acknowledged_at,
+                           CASE WHEN COALESCE(acknowledged_by, $3) IS NOT NULL THEN NOW() END
+                       ),
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status != 'resolved'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+                user_email,
+            )
+        else:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'resolved',
+                       resolved_at = NOW(),
+                       acknowledged_by = COALESCE(acknowledged_by, $3),
+                       acknowledged_at = COALESCE(
+                           acknowledged_at,
+                           CASE WHEN COALESCE(acknowledged_by, $3) IS NOT NULL THEN NOW() END
+                       ),
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status != 'resolved'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+            )
+    except Exception as exc:
+        if _is_undefined_column_error(exc):
+            reset_column_probe()
+        raise
     return Alert.from_record(row) if row else None
 
 
 __all__ = [
     "Alert",
+    "reset_column_probe",
     "claim_pending_alerts",
     "mark_notified",
     "list_for_depot",
