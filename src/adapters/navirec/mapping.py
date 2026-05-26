@@ -13,6 +13,7 @@ typically report 0–100 percent).
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timezone
 from typing import Any, NamedTuple, Optional
@@ -94,29 +95,39 @@ def _coerce_soc(value: Any) -> Optional[float]:
     """Coerce a telematics SoC into the Favonius 0–1 range.
 
     Values > 1.5 are treated as a 0–100 percentage and divided by 100; the
-    result is clamped to [0, 1]. Unparseable input returns ``None``.
+    result is clamped to [0, 1]. Unparseable or non-finite input (``NaN`` /
+    ``inf``) returns ``None`` — clamping a NaN would silently fabricate a valid
+    SoC that could override real charger telemetry in the freshest-wins merge.
     """
     try:
         soc = float(value)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(soc):
         return None
     if soc > 1.5:
         soc = soc / 100.0
     return max(0.0, min(1.0, soc))
 
 
-def _safe_float(value: Any) -> Optional[float]:
-    """Best-effort float coercion; ``None`` when absent or unparseable.
+def _safe_coord(value: Any, limit: float) -> Optional[float]:
+    """Coerce a coordinate; ``None`` if absent, unparseable, non-finite, or out
+    of range.
 
-    Keeps one malformed coordinate (e.g. ``""`` / ``"N/A"``) from aborting the
-    whole poll/backfill cycle — callers don't isolate per-record float errors.
+    Range/finite checks matter because the per-depot write is a single batched
+    insert: one out-of-range coordinate (``999``, ``inf``, ``NaN``) would
+    violate the ``vehicle_telemetry`` lat/lon CHECK constraints and fail the
+    whole batch instead of degrading that one record's coordinate to ``None``.
     """
     if value is None:
         return None
     try:
-        return float(value)
+        coord = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(coord) or abs(coord) > limit:
+        return None
+    return coord
 
 
 def _coerce_time(value: Any) -> Optional[datetime]:
@@ -170,8 +181,8 @@ def parse_navirec_point(raw: dict[str, Any]) -> Optional[ParsedPoint]:
     return ParsedPoint(
         soc=soc,
         time=when,
-        latitude=_safe_float(_first(raw, _LAT_KEYS)),
-        longitude=_safe_float(_first(raw, _LON_KEYS)),
+        latitude=_safe_coord(_first(raw, _LAT_KEYS), 90.0),
+        longitude=_safe_coord(_first(raw, _LON_KEYS), 180.0),
     )
 
 

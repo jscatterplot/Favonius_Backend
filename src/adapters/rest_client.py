@@ -22,11 +22,37 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_retry_after(value: Optional[str], default: float) -> float:
+    """Parse a 429 ``Retry-After`` header into seconds.
+
+    HTTP permits either delay-seconds or an HTTP-date; fall back to ``default``
+    when the header is absent or unparseable so a rate-limit response stays
+    recoverable (retry with backoff) instead of crashing the request.
+    """
+    if value is None:
+        return default
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return default
+    if when is None:
+        return default
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
 class RestClientError(RuntimeError):
@@ -164,7 +190,9 @@ class BaseRestClient:
                 continue
 
             if resp.status_code == 429:
-                retry_after = float(resp.headers.get("Retry-After", _RETRY_BACKOFF_S[attempt]))
+                retry_after = _parse_retry_after(
+                    resp.headers.get("Retry-After"), _RETRY_BACKOFF_S[attempt]
+                )
                 logger.warning(
                     "%s 429 — backing off %.1fs (attempt %d/%d)",
                     self._provider_name,

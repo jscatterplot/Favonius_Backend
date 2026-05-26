@@ -100,6 +100,22 @@ def test_reading_bad_latlon_degrades_to_none_not_crash():
     assert r.latitude is None and r.longitude is None
 
 
+def test_reading_non_finite_soc_returns_none():
+    # NaN/inf must not clamp into a bogus valid SoC.
+    assert navirec_vehicle_to_reading({"plate": "X", "soc": "nan", "timestamp": _TS}) is None
+    assert navirec_vehicle_to_reading({"plate": "X", "soc": float("inf"), "timestamp": _TS}) is None
+
+
+def test_reading_out_of_range_or_non_finite_coord_degrades_to_none():
+    # Out-of-range / non-finite coords would violate the vehicle_telemetry CHECK
+    # constraints and fail the batch insert — drop the coord instead.
+    r = navirec_vehicle_to_reading(
+        {"plate": "X", "soc": 50, "lat": 999, "lon": float("inf"), "timestamp": _TS}
+    )
+    assert r is not None
+    assert r.latitude is None and r.longitude is None
+
+
 def test_reading_field_precedence():
     # licensePlate beats plate; stateOfCharge beats batteryLevel.
     r = navirec_vehicle_to_reading(

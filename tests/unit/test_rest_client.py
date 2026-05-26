@@ -170,6 +170,32 @@ async def test_429_then_success(client):
 
 
 @pytest.mark.asyncio
+async def test_429_http_date_retry_after_then_success(client):
+    # Retry-After may be an HTTP-date, not just seconds — must not crash.
+    with respx.mock(assert_all_called=False) as mock:
+        _route_auth(mock)
+        route = mock.get(f"{_BASE}/things/x").mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2099 07:28:00 GMT"}),
+                httpx.Response(200, json={"id": "x"}),
+            ]
+        )
+        result = await client.get_thing("x")
+        assert result["id"] == "x"
+        assert route.call_count == 2
+    await client.aclose()
+
+
+def test_parse_retry_after_variants():
+    from src.adapters.rest_client import _parse_retry_after
+
+    assert _parse_retry_after(None, 7.0) == 7.0
+    assert _parse_retry_after("3", 7.0) == 3.0
+    assert _parse_retry_after("garbage", 7.0) == 7.0  # malformed → default
+    assert _parse_retry_after("Wed, 21 Oct 1999 07:28:00 GMT", 7.0) == 0.0  # past date → 0
+
+
+@pytest.mark.asyncio
 async def test_5xx_retry(client):
     with respx.mock(assert_all_called=False) as mock:
         _route_auth(mock)
