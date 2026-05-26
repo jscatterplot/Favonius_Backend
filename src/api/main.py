@@ -13054,8 +13054,8 @@ async def list_org_alerts(
                 page=page,
                 page_size=page_size,
             )
-    except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError):
-        logger.debug("notification_alerts table/column not present; returning empty list")
+    except asyncpg.UndefinedTableError:
+        logger.debug("notification_alerts table not present; returning empty list")
 
     # Batch-fetch depot names from static pool
     unique_depot_ids = [a.depot_id for a in alerts_list if a.depot_id is not None]
