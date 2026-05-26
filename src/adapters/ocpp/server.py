@@ -269,8 +269,8 @@ class OCPPServer:
 
         logger.debug(
             f"Meter values: {charge_point_id}, connector {connector_id}, "
-            f"SoC={soc:.2f if soc is not None else 'N/A'}, "
-            f"Power={power_kw:.2f if power_kw is not None else 'N/A'}kW"
+            f"SoC={(f'{soc:.2f}' if soc is not None else 'N/A')}, "
+            f"Power={(f'{power_kw:.2f}' if power_kw is not None else 'N/A')}kW"
             + (f", Energy={energy_kwh:.2f}kWh" if energy_kwh else "")
             + (f", max_charge={max_charge_kw:.2f}kW" if max_charge_kw else "")
         )
