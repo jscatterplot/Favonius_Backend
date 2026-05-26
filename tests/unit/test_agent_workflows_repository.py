@@ -47,8 +47,10 @@ from src.api.agent_workflows.repository import (  # noqa: E402
     get_tier,
     get_workflow,
     insert_decision,
+    insert_default_tiers_bulk,
     list_decisions,
     set_tier,
+    upsert_workflow,
 )
 
 
@@ -218,6 +220,45 @@ class TestGetWorkflow:
             await get_workflow(pool, "ghost")
 
 
+@pytest.mark.asyncio
+class TestUpsertWorkflow:
+    async def test_returns_workflow_with_upsert_sql(self, mock_asyncpg_pool):
+        pool, conn = mock_asyncpg_pool
+        # The upsert RETURNING clause echoes the same columns get_workflow reads.
+        conn.fetchrow.return_value = _workflow_row(
+            name="daily_readiness_check",
+            version="1.0.0",
+            allowed_tools=[
+                "get_scheduled_departures",
+                "get_vehicle_state",
+                "get_charger_state",
+                "get_charging_plan",
+                "get_driver_assignment",
+            ],
+            parameters={"lead_time_min": 60},
+        )
+        wf = await upsert_workflow(
+            pool,
+            name="daily_readiness_check",
+            version="1.0.0",
+            description="Daily readiness check",
+            prompt="You are the readiness agent.",
+            allowed_tools=["get_scheduled_departures", "get_vehicle_state"],
+            parameters={"lead_time_min": 60},
+        )
+        assert wf.name == "daily_readiness_check"
+        assert wf.version == "1.0.0"
+
+        sql, *params = conn.fetchrow.call_args[0]
+        assert "INSERT INTO workflows" in sql
+        assert "ON CONFLICT (name) DO UPDATE" in sql
+        assert "RETURNING" in sql
+        assert params[0] == "daily_readiness_check"
+        assert params[1] == "1.0.0"
+        # allowed_tools is positional arg #4 (index 4) — passed as TEXT[].
+        assert params[4] == ["get_scheduled_departures", "get_vehicle_state"]
+
+
 # ── get_tier / set_tier ──────────────────────────────────────────────────
 
 
@@ -296,6 +337,62 @@ class TestTierRepository:
         await set_tier(pool, uuid4(), uuid4(), PermissionTier.AUTONOMOUS, rule)
         _, *params = conn.execute.call_args[0]
         assert params[7] is None
+
+
+@pytest.mark.asyncio
+class TestInsertDefaultTiersBulk:
+    def _rule(self) -> GraduationRule:
+        return GraduationRule(
+            min_decisions=100,
+            max_override_rate=0.05,
+            max_edit_rate=0.15,
+            requires_human_signoff=True,
+            next_tier=PermissionTier.DRAFT_AND_WAIT,
+        )
+
+    async def test_single_set_based_insert_only_statement(self, mock_asyncpg_pool):
+        pool, conn = mock_asyncpg_pool
+        depot_a, depot_b = uuid4(), uuid4()
+        # RETURNING rows = depots that were freshly inserted.
+        conn.fetch.return_value = [{"depot_id": depot_a}, {"depot_id": depot_b}]
+        workflow_id = uuid4()
+
+        inserted = await insert_default_tiers_bulk(
+            pool, workflow_id, [depot_a, depot_b], PermissionTier.INFORM, self._rule()
+        )
+        assert inserted == 2
+
+        # One round-trip, not one per depot.
+        assert conn.fetch.call_count == 1
+        sql, *params = conn.fetch.call_args[0]
+        assert "INSERT INTO workflow_tiers" in sql
+        # Set-based via unnest + insert-only (no silent downgrade).
+        assert "unnest($2::uuid[])" in sql
+        assert "ON CONFLICT (workflow_id, depot_id) DO NOTHING" in sql
+        assert "DO UPDATE" not in sql
+        assert "RETURNING" in sql
+        assert params[0] == workflow_id
+        assert params[1] == [depot_a, depot_b]
+        assert params[2] == "inform"
+        assert params[7] == "draft_and_wait"
+
+    async def test_counts_only_actually_inserted_rows(self, mock_asyncpg_pool):
+        pool, conn = mock_asyncpg_pool
+        depot_new = uuid4()
+        # Two depots requested, one already existed → only one RETURNING row.
+        conn.fetch.return_value = [{"depot_id": depot_new}]
+        inserted = await insert_default_tiers_bulk(
+            pool, uuid4(), [uuid4(), depot_new], PermissionTier.INFORM, self._rule()
+        )
+        assert inserted == 1
+
+    async def test_empty_depot_list_is_a_noop(self, mock_asyncpg_pool):
+        pool, conn = mock_asyncpg_pool
+        inserted = await insert_default_tiers_bulk(
+            pool, uuid4(), [], PermissionTier.INFORM, self._rule()
+        )
+        assert inserted == 0
+        conn.fetch.assert_not_called()
 
 
 # ── insert_decision ──────────────────────────────────────────────────────

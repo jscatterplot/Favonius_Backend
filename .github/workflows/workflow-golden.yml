@@ -11,8 +11,9 @@
 #     up as a service container and run the full migrations against it
 #     before invoking the gate.
 #
-# Trigger: PRs that touch the runtime, the harness, or any scenario
-# YAML. Pushes to main also run so the default branch is always green.
+# Trigger: PRs that touch the runtime, the harness, any scenario
+# YAML, or any DB migration. Pushes to main also run so the default
+# branch is always green.
 
 name: workflow-golden
 

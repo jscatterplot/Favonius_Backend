@@ -1,7 +1,7 @@
 # OCPP Protocol Rules
 
 ## Reference
-Primary reference: docs/PRD_v2_7_Building_Integration.md#9-1-ocpp-integration
+Primary reference: `CLAUDE.md` ("OCPP Implementation"); product spec: `docs/PRD_Depot_Agent.md`
 
 ## Protocol Versions
 

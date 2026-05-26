@@ -47,7 +47,7 @@ Configuration is loaded from environment variables with defaults:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FAVONIUS_OPTIMIZATION_HORIZON_HOURS` | 24 | Optimization horizon in hours |
-| `FAVONIUS_HOURLY_OPT_START` | 0 | Hourly optimization start hour (0-23) |
+| `FAVONIUS_HOURLY_OPT_START` | 7 | Hourly optimization start hour (0-23) |
 | `FAVONIUS_HOURLY_OPT_END` | 23 | Hourly optimization end hour (0-23) |
 | `FAVONIUS_OPTIMIZATION_TIMEOUT` | 60.0 | Solver timeout in seconds |
 | `FAVONIUS_TRIGGER_COOLDOWN_MIN` | 5 | Cooldown after trigger in minutes |
@@ -78,13 +78,7 @@ Controllers run hourly optimizations during active hours (default: 24/7):
 
 ### Trigger-Based Re-Optimization
 
-The TriggerMonitor continuously monitors:
-
-- **SoC Deviation**: Vehicle SoC deviates >5% from expected (event-driven)
-- **Price Changes**: Electricity price changes >25% OR >$25/MWh (OR logic, on ingestion)
-- **Return Time Delays**: Vehicle returns >15 minutes late (event-driven)
-- **Inter-depot Handoff**: On message receipt (event-driven)
-- **Scheduled**: Hourly 24/7 (periodic)
+The TriggerMonitor continuously monitors SoC deviation, price changes, return-time delays, inter-depot handoffs, and the scheduled hourly tick. See the re-optimization trigger table (detection methods and thresholds) in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 When a trigger fires:
 1. Check cooldown period (prevents rapid re-optimization)
@@ -231,7 +225,7 @@ Controllers are automatically:
 3. Invalid depot configuration
 
 **Solutions**:
-1. Check database for depots: `SELECT * FROM depots`
+1. Check database for depots: `SELECT * FROM sites` (Supabase)
 2. Check application logs for errors
 3. Verify depot configuration is valid
 

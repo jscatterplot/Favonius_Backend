@@ -2,7 +2,7 @@
 
 An integrated depot energy management platform that coordinates EV charging schedules, stationary batteries, and building loads to reduce electricity costs by 30-50% for commercial fleet operators. The system supports OCPP 1.6/2.0.1 communication with chargers and MILP-based optimization.
 
-**Reference:** `docs/PRD_v2.md` (Product Requirements Document - single source of truth)
+**Reference:** `docs/PRD_Depot_Agent.md` (Product Requirements Document - single source of truth)
 
 ## Features
 
@@ -13,7 +13,7 @@ An integrated depot energy management platform that coordinates EV charging sche
 - **Demand Charge Minimization**: Optimizes charging schedules to reduce peak demand charges (30-50% reduction target per PRD Section 1.3).
 - **Stationary Battery Dispatch**: Coordinates battery storage for peak shaving.
 - **Building Load Integration**: **REQUIRED** for accurate grid power calculation (per PRD Section 9.4).
-- **CAISO Price Integration**: Real-time and day-ahead market price feeds for TOU arbitrage.
+- **ENTSO-E Price Integration**: Day-ahead European electricity market price feeds for TOU arbitrage.
 - **Inter-Depot Vehicle Handoff**: Messaging system for multi-depot fleet coordination (per PRD Section 5.4).
 - **Observability**: Prometheus metrics and structured JSON logging.
 
@@ -43,7 +43,7 @@ An integrated depot energy management platform that coordinates EV charging sche
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        STATE ASSEMBLER                              │
 │  • Current SoC (vehicles + battery)                                 │
-│  • Price schedule (TOU / CAISO DAM)                                 │
+│  • Price schedule (TOU / ENTSO-E day-ahead)                         │
 │  • Vehicle availability windows                                     │
 │  • Energy consumption forecasts                                     │
 └───────────────────────────────┬─────────────────────────────────────┘
@@ -150,8 +150,9 @@ curl http://localhost:8000/health
 | `SUPABASE_URL` / keys          | Supabase project credentials                    | –       |
 | `SUPABASE_DB_HOST` / creds     | Supabase Postgres details for direct access     | –       |
 | `TIMESCALE_SERVICE_URL`        | TimescaleDB connection URI                      | –       |
-| `PRICE_FEEDER_ENABLED`         | Enable CAISO price ingestion                    | true    |
-| `PRICE_FEEDER_NODES`           | CSV of CAISO nodes (e.g. `TH_SP15_GEN-APND`)    | TH_SP15_GEN-APND,TH_NP15_GEN-APND |
+| `PRICE_FEEDER_ENABLED`         | Enable ENTSO-E day-ahead price ingestion        | true    |
+| `PRICE_FEEDER_ENTSOE_ZONES`    | CSV of ENTSO-E EIC bidding-zone codes (e.g. `10Y1001A1001A82H`) | –       |
+| `EUROPEAN_ELECTRICITY_API`     | ENTSO-E Transparency Platform API token         | –       |
 | `PRICE_FEEDER_FETCH_INTERVAL`  | Price refresh interval (seconds)                | 900     |
 | `PRICE_FEEDER_LOOKAHEAD_HOURS` | Hours of price horizon                          | 24      |
 | `OPTIMIZATION_ENABLED`         | Enable schedule computation                     | true    |
@@ -171,18 +172,17 @@ TLS-specific variables (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_VERIFY_CLIENT`) re
 | `connection_manager.py`              | Tracks station sessions and pushes messages                                 |
 | `message_handler.py`                 | OCPP message parsing & telemetry persistence                                |
 | `timescale_client.py`                | Async access to TimescaleDB                                                 |
-| `price_feeder.py`                    | CAISO price ingestion & optimizer trigger                                   |
+| `price_feeder.py`                    | ENTSO-E day-ahead price ingestion & optimizer trigger                       |
 | `optimization_engine.py`             | Heuristic scheduler that creates `SetChargingProfile` directives            |
 | `analytics_service.py`               | Aggregated metrics for the REST API                                         |
 | `supabase_client.py`                 | User/fleet queries for Supabase                                             |
-| `data_sync.py`                       | Periodic Timescale→Supabase summarisation                                   |
 | `monitoring.py`                      | Prometheus metrics, structured logging, health checks                       |
 
 ## Development Notes
 
 - **TimescaleDB** is the primary state store. Schema creation in `timescale_schema.py` will run automatically in development mode.
 - **Supabase** provides user/org metadata. Populate it with demo data or connect to your project.
-- **Price feeder** requires outbound access to CAISO OASIS. In offline environments you may disable it via `PRICE_FEEDER_ENABLED=false`.
+- **Price feeder** requires outbound access to the ENTSO-E Transparency Platform. In offline environments you may disable it via `PRICE_FEEDER_ENABLED=false`.
 - **Optimization engine** uses Pyomo + Gurobi (primary) with HiGHS fallback for MILP optimization (per PRD Section 8.2). Gurobi license required for production. Julia solver available as reference implementation in `optimization/mip_solver.jl`.
 
 ## Observability
@@ -195,11 +195,10 @@ TLS-specific variables (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_VERIFY_CLIENT`) re
 
 | Issue                        | Checks                                                                    |
 |------------------------------|---------------------------------------------------------------------------|
-| Chargers fail to connect     | Verify OCPP subprotocol (`ocpp1.6` or `ocpp2.1`), TLS configuration, and heartbeat     |
+| Chargers fail to connect     | Verify OCPP subprotocol (`ocpp1.6` primary, `ocpp2.0.1` future-ready), TLS configuration, and heartbeat |
 | Telemetry missing in DB      | Inspect `message_handler` logs, confirm Timescale credentials             |
-| Price feeder errors          | Confirm CAISO API reachability and node list formatting                   |
+| Price feeder errors          | Confirm ENTSO-E API reachability and bidding-zone list formatting         |
 | Schedules not applied        | Ensure optimization engine is enabled and `send_charging_profile` succeeds|
-| Supabase sync gaps           | Look at `data_sync.py` logs for batched upserts                           |
 
 ## Development Environment
 
@@ -214,7 +213,7 @@ This project uses Cursor IDE with custom rules for AI-assisted development:
   - `timescale.mdc` - TimescaleDB best practices (PRD Section 6)
 
 **Using Cursor:**
-- Reference PRD sections using `@PRD_v2.md#section-name`
+- Reference PRD sections using `@PRD_Depot_Agent.md#section-name`
 - AI suggestions automatically follow PRD constraints and patterns
 - Domain-specific rules provide detailed implementation guidance
 

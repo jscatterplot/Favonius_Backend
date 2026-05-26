@@ -395,7 +395,9 @@ class WorkflowAgent:
                     block_input = dict(getattr(block, "input", {}) or {})
 
                     if name == EMIT_DECISION_TOOL_NAME:
-                        decision_output, rule_applied = self._capture_terminator(block_input, guard)
+                        decision_output, rule_applied = self._capture_terminator(
+                            block_input, guard, permission_tier
+                        )
                         emit_called = True
                         # Terminator: do not append a tool_result; do not
                         # process further tool_use blocks in this response.
@@ -631,6 +633,7 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
         self,
         block_input: dict[str, Any],
         guard: HardConstraintGuard,
+        permission_tier: PermissionTier,
     ) -> tuple[dict[str, Any], Optional[str]]:
         """Apply the post-emit guard to the LLM's structured output.
 
@@ -638,11 +641,25 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
         and records them under ``filtered_violations`` so the audit row
         shows what the LLM tried to propose. Returns the cleaned
         ``output`` dict and any ``rule_applied`` value.
+
+        At ``inform`` tier the contract is read-only (PRD §9.1: "the
+        agent only describes; no actions are proposed"). The prompt asks
+        the model to honour this, but prompt compliance is not a
+        guarantee — so we enforce it server-side here: any actions that
+        survived the constraint guard are stripped from
+        ``proposed_actions`` and recorded under ``tier_suppressed_actions``
+        for the audit trail. A model deviation can never surface an
+        actionable proposal to a read-only-tier depot.
         """
         raw_actions = block_input.get("proposed_actions") or []
         if not isinstance(raw_actions, list):
             raw_actions = []
         kept, violations = guard.filter_actions(raw_actions)
+
+        tier_suppressed: list[Any] = []
+        if permission_tier is PermissionTier.INFORM:
+            tier_suppressed = kept
+            kept = []
 
         output: dict[str, Any] = {
             "summary": str(block_input.get("summary") or ""),
@@ -658,6 +675,11 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
                 for v in violations
             ],
         }
+        if tier_suppressed:
+            # Audit-only: the model proposed actions at a read-only tier.
+            # They are NOT actionable, but we keep them so the audit log
+            # and graduation metrics can see the prompt deviation.
+            output["tier_suppressed_actions"] = tier_suppressed
         raw_coverage = block_input.get("coverage")
         if isinstance(raw_coverage, dict):
             coverage: dict[str, Any] = {}

@@ -44,6 +44,10 @@ def _make_alert(
         status="active",
         first_occurrence_at=first_at or datetime(2026, 4, 30, 10, 0, 0, tzinfo=timezone.utc),
         last_occurrence_at=last_at or datetime(2026, 4, 30, 10, 0, 0, tzinfo=timezone.utc),
+        acknowledged_at=None,
+        acknowledged_by=None,
+        acknowledged_by_email=None,
+        resolved_at=None,
         last_notified_at=None,
         last_notified_count=0,
     )

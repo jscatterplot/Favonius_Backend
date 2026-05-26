@@ -618,6 +618,107 @@ class TestWorkflowAgentHappyPath:
         assert "focus_window" in first_user["content"]
 
 
+# ── Permission-tier enforcement (PRD §9.1) ─────────────────────────────────
+
+
+class TestInformTierSuppression:
+    """At ``inform`` the agent only describes — no actions are proposed
+    (PRD §9.1). The prompt asks for this, but the runtime must enforce it
+    server-side so a model deviation can't surface an actionable proposal
+    to a read-only-tier depot."""
+
+    def _emit_with_proposals(self) -> list[Any]:
+        return [
+            _response(
+                [
+                    _tool_use_block(
+                        EMIT_DECISION_TOOL_NAME,
+                        id_="tu_emit",
+                        input_={
+                            "summary": "BUS-1 undercharged; recommend extending.",
+                            "rule_applied": "undercharge",
+                            "proposed_actions": [
+                                {
+                                    "vehicle_id": "BUS-1",
+                                    "type": "extend_charging",
+                                    # Constraint-clean: well above the SoC floor
+                                    # and under the grid cap, so only the tier
+                                    # gate can strip it.
+                                    "departure_soc": 0.99,
+                                    "grid_kw": 100.0,
+                                }
+                            ],
+                        },
+                    )
+                ],
+                stop_reason="end_turn",
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_inform_tier_strips_proposed_actions(
+        self,
+        workflow: Workflow,
+        depot_id: UUID,
+        auth_context: AuthContext,
+        tool_registry: ToolRegistry,
+        repo: InMemoryDecisionRepo,
+    ) -> None:
+        client = _fake_client(self._emit_with_proposals())
+        agent = WorkflowAgent(
+            anthropic_client=client,
+            decision_repo=repo,
+            constraints=DepotConstraints(max_grid_kw=500.0),
+        )
+
+        decision = await agent.run_turn(
+            workflow=workflow,
+            depot_id=depot_id,
+            auth_context=auth_context,
+            tool_registry=tool_registry,
+            permission_tier=PermissionTier.INFORM,
+        )
+
+        # No actionable proposal is persisted at the read-only tier.
+        assert decision.output["proposed_actions"] == []
+        # The model's deviation is kept for the audit / graduation metrics.
+        assert len(decision.output["tier_suppressed_actions"]) == 1
+        assert decision.output["tier_suppressed_actions"][0]["vehicle_id"] == "BUS-1"
+        # It was NOT a constraint violation — purely a tier strip.
+        assert decision.output["filtered_violations"] == []
+        # The descriptive summary still reaches the manager.
+        assert "undercharged" in decision.output["summary"]
+
+    @pytest.mark.asyncio
+    async def test_draft_and_wait_keeps_proposed_actions(
+        self,
+        workflow: Workflow,
+        depot_id: UUID,
+        auth_context: AuthContext,
+        tool_registry: ToolRegistry,
+        repo: InMemoryDecisionRepo,
+    ) -> None:
+        client = _fake_client(self._emit_with_proposals())
+        agent = WorkflowAgent(
+            anthropic_client=client,
+            decision_repo=repo,
+            constraints=DepotConstraints(max_grid_kw=500.0),
+        )
+
+        decision = await agent.run_turn(
+            workflow=workflow,
+            depot_id=depot_id,
+            auth_context=auth_context,
+            tool_registry=tool_registry,
+            permission_tier=PermissionTier.DRAFT_AND_WAIT,
+        )
+
+        # At draft_and_wait the proposal survives (constraint-clean).
+        assert len(decision.output["proposed_actions"]) == 1
+        assert decision.output["proposed_actions"][0]["vehicle_id"] == "BUS-1"
+        assert "tier_suppressed_actions" not in decision.output
+
+
 # ── Allow-list enforcement ─────────────────────────────────────────────────
 
 
