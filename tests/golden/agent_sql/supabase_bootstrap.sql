@@ -48,9 +48,10 @@
 
 -- Organizations — only `id` is referenced (sites.organization_id FK).
 CREATE TABLE IF NOT EXISTS public.organizations (
-    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    name        varchar NOT NULL DEFAULT 'Eval org',
-    created_at  timestamptz NOT NULL DEFAULT now()
+    id                     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                   varchar NOT NULL DEFAULT 'Eval org',
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    agent_sql_mode_enabled boolean NOT NULL DEFAULT TRUE
 );
 
 -- Sites — the depot configuration record (agent_views.depots).

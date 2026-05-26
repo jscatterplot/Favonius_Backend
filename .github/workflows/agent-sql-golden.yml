@@ -12,6 +12,8 @@
 #   favonius_test    <- migrations/*.sql            (agent_views.* TS functions)
 #   favonius_static  <- supabase_bootstrap.sql       (Supabase-owned base tables)
 #                       + migrations/supabase/040_agent_views_static.sql
+#                       + migrations/supabase/044_agent_sql_mode_org_flag.sql
+#                       + migrations/supabase/045_organizations_agent_token_budget.sql
 # See tests/golden/agent_sql/supabase_bootstrap.sql for why the static base is
 # reconstructed rather than replayed.
 #
@@ -129,15 +131,17 @@ jobs:
         run: python scripts/run_migrations.py
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
-      - name: Apply static base + agent_views (040) + budget column (044) -> favonius_static
-        # 044 adds organizations.agent_token_budget_monthly, which the S4 budget
-        # refusal integration test (tests/integration/agent_sql) writes + reads.
-        # It only ALTERs organizations (no colliding tables), so it's safe to add
+      - name: Apply static base + agent_views (040) + org SQL flag (044) + budget col (045) -> favonius_static
+        # 044 adds the per-org SQL-mode flag; 045 adds
+        # organizations.agent_token_budget_monthly, which the S4 budget refusal
+        # integration test (tests/integration/agent_sql) writes + reads. Both
+        # only ALTER organizations (no colliding tables), so they're safe to add
         # to the curated static base.
         run: |
           psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/golden/agent_sql/supabase_bootstrap.sql
           psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/040_agent_views_static.sql
-          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/044_organizations_agent_token_budget.sql
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/044_agent_sql_mode_org_flag.sql
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/045_organizations_agent_token_budget.sql
       - name: Run agent-SQL golden gate
         # `-m "agent_sql_golden or not agent_sql_golden"` runs both the
         # parametrised gate (real DB) and the no-DB invariants in the file

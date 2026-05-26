@@ -98,7 +98,7 @@ def _skip_without_anthropic_key() -> None:
 
 @pytest.fixture
 def sql_mode_env(monkeypatch: pytest.MonkeyPatch):
-    """Enable SQL mode (open allowlist) + the known JWT secret for one test.
+    """Enable SQL mode + the known JWT secret for one test.
 
     Mirrors the S3 integration test's fixture: clears the planner's lru-cached
     env reads before and after so the toggle doesn't leak, and resets the
@@ -109,17 +109,14 @@ def sql_mode_env(monkeypatch: pytest.MonkeyPatch):
     from src.api.agent import planner
 
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
-    monkeypatch.delenv("AGENT_SQL_ORG_ALLOWLIST", raising=False)  # open to all orgs
     monkeypatch.setenv("JWT_SECRET_KEY", _TEST_JWT_SECRET)
     monkeypatch.delenv("JWT_SECRET_KEY_PREVIOUS", raising=False)
     planner.is_sql_mode_enabled.cache_clear()
-    planner._sql_org_allowlist_tokens.cache_clear()
     agent_llm._reset_client_for_tests()
     try:
         yield
     finally:
         planner.is_sql_mode_enabled.cache_clear()
-        planner._sql_org_allowlist_tokens.cache_clear()
         agent_llm._reset_client_for_tests()
 
 

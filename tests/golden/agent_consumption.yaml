@@ -1,10 +1,10 @@
 # Golden test suite for the depot chat agent — consumption_by_user intent.
 #
-# 50 Q&A pairs covering:
+# 52 Q&A pairs covering:
 #   hp-*   Happy paths (10)
 #   amb-*  Ambiguity (10)
 #   nf-*   Not found (10)
-#   edge-* Edge cases (15)
+#   edge-* Edge cases (17) — includes vehicle/fleet + depot-wide totals
 #   ref-*  Refusals (5)
 #
 # Each entry:
@@ -431,6 +431,22 @@
       text: "O'Brien"
   expected_status: success
   # Apostrophe in name; SQL parameter escaping must handle it
+
+- id: edge-16
+  message: "How much power did the Renault vans consume last night?"
+  expected_intent: consumption_by_user
+  expected_subjects:
+    - kind: vehicle
+      text: "renault van"
+  expected_status: success
+  # Vehicle fleet (make/type) — expands to every matching vehicle and sums
+
+- id: edge-17
+  message: "How much power was consumed last month?"
+  expected_intent: consumption_by_user
+  expected_subjects: []
+  expected_status: success
+  # Depot-wide total — no named subject; extraction sets depot_wide=true
 
 # ── Refusals ─────────────────────────────────────────────────────────────────
 

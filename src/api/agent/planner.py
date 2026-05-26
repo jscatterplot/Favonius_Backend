@@ -26,7 +26,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -43,13 +43,19 @@ class PlannerDecision:
 
 # Phrases that strongly suggest the consumption fast path. All
 # lowercased; matched against a lowercased user message. The fast
-# path's compiler (`compile_consumption_by_user`) only handles
-# resolved DRIVER subjects, so any pattern here must encode that:
-# borderline shapes that could resolve to a vehicle/depot/charger
-# subject have to fall through to sql_general instead — otherwise
-# the compiler raises ValueError at runtime.
+# path's compiler (`compile_consumption_by_user`) resolves DRIVER, RFID
+# CARD, and VEHICLE/FLEET subjects, plus depot-wide totals — so the
+# first trigger accepts an optional measurand noun ("power", "energy",
+# "kwh") and the past-tense "was/were consumed" phrasing that operators
+# actually type ("how much power was consumed last month"). Borderline
+# shapes that the compiler still can't service (rankings, comparisons)
+# are pulled back to sql_general by the anti-patterns below.
 _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bhow much (did|has) .+ (charg(?:e|ed|ing)|consum(?:e|ed|ing)|used)\b"),
+    re.compile(
+        r"\bhow much(?:\s+(?:power|energy|electricity|kwh|charge|charging))?"
+        r"\s+(?:did|has|have|was|were)\b.+?"
+        r"\b(?:charg(?:e|ed|ing)|consum(?:e|ed|ing|ption)|use[ds]?)\b"
+    ),
     re.compile(r"\bconsumption (of|for|by) \S+"),
     re.compile(r"\benergy (used|consumed) by \S+"),
     re.compile(r"\bhow many kwh did \S+ "),
@@ -57,12 +63,12 @@ _CONSUMPTION_TRIGGERS: tuple[re.Pattern[str], ...] = (
 
 # Anti-patterns that pull a borderline message OUT of the fast path
 # back to sql_general (e.g. "which charger consumed the most" is a
-# ranking question, not a per-user consumption question).
+# ranking question, not a per-user consumption question). Note there is
+# deliberately no bare `vehicle(s)` anti-pattern: vehicle and fleet
+# consumption are now first-class on the fast path. Rankings over
+# vehicles ("which vehicle used the most") are still caught by the
+# `which …` pattern and routed to SQL mode.
 _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
-    # Per-vehicle rollups need agent_views.sessions on the SQL path; the fast
-    # path compiler only aggregates by resolved driver/card subjects. Match
-    # both singular and plural (`vehicle` / `vehicles`).
-    re.compile(r"\bvehicles?\b"),
     re.compile(r"\bwhich (depots?|chargers?|vehicles?|drivers?)\b"),
     re.compile(r"\bcompare\b"),
     re.compile(r"\bunderutil"),
@@ -87,40 +93,38 @@ def is_sql_mode_enabled() -> bool:
     )
 
 
-@lru_cache(maxsize=1)
-def _sql_org_allowlist_tokens() -> Optional[frozenset[str]]:
-    """Parse ``AGENT_SQL_ORG_ALLOWLIST`` once; ``None`` means all orgs."""
-    raw = os.environ.get("AGENT_SQL_ORG_ALLOWLIST", "").strip()
-    if not raw:
-        return None
-    return frozenset(tok.strip().lower() for tok in raw.split(",") if tok.strip())
+async def fetch_org_sql_enabled(static_pool: Any, organization_id: Optional[UUID]) -> bool:
+    """Query ``organizations.agent_sql_mode_enabled`` for this org.
 
-
-def is_org_in_sql_allowlist(organization_id: Optional[UUID]) -> bool:
-    """Check the per-org allowlist for SQL mode.
-
-    Empty/unset allowlist means SQL mode is open to every org (paired
-    with ``AGENT_SQL_MODE_ENABLED=true`` this is full rollout).
+    Returns ``True`` (default-on) when the org row is not found yet
+    (tenant mirror may not have run), or when ``organization_id`` is
+    ``None`` (e.g., admin/system callers without org claims). Returns
+    ``False`` only when the column is explicitly ``FALSE``.
     """
-    allowed = _sql_org_allowlist_tokens()
-    if allowed is None:
-        return True
     if organization_id is None:
-        return False
-    return str(organization_id).lower() in allowed
+        return True
+    row = await static_pool.fetchrow(
+        "SELECT agent_sql_mode_enabled FROM organizations WHERE id = $1",
+        organization_id,
+    )
+    if row is None:
+        return True  # org not mirrored yet — honour the default-on policy
+    return bool(row["agent_sql_mode_enabled"])
 
 
 def classify(
     message: str,
     *,
-    organization_id: Optional[UUID],
+    sql_mode_allowed: bool,
 ) -> PlannerDecision:
     """Pick a route for one user message.
 
     Args:
         message: Raw user-typed message.
-        organization_id: The caller's organization. Used to gate SQL
-            mode via the per-org allowlist.
+        sql_mode_allowed: Pre-resolved boolean combining the global
+            ``AGENT_SQL_MODE_ENABLED`` flag and the per-org DB check
+            (``organizations.agent_sql_mode_enabled``). Callers should
+            derive this via :func:`fetch_org_sql_enabled`.
 
     Returns:
         A :class:`PlannerDecision` whose ``route`` is one of
@@ -143,7 +147,7 @@ def classify(
             reason="matched_consumption_trigger",
         )
 
-    if is_sql_mode_enabled() and is_org_in_sql_allowlist(organization_id):
+    if is_sql_mode_enabled() and sql_mode_allowed:
         return PlannerDecision(route="sql_general", reason="sql_mode_route")
 
     # SQL mode off → fall back to the consumption fast path. The intent

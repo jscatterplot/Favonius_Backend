@@ -88,6 +88,14 @@ class QueryPlan(BaseModel):
     expands as new intents land. ``group_by`` is optional and defaults to
     an empty list — the compiler picks sensible defaults per intent when
     the user does not specify a grouping.
+
+    ``depot_wide`` is the explicit signal for a no-named-subject
+    consumption question ("how much power was consumed last month").
+    It exists to disambiguate two meanings of an empty ``subjects``
+    list: ``subjects=[], depot_wide=True`` is an in-scope depot-total
+    query the compiler services by summing every session at the
+    caller's visible depots; ``subjects=[], depot_wide=False`` remains
+    the extraction stage's out-of-scope / refusal signal.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -95,6 +103,7 @@ class QueryPlan(BaseModel):
     intent: Literal["consumption_by_user"]
     subjects: list[EntityMention]
     time_window: TimeWindow
-    group_by: list[Literal["driver", "depot", "day", "month", "category"]] = Field(
+    group_by: list[Literal["driver", "vehicle", "depot", "day", "month", "category"]] = Field(
         default_factory=list
     )
+    depot_wide: bool = False

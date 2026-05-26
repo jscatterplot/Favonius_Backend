@@ -96,15 +96,24 @@ CREATE TABLE vehicles (
     organization_id UUID,
     site_id         UUID,
     display_name    VARCHAR(255),
+    vehicle_type    VARCHAR(64),
     license_plate   VARCHAR(64),
     vin             VARCHAR(64),
     external_id     VARCHAR(100)
 );
 
+CREATE TABLE charging_stations (
+    id         UUID PRIMARY KEY,
+    site_id    UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+    station_id VARCHAR(255) NOT NULL
+);
+
 -- Time-series tables ---------------------------------------------------
 CREATE TABLE charging_sessions (
     session_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    site_id             UUID,
     station_id          VARCHAR(255),
+    vehicle_id          VARCHAR(255),
     driver_id           UUID,
     card_id             UUID,
     start_time          TIMESTAMPTZ NOT NULL,
@@ -153,6 +162,9 @@ DEPOT_A = UUID("11111111-1111-4111-8111-111111111111")
 DEPOT_B = UUID("22222222-2222-4222-8222-222222222222")
 USER_A = UUID("aa000000-0000-4000-8000-000000000001")
 USER_B = UUID("bb000000-0000-4000-8000-000000000002")
+VAN_A1 = UUID("33333333-3333-4001-8000-000000000001")
+VAN_A2 = UUID("33333333-3333-4001-8000-000000000002")
+VAN_B1 = UUID("33333333-3333-4002-8000-000000000001")
 
 
 def _test_db_url() -> str:
@@ -320,6 +332,36 @@ async def seeded_db(agent_db_pools):
             assignments,
         )
 
+        # Chargers: one per depot. The driver/card sessions all use
+        # station_id 'TEST_STATION' (DEPOT_A), so depot-wide scoping by
+        # station_id picks them up for Org A.
+        await conn.executemany(
+            """
+            INSERT INTO charging_stations (id, site_id, station_id)
+            VALUES ($1::uuid, $2::uuid, $3)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            [
+                (UUID("33333333-3333-4301-8000-000000000001"), DEPOT_A, "TEST_STATION"),
+                (UUID("33333333-3333-4302-8000-000000000001"), DEPOT_B, "TEST_STATION_B"),
+            ],
+        )
+
+        # A Renault van fleet at DEPOT_A (Org A) for the fleet path, plus
+        # one Org B vehicle to prove cross-org isolation.
+        await conn.executemany(
+            """
+            INSERT INTO vehicles (id, organization_id, site_id, display_name, vehicle_type)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            [
+                (VAN_A1, ORG_A, DEPOT_A, "Renault Van 1", "van"),
+                (VAN_A2, ORG_A, DEPOT_A, "Renault Van 2", "van"),
+                (VAN_B1, ORG_B, DEPOT_B, "Renault Van B", "van"),
+            ],
+        )
+
     # ── Charging sessions: 25 per driver across the past 30 days ─────────
     # The test only references "last_month" / "this_month" windows, so the
     # range starts 35 days ago and ends 5 days ago. 100 rows total.
@@ -355,6 +397,28 @@ async def seeded_db(agent_db_pools):
             rows,
         )
 
+        # Vehicle/fleet sessions: each Org A Renault van charges a few times
+        # in the last_month window, keyed by vehicle_id (UUID as text, as
+        # both the live and import write paths store it).
+        van_rows: list[tuple[Any, ...]] = []
+        for van_id in (VAN_A1, VAN_A2):
+            for i in range(3):
+                ts = base + timedelta(days=2 + i, hours=i)
+                van_rows.append(
+                    ("TEST_STATION", str(van_id), ts, ts + timedelta(hours=1), 5.0 + i, 1.0 + i)
+                )
+        await conn.executemany(
+            """
+            INSERT INTO charging_sessions (
+                station_id, vehicle_id,
+                start_time, end_time,
+                energy_delivered_kwh, cost_total
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            van_rows,
+        )
+
     yield {
         "static_pool": static_pool,
         "ts_pool": ts_pool,
@@ -366,6 +430,9 @@ async def seeded_db(agent_db_pools):
         "depot_b": DEPOT_B,
         "user_a": USER_A,
         "user_b": USER_B,
+        "van_a1": VAN_A1,
+        "van_a2": VAN_A2,
+        "van_b1": VAN_B1,
     }
 
 
@@ -432,6 +499,30 @@ class FakeLLMClient(LLMClient):
                 subjects=[EntityMention(kind="driver", text="Carter")],
                 time_window=TimeWindow(kind="relative", relative="last_month"),
             )
+        # Depot-scoped total: a named depot subject ("at the Vilnius depot").
+        # Checked before the depot-wide branch so the named-depot phrasing
+        # routes through the subject path (resolve → depot-scoped total).
+        if "vilnius" in m:
+            return QueryPlan(
+                intent="consumption_by_user",
+                subjects=[EntityMention(kind="depot", text="Vilnius depot")],
+                time_window=TimeWindow(kind="relative", relative="last_month"),
+            )
+        # Depot-wide total: no named subject (depot_wide signal).
+        if "total" in m or "depot-wide" in m or "was consumed" in m:
+            return QueryPlan(
+                intent="consumption_by_user",
+                subjects=[],
+                time_window=TimeWindow(kind="relative", relative="last_month"),
+                depot_wide=True,
+            )
+        # Vehicle / fleet mention.
+        if "renault" in m or "van" in m:
+            return QueryPlan(
+                intent="consumption_by_user",
+                subjects=[EntityMention(kind="vehicle", text="renault van")],
+                time_window=TimeWindow(kind="relative", relative="last_month"),
+            )
         if "jane" in m:
             return QueryPlan(
                 intent="consumption_by_user",
@@ -460,14 +551,18 @@ class FakeLLMClient(LLMClient):
         resolved: list[dict[str, Any]],
         window: dict[str, Any],
         rows: list[dict[str, Any]],
+        *,
+        result_summary: Optional[dict[str, Any]] = None,
     ) -> str:
         # Stash for assertion in tests that need to inspect what the
         # formatter saw.
         self.last_format_payload = {
             "intent": plan.intent,
+            "depot_wide": plan.depot_wide,
             "resolved": resolved,
             "window": window,
             "row_count": len(rows),
+            "result_summary": result_summary,
         }
         return self.canned_answer
 

@@ -53,23 +53,24 @@ def budget_sql_env(monkeypatch: pytest.MonkeyPatch):
     No ANTHROPIC key is set: the refusal must short-circuit before any client is
     built, so ``_get_client`` is replaced with a mock that raises if called.
     Yields that mock so the test can assert it stayed untouched.
+
+    SQL-mode org gating now lives on ``organizations.agent_sql_mode_enabled``
+    (default TRUE, migration supabase/044), so the inserted test org is SQL-
+    enabled without any allowlist env var — we only flip the global flag here.
     """
     from src.api.agent import llm as agent_llm
     from src.api.agent import planner
 
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
-    monkeypatch.delenv("AGENT_SQL_ORG_ALLOWLIST", raising=False)  # open to all orgs
     monkeypatch.setenv("JWT_SECRET_KEY", _TEST_JWT_SECRET)
     monkeypatch.delenv("JWT_SECRET_KEY_PREVIOUS", raising=False)
     planner.is_sql_mode_enabled.cache_clear()
-    planner._sql_org_allowlist_tokens.cache_clear()
     no_client = MagicMock(side_effect=AssertionError("refusal path must not call _get_client"))
     monkeypatch.setattr(agent_llm, "_get_client", no_client)
     try:
         yield no_client
     finally:
         planner.is_sql_mode_enabled.cache_clear()
-        planner._sql_org_allowlist_tokens.cache_clear()
 
 
 async def test_over_budget_org_is_refused_without_anthropic(
