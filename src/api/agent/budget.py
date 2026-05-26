@@ -281,11 +281,18 @@ class TokenBudgetTracker:
         # Pin before the ceiling await so reconcile cannot evict this past-period
         # counter while reserved is still zero (month rollover during _resolve_ceiling).
         counter.reserved += est
-        ceiling = await self._resolve_ceiling(*self._ceiling_args(organization_id))
-        if counter.total > ceiling:
-            counter.reserved -= est
-            return None
-        return Reservation(organization_id=key[0], period_yyyymm=period, est_tokens=est)
+        pinned = True
+        try:
+            ceiling = await self._resolve_ceiling(*self._ceiling_args(organization_id))
+            if counter.total > ceiling:
+                counter.reserved -= est
+                pinned = False
+                return None
+            pinned = False
+            return Reservation(organization_id=key[0], period_yyyymm=period, est_tokens=est)
+        finally:
+            if pinned:
+                counter.reserved = max(0, counter.reserved - est)
 
     def record_actual(
         self,
