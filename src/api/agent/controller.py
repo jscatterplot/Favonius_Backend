@@ -431,12 +431,26 @@ async def run_turn(
 
     try:
         # 0. Planner — pick consumption fast path, sql_general, or refuse.
-        sql_mode_allowed = (
-            await fetch_org_sql_enabled(static_pool, auth.organization_id)
-            if is_sql_mode_enabled()
-            else False
-        )
-        decision = planner_classify(message, sql_mode_allowed=sql_mode_allowed)
+        #
+        # Two-phase approach: run a cheap text-only pre-check first.  Only
+        # messages that fall through to the "fallback" branch (i.e. non-
+        # consumption, non-empty) could ever route to sql_general, so we
+        # defer the static-DB org lookup until we know it's actually needed.
+        # favonius_admin tokens carry no org claim but always get SQL mode.
+        if is_sql_mode_enabled():
+            _pre = planner_classify(message, sql_mode_allowed=False)
+            if _pre.reason == "consumption_fallback_no_sql_mode":
+                if auth.role == "favonius_admin":
+                    sql_mode_allowed = True
+                else:
+                    sql_mode_allowed = await fetch_org_sql_enabled(
+                        static_pool, auth.organization_id
+                    )
+                decision = planner_classify(message, sql_mode_allowed=sql_mode_allowed)
+            else:
+                decision = _pre
+        else:
+            decision = planner_classify(message, sql_mode_allowed=False)
         await agent_runs_step(
             ts_pool,
             run_id,
