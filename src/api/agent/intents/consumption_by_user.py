@@ -18,10 +18,13 @@ The compiler services three subject shapes:
    imported-session write paths, so the predicate compares against
    stringified UUIDs.
 3. **depot-wide** — a no-subject total ("how much was consumed last
-   month"). The caller passes the set of charger ``station_id``\\ s for
-   the visible depots (the auth boundary); the compiler filters on
-   ``station_id`` because it is the only depot linkage populated on
-   every session row.
+   month"). The caller passes both the visible depot UUIDs and the set
+   of charger ``station_id``\\ s for those depots (the auth boundary).
+   The compiler matches a session by ``site_id`` first and falls back to
+   ``station_id`` only when ``site_id`` is NULL, because neither column
+   is populated on every write path (live OCPP sets ``station_id`` only;
+   the XLSX import sets ``site_id`` with a synthetic ``station_id``). See
+   :func:`_compile_depot_wide`.
 
 Every path also selects ``energy_sample_count`` (the count of sessions
 with a non-NULL ``energy_delivered_kwh``) so the formatter can tell
@@ -82,21 +85,50 @@ def _assemble(
 
 def _compile_depot_wide(
     station_ids: list[str],
+    depot_ids: list[Any],
     window: ResolvedTimeWindow,
     bucket: str,
 ) -> tuple[str, list[Any]]:
-    """Depot-wide total: every session on the given chargers, bucketed by period."""
+    """Depot-wide total: every session attributable to the given depots.
+
+    A session links to a depot through *either* column, because no single
+    one is populated on every write path:
+
+    - ``site_id`` is set by the XLSX / platform import path — which writes a
+      synthetic ``station_id`` of ``imported:<depot_id>`` that is absent
+      from ``charging_stations`` — but is left NULL by the live OCPP insert
+      (``adapters/ocpp/server.py``).
+    - ``station_id`` is the real OCPP charge-point id on live and Kempower
+      rows (joinable to ``charging_stations``), but is a placeholder for
+      import rows.
+
+    Scoping on ``station_id`` alone silently drops imported history;
+    scoping on ``site_id`` alone drops live sessions. So we match
+    ``site_id`` first and fall back to ``station_id`` only when ``site_id``
+    is NULL. The NULL guard also ensures each session is counted by exactly
+    one timezone group even if two depots share a ``station_id`` string, so
+    the caller's per-timezone loop never double-counts.
+    """
     select_cols = [
-        f"DATE_TRUNC('{bucket}', cs.start_time AT TIME ZONE $4) AS day_local",
+        f"DATE_TRUNC('{bucket}', cs.start_time AT TIME ZONE $5) AS day_local",
         *_AGG_COLS,
     ]
     where = (
-        "        WHERE cs.station_id = ANY($1::text[])\n"
-        "          AND cs.start_time >= $2\n"
-        "          AND cs.start_time <  $3\n"
+        "        WHERE (\n"
+        "            cs.site_id = ANY($1::uuid[])\n"
+        "            OR (cs.site_id IS NULL AND cs.station_id = ANY($2::text[]))\n"
+        "          )\n"
+        "          AND cs.start_time >= $3\n"
+        "          AND cs.start_time <  $4\n"
     )
     sql = _assemble(select_cols, where, group_by="day_local", order_by="day_local")
-    params: list[Any] = [list(station_ids), window.start_utc, window.end_utc, window.timezone]
+    params: list[Any] = [
+        list(depot_ids),
+        list(station_ids),
+        window.start_utc,
+        window.end_utc,
+        window.timezone,
+    ]
     return sql, params
 
 
@@ -120,10 +152,14 @@ def compile_consumption_by_user(
             controller surfaces those as "not found" before compiling.
         window: The resolved UTC bounds plus the depot timezone the
             bounds were computed against.
-        station_ids: When provided, compiles the **depot-wide** form
-            (no subject filter) scoping to these charger OCPP ids. The
-            caller resolves them from the visible depots; this is the
-            tenant boundary for a no-subject total.
+        station_ids: When provided (even as an empty list), compiles the
+            **depot-wide** form (no subject filter). Together with
+            ``depot_ids`` these scope the total to the caller's visible
+            depots — the tenant boundary for a no-subject total. The
+            caller resolves both server-side from the visible depots.
+        depot_ids: Visible depot UUIDs for the depot-wide form. A session
+            matches by ``site_id`` (import path) or, when ``site_id`` is
+            NULL, by ``station_id`` (live OCPP path).
 
     Returns:
         A ``(sql, params)`` tuple whose ``params`` match the ``$1..$N``
@@ -136,7 +172,7 @@ def compile_consumption_by_user(
     bucket = _bucket(plan)
 
     if station_ids is not None:
-        return _compile_depot_wide(station_ids, window, bucket)
+        return _compile_depot_wide(station_ids, depot_ids or [], window, bucket)
 
     drivers = [e for e in resolved if e.kind == "driver" and e.primary_id is not None]
     rfids = [e for e in resolved if e.kind == "rfid" and e.primary_id is not None]

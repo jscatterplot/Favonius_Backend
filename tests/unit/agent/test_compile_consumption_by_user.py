@@ -79,15 +79,18 @@ EXPECTED_VEHICLE_SQL = """
 
 EXPECTED_DEPOT_WIDE_SQL = """
         SELECT
-            DATE_TRUNC('day', cs.start_time AT TIME ZONE $4) AS day_local,
+            DATE_TRUNC('day', cs.start_time AT TIME ZONE $5) AS day_local,
             SUM(cs.energy_delivered_kwh) AS energy_kwh,
             SUM(cs.cost_total)           AS cost_total,
             COUNT(*)                     AS session_count,
             COUNT(cs.energy_delivered_kwh) AS energy_sample_count
         FROM charging_sessions cs
-        WHERE cs.station_id = ANY($1::text[])
-          AND cs.start_time >= $2
-          AND cs.start_time <  $3
+        WHERE (
+            cs.site_id = ANY($1::uuid[])
+            OR (cs.site_id IS NULL AND cs.station_id = ANY($2::text[]))
+          )
+          AND cs.start_time >= $3
+          AND cs.start_time <  $4
         GROUP BY day_local
         ORDER BY day_local
 """
@@ -300,13 +303,19 @@ class TestDriverPlusVehicle:
 
 class TestDepotWidePath:
     def test_station_ids_produce_depot_wide_sql(self):
-        """``station_ids`` compiles the no-subject depot-wide form."""
+        """``station_ids`` compiles the no-subject depot-wide form.
+
+        Both depot UUIDs (site_id linkage, import path) and station ids
+        (station_id linkage, live OCPP path) are bound so neither source
+        of sessions is silently dropped.
+        """
         sql, params = compile_consumption_by_user(
             _plan(), [], _window(), station_ids=["CP-1", "CP-2"], depot_ids=[DEPOT_A, DEPOT_B]
         )
 
         assert sql == EXPECTED_DEPOT_WIDE_SQL
         assert params == [
+            [DEPOT_A, DEPOT_B],
             ["CP-1", "CP-2"],
             _window().start_utc,
             _window().end_utc,
@@ -320,6 +329,14 @@ class TestDepotWidePath:
         )
         assert sql == EXPECTED_DEPOT_WIDE_SQL
         assert params[0] == []
+        assert params[1] == []
+
+    def test_depot_ids_default_to_empty_when_omitted(self):
+        """station_ids without depot_ids still binds an empty uuid[] for site_id."""
+        sql, params = compile_consumption_by_user(_plan(), [], _window(), station_ids=["CP-1"])
+        assert sql == EXPECTED_DEPOT_WIDE_SQL
+        assert params[0] == []
+        assert params[1] == ["CP-1"]
 
 
 class TestMonthBucket:

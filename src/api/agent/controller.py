@@ -340,7 +340,11 @@ async def _depot_wide_consumption_rows(
 
     rows_list: list[dict[str, Any]] = []
     window: Optional[ResolvedTimeWindow] = None
-    for tz, ocpp_ids in groups.items():
+    # Iterate timezones in a stable order so the representative window
+    # below (and the per-group params) don't depend on the unordered
+    # station rows returned by ``load_depot_stations``.
+    for tz in sorted(groups):
+        ocpp_ids = sorted(groups[tz])
         depot_ids = sorted(tz_depots[tz], key=str)
         depot_id = depot_ids[0]
         group_window = resolve_time_window(plan.time_window, [depot_id], {depot_id: tz})

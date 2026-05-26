@@ -113,9 +113,7 @@ _VEHICLE_FLEET_WORDS: frozenset[str] = frozenset(
 # Singular type words the LLM often emits when the user asked plurally
 # ("renault van" from "Renault vans"). Numeric suffixes ("bus 42") narrow
 # to one unit and must not trigger fleet expansion.
-_VEHICLE_TYPE_SINGULARS: frozenset[str] = frozenset(
-    {"van", "bus", "car", "truck", "vehicle"}
-)
+_VEHICLE_TYPE_SINGULARS: frozenset[str] = frozenset({"van", "bus", "car", "truck", "vehicle"})
 
 
 def _vehicle_tokens(text: str) -> list[str]:
@@ -556,14 +554,15 @@ async def load_depot_stations(
 ) -> list[dict[str, Any]]:
     """Return ``{ocpp_id, depot_id, timezone}`` for chargers in visible depots.
 
-    The depot-wide consumption path scopes sessions by ``station_id``
-    rather than ``charging_sessions.site_id``: ``station_id`` (the OCPP
-    id) is populated on every session row, whereas ``site_id`` is only
-    written by some ingest paths. The returned station set is derived
-    purely from the caller's ``visible_depot_ids`` — it is therefore the
-    auth boundary for a no-subject depot total. The depot timezone rides
-    along so the caller can run the per-timezone aggregation loop without
-    a second round-trip.
+    The depot-wide consumption path scopes sessions by ``site_id`` OR
+    ``station_id`` (see :func:`compile_consumption_by_user`), because
+    neither column is populated on every write path. This helper supplies
+    the ``station_id`` set (for live OCPP rows, which leave ``site_id``
+    NULL); the depot UUIDs themselves cover the import rows (which set
+    ``site_id`` with a synthetic ``station_id``). Both are derived purely
+    from the caller's ``visible_depot_ids`` — the auth boundary for a
+    no-subject depot total. The depot timezone rides along so the caller
+    can run the per-timezone aggregation loop without a second round-trip.
     """
     if not visible_depot_ids:
         return []

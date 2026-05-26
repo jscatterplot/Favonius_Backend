@@ -1,10 +1,11 @@
 """Unit tests for the depot-wide consumption helper in the orchestrator.
 
 ``_depot_wide_consumption_rows`` is the no-subject aggregation path: it
-scopes to the caller's chargers (via ``station_id``, the auth boundary)
-and runs one query per depot timezone group. These tests drive it with
-fake asyncpg pools (no DB) so the scoping, per-timezone fan-out, and
-empty-depot fallback are all covered offline.
+scopes to the caller's depots (by ``site_id``) and their chargers (by
+``station_id``) — the auth boundary — and runs one query per depot
+timezone group. These tests drive it with fake asyncpg pools (no DB) so
+the scoping, per-timezone fan-out, and empty-depot fallback are all
+covered offline.
 """
 
 from __future__ import annotations
@@ -98,8 +99,10 @@ async def test_single_timezone_single_query_scoped_to_station_ids():
     assert tz_groups == 1
     assert len(ts_pool.calls) == 1
     sql, params = ts_pool.calls[0]
-    assert "cs.station_id = ANY($1::text[])" in sql
-    assert params[0] == ["CP-1", "CP-2"]  # scoped to the depot's chargers
+    assert "cs.site_id = ANY($1::uuid[])" in sql
+    assert "cs.station_id = ANY($2::text[])" in sql
+    assert params[0] == [DEPOT_A]  # site_id linkage (import rows)
+    assert params[1] == ["CP-1", "CP-2"]  # station_id linkage (live OCPP rows)
     assert window.timezone == "Europe/Vilnius"
     assert rows == [{"day_local": "2026-04-01", "session_count": 4}]
 
@@ -128,9 +131,12 @@ async def test_multi_timezone_runs_one_query_per_group():
 
     assert tz_groups == 2
     assert len(ts_pool.calls) == 2
-    # Each group is scoped to only its own chargers.
-    scoped = {call[1][0][0] for call in ts_pool.calls}
-    assert scoped == {"CP-A", "CP-B"}
+    # Each group is scoped to only its own chargers (station ids are $2)
+    # and its own depot (site_id is $1).
+    scoped_stations = {call[1][1][0] for call in ts_pool.calls}
+    assert scoped_stations == {"CP-A", "CP-B"}
+    scoped_depots = {call[1][0][0] for call in ts_pool.calls}
+    assert scoped_depots == {DEPOT_A, DEPOT_B}
     # Rows from both groups are concatenated.
     assert len(rows) == 2
 
