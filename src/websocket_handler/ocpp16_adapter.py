@@ -833,7 +833,8 @@ class OCPP16Session:
                 self._station_id,
                 exc,
             )
-            self._tenant_context = None
+            # Preserve any lazily cached context — a boot-time retry must not
+            # wipe a good frame-path resolution on transient lookup failure.
         if self._tenant_context is None:
             logger.info(
                 "tenant_context_not_found station=%s "
@@ -861,7 +862,9 @@ class OCPP16Session:
         # Resolve tenant context once for the lifetime of this WS connection.
         # Cached on the session and reused by _on_status_change to label
         # connector_status rows for the alerts pipeline (migration 029).
-        await self._resolve_tenant_context()
+        async with self._tenant_context_lock:
+            if self._tenant_context is None:
+                await self._resolve_tenant_context()
         # Persist vendor metadata so vendor-keyed dispatch (parser
         # selection for GetDiagnostics, ABB-safe measurand guard at
         # endpoint boundaries) can read it from the DB without holding
