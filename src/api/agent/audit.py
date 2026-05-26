@@ -376,6 +376,11 @@ def _last_failed_sql_tool_kind(tool_calls: Any) -> Optional[str]:
         result = getattr(tc, "result", None)
         if isinstance(result, dict) and result.get("error_kind"):
             kind = str(result["error_kind"])
+        else:
+            # A later SQL-tool failure with no error_kind must clear any stale
+            # earlier value so callers can fall back to generic failed-tool
+            # handling (taxonomy tool_error) instead of misattributing the run.
+            kind = None
     return kind
 
 

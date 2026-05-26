@@ -537,6 +537,19 @@ class TestClassifyFailure:
         )
         assert classify_failure(qa) is None
 
+    async def test_kindless_sql_failure_clears_stale_prior_error_kind(self):
+        # If a SQL turn has multiple failed SQL tool calls and the latest one is
+        # kindless (error envelope without error_kind), stale prior kinds must
+        # be cleared so classification falls back to tool_error.
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[
+                _tc("run_select_ts", ok=False, error_kind="parse_error"),
+                _tc("sample_values", ok=False, error_kind=None),
+            ],
+        )
+        assert classify_failure(qa) == "tool_error"
+
     async def test_tool_error_from_failed_sql_tool_without_error_kind(self):
         # sample_values can fail with only an ``error`` envelope (invalid n,
         # unknown table) and no error_kind. A turn that dies after such a
