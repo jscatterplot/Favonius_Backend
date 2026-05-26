@@ -99,27 +99,38 @@ For every specific issue (bug, smell, design concern, risk):
 Favonius_Backend/
 ├── src/                         # Primary application code (new architecture)
 │   ├── api/
-│   │   ├── main.py              # FastAPI app, all REST endpoints, OCPP WebSocket mount
+│   │   ├── main.py              # FastAPI app, most REST endpoints, OCPP WebSocket mount
+│   │   ├── optimization.py      # /depots/{id}/optimization/solver + readiness router
+│   │   ├── savings.py           # savings-summary computation
+│   │   ├── reports.py           # energy report aggregation + CSV streaming
+│   │   ├── report_schedules.py  # scheduled-reports reads + command handlers
+│   │   ├── report_schedule_timing.py # DST-aware next-run computation (stdlib)
+│   │   ├── report_pdf.py        # PDF rendering (reportlab)
+│   │   ├── charger_logs.py      # charger diagnostic-log fetch/upload/compare
+│   │   ├── fleet_list.py        # chargers/vehicles list helpers
+│   │   ├── liveness_hub.py      # LISTEN/NOTIFY charger-liveness SSE fan-out
+│   │   ├── error_codes.py       # structured API error codes
 │   │   ├── agent/               # Depot chat agent (Agent Search) — see "Depot Chat Agent" section
-│   │   └── agent_workflows/     # Depot agent runtime + eval harness
-│   │       ├── models.py        # Workflow, Decision, ToolCall, PermissionTier, Disposition (Pydantic)
-│   │       ├── runtime.py       # WorkflowAgent.run_turn — Anthropic tool-use loop + allow-list + guard
-│   │       ├── tools.py         # ToolRegistry (single source of truth for tool name → schema+fn)
-│   │       ├── constraints.py   # HardConstraintGuard (PRD §10.3)
-│   │       ├── repo.py          # DecisionRepo Protocol + asyncpg / in-memory adapters
-│   │       ├── repository.py    # Canonical insert_decision writer (sprint 1)
-│   │       └── eval/runner.py   # Scenario loader, savepoint executor, FakeAnthropicClient, assertions
+│   │   ├── agent_workflows/     # Depot agent runtime + eval harness — see "Depot Agent" sections
+│   │   ├── charging_import/     # Charging-session / price import helpers
+│   │   └── data_sources/        # Self-serve external integrations router — see "Data Sources"
 │   ├── core/
 │   │   ├── controller.py        # DepotController — main control loop
-│   │   ├── controller_config.py # ControllerConfig dataclass
+│   │   ├── controller_config.py # ControllerConfig dataclass (reads FAVONIUS_* env knobs)
 │   │   ├── controller_manager.py# ControllerManager — manages per-depot controllers
 │   │   ├── models.py            # Shared Python dataclasses (Depot, Vehicle, etc.)
+│   │   ├── version_info.py      # Build/version metadata
 │   │   ├── optimizer/
 │   │   │   ├── milp_model.py    # Pyomo MILP model construction
 │   │   │   ├── solver.py        # Gurobi + HiGHS fallback solver wrapper
 │   │   │   ├── allocator.py     # Post-solve schedule allocation
 │   │   │   ├── warm_start.py    # Warm-start from prior solutions
+│   │   │   ├── pool.py          # SolverPool — ProcessPoolExecutor solve dispatch
 │   │   │   └── exceptions.py    # SolverError, InfeasibleModelError, SolverTimeoutError
+│   │   ├── billing/             # session_cost.py — per-session cost calculator
+│   │   ├── reconciliation/      # charger-log ↔ telemetry reconciliation
+│   │   ├── data_sources/        # Provider-agnostic ingestion (base/registry/kempower/ingestion/scheduler)
+│   │   ├── scheduling/          # recurring.py — recurring schedule template expansion
 │   │   ├── state/
 │   │   │   ├── assembler.py     # StateAssembler — assembles depot state from DB
 │   │   │   └── triggers.py      # TriggerMonitor, TriggerConfig — re-optimization triggers
@@ -144,6 +155,7 @@ Favonius_Backend/
 │   │   ├── caiso/               # CAISO price ingestion (deprecated — Europe-only feeder; module retained as dead code, see follow-up)
 │   │   ├── entsoe/              # ENTSO-E European price ingestion
 │   │   ├── kempower/            # Kempower ChargEye one-shot inventory + history import (scripts/onboard_depot_from_kempower.py)
+│   │   ├── chargers/            # Charger-side log parsers (abb/log_parser.py) + vendor dispatch
 │   │   ├── weather/             # OpenMeteo weather adapter
 │   │   └── handoff/
 │   │       └── manager.py       # Inter-depot vehicle handoff manager
@@ -152,11 +164,23 @@ Favonius_Backend/
 │   │   └── queries.py           # Async DB query helpers
 │   ├── monitoring/
 │   │   └── metrics.py           # Prometheus metrics definitions
+│   ├── notifications/           # Alerts pipeline: dispatcher, renderer, Resend client, webhook, severity
 │   └── security/
-│       ├── auth.py              # JWT token verification (Supabase)
+│       ├── auth.py              # JWT verification (Supabase) + Favonius staff auto-promotion
+│       ├── rbac.py              # Role-based access control / Permission checks
+│       ├── ocpp_auth.py         # Per-charger Basic Auth verification
 │       ├── rate_limiter.py      # Rate limiter (optimize: 10/min, API: 100/min, handoff: 50/hr)
 │       ├── validators.py        # UUID and input validators
+│       ├── handoff_validator.py # Inter-depot handoff message validation
 │       ├── data_freshness.py    # Stale data detection
+│       ├── geo_block.py         # Article 73-3 geo-blocking middleware (MaxMind GeoLite2)
+│       ├── forwarded_ip.py      # Trusted-proxy client-IP resolution
+│       ├── headers.py           # TLS / forwarded header parsing
+│       ├── tenant_mirror.py     # JIT tenant mirroring + metadata self-heal
+│       ├── admin_audit.py       # audit_log writer (admin actions)
+│       ├── audit_log.py         # audit helpers
+│       ├── credential_cipher.py # Fernet credential encryption (data sources)
+│       ├── incident_response.py # incident-response helpers
 │       └── secrets.py           # Secrets management
 │
 ├── src/websocket_handler/       # Legacy OCPP WebSocket service (standalone)
@@ -174,15 +198,16 @@ Favonius_Backend/
 │   ├── security_manager.py      # Auth, TLS, rate limiting
 │   └── ...                      # Many additional managers (cache, cert, DER, etc.)
 │
-├── migrations/                  # SQL schema migrations (run on DB init)
+├── migrations/                  # TimescaleDB ops-table migrations (idempotent; 001–045+)
 │   ├── 001_initial_schema.sql   # Core schema + seed data
-│   ├── 003_vdv463_schema.sql
-│   ├── 004_connector_status.sql
-│   ├── 005_telemetry_primary_key.sql
 │   ├── 012_ocpp_pilot_hardening.sql  # OCPP 1.6 sequences + station_credentials
 │   ├── 013_recovery.sql         # charging_command_queue + cross-restart recovery
-│   ├── 014_dispatch_queue_notify.sql # queue 'sent' status + pg_notify trigger
-│   └── 016_depot_setup_metadata.sql  # depot setup metadata + depot_id indexes
+│   ├── 037_depot_agent_workflows.sql # decisions + workflows + workflow_tiers
+│   ├── 040_session_cost_provenance.sql # charging_sessions.cost_total_source
+│   ├── 042_charger_log_imports.sql   # charger-log tables (NB: 042_agent_views_ts.sql ALSO exists)
+│   ├── 044_report_schedules.sql      # report schedules + runs + deliveries
+│   ├── …                        # ~45 files; numbers can repeat across parallel PRs — see "Migrations" note
+│   └── supabase/                # Static-schema migrations (Supabase pool), e.g. 040_agent_views_static, 044_agent_sql_mode_org_flag
 │
 ├── tests/
 │   ├── unit/                    # Unit tests (mock everything)
@@ -254,7 +279,9 @@ src/api/main.py (FastAPI, middleware: rate-limiting, logging, CORS)
 
 #### SQL mode — general-purpose analytics (`AGENT_SQL_MODE_ENABLED`)
 
-The chat agent has a second execution path that opens it up to arbitrary depot analytics questions — not just consumption. `src/api/agent/planner.py` runs first on every turn: messages matching the `consumption_by_user` shape stay on the existing fast path; anything else falls through to a **text-to-SQL agent loop** when `AGENT_SQL_MODE_ENABLED=true` and the caller's organisation is in `AGENT_SQL_ORG_ALLOWLIST` (empty allowlist = open to all enabled orgs). The SQL loop reuses `WorkflowAgent.run_qa_turn` (`src/api/agent_workflows/runtime.py`) — same Anthropic tool-use mechanics as the workflows, but writes to `agent_runs` instead of `decisions` (Q&A is not a workflow per PRD §13; chat is the "escape hatch from the today view"). Security is defence-in-depth: (S1) the LLM only sees curated `agent_views.*` `SECURITY DEFINER` table-functions — each takes `p_depot_ids uuid[]` filtered server-side, so no WHERE-clause injection can leak across tenants; (S2) every executor call swaps to a read-only role (`agent_reader_ts` / `agent_reader_static`) and asserts `current_user` matches — fail-closed; (S3) migration 042 puts an append-only trigger on `agent_runs` (mirroring 037's pattern on `decisions`); (S4) the validator runs `EXPLAIN (FORMAT TEXT)` only — never `ANALYZE`; sqlglot rejects multi-statement, DML, dangerous functions, and any FROM/JOIN target outside the function allowlist. The eight tools the LLM gets (`list_tables`, `describe_table`, `sample_values`, `run_select_ts`, `run_select_static`, `current_time`, `lookup_entity`, `emit_final_answer`) are registered by `src/api/agent/sql_tools.py:build_sql_agent_tool_registry`; the system prompt with the inlined catalogue lives in `src/api/agent/prompts.py` and is cache-keyed (`cache_control: ephemeral`). New Prometheus metrics: `favonius_agent_sql_validations_total{verdict}`, `favonius_agent_sql_executions_total{outcome,pool}`, `favonius_agent_sql_execution_seconds`, `favonius_agent_sql_rows_returned`, `favonius_agent_sql_tool_turns`. Migrations: `migrations/042_agent_views_ts.sql` (numbered 042 to avoid collision with in-flight PR #214's 040+041) + `migrations/supabase/040_agent_views_static.sql`.
+The chat agent has a second execution path that opens it up to arbitrary depot analytics questions — not just consumption. `src/api/agent/planner.py` runs first on every turn: messages matching the `consumption_by_user` shape stay on the existing fast path; anything else falls through to a **text-to-SQL agent loop** when `AGENT_SQL_MODE_ENABLED=true` AND the caller's organisation has `organizations.agent_sql_mode_enabled = TRUE` — a per-org DB flag (default `TRUE`, from `migrations/supabase/044_agent_sql_mode_org_flag.sql`) checked in `src/api/agent/planner.py`. (The legacy `AGENT_SQL_ORG_ALLOWLIST` env allowlist has been removed.) The SQL loop reuses `WorkflowAgent.run_qa_turn` (`src/api/agent_workflows/runtime.py`) — same Anthropic tool-use mechanics as the workflows, but writes to `agent_runs` instead of `decisions` (Q&A is not a workflow per PRD §13; chat is the "escape hatch from the today view"). Security is defence-in-depth: (S1) the LLM only sees curated `agent_views.*` `SECURITY DEFINER` table-functions — each takes `p_depot_ids uuid[]` filtered server-side, so no WHERE-clause injection can leak across tenants; (S2) every executor call swaps to a read-only role (`agent_reader_ts` / `agent_reader_static`) and asserts `current_user` matches — fail-closed; (S3) `migrations/042_agent_views_ts.sql` puts a restricted-update guard on `agent_runs` — a denylist of immutable columns (`run_id`/`user_id`/`organization_id`/`depot_id`/`user_message`/`created_at`), mirroring 037's pattern on `decisions`; (S4) the validator runs `EXPLAIN (FORMAT TEXT)` only — never `ANALYZE`; sqlglot rejects multi-statement, DML, dangerous functions, and any FROM/JOIN target outside the function allowlist. The eight tools the LLM gets (`list_tables`, `describe_table`, `sample_values`, `run_select_ts`, `run_select_static`, `current_time`, `lookup_entity`, `emit_final_answer`) are registered by `src/api/agent/sql_tools.py:build_sql_agent_tool_registry`; the system prompt with the inlined catalogue lives in `src/api/agent/prompts.py` and is cache-keyed (`cache_control: ephemeral`). New Prometheus metrics: `favonius_agent_sql_validations_total{verdict}`, `favonius_agent_sql_executions_total{outcome,pool}`, `favonius_agent_sql_execution_seconds`, `favonius_agent_sql_rows_returned`, `favonius_agent_sql_tool_turns`. Migrations: `migrations/042_agent_views_ts.sql` (numbered 042 to avoid collision with in-flight PR #214's 040+041) + `migrations/supabase/040_agent_views_static.sql`.
+
+**Module map** (`src/api/agent/`): `router.py` (HTTP routes + metrics), `controller.py` (turn orchestration), `llm.py` (extraction), `planner.py` (fast-path vs SQL-mode routing + the per-org flag check), `resolve.py` (name→UUID, the auth boundary), `intents/` (`base.py` + `consumption_by_user.py` — the fast path now also answers vehicle/fleet and depot-wide consumption questions), `plan.py` (`QueryPlan` Pydantic types), `catalogue.py` (LLM-facing schema catalogue for SQL mode), `sql_tools.py` / `sql_executor.py` / `sql_validator.py` (SQL-mode tool registry, read-only executor, sqlglot validator), `audit.py` (`agent_runs`/`audit_log` writers + `classify_failure`), `auth_context.py`, `stream.py` (SSE helpers), `thinking.py`, `feature_flag.py`.
 
 ### Depot Agent — Workflow Runtime (`src/api/agent_workflows/`)
 
@@ -262,7 +289,7 @@ The workflow runtime is the Depot Agent product surface (PRD §4.3, §4.4). Spri
 
 `WorkflowAgent.run_turn(workflow, depot_id, auth_context, tool_registry, user_input, *, permission_tier=DRAFT_AND_WAIT)` in `runtime.py` opens one Anthropic Messages tool-use loop: the model sees only the tools named in `workflow.allowed_tools` plus the reserved `emit_decision` structured-output terminator. The runtime validates every tool call against the allow-list **before** dispatching it (`ToolNotAllowedError` if not), records each call as a Sprint-1 `ToolCall(name, arguments, result, ok, error)` in the per-turn `tool_calls` list, runs the `HardConstraintGuard` (`constraints.py`) twice — pre-dispatch on tool inputs and post-emit on the LLM's `proposed_actions` (PRD §10.3: departure SoC ≥ 99%, `max_grid_kw` never exceeded) — and writes exactly one `Decision` row at the end with `disposition=Disposition.PENDING` via `DecisionRepo` (`repo.py` wraps Sprint 1's `insert_decision`). The agent itself **never** writes `auto_executed`; humans, or a later promotion pathway, advance disposition.
 
-The runtime never queries `workflow_tiers` itself — callers resolve the per-(workflow, depot) tier via Sprint 1's `get_tier(pool, workflow_id, depot_id)` and pass it through. `auth_context.organization_id` is required (it's NOT NULL on the `decisions` row) — turns with no org abort with `WorkflowRuntimeError` before the LLM is called. Prompt caching matches the `src/api/agent/llm.py` pattern: the workflow's system block carries `cache_control={"type": "ephemeral"}` so repeat turns of the same workflow hit Anthropic's prefix cache; the per-turn user message (depot id, parameters, user input) is kept out of the cached block. Prometheus metrics: `favonius_workflow_turns_total{workflow,depot,status}`, `favonius_workflow_turn_duration_seconds`, `favonius_workflow_llm_tokens_total`. **No HTTP endpoint yet** — the runtime is exercised via `tests/unit/test_agent_workflows_runtime.py` with fake tools and a fake Anthropic client. The agent is gated by `DEPOT_AGENT_ENABLED` (default off; Sprint 1's feature flag).
+The runtime never queries `workflow_tiers` itself — callers resolve the per-(workflow, depot) tier via Sprint 1's `get_tier(pool, workflow_id, depot_id)` and pass it through. `auth_context.organization_id` is required (it's NOT NULL on the `decisions` row) — turns with no org abort with `WorkflowRuntimeError` before the LLM is called. Prompt caching matches the `src/api/agent/llm.py` pattern: the workflow's system block carries `cache_control={"type": "ephemeral"}` so repeat turns of the same workflow hit Anthropic's prefix cache; the per-turn user message (depot id, parameters, user input) is kept out of the cached block. Prometheus metrics: `favonius_workflow_turns_total{workflow,depot,status}`, `favonius_workflow_turn_duration_seconds`, `favonius_workflow_llm_tokens_total`. **No HTTP endpoint yet** — the runtime is exercised via `tests/unit/test_agent_workflows_runtime.py` with fake tools and a fake Anthropic client. The agent is gated by `DEPOT_AGENT_ENABLED` (default off; Sprint 1's feature flag). A sibling method `WorkflowAgent.run_qa_turn(...)` reuses the same tool-use loop but writes to `agent_runs` instead of `decisions` — it backs the chat agent's SQL mode (see the Agent Search SQL-mode section), not a workflow. There is still **no workflow HTTP endpoint**.
 
 ### Depot Agent — Eval Harness (`src/api/agent_workflows/eval/`)
 
@@ -287,7 +314,7 @@ Operators can pull a charger's own session log on demand and compare it against 
 
 Vendor metadata is persisted on `BootNotification` via `OCPP16Session._persist_station_vendor` (UPDATEs `charging_stations.vendor` / `firmware_version`). The Supabase mig-006 vendor column was previously empty; new boots fill it in.
 
-Migration 042 adds the three tables and extends `charging_command_queue.command_type` to allow `'get_diagnostics'` and `'get_log'` (placeholder for future OCPP 2.0.1 chargers — same queue, same upload endpoint, new dispatch helper).
+`migrations/042_charger_log_imports.sql` adds the three tables and extends `charging_command_queue.command_type` to allow `'get_diagnostics'` and `'get_log'` (placeholder for future OCPP 2.0.1 chargers — same queue, same upload endpoint, new dispatch helper). Note there is a **second, unrelated** migration also numbered 042 — `042_agent_views_ts.sql` (agent SQL-mode views); duplicate numbers are expected here (see the "Migrations" note).
 
 ### Scheduled reports (`src/api/report_schedules.py` + `report_schedule_timing.py` + `report_pdf.py`)
 
@@ -397,11 +424,12 @@ These come directly from the PRD and are non-negotiable:
 | Depot | `sites` | `id` (`AS depot_id`) | `organization_id`, `max_grid_kw`, `demand_charge_rate_kw`, `demand_charge_billing_period`, `timezone`, `currency`, `utility_id`, `address`, `billing_metadata`, `building_load_source`, `building_load_assumption_kw`, `access_mode`, `charger_vehicle_access_default`, `tariff_config`, `latitude`, `longitude` |
 | Charger | `charging_stations` | `id` (`AS charger_id`) | `site_id` (`AS depot_id`), `station_id` (`AS ocpp_id`), `max_power_kw` (`AS rated_kw`), `efficiency`, `auth_required`, `connector_type`, `display_name`, `vendor`, `connector_count`, `connector_ids` |
 | Vehicle | `vehicles` | `id` (`AS vehicle_id`) | `organization_id` (Supabase native), `site_id` (`AS depot_id`, added by mig 006), `vin` (Supabase native, UNIQUE), `external_id` (mig 006), `vehicle_type` (mig 006), `id_tag` (mig 006), `battery_capacity_kwh` (`AS battery_kwh`), `max_charge_rate_kw` (`AS max_charge_kw`), `max_discharge_rate_kw`, `v2g_capable`, `license_plate`, `driver_id`, `status` |
-| Organization | `organizations` | `id` (`AS organization_id`) | `name`, `type`, `billing_address`, `primary_contact`, `subscription_tier`, `is_active` |
+| Organization | `organizations` | `id` (`AS organization_id`) | `name`, `type`, `billing_address`, `primary_contact`, `subscription_tier`, `is_active`, `agent_sql_mode_enabled` (BOOLEAN, default TRUE; gates chat SQL mode per org — mig `supabase/044`) |
 | Org membership | `user_organizations` | `(user_id, organization_id)` | `role` (Supabase vocab: `owner|admin|operator|viewer`, enforced by CHECK constraint). The backend's tenant mirror translates Favonius vocab → Supabase vocab at the write boundary (`customer_admin → owner`, `customer_operator → operator`, `favonius_admin → admin`, unknown → `viewer`). Authorization never reads this column — see `_supabase_role_for` in `src/security/tenant_mirror.py`. |
 | Charger ↔ Vehicle access | `charger_vehicle_access` | `(charging_station_id, vehicle_id)` | `is_accessible`, `notes`. Note the FK column name is `charging_station_id`, not `charger_id`. |
 | Battery | `battery_storage` | `id` (`AS battery_id`) | `site_id` (`AS depot_id`), `capacity_kwh`, `max_power_kw`, `efficiency`, `soc_min`, `soc_max` |
 | Per-day route | `schedules` | `id` (`AS schedule_id`) | `vehicle_id`, `route_id`, `departure_time`, `return_time`, `actual_return_time`, `energy_kwh`, `required_soc`, `dest_site_id` (`AS dest_depot_id`). Distinct from Supabase's recurring `vehicle_schedules` table. |
+| Recurring route template | `recurring_schedule_template` (+ a cancellations table) | `id` | `depot_id`, `vehicle_id`, `route_id`, `departure_time_of_day`, `return_time_of_day`, `days_of_week TEXT[]`, `start_date`, `end_date`, `required_soc` (0.99–1.0), `energy_kwh`, `active` (mig `supabase/041`). Materialised into per-day trips by `src/core/scheduling/recurring.py`; cancellations keyed by `(template_id, occurrence_date)`. |
 | Driver | `drivers` | `id` (`AS driver_id`) | `site_id`, `external_driver_id`, `display_name`, `email`, `phone`, `status` |
 | RFID card | `rfid_cards` | `id` (`AS card_id`) | `site_id`, `id_tag` (UNIQUE), `label`, `status` |
 | RFID assignments | `rfid_card_vehicle_assignments`, `rfid_card_driver_assignments` | composite | `card_id`, `vehicle_id` / `driver_id` (FK column names retained on join tables) |
@@ -445,6 +473,11 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 - `notification_alerts` — Depot/org-scoped alert aggregator (migration 022). Partial unique index `(organization_id, dedup_key) WHERE status != 'resolved'` keeps one active row per fault; resolved rows let new occurrences in. `severity_level` is a generated SMALLINT (1=info, 2=warning, 3=critical). Status: `'active' | 'acknowledged' | 'resolved'`.
 - `notification_recipients` — Per-org email subscribers (migration 022). `alert_types` is `TEXT[]` where `'{*}'` matches all types; `min_severity` (with generated `min_severity_level`) gates which alerts the recipient receives.
 - `notification_deliveries` — Append-only delivery ledger (migration 022). `UNIQUE (alert_id, recipient_id, notified_count)` is the idempotency anchor. Status: `'sent' | 'delivered' | 'bounced' | 'complained' | 'failed'`. Updated by the `POST /webhooks/resend` handler from Resend events.
+- `agent_runs` — Per-turn audit trace for the chat agent (migration 025). `failure_reason` (migration `045_agent_failure_reason.sql`) is a nullable, CHECK-constrained taxonomy column (seven fixed categories) written by `agent_runs_close()` and classified solely in `src/api/agent/audit.py::classify_failure`. Restricted-update guard added by `042_agent_views_ts.sql`.
+- `decisions` / `workflows` / `workflow_tiers` — Depot Agent workflow substrate (migration 037). Append-only `decisions` hypertable; `workflow_tiers` holds per-(workflow, depot) trust-graduation rows. Written via `insert_decision` (`src/api/agent_workflows/repository.py`).
+- `agent_autonomy_settings` — Per-(depot_id, action_class) autonomy level (migration 043). PK `(depot_id, action_class)`; `level ∈ {shadow, proposed, auto_notify, auto_silent}`. Backs `GET /depots/{id}/autonomy-settings` and the `agents.autonomy.set` command. Distinct from `workflow_tiers` (which is per-workflow).
+- `charger_log_imports` / `charger_session_log_entries` / `session_log_reconciliations` — Charger-side diagnostic-log extraction (migration `042_charger_log_imports.sql`). See "Charger-side log extraction".
+- `report_schedules` / `report_schedule_recipients` / `schedule_runs` / `schedule_run_deliveries` — Scheduled reports (migration 044). See "Scheduled reports".
 
 ### Key columns
 - All UUIDs use `gen_random_uuid()` as default
@@ -459,11 +492,13 @@ Migrations in `migrations/` run automatically on `docker-compose up` (mounted to
 
 The runner is **stateless** (no `applied` tracking table) — every file re-executes on each deploy, and all DDL uses `IF [NOT] EXISTS` / `DROP … IF EXISTS` for idempotency. Migrations that formerly altered shadow tables (011, 016, 017, 018, 020, 021) are guarded with `to_regclass('public.<shadow_table>') IS NULL` checks so they silently skip on fresh databases. The `schedules` Supabase table is listed under §"Reference (static) tables" above; there is no `schedules` table in TimescaleDB.
 
+**Numbering note — duplicate migration numbers are expected.** Parallel PRs each grab the "next" number, so several numbers have 2–3 files (e.g. TimescaleDB `014`, `021`×3, `024`×3, `025`, `028`, `036`, `042`×2, `045`×3; Supabase `005`, `008`, `009`, `013`, `014`). The runner applies `sorted(glob("*.sql"))` (`scripts/run_migrations.py`), so same-number files run in **alphabetical filename order** by their suffix (e.g. `042_agent_views_ts.sql` before `042_charger_log_imports.sql`). Because every file is idempotent and re-runs on each deploy, this is currently benign, but it makes apply order depend on naming — keep new migrations independent of any same-number sibling. Supabase numbering also jumps `015 → 040` (the static set was renumbered into the 040+ band to track the TimescaleDB set). The directory itself is the source of truth for the full list.
+
 ---
 
 ## REST API Endpoints
 
-All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
+All non-health endpoints require JWT in `Authorization: Bearer <token>` header. Paths below use `{id}` as shorthand for the depot UUID (`{depot_id}` in the code). The table covers the primary endpoints; the API surface is larger (~95 routes across `main.py` + the `optimization`, `data_sources`, and `agent` routers) — **`docs/API.md` is the exhaustive reference**, and the grouped subsections below cover the rest.
 
 | Method | Path | Description |
 |---|---|---|
@@ -507,6 +542,66 @@ All non-health endpoints require JWT in `Authorization: Bearer <token>` header.
 | `GET` | `/depots/{id}/report-schedules/{schedule_id}/runs` | List a schedule's runs (most-recent first) |
 
 Report-schedule mutations flow through `POST /commands/execute` (customer_admin+, `ADMIN_CONFIG`): `reports.schedule.create` (`params.input`), `reports.schedule.update` (`params.scheduleId`+`patch`), `reports.schedule.delete` (`params.scheduleId`), `reports.schedule.run_now` (`params.scheduleId` → returns `ScheduleRun`).
+
+### Fleet & identity management
+CRUD over the Supabase static tables. Admin paths are `customer_admin`+ and depot-scoped; the `/depots/...` reads are any depot member.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET`/`POST` | `/admin/depots/{id}/chargers` | List / create chargers |
+| `GET`/`POST`/`PATCH` | `/admin/depots/{id}/vehicles` (+ `/{vid}`, `/{vid}/primary-id-tag`) | Vehicle CRUD + primary id-tag |
+| `GET`/`POST`/`PATCH` | `/admin/depots/{id}/drivers` (+ `/{driver_id}`) | Driver CRUD |
+| `GET`/`POST`/`PATCH` | `/admin/depots/{id}/rfid-cards` (+ `/{card_id}`) | RFID card CRUD |
+| `POST` | `/admin/depots/{id}/charger-vehicle-access` | Set charger↔vehicle access |
+| `GET` | `/admin/depots/{id}/identity` | Depot identity / setup metadata |
+| `POST` | `/admin/depots/{id}/charging-sessions/import` | Bulk-import historical sessions (`source='import'`) |
+| `GET` | `/depots/{id}/chargers` | List chargers (depot member) |
+| `GET` | `/depots/{id}/vehicles`, `/depots/{id}/vehicles/state` | Vehicle list + live SoC / plugged state |
+| `GET` | `/me/depots` | Depots visible to the caller |
+
+### Charger operations (admin)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/depots/{id}/chargers/{cid}/manual_authorize` | Operator override — manually authorize a charge |
+| `POST` | `/admin/depots/{id}/chargers/{cid}/local_auth/reset` | Reset OCPP local auth list |
+| `GET` | `/admin/depots/{id}/chargers/{cid}/last_manual_override` | Last manual-override record |
+
+### Schedule management (admin)
+| Method | Path | Description |
+|---|---|---|
+| `GET`/`POST` | `/admin/depots/{id}/schedule/manual` (+ `/{schedule_id}`) | One-off route CRUD |
+| `GET`/`POST` | `/admin/depots/{id}/schedule/recurring` (+ `/{template_id}`) | Recurring template CRUD (mig `supabase/041`) |
+| `POST` | `…/schedule/recurring/{template_id}/pause` · `/resume` | Pause / resume a template |
+| `POST` | `…/schedule/recurring/{template_id}/occurrences/{date}/cancel` | Skip a single occurrence |
+| `GET` | `/admin/depots/{id}/schedule/readiness` | Schedule readiness summary |
+
+### Reports & analytics
+| Method | Path | Description |
+|---|---|---|
+| `GET`/`POST` | `/depots/{id}/reports` (+ `/{report_id}`, `/{report_id}/export`) | Generate / fetch / export a report |
+| `GET` | `/reports/depots/{id}/energy/monthly` (+ `.csv`, `/sessions`, `/transactions`) | Energy report rollups (`src/api/reports.py`) |
+| `GET` | `/depots/{id}/sessions`, `/depots/{id}/sessions/active` | Charging sessions (history / live) |
+
+### Optimization & liveness
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/depots/{id}/optimization/readiness` | Inputs-ready check before a solve |
+| `GET` | `/depots/{id}/optimization/solver` | Latest solver-run metadata (`src/api/optimization.py`; structured 503 on solver failure) |
+| `GET` | `/depots/{id}/liveness/stream` | SSE charger-liveness stream (`LivenessHub`) |
+
+### Data Sources (admin; `customer_admin`, depot-scoped)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/data-sources/providers` | Provider catalogue (UI-rendered credential-field schema) |
+| `GET`/`POST` | `/admin/data-sources/connections` | List / create connections |
+| `GET`/`PATCH`/`DELETE` | `/admin/data-sources/connections/{id}` | Manage one connection |
+| `POST` | `/admin/data-sources/connections/{id}/sync` | Trigger a sync (202 + `status_url`) |
+| `GET` | `/admin/data-sources/connections/{id}/jobs` · `/admin/data-sources/jobs/{id}` | Ingestion job history / poll |
+
+### Internal
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/internal/ocpp-event` | OCPP-event ingress from the WS handler; internal-only, gated by `INTERNAL_API_TOKEN` (required in production) |
 
 ### WebSocket endpoints
 - `ws://host:9000/ocpp/{charge_point_id}` — OCPP 1.6 (dedicated port)
@@ -733,6 +828,13 @@ make test-coverage     # With HTML coverage report
 - `tests/unit/test_api_main.py` — REST endpoint tests
 - `tests/unit/test_ocpp_server_full.py` — Full OCPP coverage tests
 - `tests/unit/conftest.py` — Shared fixtures
+- `tests/unit/test_agent_workflows_runtime.py` / `tests/unit/agent_workflows/test_workflow_eval_runner.py` — Depot Agent runtime + eval harness
+- `tests/unit/test_agent_qa_runtime.py`, `tests/unit/test_api_agent_actions.py`, `tests/unit/test_api_readiness.py`, `tests/unit/test_api_reports.py` — agent Q&A loop, agent-actions/autonomy, readiness tools, report schedules
+- `tests/golden/agent_consumption.yaml` + `tests/golden/test_agent_golden.py` / `test_agent_sql_golden.py` — chat-agent golden gates (fast path + SQL mode); `tests/golden/workflows/` — workflow golden gate
+- `tests/integration/test_charging_session_import_flow.py` — data-sources / import integration
+- `tests/e2e/test_agent_search.py` (AT-18), `tests/e2e/test_alerts_pipeline_e2e.py` (AT-17); `tests/live/test_agent_sql_live.py` — nightly live-LLM shadow
+
+`pytest` auto-discovers everything under `tests/`; the list above is just the high-traffic suites.
 
 ---
 
@@ -813,6 +915,16 @@ test(api): add coverage for handoff rate limiting
 | `JWT_ISSUER` | Optional. If set, the JWT `iss` claim must match (e.g. `https://<ref>.supabase.co/auth/v1`). |
 | `FAVONIUS_ADMIN_EMAIL_DOMAINS` | Optional, comma-separated. Email domains whose verified JWT subjects are auto-promoted to `favonius_admin` (default `favoniusenergy.com`). Setting this **replaces** the default — include the original entry explicitly to keep it. |
 | `ENVIRONMENT` | `development` / `staging` / `production` |
+| `DB_POOL_MAX_SIZE` | asyncpg pool max connections (default `25`). |
+| `INTERNAL_API_TOKEN` | Shared secret authenticating `POST /internal/ocpp-event` from the WS handler. **Required in production** (startup fails closed if unset). |
+
+### Agent (chat + workflows)
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_SEARCH_ENABLED` | `true` | Mounts the chat agent router (`/agent/*`). |
+| `AGENT_SQL_MODE_ENABLED` | `false` | Enables the general-purpose text-to-SQL path. Per-org gating is the `organizations.agent_sql_mode_enabled` DB flag (NOT an env allowlist). |
+| `DEPOT_AGENT_ENABLED` | `false` | Gates the Depot Agent workflow runtime. |
+| `AGENT_LLM_EFFORT` | `high` | Anthropic reasoning-effort knob for agent LLM calls (`src/api/agent/llm.py`). |
 
 ### Tenant mirroring (optional)
 | Variable | Default | Description |
@@ -846,6 +958,22 @@ test(api): add coverage for handoff rate limiting
 | `SOLVER_WORKER_AS_LIMIT_MB` | `1500` | Per-worker `RLIMIT_AS` ceiling. A runaway solve crashes the worker, not the API container. |
 | `SOLVER_PROCESS_POOL_DISABLED` | `false` | Set `true` to fall back to running solves in a thread inside the API process (loop will block briefly). Debug only. |
 
+> **Two config sources:** the `OPTIMIZATION_*` variables above are read by the **legacy** `websocket_handler` config (`src/websocket_handler/config.py`). The new-architecture `DepotController` reads its own `FAVONIUS_*` knobs (`src/core/controller_config.py`) — note the defaults differ (e.g. horizon `24` vs `4`).
+
+### Optimization control loop (new-architecture DepotController)
+| Variable | Default | Description |
+|---|---|---|
+| `FAVONIUS_OPTIMIZATION_HORIZON_HOURS` | `24` | Rolling horizon length for the new controller. |
+| `FAVONIUS_OPTIMIZATION_TIMEOUT` | `60.0` | Solve time limit (seconds). |
+| `FAVONIUS_HOURLY_OPT_START` / `FAVONIUS_HOURLY_OPT_END` | `7` / `23` | Hours bounding the scheduled hourly re-optimization window. |
+| `FAVONIUS_TRIGGER_COOLDOWN_MIN` | `5` | Minimum minutes between trigger-driven re-optimizations. |
+| `FAVONIUS_MAX_OPT_FAILURES` | `3` | Consecutive solve failures before the controller backs off. |
+| `FAVONIUS_DISPATCH_RETRIES` | `3` | OCPP dispatch retry attempts. |
+| `FAVONIUS_DISPATCH_RETRY_DELAY` | `2.0` | Seconds between dispatch retries. |
+| `FAVONIUS_SHUTDOWN_TIMEOUT` | `30.0` | Graceful controller-shutdown timeout (seconds). |
+| `DEPOT_SOLVE_COOLDOWN_SECONDS` | `120` | Per-depot cooldown between `POST /optimize` solves (`src/api/main.py`). |
+| `DEFAULT_DEPOT_ENDPOINT` | (empty) | Optional default depot endpoint hint. |
+
 ### Price feeder
 | Variable | Default | Description |
 |---|---|---|
@@ -862,6 +990,13 @@ test(api): add coverage for handoff rate limiting
 | `SUPABASE_ANON_KEY` | Public anon key |
 | `SUPABASE_SERVICE_KEY` | Service role key |
 | `SUPABASE_DB_HOST` | Direct DB host |
+
+### Legacy WS handler (misc)
+| Variable | Default | Description |
+|---|---|---|
+| `ALLOWED_FIRMWARE_HOSTS` | (empty) | Comma-separated allowlist of hosts the `UpdateFirmware` download URL may target — SSRF guard (`src/websocket_handler/diagnostics_firmware.py`). |
+| `OCPP_SYNTHESIZED_DELTA_CAP_KWH` | (unset) | Caps the synthesized meter-delta when a charger reports a suspicious energy jump (`src/websocket_handler/timescale_client.py`). |
+| `AUTH_SECRET_PEPPER` | (empty) | Pepper mixed into credential hashing in the WS handler. |
 
 ### Observability
 | Variable | Default | Description |
@@ -907,6 +1042,7 @@ Gates the `/admin/data-sources/*` router + ingestion scheduler. See the "Data So
 | `DATA_SOURCES_SCHEDULER_INTERVAL_S` | `300` | Cadence for enqueuing due connection syncs. |
 | `DATA_SOURCES_ORPHAN_THRESHOLD_S` | `1800` | Heartbeat age after which a pending/running job is re-kicked by the startup recovery sweep. |
 | `DATA_SOURCES_MAX_BACKFILL_DAYS` | `730` | Soft cap on a first-run historical backfill window. |
+| `DATA_SOURCES_SCHEDULER_BATCH` | `50` | Max due connections enqueued per scheduler tick (`src/core/data_sources/scheduler.py`). |
 
 ### Alerts pipeline (notifications)
 The pipeline has shipped; the implementation in `src/api/main.py` (alert endpoints, Resend webhook), `src/websocket_handler/` (AlertDispatcher), and migration 022 is the source of truth. The PR-era design plan has been retired.
@@ -922,7 +1058,7 @@ The pipeline has shipped; the implementation in `src/api/main.py` (alert endpoin
 | `ALERT_DISPATCHER_BATCH_SIZE` | `50` | Maximum alerts processed per dispatcher tick. |
 | `WEB_CONCURRENCY` | (unset) | The dispatcher relies on a single-worker assumption (decision 4.1). If this is set above 1, startup logs CRITICAL and double-emails are likely. |
 
-See `.env.example` for full reference with comments.
+The tables above are the high-traffic knobs; the code reads ~160 environment variables in total. **`.env.example` is the canonical exhaustive reference** (with inline comments) — consult it before adding a new variable.
 
 ---
 
