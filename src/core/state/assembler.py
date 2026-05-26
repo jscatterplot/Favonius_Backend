@@ -371,6 +371,7 @@ class StateAssembler:
                 FROM telemetry
                 WHERE vehicle_id = ANY($1::uuid[])
                   AND soc IS NOT NULL
+                  AND time > now() - INTERVAL '24 hours'
                 ORDER BY vehicle_id, time DESC
             """
             try:
