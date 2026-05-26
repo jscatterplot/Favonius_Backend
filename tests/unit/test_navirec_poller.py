@@ -1,9 +1,10 @@
 """Unit tests for the Navirec poller (fakes only — no DB).
 
-Covers plate-map ambiguity dropping, the advisory-lock write contract,
-per-depot failure isolation, unmatched-plate counting, and stale-reading
-dropping. The advisory-lock semantics against a real Postgres are covered by
-the integration suite.
+Covers plate-map ambiguity dropping, the advisory-lock write contract (with
+true-insert counting via the unnest+RETURNING upsert), per-depot failure
+isolation, unmatched-plate counting, and stale / future-dated dropping. The
+advisory-lock semantics against a real Postgres are covered by the integration
+suite.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ class FakeConn:
         self.recorder = recorder if recorder is not None else []
         self.fetch_rows = fetch_rows or []
         self.unlock_called = False
-        self.executemany_calls = 0
+        self.insert_calls = 0
 
     async def fetchval(self, sql, *args):
         if "pg_try_advisory_lock" in sql:
@@ -43,15 +44,18 @@ class FakeConn:
             return True
         return None
 
-    async def executemany(self, sql, rows):
-        self.executemany_calls += 1
-        rows = list(rows)
-        if self.raise_for_vehicle is not None and any(r[1] == self.raise_for_vehicle for r in rows):
-            raise RuntimeError("simulated write failure")
-        self.recorder.extend(rows)
-
     async def fetch(self, sql, *args):
-        return self.fetch_rows
+        if "INSERT INTO vehicle_telemetry" in sql:
+            self.insert_calls += 1
+            # args are the 7 per-column arrays; transpose back into row tuples.
+            rows = [tuple(r) for r in zip(*args)] if args else []
+            if self.raise_for_vehicle is not None and any(
+                r[1] == self.raise_for_vehicle for r in rows
+            ):
+                raise RuntimeError("simulated write failure")
+            self.recorder.extend(rows)
+            return [1] * len(rows)  # one RETURNING row per actual insert
+        return self.fetch_rows  # build_plate_map's SELECT
 
 
 class _Acquire:
@@ -123,7 +127,7 @@ async def test_build_plate_map_drops_ambiguous():
 # write_depot_readings
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_write_acquires_lock_and_writes():
+async def test_write_acquires_lock_and_counts_true_inserts():
     conn = FakeConn(lock_result=True)
     rows = [(_NOW, "vA", 0.5, None, None, "navirec", "{}")]
     written = await write_depot_readings(FakePool(conn), "dA", rows)
@@ -138,7 +142,7 @@ async def test_write_skips_when_lock_unavailable():
     rows = [(_NOW, "vA", 0.5, None, None, "navirec", "{}")]
     written = await write_depot_readings(FakePool(conn), "dA", rows)
     assert written is None
-    assert conn.executemany_calls == 0
+    assert conn.insert_calls == 0
     assert conn.unlock_called is False  # never acquired → never unlocks
 
 
@@ -146,7 +150,7 @@ async def test_write_skips_when_lock_unavailable():
 async def test_write_empty_rows_is_noop():
     conn = FakeConn(lock_result=True)
     assert await write_depot_readings(FakePool(conn), "dA", []) == 0
-    assert conn.executemany_calls == 0
+    assert conn.insert_calls == 0
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +176,21 @@ async def test_poll_once_drops_stale_beyond_window():
     plate_map = {"PA": ("vA", "dA"), "PB": ("vB", "dB")}
     raws = [
         {"plate": "PA", "soc": 50, "timestamp": (_NOW - timedelta(hours=48)).isoformat()},
+        {"plate": "PB", "soc": 60, "timestamp": _NOW.isoformat()},
+    ]
+    conn = FakeConn(lock_result=True)
+    summary = await poll_once(None, FakePool(conn), FakeClient(raws), plate_map=plate_map, now=_NOW)
+    assert summary["stale_dropped"] == 1
+    assert summary["written"] == {"dB": 1}
+    assert "dA" not in summary["written"]
+
+
+@pytest.mark.asyncio
+async def test_poll_once_drops_future_dated():
+    # Clock-skewed future timestamp would always win freshest-wins → must drop.
+    plate_map = {"PA": ("vA", "dA"), "PB": ("vB", "dB")}
+    raws = [
+        {"plate": "PA", "soc": 50, "timestamp": (_NOW + timedelta(hours=2)).isoformat()},
         {"plate": "PB", "soc": 60, "timestamp": _NOW.isoformat()},
     ]
     conn = FakeConn(lock_result=True)

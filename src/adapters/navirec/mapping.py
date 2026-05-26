@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from pydantic import BaseModel, Field
 
@@ -57,6 +57,20 @@ class VehicleTelemetryReading(BaseModel):
     raw_fields: dict[str, Any] = Field(default_factory=dict)
 
 
+class ParsedPoint(NamedTuple):
+    """Plate-independent telemetry fields parsed from one Navirec record.
+
+    Shared by the live mapper and the historical backfill so both parse SoC /
+    time / position identically. The backfill needs this because history rows
+    carry no plate of their own — the vehicle is known from the parent object.
+    """
+
+    soc: float
+    time: datetime
+    latitude: Optional[float]
+    longitude: Optional[float]
+
+
 def _first(raw: dict[str, Any], keys: tuple[str, ...]) -> Any:
     """Return the first present, non-null value among ``keys``."""
     for key in keys:
@@ -91,62 +105,106 @@ def _coerce_soc(value: Any) -> Optional[float]:
     return max(0.0, min(1.0, soc))
 
 
-def _coerce_time(value: Any, *, now: datetime) -> datetime:
-    """Parse a telematics timestamp into a tz-aware UTC datetime.
+def _safe_float(value: Any) -> Optional[float]:
+    """Best-effort float coercion; ``None`` when absent or unparseable.
 
-    Accepts ISO-8601 (with a trailing ``Z``) or epoch seconds/millis. Falls
-    back to ``now`` when absent/unparseable — a live "latest position" reading
-    without a timestamp is implicitly current.
+    Keeps one malformed coordinate (e.g. ``""`` / ``"N/A"``) from aborting the
+    whole poll/backfill cycle — callers don't isolate per-record float errors.
     """
     if value is None:
-        return now
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_time(value: Any) -> Optional[datetime]:
+    """Parse a telematics timestamp into a tz-aware UTC datetime, or ``None``.
+
+    Returns ``None`` when the timestamp is absent, unparseable, or out of range.
+    We never fabricate a timestamp (e.g. ``now``): a made-up "now" would let a
+    schema-mismatched or stale reading win the freshest-wins SoC merge over real
+    charger telemetry, feeding the optimizer a wrong current SoC. Fail closed —
+    the caller skips records we can't time-stamp from the source.
+    """
+    if value is None or isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
         ts = float(value)
         if ts > 1e12:  # milliseconds
             ts /= 1000.0
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if isinstance(value, str):
         text = value.strip()
+        if not text:
+            return None
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         try:
             parsed = datetime.fromisoformat(text)
         except ValueError:
-            return now
+            return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
-    return now
+    return None
 
 
-def navirec_vehicle_to_reading(
-    raw: dict[str, Any],
-    *,
-    now: Optional[datetime] = None,
-) -> Optional[VehicleTelemetryReading]:
-    """Map one Navirec vehicle/position object to a reading, or ``None``.
+def parse_navirec_point(raw: dict[str, Any]) -> Optional[ParsedPoint]:
+    """Parse the plate-independent telemetry fields (SoC + time + position).
 
-    Returns ``None`` (caller skips) when the object lacks a usable plate or a
-    parseable SoC — the optimizer only consumes SoC, so a position-only row
-    would be dead weight in ``vehicle_telemetry``.
+    Returns ``None`` when SoC or timestamp is missing/unparseable so both the
+    live poller and the historical backfill skip the record rather than abort
+    the cycle. SoC and a source timestamp are mandatory (see ``_coerce_time``).
     """
-    now = now or datetime.now(timezone.utc)
-
-    plate = normalize_plate(_first(raw, _PLATE_KEYS))
-    if not plate:
-        return None
-
     soc = _coerce_soc(_first(raw, _SOC_KEYS))
     if soc is None:
         return None
+    when = _coerce_time(_first(raw, _TIME_KEYS))
+    if when is None:
+        return None
+    return ParsedPoint(
+        soc=soc,
+        time=when,
+        latitude=_safe_float(_first(raw, _LAT_KEYS)),
+        longitude=_safe_float(_first(raw, _LON_KEYS)),
+    )
 
-    lat = _first(raw, _LAT_KEYS)
-    lon = _first(raw, _LON_KEYS)
+
+def reading_from_point(
+    plate: str, point: ParsedPoint, raw_fields: dict[str, Any]
+) -> VehicleTelemetryReading:
+    """Build a reading from an already-parsed point plus a known plate.
+
+    Used by the backfill, where the vehicle (and thus plate) comes from the
+    parent object and the per-timestamp history rows carry no plate of their own.
+    """
     return VehicleTelemetryReading(
         vehicle_plate=plate,
-        soc=soc,
-        time=_coerce_time(_first(raw, _TIME_KEYS), now=now),
-        latitude=float(lat) if lat is not None else None,
-        longitude=float(lon) if lon is not None else None,
-        raw_fields=raw,
+        soc=point.soc,
+        time=point.time,
+        latitude=point.latitude,
+        longitude=point.longitude,
+        raw_fields=raw_fields,
     )
+
+
+def navirec_vehicle_to_reading(raw: dict[str, Any]) -> Optional[VehicleTelemetryReading]:
+    """Map one Navirec vehicle object (carrying its plate) to a reading, or ``None``.
+
+    Returns ``None`` (caller skips) when the object lacks a usable plate, a
+    parseable SoC, or a source timestamp — the optimizer only consumes SoC, so
+    a record we can't attribute or time-stamp would be dead weight (or worse,
+    misleading) in ``vehicle_telemetry``.
+    """
+    plate = normalize_plate(_first(raw, _PLATE_KEYS))
+    if not plate:
+        return None
+    point = parse_navirec_point(raw)
+    if point is None:
+        return None
+    return reading_from_point(plate, point, raw)

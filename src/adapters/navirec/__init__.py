@@ -18,11 +18,14 @@ Public surface:
 
 from .client import NavirecClient, NavirecClientError
 from .mapping import (
+    ParsedPoint,
     VehicleTelemetryReading,
     navirec_vehicle_id,
     navirec_vehicle_plate,
     navirec_vehicle_to_reading,
     normalize_plate,
+    parse_navirec_point,
+    reading_from_point,
 )
 from .poller import (
     build_plate_map,
@@ -35,11 +38,14 @@ from .poller import (
 __all__ = [
     "NavirecClient",
     "NavirecClientError",
+    "ParsedPoint",
     "VehicleTelemetryReading",
     "navirec_vehicle_id",
     "navirec_vehicle_plate",
     "navirec_vehicle_to_reading",
     "normalize_plate",
+    "parse_navirec_point",
+    "reading_from_point",
     "build_plate_map",
     "poll_once",
     "resolve_readings",

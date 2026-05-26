@@ -51,6 +51,11 @@ logger = logging.getLogger(__name__)
 # so the live path drops it (the backfill path writes regardless).
 _LIVE_MAX_AGE = timedelta(hours=24)
 
+# Readings time-stamped further than this ahead of now() are treated as clock
+# skew / bad data and dropped — a future timestamp would otherwise always win
+# the freshest-wins SoC merge over real charger telemetry.
+_FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
+
 # Plate maps change rarely (a vehicle's plate is near-static); cache like the
 # 5-min _get_depot_config cache in src/api/main.py.
 _PLATE_MAP_TTL_S = 300.0
@@ -58,11 +63,18 @@ _PLATE_MAP_TTL_S = 300.0
 # {normalized_plate: (vehicle_id, depot_id)}
 PlateMap = dict[str, tuple[str, str]]
 
+# Batched, idempotent upsert. unnest() lets one statement insert all rows AND
+# RETURN one row per actual insert, so we can count true inserts (ON CONFLICT
+# DO NOTHING suppresses the RETURNING for duplicates) instead of overcounting.
 _UPSERT_SQL = """
     INSERT INTO vehicle_telemetry
         (time, vehicle_id, soc, location_lat, location_lon, source, raw_fields)
-    VALUES ($1, $2::uuid, $3, $4, $5, $6, $7::jsonb)
+    SELECT * FROM unnest(
+        $1::timestamptz[], $2::uuid[], $3::float8[],
+        $4::float8[], $5::float8[], $6::text[], $7::jsonb[]
+    )
     ON CONFLICT (vehicle_id, time) DO NOTHING
+    RETURNING 1
 """
 
 
@@ -85,11 +97,13 @@ async def build_plate_map(static_pool: Any) -> PlateMap:
     it. Emits the ambiguous count as a gauge.
     """
     async with static_pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(
+            """
             SELECT id::text AS vehicle_id, site_id::text AS depot_id, license_plate
             FROM vehicles
             WHERE license_plate IS NOT NULL AND site_id IS NOT NULL
-            """)
+            """
+        )
 
     plate_map: PlateMap = {}
     ambiguous: set[str] = set()
@@ -167,12 +181,15 @@ async def write_depot_readings(
 ) -> Optional[int]:
     """Upsert one depot's rows under a per-depot advisory lock.
 
-    Returns the number of rows written, or ``None`` if another worker held the
-    lock (skipped this cycle). Idempotent: ``ON CONFLICT (vehicle_id, time)
-    DO NOTHING``. Shared by the live poller and the historical backfill.
+    Returns the number of rows **actually inserted** (duplicates suppressed by
+    ``ON CONFLICT (vehicle_id, time) DO NOTHING`` are not counted), or ``None``
+    if another worker held the lock (skipped this cycle). Shared by the live
+    poller and the historical backfill.
     """
     if not rows:
         return 0
+    # Transpose row tuples into per-column arrays for the unnest() upsert.
+    columns = list(zip(*rows))
     lock_key = f"navirec_poll:{depot_id}"
     async with ts_pool.acquire() as conn:
         locked = await conn.fetchval(
@@ -182,11 +199,13 @@ async def write_depot_readings(
             NAVIREC_LOCK_SKIPS.labels(depot_id=depot_id).inc()
             return None
         try:
-            await conn.executemany(_UPSERT_SQL, rows)
+            inserted = await conn.fetch(_UPSERT_SQL, *[list(col) for col in columns])
         finally:
             await conn.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock_key)
-    NAVIREC_READINGS_WRITTEN.labels(depot_id=depot_id).inc(len(rows))
-    return len(rows)
+    count = len(inserted)
+    if count:
+        NAVIREC_READINGS_WRITTEN.labels(depot_id=depot_id).inc(count)
+    return count
 
 
 async def poll_once(
@@ -206,10 +225,16 @@ async def poll_once(
     fresh: list[VehicleTelemetryReading] = []
     stale_dropped = 0
     async for raw in client.iter_vehicles():
-        reading = navirec_vehicle_to_reading(raw, now=now)
+        reading = navirec_vehicle_to_reading(raw)
         if reading is None:
             continue
         age = now - reading.time
+        # Future-dated (clock skew / bad data): would always win freshest-wins,
+        # so drop it rather than let it override real charger telemetry.
+        if age < -_FUTURE_SKEW_TOLERANCE:
+            stale_dropped += 1
+            NAVIREC_STALE_READINGS.inc()
+            continue
         if age > _LIVE_MAX_AGE:
             stale_dropped += 1
             continue

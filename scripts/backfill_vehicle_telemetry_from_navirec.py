@@ -52,12 +52,18 @@ from src.adapters.navirec import (  # noqa: E402
     build_plate_map,
     navirec_vehicle_id,
     navirec_vehicle_plate,
-    navirec_vehicle_to_reading,
+    parse_navirec_point,
+    reading_from_point,
     write_depot_readings,
 )
 from src.adapters.navirec.poller import _reading_to_row  # noqa: E402
 
 logger = logging.getLogger("backfill_vehicle_telemetry")
+
+# A one-shot migration tool must not silently skip a depot on a transient
+# advisory-lock collision with the live poller. Retry, then fail loudly.
+_LOCK_RETRIES = 5
+_LOCK_RETRY_BACKOFF_S = 1.0
 
 
 async def run_backfill(
@@ -102,9 +108,13 @@ async def run_backfill(
         async for raw in client.iter_vehicle_history(
             vehicle_id=nav_id, start_iso=start_iso, end_iso=end_iso
         ):
-            reading = navirec_vehicle_to_reading(raw)
-            if reading is None:
+            # History rows carry SoC + time but no plate of their own — the
+            # vehicle is already matched, so parse the plate-independent fields
+            # and attach the parent's plate.
+            point = parse_navirec_point(raw)
+            if point is None:
                 continue
+            reading = reading_from_point(plate, point, raw)
             rows_by_depot.setdefault(vehicle_depot, []).append(_reading_to_row(vehicle_id, reading))
 
     planned = {d: len(r) for d, r in rows_by_depot.items()}
@@ -113,9 +123,19 @@ async def run_backfill(
     written: dict[str, int] = {}
     if execute:
         for depot, rows in rows_by_depot.items():
-            count = await write_depot_readings(ts_pool, depot, rows)
-            if count is not None:
-                written[depot] = count
+            count: Optional[int] = None
+            for attempt in range(_LOCK_RETRIES):
+                count = await write_depot_readings(ts_pool, depot, rows)
+                if count is not None:
+                    break
+                await asyncio.sleep(_LOCK_RETRY_BACKOFF_S * (attempt + 1))
+            if count is None:
+                raise RuntimeError(
+                    f"Backfill could not acquire the advisory lock for depot {depot} "
+                    f"after {_LOCK_RETRIES} attempts (live poller contention?). "
+                    "Re-run the backfill — it is idempotent."
+                )
+            written[depot] = count
 
     summary = {
         "matched_vehicles": matched_vehicles,
