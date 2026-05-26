@@ -624,6 +624,35 @@ async def _run_sql_general_turn(
     """
     from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
 
+    # S4 per-org monthly token budget — gate FIRST, before building the Anthropic
+    # client or making any API call. A None reservation means the org is over its
+    # monthly ceiling: refuse here, touching ZERO Anthropic code (no _get_client,
+    # no messages.create), and record a first-class 'refused' / budget_exceeded
+    # outcome. system_prompt is reused by run_qa_turn below when we proceed.
+    system_prompt = build_sql_agent_system_prompt()
+    est_tokens = budget.estimate_turn_tokens(system_prompt)
+    reservation = await budget.check_and_reserve(auth.organization_id, est_tokens)
+    if reservation is None:
+        AGENT_SQL_BUDGET_REFUSED.labels(
+            organization_id=str(auth.organization_id) if auth.organization_id else "none"
+        ).inc()
+        await agent_runs_step(ts_pool, run_id, "budget_refused", {"est_tokens": est_tokens})
+        reply = AgentReply.refused(
+            run_id=run_id,
+            reason="monthly_budget_exceeded",
+            text=(
+                "This organisation has reached its monthly usage limit for the "
+                "analytics assistant. The limit resets at the start of next month — "
+                "contact your administrator if you need it raised."
+            ),
+            intent="sql_general",
+        )
+        await agent_runs_close(
+            ts_pool, run_id, "refused", reply, failure_reason=classify_failure("refused")
+        )
+        await _emit_answer_safe(sse, reply, run_id)
+        return reply
+
     client = agent_llm._get_client()
     config = agent_llm.CONFIG
 
@@ -651,34 +680,6 @@ async def _run_sql_general_turn(
         }
         await agent_runs_step(ts_pool, run_id, "tool_call", payload)
         await emit_step("tool_call", label_key=name)
-
-    # S4 per-org monthly token budget: reserve a rough estimate BEFORE any
-    # Anthropic call. A None reservation means the org is over its monthly
-    # ceiling — refuse here, consuming ZERO tokens (no client.messages.create),
-    # and record the turn as a first-class 'refused' / budget_exceeded outcome.
-    system_prompt = build_sql_agent_system_prompt()
-    est_tokens = budget.estimate_turn_tokens(system_prompt)
-    reservation = await budget.check_and_reserve(auth.organization_id, est_tokens)
-    if reservation is None:
-        AGENT_SQL_BUDGET_REFUSED.labels(
-            organization_id=str(auth.organization_id) if auth.organization_id else "none"
-        ).inc()
-        await agent_runs_step(ts_pool, run_id, "budget_refused", {"est_tokens": est_tokens})
-        reply = AgentReply.refused(
-            run_id=run_id,
-            reason="monthly_budget_exceeded",
-            text=(
-                "This organisation has reached its monthly usage limit for the "
-                "analytics assistant. The limit resets at the start of next month — "
-                "contact your administrator if you need it raised."
-            ),
-            intent="sql_general",
-        )
-        await agent_runs_close(
-            ts_pool, run_id, "refused", reply, failure_reason=classify_failure("refused")
-        )
-        await _emit_answer_safe(sse, reply, run_id)
-        return reply
 
     # Bugbot L-sev: previous shape was ``sql_tool_turns = 0`` +
     # try/except/else/finally with the variable reassigned in three

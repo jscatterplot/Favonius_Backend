@@ -11,7 +11,8 @@ Pool I/O is mocked end-to-end; no DB is required.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -19,9 +20,16 @@ import pytest
 
 from src.api.agent.budget import (
     DEFAULT_TOKEN_BUDGET_MONTHLY,
+    PER_TURN_OVERHEAD_TOKENS,
+    Reservation,
+    TokenBudgetTracker,
     _parse_positive_int,
+    current_period_yyyymm,
+    estimate_turn_tokens,
     resolve_org_token_budget,
 )
+
+_PERIOD = "202605"  # fixed period for deterministic (org, period) counter keys
 
 # Async tests are marked at the class level (TestResolveOrgTokenBudget) rather
 # than module-wide, so the sync parse tests stay unmarked and don't trip
@@ -134,3 +142,226 @@ class TestResolveOrgTokenBudget:
         sql = pool._conn.fetchval.await_args.args[0]
         assert "to_jsonb(o) ->> 'agent_token_budget_monthly'" in sql
         assert "FROM organizations o" in sql
+
+
+# ── Enforcement: TokenBudgetTracker ─────────────────────────────────────────
+
+
+def _ts_pool(
+    *,
+    hydrate_row: Any = None,
+    fetchrow_fn: Optional[Callable[..., Any]] = None,
+    executemany_raises: bool = False,
+) -> Any:
+    """Fake TS asyncpg pool: ``fetchrow`` for hydration, ``executemany`` for flush.
+
+    ``hydrate_row`` is the agent_token_usage row returned on cold start (or
+    ``None``); ``fetchrow_fn`` overrides it with a per-call side effect (used by
+    the period-rollover test to gate the row on the queried period).
+    """
+    pool = MagicMock()
+    conn = MagicMock()
+    if fetchrow_fn is not None:
+        conn.fetchrow = AsyncMock(side_effect=fetchrow_fn)
+    else:
+        conn.fetchrow = AsyncMock(return_value=hydrate_row)
+    conn.executemany = AsyncMock(
+        side_effect=RuntimeError("flush boom") if executemany_raises else None
+    )
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    pool.acquire = _acquire
+    pool._conn = conn
+    return pool
+
+
+def _tracker(
+    *,
+    ceiling: Any = "1000",
+    hydrate_row: Any = None,
+    fetchrow_fn: Optional[Callable[..., Any]] = None,
+    period: str = _PERIOD,
+    flush_every_writes: int = 1000,
+    executemany_raises: bool = False,
+) -> TokenBudgetTracker:
+    """Build a tracker over fake pools with a fixed period + high flush threshold.
+
+    ``flush_every_writes=1000`` (and the default 30 s window) means a single
+    ``record_actual`` never schedules a background flush, keeping reconcile
+    tests deterministic; flush tests call ``flush()`` directly.
+    """
+    return TokenBudgetTracker(
+        static_pool=_make_pool(fetchval_return=ceiling),
+        ts_pool=_ts_pool(
+            hydrate_row=hydrate_row,
+            fetchrow_fn=fetchrow_fn,
+            executemany_raises=executemany_raises,
+        ),
+        period_provider=lambda: period,
+        flush_every_writes=flush_every_writes,
+    )
+
+
+@pytest.mark.asyncio
+class TestCheckAndReserve:
+    async def test_accept_under_ceiling(self):
+        tr = _tracker(ceiling="1000")
+        assert await tr.check_and_reserve(uuid4(), 500) is not None
+
+    async def test_accept_at_ceiling_minus_one(self):
+        # est lands total at exactly ceiling - 1.
+        tr = _tracker(ceiling="1000")
+        r = await tr.check_and_reserve(uuid4(), 999)
+        assert r is not None and r.est_tokens == 999
+
+    async def test_accept_at_exactly_ceiling(self):
+        # Boundary: total == ceiling is allowed; only > ceiling is refused.
+        tr = _tracker(ceiling="1000")
+        assert await tr.check_and_reserve(uuid4(), 1000) is not None
+
+    async def test_reject_over_ceiling(self):
+        tr = _tracker(ceiling="1000")
+        assert await tr.check_and_reserve(uuid4(), 1001) is None
+
+    async def test_reject_when_existing_usage_plus_estimate_exceeds(self):
+        # Hydrated base 900 + est 200 = 1100 > 1000 → refuse.
+        tr = _tracker(ceiling="1000", hydrate_row={"input_tokens": 900, "output_tokens": 0})
+        assert await tr.check_and_reserve(uuid4(), 200) is None
+
+    async def test_per_org_column_beats_platform_default(self):
+        # Column ceiling 2000: a 2500-token turn is refused even though it is
+        # far below the 10M platform default — proving the column is the ceiling.
+        tr_small = _tracker(ceiling="2000")
+        assert await tr_small.check_and_reserve(uuid4(), 2500) is None
+        # Same turn with NO column value falls back to the 10M default → accept.
+        tr_default = _tracker(ceiling=None)
+        assert await tr_default.check_and_reserve(uuid4(), 2500) is not None
+
+    async def test_cold_start_hydration_matches_db_row(self):
+        org = uuid4()
+        tr = _tracker(ceiling="100000", hydrate_row={"input_tokens": 400, "output_tokens": 300})
+
+        await tr.check_and_reserve(org, 10)
+
+        counter = tr._counters[(str(org), _PERIOD)]
+        assert counter.committed_input == 400
+        assert counter.committed_output == 300
+        # total counts the hydrated 700 + the 10-token reservation.
+        assert counter.total == 710
+        assert counter.reserved == 10
+
+    async def test_period_rollover_previous_month_does_not_constrain(self):
+        # The DB has 1500 tokens, but only for the PREVIOUS period (202604).
+        def _row_for_previous_period_only(_sql, _org, period, *_a, **_k):
+            if period == "202604":
+                return {"input_tokens": 1500, "output_tokens": 0}
+            return None
+
+        # Current period 202605: hydration finds no row → usage 0 → 800 accepted
+        # under the 1000 ceiling despite last month's 1500.
+        current = _tracker(
+            ceiling="1000", fetchrow_fn=_row_for_previous_period_only, period="202605"
+        )
+        assert await current.check_and_reserve(uuid4(), 800) is not None
+
+        # Same data viewed as 202604 WOULD constrain (1500 + 800 > 1000) — proves
+        # the row is real and the isolation above is period-scoped, not absence.
+        previous = _tracker(
+            ceiling="1000", fetchrow_fn=_row_for_previous_period_only, period="202604"
+        )
+        assert await previous.check_and_reserve(uuid4(), 800) is None
+
+    async def test_none_org_returns_noop_reservation_never_refuses(self):
+        tr = _tracker(ceiling="1000")
+        r = await tr.check_and_reserve(None, 10**9)  # absurd estimate
+        assert r is not None and r.organization_id is None
+        # No counter is created for a non-org-scoped turn.
+        assert tr._counters == {}
+
+
+@pytest.mark.asyncio
+class TestRecordActual:
+    async def test_reconcile_frees_reservation_headroom(self):
+        org = uuid4()
+        tr = _tracker(ceiling="1000")
+
+        r = await tr.check_and_reserve(org, 800)
+        assert r is not None
+        # A second 300-token turn won't fit while 800 is reserved.
+        assert await tr.check_and_reserve(org, 300) is None
+
+        # Real usage was far less than the 800 estimate; reconcile frees it.
+        tr.record_actual(r, 100, 50)
+        counter = tr._counters[(str(org), _PERIOD)]
+        assert counter.reserved == 0
+        assert counter.committed_input == 100 and counter.committed_output == 50
+
+        # Now an 800-token turn fits (150 committed + 800 = 950 <= 1000).
+        assert await tr.check_and_reserve(org, 800) is not None
+
+    async def test_none_or_noop_reservation_is_ignored(self):
+        tr = _tracker(ceiling="1000")
+        tr.record_actual(None, 100, 100)  # no crash
+        tr.record_actual(
+            Reservation(organization_id=None, period_yyyymm=_PERIOD, est_tokens=0), 5, 5
+        )
+        assert tr._counters == {}
+
+    async def test_record_actual_accumulates_unflushed_for_persistence(self):
+        org = uuid4()
+        tr = _tracker(ceiling="100000")
+        r = await tr.check_and_reserve(org, 100)
+        tr.record_actual(r, 120, 40)
+        counter = tr._counters[(str(org), _PERIOD)]
+        assert counter.unflushed_input == 120 and counter.unflushed_output == 40
+
+
+@pytest.mark.asyncio
+class TestFlush:
+    async def test_flush_writes_append_style_delta_and_resets(self):
+        org = uuid4()
+        tr = _tracker(ceiling="100000")
+        r = await tr.check_and_reserve(org, 100)
+        tr.record_actual(r, 120, 40)
+
+        await tr.flush()
+
+        em = tr._explicit_ts_pool._conn.executemany
+        em.assert_awaited_once()
+        rows = em.await_args.args[1]
+        assert rows == [(str(org), _PERIOD, 120, 40)]
+        counter = tr._counters[(str(org), _PERIOD)]
+        assert counter.unflushed_input == 0 and counter.unflushed_output == 0
+
+    async def test_flush_noop_when_nothing_pending(self):
+        tr = _tracker(ceiling="100000")
+        await tr.flush()
+        tr._explicit_ts_pool._conn.executemany.assert_not_awaited()
+
+    async def test_flush_rolls_back_deltas_on_db_error(self):
+        org = uuid4()
+        tr = _tracker(ceiling="100000", executemany_raises=True)
+        r = await tr.check_and_reserve(org, 100)
+        tr.record_actual(r, 120, 40)
+
+        await tr.flush()  # best-effort: must not raise
+
+        counter = tr._counters[(str(org), _PERIOD)]
+        # Deltas rolled back so the next flush retries them.
+        assert counter.unflushed_input == 120 and counter.unflushed_output == 40
+
+
+class TestEstimateAndPeriodHelpers:
+    def test_estimate_turn_tokens_prompt_plus_overhead(self):
+        # ~4 chars/token: 16000 chars -> 4000 prompt tokens + fixed overhead.
+        assert estimate_turn_tokens("x" * 16000) == 4000 + PER_TURN_OVERHEAD_TOKENS
+
+    def test_estimate_turn_tokens_empty_prompt_is_just_overhead(self):
+        assert estimate_turn_tokens("") == PER_TURN_OVERHEAD_TOKENS
+
+    def test_current_period_yyyymm_format(self):
+        assert current_period_yyyymm(datetime(2026, 5, 26, tzinfo=timezone.utc)) == "202605"
+        assert current_period_yyyymm(datetime(2026, 1, 2, tzinfo=timezone.utc)) == "202601"
