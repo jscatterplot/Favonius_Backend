@@ -11,6 +11,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 from typing import Any, Optional, Sequence
 from uuid import UUID
 
@@ -37,6 +38,7 @@ class Alert:
     occurrence_count: int
     acknowledged_at: Optional[datetime]
     acknowledged_by: Optional[UUID]
+    acknowledged_by_email: Optional[str]
     resolved_at: Optional[datetime]
     last_notified_at: Optional[datetime]
     last_notified_count: int
@@ -58,6 +60,7 @@ class Alert:
             occurrence_count=int(row["occurrence_count"]),
             acknowledged_at=row["acknowledged_at"],
             acknowledged_by=row["acknowledged_by"],
+            acknowledged_by_email=row.get("acknowledged_by_email"),
             resolved_at=row["resolved_at"],
             last_notified_at=row["last_notified_at"],
             last_notified_count=row["last_notified_count"],
@@ -84,23 +87,70 @@ def _coerce_jsonb(value: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_ALERT_COLUMNS_LEGACY = (
+    "id, organization_id, depot_id, alert_type, severity, title, detail, "
+    "dedup_key, status, first_occurrence_at, last_occurrence_at, "
+    "occurrence_count, acknowledged_at, acknowledged_by, "
+    "resolved_at, last_notified_at, last_notified_count"
+)
+
 _ALERT_COLUMNS = (
     "id, organization_id, depot_id, alert_type, severity, title, detail, "
     "dedup_key, status, first_occurrence_at, last_occurrence_at, "
-    "occurrence_count, acknowledged_at, acknowledged_by, resolved_at, "
-    "last_notified_at, last_notified_count"
+    "occurrence_count, acknowledged_at, acknowledged_by, acknowledged_by_email, "
+    "resolved_at, last_notified_at, last_notified_count"
 )
 
+_ACK_EMAIL_COLUMN_AVAILABLE: Optional[bool] = None
+_ACK_EMAIL_COLUMN_RETRY_AFTER: float = 0.0  # monotonic; re-probe when past this
 
-_CLAIM_QUERY = f"""
-    SELECT {_ALERT_COLUMNS}
-      FROM notification_alerts
-     WHERE status = 'active'
-       AND (last_notified_at IS NULL
-            OR last_notified_at < (NOW() - ($1::int * INTERVAL '1 second')))
-     ORDER BY severity_level DESC, last_occurrence_at DESC
-     LIMIT $2
-"""
+
+def _is_undefined_column_error(exc: BaseException) -> bool:
+    return getattr(exc, "sqlstate", None) == "42703"
+
+
+def reset_column_probe() -> None:
+    """Force the next _alert_select_columns call to re-probe the DB.
+
+    Call this whenever a real query fails with sqlstate 42703 so that a
+    migration rollback is reflected within one request cycle instead of
+    requiring a worker restart.
+    """
+    global _ACK_EMAIL_COLUMN_AVAILABLE, _ACK_EMAIL_COLUMN_RETRY_AFTER
+    _ACK_EMAIL_COLUMN_AVAILABLE = None
+    _ACK_EMAIL_COLUMN_RETRY_AFTER = 0.0
+
+
+async def _alert_select_columns(conn: Any) -> str:
+    """Return SELECT column list, probing for migration 046.
+
+    Positive result (column exists) is cached forever.  Negative result is
+    cached for 60 s so a worker that started before the migration was applied
+    automatically picks up the column after the migration runs, without needing
+    a restart.
+    """
+    global _ACK_EMAIL_COLUMN_AVAILABLE, _ACK_EMAIL_COLUMN_RETRY_AFTER
+    if _ACK_EMAIL_COLUMN_AVAILABLE is True:
+        return _ALERT_COLUMNS
+    if _ACK_EMAIL_COLUMN_AVAILABLE is False and time.monotonic() < _ACK_EMAIL_COLUMN_RETRY_AFTER:
+        return _ALERT_COLUMNS_LEGACY
+    try:
+        await conn.fetchval(
+            "SELECT acknowledged_by_email FROM notification_alerts LIMIT 0"
+        )
+        _ACK_EMAIL_COLUMN_AVAILABLE = True
+        _ACK_EMAIL_COLUMN_RETRY_AFTER = 0.0
+    except Exception as exc:
+        if _is_undefined_column_error(exc):
+            _ACK_EMAIL_COLUMN_AVAILABLE = False
+            _ACK_EMAIL_COLUMN_RETRY_AFTER = time.monotonic() + 60.0
+            logger.warning(
+                "notification_alerts missing acknowledged_by_email column "
+                "(apply migrations/046_alerts_ack_email.sql); will retry in 60 s"
+            )
+        else:
+            raise
+    return _ALERT_COLUMNS if _ACK_EMAIL_COLUMN_AVAILABLE else _ALERT_COLUMNS_LEGACY
 
 
 async def claim_pending_alerts(
@@ -113,7 +163,20 @@ async def claim_pending_alerts(
     The dispatcher must filter the result against its `_currently_sending`
     set before processing.
     """
-    rows = await conn.fetch(_CLAIM_QUERY, resend_interval_s, limit)
+    cols = await _alert_select_columns(conn)
+    rows = await conn.fetch(
+        f"""
+        SELECT {cols}
+          FROM notification_alerts
+         WHERE status = 'active'
+           AND (last_notified_at IS NULL
+                OR last_notified_at < (NOW() - ($1::int * INTERVAL '1 second')))
+         ORDER BY severity_level DESC, last_occurrence_at DESC
+         LIMIT $2
+        """,
+        resend_interval_s,
+        limit,
+    )
     return [Alert.from_record(r) for r in rows]
 
 
@@ -157,9 +220,10 @@ async def list_for_depot(
     (decision 4.3). Order matches the indexed sort: severity_level DESC,
     last_occurrence_at DESC.
     """
+    cols = await _alert_select_columns(conn)
     rows = await conn.fetch(
         f"""
-        SELECT {_ALERT_COLUMNS}
+        SELECT {cols}
           FROM notification_alerts
          WHERE depot_id = $1
            AND status = ANY($2::text[])
@@ -174,9 +238,10 @@ async def list_for_depot(
 
 
 async def get_by_id(conn: Any, alert_id: UUID) -> Optional[Alert]:
+    cols = await _alert_select_columns(conn)
     row = await conn.fetchrow(
         f"""
-        SELECT {_ALERT_COLUMNS}
+        SELECT {cols}
           FROM notification_alerts
          WHERE id = $1
         """,
@@ -190,6 +255,7 @@ async def acknowledge(
 ) -> Optional[Alert]:
     """Mark an active alert as acknowledged. Returns the updated row, or None
     if the alert doesn't exist or is already resolved."""
+    cols = await _alert_select_columns(conn)
     row = await conn.fetchrow(
         f"""
         UPDATE notification_alerts
@@ -199,7 +265,7 @@ async def acknowledge(
                updated_at = NOW()
          WHERE id = $1
            AND status = 'active'
-         RETURNING {_ALERT_COLUMNS}
+         RETURNING {cols}
         """,
         alert_id,
         user_id,
@@ -210,22 +276,6 @@ async def acknowledge(
 # ---------------------------------------------------------------------------
 # Producer-side UPSERT
 # ---------------------------------------------------------------------------
-
-
-_UPSERT_QUERY = f"""
-    INSERT INTO notification_alerts (
-        organization_id, depot_id, alert_type, severity, title, detail, dedup_key
-    ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
-    ON CONFLICT (organization_id, dedup_key) WHERE status != 'resolved'
-    DO UPDATE SET
-        last_occurrence_at = NOW(),
-        occurrence_count   = notification_alerts.occurrence_count + 1,
-        severity           = EXCLUDED.severity,
-        title              = EXCLUDED.title,
-        detail             = EXCLUDED.detail,
-        updated_at         = NOW()
-    RETURNING {_ALERT_COLUMNS}
-"""
 
 
 async def upsert_alert(
@@ -249,8 +299,22 @@ async def upsert_alert(
     Callers should run this inside an existing transaction if they want the
     insert to roll back atomically with their own writes.
     """
+    cols = await _alert_select_columns(conn)
     row = await conn.fetchrow(
-        _UPSERT_QUERY,
+        f"""
+        INSERT INTO notification_alerts (
+            organization_id, depot_id, alert_type, severity, title, detail, dedup_key
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+        ON CONFLICT (organization_id, dedup_key) WHERE status != 'resolved'
+        DO UPDATE SET
+            last_occurrence_at = NOW(),
+            occurrence_count   = notification_alerts.occurrence_count + 1,
+            severity           = EXCLUDED.severity,
+            title              = EXCLUDED.title,
+            detail             = EXCLUDED.detail,
+            updated_at         = NOW()
+        RETURNING {cols}
+        """,
         organization_id,
         depot_id,
         alert_type,
@@ -279,6 +343,7 @@ async def resolve_alert(
     condition clears (e.g. successful charger auth after a string of
     failures).
     """
+    cols = await _alert_select_columns(conn)
     row = await conn.fetchrow(
         f"""
         UPDATE notification_alerts
@@ -288,7 +353,7 @@ async def resolve_alert(
          WHERE organization_id = $1
            AND dedup_key = $2
            AND status != 'resolved'
-         RETURNING {_ALERT_COLUMNS}
+         RETURNING {cols}
         """,
         organization_id,
         dedup_key,
@@ -364,13 +429,209 @@ async def update_delivery_status(
     return result.endswith(" 0") is False
 
 
+async def list_for_org(
+    conn: Any,
+    org_id: UUID,
+    *,
+    status_filter: Optional[str] = None,
+    severity_filter: Optional[str] = None,
+    depot_id_filter: Optional[UUID] = None,
+    alert_type_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 25,
+) -> tuple[list[Alert], int]:
+    """Paginated org-scoped alert list for GET /alerts.
+
+    Returns (items, total_count). Sorted by severity DESC then recency.
+    """
+    conditions: list[str] = ["organization_id = $1"]
+    params: list[Any] = [org_id]
+    idx = 2
+
+    if status_filter is not None:
+        conditions.append(f"status = ${idx}")
+        params.append(status_filter)
+        idx += 1
+
+    if severity_filter is not None:
+        conditions.append(f"severity = ${idx}")
+        params.append(severity_filter)
+        idx += 1
+
+    if depot_id_filter is not None:
+        conditions.append(f"depot_id = ${idx}")
+        params.append(depot_id_filter)
+        idx += 1
+
+    if alert_type_filter is not None:
+        conditions.append(f"alert_type = ${idx}")
+        params.append(alert_type_filter)
+        idx += 1
+
+    where = " AND ".join(conditions)
+
+    total: int = int(
+        await conn.fetchval(
+            f"SELECT COUNT(*) FROM notification_alerts WHERE {where}",
+            *params,
+        )
+        or 0
+    )
+
+    offset = (page - 1) * page_size
+    cols = await _alert_select_columns(conn)
+    rows = await conn.fetch(
+        f"""
+        SELECT {cols}
+          FROM notification_alerts
+         WHERE {where}
+         ORDER BY severity_level DESC, last_occurrence_at DESC
+         LIMIT ${idx} OFFSET ${idx + 1}
+        """,
+        *params,
+        page_size,
+        offset,
+    )
+    return [Alert.from_record(r) for r in rows], total
+
+
+async def acknowledge_for_org(
+    conn: Any,
+    alert_id: UUID,
+    *,
+    org_id: UUID,
+    user_id: UUID,
+    user_email: Optional[str] = None,
+) -> Optional[Alert]:
+    """Acknowledge an active alert scoped to an org.
+
+    Returns the updated row, or None when the alert is not found, doesn't
+    belong to the org, or is not in 'active' state.
+    """
+    cols = await _alert_select_columns(conn)
+    use_email_col = cols == _ALERT_COLUMNS
+    try:
+        if use_email_col:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'acknowledged',
+                       acknowledged_at = NOW(),
+                       acknowledged_by = $3,
+                       acknowledged_by_email = $4,
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status = 'active'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+                user_email,
+            )
+        else:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'acknowledged',
+                       acknowledged_at = NOW(),
+                       acknowledged_by = $3,
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status = 'active'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+            )
+    except Exception as exc:
+        if _is_undefined_column_error(exc):
+            reset_column_probe()
+        raise
+    return Alert.from_record(row) if row else None
+
+
+async def resolve_by_id(
+    conn: Any,
+    alert_id: UUID,
+    *,
+    org_id: UUID,
+    user_id: Optional[UUID] = None,
+    user_email: Optional[str] = None,
+) -> Optional[Alert]:
+    """Resolve an active or acknowledged alert by id within an org.
+
+    Preserves existing acknowledged_by/email via COALESCE.
+    Returns the updated row, or None when not found or already resolved.
+    """
+    cols = await _alert_select_columns(conn)
+    use_email_col = cols == _ALERT_COLUMNS
+    try:
+        if use_email_col:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'resolved',
+                       resolved_at = NOW(),
+                       acknowledged_by = COALESCE(acknowledged_by, $3),
+                       acknowledged_by_email = COALESCE(acknowledged_by_email, $4),
+                       acknowledged_at = COALESCE(
+                           acknowledged_at,
+                           CASE WHEN COALESCE(acknowledged_by, $3) IS NOT NULL THEN NOW() END
+                       ),
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status != 'resolved'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+                user_email,
+            )
+        else:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE notification_alerts
+                   SET status = 'resolved',
+                       resolved_at = NOW(),
+                       acknowledged_by = COALESCE(acknowledged_by, $3),
+                       acknowledged_at = COALESCE(
+                           acknowledged_at,
+                           CASE WHEN COALESCE(acknowledged_by, $3) IS NOT NULL THEN NOW() END
+                       ),
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND organization_id = $2
+                   AND status != 'resolved'
+                 RETURNING {cols}
+                """,
+                alert_id,
+                org_id,
+                user_id,
+            )
+    except Exception as exc:
+        if _is_undefined_column_error(exc):
+            reset_column_probe()
+        raise
+    return Alert.from_record(row) if row else None
+
+
 __all__ = [
     "Alert",
+    "reset_column_probe",
     "claim_pending_alerts",
     "mark_notified",
     "list_for_depot",
+    "list_for_org",
     "get_by_id",
     "acknowledge",
+    "acknowledge_for_org",
+    "resolve_by_id",
     "upsert_alert",
     "resolve_alert",
     "record_delivery",
