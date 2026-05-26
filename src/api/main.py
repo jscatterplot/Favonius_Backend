@@ -17,7 +17,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from datetime import time as _dt_time
 from datetime import timedelta, timezone
@@ -8219,27 +8219,7 @@ async def get_depot_alerts(
 
                 rows = await _list_alerts(conn, UUID(depot_id), statuses=("active", "acknowledged"))
                 notification_alerts = [
-                    NotificationAlertItem(
-                        alert_id=str(a.id),
-                        organization_id=str(a.organization_id),
-                        depot_id=str(a.depot_id) if a.depot_id else None,
-                        depot_name=depot_name,
-                        alert_type=a.alert_type,
-                        severity=a.severity.value,
-                        subject=a.title,
-                        body=a.detail,
-                        dedup_key=a.dedup_key,
-                        status=a.status,
-                        first_seen_at=a.first_occurrence_at.isoformat(),
-                        last_seen_at=a.last_occurrence_at.isoformat(),
-                        occurrence_count=a.occurrence_count,
-                        acknowledged_by=str(a.acknowledged_by) if a.acknowledged_by else None,
-                        resolved_at=a.resolved_at.isoformat() if a.resolved_at else None,
-                        last_notified_at=(
-                            a.last_notified_at.isoformat() if a.last_notified_at else None
-                        ),
-                    )
-                    for a in rows
+                    _alert_to_notification_item(a, depot_name=depot_name) for a in rows
                 ]
         except asyncpg.UndefinedTableError:
             logger.debug("notification_alerts table not present; skipping")
@@ -12550,11 +12530,14 @@ async def _handle_alerts_acknowledge(
             detail=f"Alert {alert_id} has status '{existing.status}'; only active alerts can be acknowledged",
         )
 
-    if dry_run:
-        from src.notifications.alerts import Alert as _Alert
+    actor_uuid = _parse_actor_uuid(actor_raw)
 
-        # Return projected result without persisting.  Re-use existing depot_name
-        # lookup only when a static pool is available.
+    if dry_run:
+        projected = _project_alert_acknowledged(
+            existing,
+            user_id=actor_uuid,
+            user_email=acknowledged_by_email,
+        )
         depot_name: Optional[str] = None
         if existing.depot_id and db_pools:
             async with db_pools.static.acquire() as sc:
@@ -12562,14 +12545,14 @@ async def _handle_alerts_acknowledge(
                     "SELECT name FROM sites WHERE id = $1", existing.depot_id
                 )
                 depot_name = row["name"] if row else None
-        return _alert_to_notification_item(existing, depot_name=depot_name).model_dump()
+        return _alert_to_notification_item(projected, depot_name=depot_name).model_dump()
 
     async with db_pools.ts.acquire() as conn:
         updated = await alerts_repo.acknowledge_for_org(
             conn,
             UUID(alert_id),
             org_id=UUID(str(org_id)),
-            user_id=UUID(str(actor_raw)),
+            user_id=actor_uuid,
             user_email=acknowledged_by_email,
         )
 
@@ -12631,7 +12614,14 @@ async def _handle_alerts_resolve(
             status_code=409, detail=f"Alert {alert_id} is already resolved"
         )
 
+    actor_uuid = _parse_actor_uuid(actor_raw)
+
     if dry_run:
+        projected = _project_alert_resolved(
+            existing,
+            user_id=actor_uuid,
+            user_email=acknowledged_by_email,
+        )
         depot_name = None
         if existing.depot_id and db_pools:
             async with db_pools.static.acquire() as sc:
@@ -12639,13 +12629,7 @@ async def _handle_alerts_resolve(
                     "SELECT name FROM sites WHERE id = $1", existing.depot_id
                 )
                 depot_name = row["name"] if row else None
-        return _alert_to_notification_item(existing, depot_name=depot_name).model_dump()
-
-    actor_uuid: Optional[UUID] = None
-    try:
-        actor_uuid = UUID(str(actor_raw))
-    except (TypeError, ValueError):
-        pass
+        return _alert_to_notification_item(projected, depot_name=depot_name).model_dump()
 
     async with db_pools.ts.acquire() as conn:
         updated = await alerts_repo.resolve_by_id(
@@ -12888,6 +12872,54 @@ async def acknowledge_notification_alert(
         id=str(updated.id),
         status=updated.status,
         acknowledged_at=updated.acknowledged_at.isoformat(),
+    )
+
+
+def _parse_actor_uuid(actor_raw: Any) -> Optional[UUID]:
+    """Parse JWT sub to UUID; return None when malformed (matches resolve path)."""
+    try:
+        return UUID(str(actor_raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _project_alert_acknowledged(
+    alert: Any,
+    *,
+    user_id: Optional[UUID],
+    user_email: Optional[str],
+) -> Any:
+    """Dry-run projection of acknowledge_for_org outcome."""
+    now = datetime.now(timezone.utc)
+    return replace(
+        alert,
+        status="acknowledged",
+        acknowledged_at=now,
+        acknowledged_by=user_id,
+        acknowledged_by_email=user_email,
+    )
+
+
+def _project_alert_resolved(
+    alert: Any,
+    *,
+    user_id: Optional[UUID],
+    user_email: Optional[str],
+) -> Any:
+    """Dry-run projection of resolve_by_id outcome."""
+    now = datetime.now(timezone.utc)
+    ack_by = alert.acknowledged_by if alert.acknowledged_by is not None else user_id
+    ack_email = alert.acknowledged_by_email if alert.acknowledged_by_email is not None else user_email
+    ack_at = alert.acknowledged_at
+    if ack_at is None and ack_by is not None:
+        ack_at = now
+    return replace(
+        alert,
+        status="resolved",
+        resolved_at=now,
+        acknowledged_by=ack_by,
+        acknowledged_by_email=ack_email,
+        acknowledged_at=ack_at,
     )
 
 

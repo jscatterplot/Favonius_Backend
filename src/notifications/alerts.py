@@ -485,6 +485,10 @@ async def resolve_by_id(
                resolved_at = NOW(),
                acknowledged_by = COALESCE(acknowledged_by, $3),
                acknowledged_by_email = COALESCE(acknowledged_by_email, $4),
+               acknowledged_at = COALESCE(
+                   acknowledged_at,
+                   CASE WHEN COALESCE(acknowledged_by, $3) IS NOT NULL THEN NOW() END
+               ),
                updated_at = NOW()
          WHERE id = $1
            AND organization_id = $2
