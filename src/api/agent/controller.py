@@ -436,16 +436,14 @@ async def run_turn(
         # messages that fall through to the "fallback" branch (i.e. non-
         # consumption, non-empty) could ever route to sql_general, so we
         # defer the static-DB org lookup until we know it's actually needed.
-        # favonius_admin tokens carry no org claim but always get SQL mode.
+        # fetch_org_sql_enabled returns True for None org_id (admin/system
+        # callers), so no separate role check is required here.
         if is_sql_mode_enabled():
             _pre = planner_classify(message, sql_mode_allowed=False)
             if _pre.reason == "consumption_fallback_no_sql_mode":
-                if auth.role == "favonius_admin":
-                    sql_mode_allowed = True
-                else:
-                    sql_mode_allowed = await fetch_org_sql_enabled(
-                        static_pool, auth.organization_id
-                    )
+                sql_mode_allowed = await fetch_org_sql_enabled(
+                    static_pool, auth.organization_id
+                )
                 decision = planner_classify(message, sql_mode_allowed=sql_mode_allowed)
             else:
                 decision = _pre
