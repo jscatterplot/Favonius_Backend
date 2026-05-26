@@ -44,7 +44,9 @@ BEGIN
           AND t.energy_kwh IS NULL;
 
         -- Step 3: insert orphan telemetry_samples rows that have no matching
-        -- telemetry row (gaps before migration 035 introduced the wide table)
+        -- telemetry row (gaps before migration 035 introduced the wide table).
+        -- Include transaction_id so session-scoped reads (get_session_energy_kwh,
+        -- backfill_terra_meter_start) can locate these rows by transaction_id.
         INSERT INTO telemetry (time, station_id, connector_id, transaction_id, energy_kwh)
         SELECT
             time,
