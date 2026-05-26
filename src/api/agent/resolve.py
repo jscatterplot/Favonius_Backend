@@ -107,6 +107,9 @@ _VEHICLE_MATCH_LIMIT = 100
 _VEHICLE_STOPWORDS: frozenset[str] = frozenset(
     {"the", "a", "an", "all", "our", "my", "show", "me", "of", "for", "and"}
 )
+_VEHICLE_FLEET_WORDS: frozenset[str] = frozenset(
+    {"all", "fleet", "fleets", "vehicles", "vans", "buses", "cars", "trucks"}
+)
 
 
 def _vehicle_tokens(text: str) -> list[str]:
@@ -151,6 +154,12 @@ def _vehicle_match_clause(text: str, start_idx: int) -> tuple[str, list[str]]:
             idx += 1
         clauses.append("(" + " OR ".join(ors) + ")")
     return " AND ".join(clauses), params
+
+
+def _is_fleet_vehicle_mention(text: str) -> bool:
+    """Heuristic: treat clearly-plural/collective mentions as fleet-wide."""
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return any(tok in _VEHICLE_FLEET_WORDS for tok in tokens)
 
 
 async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> list[ResolvedEntity]:
@@ -216,7 +225,7 @@ async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> li
     if not rows:
         return [ResolvedEntity(kind="vehicle", display=text, primary_id=None)]
 
-    return [
+    candidates = [
         ResolvedEntity(
             kind="vehicle",
             display=f"{row['display_text']} ({row['depot_name']})",
@@ -224,6 +233,9 @@ async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> li
         )
         for row in rows
     ]
+    if _is_fleet_vehicle_mention(text):
+        return candidates
+    return _wrap_candidates(candidates)
 
 
 async def _resolve_depot(text: str, auth: AuthContext, static_pool: Any) -> list[ResolvedEntity]:

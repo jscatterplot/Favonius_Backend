@@ -380,6 +380,19 @@ class TestResolveVehicle:
         assert call.args[3:] == ("%renault%", "%vans%", "%van%")
         assert " AND " in call.args[0]
 
+    async def test_specific_vehicle_multi_match_collapses_to_disambiguation(self, fake_static_pool):
+        v1, v2 = uuid4(), uuid4()
+        fake_static_pool.fetch = AsyncMock(
+            return_value=[
+                {"vehicle_id": v1, "display_text": "Bus 42", "depot_id": DEPOT_A, "depot_name": "Vilnius"},
+                {"vehicle_id": v2, "display_text": "Bus 421", "depot_id": DEPOT_A, "depot_name": "Vilnius"},
+            ]
+        )
+        result = await _resolve_vehicle("bus 42", _customer_auth(), fake_static_pool)
+        assert len(result) == 1
+        assert result[0].primary_id == v1
+        assert [c.primary_id for c in result[0].candidates] == [v1, v2]
+
 
 class TestVehicleMatchClause:
     """Direct coverage of the token-AND ILIKE clause builder.

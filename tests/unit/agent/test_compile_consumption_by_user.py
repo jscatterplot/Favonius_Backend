@@ -36,6 +36,8 @@ CARD_2 = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 CARD_3 = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
 VEHICLE_1 = UUID("e0000001-0000-4000-8000-000000000001")
 VEHICLE_2 = UUID("e0000002-0000-4000-8000-000000000002")
+DEPOT_A = UUID("d0000001-0000-4000-8000-000000000001")
+DEPOT_B = UUID("d0000002-0000-4000-8000-000000000002")
 
 EXPECTED_SQL = """
         SELECT
@@ -77,15 +79,16 @@ EXPECTED_VEHICLE_SQL = """
 
 EXPECTED_DEPOT_WIDE_SQL = """
         SELECT
-            DATE_TRUNC('day', cs.start_time AT TIME ZONE $4) AS day_local,
+            DATE_TRUNC('day', cs.start_time AT TIME ZONE $5) AS day_local,
             SUM(cs.energy_delivered_kwh) AS energy_kwh,
             SUM(cs.cost_total)           AS cost_total,
             COUNT(*)                     AS session_count,
             COUNT(cs.energy_delivered_kwh) AS energy_sample_count
         FROM charging_sessions cs
         WHERE cs.station_id = ANY($1::text[])
-          AND cs.start_time >= $2
-          AND cs.start_time <  $3
+          AND cs.site_id = ANY($2::uuid[])
+          AND cs.start_time >= $3
+          AND cs.start_time <  $4
         GROUP BY day_local
         ORDER BY day_local
 """
@@ -300,12 +303,13 @@ class TestDepotWidePath:
     def test_station_ids_produce_depot_wide_sql(self):
         """``station_ids`` compiles the no-subject depot-wide form."""
         sql, params = compile_consumption_by_user(
-            _plan(), [], _window(), station_ids=["CP-1", "CP-2"]
+            _plan(), [], _window(), station_ids=["CP-1", "CP-2"], depot_ids=[DEPOT_A, DEPOT_B]
         )
 
         assert sql == EXPECTED_DEPOT_WIDE_SQL
         assert params == [
             ["CP-1", "CP-2"],
+            [DEPOT_A, DEPOT_B],
             _window().start_utc,
             _window().end_utc,
             "Europe/Vilnius",
@@ -313,7 +317,9 @@ class TestDepotWidePath:
 
     def test_empty_station_ids_still_compiles(self):
         """A depot with zero chargers compiles (empty ANY → no rows)."""
-        sql, params = compile_consumption_by_user(_plan(), [], _window(), station_ids=[])
+        sql, params = compile_consumption_by_user(
+            _plan(), [], _window(), station_ids=[], depot_ids=[]
+        )
         assert sql == EXPECTED_DEPOT_WIDE_SQL
         assert params[0] == []
 

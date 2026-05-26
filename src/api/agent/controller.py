@@ -331,21 +331,24 @@ async def _depot_wide_consumption_rows(
     stations = await load_depot_stations(static_pool, auth.visible_depot_ids)
 
     groups: dict[str, list[str]] = {}
-    tz_depot: dict[str, UUID] = {}
+    tz_depots: dict[str, set[UUID]] = {}
     for station in stations:
         depot_id = station["depot_id"]
         tz = station["timezone"] or depot_tzs.get(depot_id) or "UTC"
         groups.setdefault(tz, []).append(station["ocpp_id"])
-        tz_depot.setdefault(tz, depot_id)
+        tz_depots.setdefault(tz, set()).add(depot_id)
 
     rows_list: list[dict[str, Any]] = []
     window: Optional[ResolvedTimeWindow] = None
     for tz, ocpp_ids in groups.items():
-        depot_id = tz_depot[tz]
+        depot_ids = sorted(tz_depots[tz], key=str)
+        depot_id = depot_ids[0]
         group_window = resolve_time_window(plan.time_window, [depot_id], {depot_id: tz})
         if window is None:
             window = group_window
-        sql, params = compile_consumption_by_user(plan, [], group_window, station_ids=ocpp_ids)
+        sql, params = compile_consumption_by_user(
+            plan, [], group_window, station_ids=ocpp_ids, depot_ids=depot_ids
+        )
         rows = await ts_pool.fetch(sql, *params)
         rows_list.extend(dict(r) for r in rows)
 
