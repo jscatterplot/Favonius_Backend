@@ -28,6 +28,7 @@ never leaked back to the client per the security review.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any, Optional, Protocol
@@ -35,6 +36,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.api.agent import budget
 from src.api.agent.audit import (
     agent_runs_close,
     agent_runs_open,
@@ -74,6 +76,7 @@ from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.monitoring.metrics import (
     AGENT_RESOLVER_MISSES,
+    AGENT_SQL_BUDGET_REFUSED,
     AGENT_SQL_TOOL_TURNS,
 )
 
@@ -154,16 +157,24 @@ class AgentReply(BaseModel):
     - ``error``           — the orchestrator failed; ``text`` is a generic
                             user-facing message (the cause is logged
                             server-side and never leaked here).
+    - ``refused``         — a pre-LLM refusal; ``reason`` is a stable
+                            machine-readable code (e.g.
+                            ``monthly_budget_exceeded``) and ``text`` is the
+                            user-facing message. No Anthropic tokens consumed.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     run_id: UUID
-    status: str = Field(..., description="success | disambiguation | not_found | error")
+    status: str = Field(..., description="success | disambiguation | not_found | error | refused")
     text: str
     intent: Optional[str] = None
     candidates: list[_CandidateOption] = Field(default_factory=list)
     not_found: list[str] = Field(default_factory=list)
+    reason: Optional[str] = Field(
+        default=None,
+        description="Machine-readable code for status='refused' (e.g. monthly_budget_exceeded).",
+    )
 
     @classmethod
     def success(cls, *, run_id: UUID, intent: str, text: str) -> "AgentReply":
@@ -216,6 +227,22 @@ class AgentReply(BaseModel):
             intent=intent,
             not_found=labels,
         )
+
+    @classmethod
+    def refused(
+        cls,
+        *,
+        run_id: UUID,
+        reason: str,
+        text: str,
+        intent: Optional[str] = None,
+    ) -> "AgentReply":
+        """A pre-LLM refusal (e.g. the per-org monthly token budget, S4).
+
+        ``reason`` is the stable machine-readable code the frontend keys off
+        (``monthly_budget_exceeded``); ``text`` is the human-facing message.
+        """
+        return cls(run_id=run_id, status="refused", text=text, intent=intent, reason=reason)
 
     @classmethod
     def error(cls, *, run_id: UUID, message: Optional[str] = None) -> "AgentReply":
@@ -441,9 +468,7 @@ async def run_turn(
         if is_sql_mode_enabled():
             _pre = planner_classify(message, sql_mode_allowed=False)
             if _pre.reason == "consumption_fallback_no_sql_mode":
-                sql_mode_allowed = await fetch_org_sql_enabled(
-                    static_pool, auth.organization_id
-                )
+                sql_mode_allowed = await fetch_org_sql_enabled(static_pool, auth.organization_id)
                 decision = planner_classify(message, sql_mode_allowed=sql_mode_allowed)
             else:
                 decision = _pre
@@ -781,12 +806,35 @@ async def _run_sql_general_turn(
     paths. Per-tool-call step events flow into both ``agent_runs`` and
     the SSE stream via the ``on_step`` callback.
     """
-    from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
-
-    client = agent_llm._get_client()
-    config = agent_llm.CONFIG
-
-    registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
+    # S4 per-org monthly token budget — gate FIRST, before importing the llm
+    # module or building any Anthropic client. A None reservation means the org
+    # is over its monthly ceiling: refuse here, touching ZERO Anthropic code
+    # (no llm import, no _get_client, no messages.create), and record a
+    # first-class 'refused' / budget_exceeded outcome. system_prompt is reused
+    # by run_qa_turn below when we proceed.
+    system_prompt = build_sql_agent_system_prompt()
+    est_tokens = budget.estimate_turn_tokens(system_prompt)
+    reservation = await budget.check_and_reserve(auth.organization_id, est_tokens)
+    if reservation is None:
+        AGENT_SQL_BUDGET_REFUSED.labels(
+            organization_id=str(auth.organization_id) if auth.organization_id else "none"
+        ).inc()
+        await agent_runs_step(ts_pool, run_id, "budget_refused", {"est_tokens": est_tokens})
+        reply = AgentReply.refused(
+            run_id=run_id,
+            reason="monthly_budget_exceeded",
+            text=(
+                "This organisation has reached its monthly usage limit for the "
+                "analytics assistant. The limit resets at the start of next month — "
+                "contact your administrator if you need it raised."
+            ),
+            intent="sql_general",
+        )
+        await agent_runs_close(
+            ts_pool, run_id, "refused", reply, failure_reason=classify_failure("refused")
+        )
+        await _emit_answer_safe(sse, reply, run_id)
+        return reply
 
     async def _on_step(tool_call: Any) -> None:
         name = tool_call.name
@@ -822,10 +870,22 @@ async def _run_sql_general_turn(
     # exc.iterations) right next to where the path is decided. One
     # observation per path; no shared mutable state.
     try:
+        # Import + build the client + registry INSIDE the try so a failure here
+        # (the llm module import eagerly loads the Anthropic SDK + validates
+        # config; or _get_client/registry init) still reconciles the reservation
+        # via the handlers below — otherwise counter.reserved would leak and
+        # wrongly refuse future turns even though no tokens were spent. Importing
+        # here (not at function top) also keeps the over-budget refusal above
+        # free of any llm dependency.
+        from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
+
+        client = agent_llm._get_client()
+        config = agent_llm.CONFIG
+        registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
         qa = await run_qa_turn(
             anthropic_client=client,
             model=config.model,
-            system_prompt=build_sql_agent_system_prompt(),
+            system_prompt=system_prompt,
             user_message=format_sql_agent_user_message(message),
             tool_registry=registry,
             allowed_tools=SQL_AGENT_TOOL_NAMES,
@@ -838,6 +898,20 @@ async def _run_sql_general_turn(
             effort=config.effort,
             on_step=_on_step,
         )
+    except asyncio.CancelledError as exc:
+        # CancelledError is a BaseException, so it bypasses the `except`
+        # handlers below: reconcile the reservation explicitly so a cancelled
+        # turn (client disconnect / server shutdown / timeout) neither leaks
+        # counter.reserved nor drops already-spent tokens. run_qa_turn attaches
+        # the partial token totals to the exception (it catches BaseException),
+        # so account real usage rather than zero — otherwise repeated
+        # cancellations could incur model cost while bypassing the ceiling.
+        budget.record_actual(
+            reservation,
+            getattr(exc, "input_tokens", 0),
+            getattr(exc, "output_tokens", 0),
+        )
+        raise
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
         # Both exception types carry ``iterations``: ToolNotAllowedError
         # via its ctor; ToolNotRegisteredError via the attribute
@@ -846,6 +920,14 @@ async def _run_sql_general_turn(
         # the histogram at 0, biasing the distribution toward zero on
         # the runs we most need to monitor.
         AGENT_SQL_TOOL_TURNS.observe(_extract_iterations(exc))
+        # Reconcile the budget reservation against tokens actually spent before
+        # the abort (run_qa_turn attaches them to the exception); keeps a failed
+        # turn from leaking its rough estimate into the org's running total.
+        budget.record_actual(
+            reservation,
+            getattr(exc, "input_tokens", 0),
+            getattr(exc, "output_tokens", 0),
+        )
         logger.error("SQL agent tool error: %s", exc)
         # Codex P2: if a disallowed tool aborted the loop AFTER one or
         # more SQL tools had already executed, we still owe those rows
@@ -890,6 +972,11 @@ async def _run_sql_general_turn(
         return reply
     except Exception as exc:
         AGENT_SQL_TOOL_TURNS.observe(_extract_iterations(exc))
+        budget.record_actual(
+            reservation,
+            getattr(exc, "input_tokens", 0),
+            getattr(exc, "output_tokens", 0),
+        )
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
         # Wrap in try/except (Bugbot M-sev): if the audit write fails
         # here it would mask the original exception, swallowing the
@@ -914,6 +1001,9 @@ async def _run_sql_general_turn(
         raise
     else:
         AGENT_SQL_TOOL_TURNS.observe(qa.iterations)
+        # Reconcile the rough reservation against the real usage the loop spent
+        # (summed across every round-trip; see QAResult.input/output_tokens).
+        budget.record_actual(reservation, qa.input_tokens, qa.output_tokens)
 
     # Server-computed audit numbers: rely on the tool-call trace, not the
     # LLM-supplied `row_evidence` (the model can hallucinate that value).

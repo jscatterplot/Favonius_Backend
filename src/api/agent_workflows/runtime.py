@@ -746,7 +746,16 @@ class QAResult:
     back empty (see :func:`_is_empty_result`).
     """
 
-    __slots__ = ("text", "tool_calls", "status", "row_evidence", "iterations", "empty_result")
+    __slots__ = (
+        "text",
+        "tool_calls",
+        "status",
+        "row_evidence",
+        "iterations",
+        "empty_result",
+        "input_tokens",
+        "output_tokens",
+    )
 
     def __init__(
         self,
@@ -757,6 +766,8 @@ class QAResult:
         row_evidence: int = 0,
         iterations: int = 0,
         empty_result: bool = False,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> None:
         self.text = text
         self.tool_calls = tool_calls
@@ -764,6 +775,11 @@ class QAResult:
         self.row_evidence = row_evidence
         self.iterations = iterations
         self.empty_result = empty_result
+        # Accumulated Anthropic usage across every round-trip of the loop. The
+        # S4 token budget reconciles its rough reservation against these via
+        # src/api/agent/budget.py::record_actual.
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 async def run_qa_turn(
@@ -851,6 +867,8 @@ async def run_qa_turn(
     status: str = "success"
     iterations: int = 0
     empty_result: bool = False
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
 
     try:
         for iterations in range(1, max_iterations + 1):
@@ -877,7 +895,9 @@ async def run_qa_turn(
             # WorkflowAgent, but lands the count in the same
             # `AGENT_LLM_TOKENS` metric the consumption path uses so a
             # single dashboard covers both agent paths.
-            _record_qa_tokens(response, model)
+            in_t, out_t = _record_qa_tokens(response, model)
+            total_input_tokens += in_t
+            total_output_tokens += out_t
 
             assistant_content = list(response.content)
             messages.append({"role": "assistant", "content": assistant_content})
@@ -1069,11 +1089,20 @@ async def run_qa_turn(
         else:
             status = "max_iterations"
 
-    except Exception as exc:
+    except BaseException as exc:
+        # BaseException (not just Exception) so asyncio.CancelledError — raised
+        # on client disconnect / shutdown / timeout — also carries the partial
+        # token totals. The controller reconciles the S4 budget against tokens
+        # actually spent before the abort instead of dropping them to zero
+        # (src/api/agent/controller.py); we attach + re-raise, never swallow.
         if not hasattr(exc, "iterations"):
             exc.iterations = iterations  # type: ignore[attr-defined]
         if not hasattr(exc, "tool_calls"):
             exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
+        if not hasattr(exc, "input_tokens"):
+            exc.input_tokens = total_input_tokens  # type: ignore[attr-defined]
+        if not hasattr(exc, "output_tokens"):
+            exc.output_tokens = total_output_tokens  # type: ignore[attr-defined]
         raise
 
     return QAResult(
@@ -1083,6 +1112,8 @@ async def run_qa_turn(
         row_evidence=row_evidence,
         iterations=iterations,
         empty_result=empty_result,
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
     )
 
 
@@ -1111,8 +1142,8 @@ def _is_empty_result(tool_calls: list[ToolCall]) -> bool:
     return saw_run_select and total_rows == 0
 
 
-def _record_qa_tokens(response: Any, model: str) -> None:
-    """Increment AGENT_LLM_TOKENS from an Anthropic response's usage block.
+def _record_qa_tokens(response: Any, model: str) -> tuple[int, int]:
+    """Increment AGENT_LLM_TOKENS and return the ``(input, output)`` token pair.
 
     Used by ``run_qa_turn`` after every API round-trip in the SQL-mode
     tool-use loop. Lands counts in the same metric the consumption
@@ -1120,16 +1151,21 @@ def _record_qa_tokens(response: Any, model: str) -> None:
     dashboard panel covers both agent paths. WorkflowAgent uses a
     DIFFERENT metric (`WORKFLOW_LLM_TOKENS`) because workflows are a
     distinct product surface.
+
+    Returns the per-round-trip token counts (``(0, 0)`` when the response
+    carries no usage block) so the caller can accumulate them onto the
+    :class:`QAResult` for the S4 budget reconciliation.
     """
     usage = getattr(response, "usage", None)
     if usage is None:
-        return
-    in_tokens = getattr(usage, "input_tokens", 0) or 0
-    out_tokens = getattr(usage, "output_tokens", 0) or 0
+        return (0, 0)
+    in_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    out_tokens = int(getattr(usage, "output_tokens", 0) or 0)
     if in_tokens:
         AGENT_LLM_TOKENS.labels(model=model, direction="input").inc(in_tokens)
     if out_tokens:
         AGENT_LLM_TOKENS.labels(model=model, direction="output").inc(out_tokens)
+    return (in_tokens, out_tokens)
 
 
 async def _dispatch_on_step(cb: Callable[[ToolCall], Any], tc: ToolCall) -> None:
