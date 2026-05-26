@@ -102,7 +102,12 @@ async def run_backfill(
         async for raw in client.iter_vehicle_history(
             vehicle_id=nav_id, start_iso=start_iso, end_iso=end_iso
         ):
-            reading = navirec_vehicle_to_reading(raw)
+            if "licensePlate" in raw or "plate" in raw:
+                reading_input = raw
+            else:
+                reading_input = dict(raw)
+                reading_input["licensePlate"] = plate
+            reading = navirec_vehicle_to_reading(reading_input)
             if reading is None:
                 continue
             rows_by_depot.setdefault(vehicle_depot, []).append(_reading_to_row(vehicle_id, reading))

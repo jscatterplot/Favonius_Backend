@@ -341,28 +341,49 @@ class StateAssembler:
             # 15-min freshness check (data_freshness.MAX_TELEMETRY_AGE) still
             # governs whether a SoC is fresh enough to optimize on.
             async with self.pools.ts.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT DISTINCT ON (vehicle_id)
-                        vehicle_id::text AS vehicle_id,
-                        soc
-                    FROM (
-                        SELECT vehicle_id, soc, time
+                try:
+                    rows = await conn.fetch(
+                        """
+                        SELECT DISTINCT ON (vehicle_id)
+                            vehicle_id::text AS vehicle_id,
+                            soc
+                        FROM (
+                            SELECT vehicle_id, soc, time
+                            FROM telemetry
+                            WHERE vehicle_id = ANY($1::uuid[])
+                              AND soc IS NOT NULL
+                              AND time > now() - INTERVAL '24 hours'
+                            UNION ALL
+                            SELECT vehicle_id, soc, time
+                            FROM vehicle_telemetry
+                            WHERE vehicle_id = ANY($1::uuid[])
+                              AND soc IS NOT NULL
+                              AND time > now() - INTERVAL '24 hours'
+                        ) merged
+                        ORDER BY vehicle_id, time DESC
+                        """,
+                        vehicle_ids,
+                    )
+                except asyncpg.UndefinedTableError as e:
+                    logger.warning(
+                        "vehicle_telemetry table unavailable for depot %s, "
+                        "falling back to telemetry-only SoC query: %s",
+                        self.depot_id,
+                        e,
+                    )
+                    rows = await conn.fetch(
+                        """
+                        SELECT DISTINCT ON (vehicle_id)
+                            vehicle_id::text AS vehicle_id,
+                            soc
                         FROM telemetry
                         WHERE vehicle_id = ANY($1::uuid[])
                           AND soc IS NOT NULL
                           AND time > now() - INTERVAL '24 hours'
-                        UNION ALL
-                        SELECT vehicle_id, soc, time
-                        FROM vehicle_telemetry
-                        WHERE vehicle_id = ANY($1::uuid[])
-                          AND soc IS NOT NULL
-                          AND time > now() - INTERVAL '24 hours'
-                    ) merged
-                    ORDER BY vehicle_id, time DESC
-                    """,
-                    vehicle_ids,
-                )
+                        ORDER BY vehicle_id, time DESC
+                        """,
+                        vehicle_ids,
+                    )
 
             result = {
                 str(row["vehicle_id"]): float(row["soc"]) for row in rows if row["soc"] is not None

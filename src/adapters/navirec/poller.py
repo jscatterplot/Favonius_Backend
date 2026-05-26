@@ -210,6 +210,9 @@ async def poll_once(
         if reading is None:
             continue
         age = now - reading.time
+        if age < timedelta(0):
+            stale_dropped += 1
+            continue
         if age > _LIVE_MAX_AGE:
             stale_dropped += 1
             continue
