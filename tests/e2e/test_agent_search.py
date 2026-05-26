@@ -180,7 +180,7 @@ CREATE TABLE audit_log (
 _SEED_SQL = f"""
 SET search_path TO {_TEST_SCHEMA};
 
-INSERT INTO organizations VALUES
+INSERT INTO organizations (id, name) VALUES
     ('{_ORG_A}', 'Org A (pilot)'),
     ('{_ORG_B}', 'Org B (other)');
 
