@@ -497,8 +497,8 @@ async def acknowledge_for_org(
     belong to the org, or is not in 'active' state.
     """
     cols = await _alert_select_columns(conn)
-    has_ack_email = cols == _ALERT_COLUMNS
-    if has_ack_email:
+    use_email_col = cols == _ALERT_COLUMNS
+    if use_email_col:
         row = await conn.fetchrow(
             f"""
             UPDATE notification_alerts
@@ -551,8 +551,8 @@ async def resolve_by_id(
     Returns the updated row, or None when not found or already resolved.
     """
     cols = await _alert_select_columns(conn)
-    has_ack_email = cols == _ALERT_COLUMNS
-    if has_ack_email:
+    use_email_col = cols == _ALERT_COLUMNS
+    if use_email_col:
         row = await conn.fetchrow(
             f"""
             UPDATE notification_alerts

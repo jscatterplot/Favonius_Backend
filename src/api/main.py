@@ -13021,6 +13021,10 @@ async def list_org_alerts(
     if not db_pools:
         raise DatabaseError("Database not available")
 
+    role = get_user_role(user)
+    if not has_permission(role, Permission.DEPOT_VIEW):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
     org_id = get_user_organization_id(user)
     if not org_id:
         raise HTTPException(
@@ -13053,8 +13057,8 @@ async def list_org_alerts(
                 page=page,
                 page_size=page_size,
             )
-    except asyncpg.UndefinedTableError:
-        logger.debug("notification_alerts table not present; returning empty list")
+    except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError) as exc:
+        logger.warning("notification_alerts schema unavailable, returning empty list: %s", exc)
 
     # Batch-fetch depot names from static pool
     unique_depot_ids = [a.depot_id for a in alerts_list if a.depot_id is not None]
