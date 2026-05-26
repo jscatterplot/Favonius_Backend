@@ -248,21 +248,18 @@ class TimescaleClient:
                         transaction_id = self._coerce_transaction_id(session_id)
 
                         raw_sample = data.get("raw_sample")
-                        # Compute per-row energy from this raw sample first. Falling
-                        # back to frame-level energy for non-raw paths keeps legacy
-                        # callers functional, but row writes must not inherit a later
-                        # register value from the same MeterValues frame.
-                        meter_wh = self._extract_register_wh(raw_sample) if raw_sample else None
-                        energy_kwh = (meter_wh / 1000.0) if meter_wh is not None else data.get("energy_kwh")
 
-                        # Live session metrics: keep the open charging_sessions row
-                        # fresh so per-charger power/SoC is observable in real time
-                        # without requiring vehicle attribution. When this row
-                        # carries an Energy.Active.Import.Register sample we also
-                        # advance last_meter_wh / energy_delivered_kwh on the
-                        # session — that is the running-meter source of truth the
-                        # orphan-recovery job falls back to when StopTransaction
-                        # is missing.
+                        # Derive energy_kwh from the individual sample so that
+                        # SoC and power rows don't inherit the frame-level register
+                        # reading. Non-register measurands get energy_kwh=NULL,
+                        # which keeps get_session_energy_kwh's delta calculation
+                        # clean. For frame-level rows (no raw_sample) fall back to
+                        # the aggregated energy_kwh that the callback extracted.
+                        meter_wh = self._extract_register_wh(raw_sample) if raw_sample else None
+                        if raw_sample is not None:
+                            energy_kwh = meter_wh / 1000.0 if meter_wh is not None else None
+                        else:
+                            energy_kwh = data.get("energy_kwh")
                         if station_id and transaction_id is not None:
                             await self._update_session_live_metrics(
                                 conn,
