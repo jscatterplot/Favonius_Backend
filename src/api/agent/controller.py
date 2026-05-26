@@ -47,7 +47,10 @@ from src.api.agent.auth_context import (
     ResolvedTimeWindow,
     build_auth_context,
 )
-from src.api.agent.intents.consumption_by_user import compile_consumption_by_user
+from src.api.agent.intents.consumption_by_user import (
+    compile_consumption_by_user,
+    summarize_consumption_rows,
+)
 from src.api.agent.plan import QueryPlan
 from src.api.agent.planner import classify as planner_classify
 from src.api.agent.prompts import (
@@ -55,6 +58,7 @@ from src.api.agent.prompts import (
     format_sql_agent_user_message,
 )
 from src.api.agent.resolve import (
+    load_depot_stations,
     load_depot_timezones,
     resolve_entities,
     resolve_time_window,
@@ -95,6 +99,8 @@ class LLMClient(Protocol):
         resolved: list[dict[str, Any]],
         window: dict[str, Any],
         rows: list[dict[str, Any]],
+        *,
+        result_summary: Optional[dict[str, Any]] = None,
     ) -> str:
         """Format a SQL result set into a natural-language reply."""
 
@@ -113,10 +119,12 @@ class RealLLMClient:
         resolved: list[dict[str, Any]],
         window: dict[str, Any],
         rows: list[dict[str, Any]],
+        *,
+        result_summary: Optional[dict[str, Any]] = None,
     ) -> str:
         from src.api.agent import llm
 
-        return await llm.format_answer(plan, resolved, window, rows)
+        return await llm.format_answer(plan, resolved, window, rows, result_summary=result_summary)
 
 
 # ── Reply shape ────────────────────────────────────────────────────────────
@@ -297,6 +305,67 @@ async def _emit_answer_safe(
         )
 
 
+# ── Depot-wide consumption (no named subject) ──────────────────────────────
+
+
+async def _depot_wide_consumption_rows(
+    static_pool: Any,
+    ts_pool: Any,
+    auth: Any,
+    plan: QueryPlan,
+) -> tuple[list[dict[str, Any]], ResolvedTimeWindow, int]:
+    """Aggregate consumption across every charger in the caller's depots.
+
+    The tenant boundary is the set of charger ``station_id``\\ s belonging
+    to ``auth.visible_depot_ids`` (resolved server-side via
+    :func:`load_depot_stations`) — never an LLM-supplied value. Sessions
+    are summed one query per depot **timezone group**, a bounded loop that
+    collapses to a single iteration for the common single-timezone org and
+    keeps each ``DATE_TRUNC`` bucket anchored to the right local day.
+
+    Returns the concatenated rows, a representative resolved window (the
+    first timezone group's, used only for the formatter's period context),
+    and the number of timezone groups for the audit trail.
+    """
+    depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
+    stations = await load_depot_stations(static_pool, auth.visible_depot_ids)
+
+    groups: dict[str, list[str]] = {}
+    tz_depot: dict[str, UUID] = {}
+    for station in stations:
+        depot_id = station["depot_id"]
+        tz = station["timezone"] or depot_tzs.get(depot_id) or "UTC"
+        groups.setdefault(tz, []).append(station["ocpp_id"])
+        tz_depot.setdefault(tz, depot_id)
+
+    rows_list: list[dict[str, Any]] = []
+    window: Optional[ResolvedTimeWindow] = None
+    for tz, ocpp_ids in groups.items():
+        depot_id = tz_depot[tz]
+        group_window = resolve_time_window(plan.time_window, [depot_id], {depot_id: tz})
+        if window is None:
+            window = group_window
+        sql, params = compile_consumption_by_user(plan, [], group_window, station_ids=ocpp_ids)
+        rows = await ts_pool.fetch(sql, *params)
+        rows_list.extend(dict(r) for r in rows)
+
+    if window is None:
+        # No chargers to scope to (depot has none, or org has no depots).
+        # Resolve a best-effort window so the formatter can still report
+        # "no sessions" against the period the user actually asked about.
+        if auth.visible_depot_ids:
+            fallback_depot = auth.visible_depot_ids[0]
+            fallback_tz = depot_tzs.get(fallback_depot) or "UTC"
+        else:
+            fallback_depot = UUID("00000000-0000-0000-0000-000000000000")
+            fallback_tz = "UTC"
+        window = resolve_time_window(
+            plan.time_window, [fallback_depot], {fallback_depot: fallback_tz}
+        )
+
+    return rows_list, window, len(groups)
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 
@@ -377,15 +446,15 @@ async def run_turn(
         await agent_runs_step(ts_pool, run_id, "extract_plan", plan.model_dump())
         await _emit_step("extract_plan")
 
-        # 1a. Empty-subjects refusal short-circuit.
-        # An empty ``subjects`` list is the extraction stage's documented
-        # refusal / out-of-scope signal (see the "Refusal / out-of-scope" rule
-        # in src/api/agent/llm.py's extraction prompt). There is nothing to
-        # resolve or aggregate, and ``compile_consumption_by_user`` raises on an
-        # empty subject set by contract — so close the run as a graceful refusal
-        # here rather than letting it fall through to the compiler and surface
-        # as a 502. Mirrors the planner ``refuse`` branch above.
-        if not plan.subjects:
+        # 1a. Branch on subject presence. An empty ``subjects`` list has
+        # two meanings, disambiguated by ``depot_wide`` (see the QueryPlan
+        # docstring + the extraction prompt):
+        #   - subjects present          → resolve + subject aggregation.
+        #   - subjects empty, depot_wide → in-scope depot-wide total.
+        #   - subjects empty, otherwise  → out-of-scope refusal (mirrors the
+        #     planner ``refuse`` branch; the compiler raises on an empty
+        #     subject set by contract, so we never let it fall through).
+        if not plan.subjects and not plan.depot_wide:
             reply = AgentReply(
                 run_id=run_id,
                 status="not_found",
@@ -401,58 +470,82 @@ async def run_turn(
             await _emit_answer_safe(sse, reply, run_id)
             return reply
 
-        # 2. Resolve entity mentions to UUIDs.
-        resolved = await resolve_entities(plan.subjects, auth, static_pool)
-        await agent_runs_step(
-            ts_pool,
-            run_id,
-            "resolve_entities",
-            [e.model_dump() for e in resolved],
-        )
-        await _emit_step("resolve_entities")
+        resolved: list[ResolvedEntity]
+        window: ResolvedTimeWindow
 
-        # 3a. Disambiguation short-circuit.
-        ambiguous = [e for e in resolved if e.candidates]
-        if ambiguous:
-            for _entity in ambiguous:
-                AGENT_RESOLVER_MISSES.labels(kind="ambiguous").inc()
-            reply = AgentReply.disambiguation(
-                run_id=run_id, intent=plan.intent, ambiguous=ambiguous
+        if plan.subjects:
+            # 2. Resolve entity mentions to UUIDs.
+            resolved = await resolve_entities(plan.subjects, auth, static_pool)
+            await agent_runs_step(
+                ts_pool,
+                run_id,
+                "resolve_entities",
+                [e.model_dump() for e in resolved],
             )
-            await agent_runs_close(ts_pool, run_id, "disambiguation", reply)
-            await _emit_answer_safe(sse, reply, run_id)
-            return reply
+            await _emit_step("resolve_entities")
 
-        # 3b. Not-found short-circuit.
-        missing = [e for e in resolved if e.primary_id is None]
-        if missing:
-            for _entity in missing:
-                AGENT_RESOLVER_MISSES.labels(kind="not_found").inc()
-            reply = AgentReply.not_found_reply(run_id=run_id, intent=plan.intent, missing=missing)
-            await agent_runs_close(ts_pool, run_id, "not_found", reply)
-            await _emit_answer_safe(sse, reply, run_id)
-            return reply
+            # 3a. Disambiguation short-circuit.
+            ambiguous = [e for e in resolved if e.candidates]
+            if ambiguous:
+                for _entity in ambiguous:
+                    AGENT_RESOLVER_MISSES.labels(kind="ambiguous").inc()
+                reply = AgentReply.disambiguation(
+                    run_id=run_id, intent=plan.intent, ambiguous=ambiguous
+                )
+                await agent_runs_close(ts_pool, run_id, "disambiguation", reply)
+                await _emit_answer_safe(sse, reply, run_id)
+                return reply
 
-        # 4. Resolve time window in the depot timezone.
-        depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
-        window: ResolvedTimeWindow = resolve_time_window(
-            plan.time_window, auth.visible_depot_ids, depot_tzs
-        )
+            # 3b. Not-found short-circuit.
+            missing = [e for e in resolved if e.primary_id is None]
+            if missing:
+                for _entity in missing:
+                    AGENT_RESOLVER_MISSES.labels(kind="not_found").inc()
+                reply = AgentReply.not_found_reply(
+                    run_id=run_id, intent=plan.intent, missing=missing
+                )
+                await agent_runs_close(ts_pool, run_id, "not_found", reply)
+                await _emit_answer_safe(sse, reply, run_id)
+                return reply
 
-        # 5. Compile + execute SQL.
-        sql, params = compile_consumption_by_user(plan, resolved, window)
-        await agent_runs_step(
-            ts_pool,
-            run_id,
-            "compile",
-            {"intent": plan.intent, "param_shapes": _describe_params(params)},
-        )
-        await _emit_step("compile")
+            # 4. Resolve time window in the depot timezone.
+            depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
+            window = resolve_time_window(plan.time_window, auth.visible_depot_ids, depot_tzs)
 
-        rows = await ts_pool.fetch(sql, *params)
-        rows_list = [dict(r) for r in rows]
-        await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
-        await _emit_step("execute")
+            # 5. Compile + execute SQL.
+            sql, params = compile_consumption_by_user(plan, resolved, window)
+            await agent_runs_step(
+                ts_pool,
+                run_id,
+                "compile",
+                {
+                    "intent": plan.intent,
+                    "mode": "subject",
+                    "param_shapes": _describe_params(params),
+                },
+            )
+            await _emit_step("compile")
+
+            rows = await ts_pool.fetch(sql, *params)
+            rows_list = [dict(r) for r in rows]
+            await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
+            await _emit_step("execute")
+        else:
+            # Depot-wide total: no subjects to resolve. Scope to the visible
+            # depots' chargers and sum, one query per timezone group.
+            resolved = []
+            await _emit_step("compile")
+            rows_list, window, tz_groups = await _depot_wide_consumption_rows(
+                static_pool, ts_pool, auth, plan
+            )
+            await agent_runs_step(
+                ts_pool,
+                run_id,
+                "compile",
+                {"intent": plan.intent, "mode": "depot_wide", "tz_groups": tz_groups},
+            )
+            await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
+            await _emit_step("execute")
 
         # 6. Mirror the executed query into the admin audit feed.
         await write_agent_query_audit(
@@ -463,12 +556,14 @@ async def run_turn(
             len(rows_list),
         )
 
-        # 7. Format + close.
+        # 7. Summarize (three-state honesty) + format + close.
+        summary = summarize_consumption_rows(rows_list)
         text = await llm_client.format_answer(
             plan,
             [e.model_dump(mode="json") for e in resolved],
             window.model_dump(mode="json"),
             rows_list,
+            result_summary=summary,
         )
         reply = AgentReply.success(run_id=run_id, intent=plan.intent, text=text)
         await agent_runs_close(ts_pool, run_id, "success", reply)

@@ -22,6 +22,7 @@ Reference:
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
@@ -92,18 +93,87 @@ async def _resolve_driver(text: str, auth: AuthContext, static_pool: Any) -> lis
     return _wrap_candidates(candidates)
 
 
+# Vehicle-match scope is widened beyond a single specific row on purpose:
+# a fleet mention ("the renault vans") must expand to EVERY matching
+# vehicle so the consumption compiler can sum across the fleet. So the
+# vehicle resolver does NOT collapse to a disambiguation head the way the
+# driver/depot/rfid resolvers do — it returns one ``ResolvedEntity`` per
+# matched vehicle (no ``candidates``), capped at this many rows.
+_VEHICLE_MATCH_LIMIT = 100
+
+# Words that carry no discriminating signal for a vehicle/fleet mention.
+# Dropping them lets "all our renault vans" reduce to the tokens that
+# actually identify the fleet ("renault", "van").
+_VEHICLE_STOPWORDS: frozenset[str] = frozenset(
+    {"the", "a", "an", "all", "our", "my", "show", "me", "of", "for", "and"}
+)
+
+
+def _vehicle_tokens(text: str) -> list[str]:
+    """Split a vehicle mention into discriminating lowercase tokens."""
+    raw = re.findall(r"[a-z0-9]+", text.lower())
+    return [t for t in raw if len(t) >= 2 and t not in _VEHICLE_STOPWORDS]
+
+
+def _vehicle_match_clause(text: str, start_idx: int) -> tuple[str, list[str]]:
+    """Build a token-AND ILIKE clause over the searchable vehicle fields.
+
+    Every token must appear (case-insensitive substring) in the
+    concatenation of ``display_name / vin / external_id / license_plate
+    / vehicle_type``. A trailing-``s`` token also matches its singular
+    form, so "vans" catches "Renault Van 1". Placeholders are numbered
+    from ``start_idx``; tokens are always parameters (never interpolated)
+    because the mention text is LLM-extracted and therefore untrusted.
+
+    Falls back to a single whole-string ILIKE when the mention has no
+    usable tokens (e.g. it was entirely stopwords/punctuation).
+    """
+    searchable = (
+        "(COALESCE(v.display_name,'') || ' ' || COALESCE(v.vin,'') || ' ' "
+        "|| COALESCE(v.external_id,'') || ' ' || COALESCE(v.license_plate,'') "
+        "|| ' ' || COALESCE(v.vehicle_type,''))"
+    )
+    tokens = _vehicle_tokens(text)
+    if not tokens:
+        return f"{searchable} ILIKE ${start_idx}", [f"%{text}%"]
+
+    clauses: list[str] = []
+    params: list[str] = []
+    idx = start_idx
+    for tok in tokens:
+        variants = [tok]
+        if len(tok) > 3 and tok.endswith("s"):
+            variants.append(tok[:-1])
+        ors = []
+        for variant in variants:
+            ors.append(f"{searchable} ILIKE ${idx}")
+            params.append(f"%{variant}%")
+            idx += 1
+        clauses.append("(" + " OR ".join(ors) + ")")
+    return " AND ".join(clauses), params
+
+
 async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> list[ResolvedEntity]:
-    """Resolve a vehicle mention via Supabase.
+    """Resolve a vehicle mention via Supabase, expanding fleets.
 
     Vehicles carry ``organization_id`` natively, so for a tenant caller
     we filter by ``v.organization_id`` and additionally constrain to
     visible depots (defence-in-depth). For ``favonius_admin`` (no
     organization_id), we fall back to the visible-depot scope, which
     spans every depot in the system.
+
+    Matching is token-AND across name/VIN/plate/external-id/type (see
+    :func:`_vehicle_match_clause`) so a make or vehicle-type phrase
+    resolves the whole fleet. Unlike the other resolvers, multiple
+    matches are NOT collapsed into a disambiguation head — every matched
+    vehicle is returned so the consumption compiler sums across the
+    fleet. A zero-match mention returns a single ``primary_id=None``
+    entity (the standard "not found" shape).
     """
     if auth.organization_id is None:
+        match_sql, match_params = _vehicle_match_clause(text, start_idx=2)
         rows = await static_pool.fetch(
-            """
+            f"""
             SELECT
                 v.id   AS vehicle_id,
                 COALESCE(v.display_name, v.license_plate, v.vin, v.external_id)
@@ -113,21 +183,17 @@ async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> li
             FROM vehicles v
             JOIN sites s ON s.id = v.site_id
             WHERE v.site_id = ANY($1::uuid[])
-              AND (
-                v.display_name   ILIKE $2
-                OR v.vin         ILIKE $2
-                OR v.external_id ILIKE $2
-                OR v.license_plate ILIKE $2
-              )
+              AND ({match_sql})
             ORDER BY display_text
-            LIMIT 10
+            LIMIT {_VEHICLE_MATCH_LIMIT}
             """,
             auth.visible_depot_ids,
-            f"%{text}%",
+            *match_params,
         )
     else:
+        match_sql, match_params = _vehicle_match_clause(text, start_idx=3)
         rows = await static_pool.fetch(
-            """
+            f"""
             SELECT
                 v.id   AS vehicle_id,
                 COALESCE(v.display_name, v.license_plate, v.vin, v.external_id)
@@ -138,24 +204,19 @@ async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> li
             JOIN sites s ON s.id = v.site_id
             WHERE v.organization_id = $1::uuid
               AND v.site_id = ANY($2::uuid[])
-              AND (
-                v.display_name   ILIKE $3
-                OR v.vin         ILIKE $3
-                OR v.external_id ILIKE $3
-                OR v.license_plate ILIKE $3
-              )
+              AND ({match_sql})
             ORDER BY display_text
-            LIMIT 10
+            LIMIT {_VEHICLE_MATCH_LIMIT}
             """,
             str(auth.organization_id),
             auth.visible_depot_ids,
-            f"%{text}%",
+            *match_params,
         )
 
     if not rows:
         return [ResolvedEntity(kind="vehicle", display=text, primary_id=None)]
 
-    candidates = [
+    return [
         ResolvedEntity(
             kind="vehicle",
             display=f"{row['display_text']} ({row['depot_name']})",
@@ -163,7 +224,6 @@ async def _resolve_vehicle(text: str, auth: AuthContext, static_pool: Any) -> li
         )
         for row in rows
     ]
-    return _wrap_candidates(candidates)
 
 
 async def _resolve_depot(text: str, auth: AuthContext, static_pool: Any) -> list[ResolvedEntity]:
@@ -466,6 +526,50 @@ async def load_depot_timezones(
 def _clear_tz_cache() -> None:
     """Reset the in-process timezone cache. Used by tests."""
     _TZ_CACHE.clear()
+
+
+async def load_depot_stations(
+    static_pool: Any,
+    visible_depot_ids: list[UUID],
+) -> list[dict[str, Any]]:
+    """Return ``{ocpp_id, depot_id, timezone}`` for chargers in visible depots.
+
+    The depot-wide consumption path scopes sessions by ``station_id``
+    rather than ``charging_sessions.site_id``: ``station_id`` (the OCPP
+    id) is populated on every session row, whereas ``site_id`` is only
+    written by some ingest paths. The returned station set is derived
+    purely from the caller's ``visible_depot_ids`` — it is therefore the
+    auth boundary for a no-subject depot total. The depot timezone rides
+    along so the caller can run the per-timezone aggregation loop without
+    a second round-trip.
+    """
+    if not visible_depot_ids:
+        return []
+    rows = await static_pool.fetch(
+        """
+        SELECT
+            cs.station_id AS ocpp_id,
+            s.id          AS depot_id,
+            s.timezone    AS timezone
+        FROM charging_stations cs
+        JOIN sites s ON s.id = cs.site_id
+        WHERE s.id = ANY($1::uuid[])
+        """,
+        visible_depot_ids,
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        ocpp_id = row["ocpp_id"]
+        if not ocpp_id:
+            continue
+        out.append(
+            {
+                "ocpp_id": str(ocpp_id),
+                "depot_id": _as_uuid(row["depot_id"]),
+                "timezone": row["timezone"],
+            }
+        )
+    return out
 
 
 # --------------------------------------------------------------------------- #

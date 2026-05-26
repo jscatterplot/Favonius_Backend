@@ -34,9 +34,11 @@ from src.api.agent.router import (
     get_llm_client,
     get_static_pool,
     get_ts_pool,
-    verify_token_and_check_agent_limit,
 )
 from src.api.agent.router import router as agent_router
+from src.api.agent.router import (
+    verify_token_and_check_agent_limit,
+)
 from src.security.auth import verify_token
 from src.security.rate_limiter import RateLimitConfig, RateLimiter
 from tests.integration.agent.conftest import (
@@ -202,6 +204,69 @@ async def test_run_turn_cross_org_isolation(seeded_db, fake_llm_client):
     )
     assert reply.status == "not_found"
     assert "Carter" in reply.text
+
+
+@pytest.mark.asyncio
+async def test_run_turn_vehicle_fleet(seeded_db, fake_llm_client):
+    """A fleet mention resolves to every matching vehicle (full expansion).
+
+    "the renault vans" must expand to BOTH seeded Org A vans and sum
+    across them — never a disambiguation prompt.
+    """
+    token = make_token_payload(seeded_db["user_a"], organization_id=seeded_db["org_a"])
+    reply = await run_turn(
+        message="how much did the renault vans charge last month",
+        token_payload=token,
+        static_pool=seeded_db["static_pool"],
+        ts_pool=seeded_db["ts_pool"],
+        llm_client=fake_llm_client,
+    )
+    assert reply.status == "success"
+    assert reply.intent == "consumption_by_user"
+    # Full expansion: both vans resolved, no disambiguation candidates.
+    resolved = fake_llm_client.last_format_payload["resolved"]
+    assert len(resolved) == 2
+    assert all(r["kind"] == "vehicle" for r in resolved)
+    assert all(not r["candidates"] for r in resolved)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_depot_wide(seeded_db, fake_llm_client):
+    """A no-subject depot-wide total sums sessions across the caller's chargers."""
+    token = make_token_payload(seeded_db["user_a"], organization_id=seeded_db["org_a"])
+    reply = await run_turn(
+        message="what was the total consumption last month",
+        token_payload=token,
+        static_pool=seeded_db["static_pool"],
+        ts_pool=seeded_db["ts_pool"],
+        llm_client=fake_llm_client,
+    )
+    assert reply.status == "success"
+    payload = fake_llm_client.last_format_payload
+    assert payload["depot_wide"] is True
+    assert payload["resolved"] == []  # no named subject
+    # DEPOT_A's 'TEST_STATION' carries the seeded sessions; last_month has data.
+    assert payload["result_summary"]["total_sessions"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_run_turn_depot_wide_scoped_to_visible_depots(seeded_db, fake_llm_client):
+    """Org B's depot-wide total only sees Org B chargers.
+
+    All seeded sessions live on DEPOT_A's 'TEST_STATION'; Org B's only
+    charger ('TEST_STATION_B') has none, so the honest answer is
+    'no_sessions' — NOT an error and NOT Org A's data.
+    """
+    token = make_token_payload(seeded_db["user_b"], organization_id=seeded_db["org_b"])
+    reply = await run_turn(
+        message="what was the total consumption last month",
+        token_payload=token,
+        static_pool=seeded_db["static_pool"],
+        ts_pool=seeded_db["ts_pool"],
+        llm_client=fake_llm_client,
+    )
+    assert reply.status == "success"
+    assert fake_llm_client.last_format_payload["result_summary"]["disposition"] == "no_sessions"
 
 
 @pytest.mark.asyncio
