@@ -13113,7 +13113,7 @@ async def list_org_alerts(
     except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError) as exc:
         logger.warning("notification_alerts schema unavailable, returning empty list: %s", exc)
 
-    # Batch-fetch depot names from static pool
+    # Batch-fetch depot names from static pool (best-effort — alerts are primary)
     unique_depot_ids = [a.depot_id for a in alerts_list if a.depot_id is not None]
     depot_name_map: dict[str, str] = {}
     if unique_depot_ids:
