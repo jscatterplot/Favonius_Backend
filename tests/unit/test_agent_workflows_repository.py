@@ -47,7 +47,7 @@ from src.api.agent_workflows.repository import (  # noqa: E402
     get_tier,
     get_workflow,
     insert_decision,
-    insert_default_tier,
+    insert_default_tiers_bulk,
     list_decisions,
     set_tier,
     upsert_workflow,
@@ -340,7 +340,7 @@ class TestTierRepository:
 
 
 @pytest.mark.asyncio
-class TestInsertDefaultTier:
+class TestInsertDefaultTiersBulk:
     def _rule(self) -> GraduationRule:
         return GraduationRule(
             min_decisions=100,
@@ -350,38 +350,49 @@ class TestInsertDefaultTier:
             next_tier=PermissionTier.DRAFT_AND_WAIT,
         )
 
-    async def test_insert_only_semantics_and_returns_true_when_inserted(
-        self, mock_asyncpg_pool
-    ):
+    async def test_single_set_based_insert_only_statement(self, mock_asyncpg_pool):
         pool, conn = mock_asyncpg_pool
-        # RETURNING row present → a row was inserted.
-        conn.fetchrow.return_value = {"workflow_id": uuid4()}
-        workflow_id, depot_id = uuid4(), uuid4()
+        depot_a, depot_b = uuid4(), uuid4()
+        # RETURNING rows = depots that were freshly inserted.
+        conn.fetch.return_value = [{"depot_id": depot_a}, {"depot_id": depot_b}]
+        workflow_id = uuid4()
 
-        inserted = await insert_default_tier(
-            pool, workflow_id, depot_id, PermissionTier.INFORM, self._rule()
+        inserted = await insert_default_tiers_bulk(
+            pool, workflow_id, [depot_a, depot_b], PermissionTier.INFORM, self._rule()
         )
-        assert inserted is True
+        assert inserted == 2
 
-        sql, *params = conn.fetchrow.call_args[0]
+        # One round-trip, not one per depot.
+        assert conn.fetch.call_count == 1
+        sql, *params = conn.fetch.call_args[0]
         assert "INSERT INTO workflow_tiers" in sql
-        # Must be insert-only (no silent downgrade of a graduated row).
+        # Set-based via unnest + insert-only (no silent downgrade).
+        assert "unnest($2::uuid[])" in sql
         assert "ON CONFLICT (workflow_id, depot_id) DO NOTHING" in sql
         assert "DO UPDATE" not in sql
         assert "RETURNING" in sql
         assert params[0] == workflow_id
-        assert params[1] == depot_id
+        assert params[1] == [depot_a, depot_b]
         assert params[2] == "inform"
         assert params[7] == "draft_and_wait"
 
-    async def test_returns_false_when_row_already_existed(self, mock_asyncpg_pool):
+    async def test_counts_only_actually_inserted_rows(self, mock_asyncpg_pool):
         pool, conn = mock_asyncpg_pool
-        # ON CONFLICT DO NOTHING → no RETURNING row → already existed.
-        conn.fetchrow.return_value = None
-        inserted = await insert_default_tier(
-            pool, uuid4(), uuid4(), PermissionTier.INFORM, self._rule()
+        depot_new = uuid4()
+        # Two depots requested, one already existed → only one RETURNING row.
+        conn.fetch.return_value = [{"depot_id": depot_new}]
+        inserted = await insert_default_tiers_bulk(
+            pool, uuid4(), [uuid4(), depot_new], PermissionTier.INFORM, self._rule()
         )
-        assert inserted is False
+        assert inserted == 1
+
+    async def test_empty_depot_list_is_a_noop(self, mock_asyncpg_pool):
+        pool, conn = mock_asyncpg_pool
+        inserted = await insert_default_tiers_bulk(
+            pool, uuid4(), [], PermissionTier.INFORM, self._rule()
+        )
+        assert inserted == 0
+        conn.fetch.assert_not_called()
 
 
 # ── insert_decision ──────────────────────────────────────────────────────

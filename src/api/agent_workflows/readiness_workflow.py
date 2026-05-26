@@ -32,7 +32,7 @@ from src.api.agent_workflows.models import (
     PermissionTier,
     Workflow,
 )
-from src.api.agent_workflows.repository import insert_default_tier, upsert_workflow
+from src.api.agent_workflows.repository import insert_default_tiers_bulk, upsert_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -263,26 +263,22 @@ async def seed_default_tiers(
     LEFT UNTOUCHED — graduation is always an explicit, audited action,
     never silently overwritten by a process restart.
 
-    The insert is atomic (``INSERT ... ON CONFLICT DO NOTHING`` via
-    :func:`~src.api.agent_workflows.repository.insert_default_tier`), so
-    a concurrent insert or graduation by another worker between depots
-    cannot be clobbered back to the default — a check-then-write would
-    have that race.
+    The insert is atomic (``INSERT ... ON CONFLICT DO NOTHING``), so a
+    concurrent insert or graduation by another worker cannot be clobbered
+    back to the default — a check-then-write would have that race. It is
+    also a single set-based statement (one round-trip for all depots via
+    ``unnest``), so this startup-path seed does not block cold start with
+    a per-depot INSERT loop.
 
     Returns the number of rows that were freshly inserted.
     """
-    inserted = 0
-    for depot_id in depot_ids:
-        was_inserted = await insert_default_tier(
-            ts_pool,
-            workflow_id,
-            depot_id,
-            READINESS_DEFAULT_TIER,
-            READINESS_DEFAULT_GRADUATION_RULE,
-        )
-        if was_inserted:
-            inserted += 1
-    return inserted
+    return await insert_default_tiers_bulk(
+        ts_pool,
+        workflow_id,
+        depot_ids,
+        READINESS_DEFAULT_TIER,
+        READINESS_DEFAULT_GRADUATION_RULE,
+    )
 
 
 async def _list_depot_ids(

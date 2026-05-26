@@ -274,29 +274,40 @@ def _fake_ts_pool_returning(
 
     async def _fetchrow(sql: str, *args: Any) -> Any:
         log.append(("fetchrow", (sql,) + args))
-        if "INSERT INTO workflow_tiers" in sql:
-            # insert_default_tier: ON CONFLICT DO NOTHING RETURNING.
-            # Returns a row only when no row pre-existed for the key.
-            key = (args[0], args[1])
-            if key in existing:
-                return None
-            existing[key] = {
-                "tier": args[2],
-                "min_decisions": args[3],
-                "max_override_rate": args[4],
-                "max_edit_rate": args[5],
-                "requires_human_signoff": args[6],
-                "next_tier": args[7],
-            }
-            return {"workflow_id": args[0]}
         if "FROM workflow_tiers" in sql:
-            # get_tier read path (no longer used by the seed, but kept).
+            # get_tier read path (not used by the seed, but kept).
             key = (args[0], args[1])
             return existing.get(key)
         # upsert_workflow: INSERT INTO workflows … RETURNING.
         return workflow_row
 
+    async def _fetch(sql: str, *args: Any) -> list[dict[str, Any]]:
+        log.append(("fetch", (sql,) + args))
+        if "INSERT INTO workflow_tiers" in sql:
+            # insert_default_tiers_bulk: one set-based INSERT over
+            # unnest($2::uuid[]) with ON CONFLICT DO NOTHING RETURNING.
+            # Only depots without an existing row are "inserted".
+            workflow_id = args[0]
+            depot_ids = args[1]
+            inserted_rows: list[dict[str, Any]] = []
+            for depot_id in depot_ids:
+                key = (workflow_id, depot_id)
+                if key in existing:
+                    continue
+                existing[key] = {
+                    "tier": args[2],
+                    "min_decisions": args[3],
+                    "max_override_rate": args[4],
+                    "max_edit_rate": args[5],
+                    "requires_human_signoff": args[6],
+                    "next_tier": args[7],
+                }
+                inserted_rows.append({"depot_id": depot_id})
+            return inserted_rows
+        return []
+
     conn.fetchrow = _fetchrow
+    conn.fetch = _fetch
 
     @asynccontextmanager
     async def _acquire():
@@ -373,17 +384,24 @@ async def test_seed_default_tiers_inserts_inform_for_new_depots():
     )
     assert inserted == 2
 
+    # Exactly one set-based INSERT for all depots (no per-depot loop) —
+    # startup must not do N round-trips for N depots.
     inserts = [
         (kind, args) for kind, args in log
-        if kind == "fetchrow" and "INSERT INTO workflow_tiers" in args[0]
+        if kind == "fetch" and "INSERT INTO workflow_tiers" in args[0]
     ]
-    assert len(inserts) == 2
+    assert len(inserts) == 1
+    _, args = inserts[0]
+    # args = (sql, workflow_id, depot_ids, tier, min_dec, max_or,
+    #         max_er, req_signoff, next_tier) — the log prepends sql.
+    sql = args[0]
     # Insert-only semantics (ON CONFLICT DO NOTHING) so a concurrent
     # graduation can't be clobbered back to the default.
-    for _, args in inserts:
-        assert "ON CONFLICT (workflow_id, depot_id) DO NOTHING" in args[0]
-        assert args[3] == "inform"  # tier column
-        assert args[8] == "draft_and_wait"  # next_tier
+    assert "ON CONFLICT (workflow_id, depot_id) DO NOTHING" in sql
+    assert "unnest($2::uuid[])" in sql
+    assert args[2] == [depot_a, depot_b]  # depot_ids array param
+    assert args[3] == "inform"  # tier column
+    assert args[8] == "draft_and_wait"  # next_tier
 
 
 @pytest.mark.asyncio

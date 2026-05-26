@@ -200,30 +200,28 @@ async def set_tier(
         )
 
 
-async def insert_default_tier(
+async def insert_default_tiers_bulk(
     pool: Any,
     workflow_id: UUID,
-    depot_id: UUID,
+    depot_ids: list[UUID],
     tier: PermissionTier,
     rule: GraduationRule,
-) -> bool:
-    """Insert a launch-default tier row iff one does not already exist.
+) -> int:
+    """Seed launch-default tier rows for many depots in one statement.
 
-    Unlike :func:`set_tier` (which is an upsert used by the graduation /
-    demotion endpoints), this is **insert-only**: ``ON CONFLICT DO
-    NOTHING``. It exists for the per-depot startup seed, where the
-    contract is "never touch an existing row" — a check-then-``set_tier``
-    sequence is racy and could silently downgrade a row that another
-    worker inserted or graduated in the gap. Doing the insert and the
-    existence check in one statement removes that race.
+    Same insert-only contract as :func:`insert_default_tier` (``ON
+    CONFLICT DO NOTHING`` — existing rows are never touched), but does
+    every depot in a single round-trip via ``unnest``. This is what the
+    startup seed uses so cold-start time does not grow linearly with the
+    depot count (no per-depot awaited INSERT in a loop).
 
-    Returns:
-        ``True`` if a new row was inserted, ``False`` if a row for
-        ``(workflow_id, depot_id)`` already existed and was left
-        untouched.
+    Returns the number of rows actually inserted (depots that already
+    had a row are skipped and not counted).
     """
+    if not depot_ids:
+        return 0
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+        rows = await conn.fetch(
             """
             INSERT INTO workflow_tiers (
                 workflow_id,
@@ -236,12 +234,13 @@ async def insert_default_tier(
                 next_tier,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            SELECT $1, d, $3, $4, $5, $6, $7, $8, NOW()
+            FROM unnest($2::uuid[]) AS d
             ON CONFLICT (workflow_id, depot_id) DO NOTHING
-            RETURNING workflow_id
+            RETURNING depot_id
             """,
             workflow_id,
-            depot_id,
+            list(depot_ids),
             tier.value,
             rule.min_decisions,
             rule.max_override_rate,
@@ -249,7 +248,7 @@ async def insert_default_tier(
             rule.requires_human_signoff,
             rule.next_tier.value if rule.next_tier else None,
         )
-    return row is not None
+    return len(rows)
 
 
 # ── decisions ─────────────────────────────────────────────────────────────
