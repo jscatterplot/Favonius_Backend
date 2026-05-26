@@ -27,6 +27,7 @@ from src.api.agent.audit import (
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import AuthContext
+from src.api.agent.llm import LLMExtractionError
 from src.api.agent.sql_executor import SqlExecutorError, SqlExecutorTimeoutError
 from src.api.agent_workflows.runtime import ToolNotAllowedError
 from src.api.agent_workflows.tools import ToolNotRegisteredError
@@ -460,3 +461,37 @@ class TestClassifyFailure:
             ],
         )
         assert classify_failure(qa) is None
+
+    async def test_terminator_failed_is_tool_error_despite_stale_run_select(self):
+        # A turn that hit a validator rejection mid-way, recovered, then failed
+        # to emit a valid final answer is a terminator (tool_error) failure —
+        # the stale run_select rejection must not shadow the terminal cause.
+        qa = _qa(
+            status="terminator_failed",
+            tool_calls=[_tc("run_select_ts", ok=False, error_kind="parse_error")],
+        )
+        assert classify_failure(qa) == "tool_error"
+
+    async def test_terminator_failed_is_tool_error_with_no_tool_calls(self):
+        assert classify_failure(_qa(status="terminator_failed", tool_calls=[])) == "tool_error"
+
+    async def test_validator_rejected_from_failed_sample_values(self):
+        # sample_values shares the validate→execute path, so an unrecovered
+        # rejection there is attributable too (not a fall-through to llm_error).
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("sample_values", ok=False, error_kind="parse_error")],
+        )
+        assert classify_failure(qa) == "validator_rejected"
+
+    async def test_executor_timeout_from_failed_sample_values(self):
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("sample_values", ok=False, error_kind="timeout")],
+        )
+        assert classify_failure(qa) == "executor_timeout"
+
+    async def test_llm_error_from_extraction_error(self):
+        # The consumption path's extractor failure is an LLM-origin error, not
+        # an unattributable "other".
+        assert classify_failure(LLMExtractionError("no tool call on retry")) == "llm_error"

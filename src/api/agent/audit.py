@@ -23,6 +23,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from src.api.agent.auth_context import AuthContext
+from src.api.agent.llm import LLMExtractionError
 from src.api.agent.sql_executor import SqlExecutorError, SqlExecutorTimeoutError
 from src.api.agent_workflows.runtime import ToolNotAllowedError
 from src.api.agent_workflows.tools import ToolNotRegisteredError
@@ -172,10 +173,10 @@ async def agent_runs_close(
 _EXECUTOR_TIMEOUT_KIND = "timeout"
 _EXECUTOR_TOOL_ERROR_KINDS = frozenset({"role_error", "plan_error", "exec_error"})
 
-# Tool names whose results carry a queryable row_count / error_kind. Mirrors
+# SQL-executing tool names whose failure results carry an error_kind. Mirrors
 # the names registered in src/api/agent/sql_tools.py (kept local to avoid a
-# src→src import just for a 2-tuple; a shared constant is an easy followup).
-_RUN_SELECT_TOOLS = frozenset({"run_select_ts", "run_select_static"})
+# src→src import just for a 3-tuple; a shared constant is an easy followup).
+_SQL_TOOL_NAMES = frozenset({"run_select_ts", "run_select_static", "sample_values"})
 
 # Terminal statuses that are NOT failures — failure_reason stays NULL.
 _GRACEFUL_STATUSES = frozenset({"success", "running", "disambiguation", "not_found"})
@@ -263,6 +264,11 @@ def _classify_exception(exc: BaseException) -> str:
         return "executor_timeout"
     if isinstance(exc, (SqlExecutorError, ToolNotAllowedError, ToolNotRegisteredError)):
         return "tool_error"
+    # The consumption path's extractor raises this when the model fails to emit
+    # a valid QueryPlan (no tool call, or malformed twice) — an LLM-origin
+    # failure, not an "other".
+    if isinstance(exc, LLMExtractionError):
+        return "llm_error"
     # Anthropic SDK errors (rate limit, 5xx, connection, malformed output).
     # Match by module so audit.py needn't import the SDK (the agent keeps it
     # an optional import for llm-free test envs).
@@ -300,10 +306,18 @@ def _classify_qa_result(qa: Any) -> Optional[str]:
     status = getattr(qa, "status", None)
     if status == "success":
         return None
-    # Dominant tool-level cause = the most recent failed run_select_* error_kind
+    # ``terminator_failed`` is itself a terminal tool-path failure (the model
+    # asked to stop but its emit_final_answer was malformed). Per the taxonomy
+    # contract it is tool_error, and it must NOT be shadowed by a stale earlier
+    # SQL-tool error the model recovered from before stopping — so classify it
+    # before consulting the per-call error_kind heuristic below.
+    if status == "terminator_failed":
+        return "tool_error"
+    # Otherwise the dominant cause is the most recent failed SQL-tool error_kind
     # (e.g. a validator rejection the model never recovered from — the §S3.5
-    # "deliberate validator rejection" done-when case).
-    kind = _last_failed_run_select_kind(getattr(qa, "tool_calls", None) or [])
+    # "deliberate validator rejection" done-when case), even when the terminal
+    # status is the generic "model gave up" marker (max_iterations / no_terminator).
+    kind = _last_failed_sql_tool_kind(getattr(qa, "tool_calls", None) or [])
     if kind is not None:
         if kind == _EXECUTOR_TIMEOUT_KIND:
             return "executor_timeout"
@@ -314,11 +328,17 @@ def _classify_qa_result(qa: Any) -> Optional[str]:
     return _classify_status_token(status) if isinstance(status, str) else "other"
 
 
-def _last_failed_run_select_kind(tool_calls: Any) -> Optional[str]:
-    """Return the error_kind of the LAST failed run_select_* call, if any."""
+def _last_failed_sql_tool_kind(tool_calls: Any) -> Optional[str]:
+    """Return the error_kind of the LAST failed SQL-executing tool call, if any.
+
+    Covers run_select_ts / run_select_static AND sample_values — all three run
+    LLM SQL through the validate→execute path and surface the same error_kind
+    envelope, so a turn that dies after a failed sample_values is attributed to
+    its tool/validator cause rather than falling through to the status token.
+    """
     kind: Optional[str] = None
     for tc in tool_calls:
-        if getattr(tc, "name", None) not in _RUN_SELECT_TOOLS:
+        if getattr(tc, "name", None) not in _SQL_TOOL_NAMES:
             continue
         if getattr(tc, "ok", True):
             continue

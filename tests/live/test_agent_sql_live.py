@@ -62,11 +62,27 @@ _SCENARIOS_PATH = Path(__file__).resolve().parents[1] / "golden" / "agent_sql_li
 
 
 def _load_live_scenarios() -> list[dict[str, Any]]:
-    """Load the shadow scenarios (empty list if the file is missing/empty)."""
+    """Load the shadow scenarios, failing loudly if the fixture is broken.
+
+    A missing / unparseable / empty fixture is a broken drift detector, not a
+    benign skip: an empty parametrize set collects zero tests, which pytest
+    reports as a pass (exit 0), so the nightly job would post a green/skip line
+    while silently testing nothing. Raising here turns that into a collection
+    error the shadow run surfaces instead. (The legitimate "don't burn tokens
+    locally" skip is handled separately by the ANTHROPIC_API_KEY fixture.)
+    """
     if not _SCENARIOS_PATH.is_file():
-        return []
+        raise RuntimeError(
+            f"shadow scenarios fixture missing: {_SCENARIOS_PATH} — the nightly "
+            "drift suite has nothing to run"
+        )
     raw = yaml.safe_load(_SCENARIOS_PATH.read_text(encoding="utf-8"))
-    return raw if isinstance(raw, list) else []
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(
+            f"shadow scenarios fixture {_SCENARIOS_PATH} did not parse to a "
+            f"non-empty list (got {type(raw).__name__})"
+        )
+    return raw
 
 
 _LIVE_SCENARIOS = _load_live_scenarios()

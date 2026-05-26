@@ -36,7 +36,10 @@ ALTER TABLE agent_runs
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'agent_runs_failure_reason_check'
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'agent_runs_failure_reason_check'
+          AND conrelid = 'agent_runs'::regclass
+          AND contype = 'c'
     ) THEN
         ALTER TABLE agent_runs
             ADD CONSTRAINT agent_runs_failure_reason_check

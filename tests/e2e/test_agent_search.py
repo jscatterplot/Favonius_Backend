@@ -155,7 +155,10 @@ CREATE TABLE agent_runs (
     status           TEXT NOT NULL
         CHECK (status IN ('running', 'success', 'disambiguation', 'not_found', 'error')),
     duration_ms      INTEGER,
-    failure_reason   TEXT,
+    failure_reason   TEXT
+        CHECK (failure_reason IS NULL OR failure_reason IN (
+            'validator_rejected', 'executor_timeout', 'empty_result',
+            'budget_exceeded', 'tool_error', 'llm_error', 'other')),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
