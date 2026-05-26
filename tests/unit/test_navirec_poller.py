@@ -201,6 +201,21 @@ async def test_poll_once_drops_future_dated():
 
 
 @pytest.mark.asyncio
+async def test_poll_once_drops_future_timestamps():
+    # Even a small forward skew is dropped (any age < 0).
+    plate_map = {"PA": ("vA", "dA"), "PB": ("vB", "dB")}
+    raws = [
+        {"plate": "PA", "soc": 50, "timestamp": (_NOW + timedelta(minutes=5)).isoformat()},
+        {"plate": "PB", "soc": 60, "timestamp": _NOW.isoformat()},
+    ]
+    conn = FakeConn(lock_result=True)
+    summary = await poll_once(None, FakePool(conn), FakeClient(raws), plate_map=plate_map, now=_NOW)
+    assert summary["stale_dropped"] == 1
+    assert summary["written"] == {"dB": 1}
+    assert "dA" not in summary["written"]
+
+
+@pytest.mark.asyncio
 async def test_poll_once_counts_unmatched():
     raws = [{"plate": "ZZZ", "soc": 50, "timestamp": _NOW.isoformat()}]
     conn = FakeConn(lock_result=True)

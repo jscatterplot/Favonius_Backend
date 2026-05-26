@@ -51,11 +51,6 @@ logger = logging.getLogger(__name__)
 # so the live path drops it (the backfill path writes regardless).
 _LIVE_MAX_AGE = timedelta(hours=24)
 
-# Readings time-stamped further than this ahead of now() are treated as clock
-# skew / bad data and dropped — a future timestamp would otherwise always win
-# the freshest-wins SoC merge over real charger telemetry.
-_FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
-
 # Plate maps change rarely (a vehicle's plate is near-static); cache like the
 # 5-min _get_depot_config cache in src/api/main.py.
 _PLATE_MAP_TTL_S = 300.0
@@ -230,8 +225,9 @@ async def poll_once(
             continue
         age = now - reading.time
         # Future-dated (clock skew / bad data): would always win freshest-wins,
-        # so drop it rather than let it override real charger telemetry.
-        if age < -_FUTURE_SKEW_TOLERANCE:
+        # so drop any reading time-stamped ahead of now rather than let it
+        # override real charger telemetry.
+        if age < timedelta(0):
             stale_dropped += 1
             NAVIREC_STALE_READINGS.inc()
             continue
