@@ -1169,10 +1169,8 @@ make docker-verify
 | `docs/SIMULATION.md` | Simulation guide |
 | `docs/CONTROL_LOOP.md` | Control loop details |
 | `docs/DATA_ANALYST_GUIDE.md` | Data access guide |
-| `docs/INTERACTION_DIAGRAM.md` | Component interaction diagram |
 | `docs/PILOT_RUNBOOK.md` | OCPP pilot ops runbook |
 | `docs/EVEREST_TESTING.md` | EVerest smoke test |
-| `docs/AUTH_HOOK_SETUP.md` | Supabase JWT auth hook setup |
 | `docs/COMPLIANCE_GAP_ANALYSIS.md` | Lithuanian Art. 73-3 / NIS2 / IEC 62443 gap analysis |
 | `docs/SECURITY_NETWORK_ARCHITECTURE.md` | IEC 62443 security zones |
 | `docs/SECURITY_DECLARATION_ESO.md` | ESO security declaration template |

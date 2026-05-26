@@ -683,15 +683,14 @@ To prevent scope drift, the following are explicitly **not** in V1 or V2:
 
 This PRD describes the product layer. The underlying systems are documented separately and remain authoritative for their respective domains:
 
-- **System architecture:** `docs/ARCHITECTURE.md` — service topology (API service + WebSocket Handler), data flow, DB layout.
-- **Component interaction:** `docs/INTERACTION_DIAGRAM.md` — visual map of component relationships.
+- **System architecture:** `docs/ARCHITECTURE.md` — service topology (API service + WebSocket Handler), data flow, DB layout, and the component-interaction map.
 - **Control loop & optimiser:** `docs/CONTROL_LOOP.md` — DepotController, TriggerMonitor, MILP dispatch.
 - **REST + WebSocket APIs:** `docs/API.md` — current endpoint reference, OCPP wiring, agent endpoints.
 - **Data analyst guide:** `docs/DATA_ANALYST_GUIDE.md` — optimisation engine files, state assembly, dispatch.
 - **Deployment & env vars:** `docs/DEPLOYMENT.md`, `docs/RAILWAY_ENV_VARIABLES.md` — Railway two-service deploy.
 - **Simulation harness:** `docs/SIMULATION.md` — scenarios, metrics, optimiser integration.
 - **Testing:** `docs/TESTING.md` — categories, markers, coverage targets.
-- **Auth & tenancy:** `docs/AUTH_HOOK_SETUP.md`, the tenant-mirroring and Favonius staff auto-promotion sections of `CLAUDE.md`.
+- **Auth & tenancy:** the JWT verification, tenant-mirroring, and Favonius staff auto-promotion sections of `CLAUDE.md`.
 - **OCPP runbook & smoke tests:** `docs/PILOT_RUNBOOK.md`, `docs/EVEREST_TESTING.md`.
 - **OCPP local auth list roadmap:** `docs/plans/ocpp_local_auth_list_roadmap.md`.
 - **Manual charger authorize (frontend):** `docs/frontend/manual_charger_authorize.md`.

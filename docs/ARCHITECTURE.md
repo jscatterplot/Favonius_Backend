@@ -17,8 +17,9 @@ Both services share access to the dual-database architecture (Supabase for refer
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         EXTERNAL INPUTS                             │
 ├─────────┬─────────┬─────────┬─────────┬─────────┬─────────────────┤
-│ Weather │ Market/ │  Fleet  │ Vehicle │ Inter-  │ Building Load   │
-│   API   │ Utility │  Mgmt   │Telemetry│  Depot  │    Meter        │
+│ Weather │ ENTSO-E │  Fleet  │ Vehicle │ Inter-  │ Building Load   │
+│   API   │ Day-    │  Mgmt   │Telemetry│  Depot  │    Meter        │
+│         │ Ahead   │         │         │         │   (optional)    │
 └────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────────┬────────┘
      │         │         │         │         │             │
      │         │         │         │         │             │
@@ -96,9 +97,9 @@ Both services share access to the dual-database architecture (Supabase for refer
 │  │  (no separate `telemetry_data` table for trial deployments) │  │
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Internal API (Planned - Phase 4)                           │  │
-│  │  - Query charge point state                                 │  │
-│  │  - Send SetChargingProfile commands                         │  │
+│  │  Internal API (POST /internal/ocpp-event)                   │  │
+│  │  - OCPP-event ingress to the Main API                       │  │
+│  │  - Token-gated via INTERNAL_API_TOKEN (fail-closed)         │  │
 │  │  - Health monitoring                                        │  │
 │  └─────────────────────────────────────────────────────────────┘  │
 │                                                                     │
@@ -122,9 +123,9 @@ Both services share access to the dual-database architecture (Supabase for refer
 │  │  (PostgreSQL)            │  │  (PostgreSQL Extension)   │       │
 │  │                          │  │                          │       │
 │  │  Static/Reference Data:  │  │  Time-Series Data:       │       │
-│  │  • depots                │  │  • telemetry             │       │
-│  │  • vehicles              │  │  • prices                │       │
-│  │  • chargers              │  │  • weather_forecasts     │       │
+│  │  • sites (depots)        │  │  • telemetry             │       │
+│  │  • vehicles              │  │  • electricity_prices    │       │
+│  │  • charging_stations     │  │  • weather_forecasts     │       │
 │  │  • schedules             │  │  • building_load          │       │
 │  │  • battery_storage       │  │  • optimization_runs     │       │
 │  │  • charger_vehicle_access│  │  • charging_commands      │       │
@@ -157,7 +158,7 @@ Both services share access to the dual-database architecture (Supabase for refer
 | Component | Responsibility | Technology | Service |
 |-----------|---------------|------------|---------|
 | **Weather Adapter** | Fetch 7-day forecast | Open-Meteo API, httpx | Main API |
-| **Price Adapter** | Fetch TOU/CAISO prices | CAISO OASIS, utility APIs | Main API |
+| **Price Adapter** | Fetch day-ahead electricity prices | ENTSO-E Transparency Platform, httpx | Main API |
 | **Building Load Adapter** | Fetch building power consumption | Modbus meter, API, or forecast | Main API |
 | **Surrogate Model** | Energy consumption prediction | scikit-learn, gpytorch | Main API |
 | **State Assembler** | Aggregate inputs for optimizer | asyncpg, pandas | Main API |
@@ -169,7 +170,7 @@ Both services share access to the dual-database architecture (Supabase for refer
 | **API Server** | External REST interface | FastAPI, uvicorn | Main API |
 | **OCPP Server** | Charger communication (OCPP 1.6, handles 2+ messages) | ocpp library, WebSocket | WebSocket Handler |
 | **Telemetry Ingestion** | Store OCPP MeterValues to TimescaleDB | asyncpg | WebSocket Handler |
-| **Internal API** | Charge point state queries for Main API | HTTP REST | WebSocket Handler (planned Phase 4) |
+| **Internal API** | OCPP-event ingress to Main API (`POST /internal/ocpp-event`, token-gated via `INTERNAL_API_TOKEN`) | HTTP REST | WebSocket Handler |
 | **Heuristic Optimizer** | Backup optimization when Main API unavailable | Heuristic algorithms | WebSocket Handler (emergency only) |
 | **Supabase** | Static/reference data storage | Supabase (PostgreSQL) | Both services |
 | **TimescaleDB** | Time-series data storage | TimescaleDB (PostgreSQL extension) | Both services |
@@ -211,7 +212,7 @@ modules are the primary deprecation candidates:
 
 **Main API Backend:**
 - Weather API → Main API → `weather_forecasts` table (TimescaleDB)
-- CAISO API → Main API → `prices` table (TimescaleDB)
+- ENTSO-E Transparency Platform (day-ahead) → price feeder → `electricity_prices` table (TimescaleDB), keyed by bidding zone
 - Fleet Mgmt System → Main API → `schedules` table (Supabase)
 - Building Load Meter/API → Main API → `building_load` table (TimescaleDB)
 - Inter-depot Messages → Main API → `interdepot_messages` table (TimescaleDB)
@@ -225,9 +226,9 @@ modules are the primary deprecation candidates:
 ### 2. STATE ASSEMBLY (before each optimization - Main API)
 
 **Data Queries:**
-- Query latest telemetry from TimescaleDB (currently direct query; Phase 4: via WebSocket Handler internal API)
-- Query prices, schedules, depot config from Supabase
-- Query building load from TimescaleDB
+- Query latest telemetry from TimescaleDB (direct query)
+- Query day-ahead prices (`electricity_prices`) and building load from TimescaleDB
+- Query schedules and depot config from Supabase
 - Query pending inter-depot incoming vehicles (where `arrival_time < horizon_end`)
 
 **Data Processing:**
@@ -348,6 +349,43 @@ See decision 4.1 in the plan.
 
 **Note:** Backup mode is emergency-only and does not meet full optimization requirements
 
+## Component Dependencies
+
+A per-component dependency map (which modules each component reads from, writes to, and is used by). Note that `interdepot_messages` is a **TimescaleDB** table, not Supabase.
+
+### Core Optimization Engine
+- **Depends on:** State Assembler, Models, Solver
+- **Used by:** Controller, API
+
+### State Assembler
+- **Depends on:** Database Pool, Models
+- **Reads from:** TimescaleDB (telemetry, `electricity_prices`, building load), Supabase (schedules, depot config, vehicles)
+- **Used by:** Controller
+
+### Controller
+- **Depends on:** State Assembler, Optimizer, Trigger Monitor, OCPP Adapter
+- **Used by:** Controller Manager, API
+
+### OCPP Adapter
+- **Depends on:** OCPP Server, Database Pool
+- **Writes to:** TimescaleDB (telemetry)
+- **Used by:** Controller, WebSocket Handler
+
+### WebSocket Handler
+- **Depends on:** OCPP Server, TimescaleDB Client
+- **Writes to:** TimescaleDB (telemetry only)
+- **Independent from:** Main API Backend (separate service); communicates via `POST /internal/ocpp-event`
+
+### Key Interactions
+
+1. **Controller → State Assembler:** Requests current depot state for optimization
+2. **Controller → Optimizer:** Passes state, receives optimization result
+3. **Controller → OCPP Adapter:** Dispatches charging profiles to chargers
+4. **Trigger Monitor → Controller:** Triggers re-optimization on events
+5. **State Assembler → TimescaleDB:** Reads telemetry, `electricity_prices`, building load
+6. **State Assembler → Supabase:** Reads schedules, depot config, vehicles
+7. **WebSocket Handler → TimescaleDB:** Writes telemetry (only)
+
 ## Implementation Structure
 
 The codebase is organized as follows:
@@ -356,10 +394,11 @@ The codebase is organized as follows:
 - `src/core/surrogate/` - Energy consumption model
 - `src/core/state/` - State assembler and trigger monitor
 - `src/adapters/ocpp/` - OCPP client/server
-- `src/adapters/caiso/` - CAISO price feeds
+- `src/adapters/entsoe/` - ENTSO-E day-ahead price ingestion (live; lands in `electricity_prices`)
+- `src/adapters/caiso/` - CAISO price feeds (deprecated; retained as dead code — Europe-only deployment)
 - `src/adapters/weather/` - Weather API integration
-- `src/adapters/building_load/` - Building load meter/API
 - `src/adapters/handoff/` - Inter-depot handoff manager
+  - Building load is ingested via the `building_load` table / optional meter or BMS source — there is no dedicated `src/adapters/building_load/` module.
 - `src/security/` - Security modules (validators, JWT auth, rate limiting, secrets)
 - `src/api/` - FastAPI REST endpoints
 - `src/db/` - Database models & migrations

@@ -1,7 +1,7 @@
 # TimescaleDB Best Practices
 
 ## Reference
-Primary reference: docs/PRD_v2_7_Building_Integration.md#6-data-models
+Primary reference: `CLAUDE.md` ("Database Schema"); product spec: `docs/PRD_Depot_Agent.md`
 
 ## Hypertable Creation
 
@@ -24,24 +24,32 @@ Required hypertables per PRD Section 6.1:
 
 ## Schema Patterns
 
-### Reference Data Tables
-- `depots` - Depot configuration
-- `vehicles` - Vehicle fleet data
-- `chargers` - Charger configuration
-- `battery_storage` - Stationary battery specs
+### Two-Database Invariant (CRITICAL)
+Static reference tables — `sites`/depots, `vehicles`, `charging_stations`/chargers,
+`organizations`, `schedules`, `battery_storage`, `charger_vehicle_access`, `drivers`,
+`rfid_cards` — live **exclusively in Supabase** (`pools.static`). The TimescaleDB
+migration set NEVER creates these tables. NEVER query static reference data from the
+TimescaleDB pool. Depot/vehicle/charger identity columns on TimescaleDB operational
+tables are plain `UUID` columns with no FK to the static tables. See CLAUDE.md
+("Database Schema") for the canonical split and Supabase column aliases
+(e.g. `SELECT id AS depot_id FROM sites …`).
 
-### Time-Series Tables (Hypertables)
+### Time-Series Tables (Hypertables) — TimescaleDB
 - `telemetry` - Vehicle SoC, location, charging status, max_charge_kw (from OCPP)
-- `prices` - Energy and demand prices per timestep
+- `prices` - Energy and demand prices per timestep (new architecture)
+- `electricity_prices` - Per-bidding-zone day-ahead prices (ENTSO-E feeder)
 - `weather_forecasts` - Weather data for surrogate model
 - `building_load` - Building power consumption (REQUIRED)
 
-### Operational Tables
-- `schedules` - Vehicle route schedules (includes actual_return_time)
+### Operational Tables — TimescaleDB
 - `optimization_runs` - Optimization results and metadata (includes status: 'optimal', 'feasible', 'degraded', 'infeasible', 'timeout', and solver_used: 'gurobi' or 'highs')
 - `charging_commands` - OCPP command history
+- `charging_sessions` - OCPP 1.6 transaction lifecycle
 - `interdepot_messages` - Vehicle handoff messages (includes status: 'pending', 'acknowledged', 'arrived')
 - `trigger_log` - Re-optimization trigger events
+
+Note: vehicle route schedules live in the Supabase `schedules` static table (see the
+two-database invariant above), NOT in TimescaleDB.
 
 Reference: PRD Section 6.1
 
@@ -52,8 +60,8 @@ Create indexes for common query patterns:
 -- Vehicle telemetry queries
 CREATE INDEX idx_telemetry_vehicle ON telemetry (vehicle_id, time DESC);
 
--- Schedule lookups
-CREATE INDEX idx_schedules_vehicle_depart ON schedules (vehicle_id, departure_time);
+-- Price lookups by bidding zone
+CREATE INDEX idx_electricity_prices_node ON electricity_prices (node_id, time DESC);
 ```
 
 ## Time-Series Query Optimization
@@ -142,7 +150,7 @@ State assembler queries (PRD Section 5.3):
 2. Price schedule from `prices` table (max age: 24 hours)
 3. Weather forecast from `weather_forecasts` table (max age: 6 hours)
 4. Building load from `building_load` table (max age: 30 minutes, REQUIRED)
-5. Schedules from `schedules` table
+5. Schedules from the Supabase `schedules` static table (`pools.static`, NOT TimescaleDB)
 6. Pending inter-depot incoming vehicles from `interdepot_messages` table
 7. Store optimization results in `optimization_runs` table
    - Include `solver_used` field in OptimizationResult (stored in schedule_json metadata)
