@@ -503,15 +503,13 @@ async def find_orphaned_jobs(
 ) -> list[asyncpg.Record]:
     """Pending/running jobs that should be re-kicked during startup recovery.
 
-    Jobs whose parent connection is not schedulable are excluded so paused/disabled
-    connections are never resumed by the startup sweep. Results are keyset-
-    ordered by ``(created_at, id)``; pass the last row's cursor back in to page
-    through more than ``limit`` orphans.
+    Pending rows are always included (a crash between enqueue and spawn leaves no
+    heartbeat to test). Running rows are included only when their heartbeat is stale
+    per ``DATA_SOURCES_ORPHAN_THRESHOLD_S``.
 
-    ``running`` jobs are only included when their lease appears stale (or was
-    never set), to avoid reclaiming work from a live worker in multi-worker
-    deployments. Reclaim remains guarded by ``claim_job`` compare-and-swap on
-    the last observed lease timestamp.
+    Paused and disabled connections are excluded so the sweep never resurrects
+    a connection the operator intentionally stopped. Results are keyset-ordered
+    by ``(created_at, id)``; pass the last row's cursor to page beyond ``limit``.
     """
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -522,10 +520,8 @@ async def find_orphaned_jobs(
                 status = 'pending'
                 OR (
                     status = 'running'
-                    AND (
-                        lease_expires_at IS NULL
-                        OR lease_expires_at <= NOW()
-                    )
+                    AND COALESCE(heartbeat_at, started_at, created_at)
+                        < NOW() - make_interval(secs => $1::int)
                 )
             )
               AND EXISTS (
@@ -534,12 +530,13 @@ async def find_orphaned_jobs(
                     AND c.status IN ('active', 'error')
               )
               AND (
-                  $2::timestamptz IS NULL
-                  OR (created_at, id) > ($2::timestamptz, $3::uuid)
+                  $3::timestamptz IS NULL
+                  OR (created_at, id) > ($3::timestamptz, $4::uuid)
               )
             ORDER BY created_at ASC, id ASC
-            LIMIT $1
+            LIMIT $2
             """,
+            _ORPHAN_THRESHOLD_S,
             limit,
             after_created_at,
             after_id,
