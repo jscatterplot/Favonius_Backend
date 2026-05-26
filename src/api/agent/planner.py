@@ -97,12 +97,12 @@ async def fetch_org_sql_enabled(static_pool: Any, organization_id: Optional[UUID
     """Query ``organizations.agent_sql_mode_enabled`` for this org.
 
     Returns ``True`` (default-on) when the org row is not found yet
-    (tenant mirror may not have run). Returns ``False`` only when the
-    column is explicitly ``FALSE``, or when ``organization_id`` is
-    ``None`` (no org context to check).
+    (tenant mirror may not have run), or when ``organization_id`` is
+    ``None`` (e.g., admin/system callers without org claims). Returns
+    ``False`` only when the column is explicitly ``FALSE``.
     """
     if organization_id is None:
-        return False
+        return True
     row = await static_pool.fetchrow(
         "SELECT agent_sql_mode_enabled FROM organizations WHERE id = $1",
         organization_id,
