@@ -12496,7 +12496,7 @@ async def _handle_alerts_acknowledge(
     """Transition an active alert to acknowledged.
 
     Params: alert_id (UUID), acknowledged_by_email (email string, optional).
-    Looks up by alert_id within the caller's org; depot_id is context only.
+    Looks up by alert_id within the caller's org and command depot_id.
     """
     alert_id = params.get("alert_id")
     if not alert_id:
@@ -12521,7 +12521,11 @@ async def _handle_alerts_acknowledge(
     async with db_pools.ts.acquire() as conn:
         existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
 
-    if existing is None or str(existing.organization_id) != str(org_id):
+    if (
+        existing is None
+        or str(existing.organization_id) != str(org_id)
+        or str(existing.depot_id) != depot_id
+    ):
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
     if existing.status != "active":
@@ -12530,7 +12534,7 @@ async def _handle_alerts_acknowledge(
             detail=f"Alert {alert_id} has status '{existing.status}'; only active alerts can be acknowledged",
         )
 
-    actor_uuid = _parse_actor_uuid(actor_raw)
+    actor_uuid = UUID(str(actor_raw))
 
     if dry_run:
         projected = _project_alert_acknowledged(
@@ -12581,7 +12585,7 @@ async def _handle_alerts_resolve(
 
     Params: alert_id (UUID), acknowledged_by_email (email string, optional).
     Sets acknowledged_by/email via COALESCE so existing values are preserved.
-    Looks up by alert_id within the caller's org; depot_id is context only.
+    Looks up by alert_id within the caller's org and command depot_id.
     """
     alert_id = params.get("alert_id")
     if not alert_id:
@@ -12606,7 +12610,11 @@ async def _handle_alerts_resolve(
     async with db_pools.ts.acquire() as conn:
         existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
 
-    if existing is None or str(existing.organization_id) != str(org_id):
+    if (
+        existing is None
+        or str(existing.organization_id) != str(org_id)
+        or str(existing.depot_id) != depot_id
+    ):
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
     if existing.status == "resolved":
@@ -12614,7 +12622,7 @@ async def _handle_alerts_resolve(
             status_code=409, detail=f"Alert {alert_id} is already resolved"
         )
 
-    actor_uuid = _parse_actor_uuid(actor_raw)
+    actor_uuid = UUID(str(actor_raw))
 
     if dry_run:
         projected = _project_alert_resolved(
@@ -12873,14 +12881,6 @@ async def acknowledge_notification_alert(
         status=updated.status,
         acknowledged_at=updated.acknowledged_at.isoformat(),
     )
-
-
-def _parse_actor_uuid(actor_raw: Any) -> Optional[UUID]:
-    """Parse JWT sub to UUID; return None when malformed (matches resolve path)."""
-    try:
-        return UUID(str(actor_raw))
-    except (TypeError, ValueError):
-        return None
 
 
 def _project_alert_acknowledged(
