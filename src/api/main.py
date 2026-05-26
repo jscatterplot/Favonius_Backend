@@ -1509,7 +1509,7 @@ class VehicleCurrentState(BaseModel):
       5. ``at_risk`` — ``current_soc < COALESCE(next_departure.required_soc, 0.95)``.
     """
 
-    state: Literal["ready", "charging", "at_risk", "in_route", "offline"]
+    state: Literal["ready", "charging", "at_risk", "in_route", "offline", "unknown"]
     current_soc: Optional[float] = Field(None, ge=0.0, le=1.0)
     current_power_kw: Optional[float] = None
     connected_charger_id: Optional[str] = Field(

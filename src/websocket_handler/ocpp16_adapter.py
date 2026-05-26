@@ -1297,8 +1297,8 @@ class OCPP16Session:
         self,
         cp_id: str,
         connector_id: int,
-        soc: float,  # 0.0–1.0 fraction from FleetChargePoint
-        power_kw: float,
+        soc: Optional[float],  # 0.0–1.0 fraction from FleetChargePoint; None when charger doesn't report it
+        power_kw: Optional[float],
         energy_kwh: Optional[float],
         timestamp: datetime,
         transaction_id: Optional[int],
@@ -1319,9 +1319,12 @@ class OCPP16Session:
             "soc_percent": soc_percent,
             "max_charge_power_kw": max_charge_kw,
         }
-        for sample in raw_samples or []:
+        for sample_index, sample in enumerate(raw_samples or []):
             row = dict(base_row)
             row["raw_sample"] = sample
+            # Preserve per-sample ordering for batches where multiple sampled
+            # values share the same OCPP timestamp.
+            row["sample_index"] = sample_index
             self._enqueue_telemetry_row(row)
         if not raw_samples:
             self._enqueue_telemetry_row(base_row)

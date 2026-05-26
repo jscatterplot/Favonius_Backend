@@ -539,8 +539,8 @@ class FleetChargePoint(CP16):
                     await self._cb_meter_values(
                         self.id,
                         connector_id,
-                        soc or 0.0,
-                        power_kw or 0.0,
+                        soc,
+                        power_kw,
                         energy_kwh,
                         timestamp,
                         transaction_id,
@@ -548,7 +548,9 @@ class FleetChargePoint(CP16):
                         raw_samples,
                     )
                 except TypeError:
-                    # Backward-compat: old callback (cp, conn, soc, power, ts, max_kw)
+                    # Backward-compat: old callback (cp, conn, soc, power, ts, max_kw).
+                    # Old signatures expected float, not Optional[float] — pass 0.0 when
+                    # the measurand was absent so legacy formatters don't raise TypeError.
                     try:
                         await self._cb_meter_values(
                             self.id,

@@ -1,17 +1,17 @@
 """Unit tests for ``TimescaleClient.insert_telemetry_batch`` after the V2G drop.
 
-Covers the three behaviors that matter for charger-centric tracking now that
-the legacy ``transaction_events_v2g`` fallback is gone:
+Covers the behaviors that matter for charger-centric tracking now that both
+the legacy ``transaction_events_v2g`` fallback and ``telemetry_samples`` EAV
+table are gone (the latter retired in migration 045; energy_kwh is now a
+first-class column on the wide telemetry table):
 
-1. ``telemetry_samples`` rows are written for every batch row that carries a
-   ``raw_sample`` regardless of whether the vehicle can be attributed.
-2. Open ``charging_sessions`` rows get their ``current_power_kw`` /
+1. Open ``charging_sessions`` rows get their ``current_power_kw`` /
    ``current_soc`` / ``max_charge_power_kw`` refreshed on each MeterValues
    batch so per-charger charging rate is observable in real time without
    needing a vehicle.
-3. The vehicle-keyed ``telemetry`` insert (optimizer view) is skipped silently
-   when no vehicle attribution exists; the batch as a whole still succeeds and
-   never queries ``transaction_events_v2g``.
+2. The wide ``telemetry`` INSERT always runs (charger-keyed), whether or not
+   vehicle attribution is possible. vehicle_id is NULL when unresolvable.
+3. Neither ``telemetry_samples`` nor ``transaction_events_v2g`` are touched.
 """
 
 from __future__ import annotations
@@ -105,7 +105,7 @@ async def test_update_session_live_metrics_writes_expected_sql():
 
 @pytest.mark.asyncio
 async def test_update_session_live_metrics_swallows_db_errors():
-    """Failing live update must not propagate — telemetry_samples is canonical."""
+    """Failing live update must not propagate — telemetry wide row is canonical."""
     conn = AsyncMock()
     conn.execute = AsyncMock(side_effect=RuntimeError("boom"))
     client = _client()
@@ -231,14 +231,14 @@ def _row(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_batch_writes_telemetry_samples_and_live_metrics_without_vehicle():
-    """No vehicle attribution → telemetry_samples + live UPDATE still run.
+async def test_batch_writes_telemetry_and_live_metrics_without_vehicle():
+    """No vehicle attribution → wide telemetry + live UPDATE still run.
 
-    The vehicle-keyed ``telemetry`` insert is skipped silently. The whole
-    batch must succeed and must NOT query ``transaction_events_v2g``.
+    vehicle_id is NULL in the telemetry row. The whole batch must succeed
+    and must NOT touch telemetry_samples or transaction_events_v2g.
     """
     conn = AsyncMock()
-    # No vehicle resolvable from the open session.
+    # No vehicle resolvable from the open session; charger lookup also None.
     conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
     client = _client()
@@ -257,13 +257,12 @@ async def test_batch_writes_telemetry_samples_and_live_metrics_without_vehicle()
     await client.insert_telemetry_batch([_row(raw_sample=raw_sample)])
 
     executed_sql = [c.args[0] for c in conn.execute.await_args_list]
-    # Per-measurand audit row was written.
-    assert any("INSERT INTO telemetry_samples" in s for s in executed_sql)
-    # Live-session metric refresh ran for the open session.
+    # Live-session metric refresh ran.
     assert any("UPDATE charging_sessions" in s for s in executed_sql)
-    # Vehicle-keyed telemetry insert was NOT issued (no vehicle attributable).
-    assert not any("INSERT INTO telemetry" in s and "telemetry_samples" not in s
-                   for s in executed_sql)
+    # Wide telemetry row inserted (charger-keyed; vehicle_id will be NULL).
+    assert any("INSERT INTO telemetry" in s for s in executed_sql)
+    # telemetry_samples EAV table is gone.
+    assert not any("telemetry_samples" in s for s in executed_sql)
     # V2G fallback is gone.
     assert not any("transaction_events_v2g" in s for s in executed_sql)
 
@@ -288,10 +287,10 @@ async def test_batch_writes_vehicle_telemetry_when_session_resolves_vehicle():
     executed_sql = [c.args[0] for c in conn.execute.await_args_list]
     # Live update fired.
     assert any("UPDATE charging_sessions" in s for s in executed_sql)
-    # Vehicle-keyed telemetry insert fired.
-    assert any(
-        "INSERT INTO telemetry" in s and "telemetry_samples" not in s for s in executed_sql
-    )
+    # Wide telemetry insert fired.
+    assert any("INSERT INTO telemetry" in s for s in executed_sql)
+    # telemetry_samples EAV table is gone.
+    assert not any("telemetry_samples" in s for s in executed_sql)
     # V2G fallback is gone.
     assert not any("transaction_events_v2g" in s for s in executed_sql)
 
@@ -348,8 +347,8 @@ async def test_batch_handles_mixed_rows_no_row_lost_to_v2g_error():
     executed_sql = [c.args[0] for c in conn.execute.await_args_list]
     # Live UPDATE happened for both rows (both have integer transaction_id).
     assert sum(1 for s in executed_sql if "UPDATE charging_sessions" in s) == 2
-    # Exactly one vehicle-keyed telemetry insert (from the resolvable row).
-    assert sum(
-        1 for s in executed_sql if "INSERT INTO telemetry" in s and "telemetry_samples" not in s
-    ) == 1
+    # Wide telemetry INSERT ran for both rows (charger-keyed, vehicle_id=NULL for row2).
+    assert sum(1 for s in executed_sql if "INSERT INTO telemetry" in s) == 2
+    # telemetry_samples EAV table is gone.
+    assert not any("telemetry_samples" in s for s in executed_sql)
     assert not any("transaction_events_v2g" in s for s in executed_sql)

@@ -40,7 +40,7 @@ def _row(**overrides):
 
 @pytest.mark.asyncio
 async def test_classify_register_path_backfills_from_earliest_sample(capsys):
-    """When telemetry_samples has Energy.Active.Import.Register, use it as start."""
+    """When telemetry has an energy_kwh reading for the session, use it as start."""
     conn = AsyncMock()
     # earliest register sample in the window is 100 Wh; last_meter_wh = 3082.
     conn.fetchval = AsyncMock(return_value=100)
@@ -89,8 +89,8 @@ async def test_classify_skips_when_last_meter_present_but_no_register():
     """last_meter_wh non-NULL means register samples DID arrive — synthesis suppressed.
 
     If last_meter_wh is populated but the earliest-register query returns
-    None (e.g. the samples were pruned from telemetry_samples after
-    retention), we cannot reconstruct a real meter_start. Don't fall back
+    None (e.g. rows aged out of the telemetry hypertable retention policy),
+    we cannot reconstruct a real meter_start. Don't fall back
     to synthesis — that would double-count the energy already captured in
     last_meter_wh.
     """

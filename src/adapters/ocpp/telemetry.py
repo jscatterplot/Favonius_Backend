@@ -28,8 +28,8 @@ async def store_meter_values(
     pools: DatabasePools,
     charge_point_id: str,
     connector_id: int,
-    soc: float,
-    power_kw: float,
+    soc: Optional[float],
+    power_kw: Optional[float],
     timestamp: datetime,
     vehicle_id: Optional[str | UUID] = None,
     max_charge_kw: Optional[float] = None,
@@ -91,7 +91,7 @@ async def store_meter_values(
         max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw)
     """
 
-    is_plugged = power_kw > 0.1
+    is_plugged = (power_kw > 0.1) if power_kw is not None else None
 
     try:
         # Write telemetry to TimescaleDB (ts pool)
@@ -108,9 +108,11 @@ async def store_meter_values(
                 is_plugged,
                 max_charge_kw,
             )
+        soc_str = f"{soc:.2f}" if soc is not None else "N/A"
+        power_str = f"{power_kw:.2f}" if power_kw is not None else "N/A"
         logger.debug(
             f"Stored meter values: {charge_point_id}, connector {connector_id}, "
-            f"vehicle_id={vehicle_id}, SoC={soc:.2f}, Power={power_kw:.2f}kW"
+            f"vehicle_id={vehicle_id}, SoC={soc_str}, Power={power_str}kW"
             + (f", Energy={energy_kwh:.2f}kWh" if energy_kwh else "")
             + (f", max_charge_kw={max_charge_kw:.2f}kW" if max_charge_kw else "")
         )
