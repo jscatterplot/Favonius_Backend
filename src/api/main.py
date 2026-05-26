@@ -8371,6 +8371,7 @@ async def get_depot_chargers(
 
             connector_statuses: dict[str, dict] = {}
             open_sessions: dict[str, dict] = {}
+            telemetry_times: dict[str, datetime] = {}
             if ocpp_ids:
 
                 async def _fetch_connector_statuses():
@@ -8383,11 +8384,21 @@ async def get_depot_chargers(
                     async with db_pools.ts.acquire() as ts_conn:
                         return await db_queries.open_sessions_by_stations(ts_conn, ocpp_ids)
 
+                async def _fetch_telemetry_times():
+                    async with db_pools.ts.acquire() as ts_conn:
+                        return await db_queries.latest_telemetry_time_by_stations(ts_conn, ocpp_ids)
+
                 connector_statuses = await _safe_runtime_fetch(
                     _fetch_connector_statuses, label="charger connector status"
                 )
                 open_sessions = await _safe_runtime_fetch(
                     _fetch_open_sessions, label="charger open sessions"
+                )
+                # MeterValues freshness — keeps an actively-metering charger
+                # "online" even when connector_status is stale and the
+                # liveness pg_notify bridge is down. Degrades to {} on error.
+                telemetry_times = await _safe_runtime_fetch(
+                    _fetch_telemetry_times, label="charger telemetry freshness"
                 )
 
             now = datetime.now(timezone.utc)
@@ -8408,6 +8419,7 @@ async def get_depot_chargers(
                     open_session=open_sessions.get(static_row["ocpp_id"]),
                     now=now,
                     last_interaction_override=_live_lookup(static_row["ocpp_id"]),
+                    telemetry_last_seen=telemetry_times.get(static_row["ocpp_id"]),
                 )
                 for static_row in static_rows
             ]
