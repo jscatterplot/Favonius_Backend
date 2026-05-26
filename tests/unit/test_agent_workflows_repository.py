@@ -47,6 +47,7 @@ from src.api.agent_workflows.repository import (  # noqa: E402
     get_tier,
     get_workflow,
     insert_decision,
+    insert_default_tier,
     list_decisions,
     set_tier,
     upsert_workflow,
@@ -336,6 +337,51 @@ class TestTierRepository:
         await set_tier(pool, uuid4(), uuid4(), PermissionTier.AUTONOMOUS, rule)
         _, *params = conn.execute.call_args[0]
         assert params[7] is None
+
+
+@pytest.mark.asyncio
+class TestInsertDefaultTier:
+    def _rule(self) -> GraduationRule:
+        return GraduationRule(
+            min_decisions=100,
+            max_override_rate=0.05,
+            max_edit_rate=0.15,
+            requires_human_signoff=True,
+            next_tier=PermissionTier.DRAFT_AND_WAIT,
+        )
+
+    async def test_insert_only_semantics_and_returns_true_when_inserted(
+        self, mock_asyncpg_pool
+    ):
+        pool, conn = mock_asyncpg_pool
+        # RETURNING row present → a row was inserted.
+        conn.fetchrow.return_value = {"workflow_id": uuid4()}
+        workflow_id, depot_id = uuid4(), uuid4()
+
+        inserted = await insert_default_tier(
+            pool, workflow_id, depot_id, PermissionTier.INFORM, self._rule()
+        )
+        assert inserted is True
+
+        sql, *params = conn.fetchrow.call_args[0]
+        assert "INSERT INTO workflow_tiers" in sql
+        # Must be insert-only (no silent downgrade of a graduated row).
+        assert "ON CONFLICT (workflow_id, depot_id) DO NOTHING" in sql
+        assert "DO UPDATE" not in sql
+        assert "RETURNING" in sql
+        assert params[0] == workflow_id
+        assert params[1] == depot_id
+        assert params[2] == "inform"
+        assert params[7] == "draft_and_wait"
+
+    async def test_returns_false_when_row_already_existed(self, mock_asyncpg_pool):
+        pool, conn = mock_asyncpg_pool
+        # ON CONFLICT DO NOTHING → no RETURNING row → already existed.
+        conn.fetchrow.return_value = None
+        inserted = await insert_default_tier(
+            pool, uuid4(), uuid4(), PermissionTier.INFORM, self._rule()
+        )
+        assert inserted is False
 
 
 # ── insert_decision ──────────────────────────────────────────────────────

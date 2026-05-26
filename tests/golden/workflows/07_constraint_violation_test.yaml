@@ -39,7 +39,10 @@ workflow:
     soc_tolerance_pct: 1.0
     escalation_threshold: 3
 
-permission_tier: inform
+# draft_and_wait: proposals are a graduated-tier feature (PRD §9.1).
+# The guard must filter the unsafe proposal at any tier; this scenario
+# pins that on the proposal-emitting path.
+permission_tier: draft_and_wait
 
 depot_constraints:
   min_departure_soc: 0.99

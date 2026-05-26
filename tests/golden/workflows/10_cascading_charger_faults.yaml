@@ -34,7 +34,10 @@ workflow:
     soc_tolerance_pct: 1.0
     escalation_threshold: 3
 
-permission_tier: inform
+# draft_and_wait: proposals are a graduated-tier feature (PRD §9.1).
+# At `inform` this workflow is a read-only brief and emits no actions;
+# this scenario exercises the post-graduation deduped-proposal path.
+permission_tier: draft_and_wait
 
 graph_snapshot:
   depot:

@@ -32,10 +32,7 @@ from src.api.agent_workflows.models import (
     PermissionTier,
     Workflow,
 )
-from src.api.agent_workflows.readiness_tools import (
-    build_readiness_tool_registry,  # noqa: F401 — re-export for callers
-)
-from src.api.agent_workflows.repository import set_tier, upsert_workflow
+from src.api.agent_workflows.repository import insert_default_tier, upsert_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -167,24 +164,36 @@ exception via emit_decision rather than speculate.
 Call emit_decision exactly once with:
   - summary: short natural-language summary for the depot manager,
     pairing the coverage statement with the exception count.
-  - proposed_actions: zero or more structured objects. Each one cites
-    the vehicle id, action type (``swap_charger``, ``extend_charging``,
-    ``hold_route``, ``swap_driver``, ``reassign_to_route``,
-    ``preserve_current_plan``), and any candidate ids. Include
-    ``requires_manager: true`` when no compliant mitigation exists.
+  - proposed_actions: structured mitigation objects (see the tier rules
+    below for whether you may emit any). Each one cites the vehicle id,
+    action type (``swap_charger``, ``extend_charging``, ``hold_route``,
+    ``swap_driver``, ``reassign_to_route``, ``preserve_current_plan``),
+    and any candidate ids. Include ``requires_manager: true`` when no
+    compliant mitigation exists.
   - coverage: counts of {vehicles_checked, chargers_checked,
     routes_checked} so the today view can render "Checked X, found N".
   - rule_applied: the dominant rule name (e.g. ``charger_fault_swap``,
     ``undercharge_extend``, ``data_freshness_block``) when one applies.
 
-# Permission tier
+# Permission tier — gates WHETHER you may propose, not just execution
 
-The depot's permission tier for this workflow gates whether each
-proposed_action is auto-executed or only drafted. Tier ``inform`` (the
-launch default) means you describe the situation only — no action is
-auto-executed. Tier ``draft_and_wait`` means you may propose actions,
-but a human approves before anything runs. You never auto-execute at
-any tier where it would risk a hard-constraint violation.
+The per-depot permission tier is given to you in the turn input. It
+controls what you are allowed to emit:
+
+  - ``inform`` (the launch default): you ONLY describe. The
+    proposed_actions list MUST be empty. State each exception and the
+    direction a human would likely take in the summary prose, but emit
+    no structured proposed_actions and never imply an action was or
+    will be taken. This is a read-only morning brief.
+  - ``draft_and_wait``: you may emit specific proposed_actions for the
+    human to approve. Nothing is executed until a human approves.
+  - ``act_and_notify`` / ``autonomous``: reserved for graduated
+    workflows; still subject to every hard constraint above.
+
+At no tier do you auto-execute, and at no tier do you emit a
+proposed_action that would risk a hard-constraint violation. When the
+tier is ``inform``, surfacing the exception in the summary IS the
+deliverable — withholding the structured action is correct, not a gap.
 """
 
 
@@ -254,23 +263,25 @@ async def seed_default_tiers(
     LEFT UNTOUCHED — graduation is always an explicit, audited action,
     never silently overwritten by a process restart.
 
+    The insert is atomic (``INSERT ... ON CONFLICT DO NOTHING`` via
+    :func:`~src.api.agent_workflows.repository.insert_default_tier`), so
+    a concurrent insert or graduation by another worker between depots
+    cannot be clobbered back to the default — a check-then-write would
+    have that race.
+
     Returns the number of rows that were freshly inserted.
     """
-    from src.api.agent_workflows.repository import get_tier
-
     inserted = 0
     for depot_id in depot_ids:
-        existing = await get_tier(ts_pool, workflow_id, depot_id)
-        if existing is not None:
-            continue
-        await set_tier(
+        was_inserted = await insert_default_tier(
             ts_pool,
             workflow_id,
             depot_id,
             READINESS_DEFAULT_TIER,
             READINESS_DEFAULT_GRADUATION_RULE,
         )
-        inserted += 1
+        if was_inserted:
+            inserted += 1
     return inserted
 
 

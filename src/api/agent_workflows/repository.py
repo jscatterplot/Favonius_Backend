@@ -200,6 +200,58 @@ async def set_tier(
         )
 
 
+async def insert_default_tier(
+    pool: Any,
+    workflow_id: UUID,
+    depot_id: UUID,
+    tier: PermissionTier,
+    rule: GraduationRule,
+) -> bool:
+    """Insert a launch-default tier row iff one does not already exist.
+
+    Unlike :func:`set_tier` (which is an upsert used by the graduation /
+    demotion endpoints), this is **insert-only**: ``ON CONFLICT DO
+    NOTHING``. It exists for the per-depot startup seed, where the
+    contract is "never touch an existing row" — a check-then-``set_tier``
+    sequence is racy and could silently downgrade a row that another
+    worker inserted or graduated in the gap. Doing the insert and the
+    existence check in one statement removes that race.
+
+    Returns:
+        ``True`` if a new row was inserted, ``False`` if a row for
+        ``(workflow_id, depot_id)`` already existed and was left
+        untouched.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO workflow_tiers (
+                workflow_id,
+                depot_id,
+                tier,
+                min_decisions,
+                max_override_rate,
+                max_edit_rate,
+                requires_human_signoff,
+                next_tier,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            ON CONFLICT (workflow_id, depot_id) DO NOTHING
+            RETURNING workflow_id
+            """,
+            workflow_id,
+            depot_id,
+            tier.value,
+            rule.min_decisions,
+            rule.max_override_rate,
+            rule.max_edit_rate,
+            rule.requires_human_signoff,
+            rule.next_tier.value if rule.next_tier else None,
+        )
+    return row is not None
+
+
 # ── decisions ─────────────────────────────────────────────────────────────
 
 

@@ -161,6 +161,19 @@ def test_registered_workflow_prompt_is_the_guarded_production_prompt():
     assert "requires_manager" in wf.prompt
 
 
+def test_system_prompt_forbids_proposals_at_inform_tier():
+    """PRD §9.1: at ``inform`` the agent describes only — no actions are
+    proposed. The prompt must make proposed_actions tier-gated, not just
+    auto-execution-gated, so a default-tier (inform) depot gets a
+    read-only brief."""
+    prompt = READINESS_SYSTEM_PROMPT
+    assert "inform" in prompt
+    # The list must be explicitly required empty at inform tier.
+    assert "MUST be empty" in prompt
+    # And draft_and_wait is where proposals become legal.
+    assert "draft_and_wait" in prompt
+
+
 def _introspect_production_registry():
     """Build the real readiness registry to introspect tool schemas.
 
@@ -261,17 +274,13 @@ def _fake_ts_pool_returning(
 
     async def _fetchrow(sql: str, *args: Any) -> Any:
         log.append(("fetchrow", (sql,) + args))
-        # `upsert_workflow` calls fetchrow with INSERT…RETURNING; everything
-        # else (get_tier) is also fetchrow but reads from workflow_tiers.
-        if "FROM workflow_tiers" in sql:
-            key = (args[0], args[1])
-            return existing.get(key)
-        return workflow_row
-
-    async def _execute(sql: str, *args: Any) -> Any:
-        log.append(("execute", (sql,) + args))
         if "INSERT INTO workflow_tiers" in sql:
-            existing[(args[0], args[1])] = {
+            # insert_default_tier: ON CONFLICT DO NOTHING RETURNING.
+            # Returns a row only when no row pre-existed for the key.
+            key = (args[0], args[1])
+            if key in existing:
+                return None
+            existing[key] = {
                 "tier": args[2],
                 "min_decisions": args[3],
                 "max_override_rate": args[4],
@@ -279,10 +288,15 @@ def _fake_ts_pool_returning(
                 "requires_human_signoff": args[6],
                 "next_tier": args[7],
             }
-        return "INSERT 0 1"
+            return {"workflow_id": args[0]}
+        if "FROM workflow_tiers" in sql:
+            # get_tier read path (no longer used by the seed, but kept).
+            key = (args[0], args[1])
+            return existing.get(key)
+        # upsert_workflow: INSERT INTO workflows … RETURNING.
+        return workflow_row
 
     conn.fetchrow = _fetchrow
-    conn.execute = _execute
 
     @asynccontextmanager
     async def _acquire():
@@ -361,11 +375,13 @@ async def test_seed_default_tiers_inserts_inform_for_new_depots():
 
     inserts = [
         (kind, args) for kind, args in log
-        if kind == "execute" and "INSERT INTO workflow_tiers" in args[0]
+        if kind == "fetchrow" and "INSERT INTO workflow_tiers" in args[0]
     ]
     assert len(inserts) == 2
-    # Every insert must be tier='inform'.
+    # Insert-only semantics (ON CONFLICT DO NOTHING) so a concurrent
+    # graduation can't be clobbered back to the default.
     for _, args in inserts:
+        assert "ON CONFLICT (workflow_id, depot_id) DO NOTHING" in args[0]
         assert args[3] == "inform"  # tier column
         assert args[8] == "draft_and_wait"  # next_tier
 
