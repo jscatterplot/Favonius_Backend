@@ -270,6 +270,46 @@ async def test_run_turn_depot_wide_scoped_to_visible_depots(seeded_db, fake_llm_
 
 
 @pytest.mark.asyncio
+async def test_run_turn_depot_scoped_subject(seeded_db, fake_llm_client):
+    """A named depot subject ("at the Vilnius depot") sums that depot's total.
+
+    The compiler raises on a depot subject; the orchestrator must route it
+    into the depot-scoped aggregation instead of erroring. DEPOT_A's
+    'TEST_STATION' carries the seeded sessions, so last_month has data.
+    """
+    token = make_token_payload(seeded_db["user_a"], organization_id=seeded_db["org_a"])
+    reply = await run_turn(
+        message="how much power did the vilnius depot use last month",
+        token_payload=token,
+        static_pool=seeded_db["static_pool"],
+        ts_pool=seeded_db["ts_pool"],
+        llm_client=fake_llm_client,
+    )
+    assert reply.status == "success"
+    assert reply.intent == "consumption_by_user"
+    payload = fake_llm_client.last_format_payload
+    assert payload["result_summary"]["total_sessions"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_run_turn_depot_scoped_cross_org_isolated(seeded_db, fake_llm_client):
+    """Org B asking for the Vilnius depot (Org A) resolves nothing → not_found.
+
+    The depot resolver scopes by visible_depot_ids, so a depot in another
+    tenant never resolves — the caller can't pull Org A's total by name.
+    """
+    token = make_token_payload(seeded_db["user_b"], organization_id=seeded_db["org_b"])
+    reply = await run_turn(
+        message="how much power did the vilnius depot use last month",
+        token_payload=token,
+        static_pool=seeded_db["static_pool"],
+        ts_pool=seeded_db["ts_pool"],
+        llm_client=fake_llm_client,
+    )
+    assert reply.status == "not_found"
+
+
+@pytest.mark.asyncio
 async def test_run_turn_error_path_marks_run(seeded_db):
     """LLM client failure → agent_runs.status='error' and the call re-raises."""
     bad_llm = FakeLLMClient(raise_on_extract=True)

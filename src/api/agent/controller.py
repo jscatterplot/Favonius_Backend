@@ -313,64 +313,77 @@ async def _depot_wide_consumption_rows(
     ts_pool: Any,
     auth: Any,
     plan: QueryPlan,
+    *,
+    depot_ids: Optional[list[UUID]] = None,
 ) -> tuple[list[dict[str, Any]], ResolvedTimeWindow, int]:
-    """Aggregate consumption across every charger in the caller's depots.
+    """Aggregate consumption across the caller's chargers.
 
-    The tenant boundary is the set of charger ``station_id``\\ s belonging
-    to ``auth.visible_depot_ids`` (resolved server-side via
-    :func:`load_depot_stations`) — never an LLM-supplied value. Sessions
-    are summed one query per depot **timezone group**, a bounded loop that
-    collapses to a single iteration for the common single-timezone org and
-    keeps each ``DATE_TRUNC`` bucket anchored to the right local day.
+    The tenant boundary is the set of depots and their charger
+    ``station_id``\\ s (resolved server-side via :func:`load_depot_stations`)
+    — never an LLM-supplied value. By default this spans every depot the
+    caller can see (a no-subject "depot-wide" total); pass ``depot_ids`` to
+    scope to a named subset (a resolved ``depot`` subject — "consumption at
+    depot X"). The subset is intersected with ``auth.visible_depot_ids`` so
+    a depot id can never widen the caller's scope.
+
+    Sessions are summed one query per depot **timezone group**, a bounded
+    loop that collapses to a single iteration for the common single-timezone
+    org and keeps each ``DATE_TRUNC`` bucket anchored to the right local day.
 
     Returns the concatenated rows, a representative resolved window (the
     first timezone group's, used only for the formatter's period context),
     and the number of timezone groups for the audit trail.
     """
-    depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
-    stations = await load_depot_stations(static_pool, auth.visible_depot_ids)
+    visible = set(auth.visible_depot_ids)
+    if depot_ids is None:
+        scope_depot_ids = list(auth.visible_depot_ids)
+    else:
+        scope_depot_ids = [d for d in depot_ids if d in visible]
 
-    groups: dict[str, list[str]] = {}
-    tz_depots: dict[str, set[UUID]] = {}
+    depot_tzs = await load_depot_timezones(static_pool, scope_depot_ids)
+    stations = await load_depot_stations(static_pool, scope_depot_ids)
+
+    # Charger station_ids per depot — the live-OCPP linkage. Imported rows
+    # carry a synthetic station_id and are matched by site_id instead, so
+    # the loop below is driven by depots (not stations): a depot with
+    # imported history but zero registered chargers is still queried.
+    depot_station_ids: dict[UUID, list[str]] = {}
     for station in stations:
-        depot_id = station["depot_id"]
-        tz = station["timezone"] or depot_tzs.get(depot_id) or "UTC"
-        groups.setdefault(tz, []).append(station["ocpp_id"])
+        depot_station_ids.setdefault(station["depot_id"], []).append(station["ocpp_id"])
+
+    # Group depots by timezone. Depots with no timezone in ``sites`` fall
+    # back to UTC.
+    tz_depots: dict[str, set[UUID]] = {}
+    for depot_id in scope_depot_ids:
+        tz = depot_tzs.get(depot_id) or "UTC"
         tz_depots.setdefault(tz, set()).add(depot_id)
 
     rows_list: list[dict[str, Any]] = []
     window: Optional[ResolvedTimeWindow] = None
-    # Iterate timezones in a stable order so the representative window
-    # below (and the per-group params) don't depend on the unordered
-    # station rows returned by ``load_depot_stations``.
-    for tz in sorted(groups):
-        ocpp_ids = sorted(groups[tz])
-        depot_ids = sorted(tz_depots[tz], key=str)
-        depot_id = depot_ids[0]
+    # Iterate timezones in a stable order so the representative window below
+    # (and the per-group params) don't depend on unordered DB rows.
+    for tz in sorted(tz_depots):
+        group_depot_ids = sorted(tz_depots[tz], key=str)
+        ocpp_ids = sorted(ocpp for d in group_depot_ids for ocpp in depot_station_ids.get(d, []))
+        depot_id = group_depot_ids[0]
         group_window = resolve_time_window(plan.time_window, [depot_id], {depot_id: tz})
         if window is None:
             window = group_window
         sql, params = compile_consumption_by_user(
-            plan, [], group_window, station_ids=ocpp_ids, depot_ids=depot_ids
+            plan, [], group_window, station_ids=ocpp_ids, depot_ids=group_depot_ids
         )
         rows = await ts_pool.fetch(sql, *params)
         rows_list.extend(dict(r) for r in rows)
 
     if window is None:
-        # No chargers to scope to (depot has none, or org has no depots).
-        # Resolve a best-effort window so the formatter can still report
-        # "no sessions" against the period the user actually asked about.
-        if auth.visible_depot_ids:
-            fallback_depot = auth.visible_depot_ids[0]
-            fallback_tz = depot_tzs.get(fallback_depot) or "UTC"
-        else:
-            fallback_depot = UUID("00000000-0000-0000-0000-000000000000")
-            fallback_tz = "UTC"
-        window = resolve_time_window(
-            plan.time_window, [fallback_depot], {fallback_depot: fallback_tz}
-        )
+        # Only reached when there are no in-scope depots at all (org has
+        # none, or a resolved depot fell outside the visible set). Resolve a
+        # best-effort window so the formatter can still report "no sessions"
+        # against the period the user actually asked about.
+        fallback_depot = UUID("00000000-0000-0000-0000-000000000000")
+        window = resolve_time_window(plan.time_window, [fallback_depot], {fallback_depot: "UTC"})
 
-    return rows_list, window, len(groups)
+    return rows_list, window, len(tz_depots)
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────────
@@ -515,28 +528,58 @@ async def run_turn(
                 await _emit_answer_safe(sse, reply, run_id)
                 return reply
 
-            # 4. Resolve time window in the depot timezone.
-            depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
-            window = resolve_time_window(plan.time_window, auth.visible_depot_ids, depot_tzs)
+            # 3c. Depot-only subjects → depot-scoped total. A depot names a
+            # *scope*, not a row filter, and the consumption compiler only
+            # filters by driver/card/vehicle (it raises on a depot subject).
+            # So reuse the depot-wide aggregation (site_id / station_id)
+            # restricted to the resolved depots. The resolver already scoped
+            # them to the caller's visible depots; the helper intersects
+            # again as defence-in-depth.
+            depot_subjects = [e for e in resolved if e.kind == "depot"]
+            other_subjects = [e for e in resolved if e.kind in ("driver", "rfid", "vehicle")]
 
-            # 5. Compile + execute SQL.
-            sql, params = compile_consumption_by_user(plan, resolved, window)
-            await agent_runs_step(
-                ts_pool,
-                run_id,
-                "compile",
-                {
-                    "intent": plan.intent,
-                    "mode": "subject",
-                    "param_shapes": _describe_params(params),
-                },
-            )
-            await _emit_step("compile")
+            if depot_subjects and not other_subjects:
+                scoped_depot_ids = [e.primary_id for e in depot_subjects if e.primary_id]
+                await _emit_step("compile")
+                rows_list, window, tz_groups = await _depot_wide_consumption_rows(
+                    static_pool, ts_pool, auth, plan, depot_ids=scoped_depot_ids
+                )
+                await agent_runs_step(
+                    ts_pool,
+                    run_id,
+                    "compile",
+                    {
+                        "intent": plan.intent,
+                        "mode": "depot_scoped",
+                        "depot_count": len(scoped_depot_ids),
+                        "tz_groups": tz_groups,
+                    },
+                )
+                await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
+                await _emit_step("execute")
+            else:
+                # 4. Resolve time window in the depot timezone.
+                depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
+                window = resolve_time_window(plan.time_window, auth.visible_depot_ids, depot_tzs)
 
-            rows = await ts_pool.fetch(sql, *params)
-            rows_list = [dict(r) for r in rows]
-            await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
-            await _emit_step("execute")
+                # 5. Compile + execute SQL.
+                sql, params = compile_consumption_by_user(plan, resolved, window)
+                await agent_runs_step(
+                    ts_pool,
+                    run_id,
+                    "compile",
+                    {
+                        "intent": plan.intent,
+                        "mode": "subject",
+                        "param_shapes": _describe_params(params),
+                    },
+                )
+                await _emit_step("compile")
+
+                rows = await ts_pool.fetch(sql, *params)
+                rows_list = [dict(r) for r in rows]
+                await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
+                await _emit_step("execute")
         else:
             # Depot-wide total: no subjects to resolve. Scope to the visible
             # depots' chargers and sum, one query per timezone group.

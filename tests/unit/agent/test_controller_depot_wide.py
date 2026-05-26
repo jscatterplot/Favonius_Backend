@@ -141,21 +141,70 @@ async def test_multi_timezone_runs_one_query_per_group():
     assert len(rows) == 2
 
 
-async def test_no_chargers_yields_empty_rows_with_fallback_window():
+async def test_depot_without_chargers_still_queried_by_site_id():
+    """A depot with imported history but no registered chargers is still
+    queried — matched by ``site_id`` — so XLSX-onboarded depots aren't
+    silently dropped from depot-wide totals.
+    """
     static_pool = _make_static_pool(
         tz_rows=[{"id": DEPOT_A, "timezone": "Europe/Vilnius"}],
-        station_rows=[],  # depot has no chargers
+        station_rows=[],  # no chargers (e.g. history-only XLSX onboarding)
     )
-    ts_pool = _FakeTsPool([])
+    ts_pool = _FakeTsPool([[{"day_local": "2026-04-01", "session_count": 7}]])
 
     rows, window, tz_groups = await _depot_wide_consumption_rows(
         static_pool, ts_pool, _auth([DEPOT_A]), _plan()
     )
 
-    assert rows == []
+    assert tz_groups == 1
+    assert len(ts_pool.calls) == 1
+    _sql, params = ts_pool.calls[0]
+    assert params[0] == [DEPOT_A]  # site_id scope catches imported rows
+    assert params[1] == []  # no chargers to scope station_id by
+    assert rows == [{"day_local": "2026-04-01", "session_count": 7}]
+    assert window.timezone == "Europe/Vilnius"
+
+
+async def test_depot_ids_scopes_to_named_subset():
+    """``depot_ids`` (a resolved depot subject) scopes to that depot only."""
+    static_pool = _make_static_pool(
+        tz_rows=[
+            {"id": DEPOT_A, "timezone": "Europe/Vilnius"},
+            {"id": DEPOT_B, "timezone": "Europe/Vilnius"},
+        ],
+        station_rows=[
+            {"ocpp_id": "CP-A", "depot_id": DEPOT_A, "timezone": "Europe/Vilnius"},
+            {"ocpp_id": "CP-B", "depot_id": DEPOT_B, "timezone": "Europe/Vilnius"},
+        ],
+    )
+    ts_pool = _FakeTsPool([[{"day_local": "2026-04-01", "session_count": 1}]])
+
+    # Caller can see both depots, but the question named only DEPOT_A.
+    rows, _window, tz_groups = await _depot_wide_consumption_rows(
+        static_pool, ts_pool, _auth([DEPOT_A, DEPOT_B]), _plan(), depot_ids=[DEPOT_A]
+    )
+
+    assert tz_groups == 1
+    assert len(ts_pool.calls) == 1
+    _sql, params = ts_pool.calls[0]
+    assert params[0] == [DEPOT_A]  # scoped to the named depot only
+    assert params[1] == ["CP-A"]  # only DEPOT_A's charger, not CP-B
+    assert len(rows) == 1
+
+
+async def test_depot_ids_outside_visible_set_are_dropped():
+    """A depot id not in ``visible_depot_ids`` can never widen scope."""
+    static_pool = _make_static_pool(
+        tz_rows=[{"id": DEPOT_A, "timezone": "Europe/Vilnius"}],
+        station_rows=[{"ocpp_id": "CP-A", "depot_id": DEPOT_A, "timezone": "Europe/Vilnius"}],
+    )
+    ts_pool = _FakeTsPool([])
+
+    # Caller sees only DEPOT_A; a (spoofed) DEPOT_B is requested.
+    rows, _window, tz_groups = await _depot_wide_consumption_rows(
+        static_pool, ts_pool, _auth([DEPOT_A]), _plan(), depot_ids=[DEPOT_B]
+    )
+
     assert tz_groups == 0
     assert len(ts_pool.calls) == 0
-    # A best-effort window is still resolved so the formatter can say
-    # "no sessions" against the right period.
-    assert window is not None
-    assert window.timezone == "Europe/Vilnius"
+    assert rows == []

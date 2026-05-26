@@ -494,6 +494,15 @@ class FakeLLMClient(LLMClient):
                 subjects=[EntityMention(kind="driver", text="Carter")],
                 time_window=TimeWindow(kind="relative", relative="last_month"),
             )
+        # Depot-scoped total: a named depot subject ("at the Vilnius depot").
+        # Checked before the depot-wide branch so the named-depot phrasing
+        # routes through the subject path (resolve → depot-scoped total).
+        if "vilnius" in m:
+            return QueryPlan(
+                intent="consumption_by_user",
+                subjects=[EntityMention(kind="depot", text="Vilnius depot")],
+                time_window=TimeWindow(kind="relative", relative="last_month"),
+            )
         # Depot-wide total: no named subject (depot_wide signal).
         if "total" in m or "depot-wide" in m or "was consumed" in m:
             return QueryPlan(
