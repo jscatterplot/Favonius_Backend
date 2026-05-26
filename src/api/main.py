@@ -316,6 +316,28 @@ async def _heartbeat_loop(ts_pool: asyncpg.Pool) -> None:
         await asyncio.sleep(30)
 
 
+async def _agent_budget_reconcile_loop() -> None:
+    """Periodically flush + re-hydrate the SQL-agent per-org token budget.
+
+    The on-write flush can't cover two cases: a low-traffic org whose single
+    turn never trips the write/time threshold (usage would sit in memory until a
+    restart drops it), and multi-worker drift (each worker only sees its own
+    increments after cold start). This loop closes both via
+    ``budget.reconcile()`` (flush local deltas, then re-read cross-worker totals
+    from ``agent_token_usage``). Best-effort: a failed tick is logged and the
+    loop continues.
+    """
+    from .agent import budget as _agent_budget  # noqa: PLC0415
+
+    interval = _agent_budget.DEFAULT_FLUSH_EVERY_SECONDS
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _agent_budget.reconcile()
+        except Exception:  # noqa: BLE001 — best-effort; never kill the loop
+            logger.warning("agent budget reconcile tick failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -583,6 +605,13 @@ async def lifespan(app: FastAPI):
     _create_background_task(run_navirec_poll_loop(static_pool, ts_pool))
     logger.info("Navirec telematics poller task started")
 
+    # ── SQL-agent token-budget reconcile ──────────────────────────────────────
+    # Flushes low-traffic usage that never trips the on-write threshold and
+    # re-hydrates cross-worker totals on a timer (bounds multi-worker over-spend).
+    # Harmless no-op when the agent is idle (empty in-process counters).
+    _create_background_task(_agent_budget_reconcile_loop())
+    logger.info("Agent token-budget reconcile loop started")
+
     # ── Depot agent — daily readiness workflow (sprint 5) ────────────────────
     # Behind DEPOT_AGENT_ENABLED. Upserts the `daily_readiness_check` row in
     # `workflows` and seeds `workflow_tiers` at tier='inform' for every depot
@@ -623,6 +652,16 @@ async def lifespan(app: FastAPI):
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
     logger.info("Shutting down application...")
+
+    # Persist any in-process token usage before the pools close so a clean
+    # shutdown doesn't drop the last interval's spend.
+    try:
+        from .agent import budget as _agent_budget  # noqa: PLC0415
+
+        await _agent_budget.flush_now()
+        logger.info("Agent token-budget flushed on shutdown")
+    except Exception as e:
+        logger.error("Error flushing agent token budget on shutdown: %s", e, exc_info=True)
 
     if liveness_hub is not None:
         try:
@@ -7892,9 +7931,7 @@ async def list_report_schedule_runs(
         # Scope check: the schedule must belong to this depot.
         schedule = await _report_schedules.fetch_schedule_row(conn, depot_id, schedule_id)
         if schedule is None:
-            raise HTTPException(
-                status_code=404, detail=f"Report schedule {schedule_id} not found"
-            )
+            raise HTTPException(status_code=404, detail=f"Report schedule {schedule_id} not found")
         return await _report_schedules.serialize_runs(conn, schedule_id)
 
 
@@ -12470,7 +12507,9 @@ async def _handle_report_schedule_run_now(
                 default_from=report_email_from,
                 now_utc=now_utc,
             )
-        except Exception as exc:  # noqa: BLE001 - record a clean failed run, not a stuck placeholder
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - record a clean failed run, not a stuck placeholder
             logger.error("run_now failed schedule=%s: %s", schedule_id, exc, exc_info=True)
             async with db_pools.ts.acquire() as conn:
                 await _report_schedules.finalize_run(
@@ -12503,6 +12542,8 @@ async def _handle_report_schedule_run_now(
         raise HTTPException(status_code=500, detail="run_now failed to produce a run")
     async with db_pools.ts.acquire() as conn:
         return await _report_schedules.serialize_run(conn, target_run_id)  # type: ignore[return-value]
+
+
 async def _handle_agent_autonomy_set(
     params: dict,
     depot_id: str,

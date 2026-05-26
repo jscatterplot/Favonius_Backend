@@ -143,6 +143,15 @@ AGENT_SQL_TOOL_TURNS = Histogram(
     buckets=[1, 2, 3, 5, 8, 12],
 )
 
+# S4: SQL-mode turns refused pre-LLM by the per-org monthly token budget. Labelled
+# by organization_id (org cardinality is small — single-digit pilot tenants); a
+# refusal consumes zero Anthropic tokens (no client.messages.create call).
+AGENT_SQL_BUDGET_REFUSED = Counter(
+    "favonius_agent_sql_budget_refused_total",
+    "SQL-mode chat agent turns refused before the LLM by the monthly token budget",
+    ["organization_id"],
+)
+
 # Depot workflow agent runtime metrics (PRD §4.3/§4.4, sprint 2).
 # Naming mirrors the existing agent_search metrics one level up.
 WORKFLOW_TURNS = Counter(
@@ -169,7 +178,9 @@ WORKFLOW_LLM_TOKENS = Counter(
 SESSION_COST_COMPUTED = Counter(
     "favonius_session_cost_computed_total",
     "Charging-session cost calculations by source / outcome",
-    ["source"],  # granular | fallback_average | unpriceable | no_energy | no_depot | manual | pending_close
+    [
+        "source"
+    ],  # granular | fallback_average | unpriceable | no_energy | no_depot | manual | pending_close
 )
 
 SESSION_COST_COMPUTE_FAILURES = Counter(
@@ -196,7 +207,10 @@ CHARGER_LOG_IMPORTS = Counter(
 CHARGER_LOG_PARSE_FAILURES = Counter(
     "favonius_charger_log_parse_failures_total",
     "Parser exceptions or empty results by vendor and reason",
-    ["vendor", "reason"],  # reason: corrupt_archive | parse_exception | no_entries | unsupported_vendor
+    [
+        "vendor",
+        "reason",
+    ],  # reason: corrupt_archive | parse_exception | no_entries | unsupported_vendor
 )
 
 CHARGER_LOG_RECONCILIATIONS = Counter(

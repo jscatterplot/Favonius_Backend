@@ -291,6 +291,15 @@ def _classify_status_token(token: str) -> Optional[str]:
     """Classify a bare status / error_kind token. See :func:`classify_failure`."""
     if token in _GRACEFUL_STATUSES:
         return None
+    # S4: the only path that closes a run with status='refused' is the per-org
+    # token-budget refusal in src/api/agent/controller.py (a pre-LLM cost
+    # refusal). This is THE canonical mapping for budget_exceeded on the
+    # return-None refusal path — no parallel category. (The BudgetExceededError
+    # class-name hook in _classify_exception covers a hypothetical raising
+    # variant; the shipped design refuses by returning None, so this is the
+    # live path.)
+    if token == "refused":
+        return "budget_exceeded"
     if token == "empty_result":
         return "empty_result"
     if token == "terminator_failed":
