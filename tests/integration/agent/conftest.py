@@ -124,6 +124,7 @@ CREATE TABLE agent_runs (
     status           TEXT NOT NULL
         CHECK (status IN ('running', 'success', 'disambiguation', 'not_found', 'error')),
     duration_ms      INTEGER,
+    failure_reason   TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
