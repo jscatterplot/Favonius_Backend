@@ -503,8 +503,8 @@ async def find_orphaned_jobs(
 ) -> list[asyncpg.Record]:
     """Pending/running jobs that should be re-kicked during startup recovery.
 
-    Jobs whose parent connection has been disabled are excluded so a soft-deleted
-    connection is never resurrected by the startup sweep. Results are keyset-
+    Jobs whose parent connection is not schedulable are excluded so paused/disabled
+    connections are never resumed by the startup sweep. Results are keyset-
     ordered by ``(created_at, id)``; pass the last row's cursor back in to page
     through more than ``limit`` orphans.
 
@@ -524,7 +524,7 @@ async def find_orphaned_jobs(
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
                   WHERE c.id = data_source_ingestion_jobs.connection_id
-                    AND c.status <> 'disabled'
+                    AND c.status IN ('active', 'error')
               )
               AND (
                   $2::timestamptz IS NULL
