@@ -35,7 +35,7 @@ DEFAULT_DEPARTURE_SOC: float = 0.95
 
 
 ChargerStatus = Literal["charging", "idle", "offline", "fault"]
-VehicleState = Literal["ready", "charging", "at_risk", "in_route", "offline"]
+VehicleState = Literal["ready", "charging", "at_risk", "in_route", "offline", "unknown"]
 
 
 def _isoformat(value: Any) -> Optional[str]:
@@ -100,14 +100,15 @@ def derive_vehicle_state(
     required_soc: Optional[float],
     now: datetime,
 ) -> VehicleState:
-    """Map runtime signals to the 5-state vehicle pill.
+    """Map runtime signals to the 6-state vehicle pill.
 
     Priority (top wins):
       1. ``offline`` — no telemetry or stale by ``VEHICLE_OFFLINE_AGE_S``.
       2. ``charging`` — open ``charging_sessions`` row exists.
       3. ``in_route`` — within an active schedule window.
       4. ``ready`` — ``current_soc >= required_soc`` (default 0.95 if none).
-      5. ``at_risk`` — otherwise.
+      5. ``at_risk`` — known SoC below threshold.
+      6. ``unknown`` — charger hasn't reported SoC, so risk can't be assessed.
     """
     age = _age_seconds(last_seen_at, now)
     if age is None or age > VEHICLE_OFFLINE_AGE_S:
@@ -119,8 +120,11 @@ def derive_vehicle_state(
     if has_active_schedule:
         return "in_route"
 
+    if current_soc is None:
+        return "unknown"
+
     threshold = required_soc if required_soc is not None else DEFAULT_DEPARTURE_SOC
-    if current_soc is not None and current_soc >= threshold:
+    if current_soc >= threshold:
         return "ready"
     return "at_risk"
 

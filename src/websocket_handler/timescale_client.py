@@ -248,35 +248,7 @@ class TimescaleClient:
                         transaction_id = self._coerce_transaction_id(session_id)
 
                         raw_sample = data.get("raw_sample")
-                        if raw_sample:
-                            await conn.execute(
-                                """
-                                INSERT INTO telemetry_samples (
-                                    time,
-                                    station_id,
-                                    connector_id,
-                                    transaction_id,
-                                    measurand,
-                                    phase,
-                                    location,
-                                    unit,
-                                    context,
-                                    format,
-                                    value
-                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                                """,
-                                raw_sample.get("timestamp", data["time"]),
-                                station_id,
-                                connector_id,
-                                transaction_id,
-                                raw_sample.get("measurand"),
-                                raw_sample.get("phase"),
-                                raw_sample.get("location"),
-                                raw_sample.get("unit"),
-                                raw_sample.get("context"),
-                                raw_sample.get("format"),
-                                raw_sample.get("value"),
-                            )
+                        energy_kwh = data.get("energy_kwh")
 
                         # Live session metrics: keep the open charging_sessions row
                         # fresh so per-charger power/SoC is observable in real time
@@ -315,9 +287,10 @@ class TimescaleClient:
                             """
                             INSERT INTO telemetry (
                                 time, station_id, connector_id, transaction_id,
-                                vehicle_id, charger_id, soc, charging_kw, is_plugged, max_charge_kw
+                                vehicle_id, charger_id, soc, charging_kw, is_plugged,
+                                max_charge_kw, energy_kwh
                             )
-                            VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7, $8, $9, $10)
+                            VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7, $8, $9, $10, $11)
                             ON CONFLICT (time, station_id, connector_id) DO UPDATE
                             SET transaction_id = COALESCE(
                                     EXCLUDED.transaction_id,
@@ -328,7 +301,8 @@ class TimescaleClient:
                                 soc = COALESCE(EXCLUDED.soc, telemetry.soc),
                                 charging_kw = COALESCE(EXCLUDED.charging_kw, telemetry.charging_kw),
                                 is_plugged = COALESCE(EXCLUDED.is_plugged, telemetry.is_plugged),
-                                max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw)
+                                max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw),
+                                energy_kwh = COALESCE(EXCLUDED.energy_kwh, telemetry.energy_kwh)
                             """,
                             data["time"],
                             station_id or "unknown",
@@ -340,6 +314,7 @@ class TimescaleClient:
                             power_kw,
                             is_plugged,
                             max_charge_kw,
+                            energy_kwh,
                         )
                         inserted += 1
                 finally:

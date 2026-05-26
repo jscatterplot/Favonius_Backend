@@ -1297,8 +1297,8 @@ class OCPP16Session:
         self,
         cp_id: str,
         connector_id: int,
-        soc: float,  # 0.0–1.0 fraction from FleetChargePoint
-        power_kw: float,
+        soc: Optional[float],  # 0.0–1.0 fraction from FleetChargePoint; None when charger doesn't report it
+        power_kw: Optional[float],
         energy_kwh: Optional[float],
         timestamp: datetime,
         transaction_id: Optional[int],

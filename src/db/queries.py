@@ -3155,7 +3155,8 @@ async def latest_telemetry_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, 
                soc               AS current_soc,
                charging_kw       AS current_power_kw,
                charger_id::text  AS charger_id,
-               is_plugged
+               is_plugged,
+               energy_kwh
         FROM telemetry
         WHERE vehicle_id = ANY($1::uuid[])
         ORDER BY vehicle_id, time DESC
@@ -3456,7 +3457,8 @@ async def latest_telemetry_for_depot_vehicles(db, *, vehicle_ids: list[str]) -> 
                time              AS last_seen_at,
                soc               AS soc,
                charging_kw       AS power_kw,
-               is_plugged
+               is_plugged,
+               energy_kwh
         FROM telemetry
         WHERE vehicle_id = ANY($1::uuid[])
         ORDER BY vehicle_id, time DESC

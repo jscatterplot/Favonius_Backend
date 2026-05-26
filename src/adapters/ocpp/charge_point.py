@@ -539,8 +539,8 @@ class FleetChargePoint(CP16):
                     await self._cb_meter_values(
                         self.id,
                         connector_id,
-                        soc or 0.0,
-                        power_kw or 0.0,
+                        soc,
+                        power_kw,
                         energy_kwh,
                         timestamp,
                         transaction_id,
@@ -553,8 +553,8 @@ class FleetChargePoint(CP16):
                         await self._cb_meter_values(
                             self.id,
                             connector_id,
-                            soc or 0.0,
-                            power_kw or 0.0,
+                            soc,
+                            power_kw,
                             timestamp,
                             max_charge_kw,
                         )
