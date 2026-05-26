@@ -331,15 +331,34 @@ class StateAssembler:
             if not vehicle_ids:
                 return {}
 
-            # Step 2: Get latest SoC per vehicle from TimescaleDB (ts)
+            # Step 2: Get latest SoC per vehicle from TimescaleDB (ts).
+            # Two sources: charger-side `telemetry` (OCPP MeterValues) and
+            # `vehicle_telemetry` (Navirec telematics feed, migration 044).
+            # UNION both and keep the freshest reading per vehicle so a vehicle
+            # that's unplugged (out on a route) still has a live SoC. The 24h
+            # lower bound confines the DISTINCT ON scan to recent chunks;
+            # telematics rows carry true device timestamps, so the downstream
+            # 15-min freshness check (data_freshness.MAX_TELEMETRY_AGE) still
+            # governs whether a SoC is fresh enough to optimize on.
             async with self.pools.ts.acquire() as conn:
                 rows = await conn.fetch(
                     """
                     SELECT DISTINCT ON (vehicle_id)
                         vehicle_id::text AS vehicle_id,
                         soc
-                    FROM telemetry
-                    WHERE vehicle_id = ANY($1::uuid[])
+                    FROM (
+                        SELECT vehicle_id, soc, time
+                        FROM telemetry
+                        WHERE vehicle_id = ANY($1::uuid[])
+                          AND soc IS NOT NULL
+                          AND time > now() - INTERVAL '24 hours'
+                        UNION ALL
+                        SELECT vehicle_id, soc, time
+                        FROM vehicle_telemetry
+                        WHERE vehicle_id = ANY($1::uuid[])
+                          AND soc IS NOT NULL
+                          AND time > now() - INTERVAL '24 hours'
+                    ) merged
                     ORDER BY vehicle_id, time DESC
                     """,
                     vehicle_ids,

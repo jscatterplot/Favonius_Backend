@@ -499,6 +499,16 @@ async def lifespan(app: FastAPI):
     _create_background_task(run_monthly_scheduler(ts_pool))
     logger.info("Monthly report-draft scheduler started")
 
+    # ── Navirec telematics poller ────────────────────────────────────────────
+    # Live SoC feed: pulls fleet telematics into vehicle_telemetry so the
+    # optimizer has a SoC for unplugged vehicles. No-ops unless
+    # NAVIREC_POLL_ENABLED=true; safe across replicas via per-depot advisory
+    # locks. The loop never raises out (failed cycles are logged + retried).
+    from ..adapters.navirec import run_navirec_poll_loop  # noqa: PLC0415
+
+    _create_background_task(run_navirec_poll_loop(static_pool, ts_pool))
+    logger.info("Navirec telematics poller task started")
+
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────

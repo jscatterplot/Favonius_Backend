@@ -21,11 +21,12 @@ _BASE = "https://api.chargeye.example"
 
 @pytest.fixture(autouse=True)
 def _patch_sleep(monkeypatch):
-    """Replace ``asyncio.sleep`` inside the client module so retry waits
-    don't actually block the test event loop."""
-    import src.adapters.kempower.client as client_module
+    """Replace ``asyncio.sleep`` in the shared base client module so retry
+    waits don't actually block the test event loop. (The retry loop moved
+    from kempower.client into src.adapters.rest_client.)"""
+    import src.adapters.rest_client as rest_client_module
 
-    monkeypatch.setattr(client_module.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(rest_client_module.asyncio, "sleep", AsyncMock())
 
 
 @pytest.fixture
