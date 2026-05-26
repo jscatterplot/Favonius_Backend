@@ -12524,7 +12524,7 @@ async def _handle_alerts_acknowledge(
     if (
         existing is None
         or str(existing.organization_id) != str(org_id)
-        or str(existing.depot_id) != depot_id
+        or not _alert_belongs_to_depot(existing.depot_id, depot_id)
     ):
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
@@ -12613,7 +12613,7 @@ async def _handle_alerts_resolve(
     if (
         existing is None
         or str(existing.organization_id) != str(org_id)
-        or str(existing.depot_id) != depot_id
+        or not _alert_belongs_to_depot(existing.depot_id, depot_id)
     ):
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
@@ -12863,7 +12863,7 @@ async def acknowledge_notification_alert(
 
     async with db_pools.ts.acquire() as conn:
         existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
-        if existing is None or str(existing.depot_id) != depot_id:
+        if existing is None or not _alert_belongs_to_depot(existing.depot_id, depot_id):
             raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
         updated = await alerts_repo.acknowledge(
@@ -12881,6 +12881,17 @@ async def acknowledge_notification_alert(
         status=updated.status,
         acknowledged_at=updated.acknowledged_at.isoformat(),
     )
+
+
+def _alert_belongs_to_depot(alert_depot_id: Optional[UUID], depot_id: str) -> bool:
+    """Whether an alert is visible for a depot-scoped route or command.
+
+    Org-level alerts (``depot_id IS NULL``) are not tied to one depot and match
+    any depot context within the caller's organization.
+    """
+    if alert_depot_id is None:
+        return True
+    return str(alert_depot_id) == depot_id
 
 
 def _project_alert_acknowledged(
