@@ -746,7 +746,11 @@ def _all_source_aliases(select: exp.Select) -> "list[str]":
 
 def _iter_select_from_tables(select: exp.Select):
     """Yield Table nodes in this SELECT's top-level FROM/JOIN only."""
-    from_clause = select.args.get("from")
+    # sqlglot 30 renamed the Select FROM arg key from "from" to "from_";
+    # accept both so the guard works across the >=23 version range pinned in
+    # pyproject. Without this the FROM never resolves, _hypertable_refs_in_select
+    # returns empty, and the entire step-6 time-bound guard silently no-ops.
+    from_clause = select.args.get("from") or select.args.get("from_")
     if from_clause is not None:
         yield from _iter_from_join_tables(from_clause)
     for join in select.args.get("joins") or []:
