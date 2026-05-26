@@ -783,7 +783,7 @@ class OCPP16Session:
         org_id = (self._tenant_context or {}).get("organization_id")
         await self._liveness_notifier.maybe_notify(self._station_id, org_id)
 
-    async def _ensure_tenant_context(self) -> None:
+    async def _ensure_tenant_context(self, *, eager: bool = False) -> None:
         """Lazily resolve tenant context off the BootNotification path.
 
         Single-flight (an ``asyncio.Lock`` so concurrent per-frame tasks issue
@@ -792,22 +792,27 @@ class OCPP16Session:
         onboarded — or a transient Supabase outage — doesn't trigger a lookup
         on every frame. Once resolved, the fast path returns immediately for
         the rest of the connection.
+
+        When ``eager`` is True (BootNotification), the cooldown is bypassed so
+        boot always retries after transient frame-path failures.
         """
         if self._tenant_context is not None:
             return
         # Cheap pre-check outside the lock to avoid serialising every frame's
         # task on the lock once we're inside a cooldown window.
-        last = self._tenant_context_last_attempt
-        if last and (time.monotonic() - last) < _TENANT_CONTEXT_RETRY_COOLDOWN_S:
-            return
+        if not eager:
+            last = self._tenant_context_last_attempt
+            if last and (time.monotonic() - last) < _TENANT_CONTEXT_RETRY_COOLDOWN_S:
+                return
         async with self._tenant_context_lock:
             # Re-check under the lock: another frame's task may have resolved
             # the context or refreshed the attempt clock while we waited.
             if self._tenant_context is not None:
                 return
-            last = self._tenant_context_last_attempt
-            if last and (time.monotonic() - last) < _TENANT_CONTEXT_RETRY_COOLDOWN_S:
-                return
+            if not eager:
+                last = self._tenant_context_last_attempt
+                if last and (time.monotonic() - last) < _TENANT_CONTEXT_RETRY_COOLDOWN_S:
+                    return
             await self._resolve_tenant_context()
 
     async def _resolve_tenant_context(self) -> None:
@@ -868,7 +873,8 @@ class OCPP16Session:
         # Routes through _ensure_tenant_context (single-flight lock) so a
         # frame-path lazy resolve that already cached a valid context is
         # reused rather than overwritten by a concurrent boot-time lookup.
-        await self._ensure_tenant_context()
+        # eager=True bypasses the frame-path cooldown so every boot retries.
+        await self._ensure_tenant_context(eager=True)
         # Persist vendor metadata so vendor-keyed dispatch (parser
         # selection for GetDiagnostics, ABB-safe measurand guard at
         # endpoint boundaries) can read it from the DB without holding

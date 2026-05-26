@@ -446,7 +446,7 @@ class TestOCPP16SessionLazyTenantContext:
         ensure_calls: list[int] = []
         resolve_calls: list[int] = []
 
-        async def _fake_ensure() -> None:
+        async def _fake_ensure(**_kwargs: object) -> None:
             ensure_calls.append(1)
 
         async def _fake_resolve() -> None:
