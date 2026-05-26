@@ -214,7 +214,11 @@ class KempowerProvider(DataSourceProvider):
             error_detail = f"Kempower API error: {exc}"
             logger.warning("Kempower ingestion aborted: %s", exc)
 
-        skipped = counts.chargers_skipped + counts.vehicles_skipped + counts.sessions_skipped
+        skipped = [
+            *counts.chargers_skipped,
+            *counts.vehicles_skipped,
+            *counts.sessions_skipped,
+        ]
         landed = (
             counts.chargers_created
             + counts.vehicles_created

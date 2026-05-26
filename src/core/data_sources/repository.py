@@ -508,9 +508,10 @@ async def find_orphaned_jobs(
     ordered by ``(created_at, id)``; pass the last row's cursor back in to page
     through more than ``limit`` orphans.
 
-    ``running`` jobs are always included during startup recovery. Reclaim is
-    made safe by ``claim_job`` compare-and-swap on the last observed lease
-    timestamp, so only one worker can resume each row.
+    ``running`` jobs are only included when their lease appears stale (or was
+    never set), to avoid reclaiming work from a live worker in multi-worker
+    deployments. Reclaim remains guarded by ``claim_job`` compare-and-swap on
+    the last observed lease timestamp.
     """
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -519,7 +520,13 @@ async def find_orphaned_jobs(
             FROM data_source_ingestion_jobs
             WHERE (
                 status = 'pending'
-                OR status = 'running'
+                OR (
+                    status = 'running'
+                    AND (
+                        lease_expires_at IS NULL
+                        OR lease_expires_at <= NOW()
+                    )
+                )
             )
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
