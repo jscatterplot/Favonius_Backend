@@ -91,7 +91,7 @@ async def store_meter_values(
         max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw)
     """
 
-    is_plugged = power_kw > 0.1
+    is_plugged = (power_kw > 0.1) if power_kw is not None else None
 
     try:
         # Write telemetry to TimescaleDB (ts pool)
