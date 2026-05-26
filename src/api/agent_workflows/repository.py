@@ -209,11 +209,12 @@ async def insert_default_tiers_bulk(
 ) -> int:
     """Seed launch-default tier rows for many depots in one statement.
 
-    Same insert-only contract as :func:`insert_default_tier` (``ON
-    CONFLICT DO NOTHING`` — existing rows are never touched), but does
-    every depot in a single round-trip via ``unnest``. This is what the
-    startup seed uses so cold-start time does not grow linearly with the
-    depot count (no per-depot awaited INSERT in a loop).
+    Insert-only contract (``ON CONFLICT DO NOTHING`` — existing rows are
+    never touched, so a concurrent graduation can't be clobbered back to
+    the default), but does every depot in a single round-trip via
+    ``unnest``. This is what the startup seed uses so cold-start time
+    does not grow linearly with the depot count (no per-depot awaited
+    INSERT in a loop).
 
     Returns the number of rows actually inserted (depots that already
     had a row are skipped and not counted).
