@@ -11,6 +11,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 from typing import Any, Optional, Sequence
 from uuid import UUID
 
@@ -101,6 +102,7 @@ _ALERT_COLUMNS = (
 )
 
 _ACK_EMAIL_COLUMN_AVAILABLE: Optional[bool] = None
+_ACK_EMAIL_COLUMN_RETRY_AFTER: float = 0.0  # monotonic; re-probe when past this
 
 
 def _is_undefined_column_error(exc: BaseException) -> bool:
@@ -108,23 +110,31 @@ def _is_undefined_column_error(exc: BaseException) -> bool:
 
 
 async def _alert_select_columns(conn: Any) -> str:
-    """Return SELECT column list, probing once for migration 046."""
-    global _ACK_EMAIL_COLUMN_AVAILABLE
+    """Return SELECT column list, probing for migration 046.
+
+    Positive result (column exists) is cached forever.  Negative result is
+    cached for 60 s so a worker that started before the migration was applied
+    automatically picks up the column after the migration runs, without needing
+    a restart.
+    """
+    global _ACK_EMAIL_COLUMN_AVAILABLE, _ACK_EMAIL_COLUMN_RETRY_AFTER
     if _ACK_EMAIL_COLUMN_AVAILABLE is True:
         return _ALERT_COLUMNS
-    if _ACK_EMAIL_COLUMN_AVAILABLE is False:
+    if _ACK_EMAIL_COLUMN_AVAILABLE is False and time.monotonic() < _ACK_EMAIL_COLUMN_RETRY_AFTER:
         return _ALERT_COLUMNS_LEGACY
     try:
         await conn.fetchval(
             "SELECT acknowledged_by_email FROM notification_alerts LIMIT 0"
         )
         _ACK_EMAIL_COLUMN_AVAILABLE = True
+        _ACK_EMAIL_COLUMN_RETRY_AFTER = 0.0
     except Exception as exc:
         if _is_undefined_column_error(exc):
             _ACK_EMAIL_COLUMN_AVAILABLE = False
+            _ACK_EMAIL_COLUMN_RETRY_AFTER = time.monotonic() + 60.0
             logger.warning(
                 "notification_alerts missing acknowledged_by_email column "
-                "(apply migrations/046_alerts_ack_email.sql)"
+                "(apply migrations/046_alerts_ack_email.sql); will retry in 60 s"
             )
         else:
             raise

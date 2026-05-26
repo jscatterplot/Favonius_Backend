@@ -12504,6 +12504,10 @@ async def _handle_alerts_acknowledge(
     validate_uuid(alert_id, "alert_id")
 
     acknowledged_by_email = params.get("acknowledged_by_email")
+    if acknowledged_by_email is not None and not isinstance(acknowledged_by_email, str):
+        raise HTTPException(
+            status_code=422, detail="params.acknowledged_by_email must be a string or null"
+        )
 
     org_id = get_user_organization_id(user or {})
     if not org_id:
@@ -12593,6 +12597,10 @@ async def _handle_alerts_resolve(
     validate_uuid(alert_id, "alert_id")
 
     acknowledged_by_email = params.get("acknowledged_by_email")
+    if acknowledged_by_email is not None and not isinstance(acknowledged_by_email, str):
+        raise HTTPException(
+            status_code=422, detail="params.acknowledged_by_email must be a string or null"
+        )
 
     org_id = get_user_organization_id(user or {})
     if not org_id:
@@ -12859,11 +12867,23 @@ async def acknowledge_notification_alert(
     if not actor_user_id:
         raise _forbidden("FORBIDDEN", "user id not present in token")
 
+    caller_org = get_user_organization_id(user)
+
     from src.notifications import alerts as alerts_repo
 
     async with db_pools.ts.acquire() as conn:
         existing = await alerts_repo.get_by_id(conn, UUID(alert_id))
-        if existing is None or not _alert_belongs_to_depot(existing.depot_id, depot_id):
+        # Depot-visibility check + org scope check (the latter prevents a
+        # favonius_admin from acknowledging an org-level alert that belongs
+        # to a different tenant just by supplying any valid depot_id).
+        if (
+            existing is None
+            or not _alert_belongs_to_depot(existing.depot_id, depot_id)
+            or (
+                caller_org is not None
+                and str(existing.organization_id) != str(caller_org)
+            )
+        ):
             raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
         updated = await alerts_repo.acknowledge(
@@ -13034,8 +13054,8 @@ async def list_org_alerts(
                 page=page,
                 page_size=page_size,
             )
-    except asyncpg.UndefinedTableError:
-        logger.debug("notification_alerts table not present; returning empty list")
+    except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError):
+        logger.debug("notification_alerts table/column not present; returning empty list")
 
     # Batch-fetch depot names from static pool
     unique_depot_ids = [a.depot_id for a in alerts_list if a.depot_id is not None]
