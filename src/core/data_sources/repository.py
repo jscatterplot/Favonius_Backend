@@ -301,7 +301,7 @@ async def find_due_connections(pool: asyncpg.Pool, *, limit: int) -> list[asyncp
             SELECT {_CONNECTION_PUBLIC_COLS}
             FROM data_source_connections c
             WHERE c.scheduled_sync_enabled
-              AND c.status = 'active'
+              AND c.status IN ('active', 'error')
               AND (c.next_sync_at IS NULL OR c.next_sync_at <= NOW())
               AND NOT EXISTS (
                   SELECT 1 FROM data_source_ingestion_jobs j
@@ -524,7 +524,7 @@ async def find_orphaned_jobs(
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
                   WHERE c.id = data_source_ingestion_jobs.connection_id
-                    AND c.status = 'active'
+                    AND c.status <> 'disabled'
               )
               AND (
                   $2::timestamptz IS NULL
