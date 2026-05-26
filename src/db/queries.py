@@ -1115,7 +1115,8 @@ async def get_latest_optimization_run(
     """
     query = """
         SELECT run_id, run_time, trigger_reason, horizon_start, horizon_end,
-               solve_time_s, objective_value, peak_demand_kw, status, schedule_json
+               solve_time_s, objective_value, peak_demand_kw, status,
+               solver_used, schedule_json
         FROM optimization_runs
         WHERE depot_id = $1
         ORDER BY run_time DESC

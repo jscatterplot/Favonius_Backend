@@ -36,3 +36,17 @@ class IdempotencyKeyReusedError(DatabaseError):
 
     def __init__(self, message: str = "Idempotency key has already been used") -> None:
         super().__init__(message)
+
+
+class StaticDbUnavailableError(DatabaseError):
+    """Raised when the Supabase (static-data) pool is absent or unreachable.
+
+    Distinct from ``DatabaseError`` so API clients can distinguish a transient
+    Supabase connectivity blip (STATIC_DB_UNAVAILABLE, HTTP 503) from a
+    TimescaleDB write failure (DATABASE_ERROR).
+    """
+
+    code = ErrorCode.STATIC_DB_UNAVAILABLE
+
+    def __init__(self, message: str = "Depot access check temporarily unavailable") -> None:
+        super().__init__(message)
