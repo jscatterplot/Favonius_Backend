@@ -472,6 +472,24 @@ class TestFormatChargerItem:
         )
         assert item["status"] == "fault"
 
+    def test_future_telemetry_timestamp_clamped_to_now(self):
+        """A charger-supplied MeterValues timestamp far in the future is clamped
+        to ``now`` so ``last_interaction_at`` stays sane and ``age()`` never
+        goes negative (which would permanently suppress the offline threshold).
+        """
+        future = NOW + timedelta(hours=6)
+        item = format_charger_item(
+            _static_charger_row(),
+            connector_status={"ocpp_status": "Available", "last_heartbeat_at": None},
+            open_session=None,
+            now=NOW,
+            telemetry_last_seen=future,
+        )
+        # Age is 0 after clamping — charger is online (it just sent MeterValues).
+        assert item["status"] == "idle"
+        # The response timestamp must be now, not the future raw value.
+        assert item["last_interaction_at"] == NOW.isoformat()
+
 
 class TestLatestHelper:
     def test_returns_none_when_all_none(self):

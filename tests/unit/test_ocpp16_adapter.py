@@ -404,6 +404,98 @@ class TestOCPP16SessionLazyTenantContext:
         notifier.maybe_notify.assert_awaited_once_with("lazy_001", "org-7")
 
     @pytest.mark.asyncio
+    async def test_resolve_exception_preserves_cached_context(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """A transient lookup failure must not wipe a valid cache set by an
+        earlier lazy frame-path resolve (the boot-time race regression)."""
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(side_effect=RuntimeError("db transient"))
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+        s._tenant_context = {"organization_id": "org-prior", "depot_id": "dep-p"}
+
+        await s._resolve_tenant_context()
+
+        assert s._tenant_context == {"organization_id": "org-prior", "depot_id": "dep-p"}
+
+    @pytest.mark.asyncio
+    async def test_on_boot_routes_through_ensure_tenant_context(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """_on_boot must call _ensure_tenant_context (single-flight) rather
+        than _resolve_tenant_context directly so a concurrent frame-path cache
+        is reused and racing failures cannot wipe it."""
+        supabase = MagicMock()
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+        ensure_calls: list[int] = []
+        resolve_calls: list[int] = []
+
+        async def _fake_ensure() -> None:
+            ensure_calls.append(1)
+
+        async def _fake_resolve() -> None:
+            resolve_calls.append(1)
+
+        s._ensure_tenant_context = _fake_ensure
+        s._resolve_tenant_context = _fake_resolve
+
+        await s._on_boot("lazy_001", "ABB", "Terra", None, None)
+
+        assert ensure_calls, "_on_boot must call _ensure_tenant_context"
+        assert not resolve_calls, "_on_boot must NOT call _resolve_tenant_context directly"
+
+    @pytest.mark.asyncio
+    async def test_publish_liveness_skips_when_resolution_in_flight(
+        self, mock_websocket, mock_timescale, mock_message_handler
+    ) -> None:
+        """While a resolution is in-flight, concurrent publish tasks must
+        return early rather than pile up waiting on the lock."""
+        release = asyncio.Event()
+
+        async def _slow_lookup(_station_id: str) -> dict:
+            await release.wait()
+            return {"organization_id": "org-slow"}
+
+        supabase = MagicMock()
+        supabase.lookup_tenant_context = AsyncMock(side_effect=_slow_lookup)
+        notifier = MagicMock()
+        notifier.maybe_notify = AsyncMock()
+        s = self._session(
+            mock_websocket,
+            mock_timescale,
+            mock_message_handler,
+            supabase=supabase,
+            notifier=notifier,
+        )
+
+        holder = asyncio.create_task(s._ensure_tenant_context())
+        await asyncio.sleep(0)  # let holder acquire the lock
+        assert s._tenant_context_lock.locked()
+
+        await s._publish_liveness()
+        notifier.maybe_notify.assert_not_awaited()  # short-circuited, not blocked
+
+        release.set()
+        await holder
+        assert s._tenant_context == {"organization_id": "org-slow"}
+
+    @pytest.mark.asyncio
     async def test_publish_liveness_no_supabase_client_publishes_none(
         self, mock_websocket, mock_timescale, mock_message_handler
     ) -> None:

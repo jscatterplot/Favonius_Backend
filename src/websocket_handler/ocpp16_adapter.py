@@ -774,6 +774,11 @@ class OCPP16Session:
         rate-limits to one publish per ~10 s per station, so this only does
         real work on the first frame(s) of such a connection.
         """
+        # Skip if resolution is already in-flight (another task holds the
+        # lock) — that task will publish once it resolves, so accumulating
+        # waiting tasks behind a slow/failing lookup is unnecessary churn.
+        if self._tenant_context is None and self._tenant_context_lock.locked():
+            return
         await self._ensure_tenant_context()
         org_id = (self._tenant_context or {}).get("organization_id")
         await self._liveness_notifier.maybe_notify(self._station_id, org_id)
@@ -833,8 +838,8 @@ class OCPP16Session:
                 self._station_id,
                 exc,
             )
-            # Preserve any lazily cached context — a boot-time retry must not
-            # wipe a good frame-path resolution on transient lookup failure.
+            # Don't wipe a valid cache on transient failure — the existing
+            # value (None or a prior successful lazy resolve) is preserved.
         if self._tenant_context is None:
             logger.info(
                 "tenant_context_not_found station=%s "
@@ -859,12 +864,11 @@ class OCPP16Session:
             serial_number,
             firmware_version,
         )
-        # Resolve tenant context once for the lifetime of this WS connection.
-        # Cached on the session and reused by _on_status_change to label
-        # connector_status rows for the alerts pipeline (migration 029).
-        async with self._tenant_context_lock:
-            if self._tenant_context is None:
-                await self._resolve_tenant_context()
+        # Resolve tenant context for the lifetime of this WS connection.
+        # Routes through _ensure_tenant_context (single-flight lock) so a
+        # frame-path lazy resolve that already cached a valid context is
+        # reused rather than overwritten by a concurrent boot-time lookup.
+        await self._ensure_tenant_context()
         # Persist vendor metadata so vendor-keyed dispatch (parser
         # selection for GetDiagnostics, ABB-safe measurand guard at
         # endpoint boundaries) can read it from the DB without holding

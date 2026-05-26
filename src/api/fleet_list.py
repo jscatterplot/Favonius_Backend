@@ -208,6 +208,11 @@ def format_charger_item(
         else None
     )
     last_interaction = _latest(last_interaction_override, db_last_interaction, telemetry_last_seen)
+    # Cap to now — charger-supplied MeterValues timestamps can be in the
+    # future (clock skew), which would make age() negative and keep a
+    # disconnected charger falsely online until wall-clock catches up.
+    if last_interaction is not None and last_interaction > now:
+        last_interaction = now
     status = derive_charger_status(
         ocpp_status=ocpp_status,
         last_heartbeat_at=last_interaction,
