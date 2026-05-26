@@ -23,7 +23,6 @@ from typing import Any, Optional
 from uuid import UUID
 
 from src.api.agent.auth_context import AuthContext
-from src.api.agent.llm import LLMExtractionError
 from src.api.agent.sql_executor import SqlExecutorError, SqlExecutorTimeoutError
 from src.api.agent_workflows.runtime import ToolNotAllowedError
 from src.api.agent_workflows.tools import ToolNotRegisteredError
@@ -236,11 +235,17 @@ def classify_failure(exc_or_status: Any) -> Optional[str]:
         exception class name (``BudgetExceededError``) until S4 lands it.
       * ``tool_error`` — a tool failed or was misused: executor
         role/plan/exec errors, a disallowed / unregistered tool
-        (:class:`ToolNotAllowedError` / :class:`ToolNotRegisteredError`), or
-        the terminator dispatch raising (status ``terminator_failed``).
-      * ``llm_error`` — the LLM layer failed: an Anthropic SDK error, or the
-        model exiting the loop without an answer (``no_terminator`` /
-        ``max_iterations``).
+        (:class:`ToolNotAllowedError` / :class:`ToolNotRegisteredError`), the
+        terminator dispatch raising (status ``terminator_failed``), or — when
+        the turn ended without recovering — ANY failed tool call that carried
+        no SQL ``error_kind`` (a non-SQL tool such as ``lookup_entity``, or a
+        SQL tool whose envelope held only ``error``, e.g. ``sample_values``
+        rejecting an invalid argument).
+      * ``llm_error`` — the LLM layer failed: an Anthropic SDK error, a
+        consumption-path :class:`LLMExtractionError`, the model exiting the
+        loop without an answer (``no_terminator`` / ``max_iterations``), or a
+        ``success`` status whose terminator answer text was blank (the model
+        finished without producing a usable answer).
       * ``other`` — anything not attributable more precisely.
     """
     if exc_or_status is None:
@@ -264,10 +269,14 @@ def _classify_exception(exc: BaseException) -> str:
         return "executor_timeout"
     if isinstance(exc, (SqlExecutorError, ToolNotAllowedError, ToolNotRegisteredError)):
         return "tool_error"
-    # The consumption path's extractor raises this when the model fails to emit
-    # a valid QueryPlan (no tool call, or malformed twice) — an LLM-origin
-    # failure, not an "other".
-    if isinstance(exc, LLMExtractionError):
+    # The consumption path's extractor raises LLMExtractionError when the model
+    # fails to emit a valid QueryPlan (no tool call, or malformed twice) — an
+    # LLM-origin failure, not an "other". Match by class name (like
+    # BudgetExceededError above) rather than importing it: LLMExtractionError
+    # lives in src.api.agent.llm, which imports the Anthropic SDK at module
+    # load, and audit.py must stay importable in llm-free envs (see the
+    # root_module note just below — same rationale).
+    if type(exc).__name__ == "LLMExtractionError":
         return "llm_error"
     # Anthropic SDK errors (rate limit, 5xx, connection, malformed output).
     # Match by module so audit.py needn't import the SDK (the agent keeps it
@@ -303,9 +312,21 @@ def _classify_qa_result(qa: Any) -> Optional[str]:
     # otherwise succeeded (status == "success").
     if getattr(qa, "empty_result", False):
         return "empty_result"
+    tool_calls = getattr(qa, "tool_calls", None) or []
     status = getattr(qa, "status", None)
     if status == "success":
-        return None
+        # A success with usable answer text is not a failure. But run_qa_turn
+        # can report status="success" with EMPTY text (emit_final_answer has no
+        # minimum length); the controller then falls back to a not_found reply.
+        # A blank terminator means the model finished the loop without a usable
+        # answer — record it as llm_error rather than leaving failure_reason
+        # NULL and undercounting the failure. A missing text attribute (older /
+        # duck-typed shapes) is treated as a genuine success (preserves prior
+        # behaviour — we only flag a text we can see is blank).
+        text = getattr(qa, "text", None)
+        if not isinstance(text, str) or text.strip():
+            return None
+        return "llm_error"
     # ``terminator_failed`` is itself a terminal tool-path failure (the model
     # asked to stop but its emit_final_answer was malformed). Per the taxonomy
     # contract it is tool_error, and it must NOT be shadowed by a stale earlier
@@ -317,14 +338,24 @@ def _classify_qa_result(qa: Any) -> Optional[str]:
     # (e.g. a validator rejection the model never recovered from — the §S3.5
     # "deliberate validator rejection" done-when case), even when the terminal
     # status is the generic "model gave up" marker (max_iterations / no_terminator).
-    kind = _last_failed_sql_tool_kind(getattr(qa, "tool_calls", None) or [])
+    kind = _last_failed_sql_tool_kind(tool_calls)
     if kind is not None:
         if kind == _EXECUTOR_TIMEOUT_KIND:
             return "executor_timeout"
         if kind in _EXECUTOR_TOOL_ERROR_KINDS:
             return "tool_error"
         return "validator_rejected"
-    # No tool-level error_kind — classify by terminal status.
+    # No SQL-tool error_kind to key off. A failed tool that carried no
+    # error_kind — whether a SQL tool whose envelope had only ``error`` (e.g.
+    # sample_values' invalid-arg / unknown-table returns) or a non-SQL tool
+    # (lookup_entity, describe_table, …) — is still a tool-path failure per the
+    # taxonomy. Attribute it to tool_error instead of letting the "model gave
+    # up" terminal status mask it as llm_error.
+    if _any_tool_failed(tool_calls):
+        return "tool_error"
+    # No tool failed at all — the model simply exited the loop without
+    # answering. Classify by terminal status (max_iterations / no_terminator →
+    # llm_error).
     return _classify_status_token(status) if isinstance(status, str) else "other"
 
 
@@ -346,6 +377,17 @@ def _last_failed_sql_tool_kind(tool_calls: Any) -> Optional[str]:
         if isinstance(result, dict) and result.get("error_kind"):
             kind = str(result["error_kind"])
     return kind
+
+
+def _any_tool_failed(tool_calls: Any) -> bool:
+    """True iff any tool call in the trace reported failure (``ok=False``).
+
+    Used as the fallback signal for :func:`_classify_qa_result` when no failed
+    SQL tool carried an ``error_kind``: a failed tool of any kind is a
+    tool-path failure (taxonomy ``tool_error``), which must take precedence
+    over the generic "model gave up" terminal status.
+    """
+    return any(not getattr(tc, "ok", True) for tc in tool_calls)
 
 
 def sql_audit_target_type(functions_accessed: list[str]) -> str:

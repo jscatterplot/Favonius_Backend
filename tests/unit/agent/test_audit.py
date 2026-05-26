@@ -27,7 +27,6 @@ from src.api.agent.audit import (
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import AuthContext
-from src.api.agent.llm import LLMExtractionError
 from src.api.agent.sql_executor import SqlExecutorError, SqlExecutorTimeoutError
 from src.api.agent_workflows.runtime import ToolNotAllowedError
 from src.api.agent_workflows.tools import ToolNotRegisteredError
@@ -358,10 +357,21 @@ def _tc(name: str, *, ok: bool, error_kind: str | None = None, row_count: int | 
 
 
 def _qa(
-    *, status: str = "success", tool_calls: list | None = None, empty_result: bool = False
+    *,
+    status: str = "success",
+    tool_calls: list | None = None,
+    empty_result: bool = False,
+    text: str | None = None,
 ) -> Any:
-    """A QAResult-shaped terminal object (duck-typed by classify_failure)."""
-    return SimpleNamespace(status=status, tool_calls=tool_calls or [], empty_result=empty_result)
+    """A QAResult-shaped terminal object (duck-typed by classify_failure).
+
+    ``text`` defaults to ``None`` (attribute present but unset) so the
+    classifier's missing-text branch is exercised by the existing success
+    cases; pass an explicit string to test the blank-terminator path.
+    """
+    return SimpleNamespace(
+        status=status, tool_calls=tool_calls or [], empty_result=empty_result, text=text
+    )
 
 
 class BudgetExceededError(Exception):
@@ -369,6 +379,17 @@ class BudgetExceededError(Exception):
 
     The name must match exactly what budget.py (S4) will raise — that is the
     whole point of the name-based hook in classify_failure.
+    """
+
+
+class LLMExtractionError(RuntimeError):
+    """Stand-in for ``src.api.agent.llm.LLMExtractionError``.
+
+    classify_failure matches it by class name so ``audit.py`` need not import
+    ``src.api.agent.llm`` (which loads the Anthropic SDK at module import). The
+    real class is a ``RuntimeError`` subclass; this local mirror lets the audit
+    unit tests run in an llm-free environment, which is the whole point of the
+    name-based hook.
     """
 
 
@@ -493,5 +514,67 @@ class TestClassifyFailure:
 
     async def test_llm_error_from_extraction_error(self):
         # The consumption path's extractor failure is an LLM-origin error, not
-        # an unattributable "other".
+        # an unattributable "other". Matched by class name so audit.py need not
+        # import the (SDK-pulling) llm module.
         assert classify_failure(LLMExtractionError("no tool call on retry")) == "llm_error"
+
+    async def test_blank_terminator_success_is_llm_error(self):
+        # run_qa_turn can report success with empty text (emit_final_answer has
+        # no min length); the controller falls back to not_found. The turn
+        # produced no usable answer → llm_error, not a NULL failure_reason.
+        qa = _qa(
+            status="success",
+            text="   ",
+            tool_calls=[_tc("run_select_ts", ok=True, row_count=4)],
+        )
+        assert classify_failure(qa) == "llm_error"
+
+    async def test_nonblank_terminator_success_is_not_a_failure(self):
+        qa = _qa(
+            status="success",
+            text="John charged 412 kWh last month.",
+            tool_calls=[_tc("run_select_ts", ok=True, row_count=4)],
+        )
+        assert classify_failure(qa) is None
+
+    async def test_tool_error_from_failed_sql_tool_without_error_kind(self):
+        # sample_values can fail with only an ``error`` envelope (invalid n,
+        # unknown table) and no error_kind. A turn that dies after such a
+        # failure is a tool_error, not a fall-through to llm_error.
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("sample_values", ok=False, error_kind=None)],
+        )
+        assert classify_failure(qa) == "tool_error"
+
+    async def test_tool_error_from_failed_non_sql_tool(self):
+        # A failed non-SQL tool (e.g. lookup_entity) the model never recovered
+        # from is a tool-path failure even though the terminal status is the
+        # generic "model gave up" marker.
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("lookup_entity", ok=False)],
+        )
+        assert classify_failure(qa) == "tool_error"
+
+    async def test_llm_error_when_model_gives_up_with_no_failed_tools(self):
+        # Guardrail for the _any_tool_failed fallback: a clean run that simply
+        # exhausted iterations (no failed tool) stays llm_error.
+        qa = _qa(
+            status="max_iterations",
+            tool_calls=[_tc("run_select_ts", ok=True, row_count=2)],
+        )
+        assert classify_failure(qa) == "llm_error"
+
+    async def test_audit_module_does_not_import_anthropic_sdk(self):
+        # Regression guard (Codex P2): audit.py must stay importable without the
+        # Anthropic SDK. It classifies LLMExtractionError / SDK errors by name,
+        # so it must not transitively import ``anthropic`` at module load.
+        import sys
+
+        assert "src.api.agent.audit" in sys.modules
+        audit_mod = sys.modules["src.api.agent.audit"]
+        # The module's own globals must not hold a direct handle to the SDK or
+        # the llm module (the two import paths that pull anthropic in).
+        assert "anthropic" not in vars(audit_mod)
+        assert "LLMExtractionError" not in vars(audit_mod)
