@@ -129,6 +129,97 @@ def test_system_prompt_describes_requires_manager_escape_hatch():
     assert "requires_manager" in READINESS_SYSTEM_PROMPT
 
 
+# ── Production prompt + tool-contract pinning ─────────────────────────────
+#
+# The golden scenarios under tests/golden/workflows/ run against the
+# sprint-3 harness's default 3-tool registry with short stub prompts —
+# they verify the *runtime plumbing* (allow-list, guard, decision write)
+# deterministically and without a live LLM. By design they do NOT carry
+# the production prompt or the sprint-4 tool input contracts.
+#
+# That leaves a regression hole the PR review flagged (PR #181, threads
+# r3263805198 / r3263805200 / r3263805203): a change that strips the
+# 99%/grid/driver guardrails from READINESS_SYSTEM_PROMPT, or that drifts
+# the production tool input schemas, would not fail a golden scenario.
+# The tests below close that hole — they pin exactly what the registered
+# production workflow ships with, so a guardrail/contract regression
+# fails here even though the golden gate stays fast and deterministic.
+
+
+def test_registered_workflow_prompt_is_the_guarded_production_prompt():
+    """The Workflow that production registers must carry the real,
+    guardrailed prompt — not a stub. Pinning this means a regression that
+    swaps in a thin prompt (the shape the golden scenarios use) fails."""
+    wf = build_readiness_workflow(uuid4())
+    assert wf.prompt is READINESS_SYSTEM_PROMPT
+    # The guardrails the golden scenarios can't assert (they use stubs).
+    assert "99%" in wf.prompt
+    assert "max_grid_kw" in wf.prompt
+    assert "shift_end" in wf.prompt
+    assert "market" in wf.prompt.lower()
+    assert "stale" in wf.prompt.lower()
+    assert "requires_manager" in wf.prompt
+
+
+def _introspect_production_registry():
+    """Build the real readiness registry to introspect tool schemas.
+
+    The callables are bound to the pools via closure but never invoked
+    here — we only read ``input_schema`` — so dummy pools are safe.
+    """
+    from src.api.agent.auth_context import AuthContext
+    from src.api.agent_workflows.readiness_tools import build_readiness_tool_registry
+
+    depot_id = uuid4()
+    auth = AuthContext(
+        user_id=uuid4(),
+        organization_id=uuid4(),
+        role="customer_operator",
+        visible_depot_ids=[depot_id],
+    )
+    return build_readiness_tool_registry(
+        static_pool=MagicMock(),
+        ts_pool=MagicMock(),
+        auth=auth,
+        depot_id=depot_id,
+    )
+
+
+def test_production_registry_exposes_exactly_the_allowed_tools():
+    """The five tools the workflow declares must be the five the
+    production registry actually ships — no drift in either direction."""
+    registry = _introspect_production_registry()
+    assert sorted(registry.names()) == sorted(READINESS_ALLOWED_TOOLS)
+
+
+def test_scheduled_departures_tool_requires_the_real_window_contract():
+    """Closes PR #181 r3263805198: the golden trace calls this tool with
+    ``{}``, but production requires depot_id + a [window_start, window_end)
+    range. Pin the real contract so a schema regression is caught here."""
+    registry = _introspect_production_registry()
+    schema = registry.get("get_scheduled_departures").input_schema
+    required = set(schema.get("required") or [])
+    assert {"depot_id", "window_start", "window_end"} <= required
+
+
+def test_driver_assignment_tool_exists_and_requires_route_id():
+    """Closes PR #181 r3263805203: the no-driver golden scenario never
+    calls get_driver_assignment, so the driver tool/contract is unpinned
+    by the gate. Pin its presence + input contract here."""
+    registry = _introspect_production_registry()
+    assert registry.has("get_driver_assignment")
+    schema = registry.get("get_driver_assignment").input_schema
+    assert "route_id" in set(schema.get("required") or [])
+
+
+def test_vehicle_and_charger_tools_require_their_ids():
+    registry = _introspect_production_registry()
+    veh = registry.get("get_vehicle_state").input_schema
+    chg = registry.get("get_charger_state").input_schema
+    assert "vehicle_id" in set(veh.get("required") or [])
+    assert "charger_id" in set(chg.get("required") or [])
+
+
 # ── Workflow object builder ───────────────────────────────────────────────
 
 
