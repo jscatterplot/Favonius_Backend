@@ -3338,7 +3338,7 @@ def _readiness_response_payload(depot_id: str, checks: list[dict]) -> dict:
     """Build readiness response including aggregate readiness."""
     return {
         "depot_id": depot_id,
-        "ready": all(check["status"] == "ready" for check in checks),
+        "ready": not any(check["status"] == "blocked" for check in checks),
         "checks": checks,
     }
 
@@ -3571,19 +3571,46 @@ async def _build_depot_readiness_checklist(
 
     has_prices = False
     has_building_load = False
+    # Resolve the ENTSO-E bidding zone so has_prices checks electricity_prices
+    # (the canonical ENTSO-E DAM store, keyed by bidding zone) rather than the
+    # legacy per-depot prices table (which is always empty on ENTSO-E deployments).
+    _bidding_zone: Optional[str] = None
+    try:
+        if conn is not None:
+            _bidding_zone = await db_queries.resolve_bidding_zone(conn, UUID(depot_id))
+        else:
+            async with db_pools.static.acquire() as _sc:
+                _bidding_zone = await db_queries.resolve_bidding_zone(_sc, UUID(depot_id))
+    except Exception:
+        pass
     if db_pools.ts is not None:
         async with db_pools.ts.acquire() as ts_conn:
-            has_prices = bool(
-                await ts_conn.fetchval(
-                    """
-                    SELECT EXISTS(
-                        SELECT 1 FROM prices
-                        WHERE depot_id = $1::uuid AND time >= NOW() - INTERVAL '24 hours'
+            if _bidding_zone:
+                has_prices = bool(
+                    await ts_conn.fetchval(
+                        """
+                        SELECT EXISTS(
+                            SELECT 1 FROM electricity_prices
+                            WHERE node_id = $1
+                              AND market_type = 'ENTSOE_DAM'
+                              AND time >= NOW() - INTERVAL '24 hours'
+                        )
+                        """,
+                        _bidding_zone,
                     )
-                    """,
-                    depot_id,
                 )
-            )
+            else:
+                has_prices = bool(
+                    await ts_conn.fetchval(
+                        """
+                        SELECT EXISTS(
+                            SELECT 1 FROM prices
+                            WHERE depot_id = $1::uuid AND time >= NOW() - INTERVAL '24 hours'
+                        )
+                        """,
+                        depot_id,
+                    )
+                )
             has_building_load = bool(
                 await ts_conn.fetchval(
                     """
@@ -3679,11 +3706,11 @@ async def _build_depot_readiness_checklist(
         {
             "id": "building_load",
             "label": "Building load available",
-            "status": "ready" if has_building_load else "blocked",
+            "status": "ready" if has_building_load else "warning",
             "detail": (
                 "Recent building load rows found"
                 if has_building_load
-                else "Missing building load data"
+                else "No building load data — optimizer will apply static derate"
             ),
         }
     )
