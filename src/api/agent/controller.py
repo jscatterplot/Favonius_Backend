@@ -54,6 +54,7 @@ from src.api.agent.intents.consumption_by_user import (
 )
 from src.api.agent.plan import QueryPlan
 from src.api.agent.planner import classify as planner_classify
+from src.api.agent.planner import fetch_org_sql_enabled, is_sql_mode_enabled
 from src.api.agent.prompts import (
     build_sql_agent_system_prompt,
     format_sql_agent_user_message,
@@ -430,7 +431,24 @@ async def run_turn(
 
     try:
         # 0. Planner — pick consumption fast path, sql_general, or refuse.
-        decision = planner_classify(message, organization_id=auth.organization_id)
+        #
+        # Two-phase approach: run a cheap text-only pre-check first.  Only
+        # messages that fall through to the "fallback" branch (i.e. non-
+        # consumption, non-empty) could ever route to sql_general, so we
+        # defer the static-DB org lookup until we know it's actually needed.
+        # fetch_org_sql_enabled returns True for None org_id (admin/system
+        # callers), so no separate role check is required here.
+        if is_sql_mode_enabled():
+            _pre = planner_classify(message, sql_mode_allowed=False)
+            if _pre.reason == "consumption_fallback_no_sql_mode":
+                sql_mode_allowed = await fetch_org_sql_enabled(
+                    static_pool, auth.organization_id
+                )
+                decision = planner_classify(message, sql_mode_allowed=sql_mode_allowed)
+            else:
+                decision = _pre
+        else:
+            decision = planner_classify(message, sql_mode_allowed=False)
         await agent_runs_step(
             ts_pool,
             run_id,

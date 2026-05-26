@@ -12,6 +12,7 @@
 #   favonius_test    <- migrations/*.sql            (agent_views.* TS functions)
 #   favonius_static  <- supabase_bootstrap.sql       (Supabase-owned base tables)
 #                       + migrations/supabase/040_agent_views_static.sql
+#                       + migrations/supabase/044_agent_sql_mode_org_flag.sql
 # See tests/golden/agent_sql/supabase_bootstrap.sql for why the static base is
 # reconstructed rather than replayed.
 #
@@ -129,10 +130,11 @@ jobs:
         run: python scripts/run_migrations.py
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
-      - name: Apply static base + agent_views (040) -> favonius_static
+      - name: Apply static base + agent_views (040) + org SQL flag (044) -> favonius_static
         run: |
           psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/golden/agent_sql/supabase_bootstrap.sql
           psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/040_agent_views_static.sql
+          psql "$TEST_STATIC_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/supabase/044_agent_sql_mode_org_flag.sql
       - name: Run agent-SQL golden gate
         # `-m "agent_sql_golden or not agent_sql_golden"` runs both the
         # parametrised gate (real DB) and the no-DB invariants in the file
