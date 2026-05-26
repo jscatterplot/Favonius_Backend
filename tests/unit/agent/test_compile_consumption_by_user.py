@@ -211,11 +211,8 @@ class TestMixedDriverAndCardsPath:
         assert params[0] == [DRIVER_A]
         assert params[1] == [CARD_1, CARD_2, CARD_3]
 
-    def test_depot_entities_are_ignored(self):
-        """Depot entities are not subjects and must not add params.
-
-        (Vehicles, by contrast, ARE subjects now — see TestVehiclePath.)
-        """
+    def test_depot_entities_ignored_without_scope_kwargs(self):
+        """Depot rows in ``resolved`` alone do not scope; caller passes ids."""
         resolved = [
             ResolvedEntity(
                 kind="driver",
@@ -226,17 +223,37 @@ class TestMixedDriverAndCardsPath:
             ResolvedEntity(
                 kind="depot",
                 display="Vilnius",
-                primary_id=UUID("88888888-8888-8888-8888-888888888888"),
+                primary_id=DEPOT_A,
             ),
         ]
 
         sql, params = compile_consumption_by_user(_plan(), resolved, _window())
 
-        # Driver path only; depot UUID not in any param and no vehicle clause.
         assert sql == EXPECTED_SQL
         assert params[0] == [DRIVER_A]
         assert params[1] == [CARD_1]
         assert len(params) == 5
+
+    def test_depot_scope_ands_onto_vehicle_subject(self):
+        """Depot ids + station ids restrict fleet totals to that depot."""
+        resolved = [
+            ResolvedEntity(kind="vehicle", display="Renault Van 1", primary_id=VEHICLE_1),
+        ]
+
+        sql, params = compile_consumption_by_user(
+            _plan(),
+            resolved,
+            _window(),
+            depot_ids=[DEPOT_A],
+            station_ids=["CP-1"],
+        )
+
+        assert "cs.vehicle_id = ANY($1::text[])" in sql
+        assert "cs.site_id = ANY($2::uuid[])" in sql
+        assert "cs.station_id = ANY($3::text[])" in sql
+        assert params[0] == [str(VEHICLE_1)]
+        assert params[1] == [DEPOT_A]
+        assert params[2] == ["CP-1"]
 
 
 class TestVehiclePath:

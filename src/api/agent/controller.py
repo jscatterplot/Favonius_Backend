@@ -558,12 +558,34 @@ async def run_turn(
                 await agent_runs_step(ts_pool, run_id, "execute", {"row_count": len(rows_list)})
                 await _emit_step("execute")
             else:
-                # 4. Resolve time window in the depot timezone.
-                depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
-                window = resolve_time_window(plan.time_window, auth.visible_depot_ids, depot_tzs)
+                # 4. Resolve time window; a named depot scopes subject queries.
+                visible = set(auth.visible_depot_ids)
+                scoped_depot_ids = [
+                    e.primary_id
+                    for e in depot_subjects
+                    if e.primary_id is not None and e.primary_id in visible
+                ]
+                if scoped_depot_ids:
+                    depot_tzs = await load_depot_timezones(static_pool, scoped_depot_ids)
+                    window = resolve_time_window(plan.time_window, scoped_depot_ids, depot_tzs)
+                else:
+                    depot_tzs = await load_depot_timezones(static_pool, auth.visible_depot_ids)
+                    window = resolve_time_window(
+                        plan.time_window, auth.visible_depot_ids, depot_tzs
+                    )
 
-                # 5. Compile + execute SQL.
-                sql, params = compile_consumption_by_user(plan, resolved, window)
+                # 5. Compile + execute SQL (depot entities are scope, not filters).
+                compile_resolved = [e for e in resolved if e.kind != "depot"]
+                compile_kwargs: dict[str, Any] = {}
+                if scoped_depot_ids:
+                    stations = await load_depot_stations(static_pool, scoped_depot_ids)
+                    compile_kwargs = {
+                        "depot_ids": scoped_depot_ids,
+                        "station_ids": sorted(s["ocpp_id"] for s in stations),
+                    }
+                sql, params = compile_consumption_by_user(
+                    plan, compile_resolved, window, **compile_kwargs
+                )
                 await agent_runs_step(
                     ts_pool,
                     run_id,

@@ -132,6 +132,16 @@ def _compile_depot_wide(
     return sql, params
 
 
+def _depot_scope_and_clause(depot_param: int, station_param: int) -> str:
+    """AND clause restricting sessions to the given depots (subject queries)."""
+    return (
+        "          AND (\n"
+        f"            cs.site_id = ANY(${depot_param}::uuid[])\n"
+        f"            OR (cs.site_id IS NULL AND cs.station_id = ANY(${station_param}::text[]))\n"
+        "          )\n"
+    )
+
+
 def compile_consumption_by_user(
     plan: QueryPlan,
     resolved: list[ResolvedEntity],
@@ -152,14 +162,15 @@ def compile_consumption_by_user(
             controller surfaces those as "not found" before compiling.
         window: The resolved UTC bounds plus the depot timezone the
             bounds were computed against.
-        station_ids: When provided (even as an empty list), compiles the
-            **depot-wide** form (no subject filter). Together with
-            ``depot_ids`` these scope the total to the caller's visible
-            depots — the tenant boundary for a no-subject total. The
-            caller resolves both server-side from the visible depots.
-        depot_ids: Visible depot UUIDs for the depot-wide form. A session
-            matches by ``site_id`` (import path) or, when ``site_id`` is
-            NULL, by ``station_id`` (live OCPP path).
+        station_ids: When provided with **no** driver/card/vehicle subjects,
+            compiles the **depot-wide** form (no subject filter). Together
+            with ``depot_ids`` these scope the total to the caller's visible
+            depots. When subjects are present, the same pair ANDs depot
+            scope onto the subject filter (a depot names a boundary, not a
+            row filter).
+        depot_ids: Depot UUIDs for depot-wide or depot-scoped subject forms.
+            A session matches by ``site_id`` (import path) or, when
+            ``site_id`` is NULL, by ``station_id`` (live OCPP path).
 
     Returns:
         A ``(sql, params)`` tuple whose ``params`` match the ``$1..$N``
@@ -171,15 +182,16 @@ def compile_consumption_by_user(
     """
     bucket = _bucket(plan)
 
-    if station_ids is not None:
-        return _compile_depot_wide(station_ids, depot_ids or [], window, bucket)
-
     drivers = [e for e in resolved if e.kind == "driver" and e.primary_id is not None]
     rfids = [e for e in resolved if e.kind == "rfid" and e.primary_id is not None]
     vehicles = [e for e in resolved if e.kind == "vehicle" and e.primary_id is not None]
 
     has_driver_or_card = bool(drivers or rfids)
     has_vehicle = bool(vehicles)
+
+    if station_ids is not None and not has_driver_or_card and not has_vehicle:
+        return _compile_depot_wide(station_ids, depot_ids or [], window, bucket)
+
     if not has_driver_or_card and not has_vehicle:
         raise ValueError(
             "consumption_by_user requires at least one resolved driver, card, or "
@@ -216,6 +228,13 @@ def compile_consumption_by_user(
         params.append(vehicle_ids)
         idx += 1
 
+    depot_scope_sql = ""
+    if station_ids is not None or depot_ids is not None:
+        depot_scope_sql = _depot_scope_and_clause(idx, idx + 1)
+        params.append(list(depot_ids or []))
+        params.append(list(station_ids or []))
+        idx += 2
+
     start_idx, end_idx, tz_idx = idx, idx + 1, idx + 2
     params += [window.start_utc, window.end_utc, window.timezone]
 
@@ -228,6 +247,7 @@ def compile_consumption_by_user(
         "        WHERE (\n"
         f"            {where_block}\n"
         "          )\n"
+        f"{depot_scope_sql}"
         f"          AND cs.start_time >= ${start_idx}\n"
         f"          AND cs.start_time <  ${end_idx}\n"
     )
