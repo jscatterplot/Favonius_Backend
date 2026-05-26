@@ -3490,11 +3490,13 @@ async def get_session_energy_kwh(
        from the OCPP StopTransaction meter delta when the session closes.
        Billing-grade; only available once the session has ended (or for
        imported rows). Returned with ``source = "session_meter_delta"``.
-    2. Meter-register delta from ``telemetry_samples`` — difference between
-       the first and last ``Energy.Active.Import.Register`` samples in the
-       session window (transaction-scoped), normalized to kWh. If the register
-       decreases at any point (rollover/reset), this fallback is treated as
-       unavailable to avoid returning misleading billing values. Returned with
+    2. Meter-register delta from ``telemetry.energy_kwh`` — difference between
+       the first and last energy register readings in the session window
+       (transaction-scoped). telemetry_samples was retired in migration 045;
+       energy_kwh is now a first-class column on the wide table, already
+       normalised to kWh by the write path. If the register decreases at any
+       point (rollover/reset), this fallback is treated as unavailable to
+       avoid returning misleading billing values. Returned with
        ``source = "telemetry_register_delta"``.
 
     Args:
@@ -3552,7 +3554,9 @@ async def get_session_energy_kwh(
             "source": ENERGY_SOURCE_SESSION_METER,
         }
 
-    # Option B: integrate the cumulative register from telemetry_samples.
+    # Option B: integrate the cumulative register from telemetry.energy_kwh.
+    # telemetry_samples was retired in migration 045; energy_kwh is now a
+    # first-class column on the wide telemetry table, already normalised to kWh.
     session_txid = session_row["transaction_id"]
     if session_txid is None:
         return None
@@ -3562,13 +3566,10 @@ async def get_session_energy_kwh(
         WITH normalized_samples AS (
             SELECT
                 time,
-                CASE
-                    WHEN LOWER(COALESCE(unit, 'Wh')) = 'kwh' THEN value
-                    ELSE value / 1000.0
-                END AS value_kwh
-            FROM telemetry_samples
+                energy_kwh AS value_kwh
+            FROM telemetry
             WHERE transaction_id = $1
-              AND measurand = 'Energy.Active.Import.Register'
+              AND energy_kwh IS NOT NULL
               AND time >= $2
               AND time <= COALESCE($3, NOW())
         ),

@@ -4,8 +4,9 @@
 --   1. Add energy_kwh column to the wide telemetry table so the write path
 --      can land Energy.Active.Import.Register directly without the EAV fan-out.
 --   2. Backfill energy_kwh from telemetry_samples for historical rows, then
---      drop telemetry_samples (the EAV table was only ever read by this
---      migration family; production code reads from telemetry).
+--      drop telemetry_samples. All production reads (get_session_energy_kwh
+--      fallback path, backfill_terra_meter_start.py) have been rewired to
+--      telemetry.energy_kwh in the same PR.
 --   3. NULL out all poisoned soc values. The ABB Terra AC chargers deployed
 --      at HRX do not have a BMS connection and never send SoC measurands.
 --      Every non-NULL soc in telemetry was fabricated by the `soc or 0.0`

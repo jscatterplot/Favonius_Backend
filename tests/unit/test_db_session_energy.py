@@ -2,8 +2,9 @@
 
 Covers the two-source resolution strategy:
 * Option A — return ``charging_sessions.energy_delivered_kwh`` when present.
-* Option B — fall back to ``telemetry_samples`` meter-register delta when the
-  stored value is missing (in-flight sessions).
+* Option B — fall back to ``telemetry.energy_kwh`` register delta when the
+  stored value is missing (in-flight sessions). telemetry_samples was retired
+  in migration 045; energy_kwh is now a first-class column on the wide table.
 """
 
 from __future__ import annotations
@@ -73,10 +74,11 @@ async def test_falls_back_to_telemetry_register_delta_for_open_session():
     assert result["energy_kwh"] == pytest.approx(34.567, abs=1e-6)
 
     fallback_query = db.fetchrow.await_args_list[1].args[0]
-    assert "telemetry_samples" in fallback_query
-    assert "Energy.Active.Import.Register" in fallback_query
-    # Wh/kWh unit normalisation must be in the SQL, not in Python.
-    assert "LOWER(COALESCE(unit, 'Wh')) = 'kwh'" in fallback_query
+    # telemetry_samples retired (mig 045) — fallback now reads telemetry.energy_kwh
+    assert "FROM telemetry" in fallback_query
+    assert "energy_kwh IS NOT NULL" in fallback_query
+    # energy_kwh is already normalised to kWh in the write path; no unit CASE needed
+    assert "telemetry_samples" not in fallback_query
 
 
 @pytest.mark.asyncio
@@ -127,7 +129,7 @@ async def test_returns_none_when_no_stored_and_no_telemetry():
 @pytest.mark.asyncio
 async def test_returns_none_when_session_lacks_transaction_id():
     # OCPP 2.0.1 rows can have transaction_id=None; without it we cannot
-    # join telemetry_samples, so the fallback path is unavailable.
+    # join telemetry, so the fallback path is unavailable.
     db = AsyncMock()
     db.fetchrow = AsyncMock(
         return_value=_session_row(transaction_id=None, energy_delivered_kwh=None)
@@ -136,7 +138,7 @@ async def test_returns_none_when_session_lacks_transaction_id():
     result = await get_session_energy_kwh(db, session_id=uuid4())
 
     assert result is None
-    # No telemetry_samples query should be issued.
+    # No telemetry fallback query should be issued.
     assert db.fetchrow.await_count == 1
 
 
@@ -225,4 +227,4 @@ async def test_lowercase_kwh_is_not_divided_by_thousand():
 
     assert result == {"energy_kwh": 50.0, "source": ENERGY_SOURCE_TELEMETRY_REGISTER}
     fallback_query = db.fetchrow.await_args_list[1].args[0]
-    assert "LOWER(COALESCE(unit, 'Wh')) = 'kwh'" in fallback_query
+    assert "energy_kwh IS NOT NULL" in fallback_query
