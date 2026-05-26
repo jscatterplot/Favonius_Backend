@@ -284,6 +284,13 @@ class TimescaleClient:
                         charger_id = await self._resolve_charger_id(station_id, conn=static_conn)
                         soc = (soc_percent / 100.0) if soc_percent is not None else None
                         is_plugged = (power_kw > 0.1) if power_kw is not None else None
+                        # Use per-sample timestamp when available (e.g. StopTransaction
+                        # transactionData carries historical readings each with their own
+                        # timestamp — collapsing them to the frame time would lose history
+                        # and break get_session_energy_kwh's energy-delta calculation).
+                        telemetry_time = (
+                            raw_sample.get("timestamp") or data["time"]
+                        ) if raw_sample else data["time"]
 
                         await conn.execute(
                             """
@@ -306,7 +313,7 @@ class TimescaleClient:
                                 max_charge_kw = COALESCE(EXCLUDED.max_charge_kw, telemetry.max_charge_kw),
                                 energy_kwh = COALESCE(EXCLUDED.energy_kwh, telemetry.energy_kwh)
                             """,
-                            data["time"],
+                            telemetry_time,
                             station_id or "unknown",
                             int(connector_id) if connector_id is not None else 1,
                             transaction_id,
