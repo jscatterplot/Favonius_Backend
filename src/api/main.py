@@ -12556,11 +12556,16 @@ async def _handle_alerts_acknowledge(
         )
         depot_name: Optional[str] = None
         if existing.depot_id and db_pools:
-            async with db_pools.static.acquire() as sc:
-                row = await sc.fetchrow(
-                    "SELECT name FROM sites WHERE id = $1", existing.depot_id
+            try:
+                async with db_pools.static.acquire() as sc:
+                    row = await sc.fetchrow(
+                        "SELECT name FROM sites WHERE id = $1", existing.depot_id
+                    )
+                    depot_name = row["name"] if row else None
+            except Exception:
+                logger.warning(
+                    "Failed to fetch depot name for alert %s; omitting from response", alert_id
                 )
-                depot_name = row["name"] if row else None
         return _alert_to_notification_item(projected, depot_name=depot_name).model_dump()
 
     async with db_pools.ts.acquire() as conn:
@@ -12665,11 +12670,16 @@ async def _handle_alerts_resolve(
         )
         depot_name = None
         if existing.depot_id and db_pools:
-            async with db_pools.static.acquire() as sc:
-                row = await sc.fetchrow(
-                    "SELECT name FROM sites WHERE id = $1", existing.depot_id
+            try:
+                async with db_pools.static.acquire() as sc:
+                    row = await sc.fetchrow(
+                        "SELECT name FROM sites WHERE id = $1", existing.depot_id
+                    )
+                    depot_name = row["name"] if row else None
+            except Exception:
+                logger.warning(
+                    "Failed to fetch depot name for alert %s; omitting from response", alert_id
                 )
-                depot_name = row["name"] if row else None
         return _alert_to_notification_item(projected, depot_name=depot_name).model_dump()
 
     async with db_pools.ts.acquire() as conn:
@@ -13107,12 +13117,17 @@ async def list_org_alerts(
     unique_depot_ids = [a.depot_id for a in alerts_list if a.depot_id is not None]
     depot_name_map: dict[str, str] = {}
     if unique_depot_ids:
-        async with db_pools.static.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, name FROM sites WHERE id = ANY($1::uuid[])",
-                unique_depot_ids,
+        try:
+            async with db_pools.static.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, name FROM sites WHERE id = ANY($1::uuid[])",
+                    unique_depot_ids,
+                )
+                depot_name_map = {str(r["id"]): r["name"] for r in rows}
+        except Exception:
+            logger.warning(
+                "Failed to batch-fetch depot names for org alerts; omitting from response"
             )
-            depot_name_map = {str(r["id"]): r["name"] for r in rows}
 
     items = [
         _alert_to_notification_item(
