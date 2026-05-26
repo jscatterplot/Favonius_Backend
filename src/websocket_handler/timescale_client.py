@@ -259,6 +259,8 @@ class TimescaleClient:
                         # orphan-recovery job falls back to when StopTransaction
                         # is missing.
                         meter_wh = self._extract_register_wh(raw_sample) if raw_sample else None
+                        if energy_kwh is None and meter_wh is not None:
+                            energy_kwh = meter_wh / 1000.0
                         if station_id and transaction_id is not None:
                             await self._update_session_live_metrics(
                                 conn,
