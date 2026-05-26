@@ -12510,8 +12510,9 @@ async def _handle_alerts_acknowledge(
             status_code=422, detail="params.acknowledged_by_email must be a string or null"
         )
 
+    role = get_user_role(user or {})
     org_id = get_user_organization_id(user or {})
-    if not org_id:
+    if role != "favonius_admin" and not org_id:
         raise HTTPException(status_code=400, detail="organization_id not present in token")
 
     actor_raw = (user or {}).get("sub")
@@ -12528,7 +12529,7 @@ async def _handle_alerts_acknowledge(
 
     if (
         existing is None
-        or str(existing.organization_id) != str(org_id)
+        or (role != "favonius_admin" and str(existing.organization_id) != str(org_id))
         or not _alert_belongs_to_depot(existing.depot_id, depot_id)
     ):
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
@@ -12540,12 +12541,15 @@ async def _handle_alerts_acknowledge(
         )
 
     actor_uuid = UUID(str(actor_raw))
+    effective_email = acknowledged_by_email
+    if effective_email is None and isinstance(user, dict):
+        effective_email = get_user_email(user)
 
     if dry_run:
         projected = _project_alert_acknowledged(
             existing,
             user_id=actor_uuid,
-            user_email=acknowledged_by_email,
+            user_email=effective_email,
         )
         depot_name: Optional[str] = None
         if existing.depot_id and db_pools:
@@ -12560,9 +12564,9 @@ async def _handle_alerts_acknowledge(
         updated = await alerts_repo.acknowledge_for_org(
             conn,
             UUID(alert_id),
-            org_id=UUID(str(org_id)),
+            org_id=UUID(str(existing.organization_id)),
             user_id=actor_uuid,
-            user_email=acknowledged_by_email,
+            user_email=effective_email,
         )
 
     if updated is None:
@@ -12603,8 +12607,9 @@ async def _handle_alerts_resolve(
             status_code=422, detail="params.acknowledged_by_email must be a string or null"
         )
 
+    role = get_user_role(user or {})
     org_id = get_user_organization_id(user or {})
-    if not org_id:
+    if role != "favonius_admin" and not org_id:
         raise HTTPException(status_code=400, detail="organization_id not present in token")
 
     actor_raw = (user or {}).get("sub")
@@ -12621,7 +12626,7 @@ async def _handle_alerts_resolve(
 
     if (
         existing is None
-        or str(existing.organization_id) != str(org_id)
+        or (role != "favonius_admin" and str(existing.organization_id) != str(org_id))
         or not _alert_belongs_to_depot(existing.depot_id, depot_id)
     ):
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
@@ -12632,12 +12637,15 @@ async def _handle_alerts_resolve(
         )
 
     actor_uuid = UUID(str(actor_raw))
+    effective_email = acknowledged_by_email
+    if effective_email is None and isinstance(user, dict):
+        effective_email = get_user_email(user)
 
     if dry_run:
         projected = _project_alert_resolved(
             existing,
             user_id=actor_uuid,
-            user_email=acknowledged_by_email,
+            user_email=effective_email,
         )
         depot_name = None
         if existing.depot_id and db_pools:
@@ -12652,9 +12660,9 @@ async def _handle_alerts_resolve(
         updated = await alerts_repo.resolve_by_id(
             conn,
             UUID(alert_id),
-            org_id=UUID(str(org_id)),
+            org_id=UUID(str(existing.organization_id)),
             user_id=actor_uuid,
-            user_email=acknowledged_by_email,
+            user_email=effective_email,
         )
 
     if updated is None:

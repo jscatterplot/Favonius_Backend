@@ -430,7 +430,7 @@ async def list_for_org(
 ) -> tuple[list[Alert], int]:
     """Paginated org-scoped alert list for GET /alerts.
 
-    Returns (items, total_count). Sorted by last_occurrence_at DESC.
+    Returns (items, total_count). Sorted by severity DESC then recency.
     """
     conditions: list[str] = ["organization_id = $1"]
     params: list[Any] = [org_id]
@@ -473,7 +473,7 @@ async def list_for_org(
         SELECT {cols}
           FROM notification_alerts
          WHERE {where}
-         ORDER BY last_occurrence_at DESC
+         ORDER BY severity_level DESC, last_occurrence_at DESC
          LIMIT ${idx} OFFSET ${idx + 1}
         """,
         *params,

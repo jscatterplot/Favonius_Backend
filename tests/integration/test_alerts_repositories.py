@@ -207,6 +207,41 @@ class TestListForDepot:
             assert [a.dedup_key for a in rows] == ["r"]
 
 
+class TestListForOrg:
+    @pytest.mark.asyncio
+    async def test_orders_by_severity_then_recency(self, db_pool, org_and_depot):
+        org_id, depot_id = org_and_depot
+        async with db_pool.acquire() as conn:
+            await _insert_alert(
+                conn,
+                organization_id=org_id,
+                depot_id=depot_id,
+                dedup_key="old-critical",
+                severity="critical",
+            )
+            await asyncio.sleep(0.01)
+            await _insert_alert(
+                conn,
+                organization_id=org_id,
+                depot_id=depot_id,
+                dedup_key="new-warning",
+                severity="warning",
+            )
+            await asyncio.sleep(0.01)
+            await _insert_alert(
+                conn,
+                organization_id=org_id,
+                depot_id=depot_id,
+                dedup_key="new-critical",
+                severity="critical",
+            )
+
+            rows, total = await alerts_repo.list_for_org(conn, org_id, page=1, page_size=25)
+            keys = [a.dedup_key for a in rows]
+            assert total >= 3
+            assert keys[:3] == ["new-critical", "old-critical", "new-warning"]
+
+
 class TestAcknowledge:
     @pytest.mark.asyncio
     async def test_active_alert_transitions_to_acknowledged(self, db_pool, org_and_depot):
