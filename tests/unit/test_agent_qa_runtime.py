@@ -24,7 +24,6 @@ from src.api.agent_workflows.runtime import (
 from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.api.agent_workflows.tools import ToolRegistry
 
-
 # ── Fake Anthropic SDK ──────────────────────────────────────────────────
 
 
@@ -185,16 +184,16 @@ async def test_happy_path_explorer_then_select_then_terminator():
     reg, log = _registry()
     script = [
         _FakeResponse([_tool_use("list_tables", "b1", {})]),
-        _FakeResponse([
-            _tool_use("run_select_ts", "b2", {"sql": "SELECT 1"})
-        ]),
-        _FakeResponse([
-            _tool_use(
-                EMIT_FINAL_ANSWER_TOOL,
-                "b3",
-                {"text": "There were 42 sessions.", "row_evidence": 1},
-            )
-        ]),
+        _FakeResponse([_tool_use("run_select_ts", "b2", {"sql": "SELECT 1"})]),
+        _FakeResponse(
+            [
+                _tool_use(
+                    EMIT_FINAL_ANSWER_TOOL,
+                    "b3",
+                    {"text": "There were 42 sessions.", "row_evidence": 1},
+                )
+            ]
+        ),
     ]
     client = _FakeClient(script)
 
@@ -357,15 +356,11 @@ async def test_terminator_failure_does_not_loop_back_to_api():
     let the LLM retry). The prior `continue` path would do so. The
     new break-and-set-terminated path exits immediately."""
     reg, _ = _registry_with_raising_terminator()
-    single_block_response = _FakeResponse(
-        [_tool_use(EMIT_FINAL_ANSWER_TOOL, "b1", {"text": "ok"})]
-    )
+    single_block_response = _FakeResponse([_tool_use(EMIT_FINAL_ANSWER_TOOL, "b1", {"text": "ok"})])
     # If the loop incorrectly continued, it would hit the second
     # response and call the (working) select. With the fix, the second
     # response is never used because we break the outer loop.
-    second_response = _FakeResponse(
-        [_tool_use("run_select_ts", "b2", {"sql": "SELECT 3"})]
-    )
+    second_response = _FakeResponse([_tool_use("run_select_ts", "b2", {"sql": "SELECT 3"})])
     client = _FakeClient([single_block_response, second_response])
 
     result = await run_qa_turn(
@@ -398,13 +393,15 @@ async def test_run_qa_turn_records_token_usage_per_round_trip():
     script = [
         _FakeResponse([_tool_use("list_tables", "b1", {})]),
         _FakeResponse([_tool_use("run_select_ts", "b2", {"sql": "SELECT 1"})]),
-        _FakeResponse([
-            _tool_use(
-                EMIT_FINAL_ANSWER_TOOL,
-                "b3",
-                {"text": "ok", "row_evidence": 1},
-            )
-        ]),
+        _FakeResponse(
+            [
+                _tool_use(
+                    EMIT_FINAL_ANSWER_TOOL,
+                    "b3",
+                    {"text": "ok", "row_evidence": 1},
+                )
+            ]
+        ),
     ]
     # Attach distinct usage to each so we can verify aggregation.
     script[0].usage = _FakeUsage(input_tokens=100, output_tokens=20)
@@ -418,7 +415,7 @@ async def test_run_qa_turn_records_token_usage_per_round_trip():
     before_in = AGENT_LLM_TOKENS.labels(model=model, direction="input")._value.get()
     before_out = AGENT_LLM_TOKENS.labels(model=model, direction="output")._value.get()
 
-    await run_qa_turn(
+    result = await run_qa_turn(
         anthropic_client=client,
         model=model,
         system_prompt="sys",
@@ -433,6 +430,10 @@ async def test_run_qa_turn_records_token_usage_per_round_trip():
     # Sum across all three round-trips: 100+150+200 input, 20+30+10 output.
     assert after_in - before_in == 450
     assert after_out - before_out == 60
+    # The same aggregate is surfaced on the QAResult for the S4 budget to
+    # reconcile against (src/api/agent/budget.py::record_actual).
+    assert result.input_tokens == 450
+    assert result.output_tokens == 60
 
 
 @pytest.mark.asyncio
@@ -471,10 +472,7 @@ async def test_run_qa_turn_no_token_recording_when_usage_missing():
 async def test_max_iterations_without_terminator():
     reg, _ = _registry()
     # Always call list_tables, never terminate.
-    looping_script = [
-        _FakeResponse([_tool_use("list_tables", f"b{i}", {})])
-        for i in range(10)
-    ]
+    looping_script = [_FakeResponse([_tool_use("list_tables", f"b{i}", {})]) for i in range(10)]
     client = _FakeClient(looping_script)
 
     result = await run_qa_turn(
@@ -523,9 +521,11 @@ async def test_max_iterations_zero_clamped_to_one():
 @pytest.mark.asyncio
 async def test_tool_not_allowed_raises():
     reg, _ = _registry()
+
     # Add a "secret" tool to the registry but NOT to allowed_tools.
     async def _secret(**_):
         return {"ok": True}
+
     reg.register(
         "secret_admin_tool",
         description="x",
@@ -556,8 +556,10 @@ async def test_tool_not_allowed_preserves_partial_trace():
     audit evidence for the calls that DID execute.
     """
     reg, _ = _registry()
+
     async def _secret(**_):
         return {"ok": True}
+
     reg.register(
         "secret_admin_tool",
         description="x",
@@ -603,6 +605,7 @@ async def test_tool_not_registered_preserves_partial_trace():
     registry — sqlite path where the registry-side error fires.
     """
     reg, _ = _registry()
+
     # Simulate dispatch-time registration drift: a tool that passes the
     # `anthropic_schemas(allowed)` check at function entry but raises
     # ToolNotRegisteredError when actually invoked. (This models the
@@ -647,9 +650,11 @@ async def test_tool_not_registered_preserves_partial_trace():
 @pytest.mark.asyncio
 async def test_no_terminator_when_model_returns_text_only():
     reg, _ = _registry()
-    script = [_FakeResponse(
-        [_FakeBlock("text", text="here is my answer without using emit_final_answer")]
-    )]
+    script = [
+        _FakeResponse(
+            [_FakeBlock("text", text="here is my answer without using emit_final_answer")]
+        )
+    ]
     client = _FakeClient(script)
 
     result = await run_qa_turn(
@@ -717,12 +722,15 @@ async def test_error_envelope_return_marks_tool_call_as_failure():
 
     script = [
         _FakeResponse([_tool_use("run_select_ts", "b1", {"sql": "SELECT * FROM public.x"})]),
-        _FakeResponse([
-            _tool_use(
-                EMIT_FINAL_ANSWER_TOOL, "b2",
-                {"text": "I cannot answer because the validator rejected my SQL."}
-            )
-        ]),
+        _FakeResponse(
+            [
+                _tool_use(
+                    EMIT_FINAL_ANSWER_TOOL,
+                    "b2",
+                    {"text": "I cannot answer because the validator rejected my SQL."},
+                )
+            ]
+        ),
     ]
     client = _FakeClient(script)
 
@@ -772,12 +780,13 @@ async def test_tool_dispatch_error_is_returned_to_model():
 
     script = [
         _FakeResponse([_tool_use("list_tables", "b1", {})]),
-        _FakeResponse([
-            _tool_use(
-                EMIT_FINAL_ANSWER_TOOL, "b2",
-                {"text": "tool failed, here is what I can say"}
-            )
-        ]),
+        _FakeResponse(
+            [
+                _tool_use(
+                    EMIT_FINAL_ANSWER_TOOL, "b2", {"text": "tool failed, here is what I can say"}
+                )
+            ]
+        ),
     ]
     client = _FakeClient(script)
 

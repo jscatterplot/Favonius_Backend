@@ -35,6 +35,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.api.agent import budget
 from src.api.agent.audit import (
     agent_runs_close,
     agent_runs_open,
@@ -69,6 +70,7 @@ from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.monitoring.metrics import (
     AGENT_RESOLVER_MISSES,
+    AGENT_SQL_BUDGET_REFUSED,
     AGENT_SQL_TOOL_TURNS,
 )
 
@@ -145,16 +147,24 @@ class AgentReply(BaseModel):
     - ``error``           — the orchestrator failed; ``text`` is a generic
                             user-facing message (the cause is logged
                             server-side and never leaked here).
+    - ``refused``         — a pre-LLM refusal; ``reason`` is a stable
+                            machine-readable code (e.g.
+                            ``monthly_budget_exceeded``) and ``text`` is the
+                            user-facing message. No Anthropic tokens consumed.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     run_id: UUID
-    status: str = Field(..., description="success | disambiguation | not_found | error")
+    status: str = Field(..., description="success | disambiguation | not_found | error | refused")
     text: str
     intent: Optional[str] = None
     candidates: list[_CandidateOption] = Field(default_factory=list)
     not_found: list[str] = Field(default_factory=list)
+    reason: Optional[str] = Field(
+        default=None,
+        description="Machine-readable code for status='refused' (e.g. monthly_budget_exceeded).",
+    )
 
     @classmethod
     def success(cls, *, run_id: UUID, intent: str, text: str) -> "AgentReply":
@@ -207,6 +217,22 @@ class AgentReply(BaseModel):
             intent=intent,
             not_found=labels,
         )
+
+    @classmethod
+    def refused(
+        cls,
+        *,
+        run_id: UUID,
+        reason: str,
+        text: str,
+        intent: Optional[str] = None,
+    ) -> "AgentReply":
+        """A pre-LLM refusal (e.g. the per-org monthly token budget, S4).
+
+        ``reason`` is the stable machine-readable code the frontend keys off
+        (``monthly_budget_exceeded``); ``text`` is the human-facing message.
+        """
+        return cls(run_id=run_id, status="refused", text=text, intent=intent, reason=reason)
 
     @classmethod
     def error(cls, *, run_id: UUID, message: Optional[str] = None) -> "AgentReply":
@@ -626,6 +652,34 @@ async def _run_sql_general_turn(
         await agent_runs_step(ts_pool, run_id, "tool_call", payload)
         await emit_step("tool_call", label_key=name)
 
+    # S4 per-org monthly token budget: reserve a rough estimate BEFORE any
+    # Anthropic call. A None reservation means the org is over its monthly
+    # ceiling — refuse here, consuming ZERO tokens (no client.messages.create),
+    # and record the turn as a first-class 'refused' / budget_exceeded outcome.
+    system_prompt = build_sql_agent_system_prompt()
+    est_tokens = budget.estimate_turn_tokens(system_prompt)
+    reservation = await budget.check_and_reserve(auth.organization_id, est_tokens)
+    if reservation is None:
+        AGENT_SQL_BUDGET_REFUSED.labels(
+            organization_id=str(auth.organization_id) if auth.organization_id else "none"
+        ).inc()
+        await agent_runs_step(ts_pool, run_id, "budget_refused", {"est_tokens": est_tokens})
+        reply = AgentReply.refused(
+            run_id=run_id,
+            reason="monthly_budget_exceeded",
+            text=(
+                "This organisation has reached its monthly usage limit for the "
+                "analytics assistant. The limit resets at the start of next month — "
+                "contact your administrator if you need it raised."
+            ),
+            intent="sql_general",
+        )
+        await agent_runs_close(
+            ts_pool, run_id, "refused", reply, failure_reason=classify_failure("refused")
+        )
+        await _emit_answer_safe(sse, reply, run_id)
+        return reply
+
     # Bugbot L-sev: previous shape was ``sql_tool_turns = 0`` +
     # try/except/else/finally with the variable reassigned in three
     # branches and a single ``finally: AGENT_SQL_TOOL_TURNS.observe(…)``.
@@ -640,7 +694,7 @@ async def _run_sql_general_turn(
         qa = await run_qa_turn(
             anthropic_client=client,
             model=config.model,
-            system_prompt=build_sql_agent_system_prompt(),
+            system_prompt=system_prompt,
             user_message=format_sql_agent_user_message(message),
             tool_registry=registry,
             allowed_tools=SQL_AGENT_TOOL_NAMES,
@@ -661,6 +715,14 @@ async def _run_sql_general_turn(
         # the histogram at 0, biasing the distribution toward zero on
         # the runs we most need to monitor.
         AGENT_SQL_TOOL_TURNS.observe(_extract_iterations(exc))
+        # Reconcile the budget reservation against tokens actually spent before
+        # the abort (run_qa_turn attaches them to the exception); keeps a failed
+        # turn from leaking its rough estimate into the org's running total.
+        budget.record_actual(
+            reservation,
+            getattr(exc, "input_tokens", 0),
+            getattr(exc, "output_tokens", 0),
+        )
         logger.error("SQL agent tool error: %s", exc)
         # Codex P2: if a disallowed tool aborted the loop AFTER one or
         # more SQL tools had already executed, we still owe those rows
@@ -705,6 +767,11 @@ async def _run_sql_general_turn(
         return reply
     except Exception as exc:
         AGENT_SQL_TOOL_TURNS.observe(_extract_iterations(exc))
+        budget.record_actual(
+            reservation,
+            getattr(exc, "input_tokens", 0),
+            getattr(exc, "output_tokens", 0),
+        )
         partial_calls = list(getattr(exc, "tool_calls", []) or [])
         # Wrap in try/except (Bugbot M-sev): if the audit write fails
         # here it would mask the original exception, swallowing the
@@ -729,6 +796,9 @@ async def _run_sql_general_turn(
         raise
     else:
         AGENT_SQL_TOOL_TURNS.observe(qa.iterations)
+        # Reconcile the rough reservation against the real usage the loop spent
+        # (summed across every round-trip; see QAResult.input/output_tokens).
+        budget.record_actual(reservation, qa.input_tokens, qa.output_tokens)
 
     # Server-computed audit numbers: rely on the tool-call trace, not the
     # LLM-supplied `row_evidence` (the model can hallucinate that value).
