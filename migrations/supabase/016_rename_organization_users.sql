@@ -1,3 +1,4 @@
+-- Supabase migration 016: rename organization_users → user_organizations.
 -- Mirror of migrations/024_rename_organization_users.sql for Supabase static schema.
 
 DO $$

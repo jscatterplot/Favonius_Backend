@@ -1,4 +1,4 @@
--- Migration 009: vehicles.external_id is required and unique per depot.
+-- Supabase migration 018: vehicles.external_id is required and unique per depot.
 --
 -- Background: external_id is the customer's fleet number (e.g. "BUS-217").
 -- The backend already requires it on POST /admin/depots/{id}/vehicles via the
@@ -32,7 +32,7 @@ BEGIN
 
     IF _null_count > 0 THEN
         RAISE EXCEPTION
-            'Cannot apply migration 009: % vehicles have NULL external_id. '
+            'Cannot apply migration 018: % vehicles have NULL external_id. '
             'Backfill them with the customer''s fleet number before re-running.',
             _null_count;
     END IF;

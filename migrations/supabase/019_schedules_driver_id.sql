@@ -1,4 +1,4 @@
--- Supabase migration 013: schedules.driver_id (sprint 4 readiness tools)
+-- Supabase migration 019: schedules.driver_id (sprint 4 readiness tools)
 --
 -- Sprint 4 of the Depot Agent product (see docs/PRD_Depot_Agent.md §6.1)
 -- introduces the daily readiness workflow. That workflow needs to answer
