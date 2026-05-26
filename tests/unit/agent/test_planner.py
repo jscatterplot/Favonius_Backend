@@ -127,10 +127,10 @@ async def test_fetch_org_sql_enabled_no_org_row_defaults_true():
 
 
 @pytest.mark.asyncio
-async def test_fetch_org_sql_enabled_none_org_id_returns_false():
+async def test_fetch_org_sql_enabled_none_org_id_defaults_true_for_admin_context():
     pool = MagicMock()
     pool.fetchrow = AsyncMock()
-    assert await fetch_org_sql_enabled(pool, None) is False
+    assert await fetch_org_sql_enabled(pool, None) is True
     pool.fetchrow.assert_not_called()
 
 
