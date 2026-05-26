@@ -110,7 +110,9 @@ async def store_meter_values(
             )
         logger.debug(
             f"Stored meter values: {charge_point_id}, connector {connector_id}, "
-            f"vehicle_id={vehicle_id}, SoC={soc:.2f}, Power={power_kw:.2f}kW"
+            f"vehicle_id={vehicle_id}, "
+            f"SoC={(f'{soc:.2f}' if soc is not None else 'N/A')}, "
+            f"Power={(f'{power_kw:.2f}' if power_kw is not None else 'N/A')}kW"
             + (f", Energy={energy_kwh:.2f}kWh" if energy_kwh else "")
             + (f", max_charge_kw={max_charge_kw:.2f}kW" if max_charge_kw else "")
         )
