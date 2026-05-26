@@ -196,11 +196,12 @@ class _PeriodCounter:
 class TokenBudgetTracker:
     """In-process per-(org, period) token counter with best-effort DB flush.
 
-    Production uses the module singleton (:func:`get_token_budget_tracker`),
-    which lazily borrows the lifespan asyncpg pools from ``src.api.main`` the
-    same way ``src/api/agent/router.py`` does. Tests instantiate this class
-    directly with fake pools and an injected ``period_provider`` /
-    ``flush_every_writes`` so neither the clock nor a real DB is required.
+    Production uses the module singleton ``_TRACKER`` (via the module-level
+    :func:`check_and_reserve` / :func:`record_actual` shims), which lazily
+    borrows the lifespan asyncpg pools from ``src.api.main`` the same way
+    ``src/api/agent/router.py`` does. Tests instantiate this class directly with
+    fake pools and an injected ``period_provider`` / ``flush_every_writes`` so
+    neither the clock nor a real DB is required.
     """
 
     def __init__(
@@ -417,11 +418,6 @@ class TokenBudgetTracker:
 # ── Module singleton + public functions (the controller's entry points) ──────
 
 _TRACKER = TokenBudgetTracker()
-
-
-def get_token_budget_tracker() -> TokenBudgetTracker:
-    """Return the process-wide tracker (lazily borrows the lifespan pools)."""
-    return _TRACKER
 
 
 async def check_and_reserve(
