@@ -58,6 +58,7 @@ class ErrorCode(str, Enum):
     INVALID_STATUS = "INVALID_STATUS"
     INVALID_ENERGY = "INVALID_ENERGY"
     MISSING_REQUIRED_FIELD = "MISSING_REQUIRED_FIELD"
+    STATIC_DB_UNAVAILABLE = "STATIC_DB_UNAVAILABLE"
 
 
 ERROR_MESSAGES: dict[ErrorCode, str] = {
@@ -86,6 +87,7 @@ ERROR_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.INVALID_STATUS: "Invalid charge status value",
     ErrorCode.INVALID_ENERGY: "Invalid energy value",
     ErrorCode.MISSING_REQUIRED_FIELD: "Required field is missing",
+    ErrorCode.STATIC_DB_UNAVAILABLE: "Depot access check temporarily unavailable",
 }
 
 
@@ -115,6 +117,7 @@ _HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.INVALID_STATUS: status.HTTP_400_BAD_REQUEST,
     ErrorCode.INVALID_ENERGY: status.HTTP_400_BAD_REQUEST,
     ErrorCode.MISSING_REQUIRED_FIELD: status.HTTP_400_BAD_REQUEST,
+    ErrorCode.STATIC_DB_UNAVAILABLE: status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
 

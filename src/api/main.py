@@ -192,7 +192,9 @@ async def _require_depot_access(
     Returns the validated depot_id string on success; raises 400, 401, or 403 otherwise.
     """
     validate_depot_id(depot_id)
-    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    await verify_depot_access(depot_id, user, db_pools.static)
     return depot_id
 
 
@@ -1103,6 +1105,15 @@ if is_data_sources_enabled():
 
     app.include_router(data_sources_router)
     logger.info("Data Sources enabled at /admin/data-sources/*")
+
+
+# ── Optimization metadata router ─────────────────────────────────────────────
+# Always mounted — no feature flag needed. Provides read-only solver metadata
+# (GET /depots/{id}/optimization/solver) behind the same JWT + depot-access
+# gate as all other /depots/* endpoints.
+from .optimization import router as optimization_router  # noqa: E402
+
+app.include_router(optimization_router)
 
 
 class OptimizationRequest(BaseModel):
@@ -5004,7 +5015,9 @@ async def get_schedule_readiness(
     """Return persisted readiness checks for manual schedule setup."""
     _require_customer_admin_with_org(user)
     validate_depot_id(depot_id)
-    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    await verify_depot_access(depot_id, user, db_pools.static)
     checks = await _build_depot_readiness_checklist(depot_id)
     return _readiness_response_payload(depot_id, checks)
 
@@ -5210,9 +5223,9 @@ async def _assert_recurring_depot_access(depot_id: str, user: dict) -> None:
     """Shared auth + depot-access check used by every recurring endpoint."""
     _require_customer_admin_with_org(user)
     validate_depot_id(depot_id)
-    await verify_depot_access(depot_id, user, db_pools.static if db_pools else None)
     if not db_pools:
         raise DatabaseError("Database not available")
+    await verify_depot_access(depot_id, user, db_pools.static)
 
 
 async def _serialize_templates_with_cancellations(conn, depot_uuid: UUID) -> list[dict]:
