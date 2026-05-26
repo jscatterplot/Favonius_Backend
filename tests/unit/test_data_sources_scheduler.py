@@ -122,6 +122,33 @@ async def test_tick_overlap_race_advances_without_spawn(monkeypatch):
     assert captured == []  # but no duplicate job kicked
 
 
+async def test_tick_connection_error_skips_bad_connection_continues_rest(monkeypatch):
+    """A transient enqueue failure on one connection must not abort the batch."""
+    conn_bad = _conn_row()
+    conn_good = _conn_row()
+    monkeypatch.setattr(
+        repo, "find_due_connections", AsyncMock(return_value=[conn_bad, conn_good])
+    )
+    good_job_id = str(uuid4())
+
+    async def _enqueue_side_effect(*a, connection_id, **k):
+        if connection_id == conn_bad["id"]:
+            raise RuntimeError("transient DB error")
+        return {"id": good_job_id}
+
+    advance = AsyncMock()
+    monkeypatch.setattr(repo, "enqueue_job", _enqueue_side_effect)
+    monkeypatch.setattr(repo, "set_next_sync_now_plus_interval", advance)
+    spawn, captured = _spawner()
+
+    await scheduler._tick(MagicMock(), MagicMock(), spawn=spawn)
+
+    # Good connection still spawned despite bad connection failing first.
+    assert len(captured) == 1
+    assert advance.await_count == 1
+    assert advance.await_args.args[1] == conn_good["id"]
+
+
 def test_check_single_worker_warns(monkeypatch, caplog):
     monkeypatch.setenv("WEB_CONCURRENCY", "4")
     import logging

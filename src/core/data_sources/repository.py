@@ -507,9 +507,12 @@ async def find_orphaned_jobs(
     heartbeat to test). Running rows are included only when their heartbeat is stale
     per ``DATA_SOURCES_ORPHAN_THRESHOLD_S``.
 
-    Paused and disabled connections are excluded so the sweep never resurrects
-    a connection the operator intentionally stopped. Results are keyset-ordered
-    by ``(created_at, id)``; pass the last row's cursor to page beyond ``limit``.
+    Disabled connections are excluded; paused connections are included because an
+    orphaned job on a paused connection still holds the overlap-guard slot, so it
+    must be resolved. ``touch_connection_after_run`` preserves the 'paused' status
+    so recovery does not inadvertently reactivate a deliberately paused connection.
+    Results are keyset-ordered by ``(created_at, id)``; pass the last row's cursor
+    to page beyond ``limit``.
     """
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -527,7 +530,7 @@ async def find_orphaned_jobs(
               AND EXISTS (
                   SELECT 1 FROM data_source_connections c
                   WHERE c.id = data_source_ingestion_jobs.connection_id
-                    AND c.status IN ('active', 'error')
+                    AND c.status <> 'disabled'
               )
               AND (
                   $3::timestamptz IS NULL

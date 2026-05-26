@@ -121,26 +121,29 @@ async def _tick(static_pool: asyncpg.Pool, ts_pool: asyncpg.Pool, *, spawn: Spaw
     for connection in due:
         connection_id = connection["id"]
         try:
-            job = await repo.enqueue_job(
-                static_pool,
-                connection_id=connection_id,
-                organization_id=connection["organization_id"],
-                site_id=connection["site_id"],
-                provider_key=connection["provider_key"],
-                trigger="scheduled",
-                triggered_by=None,
-            )
-        except asyncpg.UniqueViolationError:
-            # A manual sync won the race for this connection; just advance.
+            try:
+                job = await repo.enqueue_job(
+                    static_pool,
+                    connection_id=connection_id,
+                    organization_id=connection["organization_id"],
+                    site_id=connection["site_id"],
+                    provider_key=connection["provider_key"],
+                    trigger="scheduled",
+                    triggered_by=None,
+                )
+            except asyncpg.UniqueViolationError:
+                # A manual sync won the race for this connection; just advance.
+                await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
+                continue
+            # Spawn the just-inserted job before the non-critical reschedule write so
+            # a transient failure there can't strand it 'pending' and block the
+            # connection behind the one-active-job index.
+            spawn(run_ingestion_job(static_pool, ts_pool, job_id=job["id"]))
             await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
-            continue
-        # Spawn the just-inserted job before the non-critical reschedule write so
-        # a transient failure there can't strand it 'pending' and block the
-        # connection behind the one-active-job index.
-        spawn(run_ingestion_job(static_pool, ts_pool, job_id=job["id"]))
-        await repo.set_next_sync_now_plus_interval(static_pool, connection_id)
-        logger.info(
-            "Scheduled sync enqueued for connection %s (job %s)",
-            connection_id,
-            job["id"],
-        )
+            logger.info(
+                "Scheduled sync enqueued for connection %s (job %s)",
+                connection_id,
+                job["id"],
+            )
+        except Exception:  # noqa: BLE001 — one bad connection must not abort the batch.
+            logger.exception("Scheduler failed to enqueue connection %s; skipping", connection_id)

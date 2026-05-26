@@ -251,6 +251,8 @@ async def create_connection(
         _spawn(run_ingestion_job(static_pool, ts_pool, job_id=job_wire["id"]))
     except asyncpg.UniqueViolationError:
         logger.info("Connection %s already has an active job", connection["id"])
+    except Exception:  # noqa: BLE001 — connection is already committed; kick failure is non-fatal.
+        logger.warning("Failed to auto-kick initial sync for connection %s", connection["id"], exc_info=True)
 
     payload: dict[str, Any] = {"connection": connection}
     if job_wire is not None:
