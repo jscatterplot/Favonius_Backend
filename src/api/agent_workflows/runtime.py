@@ -1067,14 +1067,16 @@ async def run_qa_turn(
         else:
             status = "max_iterations"
 
-    except Exception as exc:
+    except BaseException as exc:
+        # BaseException (not just Exception) so asyncio.CancelledError — raised
+        # on client disconnect / shutdown / timeout — also carries the partial
+        # token totals. The controller reconciles the S4 budget against tokens
+        # actually spent before the abort instead of dropping them to zero
+        # (src/api/agent/controller.py); we attach + re-raise, never swallow.
         if not hasattr(exc, "iterations"):
             exc.iterations = iterations  # type: ignore[attr-defined]
         if not hasattr(exc, "tool_calls"):
             exc.tool_calls = list(tool_calls)  # type: ignore[attr-defined]
-        # Surface tokens already spent before the abort so the controller can
-        # reconcile the S4 budget reservation against real (partial) usage
-        # instead of leaking the rough estimate (src/api/agent/controller.py).
         if not hasattr(exc, "input_tokens"):
             exc.input_tokens = total_input_tokens  # type: ignore[attr-defined]
         if not hasattr(exc, "output_tokens"):

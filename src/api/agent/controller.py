@@ -898,14 +898,19 @@ async def _run_sql_general_turn(
             effort=config.effort,
             on_step=_on_step,
         )
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
         # CancelledError is a BaseException, so it bypasses the `except`
-        # handlers below: release the reservation explicitly so a cancelled
-        # turn (client disconnect / server shutdown / timeout) doesn't leak
-        # counter.reserved and eventually refuse valid turns. Tokens spent
-        # before cancellation aren't attached to CancelledError, so reconcile to
-        # zero (release) and re-raise so cancellation still propagates.
-        budget.record_actual(reservation, 0, 0)
+        # handlers below: reconcile the reservation explicitly so a cancelled
+        # turn (client disconnect / server shutdown / timeout) neither leaks
+        # counter.reserved nor drops already-spent tokens. run_qa_turn attaches
+        # the partial token totals to the exception (it catches BaseException),
+        # so account real usage rather than zero — otherwise repeated
+        # cancellations could incur model cost while bypassing the ceiling.
+        budget.record_actual(
+            reservation,
+            getattr(exc, "input_tokens", 0),
+            getattr(exc, "output_tokens", 0),
+        )
         raise
     except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
         # Both exception types carry ``iterations``: ToolNotAllowedError

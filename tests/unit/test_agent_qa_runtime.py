@@ -11,6 +11,7 @@ hand-rolled ToolRegistry. Verifies:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -466,6 +467,50 @@ async def test_run_qa_turn_no_token_recording_when_usage_missing():
 
     after_in = AGENT_LLM_TOKENS.labels(model=model, direction="input")._value.get()
     assert after_in == before_in  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_run_qa_turn_attaches_partial_tokens_on_cancellation():
+    """On asyncio.CancelledError (client disconnect / shutdown / timeout) the
+    loop must attach the tokens already spent so the controller accounts real
+    usage instead of dropping it — otherwise repeated cancellations could incur
+    model cost while bypassing the org budget ceiling (Codex P1)."""
+
+    class _CancellingMessages:
+        def __init__(self, first: _FakeResponse) -> None:
+            self._first = first
+            self._calls = 0
+
+        async def create(self, **_kwargs: Any) -> _FakeResponse:
+            self._calls += 1
+            if self._calls == 1:
+                return self._first  # one completed round-trip, with usage
+            raise asyncio.CancelledError()  # cancelled on the next API call
+
+    class _CancellingClient:
+        def __init__(self, first: _FakeResponse) -> None:
+            self.messages = _CancellingMessages(first)
+
+    reg, _ = _registry()
+    first = _FakeResponse([_tool_use("list_tables", "b1", {})])
+    first.usage = _FakeUsage(input_tokens=100, output_tokens=20)
+    client = _CancellingClient(first)
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await run_qa_turn(
+            anthropic_client=client,
+            model="claude-haiku-4-5",
+            system_prompt="sys",
+            user_message="q",
+            tool_registry=reg,
+            allowed_tools=_allowed_tools(),
+        )
+
+    exc = excinfo.value
+    # Tokens from the completed round-trip are attached for budget reconciliation.
+    assert getattr(exc, "input_tokens", None) == 100
+    assert getattr(exc, "output_tokens", None) == 20
+    assert hasattr(exc, "iterations") and hasattr(exc, "tool_calls")
 
 
 @pytest.mark.asyncio
