@@ -1,9 +1,9 @@
 """Tests for :mod:`src.api.agent.budget`.
 
-S4-A scope: budget *resolution* only — the env default, the per-org override,
-their precedence, and the fail-open behaviour. The enforcement layer
-(``check_and_reserve`` / ``record_actual``) and its accept/reject/hydration/
-rollover cases land in S4-B/S4-C and extend this file then.
+This module covers budget *resolution* — the platform default, the per-org
+column value, their precedence, and the fail-open behaviour. The enforcement
+layer (``check_and_reserve`` / ``record_actual``) and its accept/reject/
+hydration/rollover cases land in the S4-C suite and extend this file then.
 
 Pool I/O is mocked end-to-end; no DB is required.
 """
@@ -19,23 +19,23 @@ import pytest
 
 from src.api.agent.budget import (
     DEFAULT_TOKEN_BUDGET_MONTHLY,
-    TOKEN_BUDGET_ENV_VAR,
     _parse_positive_int,
-    env_default_budget,
     resolve_org_token_budget,
 )
 
 # Async tests are marked at the class level (TestResolveOrgTokenBudget) rather
-# than module-wide, so the sync parse/env tests stay unmarked and don't trip
+# than module-wide, so the sync parse tests stay unmarked and don't trip
 # pytest-asyncio's "marked async but not async" warning.
 
 
 def _make_pool(*, fetchval_return: Any = None, raise_on_acquire: bool = False) -> Any:
     """Fake asyncpg pool whose ``acquire()`` yields a conn with ``fetchval``.
 
-    ``fetchval`` returns ``fetchval_return`` (the metadata override text, or
-    ``None``). With ``raise_on_acquire`` the pool raises when acquired, to
-    exercise the fail-open path.
+    ``fetchval`` returns ``fetchval_return`` — the org's
+    ``agent_token_budget_monthly`` as the text asyncpg yields from the
+    ``to_jsonb(o)->>...`` read, or ``None`` when the column is unset/absent.
+    With ``raise_on_acquire`` the pool raises when acquired, to exercise the
+    fail-open path.
     """
     pool = MagicMock()
     conn = MagicMock()
@@ -59,19 +59,6 @@ def _make_pool(*, fetchval_return: Any = None, raise_on_acquire: bool = False) -
     return pool
 
 
-@pytest.fixture(autouse=True)
-def _clear_env_cache(monkeypatch):
-    """Reset the lru_cache around env_default_budget before AND after each test.
-
-    The cache is process-global, so a value read by one test would otherwise
-    leak into the next. Clearing on both sides keeps tests order-independent.
-    """
-    monkeypatch.delenv(TOKEN_BUDGET_ENV_VAR, raising=False)
-    env_default_budget.cache_clear()
-    yield
-    env_default_budget.cache_clear()
-
-
 class TestParsePositiveInt:
     @pytest.mark.parametrize(
         "raw,expected",
@@ -91,64 +78,31 @@ class TestParsePositiveInt:
         assert _parse_positive_int(raw) is None
 
 
-class TestEnvDefaultBudget:
-    def test_unset_uses_hardcoded_default(self):
-        assert env_default_budget() == DEFAULT_TOKEN_BUDGET_MONTHLY
-
-    def test_env_override(self, monkeypatch):
-        monkeypatch.setenv(TOKEN_BUDGET_ENV_VAR, "250000")
-        env_default_budget.cache_clear()
-        assert env_default_budget() == 250_000
-
-    def test_garbage_env_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv(TOKEN_BUDGET_ENV_VAR, "not-a-number")
-        env_default_budget.cache_clear()
-        assert env_default_budget() == DEFAULT_TOKEN_BUDGET_MONTHLY
-
-    def test_zero_env_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv(TOKEN_BUDGET_ENV_VAR, "0")
-        env_default_budget.cache_clear()
-        assert env_default_budget() == DEFAULT_TOKEN_BUDGET_MONTHLY
-
-
 @pytest.mark.asyncio
 class TestResolveOrgTokenBudget:
-    async def test_per_org_override_beats_env_default(self, monkeypatch):
-        # Env default deliberately different from the override so the win is
-        # unambiguous.
-        monkeypatch.setenv(TOKEN_BUDGET_ENV_VAR, "9000000")
-        env_default_budget.cache_clear()
+    async def test_per_org_value_beats_platform_default(self):
+        # A set column value wins over the hard-coded platform default.
         pool = _make_pool(fetchval_return="500000")
 
         result = await resolve_org_token_budget(pool, uuid4())
 
-        assert result == 500_000  # override wins, not the 9,000,000 env default
+        assert result == 500_000
+        assert result != DEFAULT_TOKEN_BUDGET_MONTHLY
 
-    async def test_no_override_uses_env_default(self, monkeypatch):
-        monkeypatch.setenv(TOKEN_BUDGET_ENV_VAR, "750000")
-        env_default_budget.cache_clear()
-        pool = _make_pool(fetchval_return=None)  # metadata key absent
-
-        result = await resolve_org_token_budget(pool, uuid4())
-
-        assert result == 750_000
-
-    async def test_no_override_no_env_uses_hardcoded_default(self):
-        pool = _make_pool(fetchval_return=None)
+    async def test_unset_value_uses_platform_default(self):
+        pool = _make_pool(fetchval_return=None)  # column NULL / absent
 
         result = await resolve_org_token_budget(pool, uuid4())
 
         assert result == DEFAULT_TOKEN_BUDGET_MONTHLY
 
     @pytest.mark.parametrize("bad", ["0", "-5", "  ", "garbage", None])
-    async def test_garbage_override_falls_back_to_env_default(self, monkeypatch, bad):
-        monkeypatch.setenv(TOKEN_BUDGET_ENV_VAR, "600000")
-        env_default_budget.cache_clear()
+    async def test_garbage_value_falls_back_to_platform_default(self, bad):
         pool = _make_pool(fetchval_return=bad)
 
         result = await resolve_org_token_budget(pool, uuid4())
 
-        assert result == 600_000
+        assert result == DEFAULT_TOKEN_BUDGET_MONTHLY
 
     async def test_none_org_short_circuits_to_default_without_db(self):
         pool = _make_pool(fetchval_return="123")
@@ -163,22 +117,20 @@ class TestResolveOrgTokenBudget:
         result = await resolve_org_token_budget(None, uuid4())
         assert result == DEFAULT_TOKEN_BUDGET_MONTHLY
 
-    async def test_db_error_fails_open_to_env_default(self, monkeypatch):
-        monkeypatch.setenv(TOKEN_BUDGET_ENV_VAR, "333000")
-        env_default_budget.cache_clear()
+    async def test_db_error_fails_open_to_default(self):
         pool = _make_pool(raise_on_acquire=True)
 
         result = await resolve_org_token_budget(pool, uuid4())
 
-        assert result == 333_000
+        assert result == DEFAULT_TOKEN_BUDGET_MONTHLY
 
-    async def test_query_targets_organizations_metadata_resiliently(self):
-        # Pin the SQL shape: it must read the override via to_jsonb(o)->'metadata'
-        # so a DB without supabase/044 returns NULL instead of raising.
+    async def test_query_targets_organizations_column_resiliently(self):
+        # Pin the SQL shape: it must read the column via to_jsonb(o)->>... so a
+        # DB without supabase/044 returns NULL instead of raising UndefinedColumn.
         pool = _make_pool(fetchval_return=None)
 
         await resolve_org_token_budget(pool, uuid4())
 
         sql = pool._conn.fetchval.await_args.args[0]
-        assert "to_jsonb(o) -> 'metadata' ->> 'agent_token_budget_monthly'" in sql
+        assert "to_jsonb(o) ->> 'agent_token_budget_monthly'" in sql
         assert "FROM organizations o" in sql
