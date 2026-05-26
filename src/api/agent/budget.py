@@ -224,6 +224,13 @@ class TokenBudgetTracker:
         self._monotonic = monotonic
         self._counters: dict[tuple[str, str], _PeriodCounter] = {}
         self._hydrated: set[tuple[str, str]] = set()
+        # Serialises cold-start hydration so concurrent first-turn requests for
+        # the same (org, period) all WAIT for the DB read instead of racing past
+        # it against a zero baseline (and so the hydration assignment can't clobber
+        # usage another turn committed in the meantime). asyncio.Lock binds to the
+        # running loop lazily (3.10+), so constructing it here — including for the
+        # module singleton at import time — is safe.
+        self._hydration_lock = asyncio.Lock()
         self._writes_since_flush = 0
         self._last_flush_at = monotonic()
         self._flush_task: Optional[asyncio.Task] = None
@@ -352,6 +359,58 @@ class TokenBudgetTracker:
                     counter.unflushed_input += di
                     counter.unflushed_output += do
 
+    async def reconcile(self) -> None:
+        """Flush pending usage, then refresh committed baselines from the DB.
+
+        Driven on a timer by the API lifespan (``_agent_budget_reconcile_loop``)
+        so two gaps the on-write flush can't cover are closed:
+
+        * **Low-traffic flush** — a single turn that never triggers the
+          write/time flush threshold still gets persisted within the loop
+          interval, so a restart can't silently drop it (the spec's "T seconds"
+          flush).
+        * **Multi-worker drift** — under ``WEB_CONCURRENCY > 1`` each worker
+          re-reads ``agent_token_usage`` and so sees other workers' flushed
+          spend. ``committed := DB_total + local_unflushed`` keeps our
+          not-yet-flushed actuals counted while folding in cross-worker totals,
+          bounding aggregate over-spend to roughly one interval's traffic
+          instead of letting it grow unbounded. (A single web worker remains the
+          assumed deployment — see ``data_sources.scheduler.check_single_worker``
+          — this just degrades gracefully when that doesn't hold.)
+
+        Best-effort: a per-key read failure leaves that key on its prior
+        baseline rather than aborting the sweep.
+        """
+        await self.flush()
+        _, ts_pool = self._pools()
+        if ts_pool is None:
+            return
+        for key in list(self._counters.keys()):
+            try:
+                async with ts_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT input_tokens, output_tokens
+                        FROM agent_token_usage
+                        WHERE organization_id = $1::uuid AND period_yyyymm = $2
+                        """,
+                        key[0],
+                        key[1],
+                    )
+            except Exception:  # noqa: BLE001 — best-effort: skip this key, keep sweeping
+                logger.warning("agent_token_usage re-hydration failed for %s", key, exc_info=True)
+                continue
+            counter = self._counters.get(key)
+            if counter is None:
+                continue
+            db_in = int(row["input_tokens"] or 0) if row is not None else 0
+            db_out = int(row["output_tokens"] or 0) if row is not None else 0
+            # DB total (all workers' flushed usage) + our still-unflushed local
+            # actuals. No double-count: unflushed is, by definition, not yet in
+            # the DB row we just read.
+            counter.committed_input = db_in + counter.unflushed_input
+            counter.committed_output = db_out + counter.unflushed_output
+
     # — internals —————————————————————————————————————————————————————
     def _ceiling_args(self, organization_id: UUID) -> tuple[Any, Optional[UUID]]:
         """Args for the ceiling resolver: ``(static_pool, organization_id)``."""
@@ -361,38 +420,51 @@ class TokenBudgetTracker:
     async def _maybe_hydrate(self, key: tuple[str, str]) -> None:
         """Seed an (org, period) counter from agent_token_usage exactly once.
 
-        Marks the key hydrated optimistically (before the await) so a down DB
-        isn't re-hit every turn — the counter just stays at base 0 (fail-open,
-        under-counts → allows). Sets committed_* (never +=) so a rare
-        concurrent double-hydrate is idempotent.
+        Serialised by ``_hydration_lock``: the first caller does the DB read
+        while any concurrent first-turn callers block on the lock, then return
+        early once it's hydrated. This guarantees no turn reserves or records
+        against a zero baseline before hydration completes, and that the
+        ``committed_*`` assignment below can't clobber usage another turn
+        committed (no commits happen until hydration finishes). The key is
+        marked hydrated AFTER the read — but still marked on DB failure so a
+        down DB isn't re-hit every turn (fail-open: base 0 under-counts → allows).
         """
         if key in self._hydrated:
             return
-        self._hydrated.add(key)
-        self._counters.setdefault(key, _PeriodCounter())
-        _, ts_pool = self._pools()
-        if ts_pool is None:
-            return
-        try:
-            async with ts_pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT input_tokens, output_tokens
-                    FROM agent_token_usage
-                    WHERE organization_id = $1::uuid AND period_yyyymm = $2
-                    """,
-                    key[0],
-                    key[1],
+        async with self._hydration_lock:
+            # Re-check under the lock — another coroutine may have hydrated while
+            # we waited.
+            if key in self._hydrated:
+                return
+            self._counters.setdefault(key, _PeriodCounter())
+            _, ts_pool = self._pools()
+            if ts_pool is None:
+                self._hydrated.add(key)
+                return
+            try:
+                async with ts_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT input_tokens, output_tokens
+                        FROM agent_token_usage
+                        WHERE organization_id = $1::uuid AND period_yyyymm = $2
+                        """,
+                        key[0],
+                        key[1],
+                    )
+            except Exception:  # noqa: BLE001 — fail open: base 0 under-counts, never blocks
+                logger.warning(
+                    "agent_token_usage hydration failed for %s; starting from 0",
+                    key,
+                    exc_info=True,
                 )
-        except Exception:  # noqa: BLE001 — fail open: base 0 under-counts, never blocks
-            logger.warning(
-                "agent_token_usage hydration failed for %s; starting from 0", key, exc_info=True
-            )
-            return
-        if row is not None:
-            counter = self._counters[key]
-            counter.committed_input = int(row["input_tokens"] or 0)
-            counter.committed_output = int(row["output_tokens"] or 0)
+                self._hydrated.add(key)
+                return
+            if row is not None:
+                counter = self._counters[key]
+                counter.committed_input = int(row["input_tokens"] or 0)
+                counter.committed_output = int(row["output_tokens"] or 0)
+            self._hydrated.add(key)
 
     def _maybe_schedule_flush(self) -> None:
         """Schedule a background flush when the write/time threshold is hit."""
@@ -434,3 +506,17 @@ def record_actual(
 ) -> None:
     """Module-level shim over the singleton — see :meth:`TokenBudgetTracker.record_actual`."""
     _TRACKER.record_actual(reservation, actual_input_tokens, actual_output_tokens)
+
+
+async def reconcile() -> None:
+    """Module-level shim over the singleton — see :meth:`TokenBudgetTracker.reconcile`.
+
+    Called on a timer by the API lifespan so low-traffic usage is persisted and
+    cross-worker totals are folded in (see :meth:`TokenBudgetTracker.reconcile`).
+    """
+    await _TRACKER.reconcile()
+
+
+async def flush_now() -> None:
+    """Flush any pending in-process usage to ``agent_token_usage`` (e.g. shutdown)."""
+    await _TRACKER.flush()

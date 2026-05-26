@@ -10,6 +10,7 @@ Pool I/O is mocked end-to-end; no DB is required.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -281,6 +282,33 @@ class TestCheckAndReserve:
         # No counter is created for a non-org-scoped turn.
         assert tr._counters == {}
 
+    async def test_concurrent_cold_start_reserve_against_hydrated_baseline(self):
+        # Regression for the hydration race (Bugbot High / Codex P2): two
+        # concurrent first-turn requests for the SAME cold (org, period) must
+        # both evaluate against the hydrated baseline (900), not a zero baseline.
+        # With base 900 and a 1000 ceiling, exactly one 60-token reservation
+        # fits; the other is refused. Without the hydration lock both would race
+        # past the in-flight DB read against 0 and BOTH would be admitted.
+        org = uuid4()
+
+        async def _slow_fetchrow(*_args, **_kwargs):
+            await asyncio.sleep(0.02)  # widen the race window
+            return {"input_tokens": 900, "output_tokens": 0}
+
+        tr = _tracker(ceiling="1000", fetchrow_fn=_slow_fetchrow)
+
+        results = await asyncio.gather(
+            tr.check_and_reserve(org, 60),
+            tr.check_and_reserve(org, 60),
+        )
+
+        accepted = [r for r in results if r is not None]
+        refused = [r for r in results if r is None]
+        assert len(accepted) == 1, f"expected exactly one accept, got {results}"
+        assert len(refused) == 1
+        # The DB was read exactly once despite two concurrent cold-start callers.
+        assert tr._explicit_ts_pool._conn.fetchrow.await_count == 1
+
 
 @pytest.mark.asyncio
 class TestRecordActual:
@@ -318,6 +346,23 @@ class TestRecordActual:
         counter = tr._counters[(str(org), _PERIOD)]
         assert counter.unflushed_input == 120 and counter.unflushed_output == 40
 
+    async def test_record_actual_zero_releases_reservation(self):
+        # The controller calls record_actual(reservation, 0, 0) when setup fails
+        # before the LLM loop (Codex P1): the rough estimate must be released so
+        # it doesn't leak and wrongly refuse future turns.
+        org = uuid4()
+        tr = _tracker(ceiling="1000")
+        r = await tr.check_and_reserve(org, 800)
+        assert tr._counters[(str(org), _PERIOD)].reserved == 800
+
+        tr.record_actual(r, 0, 0)
+
+        counter = tr._counters[(str(org), _PERIOD)]
+        assert counter.reserved == 0
+        assert counter.committed_input == 0 and counter.committed_output == 0
+        # Full headroom restored — a subsequent full-ceiling turn fits.
+        assert await tr.check_and_reserve(org, 1000) is not None
+
 
 @pytest.mark.asyncio
 class TestFlush:
@@ -352,6 +397,71 @@ class TestFlush:
         counter = tr._counters[(str(org), _PERIOD)]
         # Deltas rolled back so the next flush retries them.
         assert counter.unflushed_input == 120 and counter.unflushed_output == 40
+
+
+@pytest.mark.asyncio
+class TestReconcile:
+    def _reconcile_pool(self, *, executemany_raises: bool = False) -> tuple[Any, Any]:
+        """A TS pool whose ``fetchrow`` return can be flipped between phases."""
+        pool = MagicMock()
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=None)  # cold start: no row yet
+        conn.executemany = AsyncMock(
+            side_effect=RuntimeError("flush boom") if executemany_raises else None
+        )
+
+        @asynccontextmanager
+        async def _acquire():
+            yield conn
+
+        pool.acquire = _acquire
+        pool._conn = conn
+        return pool, conn
+
+    async def test_flushes_then_rehydrates_committed_from_db(self):
+        org = uuid4()
+        ts_pool, conn = self._reconcile_pool()
+        tr = TokenBudgetTracker(
+            static_pool=_make_pool(fetchval_return="100000"),
+            ts_pool=ts_pool,
+            period_provider=lambda: _PERIOD,
+            flush_every_writes=1000,
+        )
+        r = await tr.check_and_reserve(org, 100)  # cold hydrate -> committed 0
+        tr.record_actual(r, 50, 30)  # committed 80, unflushed 50/30
+
+        # The DB now holds the cross-worker total (our 50/30 once flushed + another
+        # worker's 200/100); reconcile must fold that into committed.
+        conn.fetchrow = AsyncMock(return_value={"input_tokens": 250, "output_tokens": 130})
+
+        await tr.reconcile()
+
+        conn.executemany.assert_awaited()  # flushed our delta first
+        counter = tr._counters[(str(org), _PERIOD)]
+        assert counter.unflushed_input == 0 and counter.unflushed_output == 0
+        # committed := DB(250/130) + unflushed(0/0) — picks up the other worker.
+        assert counter.committed_input == 250 and counter.committed_output == 130
+
+    async def test_preserves_local_unflushed_when_flush_fails(self):
+        org = uuid4()
+        ts_pool, conn = self._reconcile_pool(executemany_raises=True)
+        tr = TokenBudgetTracker(
+            static_pool=_make_pool(fetchval_return="100000"),
+            ts_pool=ts_pool,
+            period_provider=lambda: _PERIOD,
+            flush_every_writes=1000,
+        )
+        r = await tr.check_and_reserve(org, 100)
+        tr.record_actual(r, 50, 30)
+        # DB read for the re-hydrate sees no persisted total (our flush failed).
+        conn.fetchrow = AsyncMock(return_value={"input_tokens": 0, "output_tokens": 0})
+
+        await tr.reconcile()  # flush raises internally -> deltas rolled back
+
+        counter = tr._counters[(str(org), _PERIOD)]
+        # committed := DB(0) + unflushed(50/30): local actuals are NOT lost.
+        assert counter.committed_input == 50 and counter.committed_output == 30
+        assert counter.unflushed_input == 50 and counter.unflushed_output == 30
 
 
 class TestEstimateAndPeriodHelpers:

@@ -653,11 +653,6 @@ async def _run_sql_general_turn(
         await _emit_answer_safe(sse, reply, run_id)
         return reply
 
-    client = agent_llm._get_client()
-    config = agent_llm.CONFIG
-
-    registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
-
     async def _on_step(tool_call: Any) -> None:
         name = tool_call.name
         # Strip oversized payloads so steps_json stays readable.
@@ -692,6 +687,13 @@ async def _run_sql_general_turn(
     # exc.iterations) right next to where the path is decided. One
     # observation per path; no shared mutable state.
     try:
+        # Build the client + registry INSIDE the try so a failure here (e.g.
+        # Anthropic client/config init) still reconciles the reservation via the
+        # except handlers below — otherwise counter.reserved would leak and
+        # wrongly refuse future turns even though no tokens were spent.
+        client = agent_llm._get_client()
+        config = agent_llm.CONFIG
+        registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
         qa = await run_qa_turn(
             anthropic_client=client,
             model=config.model,
