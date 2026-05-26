@@ -54,6 +54,7 @@ from src.api.agent.intents.consumption_by_user import (
 )
 from src.api.agent.plan import QueryPlan
 from src.api.agent.planner import classify as planner_classify
+from src.api.agent.planner import fetch_org_sql_enabled, is_sql_mode_enabled
 from src.api.agent.prompts import (
     build_sql_agent_system_prompt,
     format_sql_agent_user_message,
@@ -430,7 +431,12 @@ async def run_turn(
 
     try:
         # 0. Planner — pick consumption fast path, sql_general, or refuse.
-        decision = planner_classify(message, organization_id=auth.organization_id)
+        sql_mode_allowed = (
+            await fetch_org_sql_enabled(static_pool, auth.organization_id)
+            if is_sql_mode_enabled()
+            else False
+        )
+        decision = planner_classify(message, sql_mode_allowed=sql_mode_allowed)
         await agent_runs_step(
             ts_pool,
             run_id,

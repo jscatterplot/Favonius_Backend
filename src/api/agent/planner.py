@@ -26,7 +26,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -93,40 +93,38 @@ def is_sql_mode_enabled() -> bool:
     )
 
 
-@lru_cache(maxsize=1)
-def _sql_org_allowlist_tokens() -> Optional[frozenset[str]]:
-    """Parse ``AGENT_SQL_ORG_ALLOWLIST`` once; ``None`` means all orgs."""
-    raw = os.environ.get("AGENT_SQL_ORG_ALLOWLIST", "").strip()
-    if not raw:
-        return None
-    return frozenset(tok.strip().lower() for tok in raw.split(",") if tok.strip())
+async def fetch_org_sql_enabled(static_pool: Any, organization_id: Optional[UUID]) -> bool:
+    """Query ``organizations.agent_sql_mode_enabled`` for this org.
 
-
-def is_org_in_sql_allowlist(organization_id: Optional[UUID]) -> bool:
-    """Check the per-org allowlist for SQL mode.
-
-    Empty/unset allowlist means SQL mode is open to every org (paired
-    with ``AGENT_SQL_MODE_ENABLED=true`` this is full rollout).
+    Returns ``True`` (default-on) when the org row is not found yet
+    (tenant mirror may not have run). Returns ``False`` only when the
+    column is explicitly ``FALSE``, or when ``organization_id`` is
+    ``None`` (no org context to check).
     """
-    allowed = _sql_org_allowlist_tokens()
-    if allowed is None:
-        return True
     if organization_id is None:
         return False
-    return str(organization_id).lower() in allowed
+    row = await static_pool.fetchrow(
+        "SELECT agent_sql_mode_enabled FROM organizations WHERE id = $1",
+        organization_id,
+    )
+    if row is None:
+        return True  # org not mirrored yet — honour the default-on policy
+    return bool(row["agent_sql_mode_enabled"])
 
 
 def classify(
     message: str,
     *,
-    organization_id: Optional[UUID],
+    sql_mode_allowed: bool,
 ) -> PlannerDecision:
     """Pick a route for one user message.
 
     Args:
         message: Raw user-typed message.
-        organization_id: The caller's organization. Used to gate SQL
-            mode via the per-org allowlist.
+        sql_mode_allowed: Pre-resolved boolean combining the global
+            ``AGENT_SQL_MODE_ENABLED`` flag and the per-org DB check
+            (``organizations.agent_sql_mode_enabled``). Callers should
+            derive this via :func:`fetch_org_sql_enabled`.
 
     Returns:
         A :class:`PlannerDecision` whose ``route`` is one of
@@ -149,7 +147,7 @@ def classify(
             reason="matched_consumption_trigger",
         )
 
-    if is_sql_mode_enabled() and is_org_in_sql_allowlist(organization_id):
+    if is_sql_mode_enabled() and sql_mode_allowed:
         return PlannerDecision(route="sql_general", reason="sql_mode_route")
 
     # SQL mode off → fall back to the consumption fast path. The intent

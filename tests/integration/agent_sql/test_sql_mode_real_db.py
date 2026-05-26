@@ -107,7 +107,7 @@ def _skip_without_anthropic_key() -> None:
 
 @pytest.fixture
 def sql_mode_env(monkeypatch: pytest.MonkeyPatch):
-    """Enable SQL mode (open allowlist) + a known JWT secret for one test.
+    """Enable SQL mode + a known JWT secret for one test.
 
     Clears the planner's lru-cached env reads before and after so the toggle
     does not leak into other tests, and resets the Anthropic client singleton
@@ -117,17 +117,14 @@ def sql_mode_env(monkeypatch: pytest.MonkeyPatch):
     from src.api.agent import planner
 
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
-    monkeypatch.delenv("AGENT_SQL_ORG_ALLOWLIST", raising=False)  # open to all orgs
     monkeypatch.setenv("JWT_SECRET_KEY", _TEST_JWT_SECRET)
     monkeypatch.delenv("JWT_SECRET_KEY_PREVIOUS", raising=False)
     planner.is_sql_mode_enabled.cache_clear()
-    planner._sql_org_allowlist_tokens.cache_clear()
     agent_llm._reset_client_for_tests()
     try:
         yield
     finally:
         planner.is_sql_mode_enabled.cache_clear()
-        planner._sql_org_allowlist_tokens.cache_clear()
         agent_llm._reset_client_for_tests()
 
 

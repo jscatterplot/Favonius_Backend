@@ -78,8 +78,9 @@ CREATE SCHEMA {_TEST_SCHEMA};
 SET search_path TO {_TEST_SCHEMA};
 
 CREATE TABLE organizations (
-    id   UUID PRIMARY KEY,
-    name VARCHAR(255) NOT NULL
+    id                    UUID PRIMARY KEY,
+    name                  VARCHAR(255) NOT NULL,
+    agent_sql_mode_enabled BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 CREATE TABLE sites (
@@ -605,16 +606,13 @@ async def agent_sql_e2e_static_pool():
 
 @pytest.fixture
 def _sql_mode_on(monkeypatch: pytest.MonkeyPatch):
-    """Enable SQL mode (open allowlist) and clear the planner's cached env reads."""
+    """Enable SQL mode and clear the planner's cached env reads."""
     from src.api.agent import planner
 
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
-    monkeypatch.delenv("AGENT_SQL_ORG_ALLOWLIST", raising=False)
     planner.is_sql_mode_enabled.cache_clear()
-    planner._sql_org_allowlist_tokens.cache_clear()
     yield
     planner.is_sql_mode_enabled.cache_clear()
-    planner._sql_org_allowlist_tokens.cache_clear()
 
 
 def _cross_org_snapshot() -> dict[str, Any]:
