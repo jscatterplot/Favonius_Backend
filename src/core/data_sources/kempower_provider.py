@@ -121,6 +121,7 @@ class KempowerProvider(DataSourceProvider):
                     type="string",
                     required=False,
                     help_text="Leave blank to skip historical session import.",
+                    pattern=r"^\d{4}-\d{2}-\d{2}$",
                 ),
             ],
             supports_scheduled_sync=True,

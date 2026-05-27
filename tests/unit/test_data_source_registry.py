@@ -41,6 +41,13 @@ def test_catalogue_includes_kempower():
     # Secrets are masked.
     assert fields_by_key["refresh_token"].secret is True
     assert fields_by_key["password"].secret is True and fields_by_key["password"].type == "password"
+    # backfillSince exposes a pattern the frontend can use for client-side validation.
+    import re
+    pattern = fields_by_key["backfillSince"].pattern
+    assert pattern is not None
+    assert re.match(pattern, "2025-01-01")
+    assert not re.match(pattern, "01-01-2025")
+    assert not re.match(pattern, "not-a-date")
 
 
 def test_credential_field_auth_group_defaults_to_none():
