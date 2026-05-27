@@ -8222,7 +8222,6 @@ async def get_depot_schedule(
 # ── Power timeline ────────────────────────────────────────────────────────────
 
 _TIMELINE_TIMESTEP_MINUTES = 15
-_TIMELINE_TIMESTEP_HOURS = _TIMELINE_TIMESTEP_MINUTES / 60.0
 
 
 async def _build_power_timeline(
@@ -8232,7 +8231,7 @@ async def _build_power_timeline(
     """Assemble the history + plan series for the power-timeline endpoint.
 
     History: 15-min buckets of SUM(charging_kw) from the ``telemetry``
-    hypertable, scoped to the depot's charger station_ids.
+    hypertable, scoped to the depot's charger UUIDs.
 
     Plan: per-timestep ``grid_power`` and per-vehicle ``charging_power``
     from the latest ``optimization_runs.schedule_json``, aligned to UTC
@@ -8244,7 +8243,7 @@ async def _build_power_timeline(
     now_utc = datetime.now(tz=timezone.utc)
     history_start = now_utc - timedelta(hours=history_hours)
 
-    # ── 1. Depot metadata + station_ids from Supabase ────────────────────────
+    # ── 1. Depot metadata + charger_ids from Supabase ────────────────────────
     async with db_pools.static.acquire() as conn:
         site_row = await conn.fetchrow(
             """
@@ -8259,8 +8258,8 @@ async def _build_power_timeline(
         if site_row is None:
             raise HTTPException(status_code=404, detail=f"Depot {depot_id} not found")
 
-        station_rows = await conn.fetch(
-            "SELECT station_id FROM charging_stations WHERE site_id = $1::uuid",
+        charger_rows = await conn.fetch(
+            "SELECT id AS charger_id FROM charging_stations WHERE site_id = $1::uuid",
             depot_id,
         )
 
@@ -8268,18 +8267,18 @@ async def _build_power_timeline(
     max_grid_kw: Optional[float] = (
         float(site_row["max_grid_kw"]) if site_row["max_grid_kw"] is not None else None
     )
-    station_ids: list[str] = [r["station_id"] for r in station_rows if r["station_id"]]
+    charger_ids: list[str] = [str(r["charger_id"]) for r in charger_rows if r["charger_id"]]
 
     # ── 2. Telemetry history (TimescaleDB) ───────────────────────────────────
     history_points: list[PowerTimelineHistoryPoint] = []
-    if station_ids:
+    if charger_ids:
         history_query = """
             SELECT
                 time_bucket($1::interval, t.time) AS bucket,
                 SUM(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL) AS charging_kw,
                 COUNT(DISTINCT t.vehicle_id) FILTER (WHERE t.charging_kw > 0.1) AS vehicle_count
             FROM telemetry t
-            WHERE t.charger_id = ANY($2::text[])
+            WHERE t.charger_id = ANY($2::uuid[])
               AND t.time >= $3
               AND t.time < $4
               AND t.charging_kw IS NOT NULL
@@ -8291,7 +8290,7 @@ async def _build_power_timeline(
             rows = await conn.fetch(
                 history_query,
                 interval,
-                station_ids,
+                charger_ids,
                 history_start,
                 now_utc,
             )
@@ -8323,9 +8322,17 @@ async def _build_power_timeline(
             depot_id,
         )
 
-    if run_row is not None:
+    if run_row is not None and run_row["schedule_json"]:
         raw_json = run_row["schedule_json"]
-        sched: dict = raw_json if isinstance(raw_json, dict) else json.loads(raw_json)
+        if isinstance(raw_json, dict):
+            sched: dict = raw_json
+        else:
+            try:
+                sched = json.loads(raw_json)
+            except (TypeError, json.JSONDecodeError):
+                sched = {}
+        if not isinstance(sched, dict):
+            sched = {}
 
         grid_power: list[float] = sched.get("grid_power") or []
         battery_dispatch: list[float] = sched.get("battery_dispatch") or []
