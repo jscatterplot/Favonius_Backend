@@ -103,6 +103,15 @@ async def test_validate_credentials_missing_all_auth():
         await provider.validate_credentials({}, {"locationId": "loc1"})
 
 
+async def test_validate_credentials_both_groups_rejected():
+    provider = kp.KempowerProvider()
+    with pytest.raises(CredentialValidationError, match="not both"):
+        await provider.validate_credentials(
+            {"refresh_token": "tok", "username": "u", "password": "p"},
+            {"locationId": "loc1"},
+        )
+
+
 async def test_validate_credentials_partial_basic_auth_rejected():
     # username without password is not enough.
     provider = kp.KempowerProvider()

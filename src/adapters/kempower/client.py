@@ -55,9 +55,19 @@ class KempowerClient(BaseRestClient):
         timeout_s: float = 30.0,
     ) -> None:
         """Validate credentials, resolve the base URL, and init the shared base client."""
-        self._refresh_token = refresh_token or os.getenv("KEMPOWER_REFRESH_TOKEN")
-        self._username = username or os.getenv("KEMPOWER_USERNAME")
-        self._password = password or os.getenv("KEMPOWER_PASSWORD")
+        # Env-var fallbacks only apply when the caller passed no credentials at
+        # all (CLI / default-deployment usage). Explicit constructor args always
+        # win completely — mixing e.g. username+password from args with a
+        # KEMPOWER_REFRESH_TOKEN from the environment would silently use the
+        # wrong auth path.
+        if refresh_token is None and username is None and password is None:
+            self._refresh_token = os.getenv("KEMPOWER_REFRESH_TOKEN") or None
+            self._username = os.getenv("KEMPOWER_USERNAME")
+            self._password = os.getenv("KEMPOWER_PASSWORD")
+        else:
+            self._refresh_token = refresh_token
+            self._username = username
+            self._password = password
         if not self._refresh_token and not (self._username and self._password):
             raise KempowerClientError(
                 "Kempower credentials missing. Provide a refresh_token, or both "

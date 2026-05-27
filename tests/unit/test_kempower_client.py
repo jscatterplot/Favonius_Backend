@@ -274,6 +274,24 @@ async def test_missing_credentials_raises():
 
 
 @pytest.mark.asyncio
+async def test_explicit_basic_auth_not_overridden_by_env_refresh_token(monkeypatch):
+    monkeypatch.setenv("KEMPOWER_REFRESH_TOKEN", "env-refresh-tok")
+    c = KempowerClient(username="u", password="p", base_url=_BASE)
+    # env KEMPOWER_REFRESH_TOKEN must not bleed into an explicitly-basic-auth client.
+    assert c._refresh_token is None
+    assert c._username == "u"
+    await c.aclose()
+
+
+@pytest.mark.asyncio
+async def test_env_refresh_token_used_when_no_explicit_creds(monkeypatch):
+    monkeypatch.setenv("KEMPOWER_REFRESH_TOKEN", "env-refresh-tok")
+    c = KempowerClient(base_url=_BASE)
+    assert c._refresh_token == "env-refresh-tok"
+    await c.aclose()
+
+
+@pytest.mark.asyncio
 async def test_async_context_manager_closes_owned_client():
     async with KempowerClient(username="u", password="p", base_url=_BASE) as c:
         assert c is not None

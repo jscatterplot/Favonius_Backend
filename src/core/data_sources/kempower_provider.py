@@ -146,6 +146,10 @@ class KempowerProvider(DataSourceProvider):
             raise CredentialValidationError("locationId is required")
         has_refresh_token = bool(credentials.get("refresh_token"))
         has_basic = bool(credentials.get("username")) and bool(credentials.get("password"))
+        if has_refresh_token and has_basic:
+            raise CredentialValidationError(
+                "Provide either a refresh token or username and password, not both."
+            )
         if not has_refresh_token and not has_basic:
             raise CredentialValidationError(
                 "Provide either a refresh token or both username and password."
