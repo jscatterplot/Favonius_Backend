@@ -265,19 +265,25 @@ def test_yaml_category_counts() -> None:
 
 @pytest.mark.golden
 @pytest.mark.asyncio
+@pytest.mark.parametrize("two_model_enabled", [False, True], ids=["single_model", "two_model"])
 @pytest.mark.parametrize("entry", _ALL_ENTRIES, ids=[e["id"] for e in _ALL_ENTRIES])
-async def test_extract_plan_golden(entry: dict[str, Any]) -> None:
+async def test_extract_plan_golden(entry: dict[str, Any], two_model_enabled: bool) -> None:
     """Call the real LLM and assert the extracted plan matches expected shape.
 
     Gate: ``pytest --golden``.  Requires ``ANTHROPIC_API_KEY`` in environment.
     Target: ≥ 95% pass rate (48/50) per PRD §7.
+
+    Parametrized over the two-model split (PLAN.md §S5b): the ``two_model``
+    variant routes extraction to ``claude-haiku-4-5`` (``single_model`` keeps
+    the configured default), so a live run is the Haiku-extraction accuracy
+    gate — both variants must clear the same target before any rollout.
     """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         pytest.skip("ANTHROPIC_API_KEY not set — skipping live LLM golden test")
 
     from src.api.agent.llm import extract_plan  # local import: avoids module-level init
 
-    plan = await extract_plan(entry["message"])
+    plan = await extract_plan(entry["message"], two_model_enabled=two_model_enabled)
 
     # Intent must always match.
     assert plan.intent == entry["expected_intent"], (
@@ -356,3 +362,131 @@ async def test_resolver_status_golden(entry: dict[str, Any]) -> None:
                 assert not r.candidates, (
                     f"[{entry['id']}] driver {r.display!r} unexpected candidates"
                 )
+
+
+# ── Two-model cost comparison (PLAN.md §S5b, STEP B) ──────────────────────────
+#
+# A model swap changes cost-PER-TOKEN, not token COUNT, and the golden suites
+# replay fixed traces — so "fewer tokens" is both unmeasurable here and the
+# wrong metric. Per the agreed approach we measure COST: a published per-model
+# price table applied to a deterministic token estimate of the consumption
+# path's two LLM calls (extract = the "explore" phase, format = the "format"
+# phase). Network-free, so it runs on every push (not gated behind --golden).
+#
+# The entire saving comes from routing the large, static extraction system
+# prompt to a ~3x cheaper model; the user-facing formatter stays on Sonnet in
+# BOTH variants. Assumptions are deliberately conservative — a generously large
+# format payload biases AGAINST the hypothesis (it inflates the shared Sonnet
+# cost in the denominator). Prompt caching lowers absolute cost for both
+# variants and approximately preserves the Sonnet:Haiku ratio, so the % delta is
+# the robust figure; we model the simpler uncached per-call cost.
+
+# Representative published per-MTok prices (USD): (input, output). The % delta
+# is driven by the Sonnet:Haiku input-price ratio on the shared, dominant
+# extraction prompt, so it is robust to the exact values.
+_MODEL_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+
+# Pin the single-model baseline the split is compared against, independent of
+# the ambient ``AGENT_LLM_MODEL`` (``CONFIG.model``). Inheriting it would make
+# this every-push gate environment-dependent: under ``AGENT_LLM_MODEL=claude-haiku-4-5``
+# the single_model variant already uses Haiku for explore (reduction → 0%), and
+# a known-good-but-unpriced default like ``claude-opus-4-7`` would KeyError. The
+# split's value is defined as the saving against the Sonnet baseline.
+_BASELINE_MODEL = "claude-sonnet-4-6"
+
+# Conservative per-call output + format-payload sizes. Outputs are tiny next to
+# the ~2.6k-token extraction prompt, so the result is insensitive to them; the
+# format payload is sized generously so the saving is not overstated.
+_EXTRACT_OUTPUT_TOKENS = 64
+_FORMAT_PAYLOAD_CHARS = 1500
+_FORMAT_OUTPUT_TOKENS = 96
+
+# PLAN.md §S5b deliverable: two-model must be measurably cheaper. If this floor
+# is not met, the test FAILS — do not paper over it with model/prompt tweaks.
+_TWO_MODEL_COST_REDUCTION_FLOOR = 0.15
+
+
+def _est_tokens(text: str) -> int:
+    """~4-chars-per-token heuristic (matches ``budget.estimate_turn_tokens``)."""
+    return max(0, len(text) // 4)
+
+
+def _call_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    price_in, price_out = _MODEL_PRICES_USD_PER_MTOK[model]
+    return input_tokens * price_in / 1e6 + output_tokens * price_out / 1e6
+
+
+def _variant_total_cost_usd(*, two_model_enabled: bool) -> tuple[float, str, str]:
+    """Total USD cost of replaying every consumption entry under one variant.
+
+    Returns ``(total_cost, explore_model, format_model)``. Uses the production
+    router (:func:`pick_model`) so the test tracks the real routing logic.
+    """
+    from src.api.agent.llm import (
+        EXTRACT_PLAN_SYSTEM_PROMPT,
+        FORMAT_ANSWER_SYSTEM_PROMPT,
+    )
+    from src.api.agent.llm_router import pick_model
+
+    explore_model = pick_model(
+        "explore", two_model_enabled=two_model_enabled, default_model=_BASELINE_MODEL
+    )
+    format_model = pick_model(
+        "format", two_model_enabled=two_model_enabled, default_model=_BASELINE_MODEL
+    )
+
+    extract_sys_tokens = _est_tokens(EXTRACT_PLAN_SYSTEM_PROMPT)
+    format_in_tokens = _est_tokens(FORMAT_ANSWER_SYSTEM_PROMPT) + _est_tokens(
+        "x" * _FORMAT_PAYLOAD_CHARS
+    )
+
+    total = 0.0
+    for entry in _ALL_ENTRIES:
+        extract_in_tokens = extract_sys_tokens + _est_tokens(entry["message"])
+        total += _call_cost_usd(explore_model, extract_in_tokens, _EXTRACT_OUTPUT_TOKENS)
+        total += _call_cost_usd(format_model, format_in_tokens, _FORMAT_OUTPUT_TOKENS)
+    return total, explore_model, format_model
+
+
+def test_two_model_price_table_covers_routed_models() -> None:
+    """Both models the router can pick must be priced, else the cost gate lies."""
+    from src.api.agent.llm_router import EXPLORE_MODEL, FORMAT_MODEL
+
+    for model in (EXPLORE_MODEL, FORMAT_MODEL):
+        assert model in _MODEL_PRICES_USD_PER_MTOK, f"no price for routed model {model!r}"
+
+
+def test_two_model_cost_reduction_vs_single(capsys: pytest.CaptureFixture[str]) -> None:
+    """two_model must be ≥15% cheaper than single_model across the 52 questions.
+
+    Surfaces the side-by-side in the pytest output. If the floor is not met the
+    test fails — per PLAN.md §S5b this is a STOP-and-report signal, not
+    something to rescue with model or prompt tweaks.
+    """
+    single, single_ex, single_fmt = _variant_total_cost_usd(two_model_enabled=False)
+    two, two_ex, two_fmt = _variant_total_cost_usd(two_model_enabled=True)
+    reduction = (single - two) / single if single else 0.0
+
+    report = (
+        "\n── two-model cost comparison (PLAN.md §S5b, STEP B) ──\n"
+        f"  questions          : {len(_ALL_ENTRIES)}\n"
+        f"  single_model       : explore={single_ex}  format={single_fmt}  "
+        f"total=${single:.6f}\n"
+        f"  two_model          : explore={two_ex}  format={two_fmt}  "
+        f"total=${two:.6f}\n"
+        f"  cost reduction     : {reduction * 100:.1f}%  "
+        f"(floor={_TWO_MODEL_COST_REDUCTION_FLOOR * 100:.0f}%)\n"
+        "  (uncached per-call estimate; caching preserves the ratio)\n"
+    )
+    with capsys.disabled():
+        print(report)
+
+    assert reduction >= _TWO_MODEL_COST_REDUCTION_FLOOR, (
+        f"two_model cost reduction {reduction * 100:.1f}% is below the "
+        f"{_TWO_MODEL_COST_REDUCTION_FLOOR * 100:.0f}% floor "
+        f"(single=${single:.6f}, two=${two:.6f}). Per PLAN.md §S5b, STOP and "
+        "report — do not adjust models/prompts to force it."
+    )

@@ -47,7 +47,8 @@ SET search_path TO {_AGENT_TEST_SCHEMA};
 -- Static (Supabase-shaped) tables --------------------------------------
 CREATE TABLE organizations (
     id   UUID PRIMARY KEY,
-    name VARCHAR(255) NOT NULL
+    name VARCHAR(255) NOT NULL,
+    agent_two_model_enabled BOOLEAN NOT NULL DEFAULT false
 );
 
 CREATE TABLE sites (
@@ -481,7 +482,9 @@ class FakeLLMClient(LLMClient):
         self.canned_answer = canned_answer
         self.last_format_payload: Optional[dict[str, Any]] = None
 
-    async def extract_plan(self, message: str) -> QueryPlan:
+    async def extract_plan(self, message: str, **_kwargs: Any) -> QueryPlan:
+        # ``**_kwargs`` absorbs protocol-level params this fake ignores
+        # (e.g. ``two_model_enabled`` from the two-model split).
         if self.raise_on_extract:
             raise RuntimeError("simulated LLM upstream failure")
         m = message.lower()
@@ -553,6 +556,7 @@ class FakeLLMClient(LLMClient):
         rows: list[dict[str, Any]],
         *,
         result_summary: Optional[dict[str, Any]] = None,
+        **_kwargs: Any,
     ) -> str:
         # Stash for assertion in tests that need to inspect what the
         # formatter saw.

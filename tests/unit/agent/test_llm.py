@@ -458,7 +458,9 @@ class TestFormatAnswer:
     ):
         # Haiku 4.5 supports neither adaptive thinking nor effort; sending
         # either is a 400, so the format step must fall back to temperature
-        # and omit thinking/output_config.
+        # and omit thinking/output_config. With the two-model split off (the
+        # default), the format phase honors CONFIG.model, so patching it to a
+        # non-thinking model exercises the fallback.
         _replace_config(monkeypatch, model="claude-haiku-4-5")
         patch_anthropic_client.return_value = _make_response([_make_text_block("ok")])
 

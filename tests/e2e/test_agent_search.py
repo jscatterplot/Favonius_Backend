@@ -258,7 +258,7 @@ async def at18_db_pools():
 class _FakeLLMClient:
     """Returns a canned plan for "How much did John charge last month?"."""
 
-    async def extract_plan(self, message: str) -> QueryPlan:
+    async def extract_plan(self, message: str, **_kwargs: Any) -> QueryPlan:
         return QueryPlan(
             intent="consumption_by_user",
             subjects=[EntityMention(kind="driver", text="John")],
@@ -274,6 +274,7 @@ class _FakeLLMClient:
         rows: list[dict[str, Any]],
         *,
         result_summary: dict[str, Any] | None = None,
+        **_kwargs: Any,
     ) -> str:
         if not rows:
             return "John Smith had no charging sessions in that period."
@@ -467,7 +468,7 @@ async def test_at18_refusal_not_stored_as_success(at18_db_pools: tuple[Any, Any]
     from src.api.agent.controller import run_turn
 
     class _RefusingLLMClient:
-        async def extract_plan(self, message: str) -> QueryPlan:
+        async def extract_plan(self, message: str, **_kwargs: Any) -> QueryPlan:
             return QueryPlan(
                 intent="consumption_by_user",
                 subjects=[],

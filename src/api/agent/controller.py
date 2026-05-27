@@ -50,6 +50,11 @@ from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
 )
+from src.api.agent.llm_router import (
+    configured_default_model,
+    pick_model,
+    resolve_org_two_model_enabled,
+)
 from src.api.agent.plan import QueryPlan
 from src.api.agent.planner import classify as planner_classify
 from src.api.agent.planner import fetch_org_sql_enabled, is_sql_mode_enabled
@@ -86,7 +91,7 @@ logger = logging.getLogger(__name__)
 class LLMClient(Protocol):
     """Two-method interface the agent orchestrator needs."""
 
-    async def extract_plan(self, message: str) -> QueryPlan:
+    async def extract_plan(self, message: str, *, two_model_enabled: bool = False) -> QueryPlan:
         """Parse a user message into a strict :class:`QueryPlan`."""
 
     async def format_answer(
@@ -97,6 +102,7 @@ class LLMClient(Protocol):
         rows: list[dict[str, Any]],
         *,
         result_summary: Optional[dict[str, Any]] = None,
+        two_model_enabled: bool = False,
     ) -> str:
         """Format a SQL result set into a natural-language reply."""
 
@@ -104,10 +110,10 @@ class LLMClient(Protocol):
 class RealLLMClient:
     """Default :class:`LLMClient` that calls the Anthropic SDK module."""
 
-    async def extract_plan(self, message: str) -> QueryPlan:
+    async def extract_plan(self, message: str, *, two_model_enabled: bool = False) -> QueryPlan:
         from src.api.agent import llm  # local import to keep test envs llm-free
 
-        return await llm.extract_plan(message)
+        return await llm.extract_plan(message, two_model_enabled=two_model_enabled)
 
     async def format_answer(
         self,
@@ -117,10 +123,18 @@ class RealLLMClient:
         rows: list[dict[str, Any]],
         *,
         result_summary: Optional[dict[str, Any]] = None,
+        two_model_enabled: bool = False,
     ) -> str:
         from src.api.agent import llm
 
-        return await llm.format_answer(plan, resolved, window, rows, result_summary=result_summary)
+        return await llm.format_answer(
+            plan,
+            resolved,
+            window,
+            rows,
+            result_summary=result_summary,
+            two_model_enabled=two_model_enabled,
+        )
 
 
 # ── Reply shape ────────────────────────────────────────────────────────────
@@ -503,8 +517,34 @@ async def run_turn(
                 context=context,
             )
 
+        # 0c. Resolve the per-org two-model split (PLAN.md §S5b, build-only
+        # spike). Fail-safe to off. We record the routing so the choice is
+        # auditable in agent_runs.steps_json (the spike's verification anchor);
+        # llm.py applies the same pick_model() at its own two call sites.
+        # configured_default_model() reads AGENT_LLM_MODEL llm-free, so a turn
+        # with an injected fake/custom llm_client never imports the
+        # Anthropic-backed llm module on this path.
+        two_model_enabled = await resolve_org_two_model_enabled(static_pool, auth.organization_id)
+        default_model = configured_default_model()
+        explore_model = pick_model(
+            "explore", two_model_enabled=two_model_enabled, default_model=default_model
+        )
+        format_model = pick_model(
+            "format", two_model_enabled=two_model_enabled, default_model=default_model
+        )
+        await agent_runs_step(
+            ts_pool,
+            run_id,
+            "model_route",
+            {
+                "two_model_enabled": two_model_enabled,
+                "explore_model": explore_model,
+                "format_model": format_model,
+            },
+        )
+
         # 1. Extract the plan.
-        plan = await llm_client.extract_plan(message)
+        plan = await llm_client.extract_plan(message, two_model_enabled=two_model_enabled)
         await agent_runs_step(ts_pool, run_id, "extract_plan", plan.model_dump())
         await _emit_step("extract_plan")
 
@@ -678,6 +718,7 @@ async def run_turn(
             window.model_dump(mode="json"),
             rows_list,
             result_summary=summary,
+            two_model_enabled=two_model_enabled,
         )
         reply = AgentReply.success(run_id=run_id, intent=plan.intent, text=text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
