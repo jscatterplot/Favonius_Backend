@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import status as http_status
@@ -472,3 +472,118 @@ class TestAgentActionCommands:
         assert body["status"] == "dry_run"
         assert body["result"]["actionId"] == action_id
         assert body["result"]["actionStatus"] == "executed"
+
+
+class TestAlertCommands:
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_favonius_admin_can_ack_cross_org_alert(self, _audit, client, mock_db_pool):
+        from src.notifications.alerts import Alert
+        from src.notifications.severity import Severity
+
+        pool, conn = mock_db_pool
+        alert_org = uuid4()
+        now = datetime.now(timezone.utc)
+        existing = Alert(
+            id=uuid4(),
+            organization_id=alert_org,
+            depot_id=UUID(DEPOT_ID),
+            alert_type="charger_fault",
+            severity=Severity.CRITICAL,
+            title="fault",
+            detail={},
+            dedup_key=f"k-{uuid4()}",
+            status="active",
+            first_occurrence_at=now,
+            last_occurrence_at=now,
+            occurrence_count=1,
+            acknowledged_at=None,
+            acknowledged_by=None,
+            acknowledged_by_email=None,
+            resolved_at=None,
+            last_notified_at=None,
+            last_notified_count=0,
+        )
+        updated = existing
+        admin_user = _valid_user(role="favonius_admin")
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(admin_user)
+        conn.fetchval = AsyncMock(return_value=True)
+        conn.fetchrow = AsyncMock(return_value={"name": "Depot"})
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.notifications.alerts.get_by_id", new_callable=AsyncMock, return_value=existing
+        ), patch(
+            "src.notifications.alerts.acknowledge_for_org",
+            new_callable=AsyncMock,
+            return_value=updated,
+        ) as ack:
+            response = client.post(
+                "/commands/execute",
+                json={
+                    "command": "alerts.acknowledge",
+                    "depot_id": DEPOT_ID,
+                    "params": {"alert_id": str(existing.id)},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert response.status_code == http_status.HTTP_200_OK, response.text
+        assert ack.await_args.kwargs["org_id"] == alert_org
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_ack_command_falls_back_to_jwt_email(self, _audit, client, mock_db_pool):
+        from src.notifications.alerts import Alert
+        from src.notifications.severity import Severity
+
+        pool, conn = mock_db_pool
+        org_id = uuid4()
+        now = datetime.now(timezone.utc)
+        existing = Alert(
+            id=uuid4(),
+            organization_id=org_id,
+            depot_id=UUID(DEPOT_ID),
+            alert_type="charger_fault",
+            severity=Severity.WARNING,
+            title="fault",
+            detail={},
+            dedup_key=f"k-{uuid4()}",
+            status="active",
+            first_occurrence_at=now,
+            last_occurrence_at=now,
+            occurrence_count=1,
+            acknowledged_at=now,
+            acknowledged_by=uuid4(),
+            acknowledged_by_email="operator@corp.com",
+            resolved_at=None,
+            last_notified_at=None,
+            last_notified_count=0,
+        )
+        user = {
+            "sub": str(uuid4()),
+            "email": "operator@corp.com",
+            "app_metadata": {
+                "favonius_role": "customer_operator",
+                "organization_id": str(org_id),
+            },
+            "user_metadata": {"email": "operator@corp.com"},
+        }
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(user)
+        conn.fetchval = AsyncMock(return_value=True)
+        conn.fetchrow = AsyncMock(return_value={"name": "Depot"})
+
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.notifications.alerts.get_by_id", new_callable=AsyncMock, return_value=existing
+        ), patch(
+            "src.notifications.alerts.resolve_by_id", new_callable=AsyncMock, return_value=existing
+        ) as resolve:
+            response = client.post(
+                "/commands/execute",
+                json={
+                    "command": "alerts.resolve",
+                    "depot_id": DEPOT_ID,
+                    "params": {"alert_id": str(existing.id)},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert response.status_code == http_status.HTTP_200_OK, response.text
+        assert resolve.await_args.kwargs["user_email"] == "operator@corp.com"

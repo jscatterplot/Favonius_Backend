@@ -143,6 +143,15 @@ AGENT_SQL_TOOL_TURNS = Histogram(
     buckets=[1, 2, 3, 5, 8, 12],
 )
 
+# S4: SQL-mode turns refused pre-LLM by the per-org monthly token budget. Labelled
+# by organization_id (org cardinality is small — single-digit pilot tenants); a
+# refusal consumes zero Anthropic tokens (no client.messages.create call).
+AGENT_SQL_BUDGET_REFUSED = Counter(
+    "favonius_agent_sql_budget_refused_total",
+    "SQL-mode chat agent turns refused before the LLM by the monthly token budget",
+    ["organization_id"],
+)
+
 # Depot workflow agent runtime metrics (PRD §4.3/§4.4, sprint 2).
 # Naming mirrors the existing agent_search metrics one level up.
 WORKFLOW_TURNS = Counter(
@@ -169,7 +178,9 @@ WORKFLOW_LLM_TOKENS = Counter(
 SESSION_COST_COMPUTED = Counter(
     "favonius_session_cost_computed_total",
     "Charging-session cost calculations by source / outcome",
-    ["source"],  # granular | fallback_average | unpriceable | no_energy | no_depot | manual | pending_close
+    [
+        "source"
+    ],  # granular | fallback_average | unpriceable | no_energy | no_depot | manual | pending_close
 )
 
 SESSION_COST_COMPUTE_FAILURES = Counter(
@@ -196,7 +207,10 @@ CHARGER_LOG_IMPORTS = Counter(
 CHARGER_LOG_PARSE_FAILURES = Counter(
     "favonius_charger_log_parse_failures_total",
     "Parser exceptions or empty results by vendor and reason",
-    ["vendor", "reason"],  # reason: corrupt_archive | parse_exception | no_entries | unsupported_vendor
+    [
+        "vendor",
+        "reason",
+    ],  # reason: corrupt_archive | parse_exception | no_entries | unsupported_vendor
 )
 
 CHARGER_LOG_RECONCILIATIONS = Counter(
@@ -240,4 +254,50 @@ SOLVER_POOL_BROKEN = Counter(
     "favonius_solver_pool_broken_total",
     "Times the solver process pool became broken and was recreated",
     ["reason"],  # 'broken_pool' | 'timeout'
+)
+
+# Navirec telematics poller metrics (live SoC feed → vehicle_telemetry).
+NAVIREC_POLL_CYCLES = Counter(
+    "favonius_navirec_poll_cycles_total",
+    "Navirec poll cycles by outcome",
+    ["outcome"],  # 'ok' | 'fetch_error' | 'skipped_disabled'
+)
+
+NAVIREC_POLL_DURATION = Histogram(
+    "favonius_navirec_poll_duration_seconds",
+    "Wall-clock duration of a full Navirec poll cycle",
+    buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60],
+)
+
+NAVIREC_READINGS_WRITTEN = Counter(
+    "favonius_navirec_readings_written_total",
+    "Telematics readings upserted into vehicle_telemetry",
+    ["depot_id"],
+)
+
+NAVIREC_DEPOT_FAILURES = Counter(
+    "favonius_navirec_depot_failures_total",
+    "Per-depot poll failures (isolated; other depots continue)",
+    ["depot_id"],
+)
+
+NAVIREC_LOCK_SKIPS = Counter(
+    "favonius_navirec_lock_skips_total",
+    "Depot writes skipped because another worker held the advisory lock",
+    ["depot_id"],
+)
+
+NAVIREC_UNMATCHED_PLATES = Counter(
+    "favonius_navirec_unmatched_plates_total",
+    "Telematics readings whose plate matched no Favonius vehicle",
+)
+
+NAVIREC_AMBIGUOUS_PLATES = Gauge(
+    "favonius_navirec_ambiguous_plates",
+    "Normalized plates mapping to >1 vehicle (dropped from the resolution map)",
+)
+
+NAVIREC_STALE_READINGS = Counter(
+    "favonius_navirec_stale_readings_total",
+    "Readings whose device timestamp already exceeded the telemetry freshness window",
 )

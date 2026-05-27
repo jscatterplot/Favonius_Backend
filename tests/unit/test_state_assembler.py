@@ -145,6 +145,30 @@ class TestGetVehicleSocs:
         assert len(socs) == 0
         assert isinstance(socs, dict)
 
+    @pytest.mark.asyncio
+    async def test_get_vehicle_socs_falls_back_when_vehicle_telemetry_missing(
+        self, assembler, mock_db_pool
+    ):
+        """If migration 044 is missing, fall back to telemetry-only query."""
+        mock_conn = AsyncMock()
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        vehicle_row = MagicMock()
+        vehicle_row.__getitem__.side_effect = lambda k: {"vehicle_id": "bus_1"}[k]
+        soc_row = MagicMock()
+        soc_row.__getitem__.side_effect = lambda k: {"vehicle_id": "bus_1", "soc": 0.55}[k]
+
+        mock_conn.fetch.side_effect = [
+            [vehicle_row],
+            asyncpg.UndefinedTableError('relation "vehicle_telemetry" does not exist'),
+            [soc_row],
+        ]
+
+        socs = await assembler._get_vehicle_socs()
+
+        assert socs == {"bus_1": 0.55}
+        assert mock_conn.fetch.call_count == 3
+
 
 class TestGetBatterySoc:
     """Test _get_battery_soc method."""

@@ -803,7 +803,7 @@ class TestDepotSetupWrites:
         assert checklist["charger_access"]["status"] == "blocked"
         assert checklist["schedules"]["status"] == "blocked"
         assert checklist["prices"]["status"] == "blocked"
-        assert checklist["building_load"]["status"] == "blocked"
+        assert checklist["building_load"]["status"] == "warning"
         assert checklist["battery"]["status"] == "blocked"
 
     # ── Migration 021: charger_vehicle_access_default + energy_cap tariff ──

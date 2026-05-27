@@ -1,0 +1,184 @@
+# Sprint 5 scenario 10 — three chargers on one circuit faulted together.
+#
+# A breaker on CIRC-1 has tripped, faulting CP-1001, CP-1002 and
+# CP-1003 simultaneously. All three were charging BUS-1001..1003. PRD
+# §6.3 edge case "cascading faults across multiple chargers on the
+# same circuit" applies: the agent emits ONE proposed_action covering
+# the circuit, not three.
+#
+# Carry the affected vehicle ids in the action payload so the manager
+# can investigate the upstream breaker once.
+
+id: readiness-10-cascading-charger-faults
+description: >
+  3 chargers on CIRC-1 faulted at once. Expected: exactly one
+  proposed_action with type circuit_swap covering all three vehicles.
+severity: blocking
+scenario_now: "2026-05-13T05:00:00+00:00"
+
+workflow:
+  id: "10000000-0000-4000-8000-00000000d010"
+  name: daily_readiness_check
+  version: "1.0.0"
+  description: Daily readiness check (PRD §6.1).
+  prompt: |
+    You confirm every vehicle will be ready for its assigned route at
+    scheduled departure, and surface anything that won't. De-duplicate
+    cascading charger faults onto a single proposal per circuit.
+  allowed_tools:
+    - get_scheduled_departures
+    - get_vehicle_state
+    - get_charger_state
+  parameters:
+    lead_time_min: 60
+    soc_tolerance_pct: 1.0
+    escalation_threshold: 3
+
+# draft_and_wait: proposals are a graduated-tier feature (PRD §9.1).
+# At `inform` this workflow is a read-only brief and emits no actions;
+# this scenario exercises the post-graduation deduped-proposal path.
+permission_tier: draft_and_wait
+
+graph_snapshot:
+  depot:
+    depot_id: "11111111-1111-4111-8111-111111111010"
+    name: "Vilnius depot"
+    latitude: 54.6872
+    longitude: 25.2797
+    max_grid_kw: 800.0
+    timezone: "Europe/Vilnius"
+
+  vehicles:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001001"
+      external_id: "BUS-1001"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001002"
+      external_id: "BUS-1002"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001003"
+      external_id: "BUS-1003"
+      vehicle_type: "bus_large"
+      battery_kwh: 324.0
+      max_charge_kw: 80.0
+
+  chargers:
+    - charger_id: "ccccccc0-0000-4000-8000-000000001001"
+      ocpp_id: "CP-1001"
+      rated_kw: 80.0
+      status: "Faulted"
+    - charger_id: "ccccccc0-0000-4000-8000-000000001002"
+      ocpp_id: "CP-1002"
+      rated_kw: 80.0
+      status: "Faulted"
+    - charger_id: "ccccccc0-0000-4000-8000-000000001003"
+      ocpp_id: "CP-1003"
+      rated_kw: 80.0
+      status: "Faulted"
+
+  schedules:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001001"
+      route_id: "R-1001"
+      departure_time: "+2h"
+      return_time: "+12h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001002"
+      route_id: "R-1002"
+      departure_time: "+2h"
+      return_time: "+12h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001003"
+      route_id: "R-1003"
+      departure_time: "+2h"
+      return_time: "+12h"
+      energy_kwh: 240.0
+      required_soc: 0.85
+
+  telemetry:
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001001"
+      charger_id: "ccccccc0-0000-4000-8000-000000001001"
+      time: "-5m"
+      soc: 0.91
+      is_plugged: true
+      charging_kw: 0.0
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001002"
+      charger_id: "ccccccc0-0000-4000-8000-000000001002"
+      time: "-5m"
+      soc: 0.92
+      is_plugged: true
+      charging_kw: 0.0
+    - vehicle_id: "aaaaaaa0-0000-4000-8000-000000001003"
+      charger_id: "ccccccc0-0000-4000-8000-000000001003"
+      time: "-5m"
+      soc: 0.93
+      is_plugged: true
+      charging_kw: 0.0
+
+llm_trace:
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_10_sched"
+        name: get_scheduled_departures
+        input: {}
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_10_charger"
+        name: get_charger_state
+        input:
+          charger_id: "ccccccc0-0000-4000-8000-000000001001"
+  - stop_reason: tool_use
+    content:
+      - type: tool_use
+        id: "toolu_10_emit"
+        name: emit_decision
+        input:
+          summary: >-
+            3 chargers on CIRC-1 faulted together (CP-1001/2/3).
+            BUS-1001..1003 need alternate chargers. Single alert
+            covering the upstream breaker — investigate before any
+            swap.
+          rule_applied: "circuit_fault_dedupe"
+          proposed_actions:
+            - vehicle_ids:
+                - "aaaaaaa0-0000-4000-8000-000000001001"
+                - "aaaaaaa0-0000-4000-8000-000000001002"
+                - "aaaaaaa0-0000-4000-8000-000000001003"
+              circuit_id: "CIRC-1"
+              type: "circuit_swap"
+              requires_manager: true
+              justification: >-
+                CP-1001, CP-1002, CP-1003 on CIRC-1 faulted together;
+                upstream breaker likely. One alert per circuit per PRD
+                §6.3 cascading-fault edge case.
+          coverage:
+            vehicles_checked: 3
+            chargers_checked: 3
+            routes_checked: 3
+
+expected:
+  disposition: pending
+  rule_applied: circuit_fault_dedupe
+  output:
+    summary_contains: "CIRC-1"
+    proposed_action_types:
+      - circuit_swap
+    proposed_action_count_min: 1
+    proposed_action_count_max: 1
+    filtered_violations_max: 0
+    coverage:
+      vehicles_checked: 3
+      chargers_checked: 3
+      routes_checked: 3
+  tool_calls:
+    count_min: 2
+    names_in_order:
+      - get_scheduled_departures
+      - get_charger_state
+    all_ok: true

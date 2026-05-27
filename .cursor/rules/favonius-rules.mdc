@@ -10,7 +10,7 @@ This file complements the root `.cursorrules` file and domain-specific rules in 
 ## Primary References
 
 - **Root rules:** `.cursorrules` - Main AI assistant configuration
-- **PRD:** `docs/PRD_v2_7_Building_Integration.md` - Single source of truth for all specifications
+- **PRD:** `docs/PRD_Depot_Agent.md` - Authoritative product spec; `CLAUDE.md` (root) is the canonical operational reference for the codebase
 - **Domain rules:** See `.cursor/rules/optimization.mdc`, `.cursor/rules/ocpp.mdc`, `.cursor/rules/timescale.mdc`
 
 ## Key Patterns
@@ -33,7 +33,7 @@ These constraints MUST NEVER be relaxed:
 ## Implementation Guidelines
 
 ### Optimization
-- Reference PRD_v2.md#8-optimization-engine-specifications for formulation
+- Reference `docs/PRD_Depot_Agent.md` and `CLAUDE.md` ("Hard Constraints" / "Solver Configuration") for formulation
 - See `.cursor/rules/optimization.mdc` for detailed patterns
 - Use Gurobi solver (primary) with automatic HiGHS fallback on failure (PRD Section 8.2)
 - Use Gurobi solver with specified options (TimeLimit=60, MIPGap=0.01)
@@ -46,7 +46,7 @@ These constraints MUST NEVER be relaxed:
 - Enforce BOTH power limit AND vehicle count limit for chargers
 
 ### API Endpoints
-- Reference PRD_v2.md#7-api-specifications for contracts
+- Reference `docs/API.md` and `CLAUDE.md` ("REST API Endpoints") for contracts
 - Return consistent error formats
 - Include request/response logging
 - Validate all inputs per PRD Section 10.4
@@ -56,14 +56,14 @@ These constraints MUST NEVER be relaxed:
 - Security code organized in `src/security/` folder
 
 ### OCPP Integration
-- Reference PRD_v2.md#9-1-ocpp-integration for message formats
+- Reference `CLAUDE.md` ("OCPP Implementation") for message formats
 - See `.cursor/rules/ocpp.mdc` for protocol patterns
 - OCPP 1.6 primary, 2.0.1 ready
 - Extract max_charge_kw from MeterValues (PRD Section 8.4)
 - Store charger_id in telemetry (PRD Section 6.1)
 
 ### Database Operations
-- Reference PRD_v2.md#6-data-models for schema
+- Reference `CLAUDE.md` ("Database Schema") for schema
 - See `.cursor/rules/timescale.mdc` for best practices
 - Use hypertables for time-series data
 - Include building_load hypertable
