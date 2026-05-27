@@ -285,6 +285,42 @@ The chat agent has a second execution path that opens it up to arbitrary depot a
 
 **Module map** (`src/api/agent/`): `router.py` (HTTP routes + metrics), `controller.py` (turn orchestration), `llm.py` (extraction), `planner.py` (fast-path vs SQL-mode routing + the per-org flag check), `resolve.py` (name→UUID, the auth boundary), `intents/` (`base.py` + `consumption_by_user.py` — the fast path now also answers vehicle/fleet and depot-wide consumption questions), `plan.py` (`QueryPlan` Pydantic types), `catalogue.py` (LLM-facing schema catalogue for SQL mode), `sql_tools.py` / `sql_executor.py` / `sql_validator.py` (SQL-mode tool registry, read-only executor, sqlglot validator), `audit.py` (`agent_runs`/`audit_log` writers + `classify_failure`), `auth_context.py`, `stream.py` (SSE helpers), `thinking.py`, `feature_flag.py`.
 
+#### SQL-mode v1 gate & dashboard
+
+**v1 gate** — the SQL path is gated in CI by `tests/golden/agent_sql.yaml` (20 Q&A scenarios spanning energy+cost / ops-status / pricing), replayed through a `FakeAnthropicClient` against a real TimescaleDB savepoint by `tests/golden/test_agent_sql_golden.py` (every scenario is asserted individually and the exact 7/7/6 category shape is checked, so all 20 must pass). It is the SQL-path counterpart to the consumption fast path's `tests/golden/agent_consumption.yaml`.
+
+**Dashboard** — `monitoring/grafana/agent_sql_dashboard.json` (Grafana 10; the repo's first dashboard) graphs the SQL-mode metrics: turn duration (p50/p95/p99, intent=`sql_general`), turns/min by status, validation rejections by `error_kind`, executor role-swap failures, tokens by model, and budget refusals/hour.
+
+```text
+# S5a followups:
+#  * No favonius_agent_failure_reason_total counter exists — the dashboard's
+#    "failures by failure_reason" panel is a TODO (text) until either a
+#    postgres_exporter scrapes agent_runs.failure_reason or that counter is
+#    emitted at the classify_failure site.
+#  * No metric for the nightly shadow-suite pass rate (agent-sql-shadow.yml) —
+#    that panel is a TODO until a pushgateway gauge or a GitHub datasource feeds it.
+#  * The $organization_id dashboard variable only filters the budget-refusal
+#    panel — favonius_agent_sql_budget_refused_total is the only agent metric
+#    carrying an organization_id label (the turn/validation/execution metrics
+#    omit it deliberately to bound cardinality).
+```
+
+#### Failure taxonomy
+
+Every non-graceful turn writes exactly one `agent_runs.failure_reason` (migration `045_agent_failure_reason.sql`, CHECK-constrained to these seven values), classified solely in `src/api/agent/audit.py::classify_failure` — graceful statuses (`success`/`running`/`disambiguation`/`not_found`) leave it NULL:
+
+- `validator_rejected` — a `run_select_*` SQL was rejected by the sqlglot validator.
+- `executor_timeout` — the read-only executor's `statement_timeout` fired.
+- `empty_result` — the turn answered but every `run_select_*` returned zero rows.
+- `budget_exceeded` — refused pre-LLM by the per-org monthly token budget (below).
+- `tool_error` — a tool failed or was misused (executor role/plan/exec error, a disallowed/unregistered tool, terminator-dispatch failure, or a non-SQL tool error).
+- `llm_error` — the LLM layer failed (Anthropic SDK error, consumption-path extraction failure, the model exiting the loop with no answer, or a blank terminator answer).
+- `other` — anything not attributable more precisely.
+
+#### Token budget
+
+The SQL-mode chat agent is cost-protected by a per-org monthly token ceiling (`src/api/agent/budget.py`). Precedence: a positive `organizations.agent_token_budget_monthly` column (`migrations/supabase/045_organizations_agent_token_budget.sql`) beats the hard-coded platform default `DEFAULT_TOKEN_BUDGET_MONTHLY = 10_000_000`. Usage accrues per `(organization_id, YYYYMM)` in the `agent_token_usage` table (migration `046_agent_token_budget.sql`); the tracker reserves an estimate before the LLM call and reconciles the measured total after (fail-open — a budget read never breaks a turn). An over-budget turn is refused **before** Anthropic is called → `status="refused"`, `failure_reason="budget_exceeded"`, and `favonius_agent_sql_budget_refused_total{organization_id}` increments. There is **no env var** for the budget — it is a first-class, per-company commercial DB attribute by design (the PLAN-era `AGENT_SQL_TOKEN_BUDGET_PER_ORG_MONTHLY` was intentionally not built).
+
 ### Depot Agent — Workflow Runtime (`src/api/agent_workflows/`)
 
 The workflow runtime is the Depot Agent product surface (PRD §4.3, §4.4). Sprint 1 (migration 037 + `models.py` + `repository.py` + `feature_flag.py`) shipped the substrate: append-only `decisions` hypertable, `workflows` + `workflow_tiers` tables, Pydantic types, and the canonical `insert_decision(pool, decision)` writer. Sprint 2 (this section) layers the runtime on top.
@@ -932,7 +968,12 @@ test(api): add coverage for handoff rate limiting
 | `AGENT_SEARCH_ENABLED` | `true` | Mounts the chat agent router (`/agent/*`). |
 | `AGENT_SQL_MODE_ENABLED` | `false` | Enables the general-purpose text-to-SQL path. Per-org gating is the `organizations.agent_sql_mode_enabled` DB flag (NOT an env allowlist). |
 | `DEPOT_AGENT_ENABLED` | `false` | Gates the Depot Agent workflow runtime. |
-| `AGENT_LLM_EFFORT` | `high` | Anthropic reasoning-effort knob for agent LLM calls (`src/api/agent/llm.py`). |
+| `AGENT_LLM_EFFORT` | `high` | Anthropic reasoning-effort knob for thinking-capable agent LLM calls (`src/api/agent/llm.py`). |
+| `AGENT_LLM_MODEL` | `claude-sonnet-4-6` | Model for the agent LLM (chat extraction + SQL loop); validated against a known-good set at startup. |
+| `AGENT_LLM_EXTRACT_MAX_TOKENS` | `400` | Max output tokens for the consumption-path `QueryPlan` extraction step. |
+| `AGENT_LLM_FORMAT_MAX_TOKENS` | `2048` | Max output tokens for the answer-formatting / SQL-loop step. |
+| `AGENT_LLM_TEMPERATURE` | `0.0` | Sampling temperature; applied only on models without adaptive thinking. |
+| `AGENT_LLM_TIMEOUT_S` | `30` | Per-request timeout (seconds) for Anthropic SDK calls. |
 
 ### Tenant mirroring (optional)
 | Variable | Default | Description |
