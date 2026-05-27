@@ -71,15 +71,24 @@ class AgentViewContext(BaseModel):
     focus: Optional[AgentViewFocus] = None
     view: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("view")
+    @field_validator("view", mode="before")
     @classmethod
-    def _bounded(cls, value: dict[str, Any]) -> dict[str, Any]:
-        try:
-            size = len(json.dumps(value, default=str))
-        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
-            raise ValueError("view must be JSON-serializable") from exc
-        if size > MAX_VIEW_BYTES:
-            raise ValueError(f"view is too large ({size} bytes); cap is {MAX_VIEW_BYTES}")
+    def _coerce_and_bound(cls, value: Any) -> Any:
+        # Accept an explicit ``null`` the same as an omitted field — coerce to
+        # {}. Frontends routinely serialize unset object fields as null, and
+        # depot_id/focus already accept null (they're Optional); without this
+        # ``"view": null`` would 422 the whole turn for an asymmetric reason.
+        if value is None:
+            return {}
+        # Only size-check a dict; anything else falls through to Pydantic's
+        # type validation so the caller gets the correct error, not a size one.
+        if isinstance(value, dict):
+            try:
+                size = len(json.dumps(value, default=str))
+            except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+                raise ValueError("view must be JSON-serializable") from exc
+            if size > MAX_VIEW_BYTES:
+                raise ValueError(f"view is too large ({size} bytes); cap is {MAX_VIEW_BYTES}")
         return value
 
 
@@ -88,24 +97,26 @@ def build_page_context_payload(
 ) -> dict[str, Any]:
     """Return the dict the ``get_page_context`` tool hands the model.
 
-    ``available`` is ``False`` when the app sent no context. Any ``depot_id``
-    is intersected with ``auth.visible_depot_ids`` (in-memory membership — no
-    DB round-trip): an out-of-scope depot is dropped and logged, never
-    honoured. ``focus`` is passed through as an unverified hint. The
-    informational ``note`` is always present.
+    ``available`` reflects whether anything *usable* survived sanitization —
+    an in-scope depot, a focus, or a non-empty view. It is ``False`` when the
+    app sent no context, and also when everything it sent was unusable (e.g. an
+    out-of-scope depot dropped with no focus and an empty view), so the model
+    follows rule 9 and asks the user to clarify instead of guessing from
+    nothing. Any ``depot_id`` is intersected with ``auth.visible_depot_ids``
+    (in-memory membership — no DB round-trip): an out-of-scope depot is dropped
+    and logged, never honoured. ``focus`` is passed through as an unverified
+    hint. The informational ``note`` is always present.
     """
     if context is None:
         return {"available": False, "note": PAGE_CONTEXT_NOTE}
 
-    payload: dict[str, Any] = {
-        "available": True,
-        "note": PAGE_CONTEXT_NOTE,
-        "view": context.view,
-    }
+    payload: dict[str, Any] = {"note": PAGE_CONTEXT_NOTE, "view": context.view}
 
+    in_scope_depot = False
     if context.depot_id is not None:
         if context.depot_id in set(auth.visible_depot_ids):
             payload["depot_id"] = str(context.depot_id)
+            in_scope_depot = True
         else:
             logger.warning(
                 "page_context depot_id %s is outside the caller's visible depots; dropping",
@@ -116,4 +127,5 @@ def build_page_context_payload(
     if context.focus is not None:
         payload["focus"] = {"type": context.focus.type, "id": context.focus.id}
 
+    payload["available"] = bool(in_scope_depot or context.focus is not None or context.view)
     return payload

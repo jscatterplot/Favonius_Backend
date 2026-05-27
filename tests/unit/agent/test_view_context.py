@@ -80,6 +80,18 @@ def test_oversized_view_is_rejected() -> None:
         AgentViewContext.model_validate({"view": big})
 
 
+def test_null_view_is_coerced_to_empty_dict() -> None:
+    # Frontends serialize unset object fields as null; accept it like an
+    # omitted field rather than 422-ing the whole turn.
+    ctx = AgentViewContext.model_validate({"view": None})
+    assert ctx.view == {}
+
+
+def test_all_optional_subfields_accept_null() -> None:
+    ctx = AgentViewContext.model_validate({"depotId": None, "focus": None, "view": None})
+    assert ctx.depot_id is None and ctx.focus is None and ctx.view == {}
+
+
 # ── Payload builder (sanitization) ────────────────────────────────────────
 
 
@@ -105,6 +117,9 @@ def test_payload_out_of_scope_depot_is_dropped_and_logged(
         payload = build_page_context_payload(ctx, _auth(_DEPOT_A))
     assert "depot_id" not in payload  # never honoured
     assert payload["depot_id_dropped"] is True
+    # Nothing usable survived (dropped depot, no focus, empty view) → the model
+    # is told available:False so it asks to clarify instead of guessing.
+    assert payload["available"] is False
     assert any("outside the caller's visible depots" in r.message for r in caplog.records)
 
 
@@ -112,6 +127,13 @@ def test_payload_focus_passes_through_as_hint() -> None:
     ctx = AgentViewContext(focus={"type": "charger", "id": "cp-7"})  # type: ignore[arg-type]
     payload = build_page_context_payload(ctx, _auth(_DEPOT_A))
     assert payload["focus"] == {"type": "charger", "id": "cp-7"}
+    assert payload["available"] is True  # a focus is usable on its own
+
+
+def test_payload_view_only_is_available() -> None:
+    ctx = AgentViewContext(view={"page": "reports"})
+    payload = build_page_context_payload(ctx, _auth(_DEPOT_A))
+    assert payload["available"] is True  # a non-empty view is usable on its own
 
 
 def test_payload_returns_view_verbatim_as_data_not_instructions() -> None:
