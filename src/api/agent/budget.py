@@ -11,14 +11,14 @@ This module owns the depot chat agent's cost-protection budget. Two layers:
 Budget precedence (highest wins):
 
 1. **Per-org column** — ``organizations.agent_token_budget_monthly`` (Supabase
-   static, migration ``supabase/044``) when set AND a positive integer. This is
+   static, migration ``supabase/045``) when set AND a positive integer. This is
    a per-company commercial attribute (different customers buy different
    amounts), so it lives as a first-class, editable column — not an env var.
 2. **Platform default** — :data:`DEFAULT_TOKEN_BUDGET_MONTHLY` (10,000,000), the
    hard-coded fallback for orgs with no negotiated amount.
 
 The resolver is **fail-open**: any DB error, a missing column (during the
-``supabase/044`` rollout window), or an absent / blank / zero / non-positive
+``supabase/045`` rollout window), or an absent / blank / zero / non-positive
 value all fall back to the platform default. Token accounting is
 cost-protection, not billing, so reading the budget must never break a turn.
 """
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # Hard-coded platform default. 10M tokens/org/month is generous headroom for
 # in-app operator chat while still capping a runaway loop's blast radius. A
 # per-org ceiling is set on organizations.agent_token_budget_monthly (mig
-# supabase/044) and takes precedence; this is the fallback when it's NULL.
+# supabase/045) and takes precedence; this is the fallback when it's NULL.
 DEFAULT_TOKEN_BUDGET_MONTHLY = 10_000_000
 
 
@@ -73,7 +73,7 @@ async def resolve_org_token_budget(
     Fail-open by contract — returns the platform default when there is no org,
     no pool, the value is unset/garbage, or the read raises. The column is read
     via ``to_jsonb(o)->>'agent_token_budget_monthly'`` rather than selecting the
-    column directly so a database where ``supabase/044`` has not yet applied
+    column directly so a database where ``supabase/045`` has not yet applied
     returns NULL (→ default) instead of raising ``UndefinedColumn`` every turn
     (mirrors the resilient ``to_jsonb(row)->>'col'`` reads in
     ``src/core/state/assembler.py``).

@@ -29,7 +29,7 @@ The plan below is the gap between what #216 ships and what a depot-operator-grad
 - **LLM wrapper**: `src/api/agent/llm.py` — `anthropic.AsyncAnthropic` singleton, rotation-aware API key via `get_rotation_secrets("ANTHROPIC_API_KEY")`, `claude-sonnet-4-6` default (`AGENT_LLM_MODEL`), tool-use with forced `tool_choice`, retry-on-validation-failure pattern.
 - **Audit**: `agent_runs` (TimescaleDB, migration 025) + `audit_log` action `agent.query` (migration 021). Writers in `src/api/agent/audit.py`.
 - **HTTP surface**: `POST /agent/turn` (sync) + `POST /agent/turn/stream` (SSE) + `GET /agent/runs/{id}` (`src/api/agent/router.py`). Rate limit 10/min via `check_agent_limit` bucket.
-- **Feature flags**: `AGENT_SEARCH_ENABLED` (default `true`), `AGENT_SQL_MODE_ENABLED` (default `false` — gated by PR #216), per-org allowlist `AGENT_SQL_ORG_ALLOWLIST`.
+- **Feature flags**: `AGENT_SEARCH_ENABLED` (default `true`), `AGENT_SQL_MODE_ENABLED` (default `false` — gated by PR #216). Per-org gating is the `organizations.agent_sql_mode_enabled` DB flag — the originally-planned `AGENT_SQL_ORG_ALLOWLIST` env allowlist was removed.
 - **Eval harness**: `tests/golden/workflows/_schema.yaml` + `tests/golden/workflows/test_workflow_golden.py` + `FakeAnthropicClient` (deterministic LLM-trace replay against real TimescaleDB savepoint).
 - **CI gate**: `.github/workflows/workflow-golden.yml` — spins up `timescale/timescaledb:latest-pg16`, applies migrations, runs `tests/golden/workflows/` + unit coverage floor (90% on `src/api/agent_workflows/eval`).
 
@@ -121,7 +121,7 @@ Each session ≤ ~2 hours. Numbered S0 onward. #216 has merged — S0 can start.
 ### S3.5 — Failure taxonomy + nightly shadow suite
 - **Goal**: make turn failures countable and catch model/prompt drift the canned-trace suite can't see.
 - **Files touched**:
-  - `migrations/043_agent_failure_reason.sql` — add `agent_runs.failure_reason text` (nullable) and a CHECK against an enum-as-text set: `validator_rejected | executor_timeout | empty_result | budget_exceeded | tool_error | llm_error | other`. Index on `(organization_id, started_at, failure_reason)`.
+  - `migrations/045_agent_failure_reason.sql` — add `agent_runs.failure_reason text` (nullable) and a CHECK against an enum-as-text set: `validator_rejected | executor_timeout | empty_result | budget_exceeded | tool_error | llm_error | other`. Index on `(organization_id, started_at, failure_reason)`. _(Shipped as 045, not the planned 043.)_
   - `src/api/agent/audit.py` — set `failure_reason` at the same write site as `status`. One mapping function, not scattered string literals.
   - `src/api/agent/controller.py` + `runtime.py::run_qa_turn` — propagate the reason from the existing exception paths.
   - `tests/golden/agent_sql_live.yaml` — 5 questions copied verbatim from the 20-question suite, one per row, no `llm_trace`, no `expected.agent_views_used`. Keep `expected.final_answer_must_include` and `must_not_include`.
