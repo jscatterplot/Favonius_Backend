@@ -8275,24 +8275,42 @@ async def _build_power_timeline(
     history_points: list[PowerTimelineHistoryPoint] = []
     if station_ids:
         history_query = """
-            SELECT
-                bucket,
-                SUM(avg_kw)         AS charging_kw,
-                SUM(vehicle_count)  AS vehicle_count
-            FROM (
+            WITH connector_buckets AS (
                 SELECT
-                    time_bucket($1::interval, t.time)                                     AS bucket,
+                    time_bucket($1::interval, t.time) AS bucket,
                     t.station_id,
-                    AVG(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL)           AS avg_kw,
-                    COUNT(DISTINCT t.vehicle_id) FILTER (WHERE t.charging_kw > 0.1)       AS vehicle_count
+                    t.connector_id,
+                    AVG(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL) AS avg_kw
                 FROM telemetry t
                 WHERE t.station_id = ANY($2::text[])
                   AND t.time >= $3
                   AND t.time < $4
-                GROUP BY bucket, t.station_id
-            ) charger_buckets
-            GROUP BY bucket
-            ORDER BY bucket
+                GROUP BY bucket, t.station_id, t.connector_id
+            ),
+            power_by_bucket AS (
+                SELECT
+                    bucket,
+                    SUM(avg_kw) AS charging_kw
+                FROM connector_buckets
+                GROUP BY bucket
+            ),
+            vehicles_by_bucket AS (
+                SELECT
+                    time_bucket($1::interval, t.time) AS bucket,
+                    COUNT(DISTINCT t.vehicle_id) FILTER (WHERE t.charging_kw > 0.1) AS vehicle_count
+                FROM telemetry t
+                WHERE t.station_id = ANY($2::text[])
+                  AND t.time >= $3
+                  AND t.time < $4
+                GROUP BY bucket
+            )
+            SELECT
+                p.bucket,
+                p.charging_kw,
+                COALESCE(v.vehicle_count, 0) AS vehicle_count
+            FROM power_by_bucket p
+            LEFT JOIN vehicles_by_bucket v USING (bucket)
+            ORDER BY p.bucket
         """
         interval = f"{_TIMELINE_TIMESTEP_MINUTES} minutes"
         async with db_pools.ts.acquire() as conn:
@@ -8362,8 +8380,11 @@ async def _build_power_timeline(
             h_start = h_start.replace(tzinfo=timezone.utc)
 
         step = timedelta(minutes=_TIMELINE_TIMESTEP_MINUTES)
+        plan_window_end = now_utc + timedelta(hours=24)
         for i, grid_kw in enumerate(grid_power):
             bucket_time = h_start + step * i
+            if bucket_time < now_utc or bucket_time >= plan_window_end:
+                continue
             batt_kw = float(battery_dispatch[i]) if i < len(battery_dispatch) else 0.0
             plan_points.append(
                 PowerTimelinePlanPoint(
@@ -8378,15 +8399,16 @@ async def _build_power_timeline(
         if h_end.tzinfo is None:
             h_end = h_end.replace(tzinfo=timezone.utc)
 
-        plan_meta = PowerTimelinePlanMeta(
-            run_id=str(run_row["run_id"]),
-            generated_at=run_row["run_time"].replace(tzinfo=timezone.utc).isoformat()
-            if run_row["run_time"].tzinfo is None
-            else run_row["run_time"].isoformat(),
-            solver_status=run_row["status"] or "unknown",
-            horizon_start=h_start.isoformat(),
-            horizon_end=h_end.isoformat(),
-        )
+        if plan_points:
+            plan_meta = PowerTimelinePlanMeta(
+                run_id=str(run_row["run_id"]),
+                generated_at=run_row["run_time"].replace(tzinfo=timezone.utc).isoformat()
+                if run_row["run_time"].tzinfo is None
+                else run_row["run_time"].isoformat(),
+                solver_status=run_row["status"] or "unknown",
+                horizon_start=h_start.isoformat(),
+                horizon_end=h_end.isoformat(),
+            )
 
     return PowerTimelineResponse(
         depot_id=depot_id,
