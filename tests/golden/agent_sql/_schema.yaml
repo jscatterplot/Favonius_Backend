@@ -103,6 +103,17 @@ properties:
         type: array
         items: { type: string, format: uuid }
 
+  page_context:
+    type: object
+    additionalProperties: true
+    description: |
+      Optional already-sanitized page/view context the `get_page_context`
+      tool returns verbatim (the payload shape produced by
+      src/api/agent/view_context.py::build_page_context_payload — `available`,
+      `note`, `view`, optional `depot_id`/`focus`). Lets a scenario exercise
+      the ambiguity → get_page_context → query path. Absent ⇒ the tool returns
+      {"available": false}.
+
   graph_snapshot:
     type: object
     additionalProperties: false

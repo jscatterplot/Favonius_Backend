@@ -45,11 +45,7 @@ from src.api.agent.audit import (
     sql_audit_target_type,
     write_agent_query_audit,
 )
-from src.api.agent.auth_context import (
-    ResolvedEntity,
-    ResolvedTimeWindow,
-    build_auth_context,
-)
+from src.api.agent.auth_context import ResolvedEntity, ResolvedTimeWindow, build_auth_context
 from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
@@ -57,21 +53,16 @@ from src.api.agent.intents.consumption_by_user import (
 from src.api.agent.plan import QueryPlan
 from src.api.agent.planner import classify as planner_classify
 from src.api.agent.planner import fetch_org_sql_enabled, is_sql_mode_enabled
-from src.api.agent.prompts import (
-    build_sql_agent_system_prompt,
-    format_sql_agent_user_message,
-)
+from src.api.agent.prompts import build_sql_agent_system_prompt, format_sql_agent_user_message
 from src.api.agent.resolve import (
     load_depot_stations,
     load_depot_timezones,
     resolve_entities,
     resolve_time_window,
 )
-from src.api.agent.sql_tools import (
-    SQL_AGENT_TOOL_NAMES,
-    build_sql_agent_tool_registry,
-)
+from src.api.agent.sql_tools import SQL_AGENT_TOOL_NAMES, build_sql_agent_tool_registry
 from src.api.agent.stream import SSEEventStream
+from src.api.agent.view_context import AgentViewContext, build_page_context_payload
 from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.monitoring.metrics import (
@@ -285,6 +276,7 @@ _STEP_LABELS: dict[str, str] = {
     "run_select_static": "Querying depot & vehicle records",
     "current_time": "Checking the current time",
     "lookup_entity": "Finding the matching record",
+    "get_page_context": "Checking what you're looking at",
     "emit_final_answer": "Composing your answer",
 }
 
@@ -426,6 +418,7 @@ async def run_turn(
     llm_client: LLMClient,
     *,
     sse: Optional[SSEEventStream] = None,
+    context: Optional[AgentViewContext] = None,
 ) -> AgentReply:
     """End-to-end orchestration of one chat turn.
 
@@ -438,6 +431,10 @@ async def run_turn(
         sse: Optional :class:`SSEEventStream`. When provided, the
             orchestrator emits ``step`` events for each phase and a
             final ``answer`` event with the reply payload.
+        context: Optional UI state (page, selected depot, filters, focused
+            item). Only consulted on the SQL-mode path, where it is parked for
+            the ``get_page_context`` tool. Ignored by the consumption fast path
+            (a one-shot extraction with no tool loop).
 
     Returns:
         An :class:`AgentReply`. Raises only on unrecoverable failures
@@ -503,6 +500,7 @@ async def run_turn(
                 ts_pool=ts_pool,
                 sse=sse,
                 emit_step=_emit_step,
+                context=context,
             )
 
         # 1. Extract the plan.
@@ -798,6 +796,7 @@ async def _run_sql_general_turn(
     ts_pool: Any,
     sse: Optional[SSEEventStream],
     emit_step: Any,
+    context: Optional[AgentViewContext] = None,
 ) -> AgentReply:
     """Drive the text-to-SQL agent loop via WorkflowAgent.run_qa_turn.
 
@@ -805,6 +804,10 @@ async def _run_sql_general_turn(
     ``src.api.agent.llm`` so a single Anthropic singleton serves both
     paths. Per-tool-call step events flow into both ``agent_runs`` and
     the SSE stream via the ``on_step`` callback.
+
+    ``context`` (optional UI state) is sanitized against ``auth`` and parked
+    in the tool registry so the agent can pull it via ``get_page_context``
+    when a question is ambiguous. It is never injected into the prompt.
     """
     # S4 per-org monthly token budget — gate FIRST, before importing the llm
     # module or building any Anthropic client. A None reservation means the org
@@ -879,9 +882,19 @@ async def _run_sql_general_turn(
         # free of any llm dependency.
         from src.api.agent import llm as agent_llm  # local: keeps test envs llm-free
 
+        # Sanitize + park the UI context for the get_page_context tool. depot_id
+        # is intersected with auth.visible_depot_ids inside the builder (it can
+        # only narrow scope, never widen it); the payload is recorded as the
+        # first SQL-mode step when the app actually sent something.
+        page_context_payload = build_page_context_payload(context, auth)
+        if context is not None:
+            await agent_runs_step(ts_pool, run_id, "page_context", page_context_payload)
+
         client = agent_llm._get_client()
         config = agent_llm.CONFIG
-        registry = build_sql_agent_tool_registry(static_pool, ts_pool, auth)
+        registry = build_sql_agent_tool_registry(
+            static_pool, ts_pool, auth, page_context=page_context_payload
+        )
         qa = await run_qa_turn(
             anthropic_client=client,
             model=config.model,

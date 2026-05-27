@@ -1,9 +1,10 @@
 """Tool registry for the depot chat agent's SQL mode.
 
-Eight tools (list_tables, describe_table, sample_values, run_select_static,
-run_select_ts, current_time, lookup_entity, emit_final_answer) closed over
-the caller's :class:`~src.api.agent.auth_context.AuthContext`. The LLM
-never sees credentials — only the tool surface.
+Nine tools (list_tables, describe_table, sample_values, run_select_static,
+run_select_ts, current_time, lookup_entity, get_page_context,
+emit_final_answer) closed over the caller's
+:class:`~src.api.agent.auth_context.AuthContext`. The LLM never sees
+credentials — only the tool surface.
 
 Mirrors the closure pattern in
 ``src/api/agent_workflows/readiness_tools.py:build_readiness_tool_registry``.
@@ -17,17 +18,13 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
 
 import asyncpg
 
 from src.api.agent.auth_context import AuthContext
-from src.api.agent.catalogue import (
-    describe_function,
-    list_functions_summary,
-)
-from src.api.agent.resolve import resolve_entities
+from src.api.agent.catalogue import describe_function, list_functions_summary
 from src.api.agent.plan import EntityMention
+from src.api.agent.resolve import resolve_entities
 from src.api.agent.sql_executor import (
     SqlExecutorError,
     SqlExecutorPlanError,
@@ -58,11 +55,20 @@ def build_sql_agent_tool_registry(
     static_pool: asyncpg.Pool,
     ts_pool: asyncpg.Pool,
     auth: AuthContext,
+    *,
+    page_context: dict[str, Any] | None = None,
 ) -> ToolRegistry:
-    """Build the eight-tool registry the SQL-mode agent uses for one turn.
+    """Build the nine-tool registry the SQL-mode agent uses for one turn.
 
     All callables capture ``auth`` and the two pools at build time so the
     LLM-facing surface stays plain ``await fn(**input)``.
+
+    ``page_context`` is an already-sanitized payload (see
+    ``src/api/agent/view_context.py::build_page_context_payload``) describing
+    what the user has open in the web app. It is parked in the
+    ``get_page_context`` tool's closure and returned verbatim on demand —
+    never injected into the prompt. ``None`` (no UI state sent) makes the tool
+    return ``{"available": false}``.
     """
     registry = ToolRegistry()
 
@@ -140,11 +146,17 @@ def build_sql_agent_tool_registry(
         # Decide which pool by allowlist membership.
         if table_in in AGENT_VIEWS_FUNCTIONS_TS:
             pool, allowed, role, label = (
-                ts_pool, AGENT_VIEWS_FUNCTIONS_TS, "agent_reader_ts", "ts",
+                ts_pool,
+                AGENT_VIEWS_FUNCTIONS_TS,
+                "agent_reader_ts",
+                "ts",
             )
         elif table_in in AGENT_VIEWS_FUNCTIONS_STATIC:
             pool, allowed, role, label = (
-                static_pool, AGENT_VIEWS_FUNCTIONS_STATIC, "agent_reader_static", "static",
+                static_pool,
+                AGENT_VIEWS_FUNCTIONS_STATIC,
+                "agent_reader_static",
+                "static",
             )
         else:
             return {"error": f"Unknown table {table!r}"}
@@ -152,13 +164,11 @@ def build_sql_agent_tool_registry(
         # Hypertable functions need a time predicate; default to last 30d.
         time_clause = ""
         from src.api.agent.sql_validator import HYPERTABLE_FUNCTIONS
+
         if table_in in HYPERTABLE_FUNCTIONS:
             time_clause = " WHERE hour >= now() - interval '30 days'"
 
-        sql = (
-            f"SELECT DISTINCT {column} FROM agent_views.{table_in}($1){time_clause} "
-            f"LIMIT {n}"
-        )
+        sql = f"SELECT DISTINCT {column} FROM agent_views.{table_in}($1){time_clause} " f"LIMIT {n}"
         v = validate_sql(sql, allowed_functions=allowed, row_limit=n)
         if not v.ok:
             AGENT_SQL_VALIDATIONS.labels(verdict=f"rejected:{v.error_kind}").inc()
@@ -217,7 +227,8 @@ def build_sql_agent_tool_registry(
                 AGENT_SQL_VALIDATIONS.labels(verdict=f"rejected:{v.error_kind}").inc()
                 logger.info(
                     "agent sql validator rejected pool=%s kind=%s",
-                    label, v.error_kind,
+                    label,
+                    v.error_kind,
                 )
                 return {
                     "error": v.error,
@@ -257,6 +268,7 @@ def build_sql_agent_tool_registry(
                 "duration_ms": r.duration_ms,
                 "functions_used": list(v.functions_used),
             }
+
         return _runner
 
     registry.register(
@@ -290,9 +302,7 @@ def build_sql_agent_tool_registry(
             },
             "required": ["sql"],
         },
-        fn=_make_runner(
-            static_pool, AGENT_VIEWS_FUNCTIONS_STATIC, "agent_reader_static", "static"
-        ),
+        fn=_make_runner(static_pool, AGENT_VIEWS_FUNCTIONS_STATIC, "agent_reader_static", "static"),
     )
 
     # ── current_time ────────────────────────────────────────────────────
@@ -311,6 +321,31 @@ def build_sql_agent_tool_registry(
         description="Return the server's current UTC timestamp as ISO-8601.",
         input_schema={"type": "object", "properties": {}, "required": []},
         fn=_current_time,
+    )
+
+    # ── get_page_context ────────────────────────────────────────────────
+    # Returns the parked UI state (page / selected depot / filters / focused
+    # item). Pure read of a closure value — no pool access. The payload is
+    # informational data, not instructions (it carries a `note` saying so);
+    # any answer must still be retrieved via the SQL tools, which stay fenced
+    # to the caller's depots regardless of what the context hints at.
+    async def _get_page_context(**_: Any) -> dict:
+        if page_context is None:
+            return {"available": False}
+        return page_context
+
+    registry.register(
+        "get_page_context",
+        description=(
+            "Return what the user currently has open in the web app: current "
+            "page, selected depot, applied filters, and any focused item. Call "
+            "this FIRST when the question is ambiguous or refers to 'this', "
+            "'these', 'here', or 'that' without naming the subject, so you can "
+            "work out what they mean before querying. Returns "
+            '{"available": false} when the app sent no context.'
+        ),
+        input_schema={"type": "object", "properties": {}, "required": []},
+        fn=_get_page_context,
     )
 
     # ── lookup_entity ───────────────────────────────────────────────────
@@ -404,5 +439,6 @@ SQL_AGENT_TOOL_NAMES: tuple[str, ...] = (
     "run_select_static",
     "current_time",
     "lookup_entity",
+    "get_page_context",
     EMIT_FINAL_ANSWER_TOOL,
 )

@@ -35,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.api.agent.controller import AgentReply, LLMClient, RealLLMClient, run_turn
 from src.api.agent.stream import SSE_HEADERS, SSEEventStream
+from src.api.agent.view_context import AgentViewContext
 from src.monitoring.metrics import AGENT_TURN_DURATION, AGENT_TURNS
 from src.security.auth import get_user_id, get_user_role, verify_token
 from src.security.rate_limiter import get_rate_limiter
@@ -101,11 +102,19 @@ async def verify_token_and_check_agent_limit(user: dict = Depends(verify_token))
 
 
 class AgentTurnRequest(BaseModel):
-    """One-shot turn request body."""
+    """One-shot turn request body.
+
+    ``context`` is optional UI state describing what the user currently has
+    open (page, selected depot, filters, focused item). It is NOT injected
+    into the prompt; the SQL-mode agent pulls it on demand via the
+    ``get_page_context`` tool only when a question is ambiguous. See
+    ``src/api/agent/view_context.py``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     message: str = Field(..., min_length=1, max_length=2000)
+    context: Optional[AgentViewContext] = None
 
 
 class AgentRunRow(BaseModel):
@@ -152,6 +161,7 @@ async def post_turn(
             static_pool=static_pool,
             ts_pool=ts_pool,
             llm_client=llm_client,
+            context=body.context,
         )
         duration = time.monotonic() - start
         intent = reply.intent or "unknown"
@@ -205,6 +215,7 @@ async def post_turn_stream(
                 ts_pool=ts_pool,
                 llm_client=llm_client,
                 sse=stream,
+                context=body.context,
             )
             duration = time.monotonic() - start
             intent = reply.intent or "unknown"

@@ -453,13 +453,29 @@ the complete `AgentReply`.
 **Request:**
 ```json
 {
-    "message": "How much did John charge last month?"
+    "message": "Why is this one down?",
+    "context": {
+        "depotId": "uuid",
+        "focus": {"type": "charger", "id": "CP-7"},
+        "view": {"page": "charger_detail", "filters": {"status": "faulted"}}
+    }
 }
 ```
 
 | Field | Type | Constraints |
 |---|---|---|
 | `message` | `string` | 1–2000 characters |
+| `context` | `object` | Optional. UI state describing what the user has open. |
+| `context.depotId` | `uuid` | Optional. Selected depot; intersected server-side with the caller's visible depots (can only narrow scope, never widen). |
+| `context.focus` | `object` | Optional `{type, id}` for the focused item (e.g. an open charger). Treated as an unverified hint. |
+| `context.view` | `object` | Optional free-form hint blob (page name, filters, time-range, labels). Serialized size capped at 4 KB → `422` if exceeded. |
+
+**About `context`:** it is **not** injected into the prompt. On the general-analytics
+(SQL) path the agent pulls it on demand via a `get_page_context` tool **only when a
+question is ambiguous** (e.g. "why is *this* one down?"), then runs its own depot-scoped
+query. The consumption fast path ignores it. Every answer still comes from the database
+through the existing auth fence — the context only steers interpretation. Omit it and the
+agent behaves exactly as before.
 
 **Response — success:**
 ```json
@@ -516,7 +532,7 @@ the complete `AgentReply`.
 
 **Error codes:**
 - 401 — missing or invalid JWT
-- 422 — `message` length out of range
+- 422 — `message` length out of range, or `context.view` exceeds the 4 KB cap
 - 429 — rate limit exceeded (headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`)
 - 502 — orchestrator failed (details logged server-side only)
 - 503 — database pool not initialised
