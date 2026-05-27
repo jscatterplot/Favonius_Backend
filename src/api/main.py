@@ -595,12 +595,23 @@ async def lifespan(app: FastAPI):
             )
             logger.info("Data source scheduler + recovery started")
 
+    # ── Navirec telematics poller ────────────────────────────────────────────
+    # Live SoC feed: pulls fleet telematics into vehicle_telemetry so the
+    # optimizer has a SoC for unplugged vehicles. No-ops unless
+    # NAVIREC_POLL_ENABLED=true; safe across replicas via per-depot advisory
+    # locks. The loop never raises out (failed cycles are logged + retried).
+    from ..adapters.navirec import run_navirec_poll_loop  # noqa: PLC0415
+
+    _create_background_task(run_navirec_poll_loop(static_pool, ts_pool))
+    logger.info("Navirec telematics poller task started")
+
     # ── SQL-agent token-budget reconcile ──────────────────────────────────────
     # Flushes low-traffic usage that never trips the on-write threshold and
     # re-hydrates cross-worker totals on a timer (bounds multi-worker over-spend).
     # Harmless no-op when the agent is idle (empty in-process counters).
     _create_background_task(_agent_budget_reconcile_loop())
     logger.info("Agent token-budget reconcile loop started")
+
     # ── Depot agent — daily readiness workflow (sprint 5) ────────────────────
     # Behind DEPOT_AGENT_ENABLED. Upserts the `daily_readiness_check` row in
     # `workflows` and seeds `workflow_tiers` at tier='inform' for every depot

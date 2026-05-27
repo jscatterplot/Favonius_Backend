@@ -21,11 +21,12 @@ _BASE = "https://api.chargeye.example"
 
 @pytest.fixture(autouse=True)
 def _patch_sleep(monkeypatch):
-    """Replace ``asyncio.sleep`` inside the client module so retry waits
-    don't actually block the test event loop."""
-    import src.adapters.kempower.client as client_module
+    """Replace ``asyncio.sleep`` in the shared base client module so retry
+    waits don't actually block the test event loop. (The retry loop moved
+    from kempower.client into src.adapters.rest_client.)"""
+    import src.adapters.rest_client as rest_client_module
 
-    monkeypatch.setattr(client_module.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(rest_client_module.asyncio, "sleep", AsyncMock())
 
 
 @pytest.fixture
@@ -165,9 +166,7 @@ async def test_400_does_not_retry(client):
 async def test_retry_exhaustion_raises(client):
     with respx.mock(assert_all_called=False) as mock:
         _route_login(mock)
-        mock.get(f"{_BASE}/locations/x").mock(
-            return_value=httpx.Response(503, text="down")
-        )
+        mock.get(f"{_BASE}/locations/x").mock(return_value=httpx.Response(503, text="down"))
         with pytest.raises(KempowerClientError, match="exhausted"):
             await client.get_location("x")
     await client.aclose()
@@ -178,9 +177,7 @@ async def test_iter_transactions_passes_window_params(client):
     with respx.mock(assert_all_called=False) as mock:
         _route_login(mock)
         route = mock.get(f"{_BASE}/transactions").mock(
-            return_value=httpx.Response(
-                200, json={"items": [{"txId": "t1"}], "nextPage": None}
-            )
+            return_value=httpx.Response(200, json={"items": [{"txId": "t1"}], "nextPage": None})
         )
         seen = []
         async for tx in client.iter_transactions(

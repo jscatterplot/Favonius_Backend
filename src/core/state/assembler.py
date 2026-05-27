@@ -331,19 +331,60 @@ class StateAssembler:
             if not vehicle_ids:
                 return {}
 
-            # Step 2: Get latest SoC per vehicle from TimescaleDB (ts)
-            async with self.pools.ts.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT DISTINCT ON (vehicle_id)
-                        vehicle_id::text AS vehicle_id,
-                        soc
+            # Step 2: Get latest SoC per vehicle from TimescaleDB (ts).
+            # Two sources: charger-side `telemetry` (OCPP MeterValues) and
+            # `vehicle_telemetry` (Navirec telematics feed, migration 044).
+            # UNION both and keep the freshest reading per vehicle so a vehicle
+            # that's unplugged (out on a route) still has a live SoC. The 24h
+            # lower bound confines the DISTINCT ON scan to recent chunks;
+            # telematics rows carry true device timestamps, so the downstream
+            # 15-min freshness check (data_freshness.MAX_TELEMETRY_AGE) still
+            # governs whether a SoC is fresh enough to optimize on. On an exact
+            # (vehicle_id, time) tie, src_priority makes charger telemetry win
+            # deterministically (ground truth when the vehicle is plugged in).
+            merged_sql = """
+                SELECT DISTINCT ON (vehicle_id)
+                    vehicle_id::text AS vehicle_id,
+                    soc
+                FROM (
+                    SELECT vehicle_id, soc, time, 0 AS src_priority
                     FROM telemetry
                     WHERE vehicle_id = ANY($1::uuid[])
-                    ORDER BY vehicle_id, time DESC
-                    """,
-                    vehicle_ids,
+                      AND soc IS NOT NULL
+                      AND time > now() - INTERVAL '24 hours'
+                    UNION ALL
+                    SELECT vehicle_id, soc, time, 1 AS src_priority
+                    FROM vehicle_telemetry
+                    WHERE vehicle_id = ANY($1::uuid[])
+                      AND soc IS NOT NULL
+                      AND time > now() - INTERVAL '24 hours'
+                ) merged
+                ORDER BY vehicle_id, time DESC, src_priority
+            """
+            # Fallback when vehicle_telemetry doesn't exist yet (migration 044
+            # not applied / app-rollout skew). Without it, every depot's state
+            # assembly would break — even with Navirec polling disabled.
+            telemetry_only_sql = """
+                SELECT DISTINCT ON (vehicle_id)
+                    vehicle_id::text AS vehicle_id,
+                    soc
+                FROM telemetry
+                WHERE vehicle_id = ANY($1::uuid[])
+                  AND soc IS NOT NULL
+                  AND time > now() - INTERVAL '24 hours'
+                ORDER BY vehicle_id, time DESC
+            """
+            try:
+                async with self.pools.ts.acquire() as conn:
+                    rows = await conn.fetch(merged_sql, vehicle_ids)
+            except asyncpg.exceptions.UndefinedTableError:
+                logger.warning(
+                    "vehicle_telemetry missing (migration 044 not applied?); "
+                    "falling back to charger telemetry only for depot %s",
+                    self.depot_id,
                 )
+                async with self.pools.ts.acquire() as conn:
+                    rows = await conn.fetch(telemetry_only_sql, vehicle_ids)
 
             result = {
                 str(row["vehicle_id"]): float(row["soc"]) for row in rows if row["soc"] is not None
