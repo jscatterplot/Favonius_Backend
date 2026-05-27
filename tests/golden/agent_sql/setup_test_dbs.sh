@@ -62,11 +62,13 @@ echo "==> applying TS migrations -> favonius_test"
 DATABASE_URL="$TS_URL" "$PYTHON" scripts/run_migrations.py >/dev/null
 echo "    ok"
 
-echo "==> applying supabase base + agent_views (040) -> favonius_static"
+echo "==> applying supabase base + agent_views (040 + 045 depots zone fallback) -> favonius_static"
 docker exec -i "$CONTAINER" psql -U favonius_test -d favonius_static -v ON_ERROR_STOP=1 \
   < tests/golden/agent_sql/supabase_bootstrap.sql >/dev/null
 docker exec -i "$CONTAINER" psql -U favonius_test -d favonius_static -v ON_ERROR_STOP=1 \
   < migrations/supabase/040_agent_views_static.sql >/dev/null
+docker exec -i "$CONTAINER" psql -U favonius_test -d favonius_static -v ON_ERROR_STOP=1 \
+  < migrations/supabase/045_agent_depots_entsoe_zone_fallback.sql >/dev/null
 echo "    ok"
 
 echo

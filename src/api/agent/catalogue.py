@@ -162,7 +162,8 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
             "depot. ENTSO-E prices are public market data so this surface "
             "isn't depot-scoped. To find the prices for a specific depot, "
             "first call `agent_views.depots($1)` and read its `entsoe_zone` "
-            "column, then filter `prices_hourly` with "
+            "column (populated for single-zone countries), then filter "
+            "`prices_hourly` with "
             "`WHERE bidding_zone = '<that zone>'`. REQUIRES a time "
             "predicate on `hour`. Prices are in EUR/kWh."
         ),
@@ -251,15 +252,21 @@ STATIC_FUNCTIONS: tuple[FunctionSpec, ...] = (
             ColumnSpec("timezone", "text", "IANA tz, e.g. 'Europe/Vilnius'."),
             ColumnSpec("currency", "text", "ISO 4217 code."),
             ColumnSpec("max_grid_kw", "double precision", "Hard grid power ceiling."),
-            ColumnSpec("address", "text"),
+            ColumnSpec(
+                "address",
+                "text",
+                "Postal address as a serialized JSON object (not a flat string).",
+            ),
             ColumnSpec("latitude", "double precision"),
             ColumnSpec("longitude", "double precision"),
             ColumnSpec(
                 "entsoe_zone",
                 "text",
                 "ENTSO-E EIC bidding zone (e.g. '10YLT-1001A0008Q'). "
-                "Cross-link this with `agent_views.prices_hourly($1)` to "
-                "filter by depot.",
+                "Resolved from the operator override when set, else derived "
+                "from the depot timezone for single-zone countries; NULL only "
+                "for multi-zone or unmapped countries. Cross-link this with "
+                "`agent_views.prices_hourly($1)` to filter prices by depot.",
             ),
         ),
         examples=("SELECT depot_id, name, timezone, entsoe_zone FROM agent_views.depots($1)",),
