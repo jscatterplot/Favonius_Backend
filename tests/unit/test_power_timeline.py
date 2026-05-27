@@ -8,7 +8,7 @@ import pytest
 from fastapi import status as http_status
 from fastapi.testclient import TestClient
 
-from src.api.main import app
+from src.api.main import _TIMELINE_TIMESTEP_MINUTES, app
 from src.security.tenant_mirror import ensure_tenant_mirrored
 
 DEPOT_ID = str(uuid4())
@@ -271,6 +271,47 @@ class TestPowerTimelineEmptyStates:
         assert data["plan"] == []
         assert data["plan_meta"] is None
 
+    def test_history_returned_when_telemetry_exists_but_no_plan(self, client):
+        """Regression: the past-24h actuals must render with no optimization run.
+
+        The chart short-circuited to a blank series for depots that had
+        telemetry but no recent optimization plan. History is built
+        independently of the plan, so it must be fully populated while
+        ``plan`` is ``[]`` and ``plan_meta`` is ``None``.
+        """
+        buckets = [
+            (_NOW - timedelta(minutes=45), 142.3, 6),
+            (_NOW - timedelta(minutes=30), 138.0, 6),
+            (_NOW - timedelta(minutes=15), 150.5, 7),
+        ]
+        pool = MagicMock()
+        conn = AsyncMock()
+        # fetchrow: site row, then run_row=None (no optimization run exists).
+        conn.fetchrow = AsyncMock(side_effect=iter([_site_row(), None]))
+        # fetch: station rows, then telemetry buckets.
+        conn.fetch = AsyncMock(
+            side_effect=iter([_station_rows("CP-01"), _telemetry_rows(*buckets)])
+        )
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        pool.ts = pool
+        pool.static = pool
+
+        with patch("src.api.main.db_pools", pool):
+            resp = client.get(f"/depots/{DEPOT_ID}/power-timeline")
+
+        data = resp.json()
+        assert resp.status_code == http_status.HTTP_200_OK
+        # History is fully populated even though there is no plan.
+        assert len(data["history"]) == 3
+        assert data["history"][0]["charging_kw"] == pytest.approx(142.3)
+        assert data["history"][2]["vehicle_count"] == 7
+        # No optimization run → empty plan, null plan_meta. Required fields present.
+        assert data["plan"] == []
+        assert data["plan_meta"] is None
+        assert data["timezone"] == "Europe/Vilnius"
+        assert data["timestep_minutes"] == 15
+
     def test_no_station_ids_skips_telemetry_query(self, client):
         """When depot has no chargers, history is empty without hitting telemetry."""
         pool = MagicMock()
@@ -483,12 +524,15 @@ class TestPowerTimelinePlanBehavior:
         assert plan[0]["battery_kw"] == 0.0  # None → 0.0
         assert plan[1]["battery_kw"] == 5.0
 
-    def test_plan_timestamps_snap_to_15min_grid(self, client):
-        """horizon_start at a non-boundary time is snapped down to the nearest
-        15-min UTC boundary so plan buckets align with time_bucket() history."""
-        # horizon_start 3 minutes + 17 seconds past a boundary → should snap back 3m17s
+    def test_plan_timestamps_track_horizon_start(self, client):
+        """Plan bucket times track the optimizer's actual horizon_start.
+
+        Each plan value is plotted at ``horizon_start + i * timestep`` so the
+        power shown lines up with the time the optimizer actually intends it
+        (see commit 8c749d5 — values are NOT snapped back to a 15-min grid,
+        which would shift each value up to one timestep earlier)."""
+        # horizon_start 3 minutes + 17 seconds past a 15-min boundary.
         unaligned_start = _NOW.replace(minute=3, second=17, microsecond=500000)
-        expected_snapped = _NOW.replace(minute=0, second=0, microsecond=0)
         run_row = {
             "run_id": uuid4(),
             "run_time": _GENERATED_AT,
@@ -518,7 +562,7 @@ class TestPowerTimelinePlanBehavior:
         # Both buckets are at or after _NOW (10:00:00), so both should be present.
         assert len(plan) == 2
         t0 = datetime.fromisoformat(plan[0]["time"])
-        assert t0.minute % 15 == 0, f"First plan bucket not on 15-min boundary: {t0}"
-        assert t0.second == 0 and t0.microsecond == 0
-        # First bucket must be the snapped start
-        assert t0 == expected_snapped
+        t1 = datetime.fromisoformat(plan[1]["time"])
+        # First bucket is exactly horizon_start (unsnapped); spacing is one step.
+        assert t0 == unaligned_start
+        assert (t1 - t0) == timedelta(minutes=_TIMELINE_TIMESTEP_MINUTES)
