@@ -1,10 +1,10 @@
 """Kempower ChargEye REST API client.
 
-A thin :class:`httpx.AsyncClient` wrapper that handles JWT bearer auth
-(cached, refreshed on 401 or T-5min expiry), pagination, and the small
-amount of retry / back-off needed against the public ChargEye API.
+A thin :class:`~src.adapters.rest_client.BaseRestClient` subclass that handles
+JWT bearer auth (cached, refreshed on 401 or T-5min expiry), pagination, and
+the small amount of retry / back-off needed against the public ChargEye API.
 
-Public surface is the four iterators / fetchers the CLI consumes:
+Public surface is the iterators / fetchers the CLI consumes:
 
 - :meth:`iter_charging_stations`
 - :meth:`iter_vehicles`
@@ -14,35 +14,24 @@ Public surface is the four iterators / fetchers the CLI consumes:
 
 Field names follow the ChargEye reference (``stationId``, ``maxPowerKw``,
 ``netBatterySizeKwh``, …). Translation to Favonius shapes happens in
-``mapping.py``, not here.
+``mapping.py``, not here. The shared auth / retry / pagination plumbing lives
+in :mod:`src.adapters.rest_client`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import time
 from typing import Any, AsyncIterator, Optional
 
 import httpx
 
+from ..rest_client import BaseRestClient, RestClientError
+
 logger = logging.getLogger(__name__)
 
 
-class KempowerClientError(RuntimeError):
-    """Raised on unrecoverable Kempower API errors.
-
-    Recoverable failures (429, 5xx) are retried in-process; this is only
-    raised when retries are exhausted or the response shape is malformed.
-    """
-
-
-# JWT expiry is documented as 8h; refresh 5 min early so a long-running
-# transaction backfill never trips a token-expired 401 mid-page.
-_TOKEN_EXPIRY_S = 8 * 60 * 60
-_TOKEN_REFRESH_BUFFER_S = 5 * 60
-
+<<<<<<< claude/gracious-brahmagupta-3MvPy
 # Kempower IAM endpoint: exchange a permanent refresh token for a short-lived
 # access JWT.  This is a platform-level URL, separate from the main API base.
 _REFRESH_TOKEN_URL = "https://kempower.io/api/auth/refreshAccessToken"
@@ -50,9 +39,13 @@ _REFRESH_TOKEN_URL = "https://kempower.io/api/auth/refreshAccessToken"
 # Retry policy. ENTSO-E uses the same shape (see ``src/adapters/entsoe/``).
 _MAX_RETRIES = 4
 _RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)
+=======
+class KempowerClientError(RestClientError):
+    """Raised on unrecoverable Kempower API errors."""
+>>>>>>> main
 
 
-class KempowerClient:
+class KempowerClient(BaseRestClient):
     """Async client for the Kempower ChargEye REST API."""
 
     DEFAULT_BASE_URL = "https://api.chargeye.com"
@@ -67,7 +60,11 @@ class KempowerClient:
         client: Optional[httpx.AsyncClient] = None,
         timeout_s: float = 30.0,
     ) -> None:
+<<<<<<< claude/gracious-brahmagupta-3MvPy
         self._refresh_token = refresh_token or os.getenv("KEMPOWER_REFRESH_TOKEN")
+=======
+        """Validate credentials, resolve the base URL, and init the shared base client."""
+>>>>>>> main
         self._username = username or os.getenv("KEMPOWER_USERNAME")
         self._password = password or os.getenv("KEMPOWER_PASSWORD")
         if not self._refresh_token and not (self._username and self._password):
@@ -76,31 +73,20 @@ class KempowerClient:
                 "username and password (or set KEMPOWER_REFRESH_TOKEN / "
                 "KEMPOWER_USERNAME + KEMPOWER_PASSWORD)."
             )
-        self._base_url = (
-            base_url
-            or os.getenv("KEMPOWER_API_BASE_URL")
-            or self.DEFAULT_BASE_URL
-        ).rstrip("/")
-        self._client = client or httpx.AsyncClient(timeout=timeout_s)
-        self._owns_client = client is None
-        self._token: Optional[str] = None
-        self._token_acquired_at: float = 0.0
-
-    async def __aenter__(self) -> "KempowerClient":
-        return self
-
-    async def __aexit__(self, *exc_info: Any) -> None:
-        await self.aclose()
-
-    async def aclose(self) -> None:
-        """Close the underlying HTTP client (only when this instance owns it)."""
-        if self._owns_client:
-            await self._client.aclose()
+        resolved_base_url = base_url or os.getenv("KEMPOWER_API_BASE_URL") or self.DEFAULT_BASE_URL
+        super().__init__(
+            base_url=resolved_base_url,
+            provider_name="Kempower",
+            error_cls=KempowerClientError,
+            client=client,
+            timeout_s=timeout_s,
+        )
 
     # ------------------------------------------------------------------
-    # Auth
+    # Auth — provider hook
     # ------------------------------------------------------------------
 
+<<<<<<< claude/gracious-brahmagupta-3MvPy
     async def _ensure_token(self, *, force: bool = False) -> str:
         """Return a non-expired JWT, refreshing if needed."""
         now = time.monotonic()
@@ -142,6 +128,11 @@ class KempowerClient:
 
     async def _acquire_token_from_password(self) -> str:
         """Exchange username + password for a short-lived access JWT."""
+=======
+    async def _fetch_token(self) -> str:
+        """Exchange username/password for a ChargEye JWT."""
+        url = f"{self._base_url}/auth/login"
+>>>>>>> main
         resp = await self._client.post(
             f"{self._base_url}/auth/login",
             json={"username": self._username, "password": self._password},
@@ -153,6 +144,7 @@ class KempowerClient:
         body = resp.json()
         token = body.get("accessToken") or body.get("token")
         if not token:
+<<<<<<< claude/gracious-brahmagupta-3MvPy
             raise KempowerClientError(
                 "Kempower auth response missing 'accessToken'/'token' field"
             )
@@ -249,6 +241,10 @@ class KempowerClient:
             cursor = body.get("nextPage")
             if not cursor:
                 break
+=======
+            raise KempowerClientError("Kempower auth response missing 'accessToken'/'token' field")
+        return str(token)
+>>>>>>> main
 
     # ------------------------------------------------------------------
     # Public surface — only what the CLI consumes

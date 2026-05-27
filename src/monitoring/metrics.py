@@ -255,3 +255,49 @@ SOLVER_POOL_BROKEN = Counter(
     "Times the solver process pool became broken and was recreated",
     ["reason"],  # 'broken_pool' | 'timeout'
 )
+
+# Navirec telematics poller metrics (live SoC feed → vehicle_telemetry).
+NAVIREC_POLL_CYCLES = Counter(
+    "favonius_navirec_poll_cycles_total",
+    "Navirec poll cycles by outcome",
+    ["outcome"],  # 'ok' | 'fetch_error' | 'skipped_disabled'
+)
+
+NAVIREC_POLL_DURATION = Histogram(
+    "favonius_navirec_poll_duration_seconds",
+    "Wall-clock duration of a full Navirec poll cycle",
+    buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60],
+)
+
+NAVIREC_READINGS_WRITTEN = Counter(
+    "favonius_navirec_readings_written_total",
+    "Telematics readings upserted into vehicle_telemetry",
+    ["depot_id"],
+)
+
+NAVIREC_DEPOT_FAILURES = Counter(
+    "favonius_navirec_depot_failures_total",
+    "Per-depot poll failures (isolated; other depots continue)",
+    ["depot_id"],
+)
+
+NAVIREC_LOCK_SKIPS = Counter(
+    "favonius_navirec_lock_skips_total",
+    "Depot writes skipped because another worker held the advisory lock",
+    ["depot_id"],
+)
+
+NAVIREC_UNMATCHED_PLATES = Counter(
+    "favonius_navirec_unmatched_plates_total",
+    "Telematics readings whose plate matched no Favonius vehicle",
+)
+
+NAVIREC_AMBIGUOUS_PLATES = Gauge(
+    "favonius_navirec_ambiguous_plates",
+    "Normalized plates mapping to >1 vehicle (dropped from the resolution map)",
+)
+
+NAVIREC_STALE_READINGS = Counter(
+    "favonius_navirec_stale_readings_total",
+    "Readings whose device timestamp already exceeded the telemetry freshness window",
+)
