@@ -1725,6 +1725,60 @@ class ScheduleResponse(BaseModel):
     schedule: dict = Field(..., description="Charging schedule per vehicle")
 
 
+class PowerTimelineHistoryPoint(BaseModel):
+    """One 15-minute bucket of actual depot charging power."""
+
+    time: str = Field(..., description="Bucket start time (ISO 8601 UTC)")
+    charging_kw: Optional[float] = Field(None, description="Sum of charging_kw across all chargers")
+    vehicle_count: int = Field(0, description="Distinct vehicles active in this bucket")
+
+
+class PowerTimelinePlanPoint(BaseModel):
+    """One 15-minute bucket from the optimizer's charging plan."""
+
+    time: str = Field(..., description="Bucket start time (ISO 8601 UTC)")
+    grid_kw: float = Field(..., description="Total planned grid draw (kW)")
+    charging_kw: float = Field(..., description="EV charging portion (kW)")
+    battery_kw: float = Field(
+        ..., description="Battery power (kW); negative = charging, positive = discharging"
+    )
+
+
+class PowerTimelinePlanMeta(BaseModel):
+    """Metadata about the optimization run backing the plan series."""
+
+    run_id: str
+    generated_at: str = Field(..., description="When the optimization ran (ISO 8601 UTC)")
+    solver_status: str = Field(..., description="optimal|feasible|degraded|infeasible|timeout")
+    horizon_start: str = Field(..., description="Plan start time (ISO 8601 UTC)")
+    horizon_end: str = Field(..., description="Plan end time (ISO 8601 UTC)")
+
+
+class PowerTimelineResponse(BaseModel):
+    """Response for GET /depots/{id}/power-timeline.
+
+    Returns up to 96 history buckets (last 24h at 15-min resolution) and
+    up to 96 plan buckets (next 24h from the latest optimization run).
+    """
+
+    depot_id: str
+    as_of: str = Field(..., description="Server time when the response was built (ISO 8601 UTC)")
+    max_grid_kw: Optional[float] = Field(None, description="Hard grid ceiling from site config")
+    timezone: str = Field(..., description="Depot IANA timezone (for display purposes)")
+    timestep_minutes: int = Field(15, description="Resolution of both series in minutes")
+    history: list[PowerTimelineHistoryPoint] = Field(
+        default_factory=list,
+        description="Actual charging power for the past history_hours",
+    )
+    plan: list[PowerTimelinePlanPoint] = Field(
+        default_factory=list,
+        description="Planned grid power from the latest optimization run",
+    )
+    plan_meta: Optional[PowerTimelinePlanMeta] = Field(
+        None, description="Metadata about the optimization run; null when no run exists"
+    )
+
+
 class ManualScheduleEntry(BaseModel):
     """Manually-entered route schedule for one vehicle."""
 
@@ -8161,6 +8215,226 @@ async def get_depot_schedule(
             detail={
                 "error_code": ErrorCode.INTERNAL_ERROR.value,
                 "detail": "Failed to get schedule",
+            },
+        ) from e
+
+
+# ── Power timeline ────────────────────────────────────────────────────────────
+
+_TIMELINE_TIMESTEP_MINUTES = 15
+_TIMELINE_TIMESTEP_HOURS = _TIMELINE_TIMESTEP_MINUTES / 60.0
+
+
+async def _build_power_timeline(
+    depot_id: str,
+    history_hours: int,
+) -> PowerTimelineResponse:
+    """Assemble the history + plan series for the power-timeline endpoint.
+
+    History: 15-min buckets of SUM(charging_kw) from the ``telemetry``
+    hypertable, scoped to the depot's charger station_ids.
+
+    Plan: per-timestep ``grid_power`` and per-vehicle ``charging_power``
+    from the latest ``optimization_runs.schedule_json``, aligned to UTC
+    timestamps starting at ``horizon_start``.
+    """
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    now_utc = datetime.now(tz=timezone.utc)
+    history_start = now_utc - timedelta(hours=history_hours)
+
+    # ── 1. Depot metadata + station_ids from Supabase ────────────────────────
+    async with db_pools.static.acquire() as conn:
+        site_row = await conn.fetchrow(
+            """
+            SELECT
+                timezone,
+                max_grid_kw
+            FROM sites
+            WHERE id = $1::uuid
+            """,
+            depot_id,
+        )
+        if site_row is None:
+            raise HTTPException(status_code=404, detail=f"Depot {depot_id} not found")
+
+        station_rows = await conn.fetch(
+            "SELECT station_id FROM charging_stations WHERE site_id = $1::uuid",
+            depot_id,
+        )
+
+    depot_tz = site_row["timezone"] or "UTC"
+    max_grid_kw: Optional[float] = (
+        float(site_row["max_grid_kw"]) if site_row["max_grid_kw"] is not None else None
+    )
+    station_ids: list[str] = [r["station_id"] for r in station_rows if r["station_id"]]
+
+    # ── 2. Telemetry history (TimescaleDB) ───────────────────────────────────
+    history_points: list[PowerTimelineHistoryPoint] = []
+    if station_ids:
+        history_query = """
+            SELECT
+                time_bucket($1::interval, t.time) AS bucket,
+                SUM(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL) AS charging_kw,
+                COUNT(DISTINCT t.vehicle_id) FILTER (WHERE t.charging_kw > 0.1) AS vehicle_count
+            FROM telemetry t
+            WHERE t.charger_id = ANY($2::text[])
+              AND t.time >= $3
+              AND t.time < $4
+              AND t.charging_kw IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+        """
+        interval = f"{_TIMELINE_TIMESTEP_MINUTES} minutes"
+        async with db_pools.ts.acquire() as conn:
+            rows = await conn.fetch(
+                history_query,
+                interval,
+                station_ids,
+                history_start,
+                now_utc,
+            )
+        for row in rows:
+            bucket: datetime = row["bucket"]
+            if bucket.tzinfo is None:
+                bucket = bucket.replace(tzinfo=timezone.utc)
+            history_points.append(
+                PowerTimelineHistoryPoint(
+                    time=bucket.isoformat(),
+                    charging_kw=float(row["charging_kw"]) if row["charging_kw"] is not None else None,
+                    vehicle_count=int(row["vehicle_count"] or 0),
+                )
+            )
+
+    # ── 3. Optimization plan (TimescaleDB) ───────────────────────────────────
+    plan_points: list[PowerTimelinePlanPoint] = []
+    plan_meta: Optional[PowerTimelinePlanMeta] = None
+
+    async with db_pools.ts.acquire() as conn:
+        run_row = await conn.fetchrow(
+            """
+            SELECT run_id, run_time, schedule_json, horizon_start, horizon_end, status
+            FROM optimization_runs
+            WHERE depot_id = $1
+            ORDER BY run_time DESC
+            LIMIT 1
+            """,
+            depot_id,
+        )
+
+    if run_row is not None:
+        raw_json = run_row["schedule_json"]
+        sched: dict = raw_json if isinstance(raw_json, dict) else json.loads(raw_json)
+
+        grid_power: list[float] = sched.get("grid_power") or []
+        battery_dispatch: list[float] = sched.get("battery_dispatch") or []
+        per_vehicle: dict[str, dict] = sched.get("schedule") or {}
+
+        # Sum each vehicle's charging_power per timestep.
+        n = len(grid_power)
+        vehicle_charging_per_t: list[float] = [0.0] * n
+        for vdata in per_vehicle.values():
+            cp: list[float] = vdata.get("charging_power") or []
+            for t, kw in enumerate(cp):
+                if t < n:
+                    vehicle_charging_per_t[t] += float(kw or 0.0)
+
+        h_start: datetime = run_row["horizon_start"]
+        if h_start.tzinfo is None:
+            h_start = h_start.replace(tzinfo=timezone.utc)
+
+        step = timedelta(minutes=_TIMELINE_TIMESTEP_MINUTES)
+        for i, grid_kw in enumerate(grid_power):
+            bucket_time = h_start + step * i
+            batt_kw = float(battery_dispatch[i]) if i < len(battery_dispatch) else 0.0
+            plan_points.append(
+                PowerTimelinePlanPoint(
+                    time=bucket_time.isoformat(),
+                    grid_kw=float(grid_kw or 0.0),
+                    charging_kw=vehicle_charging_per_t[i],
+                    battery_kw=batt_kw,
+                )
+            )
+
+        h_end: datetime = run_row["horizon_end"]
+        if h_end.tzinfo is None:
+            h_end = h_end.replace(tzinfo=timezone.utc)
+
+        plan_meta = PowerTimelinePlanMeta(
+            run_id=str(run_row["run_id"]),
+            generated_at=run_row["run_time"].replace(tzinfo=timezone.utc).isoformat()
+            if run_row["run_time"].tzinfo is None
+            else run_row["run_time"].isoformat(),
+            solver_status=run_row["status"] or "unknown",
+            horizon_start=h_start.isoformat(),
+            horizon_end=h_end.isoformat(),
+        )
+
+    return PowerTimelineResponse(
+        depot_id=depot_id,
+        as_of=now_utc.isoformat(),
+        max_grid_kw=max_grid_kw,
+        timezone=depot_tz,
+        timestep_minutes=_TIMELINE_TIMESTEP_MINUTES,
+        history=history_points,
+        plan=plan_points,
+        plan_meta=plan_meta,
+    )
+
+
+@app.get(
+    "/depots/{depot_id}/power-timeline",
+    response_model=PowerTimelineResponse,
+    tags=["depots"],
+    summary="Depot power timeline (past 24h actual + next 24h plan)",
+    description="""
+    Returns two time-series on a shared 15-minute grid:
+
+    - **history**: actual depot charging power aggregated from OCPP telemetry
+      for the past `history_hours` hours (default 24).
+    - **plan**: planned grid draw from the most recent MILP optimization run,
+      covering `horizon_start → horizon_end` (typically the next 24 h).
+
+    Designed to drive a single chart in the depot today-view that shows what
+    actually happened and what the optimizer intends to do next, with a "now"
+    marker dividing the two series.
+
+    **Error codes:**
+    - 401: Unauthorized
+    - 404: Depot not found
+    - 503: Database not available
+    """,
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_power_timeline(
+    depot_id: str = Depends(_require_depot_access),
+    history_hours: int = Query(default=24, ge=1, le=48, description="Hours of history to include"),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> PowerTimelineResponse:
+    """GET /depots/{depot_id}/power-timeline."""
+    try:
+        return await _build_power_timeline(depot_id, history_hours)
+    except HTTPException:
+        raise
+    except asyncpg.PostgresError as e:
+        logger.error(
+            "Database error in power-timeline for %s: %s", depot_id, e, exc_info=True
+        )
+        raise DatabaseError() from e
+    except Exception as e:
+        logger.error(
+            "Failed to build power-timeline for %s: %s", depot_id, e, exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "detail": "Failed to build power timeline",
             },
         ) from e
 
