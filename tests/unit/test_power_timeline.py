@@ -30,6 +30,23 @@ def _admin_auth():
         app.dependency_overrides.pop(ensure_tenant_mirrored, None)
 
 
+@pytest.fixture(autouse=True)
+def _freeze_now():
+    """Freeze datetime.now() in main.py to _NOW for deterministic plan filtering.
+
+    Only `.now()` is frozen; other class methods (.utcnow, .fromisoformat) are
+    delegated to the real datetime so the error-response handler and test
+    assertions still work correctly.
+    """
+    from datetime import datetime as _real_dt
+
+    with patch("src.api.main.datetime") as mock_dt:
+        mock_dt.now.return_value = _NOW
+        mock_dt.utcnow.side_effect = _real_dt.utcnow
+        mock_dt.fromisoformat.side_effect = _real_dt.fromisoformat
+        yield
+
+
 @pytest.fixture
 def client():
     return TestClient(app)
@@ -355,3 +372,81 @@ class TestPowerTimelineErrors:
             resp = client.get(f"/depots/{DEPOT_ID}/power-timeline")
 
         assert resp.status_code == http_status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+class TestPowerTimelinePlanBehavior:
+    """Plan series filtering, capping, and plan_meta correctness."""
+
+    def test_plan_buckets_before_now_are_excluded(self, client):
+        """Timesteps whose bucket_time < now_utc are skipped (stale plan)."""
+        # horizon_start is 1 h before _NOW; first 4 of 8 steps are in the past.
+        stale_start = _NOW - timedelta(hours=1)  # 4 past + 4 future (15-min steps)
+        run_row = {
+            "run_id": uuid4(),
+            "run_time": _GENERATED_AT,
+            "schedule_json": {"grid_power": [10.0] * 8, "battery_dispatch": [0.0] * 8, "schedule": {}},
+            "horizon_start": stale_start,
+            "horizon_end": stale_start + timedelta(hours=2),
+            "status": "optimal",
+        }
+        pool = MagicMock()
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(side_effect=iter([_site_row(), run_row]))
+        conn.fetch = AsyncMock(side_effect=iter([_station_rows("CP-01"), []]))
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        pool.ts = pool
+        pool.static = pool
+
+        with patch("src.api.main.db_pools", pool):
+            resp = client.get(f"/depots/{DEPOT_ID}/power-timeline")
+
+        assert resp.status_code == http_status.HTTP_200_OK
+        plan = resp.json()["plan"]
+        # 1 h / 15 min = 4 past steps skipped; 4 future steps kept
+        assert len(plan) == 4
+        # First kept bucket should be at _NOW exactly
+        t0 = datetime.fromisoformat(plan[0]["time"])
+        assert t0 >= _NOW
+
+    def test_plan_capped_at_96_buckets(self, client):
+        """Optimizer may run a 48 h horizon; endpoint caps the response at 96."""
+        pool = _make_pool(
+            _site_row(),
+            _station_rows("CP-01"),
+            [],
+            _run_row([20.0] * 192),  # 48 h at 15-min steps
+        )
+        with patch("src.api.main.db_pools", pool):
+            resp = client.get(f"/depots/{DEPOT_ID}/power-timeline")
+
+        assert resp.status_code == http_status.HTTP_200_OK
+        assert len(resp.json()["plan"]) == 96
+
+    def test_plan_meta_set_even_with_empty_schedule_json(self, client):
+        """plan_meta reflects the run row regardless of schedule_json content."""
+        run_row = {
+            "run_id": uuid4(),
+            "run_time": _GENERATED_AT,
+            "schedule_json": {},  # empty dict is falsy — must not hide plan_meta
+            "horizon_start": _HORIZON_START,
+            "horizon_end": _HORIZON_END,
+            "status": "degraded",
+        }
+        pool = MagicMock()
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(side_effect=iter([_site_row(), run_row]))
+        conn.fetch = AsyncMock(side_effect=iter([_station_rows("CP-01"), []]))
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        pool.ts = pool
+        pool.static = pool
+
+        with patch("src.api.main.db_pools", pool):
+            resp = client.get(f"/depots/{DEPOT_ID}/power-timeline")
+
+        data = resp.json()
+        assert resp.status_code == http_status.HTTP_200_OK
+        assert data["plan"] == []
+        assert data["plan_meta"] is not None
+        assert data["plan_meta"]["solver_status"] == "degraded"

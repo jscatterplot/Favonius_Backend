@@ -8274,43 +8274,43 @@ async def _build_power_timeline(
     # ── 2. Telemetry history (TimescaleDB) ───────────────────────────────────
     history_points: list[PowerTimelineHistoryPoint] = []
     if station_ids:
+        # Two CTEs: per_connector averages each connector's samples within the
+        # bucket (OCPP writes MeterValues every ~15 s per connector, so AVG gives
+        # instantaneous kW rather than a cumulative sum). per_bucket_vehicles
+        # counts distinct vehicles across the whole bucket so a reconnect mid-
+        # bucket or a vehicle on two connectors isn't double-counted.
         history_query = """
-            WITH connector_buckets AS (
+            WITH per_connector AS (
                 SELECT
-                    time_bucket($1::interval, t.time) AS bucket,
+                    time_bucket($1::interval, t.time)                              AS bucket,
                     t.station_id,
                     t.connector_id,
-                    AVG(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL) AS avg_kw
+                    AVG(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL)   AS avg_kw
                 FROM telemetry t
                 WHERE t.station_id = ANY($2::text[])
                   AND t.time >= $3
                   AND t.time < $4
-                GROUP BY bucket, t.station_id, t.connector_id
+                GROUP BY 1, 2, 3
             ),
-            power_by_bucket AS (
+            per_bucket_vehicles AS (
                 SELECT
-                    bucket,
-                    SUM(avg_kw) AS charging_kw
-                FROM connector_buckets
-                GROUP BY bucket
-            ),
-            vehicles_by_bucket AS (
-                SELECT
-                    time_bucket($1::interval, t.time) AS bucket,
-                    COUNT(DISTINCT t.vehicle_id) FILTER (WHERE t.charging_kw > 0.1) AS vehicle_count
+                    time_bucket($1::interval, t.time)                              AS bucket,
+                    COUNT(DISTINCT t.vehicle_id)
+                        FILTER (WHERE t.charging_kw > 0.1)                         AS vehicle_count
                 FROM telemetry t
                 WHERE t.station_id = ANY($2::text[])
                   AND t.time >= $3
                   AND t.time < $4
-                GROUP BY bucket
+                GROUP BY 1
             )
             SELECT
-                p.bucket,
-                p.charging_kw,
-                COALESCE(v.vehicle_count, 0) AS vehicle_count
-            FROM power_by_bucket p
-            LEFT JOIN vehicles_by_bucket v USING (bucket)
-            ORDER BY p.bucket
+                pc.bucket,
+                SUM(pc.avg_kw)                     AS charging_kw,
+                COALESCE(MAX(bv.vehicle_count), 0) AS vehicle_count
+            FROM per_connector pc
+            LEFT JOIN per_bucket_vehicles bv USING (bucket)
+            GROUP BY pc.bucket
+            ORDER BY pc.bucket
         """
         interval = f"{_TIMELINE_TIMESTEP_MINUTES} minutes"
         async with db_pools.ts.acquire() as conn:
@@ -8349,17 +8349,40 @@ async def _build_power_timeline(
             depot_id,
         )
 
-    if run_row is not None and run_row["schedule_json"]:
+    if run_row is not None:
+        h_start: datetime = run_row["horizon_start"]
+        if h_start.tzinfo is None:
+            h_start = h_start.replace(tzinfo=timezone.utc)
+        h_end: datetime = run_row["horizon_end"]
+        if h_end.tzinfo is None:
+            h_end = h_end.replace(tzinfo=timezone.utc)
+
+        # plan_meta reflects the run regardless of whether schedule_json is usable.
+        plan_meta = PowerTimelinePlanMeta(
+            run_id=str(run_row["run_id"]),
+            generated_at=run_row["run_time"].replace(tzinfo=timezone.utc).isoformat()
+            if run_row["run_time"].tzinfo is None
+            else run_row["run_time"].isoformat(),
+            solver_status=run_row["status"] or "unknown",
+            horizon_start=h_start.isoformat(),
+            horizon_end=h_end.isoformat(),
+        )
+
         raw_json = run_row["schedule_json"]
-        if isinstance(raw_json, dict):
-            sched: dict = raw_json
-        else:
-            try:
-                sched = json.loads(raw_json)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                logger.warning("Unparseable schedule_json for depot %s; returning empty plan", depot_id)
+        if raw_json:
+            if isinstance(raw_json, dict):
+                sched: dict = raw_json
+            else:
+                try:
+                    sched = json.loads(raw_json)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    logger.warning(
+                        "Unparseable schedule_json for depot %s; returning empty plan", depot_id
+                    )
+                    sched = {}
+            if not isinstance(sched, dict):
                 sched = {}
-        if not isinstance(sched, dict):
+        else:
             sched = {}
 
         grid_power: list[float] = sched.get("grid_power") or []
@@ -8375,16 +8398,14 @@ async def _build_power_timeline(
                 if t < n:
                     vehicle_charging_per_t[t] += float(kw or 0.0)
 
-        h_start: datetime = run_row["horizon_start"]
-        if h_start.tzinfo is None:
-            h_start = h_start.replace(tzinfo=timezone.utc)
-
         step = timedelta(minutes=_TIMELINE_TIMESTEP_MINUTES)
-        plan_window_end = now_utc + timedelta(hours=24)
+        _MAX_PLAN_BUCKETS = 96  # 24 h / 15 min
         for i, grid_kw in enumerate(grid_power):
             bucket_time = h_start + step * i
-            if bucket_time < now_utc or bucket_time >= plan_window_end:
-                continue
+            if bucket_time < now_utc:
+                continue  # skip elapsed buckets; history series covers actuals
+            if len(plan_points) >= _MAX_PLAN_BUCKETS:
+                break  # cap at 24 h regardless of optimizer horizon setting
             batt_kw = float(battery_dispatch[i]) if i < len(battery_dispatch) else 0.0
             plan_points.append(
                 PowerTimelinePlanPoint(
@@ -8393,21 +8414,6 @@ async def _build_power_timeline(
                     charging_kw=vehicle_charging_per_t[i],
                     battery_kw=batt_kw,
                 )
-            )
-
-        h_end: datetime = run_row["horizon_end"]
-        if h_end.tzinfo is None:
-            h_end = h_end.replace(tzinfo=timezone.utc)
-
-        if plan_points:
-            plan_meta = PowerTimelinePlanMeta(
-                run_id=str(run_row["run_id"]),
-                generated_at=run_row["run_time"].replace(tzinfo=timezone.utc).isoformat()
-                if run_row["run_time"].tzinfo is None
-                else run_row["run_time"].isoformat(),
-                solver_status=run_row["status"] or "unknown",
-                horizon_start=h_start.isoformat(),
-                horizon_end=h_end.isoformat(),
             )
 
     return PowerTimelineResponse(
