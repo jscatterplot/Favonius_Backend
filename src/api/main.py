@@ -8398,15 +8398,22 @@ async def _build_power_timeline(
                 if t < n:
                     vehicle_charging_per_t[t] += float(kw or 0.0)
 
+        # Snap horizon_start to 15-min UTC boundary so plan bucket times
+        # align with time_bucket('15 minutes', ...) used for history.
+        h_start_aligned = h_start - timedelta(
+            minutes=h_start.minute % _TIMELINE_TIMESTEP_MINUTES,
+            seconds=h_start.second,
+            microseconds=h_start.microsecond,
+        )
         step = timedelta(minutes=_TIMELINE_TIMESTEP_MINUTES)
         _MAX_PLAN_BUCKETS = 96  # 24 h / 15 min
         for i, grid_kw in enumerate(grid_power):
-            bucket_time = h_start + step * i
+            bucket_time = h_start_aligned + step * i
             if bucket_time < now_utc:
                 continue  # skip elapsed buckets; history series covers actuals
             if len(plan_points) >= _MAX_PLAN_BUCKETS:
                 break  # cap at 24 h regardless of optimizer horizon setting
-            batt_kw = float(battery_dispatch[i]) if i < len(battery_dispatch) else 0.0
+            batt_kw = float(battery_dispatch[i] or 0.0) if i < len(battery_dispatch) else 0.0
             plan_points.append(
                 PowerTimelinePlanPoint(
                     time=bucket_time.isoformat(),

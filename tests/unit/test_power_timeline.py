@@ -450,3 +450,75 @@ class TestPowerTimelinePlanBehavior:
         assert data["plan"] == []
         assert data["plan_meta"] is not None
         assert data["plan_meta"]["solver_status"] == "degraded"
+
+    def test_null_battery_dispatch_entry_defaults_to_zero(self, client):
+        """A None (JSON null) in battery_dispatch must not raise TypeError."""
+        run_row = {
+            "run_id": uuid4(),
+            "run_time": _GENERATED_AT,
+            "schedule_json": {
+                "grid_power": [50.0, 60.0],
+                "battery_dispatch": [None, 5.0],  # null at index 0
+                "schedule": {},
+            },
+            "horizon_start": _HORIZON_START,
+            "horizon_end": _HORIZON_END,
+            "status": "optimal",
+        }
+        pool = MagicMock()
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(side_effect=iter([_site_row(), run_row]))
+        conn.fetch = AsyncMock(side_effect=iter([_station_rows("CP-01"), []]))
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        pool.ts = pool
+        pool.static = pool
+
+        with patch("src.api.main.db_pools", pool):
+            resp = client.get(f"/depots/{DEPOT_ID}/power-timeline")
+
+        assert resp.status_code == http_status.HTTP_200_OK
+        plan = resp.json()["plan"]
+        assert len(plan) == 2
+        assert plan[0]["battery_kw"] == 0.0  # None → 0.0
+        assert plan[1]["battery_kw"] == 5.0
+
+    def test_plan_timestamps_snap_to_15min_grid(self, client):
+        """horizon_start at a non-boundary time is snapped down to the nearest
+        15-min UTC boundary so plan buckets align with time_bucket() history."""
+        # horizon_start 3 minutes + 17 seconds past a boundary → should snap back 3m17s
+        unaligned_start = _NOW.replace(minute=3, second=17, microsecond=500000)
+        expected_snapped = _NOW.replace(minute=0, second=0, microsecond=0)
+        run_row = {
+            "run_id": uuid4(),
+            "run_time": _GENERATED_AT,
+            "schedule_json": {
+                "grid_power": [10.0, 20.0],
+                "battery_dispatch": [0.0, 0.0],
+                "schedule": {},
+            },
+            "horizon_start": unaligned_start,
+            "horizon_end": unaligned_start + timedelta(hours=1),
+            "status": "optimal",
+        }
+        pool = MagicMock()
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(side_effect=iter([_site_row(), run_row]))
+        conn.fetch = AsyncMock(side_effect=iter([_station_rows("CP-01"), []]))
+        pool.acquire.return_value.__aenter__.return_value = conn
+        pool.acquire.return_value.__aexit__.return_value = None
+        pool.ts = pool
+        pool.static = pool
+
+        with patch("src.api.main.db_pools", pool):
+            resp = client.get(f"/depots/{DEPOT_ID}/power-timeline")
+
+        assert resp.status_code == http_status.HTTP_200_OK
+        plan = resp.json()["plan"]
+        # Both buckets are at or after _NOW (10:00:00), so both should be present.
+        assert len(plan) == 2
+        t0 = datetime.fromisoformat(plan[0]["time"])
+        assert t0.minute % 15 == 0, f"First plan bucket not on 15-min boundary: {t0}"
+        assert t0.second == 0 and t0.microsecond == 0
+        # First bucket must be the snapped start
+        assert t0 == expected_snapped
