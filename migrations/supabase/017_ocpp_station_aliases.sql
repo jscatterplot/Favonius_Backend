@@ -1,4 +1,4 @@
--- OCPP station aliases for vendor-specific charger identities.
+-- Supabase migration 017: OCPP station aliases for vendor-specific charger identities.
 
 CREATE TABLE IF NOT EXISTS public.ocpp_station_aliases (
     alias_station_id     VARCHAR(255) PRIMARY KEY,

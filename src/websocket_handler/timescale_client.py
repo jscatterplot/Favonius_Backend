@@ -2246,7 +2246,7 @@ class TimescaleClient:
         # in Supabase; using ``pg_pool`` directly raises ``UndefinedTableError``
         # against the real Timescale DB. ``_static_pool`` routes to Supabase
         # when wired and falls back to ``pg_pool`` for tests. ``ocpp_station_aliases``
-        # exists in both DBs (migration 024 + supabase/008), so the INSERT
+        # exists in both DBs (migration 024 + supabase/017), so the INSERT
         # half of the statement is correct against either pool.
         async with self._static_pool().acquire() as conn:
             result = await conn.execute(

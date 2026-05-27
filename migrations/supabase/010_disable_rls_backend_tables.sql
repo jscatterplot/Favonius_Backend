@@ -20,5 +20,20 @@
 ALTER TABLE public.sites               DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.charging_stations   DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.organizations       DISABLE ROW LEVEL SECURITY;
-ALTER TABLE public.user_organizations  DISABLE ROW LEVEL SECURITY;
+-- The table was renamed organization_users → user_organizations by migration 016.
+-- On a fresh install migration 010 runs before 016, so we must handle both names.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'user_organizations'
+    ) THEN
+        ALTER TABLE public.user_organizations DISABLE ROW LEVEL SECURITY;
+    ELSIF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'organization_users'
+    ) THEN
+        ALTER TABLE public.organization_users DISABLE ROW LEVEL SECURITY;
+    END IF;
+END $$;
 ALTER TABLE public.vehicles            DISABLE ROW LEVEL SECURITY;

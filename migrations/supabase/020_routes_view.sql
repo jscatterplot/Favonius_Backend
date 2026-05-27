@@ -1,4 +1,4 @@
--- Supabase migration 014: routes view (sprint 4 readiness tools)
+-- Supabase migration 020: routes view (sprint 4 readiness tools)
 --
 -- The PRD (docs/PRD_Depot_Agent.md §5.1) sketches the operational graph
 -- with a ``Route`` dataclass:
